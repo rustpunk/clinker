@@ -512,6 +512,72 @@ fn read_swift_fields(data: &str) -> Vec<(String, Option<String>)> {
 }
 
 #[test]
+fn swift_mixed_continuation_bytes_survive_runtime_round_trip() {
+    let fixture = "{1:HEADER}{4:\r\n:79:  café{inline}-} :20:text  \r\n next\n\r\n\r\n:79:second\n\n:86:TAIL\r\n-}";
+    let (output, _) = swift_to_swift_then_csv(fixture, &[("authored", 1, "basic_header_from_doc")]);
+    assert_eq!(output.as_bytes(), b"{1:HEADER}{4:\r\n:79:  caf\xc3\xa9{inline}-} :20:text  \r\n next\n\r\n\r\n:79:second\n\r\n:86:TAIL\r\n-}");
+    let fields = read_swift_fields(&output);
+    assert_eq!(fields.len(), 3);
+    assert_eq!(fields, read_swift_fields(fixture));
+    assert_eq!(
+        fields[0].1.as_deref(),
+        Some("  café{inline}-} :20:text  \r\n next\n\r\n")
+    );
+    assert_eq!(fields[1].1.as_deref(), Some("second\n"));
+    assert_eq!(fields[2].1.as_deref(), Some("TAIL"));
+}
+
+#[test]
+fn swift_malformed_initialization_terminates_under_both_error_strategies() {
+    // This is a liveness guard, not a throughput assertion: a reader that
+    // repeatedly reports the same failed initialization must not hang a run.
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        for strategy in ["fail_fast", "continue"] {
+            let yaml = format!(
+                r#"
+pipeline:
+  name: swift_terminal_failure
+error_handling:
+  strategy: {strategy}
+nodes:
+  - type: source
+    name: message
+    config:
+      name: message
+      type: swift
+      path: input.swift
+      schema:
+        - {{ name: block, type: string }}
+        - {{ name: tag, type: string }}
+        - {{ name: value, type: string }}
+  - type: sink
+    name: out
+    input: message
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#
+            );
+            for input in [
+                "{1:H}{2:truncated",
+                "{1:H}{4:\n::BAD\n-}",
+                "{1:H}{4:\n:20:GOOD\n-}{5:truncated",
+            ] {
+                let error = run(&yaml, "message", input, "input.swift", "out").unwrap_err();
+                assert!(error.contains("SWIFT"), "{strategy}: {error}");
+            }
+        }
+        sender.send(()).unwrap();
+    });
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("malformed SWIFT run must terminate");
+    worker.join().unwrap();
+}
+
+#[test]
 fn swift_round_trip_preserves_multiline_values_through_writer() {
     // The tag-column round-trip tests use fixtures with no folded continuation
     // values, so value faithfulness through the SWIFT WRITER's executor path
@@ -547,7 +613,7 @@ fn swift_round_trip_preserves_multiline_values_through_writer() {
             .iter()
             .find(|(t, _)| t == "50K")
             .and_then(|(_, v)| v.as_deref()),
-        Some("/12345678\nJOHN DOE\n123 MAIN ST"),
+        Some("/12345678\r\nJOHN DOE\r\n123 MAIN ST"),
         "multi-line :50K: value lost: {original:?}"
     );
     assert_eq!(
@@ -555,7 +621,7 @@ fn swift_round_trip_preserves_multiline_values_through_writer() {
             .iter()
             .find(|(t, _)| t == "77E")
             .and_then(|(_, v)| v.as_deref()),
-        Some("NARRATIVE LINE ONE\n\nNARRATIVE LINE THREE"),
+        Some("NARRATIVE LINE ONE\r\n\r\nNARRATIVE LINE THREE"),
         "interior-blank-line :77E: value lost: {original:?}"
     );
 }
@@ -593,7 +659,7 @@ fn swift_interior_block4_braces_dashes_blanks_round_trip() {
     assert!(
         original
             .iter()
-            .any(|(t, v)| t == "77E" && v.as_deref() == Some("LINE1\n\nLINE3")),
+            .any(|(t, v)| t == "77E" && v.as_deref() == Some("LINE1\r\n\r\nLINE3")),
         "interior blank line value missing: {original:?}"
     );
     assert!(

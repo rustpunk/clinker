@@ -6,8 +6,8 @@
 //! application header, `3` user header, `5` trailer) are consumed by the
 //! reader to drive the message-level document context and serve file-level
 //! `$doc` sections; they are never emitted as body records. This mirrors the
-//! one-segment-one-record shape of the X12 and HL7 readers, so memory scales
-//! O(1) with message size — only the block currently being framed is held.
+//! one-segment-one-record shape of the X12 and HL7 readers. The initial scan
+//! retains the service blocks and parsed body fields before yielding rows.
 //!
 //! A SWIFT MT message is a single envelope: the service blocks are extracted
 //! in a one-time pre-scan and surface as file-level `$doc` sections via
@@ -18,9 +18,8 @@
 //! open/close pair with no records between.
 //!
 //! Structural separators (braces, the leading `:`, the `-}` trailer, the
-//! line breaks) are kept out of the stored field values; the writer
-//! re-frames them, so the reader → writer → reader round-trip is
-//! byte-faithful.
+//! breaks between fields) are kept out of stored values. Continuation LF and
+//! CRLF bytes remain verbatim; the writer re-frames the structural boundaries.
 
 use std::io::{BufReader, Read};
 use std::sync::Arc;
@@ -75,7 +74,7 @@ pub struct SwiftReader<R: Read> {
     tokenizer: BlockTokenizer<BufReader<R>>,
     schema: SharedStorage<Schema>,
     max_fields: usize,
-    initialized: bool,
+    initialization: Initialization,
     /// Block 1 (basic header) body, captured in the pre-scan.
     basic_header: Option<String>,
     /// Block 2 (application header) body.
@@ -100,6 +99,13 @@ pub struct SwiftReader<R: Read> {
     done: bool,
 }
 
+#[derive(Clone, Copy)]
+enum Initialization {
+    Pending,
+    Ready,
+    Failed,
+}
+
 impl<R: Read> SwiftReader<R> {
     /// Build a reader over any `Read` source. Block framing and the
     /// service-block pre-scan are deferred to the first read.
@@ -108,7 +114,7 @@ impl<R: Read> SwiftReader<R> {
             tokenizer: BlockTokenizer::new(BufReader::new(reader)),
             schema: build_schema(),
             max_fields: config.max_fields,
-            initialized: false,
+            initialization: Initialization::Pending,
             basic_header: None,
             app_header: None,
             user_header: None,
@@ -123,9 +129,10 @@ impl<R: Read> SwiftReader<R> {
 
     /// Frame every block of the message once: stash the service blocks
     /// (1/2/3/5) for envelope serving and split block 4 into its field lines
-    /// for streaming. A SWIFT message is bounded and small, so framing all
-    /// blocks up front holds only the (small) service-block bodies plus the
-    /// block-4 line list — not the whole input stream. Idempotent.
+    /// for streaming. Retains service bodies and the block-4 line list under
+    /// the existing block-byte and field-count limits. Readiness commits only
+    /// after the complete scan succeeds. Failure drops partial state and makes
+    /// subsequent body pulls terminal; document preparation cannot retry it.
     ///
     /// # Errors
     ///
@@ -133,14 +140,35 @@ impl<R: Read> SwiftReader<R> {
     /// bad id, missing `-}` trailer, malformed `:tag:value` line), a repeated
     /// block id, or a block-4 line count past `max_fields`.
     fn ensure_initialized(&mut self) -> Result<(), FormatError> {
-        if self.initialized {
-            return Ok(());
+        match self.initialization {
+            Initialization::Ready => return Ok(()),
+            Initialization::Failed => {
+                return Err(FormatError::Swift(
+                    "SWIFT message initialization failed; reopen the source after correcting the input"
+                        .into(),
+                ));
+            }
+            Initialization::Pending => {}
         }
-        self.initialized = true;
-
-        while let Some(block) = self.tokenizer.read_block()? {
-            self.absorb_block(block)?;
+        let result = (|| {
+            while let Some(block) = self.tokenizer.read_block()? {
+                self.absorb_block(block)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.initialization = Initialization::Failed;
+            self.done = true;
+            self.basic_header = None;
+            self.app_header = None;
+            self.user_header = None;
+            self.trailer = None;
+            // Drop backing allocations, not just their populated lengths.
+            self.body_lines = std::collections::VecDeque::new();
+            self.pending_events = Vec::new();
+            return Err(error);
         }
+        self.initialization = Initialization::Ready;
         Ok(())
     }
 
@@ -375,6 +403,21 @@ fn string_or_null(s: &str) -> Value {
 mod tests {
     use super::*;
     use crate::envelope::EnvelopeSection;
+
+    #[test]
+    fn failed_initialization_drops_all_partial_backing() {
+        let mut reader = reader("{1:H}{2:A}{3:U}{4:\n:20:BODY\n-}{5:T}{5:duplicate}");
+        assert!(reader.next_record().is_err());
+        assert!(matches!(reader.initialization, Initialization::Failed));
+        assert!(reader.basic_header.is_none());
+        assert!(reader.app_header.is_none());
+        assert!(reader.user_header.is_none());
+        assert!(reader.trailer.is_none());
+        assert_eq!(reader.body_lines.capacity(), 0);
+        assert_eq!(reader.pending_events.capacity(), 0);
+        assert!(!reader.level_open);
+        assert!(reader.next_record().unwrap().is_none());
+    }
     use std::io::Cursor;
 
     /// A minimal single-customer-credit-transfer MT103 with all five blocks.
@@ -444,7 +487,7 @@ mod tests {
         let f59 = f59.unwrap();
         assert_eq!(
             f59.get("value"),
-            Some(&Value::String("/98765432\nJANE SMITH".into()))
+            Some(&Value::String("/98765432\r\nJANE SMITH".into()))
         );
     }
 

@@ -432,10 +432,21 @@ unit: the synchronous dispatcher, streaming writer thread, or deferred
 correlation commit. The closed metric set is `clinker.sink.started`, exactly one
 of `clinker.sink.completed`, `clinker.sink.failed`, or
 `clinker.sink.interrupted`, plus `clinker.sink.records`,
-`clinker.sink.errors`, and `clinker.sink.bytes`; each terminal work unit emits
+`clinker.sink.errors`, `clinker.sink.bytes`, and `clinker.sink.truncations`;
+each terminal work unit emits
 one complete `clinker.sink` span after the outcome is known. Admission loss is
 behavior-neutral: a full telemetry arena may drop the optional span but cannot
 change writer bytes or run status.
+
+Fixed-width `truncation: warn` is reported through a run-scoped truncation
+ledger rather than the telemetry arena. `build_format_writer` wraps every Sink
+writer it builds, so no Sink path can omit the report; when a writer drops, its
+schema-sized account (per-column counts, longest length, first eight delivered
+record numbers) settles into the ledger, shifted past the records earlier
+writers of the same Sink delivered. The `clinker.sink.truncations` counter of a
+work unit is that Sink's ledger delta across the unit, and the end-of-run W367
+advisories render from the same ledger after the streaming writer threads join,
+so the metric and the warning report one count.
 
 Preparation adds the existing fixed-cardinality admission, stage, spill and
 cleanup observations described in [prepared-output telemetry](memory-arbitration.md#prepared-output-telemetry).

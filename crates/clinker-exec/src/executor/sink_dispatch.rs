@@ -355,6 +355,10 @@ where
     ctx.sink_byte_counter = sink_byte_counter.clone();
     let records_before = ctx.counters.records_written;
     let errors_before = ctx.output_errors.len();
+    // Every writer this turn builds drops inside `dispatch_sink_work`, settling
+    // its truncations, so the ledger delta is exactly this work unit's.
+    let truncation_key = resolve_out_cfg(ctx, name).name.clone();
+    let truncations_before = ctx.truncation_ledger.truncated_cells(&truncation_key);
     let result = dispatch_sink_work(ctx, current_dag, node_idx, node);
     ctx.sink_byte_counter = None;
     let errors = ctx.output_errors[errors_before..]
@@ -371,6 +375,11 @@ where
             sink_byte_counter
                 .as_ref()
                 .map_or(0, clinker_format::SharedByteCounter::bytes_written),
+        );
+        signal.record_truncations(
+            ctx.truncation_ledger
+                .truncated_cells(&truncation_key)
+                .saturating_sub(truncations_before),
         );
         signal.record_errors(u64::try_from(failures).unwrap_or(u64::MAX));
         if failures > 0 {
@@ -723,6 +732,7 @@ fn dispatch_sink_work(
     {
         let mut fan_ctx = FanOutContext {
             writer_resources: ctx.writer_resources.clone(),
+            truncation_ledger: ctx.truncation_ledger.clone(),
             name,
             out_cfg,
             cxl_emit_names_opt,
@@ -1080,6 +1090,7 @@ fn dispatch_sink_envelope(
                             ctx.output_staging.clone(),
                             ctx.sink_byte_counter.clone(),
                             ctx.writer_resources.clone(),
+                            &ctx.truncation_ledger,
                         ))
                     });
                 }
@@ -1384,6 +1395,7 @@ fn missing_sink_input_error(
 /// a new metric guard) lands on the struct, not on two signatures.
 struct FanOutContext<'a> {
     writer_resources: clinker_format::preparation::WriterResources,
+    truncation_ledger: crate::executor::truncation_report::TruncationLedger,
     name: &'a str,
     out_cfg: &'a clinker_plan::config::SinkConfig,
     cxl_emit_names_opt: Option<&'a [String]>,
@@ -1434,6 +1446,7 @@ fn emit_single_writer(
         fan_ctx.output_staging.clone(),
         fan_ctx.sink_byte_counter.clone(),
         fan_ctx.writer_resources.clone(),
+        &fan_ctx.truncation_ledger,
     ) {
         Ok(mut csv_writer) => {
             fan_ctx.collector.record(scan_timer.finish(1, 1));
@@ -1514,14 +1527,19 @@ fn emit_fan_out(
     mut resolved_paths: HashMap<Arc<str>, String>,
     scan_timer: crate::executor::stage_metrics::StageTimer,
 ) {
-    use std::collections::HashMap as Hm;
-
     // Build one format writer per pre-opened raw writer. Failed
     // construction for one file does NOT abort the whole output —
     // siblings still get their chance.
     // A retained empty slot marks a terminal writer without confusing it with
     // an unregistered destination or retaining its failed resources.
-    let mut format_writers: Hm<Arc<str>, Option<clinker_format::FormatWriterHandle>> = Hm::new();
+    // Ordered by file so writers flush and drop in a stable order: each drop
+    // settles that file's truncations into the run's ledger, which numbers a
+    // Sink's records file by file in settle order. A hash order would make the
+    // W367 record numbers differ between runs of the same input.
+    let mut format_writers: std::collections::BTreeMap<
+        Arc<str>,
+        Option<clinker_format::FormatWriterHandle>,
+    > = std::collections::BTreeMap::new();
     for (file_arc, raw) in per_file {
         let mut resolved_config = fan_ctx.out_cfg.clone();
         if let Some(path) = resolved_paths.remove(&file_arc) {
@@ -1544,6 +1562,7 @@ fn emit_fan_out(
             fan_ctx.output_staging.clone(),
             fan_ctx.sink_byte_counter.clone(),
             fan_ctx.writer_resources.clone(),
+            &fan_ctx.truncation_ledger,
         ) {
             Ok(fw) => {
                 format_writers.insert(file_arc, Some(fw));

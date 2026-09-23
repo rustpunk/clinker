@@ -1409,6 +1409,10 @@ pub(crate) struct ExecutorContext<'a> {
     /// the whole stream can distinguish a column no record carried (a typo) from
     /// one that some record carried (a sparse column in a heterogeneous stream).
     pub(crate) mapping_probes: BTreeMap<String, crate::projection::MappingProbe>,
+    /// Per-Sink `truncation: warn` account, settled by every Sink writer as it
+    /// drops and rendered once at the end of the run as W367 advisories. Shared
+    /// with the streaming writer threads.
+    pub(crate) truncation_ledger: crate::executor::truncation_report::TruncationLedger,
     pub(crate) ok_source_rows: HashSet<crate::executor::stream_event::SourceRowId>,
     /// Successful writes keyed by both the source row and the stable terminal
     /// Sink node. This preserves fan-out evidence without changing

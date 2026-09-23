@@ -18,6 +18,19 @@ pub enum OutputEncodingKind {
     XmlName,
     XmlValue,
     XmlPath,
+    FixedWidthLayout,
+    FixedWidthScalar,
+    FixedWidthTruncation,
+    FixedWidthCardinality,
+    FixedWidthOccurrence,
+    FixedWidthBlankOccurrence,
+    FixedWidthEnvelope,
+    SwiftBlock,
+    SwiftTag,
+    SwiftContinuation,
+    SwiftScalar,
+    SwiftService,
+    SwiftDocument,
 }
 
 /// Inline diagnostic excerpt; the numeric field identity remains authoritative.
@@ -402,6 +415,33 @@ impl fmt::Display for FormatError {
                         r"invalid or colliding XML field path; use distinct leaf paths such as item.id and item.name; escape a literal dot as \. or a backslash as \\",
                     OutputEncodingKind::Json =>
                         "value has no valid JSON representation; check finite numbers, nested keys and depth",
+                    OutputEncodingKind::FixedWidthLayout =>
+                        "invalid fixed-width layout; declare positive disjoint byte ranges, single-byte padding and finite valid repetition bounds",
+                    OutputEncodingKind::FixedWidthScalar =>
+                        "fixed-width cell requires a scalar; project scalar fields, coerce with CXL to_string, \
+                         or route to JSON output; arrays of records require multiple: true with bounded fields and occurs",
+                    OutputEncodingKind::FixedWidthTruncation =>
+                        "value exceeds its declared byte width with truncation: error; shorten the value, widen the field or select truncation: warn|silent",
+                    OutputEncodingKind::FixedWidthCardinality =>
+                        "group occurrence count violates its declared min/max; adjust the array or select on_overflow: truncate with keep: first|last",
+                    OutputEncodingKind::FixedWidthOccurrence =>
+                        "group requires an array of records; provide [] for zero occurrences or maps with the declared scalar child fields",
+                    OutputEncodingKind::FixedWidthBlankOccurrence =>
+                        "occurrence renders exactly like an unused padded slot; add count_field or provide a non-padding child value",
+                    OutputEncodingKind::FixedWidthEnvelope =>
+                        "fixed-width document sections require scalar fields and do not support a computed footer count; project scalar section values and omit footer_record_count_field",
+                    OutputEncodingKind::SwiftBlock =>
+                        "SWIFT body records require block 4; set block to \"4\" or omit it and configure service blocks separately",
+                    OutputEncodingKind::SwiftTag =>
+                        "SWIFT requires a nonempty tag without colons or line breaks; set tag to a field name such as \"20\"",
+                    OutputEncodingKind::SwiftContinuation =>
+                        "SWIFT continuation lines cannot begin with ':' or '-}'; rewrite the continuation so it cannot be read as a tag or block terminator",
+                    OutputEncodingKind::SwiftScalar =>
+                        "SWIFT requires scalar fields; project scalar values or use CXL to_string",
+                    OutputEncodingKind::SwiftService =>
+                        "SWIFT service bodies require balanced braces; provide a body such as \"{CHK:AB}\" without the outer service block",
+                    OutputEncodingKind::SwiftDocument =>
+                        "SWIFT service source has no body field; declare the named document section with a scalar body field or provide a literal service body",
                 }
             ),
             Self::Resource(error) => error.fmt(f),

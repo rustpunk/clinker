@@ -59,6 +59,25 @@ resolved, on both the read and write sides. An absent or empty `pad` defaults
 to a space. Under `truncation: error` an over-long value is still a hard error
 before any slicing.
 
+`truncation: warn` truncates and reports it; `silent` performs the same
+truncation and reports nothing. Numeric columns default to `error`, and
+other columns default to `warn`.
+
+When a run finishes, each output that truncated under `warn` prints one
+**W367** warning to standard error, naming every such column with the exact
+number of values cut, the longest original value in bytes, the column width,
+and the numbers of the first eight output records that were cut (records
+count from 1 across everything that output wrote, including every file of a
+split output; an output that writes one file per source file numbers its files
+one after another in file-path order, except that a file whose writer fails is
+numbered when it fails). The warning does not change the exit code. The report never
+copies a value, so it cannot leak data into logs, and its memory is fixed by
+the schema when the output opens: recording a truncation cannot fail, so
+`warn` never turns an over-long value into a rejected record. A record
+that is rejected or not delivered is not counted. Truncations are also
+counted by the `clinker.sink.truncations` metric. Run
+`clinker explain --code W367` for the fixes.
+
 A `type: decimal` output column with a `scale` rounds its values to that
 many fractional places on write (banker's rounding), the same contract a
 `decimal` source column applies on read. This matters here: a computed
@@ -74,7 +93,7 @@ emits `1.33`; without the `scale` the 28-digit quotient overflows the
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `line_separator` | platform | Line-ending style (`lf` / `crlf`) used to split the file into records. |
+| `line_separator` | `lf` | Record separator: `lf`, `crlf`, or `none` for consecutive fixed-length records. |
 
 Under `lf` or `crlf`, the reader buffers each physical line only up to the
 declared record width plus a line-terminator allowance. A physical line wider
@@ -86,6 +105,21 @@ buffered portion is capped, a malformed file (a corrupt or missing newline)
 cannot grow a single record until end of input: memory stays bounded regardless
 of how long the physical line runs. A final line with no trailing newline reads
 normally as long as its declared fields fit within the width.
+
+### Strict selected-cell input
+
+Field offsets remain **physical byte offsets**. Each selected cell must be
+valid UTF-8 within its own byte range; a boundary that cuts through a
+multi-byte character fails rather than shifting the layout or inserting a
+replacement character. Undeclared gaps and discarded trailing bytes are not
+decoded, so invalid bytes in those ignored ranges do not invalidate a
+selected cell. A leading UTF-8 BOM is removed before applying the layout.
+There is no charset conversion for fixed-width input or output.
+
+A typed numeric cell that cannot be parsed terminates the read, including
+under `strategy: continue`; that policy does not make numeric parse failures
+recoverable. This differs from the multi-record unknown-discriminator
+handling described below.
 
 ## Multi-value cells (`split_values`)
 
@@ -176,6 +210,43 @@ bare `multiple: true` fixed-width column is not a positional group, and a
 `split_values` entry cannot stand in for `fields` plus `occurs`. A fixed-width
 sink that receives an array of records must declare the same named positional
 group in its output schema.
+
+## Scalar document headers and footers
+
+With `reconstruct_envelope: true`, `options.envelope.header_from_doc` and
+`options.envelope.footer_from_doc` select arbitrary document sections. Their
+values are concatenated in section field order, without field padding,
+delimiters, or the body's byte layout. Strings
+are verbatim, booleans use `true`/`false`, numbers use their natural scalar
+spelling, dates use `YYYYMMDD`, datetimes use `YYYYMMDDhhmmss`, and null emits
+no text. Arrays and maps have no scalar envelope representation and fail
+before any bytes from that header or footer reach the destination.
+
+An absent section emits nothing. A present section with no fields still
+emits its separator: LF, CRLF, or no bytes under `line_separator: none`.
+Header, body record, and footer are separate complete operations, so a bad
+footer cannot undo an earlier successful body. See
+[fixed-width document output](../pipelines/envelope-and-doc-context.md#fixed-width-document-output)
+for section selection and input-extraction limits.
+
+## Library output and failures
+
+Direct callers construct `FixedWidthEncoder` with their columns,
+`FixedWidthWriterConfig`, and finite `WriterResources`, then wrap it in
+`PreparedWriter`. `MemoryOnlyResources::new` requires an explicit nonzero
+budget. The resource-free writer constructor is unavailable. Read the
+truncation account through `FormatWriter::truncation_summary()` (or
+`writer.encoder().truncation_summary()`): `None` when nothing was truncated,
+otherwise per-column counts, longest lengths, and the first delivered record
+numbers.
+
+Preparation validates the complete operation before destination writes.
+Preparation failure leaves committed state unchanged and permits a corrected
+retry. Once delivery starts, a destination can accept a prefix before
+failing; the writer then refuses continuation, including flush, and drop
+does not retry. `flush_bytes()` only drains the destination; `flush()`
+finalizes once and drains. See [output preparation](../ops/storage.md#output-preparation)
+for the separate storage and publication guarantees.
 
 ## Schema drift
 

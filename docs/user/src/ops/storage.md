@@ -8,17 +8,23 @@ directory. The `[storage]` block in `clinker.toml` lets you redirect them.
 
 ## Output preparation
 
-CSV, JSON and XML output in the CLI and executor prepares each complete
-output operation before delivering its bytes. For CSV, the first body row and
+CSV, JSON, XML, fixed-width and SWIFT output in the CLI and executor prepares
+each complete output operation before delivering its bytes. For CSV, the first body row and
 its automatic header share one operation; explicit document start and end are separate operations. The
 same finite-resource preparation API is available to library integrations.
+Fixed-width prepares document headers, body records and footers separately.
+SWIFT prepares its service headers together with the first body record, then
+prepares the closing block and trailer at finalization.
 
 Prepared output bytes stay in memory unless `storage.spill.dir` supplies an explicit
 spill location. This differs from the operator spill default described below:
 output preparation does not silently use the operating system's temporary
 directory. Configured spill uses the run's disk budget and a finite descriptor
 allowance. It does not remove the memory required for a rendered CSV cell,
-retained header, or native format configuration and schema plans. See
+retained header, format configuration and schema plans, fixed-width warning
+history, or a SWIFT document trailer. Fixed-width retains every committed
+warning; resource refusal fails the next operation rather than discarding
+history. See
 [Memory Tuning](memory.md#what-the-budget-measures).
 
 Failure before delivery writes none of that operation's bytes. Once delivery
@@ -35,8 +41,9 @@ those signals being retained.
 
 These rules add no storage setting and make no atomic-publication promise for
 an arbitrary destination. [Output publication](#output-publication-and-retained-attempts)
-governs the separate file-publication boundary. Other format writers retain their
-existing behavior; these three codecs do not establish all-format migration.
+governs the separate file-publication boundary. EDIFACT, X12 and HL7 retain
+their existing writer paths. These five codecs do not establish all-format
+migration or admission of existing reader/parser allocations.
 
 ## The `[storage]` block
 
@@ -62,7 +69,7 @@ failed_retention_seconds = 86400   # 24 hours; zero is allowed
 ```
 
 The whole block is optional. With no `clinker.toml`, or a `clinker.toml` that
-omits `[storage]`, blocking operators spill to the OS temp directory. CSV
+omits `[storage]`, blocking operators spill to the OS temp directory. Prepared
 output preparation stays in memory unless `storage.spill.dir` is set.
 
 ## Table names are checked

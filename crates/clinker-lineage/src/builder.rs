@@ -5172,6 +5172,59 @@ nodes:
         assert_eq!(lineage.inputs, vec![file_ds(src)]);
     }
 
+    #[test]
+    fn physical_declared_columns_keep_direct_edges_and_dataset_identities() {
+        for (format, schema, columns) in [
+            (
+                "fixed_width",
+                "[{ name: label, type: string, start: 1, width: 2 }, { name: number, type: int, start: 4, width: 2 }]",
+                vec!["label", "number"],
+            ),
+            (
+                "swift",
+                "[{ name: block, type: string }, { name: tag, type: string }, { name: value, type: string }]",
+                vec!["block", "tag", "value"],
+            ),
+        ] {
+            for source in ["path: data/input.dat", "glob: data/*.dat"] {
+                let yaml = format!(
+                    r#"pipeline: {{ name: physical_lineage }}
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: {format}
+      {source}
+      schema: {schema}
+  - type: sink
+    name: out
+    input: src
+    config: {{ name: out, type: json, path: out/output.json }}
+"#
+                );
+                let lineage = lineage_of(&yaml);
+                let input = if source.starts_with("path:") {
+                    "/w/data/input.dat"
+                } else {
+                    "/w/data"
+                };
+                assert_eq!(lineage.inputs, vec![file_ds(input)], "{format}/{source}");
+                let out = only_output(&lineage);
+                assert_eq!(out.dataset, file_ds("/w/out/output.json"));
+                assert_eq!(out.facet.fields.len(), columns.len());
+                assert!(out.facet.dataset.is_empty());
+                for column in &columns {
+                    assert_field(
+                        &out.facet.fields,
+                        column,
+                        &[direct(input, column, TransformationSubtype::Identity)],
+                    );
+                }
+            }
+        }
+    }
+
     /// Regression: a `Generated` (engine-synthesized) source is not split — it
     /// keeps its single flat dataset identity with no `#<id>` fragment, going
     /// through the same path as a single-record `Columns` source.

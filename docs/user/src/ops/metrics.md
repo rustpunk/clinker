@@ -645,7 +645,9 @@ Each real Sink writer work unit likewise emits one `clinker.sink.started` and
 exactly one of `clinker.sink.completed`, `clinker.sink.failed`, or
 `clinker.sink.interrupted`. `clinker.sink.records`, `clinker.sink.errors`, and
 `clinker.sink.bytes` report the rows handled, errors observed, and serialized
-bytes accepted by that writer boundary. Synchronous, fused streaming, and
+bytes accepted by that writer boundary. `clinker.sink.truncations` counts the
+values a fixed-width writer cut to fit a `truncation: warn` column — the same
+count the end-of-run W367 warning reports. Synchronous, fused streaming, and
 correlation-deferred writers all use the same counter names and one closed
 `clinker.sink` span. A failed flush can therefore report bytes accepted before
 the destination rejected the flush; the failed terminal counter remains the

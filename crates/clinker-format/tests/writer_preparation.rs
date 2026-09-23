@@ -10,6 +10,1558 @@ use clinker_format::reserved::ReservedBuffer;
 use clinker_format::reserved::ReservedVec;
 
 #[test]
+fn swift_invalid_first_record_never_delivers_service_header() {
+    use clinker_format::FormatWriter;
+    use clinker_format::swift::writer::{SwiftEncoder, SwiftWriterConfig};
+    use clinker_record::{Record, Schema, Value};
+    use std::sync::Arc;
+    let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
+        "block".into(),
+        "tag".into(),
+        "value".into(),
+    ])));
+    let record = Record::new(
+        schema.clone(),
+        vec![Value::Integer(4), Value::Null, Value::String("body".into())],
+    );
+    let mut bytes = Vec::new();
+    let provider = MemoryOnlyResources::new(NonZeroUsize::new(128 * 1024).unwrap());
+    let encoder = SwiftEncoder::new(
+        schema,
+        &SwiftWriterConfig {
+            basic_header: Some("header".into()),
+            trailer: Some("trailer".into()),
+            ..Default::default()
+        },
+        provider.resources(),
+    )
+    .unwrap();
+    let mut writer = PreparedWriter::new(&mut bytes, encoder, provider.resources()).unwrap();
+    assert!(writer.write_record(&record).is_err());
+    drop(writer);
+    assert!(
+        bytes.is_empty(),
+        "invalid first body must not deliver a service prefix"
+    );
+}
+
+#[test]
+fn fixed_width_late_structured_envelope_rejects_without_delivery() {
+    use clinker_format::FormatWriter;
+    use clinker_format::envelope_writer::OutputEnvelopeSpec;
+    use clinker_format::fixed_width::writer::{FixedWidthEncoder, FixedWidthWriterConfig};
+    use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord, Value};
+    use std::sync::Arc;
+
+    for footer in [false, true] {
+        for structured in [
+            Value::Array(OwnedValues::from_vec(vec![Value::Integer(1)])),
+            Value::Map(OwnedMap::from_map(Default::default())),
+        ] {
+            let section = Value::Map(OwnedMap::from_map(
+                [
+                    (OwnedKey::from("valid"), Value::String("prefix".into())),
+                    (OwnedKey::from("unsupported"), structured),
+                ]
+                .into(),
+            ));
+            let doc = DocumentContext::new(
+                DocumentId::next(),
+                Arc::from("input.txt"),
+                EnvelopeRecord::from_sections([(OwnedKey::from("authored"), section)]),
+            );
+            let mut bytes = Vec::new();
+            let provider = MemoryOnlyResources::new(NonZeroUsize::new(128 * 1024).unwrap());
+            let encoder = FixedWidthEncoder::new(
+                &[],
+                &FixedWidthWriterConfig {
+                    envelope: Some(OutputEnvelopeSpec {
+                        header_from_doc: (!footer).then(|| "authored".into()),
+                        footer_from_doc: footer.then(|| "authored".into()),
+                        footer_record_count_field: None,
+                    }),
+                    ..Default::default()
+                },
+                provider.resources(),
+            )
+            .unwrap();
+            let mut writer =
+                PreparedWriter::new(&mut bytes, encoder, provider.resources()).unwrap();
+            let result = if footer {
+                writer.end_document(&doc)
+            } else {
+                writer.begin_document(&doc)
+            };
+            assert!(
+                result.is_err(),
+                "structured sections have no scalar representation"
+            );
+            drop(writer);
+            assert!(
+                bytes.is_empty(),
+                "the complete rejected section must stay private"
+            );
+        }
+    }
+}
+
+mod swift_prepared {
+    use super::*;
+    use clinker_format::FormatWriter;
+    use clinker_format::error::OutputEncodingKind;
+    use clinker_format::swift::writer::{SwiftEncoder, SwiftWriterConfig};
+    use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord, Record, Schema, Value};
+    use std::sync::Arc;
+
+    fn record(tag: Value, value: Value) -> Record {
+        Record::new(
+            SharedStorage::from_arc(Arc::new(Schema::new(vec![
+                "block".into(),
+                "tag".into(),
+                "value".into(),
+            ]))),
+            vec![Value::Integer(4), tag, value],
+        )
+    }
+    fn doc(record: &mut Record, sections: &[(&str, Value)]) {
+        record.set_doc_ctx(SharedStorage::from_arc(Arc::new(DocumentContext::new(
+            DocumentId::next(),
+            Arc::from("input.swift"),
+            EnvelopeRecord::from_sections(sections.iter().map(|(name, value)| {
+                (
+                    OwnedKey::from(*name),
+                    Value::Map(OwnedMap::from_map(
+                        [(OwnedKey::from("body"), value.clone())].into(),
+                    )),
+                )
+            })),
+        ))));
+    }
+    fn provider() -> MemoryOnlyResources {
+        MemoryOnlyResources::new(NonZeroUsize::new(512 * 1024).unwrap())
+    }
+
+    #[test]
+    fn swift_service_body_and_first_document_trailer_are_exact() {
+        let provider = provider();
+        let mut first = record(
+            Value::String("20".into()),
+            Value::String("  :inline-}\r\n next\n\n".into()),
+        );
+        doc(
+            &mut first,
+            &[
+                ("author header", Value::String("DOC".into())),
+                ("author trailer", Value::String("{CHK: A }".into())),
+            ],
+        );
+        let mut second = record(Value::String("20".into()), Value::String("second".into()));
+        doc(
+            &mut second,
+            &[("author trailer", Value::String("DIFFERENT".into()))],
+        );
+        let encoder = SwiftEncoder::new(
+            first.schema().clone(),
+            &SwiftWriterConfig {
+                basic_header: Some("LITERAL".into()),
+                basic_header_from_doc: Some("missing ignored".into()),
+                app_header_from_doc: Some("author header".into()),
+                user_header: Some("{108:ref}".into()),
+                trailer_from_doc: Some("author trailer".into()),
+                ..Default::default()
+            },
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+        writer.write_record(&first).unwrap();
+        drop(first);
+        writer.write_record(&second).unwrap();
+        writer.flush_bytes().unwrap();
+        assert_eq!(
+            writer.destination(),
+            b"{1:LITERAL}{2:DOC}{3:{108:ref}}{4:\r\n:20:  :inline-}\r\n next\n\n\r\n:20:second\r\n"
+        );
+        writer.flush().unwrap();
+        writer.flush().unwrap();
+        assert_eq!(writer.destination(), b"{1:LITERAL}{2:DOC}{3:{108:ref}}{4:\r\n:20:  :inline-}\r\n next\n\n\r\n:20:second\r\n-}{5:{CHK: A }}");
+        drop(writer);
+        assert_eq!(provider.used(), 0);
+    }
+
+    #[test]
+    fn swift_failed_first_service_does_not_capture_trailer_or_header() {
+        let provider = provider();
+        let mut first = record(Value::String("20".into()), Value::String("valid".into()));
+        let encoder = SwiftEncoder::new(
+            first.schema().clone(),
+            &SwiftWriterConfig {
+                basic_header: Some("prefix".into()),
+                trailer_from_doc: Some("authored tail".into()),
+                ..Default::default()
+            },
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+        let baseline = provider.used();
+        assert!(matches!(
+            writer.write_record(&first),
+            Err(FormatError::OutputEncoding {
+                kind: OutputEncodingKind::SwiftDocument,
+                ..
+            })
+        ));
+        assert!(writer.destination().is_empty());
+        assert_eq!(provider.used(), baseline);
+        doc(
+            &mut first,
+            &[("authored tail", Value::String("new tail".into()))],
+        );
+        writer.write_record(&first).unwrap();
+        writer.flush().unwrap();
+        assert_eq!(
+            writer.destination(),
+            b"{1:prefix}{4:\r\n:20:valid\r\n-}{5:new tail}"
+        );
+    }
+
+    #[test]
+    fn swift_invalid_fields_are_bounded_and_atomic() {
+        for (column, value, kind, offset) in [
+            (
+                0,
+                Value::String("5".into()),
+                OutputEncodingKind::SwiftBlock,
+                0,
+            ),
+            (1, Value::Null, OutputEncodingKind::SwiftTag, 0),
+            (
+                1,
+                Value::String("20:injected".into()),
+                OutputEncodingKind::SwiftTag,
+                2,
+            ),
+            (
+                1,
+                Value::String("20\rline".into()),
+                OutputEncodingKind::SwiftTag,
+                2,
+            ),
+            (
+                2,
+                Value::String("text\r\n:20:injected".into()),
+                OutputEncodingKind::SwiftContinuation,
+                6,
+            ),
+            (
+                2,
+                Value::String("text\n-}injected".into()),
+                OutputEncodingKind::SwiftContinuation,
+                5,
+            ),
+            (
+                2,
+                Value::Array(OwnedValues::from_vec(vec![])),
+                OutputEncodingKind::SwiftScalar,
+                0,
+            ),
+            (
+                2,
+                Value::Map(OwnedMap::from_map(Default::default())),
+                OutputEncodingKind::SwiftScalar,
+                0,
+            ),
+        ] {
+            let provider = provider();
+            let good = record(Value::String("20".into()), Value::String("good".into()));
+            let mut values = good.values().to_vec();
+            values[column] = value;
+            let bad = Record::new(good.schema().clone(), values);
+            let encoder = SwiftEncoder::new(
+                good.schema().clone(),
+                &SwiftWriterConfig {
+                    basic_header: Some("prefix".into()),
+                    ..Default::default()
+                },
+                provider.resources(),
+            )
+            .unwrap();
+            let mut writer =
+                PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+            let error = writer.write_record(&bad).unwrap_err();
+            assert!(
+                matches!(error, FormatError::OutputEncoding { format: "swift", kind: actual, field, offset: actual_offset, .. } if actual == kind && field == column + 1 && actual_offset == offset)
+            );
+            assert!(error.to_string().len() < 400);
+            assert!(writer.destination().is_empty());
+            writer.write_record(&good).unwrap();
+            writer.flush().unwrap();
+            assert_eq!(writer.destination(), b"{1:prefix}{4:\r\n:20:good\r\n-}");
+        }
+    }
+
+    #[test]
+    fn swift_zero_records_finalize_literals_once() {
+        let provider = provider();
+        let schema = record(Value::Null, Value::Null).schema().clone();
+        let encoder = SwiftEncoder::new(
+            schema,
+            &SwiftWriterConfig {
+                basic_header: Some("F01".into()),
+                app_header_from_doc: Some("unused without record".into()),
+                trailer: Some("{CHK:AB}".into()),
+                ..Default::default()
+            },
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+        writer.flush_bytes().unwrap();
+        assert!(writer.destination().is_empty());
+        writer.flush().unwrap();
+        writer.flush().unwrap();
+        assert_eq!(writer.destination(), b"{1:F01}{4:\r\n-}{5:{CHK:AB}}");
+    }
+
+    #[test]
+    fn swift_duplicate_columns_use_schema_last_wins_identity() {
+        let provider = provider();
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
+            "block".into(),
+            "tag".into(),
+            "value".into(),
+            "block".into(),
+            "tag".into(),
+            "value".into(),
+        ])));
+        let record = Record::new(
+            schema.clone(),
+            vec![
+                Value::Integer(5),
+                Value::String("20".into()),
+                Value::String("discarded".into()),
+                Value::Integer(4),
+                Value::String("21".into()),
+                Value::String(" final \r\n\n".into()),
+            ],
+        );
+        let encoder =
+            SwiftEncoder::new(schema, &SwiftWriterConfig::default(), provider.resources()).unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+        writer.write_record(&record).unwrap();
+        writer.flush().unwrap();
+        assert_eq!(writer.destination(), b"{4:\r\n:21: final \r\n\n\r\n-}");
+    }
+
+    #[test]
+    fn swift_scalar_values_keep_natural_spelling_and_optional_block_semantics() {
+        for (value, expected) in [
+            (Value::Null, ""),
+            (Value::Bool(true), "true"),
+            (Value::Integer(i64::MIN), "-9223372036854775808"),
+            (Value::Float(1.25), "1.25"),
+            (Value::Decimal("1.2300".parse().unwrap()), "1.2300"),
+            (Value::Date("2024-02-29".parse().unwrap()), "2024-02-29"),
+            (
+                Value::DateTime("2026-09-12T01:02:03.123456".parse().unwrap()),
+                "2026-09-12 01:02:03.123456",
+            ),
+            (Value::String("é好🦀  \n\n".into()), "é好🦀  \n\n"),
+        ] {
+            for block in [
+                Value::Null,
+                Value::String("".into()),
+                Value::String("04".into()),
+                Value::Integer(4),
+            ] {
+                let provider = provider();
+                let schema = record(Value::Null, Value::Null).schema().clone();
+                let row = Record::new(
+                    schema.clone(),
+                    vec![block, Value::Integer(20), value.clone()],
+                );
+                let encoder =
+                    SwiftEncoder::new(schema, &SwiftWriterConfig::default(), provider.resources())
+                        .unwrap();
+                let mut writer =
+                    PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+                writer.write_record(&row).unwrap();
+                writer.flush().unwrap();
+                assert_eq!(
+                    writer.destination(),
+                    format!("{{4:\r\n:20:{expected}\r\n-}}").as_bytes()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn swift_service_sources_reject_structures_and_unbalanced_bodies_atomically() {
+        for value in [
+            Value::Array(OwnedValues::from_vec(vec![])),
+            Value::Map(OwnedMap::from_map(Default::default())),
+            Value::String("}early".into()),
+            Value::String("{unclosed".into()),
+        ] {
+            for source in 0..4 {
+                let provider = provider();
+                let mut row = record(Value::String("20".into()), Value::String("body".into()));
+                doc(&mut row, &[("authored service", value.clone())]);
+                let mut config = SwiftWriterConfig {
+                    basic_header: Some("prefix".into()),
+                    ..Default::default()
+                };
+                match source {
+                    0 => {
+                        config.basic_header = None;
+                        config.basic_header_from_doc = Some("authored service".into());
+                    }
+                    1 => config.app_header_from_doc = Some("authored service".into()),
+                    2 => config.user_header_from_doc = Some("authored service".into()),
+                    _ => config.trailer_from_doc = Some("authored service".into()),
+                }
+                let encoder =
+                    SwiftEncoder::new(row.schema().clone(), &config, provider.resources()).unwrap();
+                let mut writer =
+                    PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+                let baseline = provider.used();
+                assert!(matches!(
+                    writer.write_record(&row),
+                    Err(FormatError::OutputEncoding {
+                        kind: OutputEncodingKind::SwiftScalar | OutputEncodingKind::SwiftService,
+                        ..
+                    })
+                ));
+                assert!(writer.destination().is_empty());
+                assert_eq!(provider.used(), baseline);
+            }
+        }
+    }
+
+    #[test]
+    fn swift_cancel_after_seal_discards_pending_trailer_and_poison_prevents_retry() {
+        use clinker_format::preparation::WriterResources;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let authority = Arc::new(super::cancellation_harness::Authority {
+            memory: provider(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            cancel_after_seal: true,
+        });
+        let resources = WriterResources::new(authority.clone());
+        let mut row = record(Value::String("20".into()), Value::String("body".into()));
+        doc(
+            &mut row,
+            &[("tail", Value::String("tail bytes".repeat(3000).into()))],
+        );
+        let encoder = SwiftEncoder::new(
+            row.schema().clone(),
+            &SwiftWriterConfig {
+                trailer_from_doc: Some("tail".into()),
+                ..Default::default()
+            },
+            resources.clone(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, resources).unwrap();
+        let retained = authority.memory.used();
+        assert!(
+            matches!(writer.write_record(&row), Err(FormatError::Resource(error)) if error.kind == ResourceErrorKind::Cancelled)
+        );
+        assert!(writer.destination().is_empty());
+        assert_eq!(authority.memory.used(), retained);
+        authority.cancelled.store(false, Ordering::SeqCst);
+        assert!(
+            matches!(writer.flush(), Err(FormatError::Resource(error)) if error.kind == ResourceErrorKind::DeliveryPoisoned)
+        );
+        drop(writer);
+        assert_eq!(authority.memory.used(), 0);
+    }
+
+    #[test]
+    fn swift_oversized_invalid_input_keeps_only_bounded_error_context() {
+        let provider = provider();
+        let payload = format!("{}\n:injected", "private payload ".repeat(100000));
+        let row = record(
+            Value::String("20".into()),
+            Value::String(payload.as_str().into()),
+        );
+        let encoder = SwiftEncoder::new(
+            row.schema().clone(),
+            &SwiftWriterConfig {
+                basic_header: Some("prefix".into()),
+                ..Default::default()
+            },
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+        let baseline = provider.used();
+        let error = writer.write_record(&row).unwrap_err();
+        assert!(matches!(
+            error,
+            FormatError::OutputEncoding {
+                kind: OutputEncodingKind::SwiftContinuation,
+                offset: 1600001,
+                ..
+            }
+        ));
+        let message = error.to_string();
+        assert!(message.len() < 400);
+        assert!(!message.contains("private payload"));
+        assert!(writer.destination().is_empty());
+        assert_eq!(provider.used(), baseline);
+        drop(row);
+        drop(writer);
+        assert_eq!(provider.used(), 0);
+        assert!(error.to_string().len() < 400);
+    }
+}
+
+mod fixed_width_prepared {
+    use super::*;
+    use clinker_format::FormatWriter;
+    use clinker_format::envelope_writer::OutputEnvelopeSpec;
+    use clinker_format::fixed_width::writer::{
+        FixedWidthEncoder, FixedWidthEncoderConfig, FixedWidthWriterConfig,
+    };
+    use clinker_format::preparation::{
+        AllocationAuthority, AllocationLease, MemoryStorage, OperationStage, OwnerId,
+        ResourceAuthority, WriterResources,
+    };
+    use clinker_format::{
+        Column, ColumnTruncation, FixedWidthCountField, FixedWidthFill, FixedWidthOccurs,
+        FixedWidthOverflow, FixedWidthTruncateKeep, TRUNCATION_EXAMPLE_LIMIT,
+    };
+    use clinker_record::schema_def::{Justify, LineSeparator, TruncationPolicy};
+    use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord, Record, Schema, Value};
+    use cxl::typecheck::Type;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    fn field(name: &str, width: usize) -> Column {
+        Column {
+            width: Some(width),
+            ..Column::bare(name, Type::String)
+        }
+    }
+    fn record(values: &[(&str, Value)]) -> Record {
+        Record::new(
+            SharedStorage::from_arc(Arc::new(Schema::new(
+                values.iter().map(|(n, _)| (*n).into()).collect(),
+            ))),
+            values.iter().map(|(_, v)| v.clone()).collect(),
+        )
+    }
+    fn doc(sections: &[(&str, &[(&str, Value)])]) -> DocumentContext {
+        DocumentContext::new(
+            DocumentId::next(),
+            Arc::from("data.txt"),
+            EnvelopeRecord::from_sections(sections.iter().map(|(n, fields)| {
+                (
+                    OwnedKey::from(*n),
+                    Value::Map(OwnedMap::from_map(
+                        fields
+                            .iter()
+                            .map(|(n, v)| (OwnedKey::from(*n), v.clone()))
+                            .collect(),
+                    )),
+                )
+            })),
+        )
+    }
+    fn config(separator: LineSeparator) -> FixedWidthWriterConfig {
+        FixedWidthWriterConfig {
+            line_separator: separator,
+            envelope: Some(OutputEnvelopeSpec {
+                header_from_doc: Some("opening authored".into()),
+                footer_from_doc: Some("closing authored".into()),
+                footer_record_count_field: None,
+            }),
+        }
+    }
+    fn provider() -> MemoryOnlyResources {
+        MemoryOnlyResources::new(NonZeroUsize::new(2 * 1024 * 1024).unwrap())
+    }
+
+    #[test]
+    fn truncation_tally_counts_every_record_in_fixed_storage() {
+        for text in ["x".repeat(4096), "好é".repeat(819)] {
+            let provider = provider();
+            let encoder = FixedWidthEncoder::new(
+                &[field("value", 2)],
+                &FixedWidthWriterConfig::default(),
+                provider.resources(),
+            )
+            .unwrap();
+            let mut writer =
+                PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+            assert_eq!(writer.encoder().truncation_summary(), None);
+            let record = record(&[("value", Value::String(text.clone().into()))]);
+            writer.write_record(&record).unwrap();
+            let retained = provider.used();
+            for _ in 1..1025 {
+                writer.write_record(&record).unwrap();
+            }
+            assert_eq!(
+                provider.used(),
+                retained,
+                "the account is sized at construction; truncating more never grows it"
+            );
+            let summary = writer.encoder().truncation_summary().unwrap();
+            assert_eq!(
+                summary.columns,
+                vec![ColumnTruncation {
+                    column: "value".into(),
+                    width: 2,
+                    cells: 1025,
+                    longest_bytes: text.len(),
+                    example_records: (1..=TRUNCATION_EXAMPLE_LIMIT as u64).collect(),
+                    more_records: true,
+                }]
+            );
+            assert_eq!(writer.encoder().record_count(), 1025);
+            drop(writer);
+            assert_eq!(provider.used(), 0);
+        }
+    }
+
+    /// `truncation: warn` cannot fail a record: preparing one that truncates
+    /// needs no budget grant and no allocation, and committing it allocates
+    /// nothing even under allocator refusal.
+    #[test]
+    fn warn_truncation_needs_no_budget_or_allocation() {
+        let authority = Authority::new();
+        let resources = WriterResources::new(authority.clone());
+        let scope = resources.scope().unwrap();
+        let mut encoder = FixedWidthEncoder::new(
+            &[field("v", 1)],
+            &FixedWidthWriterConfig::default(),
+            resources,
+        )
+        .unwrap();
+        let before = authority.memory.used();
+        for (count, text) in ["é好".repeat(64), "A".repeat(32_768)].iter().enumerate() {
+            let record = record(&[("v", Value::String(text.clone().into()))]);
+            authority.reset();
+            authority.refuse.store(0, Ordering::SeqCst);
+            let (pending, allocations) = allocation_probe(true, || {
+                encoder.prepare(
+                    OutputOperation::Record(&record),
+                    &mut std::io::sink(),
+                    &scope,
+                )
+            });
+            let pending = pending.expect("a warn truncation cannot be refused");
+            assert_eq!(allocations, 0, "preparing a truncation allocates nothing");
+            let (_, allocations) = allocation_probe(true, || encoder.commit(pending));
+            assert_eq!(allocations, 0, "committing a truncation allocates nothing");
+            assert_eq!(authority.memory.used(), before);
+            let summary = encoder.truncation_summary().unwrap();
+            assert_eq!(summary.columns[0].cells, count as u64 + 1);
+            assert_eq!(
+                summary.columns[0].example_records,
+                (1..=count as u64 + 1).collect::<Vec<_>>()
+            );
+        }
+        authority.reset();
+        drop(encoder);
+        assert_eq!(authority.memory.used(), 0);
+    }
+
+    /// Only delivered records count. A record whose later field fails after an
+    /// earlier one truncated, or whose prepared bytes are never delivered,
+    /// leaves no trace, and the next delivered record is numbered after the
+    /// last delivered one.
+    #[test]
+    fn undelivered_or_failed_records_leave_the_tally_unchanged() {
+        let provider = provider();
+        let resources = provider.resources();
+        let scope = resources.scope().unwrap();
+        let fields = [
+            field("name", 2),
+            Column {
+                width: Some(2),
+                ..Column::bare("amount", Type::Int)
+            },
+        ];
+        let mut encoder =
+            FixedWidthEncoder::new(&fields, &FixedWidthWriterConfig::default(), resources).unwrap();
+        let fits = record(&[
+            ("name", Value::String("long".into())),
+            ("amount", Value::Integer(7)),
+        ]);
+        let overflows = record(&[
+            ("name", Value::String("longer".into())),
+            ("amount", Value::Integer(12_345)),
+        ]);
+
+        let pending = encoder
+            .prepare(OutputOperation::Record(&fits), &mut std::io::sink(), &scope)
+            .unwrap();
+        encoder.commit(pending);
+        let committed = encoder.truncation_summary();
+
+        // `name` truncates, then `amount` rejects the record.
+        assert!(
+            encoder
+                .prepare(
+                    OutputOperation::Record(&overflows),
+                    &mut std::io::sink(),
+                    &scope
+                )
+                .is_err()
+        );
+        assert_eq!(encoder.truncation_summary(), committed);
+        // Prepared but never delivered.
+        let _undelivered = encoder
+            .prepare(OutputOperation::Record(&fits), &mut std::io::sink(), &scope)
+            .unwrap();
+        assert_eq!(encoder.truncation_summary(), committed);
+
+        let pending = encoder
+            .prepare(OutputOperation::Record(&fits), &mut std::io::sink(), &scope)
+            .unwrap();
+        encoder.commit(pending);
+        let name = &encoder.truncation_summary().unwrap().columns[0];
+        assert_eq!(
+            name.cells, 2,
+            "abandoned attempts left no staged hits behind"
+        );
+        assert_eq!(
+            name.longest_bytes, 4,
+            "the failed record's 6-byte value never counted"
+        );
+        assert_eq!(name.example_records, vec![1, 2]);
+    }
+
+    /// Truncations in repeating-group children are counted per child, named
+    /// `group.child`, and numbered by delivered record across documents.
+    #[test]
+    fn group_children_and_documents_share_one_record_numbering() {
+        let provider = provider();
+        let group = Column {
+            start: Some(0),
+            multiple: Some(true),
+            fields: Some(vec![
+                Column {
+                    start: Some(0),
+                    width: Some(2),
+                    ..Column::bare("code", Type::String)
+                },
+                Column {
+                    start: Some(2),
+                    width: Some(1),
+                    truncation: Some(TruncationPolicy::Silent),
+                    ..Column::bare("flag", Type::String)
+                },
+            ]),
+            occurs: Some(FixedWidthOccurs {
+                min: 0,
+                max: 2,
+                fill: FixedWidthFill::Pad,
+                on_overflow: FixedWidthOverflow::Error,
+                keep: None,
+            }),
+            ..Column::bare("items", Type::Map)
+        };
+        let item = |code: &str| {
+            Value::Map(OwnedMap::from_map(
+                [
+                    (OwnedKey::from("code"), Value::String(code.into())),
+                    (OwnedKey::from("flag"), Value::String("yes".into())),
+                ]
+                .into_iter()
+                .collect(),
+            ))
+        };
+        let encoder =
+            FixedWidthEncoder::new(&[group], &config(LineSeparator::Lf), provider.resources())
+                .unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+        let rows = |codes: &[&str]| {
+            record(&[(
+                "items",
+                Value::Array(OwnedValues::from_vec(
+                    codes.iter().map(|c| item(c)).collect(),
+                )),
+            )])
+        };
+        let document = doc(&[]);
+        writer.begin_document(&document).unwrap();
+        writer.write_record(&rows(&["ok", "long"])).unwrap();
+        writer.end_document(&document).unwrap();
+        writer.begin_document(&document).unwrap();
+        writer.write_record(&rows(&["ok"])).unwrap();
+        writer.write_record(&rows(&["longer", "longest"])).unwrap();
+        writer.end_document(&document).unwrap();
+
+        assert_eq!(
+            writer.encoder().truncation_summary().unwrap().columns,
+            vec![ColumnTruncation {
+                column: "items.code".into(),
+                width: 2,
+                cells: 3,
+                longest_bytes: 7,
+                example_records: vec![1, 3],
+                more_records: false,
+            }],
+            "`silent` records nothing; numbering continues across documents"
+        );
+    }
+
+    #[test]
+    fn cancelled_sealed_or_final_delivery_preserves_tally_and_poison() {
+        use super::cancellation_harness::{Authority as CancelAuthority, CancelOnWrite};
+        use std::sync::atomic::AtomicBool;
+        for after_seal in [false, true] {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let authority = Arc::new(CancelAuthority {
+                memory: provider(),
+                cancelled: cancelled.clone(),
+                cancel_after_seal: after_seal,
+            });
+            let resources = authority.memory.resources();
+            let scope = resources.scope().unwrap();
+            let mut encoder = FixedWidthEncoder::new(
+                &[field("v", 1)],
+                &FixedWidthWriterConfig::default(),
+                resources,
+            )
+            .unwrap();
+            let record = record(&[("v", Value::String("warning".into()))]);
+            let mut stage = scope.stage().unwrap();
+            let pending = encoder
+                .prepare(OutputOperation::Record(&record), &mut stage, &scope)
+                .unwrap();
+            let mut bytes = Vec::new();
+            stage.finish().unwrap().deliver(&mut bytes).unwrap();
+            encoder.commit(pending);
+            let committed = encoder.truncation_summary();
+            let retained = authority.memory.used();
+            let mut writer = PreparedWriter::new(
+                CancelOnWrite {
+                    cancelled,
+                    bytes,
+                    attempts: 0,
+                },
+                encoder,
+                WriterResources::new(authority.clone()),
+            )
+            .unwrap();
+            assert!(
+                matches!(writer.write_record(&record), Err(FormatError::Resource(error)) if error.kind == ResourceErrorKind::Cancelled)
+            );
+            assert_eq!(writer.encoder().record_count(), 1);
+            assert_eq!(writer.encoder().truncation_summary(), committed);
+            assert_eq!(
+                writer.destination().bytes,
+                if after_seal {
+                    b"w\n".as_slice()
+                } else {
+                    b"w\nw\n".as_slice()
+                }
+            );
+            assert_eq!(authority.memory.used(), retained);
+            let attempts = writer.destination().attempts;
+            assert!(writer.write_record(&record).is_err());
+            assert!(writer.flush().is_err());
+            assert_eq!(writer.destination().attempts, attempts);
+            drop(writer);
+            assert_eq!(authority.memory.used(), 0);
+        }
+    }
+
+    #[test]
+    fn scalar_sections_order_presence_separators_and_multiple_documents() {
+        let values = [
+            ("text", Value::String("hé".into())),
+            ("null", Value::Null),
+            ("integer", Value::Integer(-17)),
+            ("float", Value::Float(1.25)),
+            ("decimal", Value::Decimal("12.30".parse().unwrap())),
+            ("bool", Value::Bool(true)),
+            (
+                "date",
+                Value::Date(chrono::NaiveDate::from_ymd_opt(2024, 2, 29).unwrap()),
+            ),
+            (
+                "datetime",
+                Value::DateTime(
+                    chrono::NaiveDate::from_ymd_opt(2024, 2, 29)
+                        .unwrap()
+                        .and_hms_opt(13, 14, 15)
+                        .unwrap(),
+                ),
+            ),
+        ];
+        let full = doc(&[
+            ("opening authored", &values),
+            (
+                "closing authored",
+                &[("last", Value::String("tail".into()))],
+            ),
+        ]);
+        let empty = doc(&[("opening authored", &[]), ("closing authored", &[])]);
+        let missing = doc(&[]);
+        for (sep, literal) in [
+            (LineSeparator::Lf, "\n"),
+            (LineSeparator::CrLf, "\r\n"),
+            (LineSeparator::None, ""),
+        ] {
+            let provider = provider();
+            let encoder =
+                FixedWidthEncoder::new(&[field("body", 2)], &config(sep), provider.resources())
+                    .unwrap();
+            let mut writer =
+                PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+            writer.begin_document(&full).unwrap();
+            writer
+                .write_record(&record(&[("body", Value::String("B".into()))]))
+                .unwrap();
+            assert_eq!(writer.encoder().record_count(), 1);
+            writer.end_document(&full).unwrap();
+            assert!(!writer.encoder().document_open());
+            writer.begin_document(&missing).unwrap();
+            assert_eq!(writer.encoder().record_count(), 0);
+            writer.end_document(&missing).unwrap();
+            writer.begin_document(&empty).unwrap();
+            writer.end_document(&empty).unwrap();
+            writer.begin_document(&full).unwrap();
+            writer.end_document(&full).unwrap();
+            writer.flush().unwrap();
+            let line = "hé-171.2512.30true2024022920240229131415";
+            let expected = format!(
+                "{line}{literal}B {literal}tail{literal}{literal}{literal}{line}{literal}tail{literal}"
+            );
+            assert_eq!(writer.destination(), expected.as_bytes());
+            drop(writer);
+            assert_eq!(provider.used(), 0);
+        }
+    }
+
+    #[test]
+    fn scalar_body_byte_width_padding_order_and_narrow_borrowed_text() {
+        let values = [
+            ("text", Value::String("é好".into())),
+            ("null", Value::Null),
+            ("integer", Value::Integer(-17)),
+            ("float", Value::Float(1.25)),
+            ("decimal", Value::Decimal("12.30".parse().unwrap())),
+            ("bool", Value::Bool(false)),
+            (
+                "date",
+                Value::Date(chrono::NaiveDate::from_ymd_opt(2024, 2, 29).unwrap()),
+            ),
+            (
+                "datetime",
+                Value::DateTime(
+                    chrono::NaiveDate::from_ymd_opt(2024, 2, 29)
+                        .unwrap()
+                        .and_hms_opt(13, 14, 15)
+                        .unwrap(),
+                ),
+            ),
+        ];
+        let mut fields: Vec<_> = values.iter().map(|(name, _)| field(name, 16)).collect();
+        fields[0].width = Some(4);
+        fields[0].truncation = Some(TruncationPolicy::Silent);
+        fields[2].justify = Some(Justify::Right);
+        fields[2].pad = Some("0".into());
+        let provider = provider();
+        let encoder = FixedWidthEncoder::new(
+            &fields,
+            &FixedWidthWriterConfig::default(),
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+        writer.write_record(&record(&values)).unwrap();
+        assert_eq!(writer.destination(), "é                  0000000000000-171.25            12.30           false           20240229        20240229131415  \n".as_bytes());
+        drop(writer);
+        let mut narrow = field("value", 3);
+        narrow.truncation = Some(TruncationPolicy::Silent);
+        let encoder = FixedWidthEncoder::new(
+            &[narrow],
+            &FixedWidthWriterConfig::default(),
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+        for text in ["a".repeat(1024 * 1024), "好".repeat(400_000)] {
+            writer
+                .write_record(&record(&[("value", Value::String(text.into()))]))
+                .unwrap();
+        }
+        assert_eq!(writer.destination(), "aaa\n好\n".as_bytes());
+        drop(writer);
+        assert_eq!(provider.used(), 0);
+    }
+
+    #[test]
+    fn large_ascii_and_multibyte_sections_stream_exactly() {
+        for text in ["x".repeat(100_000), "好é".repeat(20_000)] {
+            let provider = provider();
+            let doc = doc(&[
+                (
+                    "opening authored",
+                    &[("text", Value::String(text.clone().into()))],
+                ),
+                (
+                    "closing authored",
+                    &[("text", Value::String(text.clone().into()))],
+                ),
+            ]);
+            let encoder =
+                FixedWidthEncoder::new(&[], &config(LineSeparator::CrLf), provider.resources())
+                    .unwrap();
+            let retained = provider.used();
+            let mut writer =
+                PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+            writer.begin_document(&doc).unwrap();
+            writer.end_document(&doc).unwrap();
+            assert_eq!(
+                writer.destination(),
+                format!("{text}\r\n{text}\r\n").as_bytes()
+            );
+            assert_eq!(
+                provider.used(),
+                retained,
+                "sections are borrowed and never retained"
+            );
+            drop(writer);
+            assert_eq!(provider.used(), 0);
+        }
+    }
+
+    #[test]
+    fn late_record_and_section_failure_preserves_committed_state() {
+        let provider = provider();
+        let encoder = FixedWidthEncoder::new(
+            &[field("a", 2), field("b", 2)],
+            &config(LineSeparator::Lf),
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+        let empty = doc(&[]);
+        writer.begin_document(&empty).unwrap();
+        let good = record(&[
+            ("a", Value::String("long".into())),
+            ("b", Value::Integer(1)),
+        ]);
+        writer.write_record(&good).unwrap();
+        let before = provider.used();
+        let warning = writer.encoder().truncation_summary();
+        assert_eq!(warning.as_ref().map(|s| s.total_cells()), Some(1));
+        let bad = record(&[
+            ("a", Value::String("another warning".into())),
+            ("b", Value::Map(OwnedMap::from_map(Default::default()))),
+        ]);
+        assert!(writer.write_record(&bad).is_err());
+        assert_eq!(provider.used(), before);
+        let bad_doc = doc(&[
+            (
+                "opening authored",
+                &[
+                    ("valid", Value::Integer(5)),
+                    ("bad", Value::Array(OwnedValues::from_vec(vec![]))),
+                ],
+            ),
+            (
+                "closing authored",
+                &[("bad", Value::Map(OwnedMap::from_map(Default::default())))],
+            ),
+        ]);
+        assert!(writer.begin_document(&bad_doc).is_err());
+        assert!(writer.end_document(&bad_doc).is_err());
+        assert_eq!(writer.encoder().record_count(), 1);
+        assert!(writer.encoder().document_open());
+        assert_eq!(writer.encoder().truncation_summary(), warning);
+        assert_eq!(writer.destination(), b"lo1 \n");
+        assert_eq!(provider.used(), before);
+        writer.end_document(&empty).unwrap();
+        drop(writer);
+        assert_eq!(provider.used(), 0);
+    }
+
+    fn group(fill: FixedWidthFill, count: bool) -> Column {
+        Column {
+            start: Some(2),
+            multiple: Some(true),
+            fields: Some(vec![field("code", 2)]),
+            occurs: Some(FixedWidthOccurs {
+                min: 0,
+                max: 2,
+                fill,
+                on_overflow: FixedWidthOverflow::Error,
+                keep: None,
+            }),
+            count_field: count.then(|| FixedWidthCountField {
+                name: "count".into(),
+                width: 1,
+            }),
+            ..Column::bare("items", Type::Map)
+        }
+    }
+    fn items(values: &[&str]) -> Value {
+        Value::Array(OwnedValues::from_vec(
+            values
+                .iter()
+                .map(|text| {
+                    Value::Map(OwnedMap::from_map(
+                        [(OwnedKey::from("code"), Value::String((*text).into()))].into(),
+                    ))
+                })
+                .collect(),
+        ))
+    }
+    #[test]
+    fn group_bounds_count_overflow_gaps_and_shift_preserve_bytes() {
+        for (fill, expected) in [
+            (FixedWidthFill::Pad, b"  1AB    Z \n".as_slice()),
+            (FixedWidthFill::Shift, b"  1AB  Z \n".as_slice()),
+        ] {
+            let provider = provider();
+            let mut last = field("last", 2);
+            last.start = Some(9);
+            let mut group = group(fill, true);
+            let encoder = FixedWidthEncoder::new(
+                &[last, group.clone()],
+                &FixedWidthWriterConfig::default(),
+                provider.resources(),
+            )
+            .unwrap();
+            let mut writer =
+                PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+            writer
+                .write_record(&record(&[
+                    ("items", items(&["AB"])),
+                    ("last", Value::String("Z".into())),
+                ]))
+                .unwrap();
+            assert_eq!(writer.destination(), expected);
+            assert!(
+                writer
+                    .write_record(&record(&[("items", items(&["AA", "BB", "CC"]))]))
+                    .is_err()
+            );
+            drop(writer);
+            for (keep, bytes) in [
+                (FixedWidthTruncateKeep::First, b"  2AABB\n"),
+                (FixedWidthTruncateKeep::Last, b"  2BBCC\n"),
+            ] {
+                let occurs = group.occurs.as_mut().unwrap();
+                occurs.on_overflow = FixedWidthOverflow::Truncate;
+                occurs.keep = Some(keep);
+                let encoder = FixedWidthEncoder::new(
+                    &[group.clone()],
+                    &FixedWidthWriterConfig::default(),
+                    provider.resources(),
+                )
+                .unwrap();
+                let mut writer =
+                    PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+                writer
+                    .write_record(&record(&[("items", items(&["AA", "BB", "CC"]))]))
+                    .unwrap();
+                assert_eq!(writer.destination(), bytes);
+                drop(writer);
+            }
+            assert_eq!(provider.used(), 0);
+        }
+    }
+    #[test]
+    fn group_blank_minimum_null_and_late_occurrence_validation() {
+        let provider = provider();
+        let mut group = group(FixedWidthFill::Pad, false);
+        let encoder = FixedWidthEncoder::new(
+            &[group.clone()],
+            &FixedWidthWriterConfig::default(),
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+        writer
+            .write_record(&record(&[("items", Value::Null)]))
+            .unwrap();
+        assert_eq!(writer.destination(), b"      \n");
+        assert!(
+            writer
+                .write_record(&record(&[("items", items(&["  "]))]))
+                .is_err()
+        );
+        assert!(
+            writer
+                .write_record(&record(&[(
+                    "items",
+                    Value::Array(OwnedValues::from_vec(vec![
+                        Value::Map(OwnedMap::from_map(
+                            [(OwnedKey::from("code"), Value::String("AB".into()))].into()
+                        )),
+                        Value::Integer(1)
+                    ]))
+                )]))
+                .is_err()
+        );
+        assert_eq!(writer.destination(), b"      \n");
+        drop(writer);
+        group.occurs.as_mut().unwrap().min = 1;
+        let encoder = FixedWidthEncoder::new(
+            &[group],
+            &FixedWidthWriterConfig::default(),
+            provider.resources(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+        assert!(
+            writer
+                .write_record(&record(&[("items", items(&[]))]))
+                .is_err()
+        );
+        assert!(writer.destination().is_empty());
+        drop(writer);
+        assert_eq!(provider.used(), 0);
+    }
+
+    #[test]
+    fn virtual_padding_width_cannot_delay_blank_rejection() {
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let provider = provider();
+            let mut group = group(FixedWidthFill::Pad, false);
+            group.start = Some(0);
+            group.occurs.as_mut().unwrap().max = 1;
+            group.fields.as_mut().unwrap()[0].width = Some(usize::MAX - 1);
+            let encoder = FixedWidthEncoder::new(
+                &[group],
+                &FixedWidthWriterConfig::default(),
+                provider.resources(),
+            )
+            .unwrap();
+            let mut writer =
+                PreparedWriter::new(Vec::new(), encoder, provider.resources()).unwrap();
+            let value = Value::Array(OwnedValues::from_vec(vec![Value::Map(OwnedMap::from_map(
+                [(OwnedKey::from("code"), Value::Null)].into(),
+            ))]));
+            assert!(matches!(
+                writer.write_record(&record(&[("items", value)])),
+                Err(FormatError::OutputEncoding {
+                    kind: clinker_format::error::OutputEncodingKind::FixedWidthBlankOccurrence,
+                    ..
+                })
+            ));
+            assert!(writer.destination().is_empty());
+            drop(writer);
+            assert_eq!(provider.used(), 0);
+            send.send(()).unwrap();
+        });
+        receive
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("virtual padding must not require a scan of the declared width");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn shared_overlap_diagnostic_names_actual_group_in_both_declaration_orders() {
+        let mut group = group(FixedWidthFill::Pad, false);
+        group.start = Some(0);
+        let mut tail = field("tail", 1);
+        tail.start = Some(2);
+        for fields in [vec![group.clone(), tail.clone()], vec![tail, group.clone()]] {
+            let error = clinker_format::fixed_width::field::validate_write_layout(&fields)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("group 'items'"), "{error}");
+            assert!(!error.contains("group 'tail'"), "{error}");
+            assert!(
+                error.contains("range 2..3 overlaps field 'items' (0..4)"),
+                "{error}"
+            );
+            assert!(error.contains("count, payload"), "{error}");
+        }
+        let mut second = field("other", 1);
+        second.start = Some(1);
+        group.fields.as_mut().unwrap().push(second);
+        let error = clinker_format::fixed_width::field::validate_write_layout(&[group])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("child 'other' range 1..2 overlaps child 'code' range 0..2"),
+            "{error}"
+        );
+    }
+
+    struct Authority {
+        memory: MemoryOnlyResources,
+        attempts: AtomicUsize,
+        refuse: AtomicUsize,
+        cancel_checks: AtomicUsize,
+        cancel_at: AtomicUsize,
+    }
+    impl Authority {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                memory: provider(),
+                attempts: AtomicUsize::new(0),
+                refuse: AtomicUsize::new(usize::MAX),
+                cancel_checks: AtomicUsize::new(0),
+                cancel_at: AtomicUsize::new(usize::MAX),
+            })
+        }
+        fn reset(&self) {
+            self.attempts.store(0, Ordering::SeqCst);
+            self.refuse.store(usize::MAX, Ordering::SeqCst);
+            self.cancel_checks.store(0, Ordering::SeqCst);
+            self.cancel_at.store(usize::MAX, Ordering::SeqCst);
+        }
+    }
+    impl AllocationAuthority for Authority {
+        fn identity(&self) -> usize {
+            self.memory.resources().allocation().identity()
+        }
+        fn try_reserve(
+            self: Arc<Self>,
+            owner: OwnerId,
+            layout: std::alloc::Layout,
+        ) -> Result<AllocationLease, ResourceError> {
+            self.check_cancelled()?;
+            if self.attempts.fetch_add(1, Ordering::SeqCst) >= self.refuse.load(Ordering::SeqCst) {
+                return Err(ResourceError::new(
+                    ResourceErrorKind::Budget,
+                    layout.size(),
+                    0,
+                ));
+            }
+            self.memory.resources().allocation().reserve(owner, layout)
+        }
+        fn release(&self, _: OwnerId, _: usize) {
+            unreachable!("delegated grants");
+        }
+        fn check_cancelled(&self) -> Result<(), ResourceError> {
+            if self.cancel_checks.fetch_add(1, Ordering::SeqCst)
+                >= self.cancel_at.load(Ordering::SeqCst)
+            {
+                Err(ResourceError::new(ResourceErrorKind::Cancelled, 0, 0))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    impl ResourceAuthority for Authority {
+        fn create_stage(
+            self: Arc<Self>,
+            scope: WriterScope,
+        ) -> Result<OperationStage, FormatError> {
+            StorageStage::create(scope.clone(), MemoryStorage::new(scope))
+        }
+    }
+    #[test]
+    fn construction_admits_every_backing_and_retains_shared_config() {
+        let authority = Authority::new();
+        let resources = WriterResources::new(authority.clone());
+        let fields = [group(FixedWidthFill::Pad, true), field("tail", 2)];
+        let policy =
+            FixedWidthEncoderConfig::new(&fields, &config(LineSeparator::Lf), &resources).unwrap();
+        let attempts = authority.attempts.load(Ordering::SeqCst);
+        assert!(attempts >= 6);
+        let retained = authority.memory.used();
+        let (alias, allocations) = allocation_probe(false, || policy.clone());
+        assert_eq!(allocations, 0);
+        drop(policy);
+        assert_eq!(authority.memory.used(), retained);
+        drop(alias);
+        assert_eq!(authority.memory.used(), 0);
+        for stop in 0..attempts {
+            authority.reset();
+            authority.refuse.store(stop, Ordering::SeqCst);
+            assert!(matches!(
+                FixedWidthEncoderConfig::new(&fields, &config(LineSeparator::Lf), &resources),
+                Err(FormatError::Resource(_))
+            ));
+            assert_eq!(authority.memory.used(), 0, "constructor refusal {stop}");
+        }
+    }
+    #[test]
+    fn preparation_denial_and_cancellation_restore_all_committed_owners() {
+        let authority = Authority::new();
+        let resources = WriterResources::new(authority.clone());
+        let encoder = FixedWidthEncoder::new(
+            &[field("v", 2)],
+            &config(LineSeparator::Lf),
+            resources.clone(),
+        )
+        .unwrap();
+        let mut writer = PreparedWriter::new(Vec::new(), encoder, resources.clone()).unwrap();
+        let good = doc(&[]);
+        writer.begin_document(&good).unwrap();
+        let record = record(&[("v", Value::String("warning".into()))]);
+        writer.write_record(&record).unwrap();
+        let baseline = authority.memory.used();
+        let scope = resources.scope().unwrap();
+        let section = doc(&[
+            (
+                "opening authored",
+                &[("v", Value::String("x".repeat(20_000).into()))],
+            ),
+            ("closing authored", &[("v", Value::Integer(9))]),
+        ]);
+        for operation in [
+            OutputOperation::Record(&record),
+            OutputOperation::BeginDocument(&section),
+            OutputOperation::EndDocument(&section),
+        ] {
+            // First measure bounded cancellation points through immutable preparation.
+            authority.reset();
+            let measured = match &operation {
+                OutputOperation::Record(r) => OutputOperation::Record(r),
+                OutputOperation::BeginDocument(d) => OutputOperation::BeginDocument(d),
+                OutputOperation::EndDocument(d) => OutputOperation::EndDocument(d),
+                _ => unreachable!(),
+            };
+            let pending = writer
+                .encoder()
+                .prepare(measured, &mut std::io::sink(), &scope)
+                .unwrap();
+            let checks = authority.cancel_checks.load(Ordering::SeqCst);
+            let allocations = authority.attempts.load(Ordering::SeqCst);
+            let _ = pending;
+            assert_eq!(authority.memory.used(), baseline);
+            for cancel in [false, true] {
+                for stop in 0..if cancel { checks } else { allocations } {
+                    authority.reset();
+                    if cancel {
+                        authority.cancel_at.store(stop, Ordering::SeqCst);
+                    } else {
+                        authority.refuse.store(stop, Ordering::SeqCst);
+                    }
+                    let operation = match &operation {
+                        OutputOperation::Record(r) => OutputOperation::Record(r),
+                        OutputOperation::BeginDocument(d) => OutputOperation::BeginDocument(d),
+                        OutputOperation::EndDocument(d) => OutputOperation::EndDocument(d),
+                        _ => unreachable!(),
+                    };
+                    assert!(
+                        writer
+                            .encoder()
+                            .prepare(operation, &mut std::io::sink(), &scope)
+                            .is_err()
+                    );
+                    assert_eq!(authority.memory.used(), baseline);
+                    assert_eq!(writer.encoder().record_count(), 1);
+                    assert!(writer.encoder().document_open());
+                    assert_eq!(
+                        writer
+                            .encoder()
+                            .truncation_summary()
+                            .map(|s| s.total_cells()),
+                        Some(1)
+                    );
+                    assert_eq!(writer.destination(), b"wa\n");
+                }
+            }
+        }
+        authority.reset();
+        drop(writer);
+        assert_eq!(authority.memory.used(), 0);
+    }
+
+    struct Destination {
+        bytes: Vec<u8>,
+        limit: Arc<AtomicUsize>,
+        calls: Arc<AtomicUsize>,
+        flushes: Arc<AtomicUsize>,
+    }
+    impl Write for Destination {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let remaining = self
+                .limit
+                .load(Ordering::SeqCst)
+                .saturating_sub(self.bytes.len());
+            if remaining == 0 {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            let n = bytes.len().min(2).min(remaining);
+            self.bytes.extend_from_slice(&bytes[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    #[test]
+    fn short_delivery_completes_and_partial_delivery_poison_never_retries() {
+        for operation in 0..3 {
+            let provider = provider();
+            let encoder = FixedWidthEncoder::new(
+                &[field("v", 3)],
+                &config(LineSeparator::Lf),
+                provider.resources(),
+            )
+            .unwrap();
+            let limit = Arc::new(AtomicUsize::new(usize::MAX));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let flushes = Arc::new(AtomicUsize::new(0));
+            let destination = Destination {
+                bytes: Vec::new(),
+                limit: limit.clone(),
+                calls: calls.clone(),
+                flushes: flushes.clone(),
+            };
+            let mut writer =
+                PreparedWriter::new(destination, encoder, provider.resources()).unwrap();
+            let empty = doc(&[]);
+            writer.begin_document(&empty).unwrap();
+            let r = record(&[("v", Value::String("warning".into()))]);
+            writer.write_record(&r).unwrap();
+            assert_eq!(writer.destination().bytes, b"war\n");
+            let retained = provider.used();
+            limit.store(6, Ordering::SeqCst);
+            let doc = doc(&[
+                ("opening authored", &[("x", Value::String("header".into()))]),
+                ("closing authored", &[("x", Value::String("footer".into()))]),
+            ]);
+            let result = match operation {
+                0 => writer.write_record(&r),
+                1 => writer.begin_document(&doc),
+                _ => writer.end_document(&doc),
+            };
+            assert!(matches!(result, Err(FormatError::Io(_))));
+            assert_eq!(
+                &writer.destination().bytes,
+                match operation {
+                    0 => b"war\nwa",
+                    1 => b"war\nhe",
+                    _ => b"war\nfo",
+                }
+            );
+            assert_eq!(writer.encoder().record_count(), 1);
+            assert!(writer.encoder().document_open());
+            assert_eq!(
+                writer
+                    .encoder()
+                    .truncation_summary()
+                    .map(|s| s.total_cells()),
+                Some(1)
+            );
+            assert_eq!(provider.used(), retained);
+            let attempts = calls.load(Ordering::SeqCst);
+            assert!(writer.write_record(&r).is_err());
+            assert!(writer.flush().is_err());
+            assert!(writer.flush_bytes().is_err());
+            drop(writer);
+            assert_eq!(calls.load(Ordering::SeqCst), attempts);
+            assert_eq!(flushes.load(Ordering::SeqCst), 0);
+            assert_eq!(provider.used(), 0);
+        }
+    }
+}
+
+#[test]
 fn allocation_only_scope_and_writer_stage_share_one_finite_ledger() {
     let provider = MemoryOnlyResources::new(NonZeroUsize::new(128 * 1024).unwrap());
     let resources = provider.resources();
@@ -3968,6 +5520,9 @@ mod nested_fault_boundaries {
         Destination,
         AfterWrite,
         Complete,
+        ZeroWrite,
+        Interrupted,
+        DestinationFlush,
     }
     const FAULTS: [Fault; 13] = [
         Fault::Budget,
@@ -4136,6 +5691,12 @@ mod nested_fault_boundaries {
     impl Write for Destination {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             self.calls += 1;
+            if self.authority.is(Fault::ZeroWrite) {
+                return Ok(0);
+            }
+            if self.authority.is(Fault::Interrupted) && self.remaining.replace(usize::MAX) == 0 {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
             if self.authority.is(Fault::Destination) && self.remaining.get() == 0 {
                 return Err(std::io::ErrorKind::BrokenPipe.into());
             }
@@ -4152,6 +5713,9 @@ mod nested_fault_boundaries {
             Ok(n)
         }
         fn flush(&mut self) -> std::io::Result<()> {
+            if self.authority.is(Fault::DestinationFlush) {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
             Ok(())
         }
     }
@@ -4404,6 +5968,283 @@ mod nested_fault_boundaries {
             )
             .unwrap()
         });
+    }
+
+    fn physical_literal(swift: bool, index: usize) -> &'static [u8] {
+        match (swift, index) {
+            (false, 0 | 1) => b"HEAD\n",
+            (false, 2 | 3) => b"war\n",
+            (false, 4 | 5) => b"TAIL\n",
+            (false, 6 | 7) | (true, 0 | 1 | 4 | 5) => b"",
+            (true, 2) => b"{1:HEADER}{4:\r\n:20:warning\r\n",
+            (true, 3) => b":20:warning\r\n",
+            (true, 6) => b"{1:HEADER}{4:\r\n-}",
+            (true, 7) => b"-}{5:TAIL}",
+            _ => unreachable!(),
+        }
+    }
+
+    fn physical<E: FormatEncoder>(
+        swift: bool,
+        build: impl Fn(WriterResources, SharedStorage<clinker_record::Schema>) -> E,
+        state: impl Fn(&E) -> Vec<String>,
+    ) {
+        let schema = SharedStorage::from_arc(Arc::new(clinker_record::Schema::new(if swift {
+            vec!["tag".into(), "value".into()]
+        } else {
+            vec!["value".into()]
+        })));
+        let doc = Arc::new(DocumentContext::new(
+            DocumentId::next(),
+            Arc::from("input.txt"),
+            EnvelopeRecord::from_sections([("opening", "HEAD"), ("closing", "TAIL")].map(
+                |(section, text)| {
+                    (
+                        section.into(),
+                        Value::Map(OwnedMap::from_map(
+                            [("body".into(), Value::String(text.into()))].into(),
+                        )),
+                    )
+                },
+            )),
+        ));
+        let mut record = Record::new(
+            schema.clone(),
+            if swift {
+                vec![Value::String("20".into()), Value::String("warning".into())]
+            } else {
+                vec![Value::String("warning".into())]
+            },
+        );
+        record.set_doc_ctx(SharedStorage::from_arc(doc.clone()));
+        let mut cases = 0;
+        for index in 0..8 {
+            for fault in FAULTS.into_iter().chain([
+                Fault::ZeroWrite,
+                Fault::Interrupted,
+                Fault::DestinationFlush,
+            ]) {
+                let literal = physical_literal(swift, index);
+                // Empty operations still exercise admission, seal, cancellation
+                // and completion; byte-dependent faults cannot fire on them.
+                if literal.is_empty()
+                    && matches!(
+                        fault,
+                        Fault::Write
+                            | Fault::BeforeSeal
+                            | Fault::Read
+                            | Fault::ShortRead
+                            | Fault::Destination
+                            | Fault::AfterWrite
+                            | Fault::ZeroWrite
+                            | Fault::Interrupted
+                    )
+                {
+                    continue;
+                }
+                cases += 1;
+                let authority = Arc::new(Authority {
+                    memory: MemoryOnlyResources::new(NonZeroUsize::new(1024 * 1024).unwrap()),
+                    fault: AtomicUsize::new(0),
+                    cancelled: AtomicBool::new(false),
+                    stages: AtomicUsize::new(0),
+                });
+                let resources = WriterResources::new(authority.clone());
+                let mut writer = PreparedWriter::new(
+                    Destination {
+                        bytes: Vec::new(),
+                        authority: authority.clone(),
+                        remaining: std::cell::Cell::new(usize::MAX),
+                        calls: 0,
+                    },
+                    build(resources.clone(), schema.clone()),
+                    resources.clone(),
+                )
+                .unwrap();
+                let prior: &[usize] = match index {
+                    0 | 6 => &[],
+                    1 | 7 => &[0, 2, 5],
+                    2 | 4 => &[0],
+                    3 | 5 => &[0, 2],
+                    _ => unreachable!(),
+                };
+                let mut expected = Vec::new();
+                for &step in prior {
+                    writer
+                        .write_operation(operation(step, &record, &doc))
+                        .unwrap();
+                    expected.extend_from_slice(physical_literal(swift, step));
+                }
+                assert_eq!(writer.destination().bytes, expected);
+                let before = snapshot(writer.encoder(), &resources, &record, &doc);
+                let committed = state(writer.encoder());
+                let retained = authority.memory.used();
+                writer
+                    .destination()
+                    .remaining
+                    .set(if fault == Fault::Interrupted { 0 } else { 2 });
+                authority.fault.store(fault as usize, Ordering::SeqCst);
+                if fault == Fault::DestinationFlush {
+                    let calls = writer.destination().calls;
+                    assert!(matches!(writer.flush_bytes(), Err(FormatError::Io(error))
+                        if error.kind() == std::io::ErrorKind::BrokenPipe));
+                    authority.reset();
+                    assert_eq!(state(writer.encoder()), committed);
+                    assert_eq!(writer.destination().bytes, expected);
+                    assert!(matches!(writer.flush(), Err(FormatError::Resource(error))
+                        if error.kind == ResourceErrorKind::DeliveryPoisoned));
+                    assert_eq!(writer.destination().calls, calls);
+                } else if fault == Fault::Interrupted {
+                    let calls = writer.destination().calls;
+                    writer
+                        .write_operation(operation(index, &record, &doc))
+                        .unwrap();
+                    expected.extend_from_slice(literal);
+                    assert_eq!(writer.destination().bytes, expected);
+                    assert_eq!(writer.destination().calls, calls + 2);
+                } else {
+                    let error = writer
+                        .write_operation(operation(index, &record, &doc))
+                        .unwrap_err();
+                    let kind = match fault {
+                        Fault::Budget => ResourceErrorKind::Budget,
+                        Fault::Layout => ResourceErrorKind::Layout,
+                        Fault::Allocation => ResourceErrorKind::Allocation,
+                        Fault::BeforeSeal | Fault::AfterSeal | Fault::AfterWrite => {
+                            ResourceErrorKind::Cancelled
+                        }
+                        Fault::Read | Fault::ShortRead => ResourceErrorKind::Readback,
+                        _ => ResourceErrorKind::Storage,
+                    };
+                    match (&error, fault) {
+                        (FormatError::Io(error), Fault::Destination) => {
+                            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe)
+                        }
+                        (FormatError::Io(error), Fault::ZeroWrite) => {
+                            assert_eq!(error.kind(), std::io::ErrorKind::WriteZero)
+                        }
+                        (FormatError::Resource(error), Fault::ShortRead) => {
+                            assert_eq!(error.kind, kind);
+                            assert_eq!((error.requested, error.available), (literal.len(), 0));
+                        }
+                        (FormatError::Resource(error), _) => assert_eq!(
+                            *error,
+                            authority.evidence(kind),
+                            "{swift}/{index}/{fault:?}"
+                        ),
+                        _ => panic!("{swift}/{index}/{fault:?}: {error:?}"),
+                    }
+                    match fault {
+                        Fault::Destination => expected.extend_from_slice(&literal[..2]),
+                        Fault::AfterWrite | Fault::Complete => expected.extend_from_slice(literal),
+                        _ => {}
+                    }
+                    assert_eq!(
+                        writer.destination().bytes,
+                        expected,
+                        "{swift}/{index}/{fault:?}"
+                    );
+                    authority.reset();
+                    assert_eq!(state(writer.encoder()), committed);
+                    assert_eq!(
+                        snapshot(writer.encoder(), &resources, &record, &doc),
+                        before
+                    );
+                    assert_eq!(authority.memory.used(), retained);
+                    assert_eq!(authority.stages.load(Ordering::SeqCst), 0);
+                    if matches!(
+                        fault,
+                        Fault::AfterSeal
+                            | Fault::Read
+                            | Fault::ShortRead
+                            | Fault::Destination
+                            | Fault::AfterWrite
+                            | Fault::Complete
+                            | Fault::ZeroWrite
+                    ) {
+                        let calls = writer.destination().calls;
+                        for op in [operation(index, &record, &doc), OutputOperation::Finalize] {
+                            assert!(
+                                matches!(writer.write_operation(op), Err(FormatError::Resource(error))
+                                if error.kind == ResourceErrorKind::DeliveryPoisoned)
+                            );
+                        }
+                        assert!(writer.flush_bytes().is_err());
+                        assert_eq!(writer.destination().calls, calls);
+                    } else {
+                        writer
+                            .write_operation(operation(index, &record, &doc))
+                            .unwrap();
+                        expected.extend_from_slice(literal);
+                        assert_eq!(writer.destination().bytes, expected);
+                    }
+                }
+                drop(writer);
+                assert_eq!(authority.memory.used(), 0);
+                assert_eq!(authority.stages.load(Ordering::SeqCst), 0);
+            }
+        }
+        assert_eq!(cases, if swift { 96 } else { 112 });
+    }
+
+    #[test]
+    fn physical_fault_fixed_width_operations_preserve_warnings_and_framing() {
+        use clinker_format::fixed_width::writer::{FixedWidthEncoder, FixedWidthWriterConfig};
+        physical(
+            false,
+            |resources, _| {
+                FixedWidthEncoder::new(
+                    &[clinker_format::Column {
+                        width: Some(3),
+                        ..clinker_format::Column::bare("value", cxl::typecheck::Type::String)
+                    }],
+                    &FixedWidthWriterConfig {
+                        envelope: Some(clinker_format::OutputEnvelopeSpec {
+                            header_from_doc: Some("opening".into()),
+                            footer_from_doc: Some("closing".into()),
+                            footer_record_count_field: None,
+                        }),
+                        ..Default::default()
+                    },
+                    resources,
+                )
+                .unwrap()
+            },
+            |encoder| {
+                let mut state: Vec<String> = encoder
+                    .truncation_summary()
+                    .map(|summary| format!("{summary:?}"))
+                    .into_iter()
+                    .collect();
+                state.push(format!(
+                    "{}:{}",
+                    encoder.record_count(),
+                    encoder.document_open()
+                ));
+                state
+            },
+        );
+    }
+
+    #[test]
+    fn physical_fault_swift_operations_preserve_service_and_trailer_state() {
+        use clinker_format::swift::writer::{SwiftEncoder, SwiftWriterConfig};
+        physical(
+            true,
+            |resources, schema| {
+                SwiftEncoder::new(
+                    schema,
+                    &SwiftWriterConfig {
+                        basic_header: Some("HEADER".into()),
+                        trailer_from_doc: Some("closing".into()),
+                        ..Default::default()
+                    },
+                    resources,
+                )
+                .unwrap()
+            },
+            |_| Vec::new(),
+        );
     }
 }
 

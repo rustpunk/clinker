@@ -102,6 +102,25 @@ telemetry capability. See [allocation-owned record storage](../engine/src/memory
 for ownership and accounting boundaries; the production-contract register
 tracks the remaining decoder integration.
 
+CSV, JSON, XML, fixed-width and SWIFT writers use finite prepared output:
+each complete operation is validated and sealed before destination delivery,
+and encoder state commits only after successful delivery and stage cleanup.
+Fixed-width retains every committed truncation warning under allocation
+ownership; SWIFT retains the first successful record's document trailer.
+Preparation failure leaves committed state unchanged; failed delivery can
+leave an accepted prefix and poisons continuation without a drop-time retry.
+Direct callers use the admitted encoders and `PreparedWriter`, with explicit
+finite `WriterResources`; raw fixed-width and SWIFT writer APIs are retired.
+See [physical-text ownership](../engine/src/memory-arbitration.md#physical-text-configuration-truncation-tallies-and-trailers)
+and [prepared storage](../engine/src/storage-internals.md#prepared-output-storage).
+
+Fixed-width input validates selected UTF-8 cells at physical byte offsets,
+leaving ignored ranges undecoded. SWIFT preserves continuation bytes and
+discards partial fields and service blocks on terminal initialization failure.
+These reader corrections do not admit their existing materialization or parser
+allocations. EDIFACT, X12 and HL7 still use legacy writer paths; the all-format
+encoding and allocation contract (AUTH-06) remains partial.
+
 ### Current execution path and locked target
 
 The current call path is explicit and non-conforming with the locked target:

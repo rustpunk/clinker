@@ -250,11 +250,12 @@ pub struct ExecutionReport {
     /// the interrupted exit code (130). A clean run leaves it `false`.
     pub interrupted: bool,
     /// Advisory end-of-run findings, already rendered, in Output declaration
-    /// order. Today: the per-Sink `mapping:` report — **W365** for an entry
-    /// whose column no record carried, **W366** for an upstream column a mapped
-    /// output name displaced.
+    /// order within each kind. The per-Sink `mapping:` report comes first —
+    /// **W365** for an entry whose column no record carried, **W366** for an
+    /// upstream column a mapped output name displaced — then **W367**, one per
+    /// Sink whose `truncation: warn` columns cut values to fit.
     ///
-    /// Never fatal. Both describe a file that was written and is readable; by
+    /// Never fatal. Each describes a file that was written and is readable; by
     /// the time a stream ends its sibling Outputs have flushed, so aborting
     /// would leave a half-written run behind for a fault visible in the output
     /// itself. Empty on a clean run.

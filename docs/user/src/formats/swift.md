@@ -2,11 +2,11 @@
 
 Clinker reads and writes SWIFT MT (FIN) messages alongside CSV, JSON, XML,
 fixed-width, EDIFACT, X12, and HL7 v2. A SWIFT MT message is a finite file
-built from brace-balanced blocks. The reader streams the message body one
-field at a time and surfaces the service blocks as document-envelope
-sections; the writer inverts the reader exactly, re-framing the block
-structure around emitted records so a read → write → read round-trip is
-byte-faithful.
+built from brace-balanced blocks. The reader scans the message into retained
+fields, then emits one body field at a time and surfaces service blocks as
+document-envelope sections. The writer preserves field-value bytes while
+reconstructing the message with CRLF structural separators; it does not
+preserve the original file's inter-block whitespace or field separators.
 
 ## Block structure
 
@@ -33,7 +33,8 @@ Block 4 is special. Its body is opaque line-structured free text — a field
 value (a `:77E:` envelope, a `:79:` narrative, an `:86:` information line)
 legitimately contains `{`, `}`, and even `-}` as data. So braces inside
 block 4 are treated as data, not framing: the block closes only on a
-*line-anchored* `-}` trailer — a `-}` that begins a line. An interior `{`,
+*line-anchored* `-}` trailer — at the start of the block-4 body or after
+either LF or CR. An interior `{`,
 `}`, or a `-}` in the middle of a value is data, not a frame boundary. Both
 the framing braces and the closing `-}` trailer are stripped from the stored
 values, so a record carries clean tag/value data.
@@ -60,8 +61,14 @@ A multi-line field (a `:50K:` ordering-customer block, a `:77E:` / `:86:`
 narrative) keeps its continuation lines: any line of block 4 that does not
 begin a new `:tag:` is folded into the current field's value with its line
 break preserved — including a blank line **inside** the value, so a narrative
-with an internal blank line round-trips faithfully. A repeated tag (the
-`:61:` / `:86:` statement lines of an MT940, for instance) streams as one
+with an internal blank line round-trips faithfully. LF and CRLF are retained
+exactly inside values, including mixed separators, leading/trailing spaces,
+and trailing blank continuation lines. Only the separator before the next
+field or trailer is structural: one CRLF, LF, or (at the trailer) lone CR is
+removed. A data CR immediately followed by the structural LF is necessarily
+read as one CRLF separator; these bytes cannot express a separate data CR.
+A repeated tag (the `:61:` / `:86:` statement lines of an MT940, for instance)
+streams as one
 record per occurrence, in order.
 
 The service blocks (`1`, `2`, `3`, `5`) are consumed by the reader to serve
@@ -86,8 +93,8 @@ nodes:
 
 The `max_fields` option caps the number of block-4 field lines a single
 message may carry (default 10000). A message exceeding it is rejected with
-guidance rather than streamed unbounded — a corruption guard, since a real
-MT message is well under the cap.
+guidance. This is a field-count guard, not a byte budget for retained reader
+data; it does not establish constant-memory input parsing.
 
 ## Envelope sections over the service blocks
 
@@ -149,28 +156,41 @@ rather than producing garbled records:
   closing the tag, or an empty tag, is rejected.
 - **Repeated service block** — a second `{1:...}` (or any repeated service
   block) in one message is rejected.
+- **Invalid UTF-8** — block ids and bodies are validated before parsing;
+  invalid bytes in headers, body text, or trailers are never replaced with
+  substitute characters. A leading UTF-8 BOM is rejected: after optional
+  ASCII whitespace, the next byte must be an opening `{`.
+
+Initialization succeeds only after the complete message has parsed. On
+failure, partial fields and service blocks are discarded; later reads are
+terminal and cannot reveal partial records or sections. Malformed messages
+terminate execution under both `fail_fast` and `continue`.
 
 A header-only message (no block 4, or an empty block 4) is valid: it
 produces no body records and drains cleanly.
 
 ## Writing SWIFT MT
 
-A SWIFT Sink node inverts the reader exactly. It re-emits each block-4
+A SWIFT Sink node re-emits each block-4
 record as a `:tag:value` line and re-frames the single message envelope
 around them: the service blocks 1/2/3 first, then block 4 (`{4:` … `-}`),
 then the optional block-5 trailer. Block-4 free text is opaque, so values are
 written **verbatim with no escaping** — an interior `{`, `}`, a mid-line `-}`,
 a folded continuation break, and an interior blank line all reproduce as data.
-The reader strips exactly the structural separators (braces, the leading `:`,
-the `-}` trailer, the line breaks) and keeps every other byte; the writer
-re-adds exactly those separators and nothing else, so a read → write → read
-round-trip returns byte-identical field values.
+The writer opens block 4 with `{4:\r\n`, appends `\r\n` after each
+`:tag:value`, and closes with `-}` before any block-5 trailer. Existing LF
+and CRLF inside values remain unchanged. Re-reading returns the same field
+values even when the original input used LF structural separators.
 
 Records map by the `tag` and `value` columns. The `block` column is the
 constant `4` discriminator (an empty `block` is treated as block 4, so a
 Transform that projects only `tag`/`value` writes fine); a record carrying a
 `block` other than `4` is rejected, because service blocks are never emitted
 as records — they ride the document context.
+
+Strings are written verbatim; other scalar values use their natural display
+spelling, and null renders empty text. Arrays and maps are rejected. A tag
+must be nonempty and contain no colon, CR, or LF.
 
 ```yaml
 nodes:
@@ -204,39 +224,65 @@ user-declared `$doc` section:
 
 The `*_from_doc` options name the section the user declared on the **source**
 — the engine reserves no section name. A literal `*_header` wins over its
-`*_from_doc` companion when both are set; a service block with neither is
-omitted. The `_from_doc` echo reads the block body verbatim from the section's
+`*_from_doc` companion when both are set (the same rule applies to `trailer`);
+a service block with neither is omitted. The `_from_doc` echo reads the block
+body verbatim from the section's
 `body` field — the same single-field shape the reader writes — so a SWIFT
 source's service blocks (declared as `segment` envelope sections) round-trip
 unchanged when their section names are passed back to the writer here.
 
+The first successfully delivered record supplies the document service bodies;
+its trailer is retained until finalization, even if later records carry a
+different context. A selected section must contain `body`. Missing sections
+or fields, structured values, and unbalanced braces in service bodies fail
+before delivering that operation, including the first message header.
+
 The document context that carries the `$doc` sections rides on each body
 record, so the `*_from_doc` echoes require at least one block-4 record to
-read from. A document with **zero** block-4 records emits a valid empty
-message — `{4:` immediately closed by `-}` — wrapped only by the
-**literal-configured** service blocks (`basic_header`, `app_header`,
-`user_header`, `trailer`); the `*_from_doc` echoes are skipped because no
-record carries the document context. Use the literal options when a
-zero-record output must still emit its service blocks.
+read from. Explicitly finalizing a library writer with **zero** records emits
+`{4:\r\n-}`, wrapped only by literal-configured service blocks; document
+echoes are skipped because no record supplies context. The CLI opens its
+writer lazily: a zero-record run publishes an empty file, even when literal
+service options are configured.
 
 Block-4 free text has no escape mechanism, so values are written verbatim.
 Almost any value round-trips faithfully, but two shapes are unrepresentable
 when the value is built from arbitrary records (CSV/JSON → Transform →
 SWIFT): a value whose continuation line — a line after a folded line break —
-begins with the block terminator `-}` (which would re-read as an early block
-close) or with a `:` tag marker (which would re-read as a spurious field).
+begins with the block terminator `-}` after LF or CR (which would re-read as
+an early block close), or with a `:` tag marker after LF (which would
+re-read as a spurious field). A bare CR before `:` is literal data.
 The writer rejects such a value with a clear error rather than emitting
 silently-corrupt output. Values read from a SWIFT source can never take these
 shapes, so a read → write → read round-trip is always safe.
 
 A SWIFT MT message is a single indivisible envelope, so a `swift` output
-cannot be combined with a byte-limit `split:` block — the pairing is rejected
+cannot be combined with a `split:` block, including `max_records` splitting — the pairing is rejected
 at config-validation time (diagnostic `E342`).
+
+## Library output and failures
+
+Direct callers use `SwiftEncoder::new` with a schema, `SwiftWriterConfig`,
+and finite `WriterResources`, then `PreparedWriter::new`. A standalone
+`MemoryOnlyResources` provider requires an explicit nonzero budget. The
+resource-free writer constructor is unavailable.
+
+The first record's headers and body are prepared together; finalization
+prepares the closing block and trailer together. Preparation failure leaves
+the destination and committed state unchanged and permits a corrected retry.
+Delivery failure can leave an accepted prefix and poisons continuation.
+`flush_bytes()` drains without closing the message; `flush()` finalizes once
+and drains, with no duplicate trailer on repeated calls. Drop does not finalize
+or retry writes. See [output preparation](../ops/storage.md#output-preparation)
+for resource and publication boundaries.
 
 ## Limitations
 
 - **UTF-8 only.** SWIFT MT messages are decoded as UTF-8; a non-UTF-8 block
-  body is rejected explicitly rather than corrupted silently.
+  id or body is rejected explicitly rather than corrupted silently.
+- **One message per input.** Adjacent complete messages are rejected. Reader
+  materialization keeps its existing allocation behavior; the finite writer
+  budget does not account for the reader's retained fields or service blocks.
 - **Field-content parsing.** The reader exposes each `:tag:value` line as a
   `tag`/`value` pair verbatim. Parsing a field's internal structure (the
   sub-fields of a `:32A:` value-date/currency/amount, say) is a CXL concern

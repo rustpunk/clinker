@@ -1,9 +1,11 @@
+use clinker_format::error::OutputEncodingKind;
+use clinker_format::preparation::PreparedWriter;
 use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues, SharedStorage};
 use std::sync::Arc;
 
 use clinker_format::fixed_width::field::ResolvedRepeatingGroup;
 use clinker_format::fixed_width::{
-    FixedWidthReader, FixedWidthReaderConfig, FixedWidthWriter, FixedWidthWriterConfig,
+    FixedWidthEncoder, FixedWidthReader, FixedWidthReaderConfig, FixedWidthWriterConfig,
 };
 use clinker_format::{
     Column, FixedWidthCountField, FixedWidthFill, FixedWidthOccurs, FixedWidthOverflow,
@@ -12,6 +14,37 @@ use clinker_format::{
 use clinker_record::{Record, Schema, Value};
 use cxl::typecheck::Type;
 use indexmap::IndexMap;
+
+fn finite_writer<W: std::io::Write + Send>(
+    destination: W,
+    fields: Vec<Column>,
+    config: FixedWidthWriterConfig,
+) -> Result<PreparedWriter<W, FixedWidthEncoder>, FormatError> {
+    let provider = clinker_format::preparation::MemoryOnlyResources::new(
+        std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+    );
+    let encoder = FixedWidthEncoder::new(&fields, &config, provider.resources())?;
+    Ok(PreparedWriter::new(
+        destination,
+        encoder,
+        provider.resources(),
+    )?)
+}
+
+fn layout_error(fields: Vec<Column>) -> FormatError {
+    let error = clinker_format::fixed_width::field::validate_write_layout(&fields)
+        .expect_err("pure validation rejects layout");
+    let result = finite_writer(Vec::new(), fields, FixedWidthWriterConfig::default());
+    assert!(matches!(
+        result,
+        Err(FormatError::OutputEncoding {
+            format: "fixed-width",
+            kind: OutputEncodingKind::FixedWidthLayout,
+            ..
+        })
+    ));
+    error
+}
 
 fn child(name: &str, start: usize, width: usize) -> Column {
     Column {
@@ -83,8 +116,7 @@ fn scalar(name: &str, start: usize, width: usize) -> Column {
 fn write(layout: Vec<Column>, record: &Record) -> Result<Vec<u8>, FormatError> {
     let mut bytes = Vec::new();
     {
-        let mut writer =
-            FixedWidthWriter::new(&mut bytes, layout, FixedWidthWriterConfig::default())?;
+        let mut writer = finite_writer(&mut bytes, layout, FixedWidthWriterConfig::default())?;
         writer.write_record(record)?;
         writer.flush()?;
     }
@@ -117,7 +149,7 @@ fn tracer_group_round_trip() {
 
     let mut bytes = Vec::new();
     {
-        let mut writer = FixedWidthWriter::new(
+        let mut writer = finite_writer(
             &mut bytes,
             layout.clone(),
             FixedWidthWriterConfig::default(),
@@ -155,7 +187,7 @@ fn tracer_group_round_trip() {
         Value::String("not a nested record".into()),
     ]));
     let mut destination = Vec::new();
-    let mut writer = FixedWidthWriter::new(
+    let mut writer = finite_writer(
         &mut destination,
         vec![group("transactions", 0, 2, true)],
         FixedWidthWriterConfig::default(),
@@ -180,23 +212,11 @@ fn tracer_group_round_trip() {
 
     let mut zero_max = group("transactions", 0, 1, false);
     zero_max.occurs.as_mut().expect("occurs").max = 0;
-    let zero_error = FixedWidthWriter::new(
-        Vec::<u8>::new(),
-        vec![zero_max],
-        FixedWidthWriterConfig::default(),
-    )
-    .err()
-    .expect("zero max must fail before I/O");
+    let zero_error = layout_error(vec![zero_max]);
     assert!(zero_error.to_string().contains("positive"), "{zero_error}");
 
     let overflow = group("transactions", 0, usize::MAX, false);
-    let overflow_error = FixedWidthWriter::new(
-        Vec::<u8>::new(),
-        vec![overflow],
-        FixedWidthWriterConfig::default(),
-    )
-    .err()
-    .expect("overflowing layout must fail before allocation");
+    let overflow_error = layout_error(vec![overflow]);
     assert!(
         overflow_error.to_string().contains("overflows"),
         "{overflow_error}"
@@ -204,13 +224,7 @@ fn tracer_group_round_trip() {
 
     let mut nested = group("transactions", 0, 2, false);
     nested.fields.as_mut().expect("children")[0].fields = Some(vec![child("nested", 0, 1)]);
-    let nested_error = FixedWidthWriter::new(
-        Vec::<u8>::new(),
-        vec![nested],
-        FixedWidthWriterConfig::default(),
-    )
-    .err()
-    .expect("recursive groups must fail before I/O");
+    let nested_error = layout_error(vec![nested]);
     assert!(
         nested_error.to_string().contains("flatten"),
         "{nested_error}"
@@ -282,7 +296,16 @@ fn zero_null_one_min_and_max_have_exact_pad_bytes() {
         &record("transactions", Value::Null),
     )
     .expect_err("min minus one rejects");
-    assert!(error.to_string().contains("minimum is 1"), "{error}");
+    assert!(
+        matches!(
+            error,
+            FormatError::OutputEncoding {
+                kind: OutputEncodingKind::FixedWidthCardinality,
+                ..
+            }
+        ),
+        "{error}"
+    );
     write(
         vec![minimum_layout],
         &record(
@@ -357,11 +380,19 @@ fn overflow_errors_or_retains_the_selected_end_atomically() {
     .expect_err("max plus one rejects by default");
     let message = error.to_string();
     assert!(message.contains("transactions"), "{message}");
-    assert!(message.contains("maximum is 2"), "{message}");
-    assert!(message.contains("contains 3"), "{message}");
+    assert!(
+        matches!(
+            error,
+            FormatError::OutputEncoding {
+                kind: OutputEncodingKind::FixedWidthCardinality,
+                ..
+            }
+        ),
+        "{message}"
+    );
 
     let mut destination = Vec::new();
-    let mut writer = FixedWidthWriter::new(
+    let mut writer = finite_writer(
         &mut destination,
         vec![group("transactions", 0, 2, false)],
         FixedWidthWriterConfig::default(),
@@ -435,7 +466,7 @@ fn ambiguous_padding_and_non_record_shapes_fail_before_destination_write() {
         )])),
     ] {
         let mut destination = Vec::new();
-        let mut writer = FixedWidthWriter::new(
+        let mut writer = finite_writer(
             &mut destination,
             vec![group("transactions", 0, 2, true)],
             FixedWidthWriterConfig::default(),
@@ -476,13 +507,7 @@ fn adjacent_groups_preserve_equal_occurrences_and_never_exchange_bytes() {
 fn malformed_occurrence_policies_fail_during_layout_resolution() {
     let mut minimum = group("transactions", 0, 2, false);
     minimum.occurs.as_mut().expect("occurs").min = 3;
-    let error = FixedWidthWriter::new(
-        Vec::<u8>::new(),
-        vec![minimum],
-        FixedWidthWriterConfig::default(),
-    )
-    .err()
-    .expect("minimum cannot exceed maximum");
+    let error = layout_error(vec![minimum]);
     assert!(error.to_string().contains("greater than"), "{error}");
 
     let mut truncate_without_end = group("transactions", 0, 2, false);
@@ -491,13 +516,7 @@ fn malformed_occurrence_policies_fail_during_layout_resolution() {
         .as_mut()
         .expect("occurs")
         .on_overflow = FixedWidthOverflow::Truncate;
-    let error = FixedWidthWriter::new(
-        Vec::<u8>::new(),
-        vec![truncate_without_end],
-        FixedWidthWriterConfig::default(),
-    )
-    .err()
-    .expect("truncation must select a retained end");
+    let error = layout_error(vec![truncate_without_end]);
     assert!(error.to_string().contains("keep: first"), "{error}");
 
     let mut retained_end_with_error = group("transactions", 0, 2, false);
@@ -506,23 +525,133 @@ fn malformed_occurrence_policies_fail_during_layout_resolution() {
         .as_mut()
         .expect("occurs")
         .keep = Some(FixedWidthTruncateKeep::First);
-    let error = FixedWidthWriter::new(
-        Vec::<u8>::new(),
-        vec![retained_end_with_error],
-        FixedWidthWriterConfig::default(),
-    )
-    .err()
-    .expect("error overflow policy cannot select a retained end");
+    let error = layout_error(vec![retained_end_with_error]);
     assert!(error.to_string().contains("remove `keep`"), "{error}");
 
     let mut narrow_count = group("transactions", 0, 10, true);
     narrow_count.count_field.as_mut().expect("count").width = 1;
-    let error = FixedWidthWriter::new(
-        Vec::<u8>::new(),
-        vec![narrow_count],
-        FixedWidthWriterConfig::default(),
-    )
-    .err()
-    .expect("count width must fit the maximum");
+    let error = layout_error(vec![narrow_count]);
     assert!(error.to_string().contains("at least 2"), "{error}");
+}
+
+#[test]
+fn read_layout_reports_the_first_physical_shift_group() {
+    let mut early = group("early", 0, 1, false);
+    let mut late = group("late", 10, 1, false);
+    early.occurs.as_mut().unwrap().fill = FixedWidthFill::Shift;
+    late.occurs.as_mut().unwrap().fill = FixedWidthFill::Shift;
+    let layout = vec![late, early, scalar("tail", 20, 1)];
+    let error = clinker_format::fixed_width::field::validate_read_layout(&layout).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "invalid record at row 0: group 'early': fixed-width repeating group uses `fill: shift` before another field without a `count_field`; add a count field so the next byte position is unambiguous, or make the group last"
+    );
+    let reader_error =
+        FixedWidthReader::new(std::io::empty(), layout, FixedWidthReaderConfig::default())
+            .err()
+            .unwrap();
+    assert_eq!(reader_error.to_string(), error.to_string());
+}
+
+fn output_field(error: FormatError) -> (usize, String, Option<usize>, OutputEncodingKind) {
+    match error {
+        FormatError::OutputEncoding {
+            format: "fixed-width",
+            field,
+            field_name,
+            element,
+            kind,
+            ..
+        } => (
+            field,
+            field_name.to_string(),
+            element.map(|e| e.get()),
+            kind,
+        ),
+        other => panic!("expected a fixed-width output encoding error, got {other:?}"),
+    }
+}
+
+fn numeric(name: &str, start: usize, width: usize) -> Column {
+    Column {
+        ty: Type::Int,
+        ..scalar(name, start, width)
+    }
+}
+
+/// `field` is the column's 1-based position among the record's user fields —
+/// the numbering every writer shares and the DLQ indexes by — never its rank
+/// in byte-offset order or in the declared schema.
+#[test]
+fn cell_errors_number_fields_by_record_position() {
+    // Declared `b` first but laid out after `a`; `b` overflows its width.
+    let layout = || vec![numeric("b", 10, 3), scalar("a", 0, 3)];
+    let overflow = Value::Integer(12_345);
+
+    let b_first = record_fields(&[("b", overflow.clone()), ("a", Value::String("x".into()))]);
+    let error = write(layout(), &b_first).expect_err("b overflows");
+    assert_eq!(
+        output_field(error),
+        (
+            1,
+            "b".into(),
+            None,
+            OutputEncodingKind::FixedWidthTruncation
+        )
+    );
+
+    let a_first = record_fields(&[("a", Value::String("x".into())), ("b", overflow)]);
+    let error = write(layout(), &a_first).expect_err("b overflows");
+    assert_eq!(
+        output_field(error),
+        (
+            2,
+            "b".into(),
+            None,
+            OutputEncodingKind::FixedWidthTruncation
+        )
+    );
+}
+
+#[test]
+fn layout_errors_number_the_declared_column() {
+    let layout = vec![scalar("a", 0, 5), scalar("b", 5, 5), scalar("c", 7, 5)];
+    let error = finite_writer(Vec::new(), layout, FixedWidthWriterConfig::default())
+        .err()
+        .expect("c overlaps b");
+    assert_eq!(
+        output_field(error),
+        (3, "c".into(), None, OutputEncodingKind::FixedWidthLayout)
+    );
+}
+
+/// A repeating-group child error carries the group's record position and the
+/// 1-based occurrence, so `field` + `element` address the offending cell.
+#[test]
+fn group_child_errors_carry_group_position_and_occurrence() {
+    let layout = vec![scalar("id", 0, 3), group("items", 3, 2, false)];
+    let bad = nested_record(&[
+        ("kind", Value::String("B".into())),
+        (
+            "code",
+            Value::Array(OwnedValues::from_vec(vec![Value::String("x".into())])),
+        ),
+    ]);
+    let record = record_fields(&[
+        ("id", Value::String("1".into())),
+        (
+            "items",
+            Value::Array(OwnedValues::from_vec(vec![occurrence("A", "12"), bad])),
+        ),
+    ]);
+    let error = write(layout, &record).expect_err("array child is not a scalar");
+    assert_eq!(
+        output_field(error),
+        (
+            2,
+            "code".into(),
+            Some(2),
+            OutputEncodingKind::FixedWidthScalar
+        )
+    );
 }

@@ -136,6 +136,7 @@ fn config_with_writer_headroom(root: &std::path::Path, csv: &str) -> PipelineCon
         crate::output::staging::OutputStagingRegistry::default(),
         None,
         provider.resources(),
+        &Default::default(),
     )
     .unwrap();
     writer
