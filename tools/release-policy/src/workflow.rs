@@ -495,7 +495,7 @@ fn validate_ci_policy_jobs(jobs: &BTreeMap<String, Job>) -> Result<(), GateError
     )?;
     require_unnamed_action_step(
         &steps[1],
-        "dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772",
+        "dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de",
         &["toolchain", "1.91", "components", "clippy, rustfmt"],
     )?;
     require_plain_command_step(
@@ -536,7 +536,7 @@ fn validate_ci_policy_jobs(jobs: &BTreeMap<String, Job>) -> Result<(), GateError
     )?;
     require_unnamed_action_step(
         &steps[1],
-        "dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772",
+        "dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de",
         &["toolchain", "1.91", "components", "clippy, rustfmt"],
     )?;
     require_plain_command_step(
@@ -743,7 +743,7 @@ fn require_exact_release_dependency(job: &Job) -> Result<(), GateError> {
     )?;
     require_unnamed_action_step(
         &steps[1],
-        "dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772",
+        "dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de",
         &["toolchain", "1.91"],
     )?;
     require_command_step(
