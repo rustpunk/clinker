@@ -111,7 +111,7 @@ Preparation failure leaves committed state unchanged; failed delivery can
 leave an accepted prefix and poisons continuation without a drop-time retry.
 Direct callers use the admitted encoders and `PreparedWriter`, with explicit
 finite `WriterResources`; raw fixed-width and SWIFT writer APIs are retired.
-See [physical-text ownership](../engine/src/memory-arbitration.md#physical-text-configuration-warnings-and-trailers)
+See [physical-text ownership](../engine/src/memory-arbitration.md#physical-text-configuration-truncation-tallies-and-trailers)
 and [prepared storage](../engine/src/storage-internals.md#prepared-output-storage).
 
 Fixed-width input validates selected UTF-8 cells at physical byte offsets,

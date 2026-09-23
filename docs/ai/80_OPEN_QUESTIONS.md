@@ -737,12 +737,12 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
 Resolved by maintainer approval on 2026-09-15; [the production-contract register](15_PRODUCTION_CONTRACTS.md#decoded-allocation-ownership) records both the decision and current implementation. Core storage and CSV decoding now retain reservations through final backing destruction, preserve release state for escaped values, and use shared schema/document carriers with matching legacy accounting. CSV writer, factory and stage owners have actual-deallocation tests. Local qualification establishes this subset; it does not establish all-format admission, release qualification or whole-engine memory bounds. The approved parser/copy allowances remain explicit, and [variable-payload residency #1183](https://github.com/rustpunk/clinker/issues/1183) and [bounded fan-in #1044](https://github.com/rustpunk/clinker/issues/1044) remain separate work. See [memory ownership](../engine/src/memory-arbitration.md#csv-decoding-and-document-ownership) and [writer/storage extension contracts](../engine/src/extension-seams.md#allocation-aware-csv-construction).
 
 Native JSON/XML and physical fixed-width/SWIFT output also use finite admitted
-configuration, factories and sealed operation storage. Fixed-width warning
-history and SWIFT retained trailers carry leases through actual backing
-destruction. Existing fixed-width/SWIFT reader materialization and parser
+configuration, factories and sealed operation storage. Fixed-width
+truncation tallies are sized by the layout when the encoder is built, and
+SWIFT retained trailers carry leases through actual backing destruction. Existing fixed-width/SWIFT reader materialization and parser
 allocations remain outside that writer guarantee, and EDIFACT, X12 and HL7
 writer migration remains outstanding. AUTH-06 is still partial. See
-[physical-text ownership](../engine/src/memory-arbitration.md#physical-text-configuration-warnings-and-trailers).
+[physical-text ownership](../engine/src/memory-arbitration.md#physical-text-configuration-truncation-tallies-and-trailers).
 
 Numbers are never reused. One line per entry: the answer and its evidence.
 
