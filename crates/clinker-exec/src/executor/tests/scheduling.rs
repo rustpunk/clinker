@@ -142,7 +142,13 @@ fn no_estimates_reproduces_topo_order_exactly() {
     );
     let all: HashSet<NodeIndex> = dag.topo_order.iter().copied().collect();
 
-    let order = scheduled_pass_order(dag, &arbitrator, &all, &std::collections::HashMap::new());
+    let order = scheduled_pass_order(
+        dag,
+        &arbitrator,
+        &all,
+        &std::collections::HashMap::new(),
+        false,
+    );
     assert_eq!(
         order, dag.topo_order,
         "with no estimates the scheduler must reproduce topo order exactly"
@@ -353,7 +359,13 @@ fn scheduler_elects_heavy_chain_source_before_lower_index_light_source() {
     // task specifies (no spill, no back-pressure, fully decoupled from RSS).
     let arbitrator = huge_budget_arbitrator();
     let all: HashSet<NodeIndex> = dag.topo_order.iter().copied().collect();
-    let order = scheduled_pass_order(dag, &arbitrator, &all, &std::collections::HashMap::new());
+    let order = scheduled_pass_order(
+        dag,
+        &arbitrator,
+        &all,
+        &std::collections::HashMap::new(),
+        false,
+    );
     let pos = |idx: NodeIndex| order.iter().position(|&n| n == idx).unwrap();
 
     assert!(
@@ -411,6 +423,117 @@ fn headroom_fit_prefers_fitting_node_over_lower_index() {
         "headroom fit must prefer the Source that fits remaining headroom over a lower-index \
          Source that would overflow it"
     );
+}
+
+/// Two sibling branches off a document-granularity Source: `t2` condemns
+/// a document and feeds `out2`; `t1` passes every record to `out1`.
+const DOCUMENT_SIBLING_BRANCHES_YAML: &str = r#"
+pipeline: { name: doc_sibling_branches }
+error_handling: { strategy: continue, dlq: { path: rejected.csv } }
+nodes:
+  - type: source
+    name: events
+    config:
+      name: events
+      type: csv
+      glob: ./*.csv
+      dlq_granularity: document
+      files: { on_no_match: skip }
+      schema:
+        - { name: id, type: string }
+        - { name: value, type: string }
+  - type: transform
+    name: t2
+    input: events
+    config:
+      cxl: |
+        emit id = id
+        emit val = value.to_int()
+  - type: sink
+    name: out2
+    input: t2
+    config: { name: out2, type: csv, path: out2.csv, include_unmapped: true }
+  - type: transform
+    name: t1
+    input: events
+    config:
+      cxl: |
+        emit id = id
+        emit val = value
+  - type: sink
+    name: out1
+    input: t1
+    config: { name: out1, type: csv, path: out1.csv, include_unmapped: true }
+"#;
+
+/// Under document dead-lettering no estimate moves a Sink ahead of an
+/// operator. A huge freed-on-complete estimate on `out1` makes the
+/// freed-bytes rule pick it as soon as `t1` has run, before `t2` could
+/// condemn a document `out1` holds; the gate holds every Sink until every
+/// operator of the pass has run.
+#[test]
+fn document_policy_runs_every_sink_after_every_operator_under_estimates() {
+    use clinker_plan::plan::execution::PlanNode;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = compile_dag(DOCUMENT_SIBLING_BRANCHES_YAML, tmp.path());
+    let mut dag = plan.dag().clone();
+    let out1 = node_idx(&dag, "out1");
+    let t2 = node_idx(&dag, "t2");
+    dag.node_properties
+        .get_mut(&out1)
+        .expect("out1 carries a node_properties entry")
+        .predicted_freed_bytes_on_complete = 1 << 30;
+
+    let arbitrator = huge_budget_arbitrator();
+    let all: HashSet<NodeIndex> = dag.topo_order.iter().copied().collect();
+    let position = |order: &[NodeIndex], idx: NodeIndex| {
+        order
+            .iter()
+            .position(|&n| n == idx)
+            .expect("every candidate is dispatched")
+    };
+
+    let ungated = scheduled_pass_order(
+        &dag,
+        &arbitrator,
+        &all,
+        &std::collections::HashMap::new(),
+        false,
+    );
+    assert!(
+        position(&ungated, out1) < position(&ungated, t2),
+        "premise: without the gate the freed-bytes rule dispatches out1 before t2 \
+         (order {ungated:?})"
+    );
+
+    let gated = scheduled_pass_order(
+        &dag,
+        &arbitrator,
+        &all,
+        &std::collections::HashMap::new(),
+        true,
+    );
+    let is_sink = |idx: NodeIndex| matches!(dag.graph[idx], PlanNode::Sink { .. });
+    let last_operator = gated
+        .iter()
+        .rposition(|&idx| !is_sink(idx))
+        .expect("the pipeline has operators");
+    let first_sink = gated
+        .iter()
+        .position(|&idx| is_sink(idx))
+        .expect("the pipeline has Sinks");
+    assert!(
+        last_operator < first_sink,
+        "every Sink is dispatched after every operator (order {gated:?})"
+    );
+    for edge in dag.graph.edge_indices() {
+        let (from, to) = dag.graph.edge_endpoints(edge).expect("edge endpoints");
+        assert!(
+            position(&gated, from) < position(&gated, to),
+            "every edge points forward in the gated order"
+        );
+    }
 }
 
 /// Hard limit large enough that real process RSS can never push the

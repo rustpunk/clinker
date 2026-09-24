@@ -1926,6 +1926,10 @@ impl PipelineExecutor {
         // tripped shutdown token surfaces as `PipelineError::Interrupted`
         // from a per-node poll, which lands here too so the same
         // drain-then-join cleanup runs.
+        // Under document dead-lettering every Sink waits for every operator
+        // of its pass, so each document's verdict is final before any Sink
+        // writes; the plan orders Sinks last on the same predicate.
+        let sinks_after_operators = ctx.document_dlq.is_some();
         let dispatch_sequence: Vec<petgraph::graph::NodeIndex> = if !init_phase_set.is_empty() {
             let runtime_set: HashSet<petgraph::graph::NodeIndex> = plan
                 .topo_order
@@ -1938,12 +1942,14 @@ impl PipelineExecutor {
                 &ctx.memory_budget,
                 &init_phase_set,
                 &ctx.streaming_combine_probe_edges,
+                sinks_after_operators,
             );
             seq.extend(scheduled_pass_order(
                 plan,
                 &ctx.memory_budget,
                 &runtime_set,
                 &ctx.streaming_combine_probe_edges,
+                sinks_after_operators,
             ));
             seq
         } else {
@@ -1954,6 +1960,7 @@ impl PipelineExecutor {
                 &ctx.memory_budget,
                 &all,
                 &ctx.streaming_combine_probe_edges,
+                sinks_after_operators,
             )
         };
 

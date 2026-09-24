@@ -71,6 +71,16 @@ pub(crate) fn csv_single_byte(
 /// scheduling reorders the dispatch sequence only when real estimates
 /// distinguish the candidates, and never changes record output, which is
 /// independent of dispatch order.
+///
+/// `sinks_after_operators` is set when document dead-lettering is active
+/// (`dlq_granularity: document`). A Sink candidate is then runnable only
+/// once every non-Sink candidate of the pass has been emitted. This is a
+/// hard constraint applied to the frontier before `next_runnable` ranks
+/// it, so no estimate can move a Sink ahead of an operator: every place
+/// that condemns a document is an operator, and a document's verdict must
+/// be final before any Sink writes one of its records. The plan already
+/// orders Sinks last in `topo_order`; the gate keeps that order when the
+/// freed-bytes rule would otherwise pick a Sink early.
 pub(super) fn scheduled_pass_order(
     plan: &clinker_plan::plan::execution::ExecutionPlanDag,
     arbitrator: &crate::pipeline::memory::MemoryArbitrator,
@@ -79,8 +89,20 @@ pub(super) fn scheduled_pass_order(
         petgraph::graph::NodeIndex,
         petgraph::graph::NodeIndex,
     >,
+    sinks_after_operators: bool,
 ) -> Vec<petgraph::graph::NodeIndex> {
+    use clinker_plan::plan::execution::PlanNode;
     use clinker_plan::plan::scheduling_hint::SchedulingHint;
+
+    let is_sink =
+        |idx: petgraph::graph::NodeIndex| matches!(plan.graph[idx], PlanNode::Sink { .. });
+    // Non-Sink candidates not yet emitted. While any remain, the gate holds
+    // every Sink back.
+    let mut operators_left = if sinks_after_operators {
+        candidates.iter().filter(|&&idx| !is_sink(idx)).count()
+    } else {
+        0
+    };
 
     let mut emitted: HashSet<petgraph::graph::NodeIndex> = HashSet::with_capacity(candidates.len());
     let mut order: Vec<petgraph::graph::NodeIndex> = Vec::with_capacity(candidates.len());
@@ -123,6 +145,7 @@ pub(super) fn scheduled_pass_order(
                     .all(|pred| !candidates.contains(&pred) || emitted.contains(&pred))
             })
             .filter(|&idx| build_ready(idx, &emitted))
+            .filter(|&idx| operators_left == 0 || !is_sink(idx))
             .collect();
 
         // The candidate set is the node set of an acyclic graph, so as
@@ -136,6 +159,9 @@ pub(super) fn scheduled_pass_order(
         );
 
         let chosen = arbitrator.next_runnable(&runnable, hint);
+        if operators_left > 0 && !is_sink(chosen) {
+            operators_left -= 1;
+        }
         emitted.insert(chosen);
         order.push(chosen);
     }

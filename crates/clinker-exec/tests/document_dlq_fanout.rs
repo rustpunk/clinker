@@ -288,3 +288,25 @@ fn dlq_count_counts_each_row_once_across_sinks() {
         "the dead-letter rows name three distinct source rows"
     );
 }
+
+/// `--explain` lists the nodes in the order the run dispatches them, so
+/// under document granularity it lists every Sink after every operator.
+#[test]
+fn explain_lists_every_sink_after_every_operator() {
+    let yaml = sibling_branches();
+    let config = parse_config(&yaml).expect("parse fan-out pipeline");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("compile fan-out pipeline");
+    let text = plan.dag().explain_text(&config);
+
+    let line_of = |needle: &str| {
+        text.lines()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("explain lists {needle:?}:\n{text}"))
+    };
+    let t2 = line_of("transform.t2:");
+    assert!(line_of("sink.out1:") > t2, "sink.out1 follows transform.t2");
+    assert!(line_of("sink.out2:") > t2, "sink.out2 follows transform.t2");
+    insta::assert_snapshot!("explain_sinks_after_operators", text);
+}

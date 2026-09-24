@@ -28,6 +28,7 @@ mod predicate_support;
 mod record_path_validation;
 mod reshape_validation;
 mod route_ports;
+mod sinks_after_operators;
 mod source_activation;
 mod typed_scoped_key;
 mod watermark_validation;
