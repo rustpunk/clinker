@@ -49,6 +49,16 @@ pub enum OpenDisposition {
     Truncate,
 }
 
+/// Access a contained leaf is opened with when it is created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LeafAccess {
+    /// Write only: output the process never reads back.
+    Write,
+    /// Read and write: scratch bytes the process copies elsewhere later
+    /// through the same handle.
+    ReadWrite,
+}
+
 /// Collision behavior for same-filesystem atomic promotion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromotionDisposition {
@@ -204,8 +214,24 @@ impl AnchoredDirectory {
 
     pub(crate) fn create_file(&self, leaf: &str) -> Result<File, ContainmentError> {
         let leaf = checked_child(leaf, &self.path)?;
-        self.anchor
-            .open_leaf(&leaf, OpenDisposition::CreateNew, &self.path.join(&leaf))
+        self.anchor.open_leaf(
+            &leaf,
+            OpenDisposition::CreateNew,
+            LeafAccess::Write,
+            &self.path.join(&leaf),
+        )
+    }
+
+    /// Create a new leaf open for reading and writing, for bytes written now
+    /// and read back later through the returned handle.
+    pub(crate) fn create_read_write_file(&self, leaf: &str) -> Result<File, ContainmentError> {
+        let leaf = checked_child(leaf, &self.path)?;
+        self.anchor.open_leaf(
+            &leaf,
+            OpenDisposition::CreateNew,
+            LeafAccess::ReadWrite,
+            &self.path.join(&leaf),
+        )
     }
 
     pub(crate) fn open_file(&self, leaf: &str) -> Result<File, ContainmentError> {
@@ -354,8 +380,12 @@ impl OutputContainment {
     /// Returns a security-policy error when the leaf is a link/reparse point,
     /// and an I/O error when creation fails for another reason.
     pub fn open(&self, disposition: OpenDisposition) -> Result<File, ContainmentError> {
-        self.parent
-            .open_leaf(&self.leaf, disposition, self.destination.as_path())
+        self.parent.open_leaf(
+            &self.leaf,
+            disposition,
+            LeafAccess::Write,
+            self.destination.as_path(),
+        )
     }
 
     /// Check the final leaf relative to the retained destination handle.
@@ -396,6 +426,7 @@ impl OutputContainment {
             match self.parent.open_leaf(
                 &quarantine_leaf,
                 OpenDisposition::CreateNew,
+                LeafAccess::Write,
                 &quarantine_path,
             ) {
                 Ok(file) => {
@@ -498,7 +529,7 @@ impl OutputContainment {
         for attempt in 0..2 {
             match self
                 .parent
-                .open_leaf(&leaf, OpenDisposition::CreateNew, &path)
+                .open_leaf(&leaf, OpenDisposition::CreateNew, LeafAccess::Write, &path)
             {
                 Ok(mut file) => {
                     if let Err(source) = FileExt::try_lock(&file) {
@@ -1158,7 +1189,7 @@ mod platform {
 
     use super::{
         BoundedEntries, ContainedEntry, ContainedEntryKind, ContainmentError, FilesystemProfile,
-        OpenDisposition, PromotionDisposition,
+        LeafAccess, OpenDisposition, PromotionDisposition,
     };
 
     const CIFS_SUPER_MAGIC: u32 = 0xff53_4d42;
@@ -1258,16 +1289,21 @@ mod platform {
             &self,
             leaf: &OsStr,
             disposition: OpenDisposition,
+            access: LeafAccess,
             display_path: &Path,
         ) -> Result<File, ContainmentError> {
             let creation = match disposition {
                 OpenDisposition::CreateNew => OFlag::O_CREAT | OFlag::O_EXCL,
                 OpenDisposition::Truncate => OFlag::O_CREAT | OFlag::O_TRUNC,
             };
+            let access = match access {
+                LeafAccess::Write => OFlag::O_WRONLY,
+                LeafAccess::ReadWrite => OFlag::O_RDWR,
+            };
             let fd = openat(
                 &self.file,
                 leaf,
-                OFlag::O_WRONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | creation,
+                access | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | creation,
                 Mode::from_bits_truncate(0o600),
             )
             .map_err(|error| leaf_error(display_path, error))?;
@@ -1622,7 +1658,7 @@ mod platform {
 
     use super::{
         BoundedEntries, ContainedEntry, ContainedEntryKind, ContainmentError, FilesystemProfile,
-        OpenDisposition, PromotionDisposition,
+        LeafAccess, OpenDisposition, PromotionDisposition,
     };
 
     #[derive(Debug)]
@@ -1739,6 +1775,7 @@ mod platform {
             &self,
             leaf: &OsStr,
             disposition: OpenDisposition,
+            access: LeafAccess,
             display_path: &Path,
         ) -> Result<File, ContainmentError> {
             let leaf = c_string(leaf, display_path)?;
@@ -1746,13 +1783,17 @@ mod platform {
                 OpenDisposition::CreateNew => libc::O_CREAT | libc::O_EXCL,
                 OpenDisposition::Truncate => libc::O_CREAT | libc::O_TRUNC,
             };
+            let access = match access {
+                LeafAccess::Write => libc::O_WRONLY,
+                LeafAccess::ReadWrite => libc::O_RDWR,
+            };
             // SAFETY: the retained parent fd and NUL-terminated one-component
             // leaf meet `openat`'s contract; success transfers ownership below.
             let fd = unsafe {
                 libc::openat(
                     self.file.as_raw_fd(),
                     leaf.as_ptr(),
-                    libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | creation,
+                    access | libc::O_CLOEXEC | libc::O_NOFOLLOW | creation,
                     0o600,
                 )
             };
@@ -2197,7 +2238,7 @@ mod platform {
 
     use super::{
         BoundedEntries, ContainedEntry, ContainedEntryKind, ContainmentError, FilesystemProfile,
-        OpenDisposition, PromotionDisposition,
+        LeafAccess, OpenDisposition, PromotionDisposition,
     };
 
     #[derive(Debug)]
@@ -2286,6 +2327,9 @@ mod platform {
             &self,
             leaf: &OsStr,
             disposition: OpenDisposition,
+            // Every created leaf is opened for reading and writing here, so
+            // both accesses are met.
+            _access: LeafAccess,
             display_path: &Path,
         ) -> Result<File, ContainmentError> {
             let creation = match disposition {
@@ -2955,7 +2999,8 @@ mod platform {
     use std::path::{Path, PathBuf};
 
     use super::{
-        BoundedEntries, ContainmentError, FilesystemProfile, OpenDisposition, PromotionDisposition,
+        BoundedEntries, ContainmentError, FilesystemProfile, LeafAccess, OpenDisposition,
+        PromotionDisposition,
     };
 
     #[derive(Debug)]
@@ -2985,6 +3030,7 @@ mod platform {
             &self,
             _leaf: &OsStr,
             _disposition: OpenDisposition,
+            _access: LeafAccess,
             _display_path: &Path,
         ) -> Result<File, ContainmentError> {
             Err(ContainmentError::PolicyRequired {

@@ -25,7 +25,7 @@ spill handling, DLQ behavior, metrics/reporting, and runtime I/O handoff.
 - `PipelineExecutor::{explain_plan, explain_plan_dag}`.
 - `executor::{PipelineRunParams, ExecutionReport, WriterRegistry, SourceReaders}`.
 - `executor::single_file_reader`.
-- `dlq::{DlqSink, DlqRowWriter, DiscardingDlqSink, DlqReport}`: the caller-supplied dead-letter seam; the executor streams each dead-lettered row through the sink and the report keeps only counts.
+- `dlq::{DlqSink, DlqRowWriter, DlqPartWriter, DlqPartReceipt, DlqPartSegment, DlqOrigin, DiscardingDlqSink, DlqReport}`: the caller-supplied dead-letter seam; the executor streams each dead-lettered row through the sink; a part writer lets a thread other than the walk write its own parts, which the walk splices into their buckets; and the report keeps only counts.
 - `output::dlq_sink::StagedDlqSink`: the staged-file `DlqSink` the CLI supplies.
 - `source::{RecordSource, SourceInput}`.
 - `executor::storage_validate::{validate_storage_config, ResolvedStorage, StorageValidationError, FreeSpaceWarning, CapHeadroomWarning}`.

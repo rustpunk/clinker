@@ -401,3 +401,54 @@ fn dead_letter_work_unit_reports_records_and_bytes() {
     assert!(signals.bytes > 0, "{signals:?}");
     assert_eq!(signals.spans, vec![SpanStatus::Ok], "{signals:?}");
 }
+
+/// A side thread's part spliced into a bucket counts in that bucket's one
+/// work unit: its rows and bytes join the walk's, and it opens no unit of
+/// its own.
+#[test]
+fn spliced_part_counts_in_the_dead_letter_work_unit() {
+    let root = tempfile::tempdir().expect("destination root");
+    let dlq_path = root.path().join("dlq.csv");
+    let plan = every_row_fails(&dlq_path);
+    let (id, _) = plan
+        .dlq_layout()
+        .expect("a DLQ block yields a layout")
+        .iter()
+        .next()
+        .expect("one bucket");
+    let (producer, receiver) = telemetry();
+    let sink = StagedDlqSink::new(attempt_staging(root.path()), Some(producer));
+    let target = DlqBucketTarget {
+        id,
+        path: &dlq_path,
+        header: b"h\n",
+    };
+
+    let mut part = sink
+        .open_part_writer(DlqOrigin::CombineProbe {
+            node: "join".to_owned(),
+        })
+        .expect("open part writer");
+    part.write_row(&target, b"p1\n").expect("part row");
+    part.write_row(&target, b"p2\n").expect("part row");
+    let receipt = part.close().expect("close part writer");
+    let mut walk = sink.open_walk_writer().expect("open walk writer");
+    walk.write_row(&target, b"w1\n").expect("walk row");
+    for segment in receipt.into_segments() {
+        walk.splice(&target, segment).expect("splice part");
+    }
+    walk.close().expect("close walk writer");
+    assert_eq!(sink.finish().expect("finish")[0].rows, 3);
+
+    let signals = dead_letter_signals(&receiver);
+    assert_eq!(signals.started, 1, "{signals:?}");
+    assert_eq!(signals.completed, 1, "{signals:?}");
+    assert_eq!(signals.failed + signals.interrupted, 0, "{signals:?}");
+    assert_eq!(signals.records, 3, "{signals:?}");
+    assert_eq!(
+        signals.bytes,
+        2 + 3 * 3,
+        "the header and three rows: {signals:?}"
+    );
+    assert_eq!(signals.spans, vec![SpanStatus::Ok], "{signals:?}");
+}

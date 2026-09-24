@@ -4771,7 +4771,7 @@ impl AttemptPublication {
         next.scratch.push(entry);
         self.persist_replacement(next, false)?;
         self.scratch_serial = serial;
-        match self.create_artifact_in_root(&root_key, &scratch_id) {
+        match self.create_scratch_in_root(&root_key, &scratch_id) {
             Ok(file) => {
                 self.scratch_roots.insert(scratch_id.clone(), root_key);
                 Ok((scratch_id, file))
@@ -4845,6 +4845,29 @@ impl AttemptPublication {
             .root
             .directory
             .create_file(leaf)
+            .map_err(AttemptError::from)
+    }
+
+    /// Create a scratch leaf open for reading and writing: its bytes are
+    /// read back through this handle when they are copied where they belong.
+    fn create_scratch_in_root(&self, root_key: &str, leaf: &str) -> Result<File, AttemptError> {
+        if root_key == self.owner_root_key {
+            return self
+                .attempt_root
+                .as_ref()
+                .ok_or(AttemptError::InvalidTransition("attempt root was removed"))?
+                .directory
+                .create_read_write_file(leaf)
+                .map_err(AttemptError::from);
+        }
+        self.additional_roots
+            .get(root_key)
+            .ok_or(AttemptError::InvalidTransition(
+                "destination attempt root is missing",
+            ))?
+            .root
+            .directory
+            .create_read_write_file(leaf)
             .map_err(AttemptError::from)
     }
 

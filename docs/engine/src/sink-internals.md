@@ -151,6 +151,16 @@ artifact count bound. Inventory and purge treat a recorded scratch file in its
 own root as an owned child whose observed size counts toward retained bytes,
 and a complete attempt never records one: publication refuses to start while
 one is recorded.
+Dead-letter parts are scratch files. A dead-letter part writer, owned by one
+thread other than the walk, writes each bucket's rows, without the header, into
+its own scratch file behind a fixed buffer. The walk's dead-letter writer
+splices a closed part into the bucket's staged file at the point where it is
+called: it stages the bucket and writes the header if the walk has not written
+that bucket yet, flushes its own buffered rows, and then copies the part's
+bytes unchanged. The part's scratch file is retired right after the copy. A
+part that is dropped without a splice is retired too. A failed copy fails the
+run with the storage error's kind. The sink's `finish` refuses to report
+artifacts while any part that held rows was never spliced.
 Namespace enumeration is bounded by the publication policy's fixed maximum,
 not the current desired retained count. A configuration downgrade therefore
 still returns physical attempts through advancing continuation tokens while

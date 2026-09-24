@@ -95,7 +95,7 @@ impl AttemptScratchId {
     }
 }
 
-/// One recorded scratch file, open for writing.
+/// One recorded scratch file, open for reading and writing.
 ///
 /// The file lives in the attempt root that stages artifacts for its
 /// destination, and the attempt manifest names it before it exists. It holds

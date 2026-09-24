@@ -4,9 +4,14 @@
 //!
 //! The file is staged, never published, here: a failed or interrupted run
 //! promotes nothing, and publication stays with the owner of the attempt.
+//!
+//! Side threads write into parts instead: one recorded attempt scratch file
+//! per bucket a thread writes, holding rows only. The walk splices each part
+//! into its bucket's staged file by byte copy where the thread's rows belong,
+//! and the part is released at once.
 
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -15,9 +20,10 @@ use clinker_plan::error::PipelineError;
 use clinker_plan::plan::dlq_layout::DlqBucketId;
 
 use super::attempt::ArtifactKind;
-use super::staging::OutputStagingRegistry;
+use super::staging::{AttemptScratchId, OutputStagingRegistry};
 use crate::dlq::{
-    DlqArtifact, DlqBucketTarget, DlqOrigin, DlqPartSegment, DlqPartWriter, DlqRowWriter, DlqSink,
+    DlqArtifact, DlqBucketTarget, DlqOrigin, DlqPartReceipt, DlqPartSegment, DlqPartWriter,
+    DlqRowWriter, DlqSink,
 };
 use crate::pipeline::shutdown::ShutdownToken;
 use crate::telemetry::{DeadLetterSignal, TelemetryProducer};
@@ -42,6 +48,14 @@ const DLQ_PRODUCER_LABEL: &str = "dead-letter output";
 /// the sink keeps only one file handle per closed bucket until
 /// [`DlqSink::finish`].
 ///
+/// A part writer ([`DlqSink::open_part_writer`]) writes each bucket's rows
+/// into one recorded attempt scratch file behind a
+/// [`DLQ_WRITE_BUFFER_BYTES`] buffer, created on that bucket's first row.
+/// [`DlqRowWriter::splice`] on the walk writer copies a part into its
+/// bucket's staged file and retires the scratch file; a part dropped
+/// without a splice retires it too. `finish` refuses while a part that held
+/// rows was never spliced.
+///
 /// With a telemetry producer, each staged bucket file is one dead-letter work
 /// unit: started when the file is staged, completed by `finish`, failed on a
 /// write or flush error, and, when the file is abandoned without `finish`,
@@ -64,12 +78,33 @@ struct UnitConfig {
 }
 
 /// State shared between the sink and its writers. Touched when a writer
-/// opens or closes and at `finish`, never per row.
+/// opens or closes, when a part is created, spliced or released, and at
+/// `finish`, never per row.
 #[derive(Default)]
 struct SinkState {
     open_writers: usize,
     closed: Vec<ClosedBucket>,
     finished: bool,
+    /// Parts created, each holding rows from its first row on.
+    parts_holding_rows: u64,
+    /// Parts whose rows were copied into their bucket.
+    parts_spliced: u64,
+    /// Parts released without a splice, on an error or cancellation path.
+    parts_released_unspliced: u64,
+}
+
+impl UnitConfig {
+    /// The injected part-copy fault, if any.
+    fn copy_fault(&self) -> Option<std::io::ErrorKind> {
+        #[cfg(feature = "test-utils")]
+        {
+            self.copy_fault
+        }
+        #[cfg(not(feature = "test-utils"))]
+        {
+            None
+        }
+    }
 }
 
 /// A bucket file a closed writer handed back, flushed. Dropped without
@@ -252,13 +287,25 @@ impl DlqSink for StagedDlqSink {
     }
 
     fn open_part_writer(&self, origin: DlqOrigin) -> Result<Box<dyn DlqPartWriter>, PipelineError> {
-        Err(sink_invariant(format!(
-            "dead-letter parts are not supported yet ({origin})"
-        )))
+        Ok(Box::new(StagedDlqPartWriter {
+            staging: self.staging.clone(),
+            shared: Arc::clone(&self.shared),
+            label: format!("dead-letter part of {origin}"),
+            parts: Vec::new(),
+            failed: None,
+        }))
     }
 
     fn finish(&self) -> Result<Vec<DlqArtifact>, PipelineError> {
         let mut state = self.state();
+        let unspliced = state.parts_holding_rows.saturating_sub(state.parts_spliced);
+        if unspliced != 0 {
+            return Err(sink_invariant(format!(
+                "{unspliced} dead-letter part(s) holding rows were never spliced \
+                 ({} released without a splice), so their buckets lack rows the run counted",
+                state.parts_released_unspliced
+            )));
+        }
         if state.finished {
             return Err(sink_invariant("finish was called twice"));
         }
@@ -433,12 +480,253 @@ impl DlqRowWriter for StagedDlqRowWriter {
 
     fn splice(
         &mut self,
-        _target: &DlqBucketTarget<'_>,
-        _segment: DlqPartSegment,
+        target: &DlqBucketTarget<'_>,
+        segment: DlqPartSegment,
     ) -> Result<u64, PipelineError> {
-        Err(sink_invariant(
-            "splicing a dead-letter part is not supported yet",
-        ))
+        if let Some(kind) = self.failed {
+            return Err(earlier_write_failed(kind));
+        }
+        if segment.bucket() != target.id {
+            return Err(sink_invariant(format!(
+                "a dead-letter part of bucket {} was spliced into {}",
+                segment.bucket().index(),
+                target.path.display()
+            )));
+        }
+        let rows = segment.rows();
+        // A segment of another sink is released by its own handle here.
+        let Ok(mut part) = segment.into_part::<StagedPart>() else {
+            return Err(sink_invariant(
+                "a dead-letter part from another sink was spliced",
+            ));
+        };
+        if rows == 0 {
+            lock(&self.shared).parts_spliced += 1;
+            part.file.retire()?;
+            return Ok(0);
+        }
+        let copy_fault = self.units.copy_fault();
+        let index = target.id.index();
+        if self.buckets.len() <= index {
+            self.buckets.resize_with(index + 1, || None);
+        }
+        let bucket = match &mut self.buckets[index] {
+            Some(open) => open,
+            slot @ None => match open_bucket(&self.staging, &self.units, target) {
+                Ok(open) => slot.insert(open),
+                Err(error) => {
+                    if let PipelineError::Io(io) = &error {
+                        self.failed = Some(io.kind());
+                    }
+                    return Err(error);
+                }
+            },
+        };
+        // The walk's buffered rows reach the file first; the part's bytes
+        // follow them unbuffered, exactly as the part writer encoded them.
+        let copied = bucket
+            .out
+            .flush()
+            .and_then(|()| copy_part(&mut part, bucket.out.get_mut(), copy_fault));
+        if let Err(error) = copied {
+            // The bucket is incomplete from here on, as after a failed row;
+            // the part is released when it drops below.
+            if let Some(failed) = self.buckets[index].take() {
+                failed.unit.fail();
+            }
+            self.failed = Some(error.kind());
+            return Err(PipelineError::Io(error));
+        }
+        bucket.rows += rows;
+        bucket.unit.record(rows, part.bytes);
+        lock(&self.shared).parts_spliced += 1;
+        // The rows are in place; a part that cannot be released still fails
+        // the run, and its record keeps publication refused.
+        part.file.retire()?;
+        Ok(rows)
+    }
+}
+
+/// Copy all of `part`'s bytes from its start onto `into`. Short of the
+/// bytes the part writer wrote, the copy fails as truncated.
+fn copy_part(
+    part: &mut StagedPart,
+    into: &mut BucketFile,
+    fault: Option<std::io::ErrorKind>,
+) -> std::io::Result<()> {
+    let file = part.file.file.as_mut().ok_or_else(part_released)?;
+    file.seek(SeekFrom::Start(0))?;
+    if let Some(kind) = fault {
+        return Err(std::io::Error::new(
+            kind,
+            "injected dead-letter part copy fault",
+        ));
+    }
+    let copied = std::io::copy(file, into)?;
+    if copied != part.bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!(
+                "a dead-letter part held {copied} bytes where {} were written",
+                part.bytes
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// A side thread's writer of a [`StagedDlqSink`]: one part per bucket it
+/// writes, indexed by bucket, each a recorded attempt scratch file behind a
+/// [`DLQ_WRITE_BUFFER_BYTES`] buffer. After its first I/O failure it
+/// refuses every later row and its close with the same error kind.
+struct StagedDlqPartWriter {
+    staging: OutputStagingRegistry,
+    shared: Arc<Mutex<SinkState>>,
+    /// Names the owning side thread when a part cannot be created.
+    label: String,
+    parts: Vec<Option<OpenPart>>,
+    failed: Option<std::io::ErrorKind>,
+}
+
+struct OpenPart {
+    id: DlqBucketId,
+    out: BufWriter<PartFile>,
+    rows: u64,
+    bytes: u64,
+}
+
+/// A closed part as its segment carries it to the walk.
+struct StagedPart {
+    file: PartFile,
+    /// Bytes the part writer wrote, so a short copy is detected.
+    bytes: u64,
+}
+
+/// A part's recorded scratch file.
+///
+/// Dropped before [`Self::retire`] ran, it releases the part: the
+/// descriptor closes, the scratch file is retired best effort and the part
+/// counts as released without a splice. A failed retirement there is
+/// ignored so it never masks the error that caused the drop; it leaves a
+/// record that cleanup purges with the attempt.
+struct PartFile {
+    file: Option<File>,
+    scratch: Option<AttemptScratchId>,
+    staging: OutputStagingRegistry,
+    shared: Arc<Mutex<SinkState>>,
+}
+
+impl PartFile {
+    /// Close the descriptor, then remove the scratch file and its record.
+    fn retire(&mut self) -> Result<(), PipelineError> {
+        drop(self.file.take());
+        match self.scratch.take() {
+            Some(id) => self.staging.retire_attempt_scratch(&id),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Write for PartFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.file.as_mut().ok_or_else(part_released)?.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.as_mut().ok_or_else(part_released)?.flush()
+    }
+}
+
+impl Drop for PartFile {
+    fn drop(&mut self) {
+        if self.scratch.is_none() {
+            return;
+        }
+        let _ = self.retire();
+        lock(&self.shared).parts_released_unspliced += 1;
+    }
+}
+
+fn part_released() -> std::io::Error {
+    std::io::Error::other("the dead-letter part was already released")
+}
+
+/// Create `target`'s part: one recorded scratch file for its bucket.
+fn open_part(
+    staging: &OutputStagingRegistry,
+    shared: &Arc<Mutex<SinkState>>,
+    label: &str,
+    target: &DlqBucketTarget<'_>,
+) -> Result<OpenPart, PipelineError> {
+    let scratch = staging.create_attempt_scratch(target.path, label)?;
+    lock(shared).parts_holding_rows += 1;
+    let file = PartFile {
+        file: Some(scratch.file),
+        scratch: Some(scratch.id),
+        staging: staging.clone(),
+        shared: Arc::clone(shared),
+    };
+    Ok(OpenPart {
+        id: target.id,
+        out: BufWriter::with_capacity(DLQ_WRITE_BUFFER_BYTES, file),
+        rows: 0,
+        bytes: 0,
+    })
+}
+
+impl DlqPartWriter for StagedDlqPartWriter {
+    fn write_row(&mut self, target: &DlqBucketTarget<'_>, row: &[u8]) -> Result<(), PipelineError> {
+        if let Some(kind) = self.failed {
+            return Err(earlier_write_failed(kind));
+        }
+        let index = target.id.index();
+        if self.parts.len() <= index {
+            self.parts.resize_with(index + 1, || None);
+        }
+        let part = match &mut self.parts[index] {
+            Some(open) => open,
+            slot @ None => match open_part(&self.staging, &self.shared, &self.label, target) {
+                Ok(open) => slot.insert(open),
+                Err(error) => {
+                    if let PipelineError::Io(io) = &error {
+                        self.failed = Some(io.kind());
+                    }
+                    return Err(error);
+                }
+            },
+        };
+        if let Err(error) = part.out.write_all(row) {
+            // The part is incomplete: release it now, so nothing splices it.
+            self.parts[index] = None;
+            self.failed = Some(error.kind());
+            return Err(PipelineError::Io(error));
+        }
+        part.rows += 1;
+        part.bytes += row.len() as u64;
+        Ok(())
+    }
+
+    fn close(self: Box<Self>) -> Result<DlqPartReceipt, PipelineError> {
+        let Self { parts, failed, .. } = *self;
+        if let Some(kind) = failed {
+            return Err(earlier_write_failed(kind));
+        }
+        let mut segments = Vec::with_capacity(parts.iter().flatten().count());
+        // On an error the parts not yet moved, and those already in
+        // `segments`, are released as they drop.
+        for part in parts.into_iter().flatten() {
+            let OpenPart {
+                id,
+                out,
+                rows,
+                bytes,
+            } = part;
+            let file = out
+                .into_inner()
+                .map_err(|error| PipelineError::Io(error.into_error()))?;
+            segments.push(DlqPartSegment::new(id, rows, StagedPart { file, bytes }));
+        }
+        Ok(DlqPartReceipt::new(segments))
     }
 }
 
@@ -475,7 +763,7 @@ mod tests {
 
     use super::*;
     use crate::dlq::DiscardingDlqSink;
-    use crate::output::attempt::{AttemptManifest, AttemptState, RunAttemptPublication};
+    use crate::output::attempt::{AttemptManifest, RunAttemptPublication};
 
     const HEADER: &[u8] = b"_cxl_dlq_id,id\n";
 
@@ -989,6 +1277,8 @@ nodes:\n- type: source\n  name: src_a\n  config:\n    name: src_a\n    type: csv
     #[cfg(feature = "test-utils")]
     #[test]
     fn part_splice_failure_publishes_nothing() {
+        use crate::output::attempt::AttemptState;
+
         let root = tempfile::tempdir().expect("destination root");
         let (attempt, staging, dir) = attempt_run(root.path());
         let (id, _) = two_bucket_ids();
