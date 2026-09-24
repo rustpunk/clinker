@@ -5,7 +5,8 @@
 //! [`DlqEntry`] records into the on-disk CSV shape, which couples to the
 //! pipeline's config and executor types.
 
-use clinker_record::owned_storage::OwnedMap;
+use clinker_record::owned_storage::{OwnedMap, SharedStorage};
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -14,6 +15,244 @@ use clinker_record::{FieldMetadata, Schema, Value};
 
 use crate::executor::DlqEntry;
 use clinker_plan::config::DlqConfig;
+use clinker_plan::error::PipelineError;
+use clinker_plan::plan::dlq_layout::{DlqBucket, DlqLayout, dlq_user_columns};
+
+/// Encodes dead-letter output one row at a time under the header a compiled
+/// [`DlqLayout`] fixed for each bucket.
+///
+/// Holds one reusable CSV writer and output buffer, so encoding a row
+/// allocates nothing beyond the cell text, plus a per-bucket cache mapping
+/// each record schema seen to the header positions of its user columns. The
+/// cache is bounded by the plan: one entry per distinct schema that reaches a
+/// bucket. Returned bytes are valid until the next call. One encoder serves
+/// one layout.
+pub struct DlqRowEncoder {
+    writer: csv::Writer<RowBytes>,
+    out: Vec<u8>,
+    positions: Vec<Vec<SchemaPositions>>,
+}
+
+/// Where each of a bucket's user columns sits in one record schema. The
+/// schema handle is kept so its identity cannot be reused by another schema
+/// while the cache holds it.
+struct SchemaPositions {
+    schema: SharedStorage<Schema>,
+    columns: Vec<Option<usize>>,
+}
+
+/// The CSV writer's sink. The encoder hands its buffer in before a call and
+/// takes it back after the writer flushes, so no allocation moves per row.
+#[derive(Default)]
+struct RowBytes(Cell<Vec<u8>>);
+
+impl Write for RowBytes {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.get_mut().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Default for DlqRowEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DlqRowEncoder {
+    /// A fresh encoder with an empty schema cache.
+    pub fn new() -> Self {
+        Self {
+            // Headers of different buckets differ in length, so the writer
+            // must not hold every record to the first record's field count.
+            writer: csv::WriterBuilder::new()
+                .flexible(true)
+                .from_writer(RowBytes::default()),
+            out: Vec::new(),
+            positions: Vec::new(),
+        }
+    }
+
+    /// The CSV header line of `bucket`, terminator included.
+    pub fn header(&mut self, bucket: &DlqBucket) -> Result<&[u8], PipelineError> {
+        self.begin();
+        self.writer
+            .write_record(bucket.header())
+            .map_err(csv_error)?;
+        self.finish()
+    }
+
+    /// One CSV row for `entry` under `bucket`'s header, terminator included.
+    ///
+    /// The engine columns carry the entry's identity and reason; each user
+    /// column is placed at its header position, and a header column the
+    /// record lacks is an empty cell. A user column of the record that the
+    /// bucket's compiled header does not admit is a planner defect: it returns
+    /// [`PipelineError::Internal`] and writes nothing. Under
+    /// `include_source_row: false` no record column is looked up or formatted.
+    pub fn row(
+        &mut self,
+        layout: &DlqLayout,
+        bucket: &DlqBucket,
+        entry: &DlqEntry,
+    ) -> Result<&[u8], PipelineError> {
+        let Self {
+            writer,
+            out,
+            positions,
+        } = self;
+        // Resolve and check the record's columns before any byte is written,
+        // so a refused row leaves the writer at a record boundary.
+        let columns = if layout.include_source_row() {
+            Some(record_positions(positions, layout, bucket, entry)?)
+        } else {
+            None
+        };
+        let mut buffer = std::mem::take(out);
+        buffer.clear();
+        writer.get_ref().0.set(buffer);
+
+        let record = &entry.original_record;
+        let id = uuid::Uuid::now_v7().to_string();
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        writer.write_field(id).map_err(csv_error)?;
+        writer.write_field(timestamp).map_err(csv_error)?;
+        writer
+            .write_field(source_file_of(entry))
+            .map_err(csv_error)?;
+        writer
+            .write_field(entry.source_name.as_bytes())
+            .map_err(csv_error)?;
+        writer
+            .write_field(entry.source_row.to_string())
+            .map_err(csv_error)?;
+        writer
+            .write_field(entry.triggering_field.as_deref().unwrap_or(""))
+            .map_err(csv_error)?;
+        writer
+            .write_field(
+                entry
+                    .triggering_value
+                    .as_ref()
+                    .map(value_to_string)
+                    .unwrap_or_default(),
+            )
+            .map_err(csv_error)?;
+        if layout.include_reason() {
+            writer
+                .write_field(entry.category.as_str())
+                .map_err(csv_error)?;
+            writer
+                .write_field(entry.error_message.as_bytes())
+                .map_err(csv_error)?;
+        }
+        writer
+            .write_field(entry.stage.as_deref().unwrap_or(""))
+            .map_err(csv_error)?;
+        writer
+            .write_field(entry.route.as_deref().unwrap_or(""))
+            .map_err(csv_error)?;
+        writer
+            .write_field(if entry.trigger { "true" } else { "false" })
+            .map_err(csv_error)?;
+        if let Some(columns) = columns {
+            for column in columns {
+                match column.and_then(|index| record.values().get(index)) {
+                    Some(value) => writer
+                        .write_field(value_to_string(value))
+                        .map_err(csv_error)?,
+                    None => writer.write_field("").map_err(csv_error)?,
+                }
+            }
+        }
+        writer.write_record(None::<&[u8]>).map_err(csv_error)?;
+        writer.flush().map_err(PipelineError::Io)?;
+        *out = writer.get_ref().0.take();
+        Ok(out)
+    }
+
+    fn begin(&mut self) {
+        let mut buffer = std::mem::take(&mut self.out);
+        buffer.clear();
+        self.writer.get_ref().0.set(buffer);
+    }
+
+    fn finish(&mut self) -> Result<&[u8], PipelineError> {
+        self.writer.flush().map_err(PipelineError::Io)?;
+        self.out = self.writer.get_ref().0.take();
+        Ok(&self.out)
+    }
+}
+
+/// The header positions of `entry`'s record columns under `bucket`, from the
+/// cache or resolved and checked once for a schema not seen before.
+fn record_positions<'c>(
+    cache: &'c mut Vec<Vec<SchemaPositions>>,
+    layout: &DlqLayout,
+    bucket: &DlqBucket,
+    entry: &DlqEntry,
+) -> Result<&'c [Option<usize>], PipelineError> {
+    let node = || {
+        entry
+            .stage
+            .clone()
+            .unwrap_or_else(|| entry.source_name.as_ref().to_owned())
+    };
+    let Some(bucket_index) = layout
+        .buckets()
+        .iter()
+        .position(|candidate| std::ptr::eq(candidate, bucket))
+    else {
+        return Err(PipelineError::Internal {
+            op: "dead-letter",
+            node: node(),
+            detail: format!(
+                "bucket {} is not part of the dead-letter layout it was encoded against",
+                bucket.path().display()
+            ),
+        });
+    };
+    if cache.len() < layout.buckets().len() {
+        cache.resize_with(layout.buckets().len(), Vec::new);
+    }
+    let schema = entry.original_record.schema();
+    let per_bucket = &mut cache[bucket_index];
+    if let Some(found) = per_bucket
+        .iter()
+        .position(|cached| SharedStorage::ptr_eq(&cached.schema, schema))
+    {
+        return Ok(&per_bucket[found].columns);
+    }
+    let user_columns = bucket.user_columns();
+    let mut columns = vec![None; user_columns.len()];
+    for (index, name) in dlq_user_columns(schema) {
+        let Some(slot) = user_columns.iter().position(|column| column == name) else {
+            return Err(PipelineError::Internal {
+                op: "dead-letter",
+                node: node(),
+                detail: format!(
+                    "column {name:?} of a dead-lettered record is outside the compiled dead-letter header of {}",
+                    bucket.path().display()
+                ),
+            });
+        };
+        columns[slot] = Some(index);
+    }
+    let slot = per_bucket.len();
+    per_bucket.push(SchemaPositions {
+        schema: schema.clone(),
+        columns,
+    });
+    Ok(&per_bucket[slot].columns)
+}
+
+fn csv_error(error: csv::Error) -> PipelineError {
+    PipelineError::Format(error.into())
+}
 
 /// Write DLQ entries to a CSV writer (DLQ is always CSV per spec §10.4).
 ///
@@ -218,31 +457,6 @@ pub fn partition_dlq_entries<'a>(
     }
 
     buckets
-}
-
-/// Iterator over schema columns that should appear in DLQ output:
-/// user-declared columns, the conditional `_cxl_dlq_source_record` physical-
-/// row capture, plus correlation-lattice columns
-/// (`$ck.<field>`, `$ck.aggregate.<name>`). The `$widened`
-/// `auto_widen` sidecar absorber is filtered out — its
-/// `Value::Map` payload has no canonical scalar serialization and
-/// would silently JSON-encode into a single CSV cell, hiding
-/// routing bugs.
-fn dlq_user_columns(schema: &Schema) -> impl Iterator<Item = (usize, &str)> {
-    schema
-        .columns()
-        .iter()
-        .enumerate()
-        .filter_map(|(i, c)| match schema.field_metadata(i) {
-            Some(FieldMetadata::WidenedSidecar)
-            | Some(FieldMetadata::SourceFile)
-            | Some(FieldMetadata::SourceName)
-            | Some(FieldMetadata::SourceEventTime)
-            | Some(FieldMetadata::ReshapeAudit) => None,
-            Some(FieldMetadata::SourceCorrelation { .. })
-            | Some(FieldMetadata::AggregateGroupIndex { .. })
-            | None => Some((i, c.as_ref())),
-        })
 }
 
 fn value_to_string(value: &Value) -> String {

@@ -3,6 +3,7 @@ pub mod combine;
 pub mod compiled;
 pub mod composition_body;
 pub mod deferred_region;
+pub mod dlq_layout;
 pub mod entity;
 pub mod envelope_synthesis;
 pub mod execution;
@@ -22,6 +23,7 @@ pub use compiled::{ChannelIdentity, CompiledPlan};
 pub use composition_body::{
     BodyScopeId, BodyWindowBinding, BoundBody, CompositionBodyId, WindowRuntimeKey,
 };
+pub use dlq_layout::{DlqBucket, DlqBucketId, DlqLayout};
 pub use entity::{EntityRef, PlanNodeId, SecondaryMap};
 pub use predicate_support::{PredicateSupport, predicate_support};
 pub use row_type::{ColumnLookup, QualifiedField, Row, RowTail, TailVarId};

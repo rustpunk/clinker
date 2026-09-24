@@ -25,6 +25,7 @@
 
 use super::bind_schema::CompileArtifacts;
 use super::composition_body::{BoundBody, CompositionBodies, CompositionBodyId};
+use super::dlq_layout::DlqLayout;
 use super::execution::{ExecutionPlanDag, PlanNode};
 use super::statistics::StatisticsCatalog;
 use crate::config::PipelineConfig;
@@ -194,6 +195,11 @@ pub struct CompiledPlan {
     /// pipeline. The top-level counterpart of [`BoundBody::body_rows`].
     /// Tooling metadata: excluded from `pipeline_hash` and semantic identity.
     output_rows: IndexMap<String, Row>,
+    /// Dead-letter buckets and the header each carries, derived once from the
+    /// final DAG, the composition bodies and `error_handling.dlq`. `None`
+    /// without a DLQ block. Excluded from `pipeline_hash` and semantic
+    /// identity.
+    dlq_layout: Option<DlqLayout>,
     /// Complete immutable CXL module closure captured during planning.
     cxl_modules: CompiledModuleRegistry,
 }
@@ -226,6 +232,15 @@ impl CompiledPlan {
             schema_provenance.seed_base(name, schema);
         }
         assign_provenance_scopes(&dag, &composition_bodies, &mut provenance);
+        // Every structural rewrite, body binding and deferred-region
+        // detection has run by now, so the layout reads the schemas the
+        // runtime carries.
+        let dlq_layout = DlqLayout::derive(
+            &dag,
+            &composition_bodies,
+            config.error_handling.dlq.as_ref(),
+            config.error_handling.strategy,
+        );
         Self {
             dag,
             config,
@@ -237,6 +252,7 @@ impl CompiledPlan {
             bound_schemas,
             schema_provenance,
             output_rows,
+            dlq_layout,
             cxl_modules,
         }
     }
@@ -338,6 +354,18 @@ impl CompiledPlan {
     /// declaration order. See [`Self::output_row`] for which nodes appear.
     pub fn output_rows(&self) -> &IndexMap<String, Row> {
         &self.output_rows
+    }
+
+    /// Dead-letter layout of this pipeline: every bucket, the rule that
+    /// routes a dead-lettered row to one, and the CSV header each bucket
+    /// carries, fixed at compile time from the final plan.
+    ///
+    /// `None` when the pipeline declares no `error_handling.dlq` block. A
+    /// bucket's header does not depend on which rows fail at runtime. The
+    /// layout is tooling and runtime metadata: excluded from `pipeline_hash`
+    /// and semantic identity.
+    pub fn dlq_layout(&self) -> Option<&DlqLayout> {
+        self.dlq_layout.as_ref()
     }
 
     /// Per-attribute source-schema provenance, queried by `explain --field

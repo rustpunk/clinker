@@ -1349,6 +1349,13 @@ pub const WIDENED_SIDECAR_COLUMN: &str = "$widened";
 /// merges instead of via an external row-keyed array.
 pub const SOURCE_FILE_COLUMN: &str = "$source.file";
 
+/// Stable column name for the decoded physical row a source rejection
+/// captures. Every source-rejection schema carries it after the reader
+/// columns: Null for a declared-type failure, the raw row for an undeclared
+/// discriminator or a fan-out ceiling breach. It is a dead-letter user column,
+/// so the compiled DLQ header admits it wherever a Source can reject.
+pub const SOURCE_RAW_RECORD_COLUMN: &str = "_cxl_dlq_source_record";
+
 /// Stable column name for the per-record Source-node identity stamp.
 /// Every Source's bound schema carries one such tail-appended slot;
 /// ingest stamps a shared `Arc<str>` of the originating Source's name

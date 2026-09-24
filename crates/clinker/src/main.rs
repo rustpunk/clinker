@@ -3911,27 +3911,35 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
     // configured (pipeline-wide or per-source). Same atomic
     // temp+rename discipline as primary outputs above — operators
     // inspecting DLQ output should never see a truncated file.
-    // Per-source `path:` overrides partition entries into separate
-    // sidecar files; entries from sources without an override fall
-    // through to `dlq_config.path` (the pipeline-wide sink).
+    // The compiled plan's dead-letter layout owns the bucket rule and each
+    // bucket's header: per-source `path:` overrides get their own file,
+    // sources without one fall through to the pipeline-wide file, and every
+    // file carries the header fixed at compile time whatever failed.
     let publication_preparation = (|| -> Result<(), PipelineError> {
         if report.interrupted {
             return Ok(());
         }
         if !dlq_entries.is_empty()
-            && let Some(ref dlq_config) = pipeline_config.error_handling.dlq
+            && let Some(layout) = compiled_plan.dlq_layout()
         {
-            let buckets = clinker_exec::dlq::partition_dlq_entries(dlq_entries, dlq_config);
-            if buckets.is_empty() {
-                return Ok(());
+            // Route each entry through the compiled bucket rule, keeping
+            // arrival order within a bucket. An entry with no bucket has no
+            // destination and is not written.
+            let mut bucket_entries: Vec<Vec<&clinker_exec::executor::DlqEntry>> =
+                vec![Vec::new(); layout.buckets().len()];
+            for entry in dlq_entries {
+                if let Some(id) = layout.bucket_for_source(&entry.source_name) {
+                    bucket_entries[id.index()].push(entry);
+                }
             }
-            let include_reason = dlq_config.include_reason.unwrap_or(true);
-            let include_source_row = dlq_config.include_source_row.unwrap_or(true);
-            for (target_path, bucket_entries) in &buckets {
-                if bucket_entries.is_empty() {
+            use std::io::Write as _;
+            let mut encoder = clinker_exec::dlq::DlqRowEncoder::new();
+            for (bucket, entries) in layout.buckets().iter().zip(&bucket_entries) {
+                // No file for a bucket nothing failed into.
+                if entries.is_empty() {
                     continue;
                 }
-                let bare = target_path.clone();
+                let bare = bucket.path().to_path_buf();
                 let (_final_path, dlq_handle) = output_staging.stage_attempt_output(
                     clinker_exec::output::attempt::ArtifactKind::Dlq,
                     "dead-letter output",
@@ -3942,15 +3950,14 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                         Ok(bare.clone())
                     },
                 )?;
-                let owned: Vec<clinker_exec::executor::DlqEntry> =
-                    bucket_entries.iter().map(|e| (*e).clone()).collect();
-                clinker_exec::dlq::write_dlq(
-                    dlq_handle,
-                    &owned,
-                    include_reason,
-                    include_source_row,
-                )
-                .map_err(PipelineError::Format)?;
+                let mut file = std::io::BufWriter::with_capacity(64 * 1024, dlq_handle);
+                file.write_all(encoder.header(bucket)?)
+                    .map_err(PipelineError::Io)?;
+                for entry in entries {
+                    file.write_all(encoder.row(layout, bucket, entry)?)
+                        .map_err(PipelineError::Io)?;
+                }
+                file.flush().map_err(PipelineError::Io)?;
             }
         }
         for output in pipeline_config.sink_configs() {

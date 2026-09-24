@@ -93,7 +93,7 @@ first match wins and the `default:` catches the rest.
 
 ## Reading the DLQ
 
-`output/rejected.csv` has 6 rows and 20 columns. The engine-stamped ones carry
+`output/rejected.csv` has 6 rows and 23 columns. The engine-stamped ones carry
 the diagnosis — this is the first entry:
 
 | column | value |
@@ -106,9 +106,17 @@ the diagnosis — this is the first entry:
 The original record follows in full, so a rejected row can be corrected and
 replayed without going back to the source system.
 
+The columns after the engine-stamped ones are fixed by the pipeline, not by
+which rows happened to fail: they are every column a record can carry at any
+step that is able to dead-letter it. Here that is the eight source columns, then
+`_cxl_dlq_source_record` (filled only when the source itself rejects a row it
+could not read), then `priority` and `sla_breached` (the `normalize` output the
+`triage` route could reject). These six rows failed in `normalize`, so those
+last three cells are empty.
+
 In the committed golden the first two columns read `<volatile>`. Every DLQ entry
 carries a fresh UUID and a wall-clock timestamp, which cannot be byte-compared;
-the test harness blanks exactly those two and compares the other eighteen
+the test harness blanks exactly those two and compares the other twenty-one
 verbatim. See the [corpus README](../README.md#determinism).
 
 ## Try changing it
