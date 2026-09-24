@@ -582,12 +582,15 @@ impl DocumentDlqState {
     /// row `bytes` (`None` when the row has no destination) behind `row`'s
     /// header, marking the document failed if this is its first failure.
     ///
-    /// The frame, and on a first failure the document's slot and index
-    /// entry, are preflighted against the hard limit, flushing every held
-    /// tail first if they do not fit. After the append the arbitrator's
-    /// signals are polled: the consumer's election every time, the soft
-    /// threshold every `batch_size` appends. `node` is the failing node, for
-    /// E310 and for the spill attribution of any flush.
+    /// Before the row is held the arbitrator's signals are polled: the
+    /// consumer's election every time, the soft threshold every `batch_size`
+    /// holds; either flushes every held tail. Then the frame, and on a first
+    /// failure the document's slot and index entry, are preflighted against
+    /// the hard limit, flushing every held tail first if they do not fit.
+    /// Between two polls the resident tails grow by at most one batch of
+    /// holds past the soft threshold; the hard limit is checked on every
+    /// hold. `node` is the failing node, for E310 and for the spill
+    /// attribution of any flush.
     ///
     /// # Errors
     ///
@@ -615,6 +618,11 @@ impl DocumentDlqState {
         node: &str,
         frame: &mut Vec<u8>,
     ) -> Result<(), PipelineError> {
+        self.held.relieve(
+            &self.arbitrator,
+            node,
+            self.appends.is_multiple_of(self.batch_size),
+        )?;
         self.names.encode(frame, row, bytes)?;
         let first = !self.failed.contains_key(&key);
         let extra = if first { FAILED_DOCUMENT_BYTES } else { 0 };
@@ -636,11 +644,6 @@ impl DocumentDlqState {
         );
         self.arbitrator.sample_peak_consumer_usage();
         self.appends += 1;
-        self.held.relieve(
-            &self.arbitrator,
-            node,
-            self.appends.is_multiple_of(self.batch_size),
-        )?;
         Ok(())
     }
 
@@ -872,7 +875,8 @@ fn held_frame_error(detail: &str) -> PipelineError {
 /// that cannot be relieved is refused at the hard limit with E310.
 ///
 /// No producer feeds the state that the arbitrator could pause, so
-/// `can_back_pressure` is false and the consumer is never paused.
+/// `can_back_pressure` is false and the consumer is never paused: there is
+/// nothing for it to wait on while paused.
 struct DocumentDlqConsumer {
     handle: Arc<ConsumerHandle>,
     /// The held log's resident frame bytes.
