@@ -352,3 +352,151 @@ fn preview_exit_code_reflects_dead_letters() {
         "a preview publishes nothing"
     );
 }
+
+/// `src → ratio → split → {high, low}`: `ratio` fails on a row whose
+/// `amount` is zero, and `split`'s condition fails on a row whose `d` is
+/// zero. One source and no interleave, so the row order is fixed by the
+/// input: the walk dispatches node by node, so the Transform's failures
+/// come first, in input order, then the Route's. `input` is the source file.
+fn transform_and_route_failures(input: &Path) -> String {
+    format!(
+        r#"pipeline:
+  name: dlq_determinism
+error_handling:
+  strategy: continue
+  dlq:
+    path: rejects.csv
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: '{}'
+    type: csv
+    schema:
+      - {{ name: id, type: int }}
+      - {{ name: amount, type: int }}
+      - {{ name: d, type: int }}
+- type: transform
+  name: ratio
+  input: src
+  config:
+    cxl: |
+      emit id = id
+      emit d = d
+      emit ratio = id / amount
+- type: route
+  name: split
+  input: ratio
+  config:
+    conditions:
+      high: 100 / d > 10
+    default: low
+- type: sink
+  name: high
+  input: split
+  config:
+    name: high
+    path: high.csv
+    type: csv
+- type: sink
+  name: low
+  input: split
+  config:
+    name: low
+    path: low.csv
+    type: csv
+"#,
+        input.display()
+    )
+}
+
+/// Transform failures on rows 2, 5 and 9; route failures on rows 3, 7 and 8.
+const DETERMINISM_INPUT: &str = "id,amount,d\n\
+1,1,5\n2,0,5\n3,3,0\n4,4,20\n5,0,1\n6,6,2\n7,7,0\n8,8,0\n9,0,4\n10,10,50\n";
+
+/// The bytes of the DLQ file at `path` with every `_cxl_dlq_id` and
+/// `_cxl_dlq_timestamp` cell replaced by a fixed placeholder, and how many
+/// data rows it has.
+///
+/// Each cell is found by parsing the file under its own header, so the
+/// columns are located by name. Each parsed value is then replaced in the
+/// raw bytes, after checking it occurs there exactly as often as in those
+/// cells, so no other byte of the file can be rewritten. Every id must be a
+/// version-7 UUID and every timestamp RFC 3339.
+fn masked_dead_letters(path: &Path) -> (Vec<u8>, usize) {
+    let ids = column_values(path, "_cxl_dlq_id");
+    let timestamps = column_values(path, "_cxl_dlq_timestamp");
+    assert_eq!(ids.len(), timestamps.len());
+    let mut bytes = std::fs::read_to_string(path).expect("read DLQ");
+    for id in &ids {
+        let parsed = uuid::Uuid::parse_str(id).unwrap_or_else(|e| panic!("{id:?}: {e}"));
+        assert_eq!(parsed.get_version_num(), 7, "{id} is a version-7 UUID");
+        assert_eq!(bytes.matches(id.as_str()).count(), 1, "{id} occurs once");
+        bytes = bytes.replace(id.as_str(), "<id>");
+    }
+    let mut distinct = timestamps.clone();
+    distinct.sort();
+    distinct.dedup();
+    for timestamp in &distinct {
+        chrono::DateTime::parse_from_rfc3339(timestamp)
+            .unwrap_or_else(|e| panic!("{timestamp:?} is RFC 3339: {e}"));
+        let cells = timestamps.iter().filter(|t| *t == timestamp).count();
+        assert_eq!(
+            bytes.matches(timestamp.as_str()).count(),
+            cells,
+            "{timestamp} occurs only in its timestamp cells"
+        );
+        bytes = bytes.replace(timestamp.as_str(), "<timestamp>");
+    }
+    (bytes.into_bytes(), ids.len())
+}
+
+#[test]
+fn two_runs_produce_identical_dlq_bytes_modulo_id_and_timestamp() {
+    // Both runs read the same input file, whose path is recorded in every
+    // row's `_cxl_dlq_source_file`; each run publishes into its own directory.
+    let inputs = tempfile::tempdir().expect("input tempdir");
+    let input = inputs.path().join("input.csv");
+    std::fs::write(&input, DETERMINISM_INPUT).expect("write input");
+    let pipeline = transform_and_route_failures(&input);
+    let mut runs = Vec::new();
+    for _ in 0..2 {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = run_clinker(dir.path(), &pipeline, &[], &["--allow-absolute-paths"]);
+        assert_eq!(output.status.code(), Some(2), "{}", describe(&output));
+        let path = dir.path().join("rejects.csv");
+        let raw = std::fs::read(&path).expect("DLQ file published");
+        assert_eq!(
+            column_values(&path, "id"),
+            ["2", "5", "9", "3", "7", "8"],
+            "one row per failure, in dispatch order"
+        );
+        assert_eq!(
+            column_values(&path, "_cxl_dlq_stage"),
+            [
+                "transform:ratio",
+                "transform:ratio",
+                "transform:ratio",
+                "route_eval",
+                "route_eval",
+                "route_eval"
+            ],
+            "both Transform and Route failures are dead-lettered"
+        );
+        runs.push((raw, masked_dead_letters(&path)));
+    }
+    let (first_raw, (first, rows)) = &runs[0];
+    let (second_raw, (second, _)) = &runs[1];
+    assert_eq!(*rows, 6);
+    assert_ne!(
+        first_raw, second_raw,
+        "each run stamps its own ids, so the raw files differ"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(first),
+        String::from_utf8_lossy(second),
+        "the files are byte-identical once ids and timestamps are masked"
+    );
+    assert_eq!(first, second);
+}
