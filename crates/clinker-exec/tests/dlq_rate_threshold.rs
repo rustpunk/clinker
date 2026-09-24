@@ -324,6 +324,143 @@ error_handling:
     assert_eq!(report.counters.dlq_count, 5);
 }
 
+/// Whether the compiled plan streams `node`'s output into its consumer
+/// rather than materializing it in a node buffer. The runtime dispatcher
+/// reads the same verdict to pick the Sink's write arm.
+fn streams(plan: &clinker_plan::plan::CompiledPlan, node: &str) -> bool {
+    use clinker_plan::plan::execution::{StreamClass, classify_stream_nodes};
+    let dag = plan.dag();
+    let idx = dag
+        .graph
+        .node_indices()
+        .find(|&idx| dag.graph[idx].name() == node)
+        .unwrap_or_else(|| panic!("{node} is a plan node"));
+    classify_stream_nodes(dag, plan.config())[&idx] == StreamClass::Streaming
+}
+
+/// A dead letter the buffered Sink arm cannot place stops the run at that
+/// Sink, exactly as a refusal anywhere else in the walk does.
+///
+/// `orders -> widen -> out` sorts, so `out` writes on the buffered arm, and
+/// row 1's `tags` holds the CSV join delimiter: its collision dead letter is
+/// 1 of 2 records against `max_rate: 0.4`, so the funnel refuses it with
+/// E315. `ledger` is a second sorted Sink on `widen` that excludes `tags`,
+/// so it has nothing to collide on and would write both rows. It sits after
+/// `out` in the plan's topological order, which the scheduler follows when no
+/// volume estimate separates the two; the test asserts that premise. The
+/// breach is the run's error, and `ledger` never runs: its writer receives
+/// no byte.
+#[test]
+fn buffered_sink_rate_breach_stops_the_run() {
+    const PIPELINE: &str = r#"
+pipeline:
+  name: buffered_sink_rate_breach
+error_handling:
+  strategy: continue
+  dlq:
+    path: dlq.csv
+    min_records: 1
+    max_rate: 0.4
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: json
+      path: in.json
+      schema:
+        - { name: order_id, type: string }
+        - { name: tags, type: string, multiple: true }
+  - type: transform
+    name: widen
+    input: orders
+    config:
+      cxl: |
+        emit order_id = order_id
+        emit tags = tags
+  - type: sink
+    name: ledger
+    input: widen
+    config:
+      name: ledger
+      type: csv
+      path: ledger.csv
+      sort_order: [order_id]
+      exclude: [tags]
+  - type: sink
+    name: out
+    input: widen
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      sort_order: [order_id]
+"#;
+    const INPUT: &str =
+        r#"[{"order_id":"1","tags":["a;b","c"]},{"order_id":"2","tags":["x","y"]}]"#;
+
+    let plan = parse_config(PIPELINE)
+        .unwrap()
+        .compile(&CompileContext::default())
+        .unwrap();
+    assert!(
+        !streams(&plan, "widen"),
+        "both sorted Sinks take the buffered arm"
+    );
+    let topo_position = |node: &str| {
+        let dag = plan.dag();
+        dag.topo_order
+            .iter()
+            .position(|&idx| dag.graph[idx].name() == node)
+            .unwrap_or_else(|| panic!("{node} is in the topological order"))
+    };
+    assert!(
+        topo_position("out") < topo_position("ledger"),
+        "`ledger` is dispatched after `out`"
+    );
+
+    let readers: SourceReaders = HashMap::from([(
+        "orders".to_string(),
+        clinker_exec::executor::single_file_reader(
+            "in.json",
+            Box::new(Cursor::new(INPUT.as_bytes().to_vec())),
+        ),
+    )]);
+    let out = SharedBuffer::new();
+    let ledger = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([
+        ("out".to_string(), writer(&out)),
+        ("ledger".to_string(), writer(&ledger)),
+    ]);
+
+    let err = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        dlq_sink::discarding_registry(writers),
+        &run_params(),
+    )
+    .expect_err("the collision dead letter breaches max_rate 0.4 and halts the run");
+    match err {
+        PipelineError::DlqRateExceeded {
+            source,
+            max_rate,
+            observed_count,
+            total_count,
+            ..
+        } => {
+            assert!(source.is_none(), "E315 carries source: None");
+            assert_eq!(max_rate, 0.4);
+            assert_eq!((observed_count, total_count), (1, 2));
+        }
+        other => panic!("expected E315 DlqRateExceeded(pipeline-wide), got: {other:?}"),
+    }
+    assert!(
+        ledger.contents().is_empty(),
+        "no node runs after the breach; ledger received: {:?}",
+        String::from_utf8_lossy(&ledger.contents())
+    );
+}
+
 /// AC4: a per-source `path:` routes that Source's dead-lettered rows to a
 /// sidecar file of their own, while a Source without an override falls
 /// through to the pipeline-wide file. Routing is the compiled plan's

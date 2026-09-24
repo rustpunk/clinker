@@ -1382,6 +1382,80 @@ fn sink_join_values_collision_streaming() {
     assert_join_values_collision(&files);
 }
 
+/// A rate-ceiling breach on the buffered arm stops the run at the Sink that
+/// breached. `widen` feeds two sorted Sinks, both of which collide on row 1;
+/// the first collision is 1 of 2 records against `max_rate: 0.4`. The run
+/// exits 3 with the one E315 diagnostic: the second Sink never runs, so its
+/// collision cannot breach again and fold both into a combined error.
+#[test]
+fn buffered_sink_rate_breach_exits_with_the_rate_ceiling() {
+    const PIPELINE: &str = r#"pipeline:
+  name: dlq_buffered_rate_breach
+error_handling:
+  strategy: continue
+  dlq:
+    path: '{dir}/rejects.csv'
+    min_records: 1
+    max_rate: 0.4
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    type: json
+    path: in.json
+    schema:
+      - { name: order_id, type: string }
+      - { name: tags, type: string, multiple: true }
+- type: transform
+  name: widen
+  input: orders
+  config:
+    cxl: |
+      emit order_id = order_id
+      emit tags = tags
+- type: sink
+  name: first
+  input: widen
+  config:
+    name: first
+    type: csv
+    path: first.csv
+    sort_order: [order_id]
+- type: sink
+  name: second
+  input: widen
+  config:
+    name: second
+    type: csv
+    path: second.csv
+    sort_order: [order_id]
+"#;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let yaml = render(PIPELINE, dir.path());
+    write_inputs(dir.path(), &[("in.json", JOIN_VALUES_INPUT)]);
+    let plan = compile(dir.path(), &yaml);
+    assert!(
+        !streams(&plan, "widen"),
+        "both sorted Sinks take the buffered arm"
+    );
+
+    let output = run_clinker(dir.path(), &yaml);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "a rate-ceiling breach exits 3.\n{}",
+        describe(&output)
+    );
+    assert_eq!(
+        stderr.matches("E315").count(),
+        1,
+        "the run reports the one breach that stopped it.\n{}",
+        describe(&output)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Correlation buffer (sites 5-7)
 // ---------------------------------------------------------------------------
