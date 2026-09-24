@@ -208,6 +208,12 @@ fn cell<'a>(row: &'a Row, column: &str) -> &'a str {
         .unwrap_or_else(|| panic!("{column} is a header column; row: {row:?}"))
 }
 
+/// The failure a row belongs to: the `_cxl_dlq_id` of that failure's
+/// trigger row.
+fn failure_id(row: &Row) -> &str {
+    cell(row, "_cxl_dlq_failure_id")
+}
+
 /// The one file of a single-bucket run, holding `rows` rows.
 fn only_file(files: &[DlqFile], rows: usize) -> &DlqFile {
     assert_eq!(files.len(), 1, "one dead-letter file is published");
@@ -483,6 +489,13 @@ nodes:
         "the row carries the Transform's own input schema"
     );
     assert_eq!(cell(row, "_cxl_dlq_source_record"), "");
+    for row in &dlq.rows {
+        assert_eq!(
+            failure_id(row),
+            cell(row, "_cxl_dlq_id"),
+            "a failure that wrote one row carries its own id: {row:?}"
+        );
+    }
 }
 
 #[test]
@@ -1054,6 +1067,24 @@ nodes:
         "the build file admits no probe column: {}",
         build.header_line
     );
+
+    let driver_row = &probe.rows[0];
+    let build_row = &build.rows[0];
+    assert_eq!(
+        failure_id(driver_row),
+        cell(driver_row, "_cxl_dlq_id"),
+        "the driver row is the failure's trigger: {driver_row:?}"
+    );
+    assert_eq!(
+        failure_id(build_row),
+        cell(driver_row, "_cxl_dlq_id"),
+        "the build row pairs with the driver row of the same failure: {build_row:?}"
+    );
+    assert_ne!(
+        cell(build_row, "_cxl_dlq_id"),
+        cell(driver_row, "_cxl_dlq_id"),
+        "the build row has its own id"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1423,6 +1454,12 @@ nodes:
         "the trigger carries the failing Transform's input schema"
     );
 
+    assert_eq!(
+        failure_id(trigger),
+        cell(trigger, "_cxl_dlq_id"),
+        "the trigger carries its own id: {trigger:?}"
+    );
+
     let collateral: Vec<&Row> = dlq
         .rows
         .iter()
@@ -1431,6 +1468,12 @@ nodes:
     assert_eq!(collateral.len(), 2, "{:?}", dlq.rows);
     for row in collateral {
         assert_eq!(cell(row, "_cxl_dlq_error_category"), "correlated");
+        assert_eq!(
+            failure_id(row),
+            cell(trigger, "_cxl_dlq_id"),
+            "a collateral pairs with its group's first trigger: {row:?}"
+        );
+        assert_ne!(cell(row, "_cxl_dlq_id"), cell(trigger, "_cxl_dlq_id"));
         assert_eq!(cell(row, "emp_id"), "A");
         assert!(
             !cell(row, "val").is_empty(),
@@ -1504,10 +1547,30 @@ nodes:
         .filter(|row| cell(row, "_cxl_dlq_trigger") == "true")
         .collect();
     assert_eq!(triggers.len(), 1, "{:?}", dlq.rows);
+    let overflow = triggers[0];
     assert_eq!(
-        cell(triggers[0], "_cxl_dlq_error_category"),
+        cell(overflow, "_cxl_dlq_error_category"),
         "group_size_exceeded"
     );
+    assert_eq!(
+        failure_id(overflow),
+        cell(overflow, "_cxl_dlq_id"),
+        "the overflow row carries its own id: {overflow:?}"
+    );
+    let collateral: Vec<&Row> = dlq
+        .rows
+        .iter()
+        .filter(|row| cell(row, "_cxl_dlq_trigger") != "true")
+        .collect();
+    assert_eq!(collateral.len(), 4, "{:?}", dlq.rows);
+    for row in collateral {
+        assert_eq!(cell(row, "_cxl_dlq_error_category"), "correlated");
+        assert_eq!(
+            failure_id(row),
+            cell(overflow, "_cxl_dlq_id"),
+            "an overflowed row pairs with the group_size_exceeded row: {row:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1591,7 +1654,13 @@ nodes:
         .filter(|row| cell(row, "_cxl_dlq_trigger") == "true")
         .collect();
     assert_eq!(triggers.len(), 1, "{:?}", dlq.rows);
-    assert_eq!(cell(triggers[0], "id"), "2");
+    let trigger = triggers[0];
+    assert_eq!(cell(trigger, "id"), "2");
+    assert_eq!(
+        failure_id(trigger),
+        cell(trigger, "_cxl_dlq_id"),
+        "the document trigger carries its own id: {trigger:?}"
+    );
     assert_eq!(
         cell(triggers[0], "marker"),
         "widened",
@@ -1605,6 +1674,12 @@ nodes:
         assert!(
             !cell(row, "val").is_empty(),
             "a collateral row carries the Sink's input schema: {row:?}"
+        );
+        assert_eq!(cell(row, "_cxl_dlq_error_category"), "document_rejected");
+        assert_eq!(
+            failure_id(row),
+            cell(trigger, "_cxl_dlq_id"),
+            "a rejected document's other records pair with its trigger: {row:?}"
         );
     }
     assert!(
