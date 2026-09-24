@@ -254,9 +254,15 @@ pub(crate) fn source_name_arc_of(record: &Record) -> Arc<str> {
     }
 }
 
-/// Push a [`DlqEntry`] to the run-scoped DLQ vector, increment both the
-/// pipeline-wide and per-source DLQ counters, then check the configured
-/// rate ceilings. Returns [`PipelineError::DlqRateExceeded`] (E315 or
+/// Count one dead letter, write its row into its bucket, then check the
+/// configured rate ceilings, in that order.
+///
+/// Counting first and checking last means the row that trips a ceiling is
+/// itself counted and written, and the diagnostic's observed count equals
+/// the rows counted. The row is encoded under its bucket's compiled header
+/// and written through the walk's [`DlqRowWriter`](crate::dlq::DlqRowWriter)
+/// before this returns; an entry whose source has no bucket is counted and
+/// never formatted. Returns [`PipelineError::DlqRateExceeded`] (E315 or
 /// E316) when the per-source ratio crosses
 /// `error_handling.dlq.per_source.<name>.max_rate` or the pipeline-wide
 /// ratio crosses `error_handling.dlq.max_rate`. Per-source > pipeline-wide
@@ -279,8 +285,134 @@ pub(crate) fn push_dlq(
     *ctx.dlq_per_source
         .entry(Arc::clone(&source_name))
         .or_insert(0) += 1;
-    ctx.dlq_entries.push(entry);
+    ctx.dlq
+        .report
+        .record(entry.stage.as_deref(), entry.category);
+    ctx.dlq.write(&entry)?;
+    ctx.dlq_entries.push(entry); // Removed when the executor test suite reads the DLQ sink.
     check_dlq_rate(ctx, &source_name)
+}
+
+/// The walk thread's dead-letter output: the compiled layout, each bucket's
+/// header encoded once, the row encoder, the walk's writer, and the run's
+/// counters.
+///
+/// Holds no rows or entries. Its size is fixed by the plan: one header per
+/// bucket, the encoder's reusable buffers and per-schema position cache, and
+/// the writer's fixed buffer per open bucket. Owned by the walk thread only.
+pub(crate) struct DlqWalkState<'a> {
+    /// The compiled layout; `None` when the pipeline has no dead-letter block.
+    layout: Option<&'a clinker_plan::plan::dlq_layout::DlqLayout>,
+    /// Each bucket's CSV header line, indexed by bucket id.
+    headers: Vec<Vec<u8>>,
+    encoder: crate::dlq::DlqRowEncoder,
+    writer: DlqWalkWriter,
+    /// Rows per stage and category, and rows written per bucket.
+    pub(crate) report: crate::dlq::DlqReport,
+}
+
+/// Where the walk's writer is in its life.
+enum DlqWalkWriter {
+    /// The run has no layout or its caller supplied no sink: rows are counted
+    /// and never written.
+    Absent,
+    Open(Box<dyn crate::dlq::DlqRowWriter>),
+    /// Closed at the end of the walk; no row may arrive after this.
+    Closed,
+}
+
+impl<'a> DlqWalkState<'a> {
+    /// Encode every bucket's header and open the walk's writer from `sink`
+    /// when the plan has a layout and the caller supplied a sink. Opens no
+    /// file: a bucket's file is staged by the sink on its first row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError`] when a header cannot be encoded or the sink
+    /// refuses a writer.
+    pub(crate) fn open(
+        layout: Option<&'a clinker_plan::plan::dlq_layout::DlqLayout>,
+        sink: Option<&dyn crate::dlq::DlqSink>,
+    ) -> Result<Self, PipelineError> {
+        let mut encoder = crate::dlq::DlqRowEncoder::new();
+        let headers = match layout {
+            Some(layout) => layout
+                .buckets()
+                .iter()
+                .map(|bucket| encoder.header(bucket).map(<[u8]>::to_vec))
+                .collect::<Result<Vec<_>, _>>()?,
+            None => Vec::new(),
+        };
+        let writer = match (layout, sink) {
+            (Some(_), Some(sink)) => DlqWalkWriter::Open(sink.open_walk_writer()?),
+            _ => DlqWalkWriter::Absent,
+        };
+        Ok(Self {
+            layout,
+            headers,
+            encoder,
+            writer,
+            report: crate::dlq::DlqReport::default(),
+        })
+    }
+
+    /// Encode `entry` under its bucket's header and write it, then count the
+    /// row against the bucket. An entry whose source has no bucket, or a run
+    /// with no writer, writes nothing. May block on the sink's file I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError::Internal`] when the record carries a column
+    /// its bucket's compiled header does not admit, or when a row arrives
+    /// after [`Self::close`]; any write error of the sink is returned as is.
+    fn write(&mut self, entry: &DlqEntry) -> Result<(), PipelineError> {
+        let Some(layout) = self.layout else {
+            return Ok(());
+        };
+        let Some(id) = layout.bucket_for_source(&entry.source_name) else {
+            return Ok(());
+        };
+        let writer = match &mut self.writer {
+            DlqWalkWriter::Absent => return Ok(()),
+            DlqWalkWriter::Open(writer) => writer,
+            DlqWalkWriter::Closed => {
+                return Err(PipelineError::Internal {
+                    op: "dead-letter-write",
+                    node: entry.stage.clone().unwrap_or_default(),
+                    detail: "a dead-letter row arrived after the walk closed its writer"
+                        .to_string(),
+                });
+            }
+        };
+        let bucket = layout.bucket(id);
+        let row = self.encoder.row(layout, bucket, entry)?;
+        let target = crate::dlq::DlqBucketTarget {
+            id,
+            path: bucket.path(),
+            header: &self.headers[id.index()],
+        };
+        writer.write_row(&target, row)?;
+        self.report.record_bucket_row(id, bucket.path());
+        Ok(())
+    }
+
+    /// Flush and close the walk's writer, handing its bucket files back to
+    /// the sink. Called once, after the last dead letter of the walk; a later
+    /// row is refused. Blocks until every buffer is flushed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the sink's flush error; the run then fails and nothing is
+    /// published.
+    pub(crate) fn close(&mut self) -> Result<(), PipelineError> {
+        if let DlqWalkWriter::Absent = self.writer {
+            return Ok(());
+        }
+        match std::mem::replace(&mut self.writer, DlqWalkWriter::Closed) {
+            DlqWalkWriter::Open(writer) => writer.close(),
+            DlqWalkWriter::Absent | DlqWalkWriter::Closed => Ok(()),
+        }
+    }
 }
 
 /// One population shared by source-type strategy routing and its circuit
@@ -1353,6 +1485,8 @@ pub(crate) struct ExecutorContext<'a> {
     pub(crate) composition_call_sites: Vec<String>,
     pub(crate) counters: PipelineCounters,
     pub(crate) dlq_entries: Vec<DlqEntry>,
+    /// Dead-letter output and counters of the walk; see [`DlqWalkState`].
+    pub(crate) dlq: DlqWalkState<'a>,
     /// Per-source DLQ counters keyed by Source-node name. Incremented
     /// alongside `counters.dlq_count` at the [`push_dlq`] funnel so
     /// per-source `max_rate` thresholds can fire with attribution.
