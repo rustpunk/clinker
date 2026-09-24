@@ -10,17 +10,18 @@ mod common;
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
 
-use clinker_exec::executor::{DlqEntry, SourceReaders, single_file_reader};
+use clinker_exec::executor::{SourceReaders, single_file_reader};
 use clinker_plan::config::parse_config;
 use clinker_plan::error::PipelineError;
 use clinker_record::PipelineCounters;
 
 /// Run a single-source, single-output branching pipeline with the given
-/// YAML config and CSV input. Returns `(counters, dlq_entries, output_csv)`.
+/// YAML config and CSV input. Returns `(counters, output_csv)`; dead letters
+/// are asserted through `counters.dlq_count`.
 fn run_branch_test(
     yaml: &str,
     csv_input: &str,
-) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
+) -> Result<(PipelineCounters, String), PipelineError> {
     let config = parse_config(yaml).unwrap();
     let output_buf = clinker_bench_support::io::SharedBuffer::new();
 
@@ -46,7 +47,7 @@ fn run_branch_test(
     };
 
     let report = common::run_config(&config, readers, writers, &params)?;
-    Ok((report.counters, report.dlq_entries, output_buf.as_string()))
+    Ok((report.counters, output_buf.as_string()))
 }
 
 /// Diamond DAG: fork -> 2 branches -> merge: all records present in output.
@@ -91,10 +92,10 @@ fn test_branch_diamond_dag() {
     );
 
     let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n";
-    let (counters, dlq, output) = run_branch_test(&yaml, csv).unwrap();
+    let (counters, output) = run_branch_test(&yaml, csv).unwrap();
 
     assert_eq!(counters.ok_count, 4, "all 4 records should be in output");
-    assert!(dlq.is_empty(), "no DLQ entries expected");
+    assert_eq!(counters.dlq_count, 0, "no DLQ entries expected");
 
     // All records should be present
     assert!(
@@ -150,7 +151,7 @@ fn test_branch_exclusive_conservation() {
     );
 
     let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n5,150\n";
-    let (counters, _, _) = run_branch_test(&yaml, csv).unwrap();
+    let (counters, _) = run_branch_test(&yaml, csv).unwrap();
 
     // Exclusive mode: no duplication, no loss
     assert_eq!(
@@ -211,7 +212,7 @@ fn test_branch_inclusive_duplication() {
     );
 
     let csv = "id,amount\n1,200\n2,50\n3,75\n";
-    let (counters, _, output) = run_branch_test(&yaml, csv).unwrap();
+    let (counters, output) = run_branch_test(&yaml, csv).unwrap();
 
     // id=1 (200): matches over_50 AND over_100 -> 2 writes
     // id=2 (50): matches nothing -> default (low) -> 1 write
@@ -272,7 +273,7 @@ fn test_branch_order_within_branch() {
 
     // High records: 1(200), 3(300), 5(500) -- should maintain order
     let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n5,500\n";
-    let (counters, _, output) = run_branch_test(&yaml, csv).unwrap();
+    let (counters, output) = run_branch_test(&yaml, csv).unwrap();
 
     assert_eq!(counters.ok_count, 5, "all records should be in output");
 
@@ -339,7 +340,7 @@ fn test_branch_merge_concatenation_order() {
     );
 
     let csv = "id,amount\n1,200\n2,50\n3,300\n4,10\n";
-    let (_, _, output) = run_branch_test(&yaml, csv).unwrap();
+    let (_, output) = run_branch_test(&yaml, csv).unwrap();
 
     // enrich_high is declared first in the merge input, so high records come first
     let lines: Vec<&str> = output.lines().collect();
@@ -399,11 +400,11 @@ fn test_branch_empty_branch_no_error() {
     );
 
     let csv = "id,amount\n1,100\n2,200\n3,300\n";
-    let (counters, dlq, output) = run_branch_test(&yaml, csv).unwrap();
+    let (counters, output) = run_branch_test(&yaml, csv).unwrap();
 
     // All records go to 'normal' branch, 'impossible' is empty
     assert_eq!(counters.ok_count, 3);
-    assert!(dlq.is_empty());
+    assert_eq!(counters.dlq_count, 0);
     assert!(output.contains("NORMAL"));
     assert!(!output.contains("IMPOSSIBLE"));
 }
@@ -459,7 +460,7 @@ fn test_branch_three_way_fork() {
     );
 
     let csv = "id,amount\n1,300\n2,100\n3,10\n4,500\n5,75\n6,5\n";
-    let (counters, _, output) = run_branch_test(&yaml, csv).unwrap();
+    let (counters, output) = run_branch_test(&yaml, csv).unwrap();
 
     assert_eq!(counters.ok_count, 6, "all 6 records in output");
     assert!(output.contains("HIGH"));
@@ -509,7 +510,7 @@ fn test_branch_different_transforms_per_branch() {
     );
 
     let csv = "id,amount\n1,200\n2,50\n3,300\n";
-    let (counters, _, output) = run_branch_test(&yaml, csv).unwrap();
+    let (counters, output) = run_branch_test(&yaml, csv).unwrap();
 
     assert_eq!(counters.ok_count, 3);
     assert!(
@@ -563,11 +564,11 @@ nodes:
 "#;
 
     let csv = "name,age\nAlice,30\nBob,25\nCarol,35\n";
-    let (counters, dlq, output) = run_branch_test(yaml, csv).unwrap();
+    let (counters, output) = run_branch_test(yaml, csv).unwrap();
 
     assert_eq!(counters.total_count, 3);
     assert_eq!(counters.ok_count, 3);
-    assert!(dlq.is_empty());
+    assert_eq!(counters.dlq_count, 0);
     assert!(output.contains("Alice_doubled"));
     assert!(output.contains("Bob_doubled"));
     assert!(output.contains("Carol_doubled"));
@@ -621,11 +622,11 @@ nodes:
 "#;
 
     let csv = "dept,amount\nA,10\nB,20\nA,30\n";
-    let (counters, dlq, output) = run_branch_test(yaml, csv).unwrap();
+    let (counters, output) = run_branch_test(yaml, csv).unwrap();
 
     assert_eq!(counters.total_count, 3);
     assert_eq!(counters.ok_count, 3);
-    assert!(dlq.is_empty());
+    assert_eq!(counters.dlq_count, 0);
     assert!(
         output.contains("label"),
         "stateless transform output: {output}"
@@ -688,9 +689,9 @@ fn test_branch_rayon_scope_deterministic_order() {
     let csv = "id,amount\n1,300\n2,100\n3,10\n4,500\n5,75\n";
 
     // Run multiple times and check deterministic output
-    let (_, _, output1) = run_branch_test(&yaml, csv).unwrap();
-    let (_, _, output2) = run_branch_test(&yaml, csv).unwrap();
-    let (_, _, output3) = run_branch_test(&yaml, csv).unwrap();
+    let (_, output1) = run_branch_test(&yaml, csv).unwrap();
+    let (_, output2) = run_branch_test(&yaml, csv).unwrap();
+    let (_, output3) = run_branch_test(&yaml, csv).unwrap();
 
     assert_eq!(output1, output2, "output must be deterministic");
     assert_eq!(output2, output3, "output must be deterministic");
@@ -740,7 +741,7 @@ fn test_branch_inclusive_isolation() {
     );
 
     let csv = "id,amount\n1,100\n";
-    let (counters, _, output) = run_branch_test(&yaml, csv).unwrap();
+    let (counters, output) = run_branch_test(&yaml, csv).unwrap();
 
     // id=1 matches both branches (inclusive) -> 2 writes from 1 input record.
     // Dual counters:

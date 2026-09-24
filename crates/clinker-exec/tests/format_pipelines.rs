@@ -7,6 +7,9 @@
 #[path = "common/mod.rs"]
 mod common;
 
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
+
 macro_rules! format_pipeline_cases {
     ($($module:ident => $path:literal),+ $(,)?) => {
         $(
