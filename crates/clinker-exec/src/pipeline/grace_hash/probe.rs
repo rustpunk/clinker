@@ -32,53 +32,56 @@ pub(crate) enum ProbeOutcome<'a> {
     Spilled,
 }
 
-/// One probe's candidates against a built hash table, with the
-/// [`BuildSeq`]s of the build rows that table was built from.
+/// One probe's candidates against a built hash table, with the row id and
+/// [`BuildSeq`] of every build row that table was built from.
 ///
-/// Invariant: `build_seqs[i]` is the arrival position of the build record
-/// the table reports at `ProbeCandidate.index == i`, and a probe yields a
-/// key's candidates in ascending arrival position. [`CandidateOrder`]
-/// checks both, so a table that walked its candidates out of arrival order
-/// fails as `PipelineError::Internal` instead of picking another row.
+/// Invariant: `build_ids[i]` is the row id its Source minted and the
+/// arrival position of the build record the table reports at
+/// `ProbeCandidate.index == i`, and a probe yields a key's candidates in
+/// ascending arrival position. [`CandidateOrder`] checks both, so a table
+/// that reported an index with no build row, or walked its candidates out of
+/// arrival order, fails as `PipelineError::Internal` instead of reporting or
+/// picking another row.
 pub(crate) struct ProbeMatches<'a> {
     pub(crate) candidates: ProbeIter<'a>,
-    pub(crate) build_seqs: &'a [BuildSeq],
+    pub(crate) build_ids: &'a [(RecordOrder, BuildSeq)],
 }
 
-/// The candidate order of one probe: each candidate's [`BuildSeq`], checked
-/// to rise strictly, so `first`, `all` and `collect` follow build arrival
-/// order by construction rather than by the table's layout.
+/// The candidate order of one probe: each candidate's row id and
+/// [`BuildSeq`], with the positions checked to rise strictly, so `first`,
+/// `all` and `collect` follow build arrival order by construction rather
+/// than by the table's layout.
 struct CandidateOrder<'a> {
-    build_seqs: &'a [BuildSeq],
+    build_ids: &'a [(RecordOrder, BuildSeq)],
     last: Option<BuildSeq>,
     name: &'a str,
 }
 
 impl<'a> CandidateOrder<'a> {
-    fn new(build_seqs: &'a [BuildSeq], name: &'a str) -> Self {
+    fn new(build_ids: &'a [(RecordOrder, BuildSeq)], name: &'a str) -> Self {
         Self {
-            build_seqs,
+            build_ids,
             last: None,
             name,
         }
     }
 
-    /// The arrival position of the candidate at `index`, after checking it
-    /// follows the previous candidate's.
-    fn next(&mut self, index: usize) -> Result<BuildSeq, PipelineError> {
-        let seq = self
-            .build_seqs
-            .get(index)
-            .copied()
-            .ok_or_else(|| PipelineError::Internal {
-                op: "grace_hash probe",
-                node: self.name.to_string(),
-                detail: format!(
-                    "hash table candidate index {index} has no build arrival position; the \
-                     partition holds {}",
-                    self.build_seqs.len()
-                ),
-            })?;
+    /// The row id and arrival position of the candidate at `index`, after
+    /// checking its position follows the previous candidate's.
+    fn next(&mut self, index: usize) -> Result<(RecordOrder, BuildSeq), PipelineError> {
+        let (row, seq) =
+            self.build_ids
+                .get(index)
+                .copied()
+                .ok_or_else(|| PipelineError::Internal {
+                    op: "grace_hash probe",
+                    node: self.name.to_string(),
+                    detail: format!(
+                        "hash table candidate index {index} has no build row; the partition \
+                         holds {}",
+                        self.build_ids.len()
+                    ),
+                })?;
         if self.last.is_some_and(|last| seq <= last) {
             return Err(PipelineError::Internal {
                 op: "grace_hash probe",
@@ -91,7 +94,7 @@ impl<'a> CandidateOrder<'a> {
             });
         }
         self.last = Some(seq);
-        Ok(seq)
+        Ok((row, seq))
     }
 }
 
@@ -176,16 +179,16 @@ pub(super) fn emit_for_probe<'a>(
     } = *args;
     let ProbeMatches {
         candidates: probe_iter,
-        build_seqs,
+        build_ids,
     } = matches;
-    let mut order = CandidateOrder::new(build_seqs, name);
+    let mut order = CandidateOrder::new(build_ids, name);
     match match_mode {
         MatchMode::Collect => {
             let mut arr: Vec<Value> = Vec::new();
             let mut first_build: Option<Record> = None;
             let mut truncated = false;
             for cand in probe_iter {
-                order.next(cand.index)?;
+                let (row, _) = order.next(cand.index)?;
                 if let Some(residual) = decomposed.residual.as_ref() {
                     let resolver =
                         CombineResolver::new(resolver_mapping, probe_record, Some(cand.record));
@@ -207,7 +210,7 @@ pub(super) fn emit_for_probe<'a>(
                             sink.failures.push(CombineOutputEvalFailure {
                                 probe_record: probe_record.clone(),
                                 row: rn,
-                                matched_build: Some((cand.record.clone(), rn)),
+                                matched_build: Some((cand.record.clone(), row)),
                                 error: e,
                                 failed_at: crate::executor::DlqFailureStamp::now(),
                             });
@@ -258,10 +261,10 @@ pub(super) fn emit_for_probe<'a>(
             sink.push_row(rec, rn)?;
         }
         MatchMode::First | MatchMode::All => {
-            let matched: Vec<Record> = {
-                let mut acc: Vec<Record> = Vec::new();
+            let matched: Vec<(Record, RecordOrder)> = {
+                let mut acc: Vec<(Record, RecordOrder)> = Vec::new();
                 for cand in probe_iter {
-                    order.next(cand.index)?;
+                    let (row, _) = order.next(cand.index)?;
                     if let Some(residual) = decomposed.residual.as_ref() {
                         let resolver =
                             CombineResolver::new(resolver_mapping, probe_record, Some(cand.record));
@@ -283,7 +286,7 @@ pub(super) fn emit_for_probe<'a>(
                                 sink.failures.push(CombineOutputEvalFailure {
                                     probe_record: probe_record.clone(),
                                     row: rn,
-                                    matched_build: Some((cand.record.clone(), rn)),
+                                    matched_build: Some((cand.record.clone(), row)),
                                     error: e,
                                     failed_at: crate::executor::DlqFailureStamp::now(),
                                 });
@@ -291,7 +294,7 @@ pub(super) fn emit_for_probe<'a>(
                             }
                         }
                     }
-                    acc.push(cand.record.clone());
+                    acc.push((cand.record.clone(), row));
                     if matches!(match_mode, MatchMode::First) {
                         break;
                     }
@@ -359,7 +362,7 @@ pub(super) fn emit_for_probe<'a>(
                     }
                 }
             } else if let Some(evaluator) = body_evaluator {
-                for m in &matched {
+                for (m, build_row) in &matched {
                     let resolver = CombineResolver::new(resolver_mapping, probe_record, Some(m));
                     match evaluator.eval_record::<NullStorage>(ctx, &resolver, None) {
                         Ok(EvalResult::Emit {
@@ -396,7 +399,7 @@ pub(super) fn emit_for_probe<'a>(
                             sink.failures.push(CombineOutputEvalFailure {
                                 probe_record: probe_record.clone(),
                                 row: rn,
-                                matched_build: Some((m.clone(), rn)),
+                                matched_build: Some((m.clone(), *build_row)),
                                 error: e,
                                 failed_at: crate::executor::DlqFailureStamp::now(),
                             });
@@ -413,7 +416,7 @@ pub(super) fn emit_for_probe<'a>(
                     node: name.to_string(),
                     detail: "synthetic grace hash step has no output schema".to_string(),
                 })?;
-                for m in &matched {
+                for (m, _) in &matched {
                     let mut values: Vec<Value> = Vec::with_capacity(target_schema.column_count());
                     values.extend(probe_record.values().iter().cloned());
                     values.extend(m.values().iter().cloned());

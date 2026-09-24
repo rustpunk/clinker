@@ -6,6 +6,7 @@
 
 use clinker_record::Record;
 
+use super::RecordOrder;
 use crate::pipeline::combine::BuildSeq;
 
 use crate::sketch::Hll;
@@ -99,31 +100,34 @@ pub(super) fn estimated_record_bytes(record: &Record) -> usize {
 }
 
 /// Estimate one build entry's footprint: the record, per
-/// [`estimated_record_bytes`], plus the [`BuildSeq`] held beside it. The
-/// unit every build-side charge and chunk size uses, so a partition's
-/// admitted charge and the bytes its spill releases stay symmetric.
+/// [`estimated_record_bytes`], plus the build row id and the [`BuildSeq`]
+/// held beside it. The unit every build-side charge and chunk size uses, so
+/// a partition's admitted charge and the bytes its spill releases stay
+/// symmetric.
 pub(super) fn estimated_build_entry_bytes(record: &Record) -> usize {
-    estimated_record_bytes(record) + std::mem::size_of::<BuildSeq>()
+    estimated_record_bytes(record)
+        + std::mem::size_of::<RecordOrder>()
+        + std::mem::size_of::<BuildSeq>()
 }
 
-/// Iterator over a build buffer of `(record, BuildSeq)` pairs that yields
-/// chunks bounded by [`estimated_build_entry_bytes`], in buffer order.
-/// Emits at least one entry per non-empty remainder so a chunk budget
-/// smaller than a single entry's footprint still terminates rather than
-/// spinning. Entries are moved out of the underlying Vec; the iterator
+/// Iterator over a build buffer of `(record, build row id, BuildSeq)`
+/// entries that yields chunks bounded by [`estimated_build_entry_bytes`], in
+/// buffer order. Emits at least one entry per non-empty remainder so a chunk
+/// budget smaller than a single entry's footprint still terminates rather
+/// than spinning. Entries are moved out of the underlying Vec; the iterator
 /// drains its source.
 pub(crate) struct BuildChunkIter {
-    source: std::vec::IntoIter<(Record, BuildSeq)>,
-    pending: Option<(Record, BuildSeq)>,
+    source: std::vec::IntoIter<(Record, RecordOrder, BuildSeq)>,
+    pending: Option<(Record, RecordOrder, BuildSeq)>,
     byte_budget: usize,
 }
 
 impl BuildChunkIter {
     /// Construct an iterator over `records`. `byte_budget` is the
-    /// maximum estimated heap footprint per emitted chunk. The
+    /// maximum estimated footprint per emitted chunk. The
     /// constructor enforces a `byte_budget >= 1` floor so the iterator
     /// always makes forward progress.
-    pub(crate) fn new(records: Vec<(Record, BuildSeq)>, byte_budget: usize) -> Self {
+    pub(crate) fn new(records: Vec<(Record, RecordOrder, BuildSeq)>, byte_budget: usize) -> Self {
         Self {
             source: records.into_iter(),
             pending: None,
@@ -133,10 +137,10 @@ impl BuildChunkIter {
 }
 
 impl Iterator for BuildChunkIter {
-    type Item = Vec<(Record, BuildSeq)>;
+    type Item = Vec<(Record, RecordOrder, BuildSeq)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut out: Vec<(Record, BuildSeq)> = Vec::new();
+        let mut out: Vec<(Record, RecordOrder, BuildSeq)> = Vec::new();
         let mut accumulated: usize = 0;
         if let Some(r) = self.pending.take() {
             accumulated += estimated_build_entry_bytes(&r.0);
