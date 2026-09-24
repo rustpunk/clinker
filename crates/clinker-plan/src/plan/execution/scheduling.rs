@@ -147,7 +147,8 @@ pub(crate) fn order_sinks_after_operators(dag: &mut ExecutionPlanDag) -> Result<
         .collect();
     let mut ready: BTreeSet<(bool, usize, usize)> = indegree
         .iter()
-        .filter_map(|(&idx, &degree)| (degree == 0).then(|| key(idx)))
+        .filter(|&(_, &degree)| degree == 0)
+        .map(|(&idx, _)| key(idx))
         .collect();
     let mut ordered = Vec::with_capacity(graph.node_count());
 
