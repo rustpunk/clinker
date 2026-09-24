@@ -63,9 +63,14 @@ pub struct WriterRegistry {
     /// writer before the executor returns `Ok`, so the caller may call
     /// [`DlqSink::finish`] once the run has returned. With
     /// [`Self::auto_commit_staged`] the executor calls `finish` itself, before
-    /// it commits the staged files, and the caller must not. A run whose plan has a
-    /// dead-letter bucket needs a sink to write rows; with `None` the run
-    /// still counts every dead letter in its report and writes none.
+    /// it commits the staged files, and the caller must not.
+    ///
+    /// Required whenever a dead letter can reach a bucket: a run whose plan
+    /// gives a failing row a dead-letter destination and whose sink is `None`
+    /// fails at that row with [`PipelineError::Internal`] naming the bucket,
+    /// rather than count the row and drop it. `None` is valid only for a plan
+    /// with no dead-letter destination, or a run that dead-letters no row
+    /// into one; a dead letter with no destination is counted either way.
     pub dlq_sink: Option<Arc<dyn DlqSink>>,
 }
 

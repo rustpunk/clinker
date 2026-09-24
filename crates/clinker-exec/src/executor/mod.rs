@@ -149,9 +149,6 @@ pub use crate::source::{RecordSource, SourceInput};
 pub(crate) struct DispatchOutcome {
     /// Aggregate pipeline counters: total / ok / dlq / records-written.
     pub(crate) counters: PipelineCounters,
-    /// Every DLQ entry produced across every dispatcher arm, in
-    /// observation order. Empty when the run had no failures.
-    pub(crate) dlq_entries: Vec<DlqEntry>,
     /// Dead-letter counters by stage and category, and rows written per
     /// bucket. Bounded by the plan.
     pub(crate) dead_letters: crate::dlq::DlqReport,
@@ -1231,7 +1228,6 @@ impl PipelineExecutor {
 
         let DispatchOutcome {
             counters,
-            dlq_entries,
             dead_letters,
             peak_rss_bytes,
             mut watermarks,
@@ -1347,7 +1343,6 @@ impl PipelineExecutor {
 
         Ok(ExecutionReport {
             counters,
-            dlq_entries,
             dead_letters,
             execution_summary,
             required_arena,
@@ -1390,15 +1385,14 @@ impl PipelineExecutor {
     /// the receivers via `recv` and never touches a `FormatReader`
     /// directly.
     ///
-    /// Returns `(counters, dlq_entries, peak_rss_bytes)`.
+    /// Returns the run's [`DispatchOutcome`]: counters, dead-letter report,
+    /// peak RSS and the per-source bookkeeping the report folds in.
     fn execute_dag(
         inputs: &DagExecInputs<'_>,
         resources: DagExecResources,
         collector: &mut stage_metrics::StageCollector,
         mut counters: PipelineCounters,
     ) -> Result<DispatchOutcome, PipelineError> {
-        let mut dlq_entries: Vec<DlqEntry> = Vec::new();
-
         // No prologue drain or arena build. The dispatch Source arm
         // is the first consumer of every crossbeam `Receiver`:
         // - canonicalize per record onto the source's plan-time schema,
@@ -1419,14 +1413,7 @@ impl PipelineExecutor {
             &inputs.plan.indices_to_build,
         );
 
-        Self::execute_dag_branching(
-            inputs,
-            resources,
-            &mut counters,
-            &mut dlq_entries,
-            collector,
-            window_runtime,
-        )
+        Self::execute_dag_branching(inputs, resources, &mut counters, collector, window_runtime)
     }
 
     /// Execute a branching DAG by walking nodes in topological order.
@@ -1445,7 +1432,6 @@ impl PipelineExecutor {
         inputs: &DagExecInputs<'_>,
         resources: DagExecResources,
         counters: &mut PipelineCounters,
-        dlq_entries: &mut Vec<DlqEntry>,
         collector: &mut stage_metrics::StageCollector,
         window_runtime: crate::executor::window_runtime::WindowRuntimeRegistry,
     ) -> Result<DispatchOutcome, PipelineError> {
@@ -1841,7 +1827,6 @@ impl PipelineExecutor {
             fan_out_paths: writers.fan_out_paths,
             output_staging: writers.output_staging,
             counters: std::mem::take(counters),
-            dlq_entries: std::mem::take(dlq_entries),
             dlq,
             dlq_per_source: HashMap::new(),
             total_per_source,
@@ -2132,7 +2117,6 @@ impl PipelineExecutor {
         let collector = ctx.collector;
         let total_records: u64 = ctx.total_per_source.values().sum();
         *counters = ctx.counters;
-        *dlq_entries = ctx.dlq_entries;
 
         collector.record(transform_timer.finish(
             stage_metrics::StageName::TransformEval,
@@ -2207,7 +2191,6 @@ impl PipelineExecutor {
         advisories.extend(ctx.truncation_ledger.advisories(ctx.sink_configs));
         Ok(DispatchOutcome {
             counters: std::mem::take(counters),
-            dlq_entries: std::mem::take(dlq_entries),
             dead_letters: ctx.dlq.report,
             peak_rss_bytes: rss_bytes(),
             watermarks: ctx.watermarks,
