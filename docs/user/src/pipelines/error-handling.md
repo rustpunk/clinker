@@ -195,7 +195,13 @@ DLQ files use does not grow with the number of failures.
   That record is charged to the memory budget. A rejected document whose
   rows are contiguous costs about 2 KiB; no document costs more than that
   plus about 2 bytes per row. It cannot spill: if it would pass the memory
-  limit, the run fails with E310.
+  limit, the run fails with E310. A failed document's failing records are
+  formatted as DLQ rows when they fail and held until the document is
+  rejected. They are held in memory, charged to the memory budget, and move
+  to one file in the spill directory only when the budget needs the memory,
+  counting toward `storage.spill.disk_cap_bytes` (E320). With memory to
+  spare nothing is written to disk. If even one more held row would not fit
+  with every held row on disk, the run fails with E310.
 
 Disk bounds how much DLQ output a run can produce: the free space at the
 staging location, and the publication attempt's byte ceiling
@@ -261,7 +267,7 @@ Every DLQ record includes these metadata columns:
 |--------|-------------|
 | `_cxl_dlq_id` | UUID v7 (time-ordered unique identifier), unique to the row. It is taken together with `_cxl_dlq_timestamp`, so ids order the same way as timestamps. |
 | `_cxl_dlq_trigger_id` | The `_cxl_dlq_id` of the trigger row whose failure produced this row. That trigger row is always written in the same run. A trigger row points to itself, so `_cxl_dlq_trigger` is `true` exactly when this value equals `_cxl_dlq_id`; every row one failure produced carries the same value. See [Pairing the rows one failure produced](#pairing-the-rows-one-failure-produced). |
-| `_cxl_dlq_timestamp` | RFC 3339 timestamp of when the failure was observed, not of when the row was written. A collateral row (`correlated`, `document_rejected`) carries the time its correlation group or document was condemned. A `group_size_exceeded` row carries the time its group went over `max_group_buffer`. |
+| `_cxl_dlq_timestamp` | RFC 3339 timestamp of when the failure was observed, not of when the row was written. A collateral row (`correlated`, `document_rejected`) carries the time its correlation group or document was condemned, except that a rejected document's other failing records carry the time each one failed. A `group_size_exceeded` row carries the time its group went over `max_group_buffer`. |
 | `_cxl_dlq_source_file` | Input filename carried by that failing record's `$source.file` provenance (or `<merged>` when no source-file provenance exists) |
 | `_cxl_dlq_source_name` | Name of the Source the failing record came from (or `<merged>` when the record carries no Source identity) |
 | `_cxl_dlq_source_row` | 1-based row number in the source file |
@@ -570,6 +576,7 @@ Under `dlq_granularity: document` and the `continue` strategy, a document is rej
 
 - the failing record becomes the **root-cause** DLQ entry (`_cxl_dlq_trigger = true`, carrying its original error category);
 - every other record of the document that reaches a Sink becomes a **collateral** entry (`_cxl_dlq_trigger = false`, category `document_rejected`); a record dropped before any Sink is not written;
+- every other record of the document that fails is also a `document_rejected` collateral, written right after the root cause in the order the records failed. These records are stamped (`_cxl_dlq_id`, `_cxl_dlq_timestamp`) when they fail; the records a Sink held are stamped when the Sink rejects the document. Every collateral carries the root cause's id in `_cxl_dlq_trigger_id`;
 - **no** record of that document is written by any Sink, however many Sinks read it.
 
 Clean documents in the same run stream through untouched, and records from sibling sources still on the default `record` granularity keep per-record semantics — the policy is per source.

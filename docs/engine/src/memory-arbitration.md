@@ -317,6 +317,8 @@ Window-runtime arenas (the columnar backing store that analytic-window evaluatio
 
 Under `dlq_granularity: document` the run-scoped document state registers one consumer for the ledgers that record, per rejected document, which rows have been dead-lettered, so a row held by several Sinks is written once. A ledger is a compressed row set, one per Source and document, keyed by absolute row ordinal. It is exact dedup state, so it cannot spill and ranks last: each admission is charged its worst-case growth and preflighted against the hard limit, and growth past it fails the run with E310 (`Arena`). At the end of every rejection pass, and every 65,536 admissions within one, the ledger is compressed and its charge replaced by a bound on the compressed heap. The consumer is unregistered when the run's context drops.
 
+The same consumer carries the document state's held rows (see **Document dead-letter state** under the bounded-memory contract below). While any held row is resident it reports priority 0, alongside the `node_buffers` slots, because it spills with one sequential write per document; its `try_spill` raises its spill request and reports the resident held bytes as what it frees. With no held row resident it reports the last priority and frees nothing, so a state holding only ledgers never shadows a consumer that can spill.
+
 ### Per-operator arbitration parameters
 
 Each registered consumer carries two parameters the active policy reads: a **spill priority** (lower is spilled first under `Priority`) and a **back-pressure flag** (whether its producer can be paused instead). The defaults are:
@@ -337,7 +339,7 @@ Each registered consumer carries two parameters the active policy reads: a **spi
 | credential registry | last | false |
 | transient scan materialization | last | false |
 | window arena | last | false |
-| document dead-letter ledger | last | false |
+| document dead-letter state | 0 while it holds resident rows, else last | false |
 
 A consumer whose state cannot spill is listed as charged-only in `crates/clinker-exec/tests/memory_consumer_inventory.rs` with the approval that allows it.
 
@@ -421,6 +423,8 @@ the consuming node's name. A consumer that stays lazy, such as an Output
 writer on the envelope-reconstruction path, reads directly from the cursor
 without a full duplicate. The final reader reclaims the authoritative backing
 and its existing registration.
+
+**Document dead-letter state.** Under `dlq_granularity: document` the run has one document dead-letter consumer, registered by the run-scoped document state. Its ledgers (above) do not spill. Every failing record of a failed document is encoded as its dead-letter row where it fails and held, behind a small header, in a per-document resident tail; no record is kept. The tails leave memory only on the arbitrator's signals, never on a size of their own: the consumer's election (its spill request, read before every held row and at every document decision), the soft threshold (polled every `pipeline.batch_size` held rows and at every decision), and the hard-limit preflight on every held row. Any of them flushes every tail to one chained-extent spill file in the run's spill directory: each flush writes a document's tail as one extent at the end of the file and links it from the document's previous extent. The index is one entry per failed document, charged, and preflighted with the held row; a row that still does not fit after every tail is flushed fails the run with E310 (`Arena`). Flushes are charged to the spill quota under the failing node, or the rejecting Sink for a flush at a decision, and past `max_spill_bytes` return E320. A document's first rejection streams its chain row by row through its ledger into the dead-letter writer, in the order the rows were held. The file is removed with the state, and nothing in it is ever promoted.
 
 `MergeSpilled` is the one destructive spill form: its k-way merger consumes
 and unlinks input runs. On the first shared read, the executor folds those runs
