@@ -295,7 +295,6 @@ pub(crate) struct DlqAccounts<'b> {
     /// The rate denominator; see [`ExecutorContext::total_per_source`].
     pub(crate) total_per_source: &'b HashMap<Arc<str>, u64>,
     pub(crate) config: Option<&'b clinker_plan::config::DlqConfig>,
-    pub(crate) entries: &'b mut Vec<DlqEntry>,
 }
 
 /// A dead-letter push handle: the walk's [`DlqWalkState`] and the accounts
@@ -329,7 +328,6 @@ impl<'a> ExecutorContext<'a> {
                 dlq_per_source: &mut self.dlq_per_source,
                 total_per_source: &self.total_per_source,
                 config: self.config.error_handling.dlq.as_ref(),
-                entries: &mut self.dlq_entries,
             },
         }
     }
@@ -397,8 +395,9 @@ pub(crate) struct DlqCaptureMark(usize);
 
 /// Where the walk's writer is in its life.
 enum DlqWalkWriter {
-    /// The run has no layout or its caller supplied no sink: rows are counted
-    /// and never written.
+    /// The run has no layout, or its caller supplied no sink. Without a
+    /// layout no row has a destination; without a sink the first row that
+    /// has one fails the run (see [`DlqWalkState::write`]).
     Absent,
     Open(Box<dyn crate::dlq::DlqRowWriter>),
     /// Closed at the end of the walk; no row may arrive after this.
@@ -466,19 +465,20 @@ impl<'a> DlqWalkState<'a> {
         if self.capture_depth > 0 {
             self.capture.push(entry.source_row);
         }
-        accounts.entries.push(entry); // Removed when the executor test suite reads the DLQ sink.
         check_dlq_rate(accounts, &source_name)
     }
 
     /// Encode `entry` under its bucket's header and write it, then count the
     /// row against the bucket. An entry whose source has no bucket, or a run
-    /// with no writer, writes nothing. May block on the sink's file I/O.
+    /// whose plan has no dead-letter block, writes nothing. May block on the
+    /// sink's file I/O.
     ///
     /// # Errors
     ///
     /// Returns [`PipelineError::Internal`] when the record carries a column
-    /// its bucket's compiled header does not admit, or when a row arrives
-    /// after [`Self::close`]. A sink I/O error is returned as
+    /// its bucket's compiled header does not admit, when the entry has a
+    /// bucket but the caller supplied no sink (the row would otherwise be
+    /// counted and dropped), or when a row arrives after [`Self::close`]. A sink I/O error is returned as
     /// [`PipelineError::Io`] of the same kind carrying a
     /// [`DlqWriteFailure`](crate::dlq::DlqWriteFailure) that names the bucket
     /// and the run's `dead_letters` so far; any other sink error as is.
@@ -490,7 +490,15 @@ impl<'a> DlqWalkState<'a> {
             return Ok(());
         };
         let writer = match &mut self.writer {
-            DlqWalkWriter::Absent => return Ok(()),
+            DlqWalkWriter::Absent => {
+                return Err(PipelineError::Internal {
+                    op: "dead-letter",
+                    node: layout.bucket(id).path().display().to_string(),
+                    detail: "a dead-lettered row has a destination but the caller supplied \
+                             no dead-letter sink"
+                        .to_string(),
+                });
+            }
             DlqWalkWriter::Open(writer) => writer,
             DlqWalkWriter::Closed => {
                 return Err(PipelineError::Internal {
@@ -1027,7 +1035,7 @@ pub(crate) fn buffer_key_for_record(
 ///
 /// Returns `true` iff the buffer is active and the error has been
 /// parked under the record's group cell — the caller must NOT also
-/// push to `ctx.dlq_entries` / `counters.dlq_count`. Returns `false`
+/// call [`push_dlq`] for it. Returns `false`
 /// when the buffer is unconfigured, signaling the caller to take the
 /// per-record DLQ path. Buffer admission bumps `total_records`,
 /// tripping the overflow flag once `max_group_buffer` is exceeded.
@@ -1437,7 +1445,8 @@ impl NodeBufferReaderLedger {
 ///   `SourceIngestChannel`. The `$source.file` per-record stamp travels
 ///   on each record's engine-stamped column.
 /// * `writers` — output writer registry consumed lazily as Output arms fire.
-/// * `counters` / `dlq_entries` — pipeline-wide accounting.
+/// * `counters` / `dlq` — pipeline-wide accounting and the walk's
+///   dead-letter output.
 /// * `output_errors` — collected sink failures so siblings still attempt
 ///   their writes (DataFusion collection-pattern PR #14439).
 /// * `ok_source_rows` — distinct source rows that have reached at least
@@ -1663,7 +1672,6 @@ pub(crate) struct ExecutorContext<'a> {
     /// [`ExecutorContext::qualified_node_name`].
     pub(crate) composition_call_sites: Vec<String>,
     pub(crate) counters: PipelineCounters,
-    pub(crate) dlq_entries: Vec<DlqEntry>,
     /// Dead-letter output and counters of the walk; see [`DlqWalkState`].
     pub(crate) dlq: DlqWalkState<'a>,
     /// Per-source DLQ counters keyed by Source-node name. Incremented
@@ -4866,7 +4874,7 @@ pub(crate) fn service_pending_node_buffer_spills(
 /// `PlanNode` variant. Each arm reads from and writes to `ctx.node_buffers`
 /// and updates the cumulative counters / timers. Errors short-circuit only for
 /// invariant violations and `ErrorStrategy::FailFast` runtime failures;
-/// per-record DLQ-able errors land in `ctx.dlq_entries` under `Continue`.
+/// per-record DLQ-able errors go through [`push_dlq`] under `Continue`.
 /// Output sink errors are collected into `ctx.output_errors` instead of
 /// short-circuiting so sibling outputs still get their chance to fail (and be
 /// reported) — the caller aggregates after the walk.
@@ -5165,7 +5173,6 @@ mod dlq_capture_tests {
         counters: PipelineCounters,
         dlq_per_source: HashMap<Arc<str>, u64>,
         total_per_source: HashMap<Arc<str>, u64>,
-        entries: Vec<DlqEntry>,
     }
 
     impl Accounts {
@@ -5174,7 +5181,6 @@ mod dlq_capture_tests {
                 counters: PipelineCounters::default(),
                 dlq_per_source: HashMap::new(),
                 total_per_source: HashMap::new(),
-                entries: Vec::new(),
             }
         }
 
@@ -5184,7 +5190,6 @@ mod dlq_capture_tests {
                 dlq_per_source: &mut self.dlq_per_source,
                 total_per_source: &self.total_per_source,
                 config: None,
-                entries: &mut self.entries,
             };
             state
                 .push(entry(ordinal), &mut accounts)

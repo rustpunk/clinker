@@ -749,7 +749,6 @@ fn dispatch_sink_work(
                     dlq_per_source: &mut ctx.dlq_per_source,
                     total_per_source: &ctx.total_per_source,
                     config: ctx.config.error_handling.dlq.as_ref(),
-                    entries: &mut ctx.dlq_entries,
                 },
             },
             written_rows: &mut written_rows,
