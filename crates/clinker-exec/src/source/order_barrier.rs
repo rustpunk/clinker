@@ -137,6 +137,11 @@ struct StagedSourceRejection {
     message: String,
     triggering_field: Box<str>,
     triggering_value: Value,
+    /// The reader's failure stamp, split so the spill payload needs no
+    /// UUID serializer: a rejection held or spilled here still reports the
+    /// moment the reader rejected it.
+    failed_at_id: u128,
+    failed_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl StagedSourceRejection {
@@ -151,6 +156,7 @@ impl StagedSourceRejection {
             original_record,
             triggering_field,
             triggering_value,
+            failed_at,
         } = event;
         (
             original_record,
@@ -163,6 +169,8 @@ impl StagedSourceRejection {
                 message,
                 triggering_field,
                 triggering_value,
+                failed_at_id: failed_at.id().as_u128(),
+                failed_at: failed_at.at(),
             },
         )
     }
@@ -178,6 +186,10 @@ impl StagedSourceRejection {
             original_record,
             triggering_field: self.triggering_field,
             triggering_value: self.triggering_value,
+            failed_at: crate::executor::DlqFailureStamp::from_parts(
+                uuid::Uuid::from_u128(self.failed_at_id),
+                self.failed_at,
+            ),
         }
     }
 }
@@ -1504,6 +1516,7 @@ mod tests {
             original_record: record,
             triggering_field: "payload".into(),
             triggering_value: Value::String(leaf.clone()),
+            failed_at: crate::executor::DlqFailureStamp::now(),
         }
     }
 
@@ -1568,6 +1581,7 @@ mod tests {
             barrier
                 .observe_punctuation(Punctuation::document_open(inner.clone()))
                 .unwrap();
+            let mut stamps = std::collections::HashMap::new();
             for ordinal in 1..=12 {
                 let record = governed_record(
                     &resources,
@@ -1577,10 +1591,10 @@ mod tests {
                     &leaf,
                 );
                 if ordinal % 4 == 0 {
+                    let event = rejection(record, ordinal, &leaf);
+                    stamps.insert(ordinal, event.failed_at);
                     barrier
-                        .observe_attempt(SourceAttemptEvent::Rejection(Box::new(rejection(
-                            record, ordinal, &leaf,
-                        ))))
+                        .observe_attempt(SourceAttemptEvent::Rejection(Box::new(event)))
                         .unwrap();
                 } else {
                     barrier
@@ -1625,6 +1639,11 @@ mod tests {
                                 assert_eq!(event.message, "E126 preserved diagnostic");
                                 assert_eq!(event.row, event.source_row.ordinal() + 10);
                                 assert_eq!(event.triggering_value, Value::String(leaf.clone()));
+                                assert_eq!(
+                                    event.failed_at,
+                                    stamps[&event.source_row.ordinal()],
+                                    "the reader's failure stamp survives staging and spill"
+                                );
                                 let prefix =
                                     format!("rejection:{}:{}", event.row, event.triggering_field);
                                 (event.original_record, event.source_row, prefix)
@@ -2192,9 +2211,11 @@ nodes:
             "E345 line 3".to_string(),
         );
 
+        let stamp = event.failed_at;
         let (record, staged) = StagedSourceRejection::from_event(event);
         let restored = staged.into_event(record);
 
+        assert_eq!(restored.failed_at, stamp);
         assert_eq!(restored.source_row, source_row);
         assert_eq!(restored.row, 3);
         assert_eq!(restored.diagnostic_message(), "E345 line 3");

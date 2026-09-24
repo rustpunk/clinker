@@ -68,7 +68,7 @@ use crate::executor::node_buffer::NodeBuffer;
 use crate::executor::sink_dispatch::OrderedWriterBoundary;
 use crate::executor::stream_event::{SourceRowId, StreamEvent};
 use crate::executor::structured_output_guard::StructuredOutputDocumentGuard;
-use crate::executor::{DlqEntry, build_format_writer};
+use crate::executor::{DlqEntry, DlqFailureStamp, build_format_writer};
 use clinker_plan::config::SinkConfig;
 use clinker_plan::error::PipelineError;
 
@@ -90,6 +90,9 @@ struct DocTrigger {
     source_name: Arc<str>,
     triggering_field: Option<Arc<str>>,
     triggering_value: Option<clinker_record::Value>,
+    /// Taken when the failure marked the document; the trigger entry
+    /// emitted at the document's reject carries it.
+    failed_at: DlqFailureStamp,
 }
 
 /// Run-scoped document-DLQ state: which sources opt into the policy, the
@@ -200,6 +203,7 @@ pub(crate) fn record_error_to_document_buffer_if_doc_dlq(
     route: Option<String>,
     triggering_field: Option<Arc<str>>,
     triggering_value: Option<clinker_record::Value>,
+    failed_at: DlqFailureStamp,
 ) -> bool {
     let Some(state) = ctx.document_dlq.as_ref() else {
         return false;
@@ -221,6 +225,7 @@ pub(crate) fn record_error_to_document_buffer_if_doc_dlq(
             source_name,
             triggering_field,
             triggering_value,
+            failed_at,
         },
     );
     true
@@ -257,6 +262,7 @@ pub(crate) fn record_source_rejection_to_document_buffer_if_doc_dlq(
             source_name: Arc::clone(&event.source_name),
             triggering_field: Some(Arc::from(event.triggering_field.as_ref())),
             triggering_value: Some(event.triggering_value.clone()),
+            failed_at: event.failed_at,
         },
     );
     true
@@ -291,6 +297,7 @@ pub(crate) fn mark_structural_reject_if_present(
         None,
         None,
         None,
+        reject.failed_at,
     );
 }
 
@@ -1015,6 +1022,7 @@ fn push_document_collateral(
             source_name,
             triggering_field: None,
             triggering_value: None,
+            failed_at: DlqFailureStamp::now(),
         },
     )
 }
@@ -1137,9 +1145,12 @@ fn reject_document_now(
                 source_name: t.source_name,
                 triggering_field: t.triggering_field,
                 triggering_value: t.triggering_value,
+                failed_at: t.failed_at,
             },
         )?;
     }
+    // Collaterals are stamped as the document is rejected: that is when
+    // the engine condemns them, not when a sibling failed.
     for (record, source_row, source_name) in collaterals {
         push_dlq(
             ctx,
@@ -1154,6 +1165,7 @@ fn reject_document_now(
                 source_name,
                 triggering_field: None,
                 triggering_value: None,
+                failed_at: DlqFailureStamp::now(),
             },
         )?;
     }
@@ -1226,6 +1238,7 @@ mod tests {
                 source_name,
                 triggering_field: None,
                 triggering_value: None,
+                failed_at: DlqFailureStamp::now(),
             },
         );
 

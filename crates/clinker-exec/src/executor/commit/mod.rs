@@ -276,6 +276,7 @@ fn archive_iteration_errors(
                     error_message: err.error_message.clone(),
                     stage: err.stage.clone(),
                     route: err.route.clone(),
+                    failed_at: err.failed_at,
                 });
             }
         }

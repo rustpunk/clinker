@@ -51,12 +51,12 @@ use clinker_record::{FieldMetadata, GroupByKey, Record, Schema, Value};
 use cxl::eval::{EvalContext, EvalResult, ProgramEvaluator};
 use petgraph::graph::NodeIndex;
 
-use crate::executor::DlqEntry;
 use crate::executor::dispatch::{
     ExecutorContext, admit_node_buffer, node_buffer_spill_allowed, push_dlq,
     require_single_input_node_buffer_slot, source_file_arc_of, source_name_arc_of,
     tee_emit_to_region_input_buffers,
 };
+use crate::executor::{DlqEntry, DlqFailureStamp};
 use crate::executor::{GroupedNodeKind, giant_group_error};
 use crate::pipeline::memory::{
     ConsumerHandle, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
@@ -198,6 +198,7 @@ struct MutationConflict {
     field: String,
     record: Record,
     row_num: crate::executor::stream_event::SourceRowId,
+    failed_at: DlqFailureStamp,
 }
 
 /// Execute the `Reshape` arm for `node_idx`. Drains the predecessor,
@@ -940,6 +941,7 @@ fn process_group(
                         field: field.clone(),
                         record: record.clone(),
                         row_num: *row_num,
+                        failed_at: DlqFailureStamp::now(),
                     });
                     break 'rules;
                 }
@@ -1006,6 +1008,7 @@ fn dlq_group_conflict(
         field,
         record,
         row_num,
+        failed_at,
     } = conflict;
     let stage = stage_reshape_mutation_conflict(node_name, rule_a, rule_b);
     let source_name = source_name_arc_of(record);
@@ -1025,6 +1028,7 @@ fn dlq_group_conflict(
             source_name,
             triggering_field: Some(Arc::from(field.as_str())),
             triggering_value: None,
+            failed_at: *failed_at,
         },
     )
 }

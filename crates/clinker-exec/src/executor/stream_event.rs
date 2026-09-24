@@ -186,6 +186,9 @@ pub struct StructuralReject {
     pub row_num: SourceRowId,
     /// The precise count-mismatch message the reader built at the trailer.
     pub message: String,
+    /// Taken by the reader when it found the structural failure; the
+    /// document's trigger dead letter carries it.
+    pub failed_at: crate::executor::DlqFailureStamp,
 }
 
 /// Document-boundary punctuation on the executor's record stream.
@@ -452,6 +455,7 @@ mod tests {
             record: rec(7),
             row_num: SourceRowId::from(42),
             message: "SE segment count mismatch".to_string(),
+            failed_at: crate::executor::DlqFailureStamp::now(),
         };
         let close = Punctuation::structural_reject_close(ctx.clone(), reject);
         assert_eq!(close.kind(), PunctuationKind::DocumentClose);

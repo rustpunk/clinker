@@ -25,7 +25,7 @@ use crate::executor::dispatch::{
     tee_emit_to_region_input_buffers,
 };
 use crate::executor::schema_check::check_input_schema;
-use crate::executor::{DlqEntry, parse_memory_limit, stage_metrics};
+use crate::executor::{DlqEntry, DlqFailureStamp, parse_memory_limit, stage_metrics};
 use clinker_plan::config::ErrorStrategy;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
@@ -1108,10 +1108,17 @@ struct StreamingIngestEffects {
     /// replayed via [`advance_cursor`] so rollback cursors and watermark
     /// liveness match the drain-to-`Vec` path.
     cursor_advances: Vec<(Arc<str>, crate::executor::stream_event::SourceRowId)>,
-    /// `(record, row_num, error_message)` for each `add_record` failure
-    /// under `Continue`, replayed via the dispatcher's DLQ routing after
+    /// `(record, row_num, error_message, failed_at)` for each `add_record`
+    /// failure under `Continue`, replayed via the dispatcher's DLQ routing
+    /// after join. `failed_at` is stamped on the ingest thread as the failure
+    /// is observed, so the replayed dead letter reports that moment, not the
     /// join. `FailFast` surfaces the error eagerly instead.
-    add_errors: Vec<(Record, crate::executor::stream_event::SourceRowId, String)>,
+    add_errors: Vec<(
+        Record,
+        crate::executor::stream_event::SourceRowId,
+        String,
+        DlqFailureStamp,
+    )>,
 }
 
 /// Finalized aggregate output handed to [`finalize_aggregate_emit`]: the
@@ -1349,6 +1356,7 @@ fn run_streaming_aggregate_ingest(
                                     record,
                                     rn,
                                     format!("aggregate {name}: {e}"),
+                                    DlqFailureStamp::now(),
                                 ));
                             }
                         },
@@ -1436,7 +1444,7 @@ fn run_streaming_aggregate_ingest(
     for (source_name_arc, rn) in std::mem::take(&mut effects.cursor_advances) {
         advance_cursor(ctx, &source_name_arc, rn);
     }
-    for (record, rn, message) in std::mem::take(&mut effects.add_errors) {
+    for (record, rn, message, failed_at) in std::mem::take(&mut effects.add_errors) {
         let stage = Some(clinker_core_types::dlq::stage_aggregate(name));
         let routed = record_error_to_buffer_if_grouped(
             ctx,
@@ -1446,6 +1454,7 @@ fn run_streaming_aggregate_ingest(
             message.clone(),
             stage.clone(),
             None,
+            failed_at,
         );
         if !routed {
             let source_name = source_name_arc_of(&record);
@@ -1462,6 +1471,7 @@ fn run_streaming_aggregate_ingest(
                     source_name,
                     triggering_field: None,
                     triggering_value: None,
+                    failed_at,
                 },
             )?;
         }
@@ -2037,6 +2047,7 @@ fn handle_aggregate_add_error(
         // names the stage that overran.
         ErrorStrategy::FailFast => Err(agg_hash_error_into(name, e)),
         ErrorStrategy::Continue => {
+            let failed_at = DlqFailureStamp::now();
             let stage = Some(clinker_core_types::dlq::stage_aggregate(name));
             let routed = record_error_to_buffer_if_grouped(
                 ctx,
@@ -2046,6 +2057,7 @@ fn handle_aggregate_add_error(
                 format!("aggregate {name}: {e}"),
                 stage.clone(),
                 None,
+                failed_at,
             );
             if !routed {
                 let source_name = source_name_arc_of(record);
@@ -2062,6 +2074,7 @@ fn handle_aggregate_add_error(
                         source_name,
                         triggering_field: None,
                         triggering_value: None,
+                        failed_at,
                     },
                 )?;
             }
@@ -2166,6 +2179,7 @@ fn push_late_record(
             source_name,
             triggering_field: None,
             triggering_value: None,
+            failed_at: DlqFailureStamp::now(),
         },
     )
 }
@@ -2213,6 +2227,7 @@ fn emit_aggregate_finalize_dlq(
             source_name,
             triggering_field: None,
             triggering_value: None,
+            failed_at: DlqFailureStamp::now(),
         },
     )
 }

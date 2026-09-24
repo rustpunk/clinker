@@ -847,6 +847,7 @@ mod tests {
             record: representative.clone(),
             row_num: identity,
             message: "bad trailer count".to_string(),
+            failed_at: crate::executor::DlqFailureStamp::now(),
         };
         let records = vec![(representative, identity)];
         let puncts = vec![

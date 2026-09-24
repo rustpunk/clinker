@@ -484,6 +484,9 @@ pub(crate) struct CombineOutputEvalFailure {
     /// The captured eval error. `EvalError` is `Clone`, so stashing the
     /// failing error per row and replaying it from the dispatcher is sound.
     pub error: EvalError,
+    /// Taken in the kernel as the failure is observed, so the dead letter
+    /// the dispatcher emits after the kernel returns reports that moment.
+    pub failed_at: crate::executor::DlqFailureStamp,
 }
 
 /// A combine kernel's emitted rows plus any recoverable output-stage eval

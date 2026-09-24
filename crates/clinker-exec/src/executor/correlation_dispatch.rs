@@ -22,7 +22,9 @@ use crate::executor::dispatch::{
 };
 use crate::executor::preparation::is_explicit_cancellation;
 use crate::executor::structured_output_guard::StructuredOutputDocumentGuard;
-use crate::executor::{DlqEntry, OutputDeliveryId, build_format_writer, format_group_key};
+use crate::executor::{
+    DlqEntry, DlqFailureStamp, OutputDeliveryId, build_format_writer, format_group_key,
+};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, WriterBoundaryMode};
 
@@ -152,6 +154,8 @@ fn commit_one_group(
                     source_name,
                     triggering_field: None,
                     triggering_value: None,
+                    // The group is condemned here, at commit.
+                    failed_at: DlqFailureStamp::now(),
                 },
             )?;
         }
@@ -244,6 +248,7 @@ fn commit_one_group(
                 source_name,
                 triggering_field: None,
                 triggering_value: None,
+                failed_at: err.failed_at,
             },
         )?;
     }
@@ -319,6 +324,8 @@ fn commit_one_group(
                 source_name: slot_source,
                 triggering_field: None,
                 triggering_value: None,
+                // Stamped as the dirty group is condemned, at commit.
+                failed_at: DlqFailureStamp::now(),
             },
         )?;
     }

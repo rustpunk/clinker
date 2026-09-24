@@ -524,6 +524,7 @@ mod tests {
             triggering_field: "v".into(),
             triggering_value: Value::String(foreign_text.clone()),
             original_record: admitted_record(&resources, Value::String(local_text.clone())),
+            failed_at: crate::executor::DlqFailureStamp::now(),
         };
         let diagnostic = event.source_name.len()
             + event.source_file.len()

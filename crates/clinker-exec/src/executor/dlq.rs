@@ -47,6 +47,9 @@ pub(crate) struct SourceRejectionEvent {
     pub(crate) original_record: Record,
     pub(crate) triggering_field: Box<str>,
     pub(crate) triggering_value: clinker_record::Value,
+    /// Taken by the reader when it rejected the attempt, so a rejection the
+    /// ordering barrier held or spilled keeps the moment it was observed.
+    pub(crate) failed_at: DlqFailureStamp,
 }
 
 impl SourceRejectionEvent {
@@ -89,6 +92,7 @@ impl SourceRejectionEvent {
             original_record,
             triggering_field: field.into_boxed_str(),
             triggering_value: original_value,
+            failed_at: DlqFailureStamp::now(),
         }
     }
 
@@ -111,6 +115,7 @@ impl SourceRejectionEvent {
             original_record,
             triggering_field: "record_type".into(),
             triggering_value: clinker_record::Value::String(discriminator.into()),
+            failed_at: DlqFailureStamp::now(),
         }
     }
 
@@ -138,6 +143,7 @@ impl SourceRejectionEvent {
             original_record,
             triggering_field: field.into_boxed_str(),
             triggering_value: clinker_record::Value::String(actual.to_string().into()),
+            failed_at: DlqFailureStamp::now(),
         }
     }
 
@@ -180,6 +186,56 @@ impl SourceRejectionEvent {
     }
 }
 
+/// The identity and time of one observed failure: the `_cxl_dlq_id` and
+/// `_cxl_dlq_timestamp` of the dead-letter row it becomes.
+///
+/// Taken with [`Self::now`] where the engine observes the failure, and
+/// carried unchanged through every place that holds the failure before its
+/// row is written: the correlation and document buffers, side-thread
+/// replays, combine kernels and the source ordering barrier. The row encoder
+/// only renders it. The id is a UUIDv7 from the process-wide generator, so
+/// ids are unique and increase in the order stamps are taken, on any thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DlqFailureStamp {
+    id: uuid::Uuid,
+    at: chrono::DateTime<chrono::Utc>,
+}
+
+impl DlqFailureStamp {
+    /// A fresh id and the current UTC time.
+    pub fn now() -> Self {
+        Self {
+            id: uuid::Uuid::now_v7(),
+            at: chrono::Utc::now(),
+        }
+    }
+
+    /// The dead-letter row's `_cxl_dlq_id`.
+    pub fn id(&self) -> uuid::Uuid {
+        self.id
+    }
+
+    /// When the failure was observed: the row's `_cxl_dlq_timestamp`.
+    pub fn at(&self) -> chrono::DateTime<chrono::Utc> {
+        self.at
+    }
+
+    /// A stamp for a second dead letter produced by the same observed
+    /// failure: the same time under a fresh id, because every row's id is
+    /// unique.
+    pub(crate) fn sibling(&self) -> Self {
+        Self {
+            id: uuid::Uuid::now_v7(),
+            at: self.at,
+        }
+    }
+
+    /// Rebuild a stamp from the parts a spill payload kept.
+    pub(crate) fn from_parts(id: uuid::Uuid, at: chrono::DateTime<chrono::Utc>) -> Self {
+        Self { id, at }
+    }
+}
+
 /// Record that failed evaluation, queued for DLQ output.
 #[derive(Debug, Clone)]
 pub struct DlqEntry {
@@ -213,6 +269,11 @@ pub struct DlqEntry {
     /// index, mismatched arity). `None` otherwise. Serialized as
     /// `_cxl_dlq_triggering_value`.
     pub triggering_value: Option<clinker_record::Value>,
+    /// When the failure behind this entry was observed, and the row's id.
+    /// A trigger carries the stamp taken at its failure; a collateral entry
+    /// carries one taken when its correlation group or document was
+    /// condemned. Serialized as `_cxl_dlq_id` and `_cxl_dlq_timestamp`.
+    pub failed_at: DlqFailureStamp,
 }
 
 impl DlqEntry {
