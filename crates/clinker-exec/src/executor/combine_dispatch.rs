@@ -21,8 +21,9 @@ use petgraph::graph::NodeIndex;
 use crate::executor::dispatch::{
     ExecutorContext, NodeBufferKey, admit_node_buffer, advance_cursor, declare_node_buffer_readers,
     drain_node_buffer_slot, finalize_node_rooted_windows, node_buffer_spill_allowed, push_dlq,
-    record_error_to_buffer_if_grouped, require_node_buffer_input, source_file_arc_of,
-    source_name_arc_of, stream_linear_producer_emit, tee_emit_to_region_input_buffers,
+    record_collateral_to_buffer_if_grouped, record_error_to_buffer_if_grouped,
+    require_node_buffer_input, source_file_arc_of, source_name_arc_of, stream_linear_producer_emit,
+    tee_emit_to_region_input_buffers,
 };
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{
@@ -2811,7 +2812,9 @@ fn adopt_spilled_runs_into_node_buffer(
 /// build row contributed, a build-side entry. `failed_at` is the stamp taken
 /// where the failure was observed, which may be a probe thread or a kernel
 /// that returned long after; the build-side entry shares its time under its
-/// own id.
+/// own id. Under correlation buffering the build-side entry is held with the
+/// probe row's group as a collateral, so it is written or rolled back with
+/// that group and condemns nothing by itself.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_combine_output_error(
     ctx: &mut ExecutorContext<'_>,
@@ -2902,16 +2905,23 @@ fn dispatch_combine_output_error(
         // time and trigger id under its own id, so it pairs with the driver
         // row wherever it is held.
         let build_failed_at = failed_at.sibling();
-        let build_routed = record_error_to_buffer_if_grouped(
-            ctx,
-            build_record,
-            build_row_num,
-            category,
-            message.clone(),
-            stage.clone(),
-            None,
-            build_failed_at,
-        );
+        // The build entry lives and dies with the driver's group. It is held
+        // in the driver's correlation cell as that group's collateral, never
+        // under the build record's own key: the build record did not fail,
+        // so it must not condemn its own group, nor the output of any other
+        // driver that matched it and succeeded.
+        let build_routed = routed
+            && record_collateral_to_buffer_if_grouped(
+                ctx,
+                probe_record,
+                row_num,
+                build_record,
+                build_row_num,
+                category,
+                message.clone(),
+                stage.clone(),
+                build_failed_at,
+            );
         if !build_routed {
             let build_source_name = build_source
                 .clone()

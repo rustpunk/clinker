@@ -458,6 +458,15 @@ This is useful for transactional data where partial processing of a group is wor
 
 Under multi-source ingest, the collateral fan-out narrows to the failing source: a `src_b` trigger does NOT DLQ records from `src_a` that share the same correlation key. Single-source pipelines see bit-identical behavior to today's pipeline-wide collateral DLQ. See [Per-source rollback narrowing](correlation-keys.md#per-source-rollback-narrowing) for the full semantic and the two documented exceptions (`max_group_buffer` overflow and Combine output failures).
 
+When a Combine output row fails under a correlation key, the failing driver
+row is the trigger of the driver's correlation group. The dead letter for the
+matched build record is held with that group as a collateral
+(`_cxl_dlq_trigger: false`, category `combine_output_row`), written right after
+its driver's row with its driver's `_cxl_dlq_trigger_id`, and written or rolled
+back exactly when that group is. It never condemns the build record's own
+correlation group, so another driver that matched the same build record keeps
+its output unless its own group failed.
+
 For the full lifecycle and per-operator semantics (route, merge, aggregate, combine), see [Correlation Keys](correlation-keys.md).
 
 ### Max group buffer

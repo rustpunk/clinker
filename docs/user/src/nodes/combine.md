@@ -263,7 +263,7 @@ Combine declares which correlation-key columns its output rows carry via the req
       named: [order_id]         # explicit subset (intersected with upstream)
 ```
 
-- `driver` -- output carries only the driver input's correlation-key columns. Build-side records contribute body fields, but their group identity is consumed by the match.
+- `driver` -- output carries only the driver input's correlation-key columns. Build-side records contribute body fields, but their group identity is consumed by the match; when a match fails, the build record's dead letter follows the failing driver's correlation group.
 - `all` -- output carries every input's correlation-key columns. Use when the build side carries keys that downstream operators need to read.
 - `named: [<field>, ...]` -- an explicit subset. Use to project a multi-field key down to a single field after a join.
 

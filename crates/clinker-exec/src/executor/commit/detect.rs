@@ -131,12 +131,15 @@ pub(crate) fn detect_retract_scope(
             continue;
         };
         // Probe the cell's schema for engine-stamped column lineage.
-        // Every CorrelationErrorRecord in a given cell shares the same
-        // schema (cells are keyed by the engine-stamped tuple), so the
-        // first error_message is representative.
+        // Every trigger record in a given cell shares the same schema
+        // (cells are keyed by the engine-stamped tuple), so the first
+        // trigger is representative. A parked collateral is keyed by its
+        // trigger's cell, not its own record, so it may come from another
+        // source with another schema and is never probed.
         let schema = group
             .error_messages
-            .first()
+            .iter()
+            .find(|err| err.trigger)
             .map(|err| err.original_record.schema().clone());
         let mut has_source_ck = false;
         let mut had_synthetic_lookup = false;

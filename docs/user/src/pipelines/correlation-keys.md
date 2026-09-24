@@ -95,7 +95,7 @@ For example, with `[src_a, src_b] → merge → transform → out` where both de
 Two cases stay group-wide rather than narrowing per source:
 
 - **`max_group_buffer` overflow** DLQ's every record in the overflowing group — no single source is to blame for the overflow.
-- **Combine output failures** DLQ the synthesized output row, which has no single-source attribution.
+- **Combine output failures** DLQ the synthesized output row, which has no single-source attribution. The exception concerns the output row only: the matched build record's dead letter follows the failing driver's group, as described under [Combine interaction](#combine-interaction), and never widens the narrowing to the build record's source.
 
 ### Aggregate interaction
 
@@ -157,6 +157,8 @@ How match mode fills the propagated key:
 **Driver wins on a name collision**: if both the driver and a build input declare the same key field, the output keeps the driver's value.
 
 `propagate_ck` is a required field — every combine must spell out which mode it uses.
+
+**A failing match's build-side dead letter follows the driver's group.** When the combine body fails for a driver row, that driver row is the trigger of the driver's correlation group. The matched build record's dead letter is held with the same group as a collateral (`_cxl_dlq_trigger: false`, category `combine_output_row`), written right after its driver's row and carrying that driver's `_cxl_dlq_trigger_id`, and it is written or rolled back exactly when the driver's group is. It never condemns the build record's own correlation group: another driver that matched the same build record keeps its output unless its own group failed. When several drivers in different groups fail against one build record, the build record is written once with each failing driver's group.
 
 ### Composition interaction
 

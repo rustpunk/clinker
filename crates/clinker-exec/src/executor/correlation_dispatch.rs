@@ -191,8 +191,18 @@ fn commit_one_group(
         return Ok(());
     }
 
-    let group_dirty = !error_rows.is_empty();
-    if !group_dirty {
+    // A group is dirty when it holds at least one trigger: a failure of its
+    // own. A parked collateral (a Combine build-side dead letter held with
+    // its failing driver's group) never makes a group dirty by itself; it is
+    // only ever parked beside the trigger that condemned it.
+    let Some(first_err) = error_messages.iter().find(|err| err.trigger) else {
+        if !error_rows.is_empty() || !error_messages.is_empty() {
+            return Err(PipelineError::Internal {
+                op: "correlation-commit",
+                node: format_group_key(group_key),
+                detail: "a correlation group holds parked dead letters but no trigger".to_string(),
+            });
+        }
         // Clean group → drop the records into the per-output queue
         // for batched flush after every group has been visited.
         for slot in records {
@@ -202,22 +212,16 @@ fn commit_one_group(
                 .push(slot);
         }
         return Ok(());
-    }
+    };
 
     // Dirty group → drop projected records, emit DLQ entries for every
-    // distinct row_num touched by the group. Triggers come from
-    // `error_messages`; collaterals come from `records` (rows that
-    // succeeded their leg but get rolled back because the group failed).
-    // The group's first parked error is the failure its collaterals are
-    // attributed to: their detail quotes its message, and their trigger id
-    // is its trigger row's id. `group_dirty` guarantees it exists.
-    let Some(first_err) = error_messages.first() else {
-        return Err(PipelineError::Internal {
-            op: "correlation-commit",
-            node: format_group_key(group_key),
-            detail: "a dirty correlation group holds no parked error".to_string(),
-        });
-    };
+    // distinct row_num touched by the group. Parked records come from
+    // `error_messages` (triggers, and collaterals held with them);
+    // collaterals also come from `records` (rows that succeeded their leg
+    // but get rolled back because the group failed). The group's first
+    // trigger is the failure its `records` collaterals are attributed to:
+    // their detail quotes its message, and their failure id is its trigger
+    // row's id.
     let first_err_message = first_err.error_message.clone();
     let first_err_stamp = first_err.failed_at;
 
@@ -232,8 +236,11 @@ fn commit_one_group(
     // single-source pipeline by construction: every co-grouped slot
     // shares the failing source, so the wider behavior is
     // bit-identical to today's pipeline-wide collateral DLQ.
+    // Only triggers count: a parked collateral's source had no causal
+    // role in the group's failure.
     let failing_sources: HashSet<Arc<str>> = error_messages
         .iter()
+        .filter(|err| err.trigger)
         .map(|err| source_name_arc_of(&err.original_record))
         .collect();
 
@@ -241,9 +248,11 @@ fn commit_one_group(
     // directly so Route fan-out emits one entry per source row without
     // reconstructing identity from a diagnostic source name.
     let mut seen_rows: HashSet<crate::executor::stream_event::SourceRowId> = HashSet::new();
-    // Trigger entries: one per distinct erroring row. Multiple errors
-    // per row (different branches failing) collapse to a single trigger
-    // entry carrying the first error.
+    // Parked entries, in parking order: one per distinct row. Multiple
+    // errors per row (different branches failing) collapse to a single
+    // entry carrying the first error. A trigger is written as a trigger; a
+    // parked collateral is written as a collateral right where it was
+    // parked, after the trigger that condemned it, with its own stamp.
     for err in &error_messages {
         let source_name = source_name_arc_of(&err.original_record);
         if !seen_rows.insert(err.row_num) {
@@ -258,7 +267,7 @@ fn commit_one_group(
                 original_record: err.original_record.clone(),
                 stage: err.stage.clone(),
                 route: err.route.clone(),
-                trigger: true,
+                trigger: err.trigger,
                 source_name,
                 triggering_field: None,
                 triggering_value: None,

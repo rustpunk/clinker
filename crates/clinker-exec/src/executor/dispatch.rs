@@ -1076,6 +1076,63 @@ pub(crate) fn record_error_to_buffer_if_grouped(
         stage,
         route,
         failed_at,
+        trigger: true,
+    });
+    true
+}
+
+/// Hold a collateral dead letter with the correlation group of the failure
+/// that condemned it, when correlation buffering is active.
+///
+/// `group_record` and `group_row` identify the failing record whose trigger
+/// the caller has already parked through [`record_error_to_buffer_if_grouped`];
+/// the collateral is keyed by *their* group cell, not by `record`'s own
+/// correlation values, so it is written or rolled back exactly when that
+/// group is and never condemns a group of its own. It is parked with
+/// `trigger: false`: it does not make the cell dirty, does not widen the
+/// cell's per-source narrowing, and is never the cell's first trigger (see
+/// [`CorrelationErrorRecord::trigger`]).
+///
+/// It counts toward the cell's `total_records` and overflow check, and its
+/// row joins the cell's `error_rows` so a relaxed-key retract still reaches
+/// it. Returns `true` iff it was parked; `false` when the buffer is
+/// unconfigured, in which case the caller pushes it to the DLQ directly.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_collateral_to_buffer_if_grouped(
+    ctx: &mut ExecutorContext<'_>,
+    group_record: &Record,
+    group_row: crate::executor::stream_event::SourceRowId,
+    record: &Record,
+    row_num: crate::executor::stream_event::SourceRowId,
+    category: clinker_core_types::dlq::DlqErrorCategory,
+    error_message: String,
+    stage: Option<String>,
+    failed_at: DlqFailureStamp,
+) -> bool {
+    if ctx.correlation_buffers.is_none() {
+        return false;
+    }
+    let key = buffer_key_for_record(group_record, group_row);
+    let max_buf = ctx.correlation_max_group_buffer;
+    let buffers = ctx
+        .correlation_buffers
+        .as_mut()
+        .expect("checked buffers Some above");
+    let entry = buffers.entry(key).or_default();
+    entry.total_records += 1;
+    if max_buf > 0 && entry.total_records > max_buf {
+        entry.overflowed = true;
+    }
+    entry.error_rows.insert(row_num);
+    entry.error_messages.push(CorrelationErrorRecord {
+        row_num,
+        original_record: record.clone(),
+        category,
+        error_message,
+        stage,
+        route: None,
+        failed_at,
+        trigger: false,
     });
     true
 }
@@ -5119,14 +5176,16 @@ pub(crate) struct CorrelationRecordSlot {
     pub(crate) output_name: String,
 }
 
-/// One failure event captured against a correlation group.
+/// One dead letter held with a correlation group until the group commits.
 ///
-/// Pushed by the Transform / Route / Output arms when correlation
+/// Pushed by the Transform / Route / Combine / Output arms when correlation
 /// buffering is active. `original_record` is the record at the moment
 /// of failure (e.g., the Transform input that failed evaluation).
 /// Multiple events per row are possible if a row fans out across
 /// branches and more than one branch fails — the `CorrelationCommit`
-/// arm dedupes by `row_num` for trigger emission.
+/// arm dedupes by `row_num` for emission. Most records are the group's
+/// own failures (`trigger: true`); a Combine build-side dead letter is a
+/// collateral held with its failing driver's group (`trigger: false`).
 #[derive(Debug, Clone)]
 pub(crate) struct CorrelationErrorRecord {
     pub(crate) row_num: crate::executor::stream_event::SourceRowId,
@@ -5135,9 +5194,15 @@ pub(crate) struct CorrelationErrorRecord {
     pub(crate) error_message: String,
     pub(crate) stage: Option<String>,
     pub(crate) route: Option<String>,
-    /// Taken when the failure was observed; the trigger entry the commit
-    /// emits for this row carries it.
+    /// Taken when the failure was observed; the entry the commit emits for
+    /// this row carries it.
     pub(crate) failed_at: DlqFailureStamp,
+    /// `true` for a failure of this group's own. `false` marks a collateral
+    /// held with the failure that condemned it: it is written with the
+    /// group, or rolled back with it, as `_cxl_dlq_trigger: false`. Such a
+    /// record never makes its cell dirty, never adds its source to the
+    /// cell's per-source narrowing, and is never the cell's first trigger.
+    pub(crate) trigger: bool,
 }
 
 #[cfg(test)]
