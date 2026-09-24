@@ -18,16 +18,18 @@
 //! or the retraction round-trip surfaces as a value mismatch against
 //! the baseline.
 
-mod common;
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_exec::executor::{DlqEntry, PipelineRunParams};
+use clinker_exec::executor::PipelineRunParams;
 use clinker_plan::error::PipelineError;
 use clinker_record::PipelineCounters;
+use dlq_sink::DlqRow;
 use std::collections::HashMap;
 
-/// Successful run yields counters, the DLQ entries, and the rendered output.
-type RunOutput = (PipelineCounters, Vec<DlqEntry>, String);
+/// Successful run yields counters, the dead-letter rows, and the rendered output.
+type RunOutput = (PipelineCounters, Vec<DlqRow>, String);
 
 fn run_pipeline(yaml: &str, csv_input: &str) -> Result<RunOutput, PipelineError> {
     let config = clinker_plan::config::parse_config(yaml).unwrap();
@@ -54,8 +56,8 @@ fn run_pipeline(yaml: &str, csv_input: &str) -> Result<RunOutput, PipelineError>
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report = common::run_config(&config, readers, writers, &params)?;
-    Ok((report.counters, report.dlq_entries, buf.as_string()))
+    let (report, rows) = dlq_sink::run_config_with_dlq(&config, readers, writers, &params)?;
+    Ok((report.counters, rows, buf.as_string()))
 }
 
 fn sort_body(s: &str) -> Vec<String> {
@@ -90,6 +92,8 @@ pipeline:
   name: post_aggregate_div_zero
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src
@@ -188,7 +192,7 @@ O9,ENG,300
         "expected at least one DLQ entry for the post-aggregate failure"
     );
     assert!(
-        dlq.iter().any(|d| d.trigger),
+        dlq.iter().any(|d| d.trigger()),
         "expected a trigger DLQ entry for the post-aggregate failure"
     );
 }
@@ -428,6 +432,8 @@ pipeline:
   name: sibling_aggregates_isolation
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src
@@ -497,7 +503,7 @@ O9,ENG,East,300
          got: {output}"
     );
     assert!(counters.dlq_count >= 1);
-    assert!(dlq.iter().any(|d| d.trigger));
+    assert!(dlq.iter().any(|d| d.trigger()));
 }
 
 /// Reversible-binding-only post-aggregate failure: pure `sum` /
@@ -511,6 +517,8 @@ pipeline:
   name: reversible_post_aggregate
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src
