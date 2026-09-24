@@ -377,6 +377,13 @@ nodes:
         "the build row keeps its driver's trigger id through its correlation group"
     );
     assert_ne!(id(build), id(driver), "the build row has its own id");
+    assert!(driver.trigger(), "the driver row is the trigger");
+    assert!(
+        !build.trigger(),
+        "a build row held by a correlation group is not a trigger, as on the \
+         unbuffered path: {:?}",
+        describe(&rows)
+    );
 }
 
 /// Transform and Route failures with no correlation key each write one

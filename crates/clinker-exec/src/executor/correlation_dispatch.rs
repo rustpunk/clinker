@@ -258,7 +258,10 @@ fn commit_one_group(
                 original_record: err.original_record.clone(),
                 stage: err.stage.clone(),
                 route: err.route.clone(),
-                trigger: true,
+                // A parked error is its own failure's trigger unless it is a
+                // second row of another failure (a Combine build row keeps
+                // its driver's trigger id), which is never a trigger.
+                trigger: err.failed_at.trigger_id() == err.failed_at.id(),
                 source_name,
                 triggering_field: None,
                 triggering_value: None,
