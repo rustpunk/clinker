@@ -20,6 +20,10 @@ use clinker_plan::error::PipelineError;
 
 #[path = "common/dlq_encode.rs"]
 mod dlq_encode;
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
+
+use dlq_sink::CollectingDlqSink;
 
 fn slot(name: &str, csv: &str) -> FileSlot {
     FileSlot::new(
@@ -109,6 +113,50 @@ fn five_each_readers() -> SourceReaders {
             )]),
         ),
     ])
+}
+
+/// The collecting sink holds exactly the rows the executor counted when every
+/// failure has a destination: one parsed row per dead letter, each under the
+/// header the compiled plan fixed for the bucket.
+#[test]
+fn collecting_sink_rows_match_counted_dead_letters() {
+    let yaml = fail_src_b_yaml(
+        r#"
+error_handling:
+  strategy: continue
+  dlq:
+    path: dlq.csv
+"#,
+    );
+    let config = parse_config(&yaml).unwrap();
+    let plan = config.compile(&CompileContext::default()).unwrap();
+    let layout = plan.dlq_layout().expect("a DLQ block yields a layout");
+    let bucket = layout.bucket_for_source("src_b").expect("src_b routes");
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
+        HashMap::from([("out".to_string(), writer(&buf))]);
+    let sink = CollectingDlqSink::new();
+
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        five_each_readers(),
+        dlq_sink::registry(writers, &sink),
+        &run_params(),
+    )
+    .expect("pipeline must complete under Continue strategy");
+
+    let rows = sink.rows();
+    assert_eq!(report.counters.dlq_count, 5, "5 src_b rows fail");
+    assert_eq!(rows.len() as u64, report.counters.dlq_count);
+    assert_eq!(
+        sink.header_for("dlq.csv").expect("the bucket received rows"),
+        layout.bucket(bucket).header()
+    );
+    assert!(
+        rows.iter()
+            .all(|row| row.bucket_path() == PathBuf::from("dlq.csv")
+                && row.source_name() == "src_b")
+    );
 }
 
 /// AC1 reinforcement: every DLQ entry carries the originating Source
