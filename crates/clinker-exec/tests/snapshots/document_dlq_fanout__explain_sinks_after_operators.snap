@@ -1,0 +1,113 @@
+---
+source: crates/clinker-exec/tests/document_dlq_fanout.rs
+expression: text
+---
+=== Execution Plan ===
+
+Mode: Streaming
+Indices to build: 0
+Transforms: 2
+Output projections: 2
+DAG nodes: 5
+arbitration: BackPressurePreferred -> Priority (pause at 0.80·limit, resume below 0.70·limit)
+
+Source DAG:
+  Tier 0: events
+
+Transform 't2':
+  Parallelism: Stateless
+  Window index: None
+  Partition lookup: None
+
+Transform 't1':
+  Parallelism: Stateless
+  Window index: None
+  Partition lookup: None
+
+=== Physical Properties ===
+
+source.events:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: FilePartitioned { keys: ["$source.file"] }
+  partitioning_provenance: IntroducedByMultiFileSource { source_name: "events" }
+  buffer: materialized
+  arbitration: spill_priority=N/A, can_back_pressure=true, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
+
+transform.t1:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: FilePartitioned { keys: ["$source.file"] }
+  partitioning_provenance: IntroducedByMultiFileSource { source_name: "events" }
+  buffer: materialized
+  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
+
+transform.t2:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: FilePartitioned { keys: ["$source.file"] }
+  partitioning_provenance: IntroducedByMultiFileSource { source_name: "events" }
+  buffer: materialized
+  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
+
+sink.out1:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: FilePartitioned { keys: ["$source.file"] }
+  partitioning_provenance: IntroducedByMultiFileSource { source_name: "events" }
+  buffer: streaming
+  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
+
+sink.out2:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: FilePartitioned { keys: ["$source.file"] }
+  partitioning_provenance: IntroducedByMultiFileSource { source_name: "events" }
+  buffer: streaming
+  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
+
+=== Buffer Edges ===
+
+edge source.events -> transform.t1:
+  buffer: node_buffer (slot=0)
+  arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: source)
+
+edge source.events -> transform.t2:
+  buffer: node_buffer (slot=0)
+  arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: source)
+
+edge transform.t1 -> sink.out1:
+  buffer: node_buffer (slot=3)
+  arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: transform)
+
+edge transform.t2 -> sink.out2:
+  buffer: node_buffer (slot=1)
+  arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: transform)
+
+=== CXL Expressions ===
+
+Transform 't2':
+  emit id = id
+  emit val = value.to_int()
+
+Transform 't1':
+  emit id = id
+  emit val = value
+
+=== Type Annotations ===
+
+Transform 't2': (types inferred at compile time)
+Transform 't1': (types inferred at compile time)
+
+=== Memory Budget ===
+
+Memory limit: default
+Worker threads: 4
+
+=== DAG Topology ===
+
+  ● [source] events (line:5)
+  │ [transform] t1 (line:27)
+  │ [transform] t2 (line:16)
+  │ [sink] out1 (line:34)
+  │ [sink] out2 (line:23)

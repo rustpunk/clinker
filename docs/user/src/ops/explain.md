@@ -33,7 +33,7 @@ Node 4: output_standard (Sink, parallel: serial)
 
 Key information shown:
 
-- **Node index and name** -- the topological position in the DAG
+- **Node index and name** -- the topological position in the DAG. Under `dlq_granularity: document` every Sink is listed after every other node, which is the order the run dispatches them in (see [Document-level DLQ](../pipelines/error-handling.md#document-level-dlq)).
 - **Node type** -- Source, Transform, Aggregate, Route, Merge, Sink, Composition
 - **Parallelism strategy** -- how the optimizer plans to execute the node
 - **Connections** -- downstream nodes, with port labels for route branches
