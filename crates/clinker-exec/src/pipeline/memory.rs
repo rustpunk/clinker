@@ -1783,13 +1783,19 @@ mod tests {
         let guard = signal.mu.lock().unwrap();
         assert!(signal.is_paused());
 
+        let (resumed_tx, resumed_rx) = std::sync::mpsc::channel();
         let resumer = {
             let signal = signal.clone();
-            std::thread::spawn(move || signal.resume())
+            std::thread::spawn(move || {
+                signal.resume();
+                let _ = resumed_tx.send(());
+            })
         };
-        // Give a resume that bypasses the mutex time to store and notify
-        // before this thread parks.
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // A resume that bypasses the mutex returns while this thread still
+        // holds it, so its notification has fired before the park below.
+        // A resume that takes the mutex cannot return yet; the timeout
+        // lets this thread go on to park and release it.
+        let _ = resumed_rx.recv_timeout(std::time::Duration::from_secs(1));
 
         // Park without re-checking the flag first, exactly as the waiter
         // does once it has seen `paused`.
