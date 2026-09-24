@@ -7,6 +7,9 @@ use clinker_exec::{
 };
 use clinker_record::owned_storage::ResourceErrorKind;
 
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
+
 mod physical_runtime {
     use super::*;
     use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, WriterRegistry};
@@ -1811,11 +1814,9 @@ fn decode_ordered_spill_reload_keeps_original_aliases_and_context_owners() {
 }
 
 #[test]
-fn decode_dispatch_paths_retain_shared_leaves_past_executor_teardown() {
-    use clinker_exec::executor::{
-        PipelineExecutor, PipelineRunParams, WriterRegistry, single_file_reader,
-    };
-    use clinker_record::Value;
+fn decode_dispatch_paths_dead_letter_decoded_source_text() {
+    // Decode-time ownership is covered at the coercion layer by schema_coerce.rs tests csv_multirecord_projection_moves_nested_owners_and_logical_names and csv_multirecord_projection_uses_local_repeated_text_policy.
+    use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, single_file_reader};
     for mode in ["fused", "merge", "fanout"] {
         let text = "detached-source-text-".repeat(40);
         let source = |name: &str| {
@@ -1870,7 +1871,8 @@ nodes:
             "rows"
         };
         let branches = if mode == "fanout" { 2 } else { 1 };
-        let mut writers = WriterRegistry::default();
+        let sink = dlq_sink::CollectingDlqSink::new();
+        let mut writers = dlq_sink::registry(std::collections::HashMap::new(), &sink);
         for index in 0..branches {
             yaml.push_str(&format!(
                 r#"  - type: transform
@@ -1902,34 +1904,17 @@ nodes:
             &PipelineRunParams::default(),
         )
         .unwrap();
-        assert_eq!(
-            report.dlq_entries.len(),
-            if mode == "fused" { 1 } else { 2 },
-            "{mode}"
-        );
-        let aliases: Vec<_> = report
-            .dlq_entries
-            .iter()
-            .map(|entry| {
-                let row = &entry.original_record;
-                let leaf = row.get("exposed").unwrap().clone();
-                let Value::String(value) = &leaf else {
-                    panic!("text")
-                };
-                assert_eq!(value.as_str(), text);
-                assert_eq!(
-                    value.legacy_heap_size(),
-                    0,
-                    "{mode}: canonicalization must preserve the actual shared owner"
-                );
-                (leaf, row.schema().clone(), row.doc_ctx().clone())
-            })
-            .collect();
-        drop(report);
-        for (leaf, schema, document) in aliases {
-            assert_eq!(leaf, Value::String(text.as_str().into()));
-            assert!(schema.contains("exposed"));
-            assert!(document.source_file().ends_with(".csv"));
+        let expected = if mode == "fused" { 1 } else { 2 };
+        assert_eq!(report.counters.dlq_count, expected, "{mode}");
+        let rows = sink.rows();
+        assert_eq!(rows.len() as u64, expected, "{mode}");
+        let header = sink
+            .header_for("rejected.csv")
+            .expect("the rejected rows reach the dead-letter file");
+        assert!(header.iter().any(|column| column == "exposed"), "{mode}");
+        for row in &rows {
+            assert_eq!(row.field("exposed"), Some(text.as_str()), "{mode}");
+            assert!(row.source_file().ends_with(".csv"), "{mode}");
         }
     }
 }
@@ -2024,6 +2009,53 @@ fn decode_file_run_with_params(
     memory_limit: &str,
     params: &clinker_exec::executor::PipelineRunParams,
 ) -> Result<clinker_exec::executor::ExecutionReport, clinker_plan::error::PipelineError> {
+    decode_file_run_into(
+        root,
+        inputs,
+        source_options,
+        schema,
+        memory_limit,
+        params,
+        Arc::new(clinker_exec::dlq::DiscardingDlqSink),
+    )
+}
+
+/// [`decode_file_run`], returning the dead-letter rows the run wrote as well.
+fn decode_file_run_collecting(
+    root: &std::path::Path,
+    inputs: &[&[u8]],
+    source_options: &str,
+    schema: &str,
+    memory_limit: &str,
+) -> Result<
+    (
+        clinker_exec::executor::ExecutionReport,
+        Vec<dlq_sink::DlqRow>,
+    ),
+    clinker_plan::error::PipelineError,
+> {
+    let sink = dlq_sink::CollectingDlqSink::new();
+    let report = decode_file_run_into(
+        root,
+        inputs,
+        source_options,
+        schema,
+        memory_limit,
+        &clinker_exec::executor::PipelineRunParams::default(),
+        sink.clone(),
+    )?;
+    Ok((report, sink.rows()))
+}
+
+fn decode_file_run_into(
+    root: &std::path::Path,
+    inputs: &[&[u8]],
+    source_options: &str,
+    schema: &str,
+    memory_limit: &str,
+    params: &clinker_exec::executor::PipelineRunParams,
+    dlq_sink: Arc<dyn clinker_exec::dlq::DlqSink>,
+) -> Result<clinker_exec::executor::ExecutionReport, clinker_plan::error::PipelineError> {
     use clinker_exec::executor::{PipelineExecutor, WriterRegistry};
     use clinker_exec::source::{SourceInput, multi_file::FileSlot};
     let yaml = format!(
@@ -2075,6 +2107,7 @@ nodes:
                 as Box<dyn Write + Send>,
         )]
         .into(),
+        dlq_sink: Some(dlq_sink),
         ..Default::default()
     };
     PipelineExecutor::run_plan_with_readers_writers(
@@ -2087,16 +2120,16 @@ nodes:
 
 #[test]
 fn decode_single_schema_ingest_tracer() {
+    // Decode-time ownership is covered at the coercion layer by schema_coerce.rs tests csv_multirecord_projection_moves_nested_owners_and_logical_names and csv_multirecord_projection_uses_local_repeated_text_policy.
     let root = tempfile::tempdir().unwrap();
     let invalid = "not-an-integer-".repeat(100);
     let input = format!("value\n42\n{invalid}\n");
-    let report = decode_file_run(
+    let (report, rows) = decode_file_run_collecting(
         root.path(),
         &[input.as_bytes()],
         "",
         "        - { name: value, type: int }",
         "256M",
-        None,
     )
     .unwrap();
     assert_eq!(
@@ -2105,32 +2138,17 @@ fn decode_single_schema_ingest_tracer() {
     );
     assert_eq!(report.counters.total_count, 2);
     assert_eq!(report.counters.dlq_count, 1);
-    let clinker_record::Value::String(alias) = report.dlq_entries[0]
-        .original_record
-        .get("value")
-        .unwrap()
-        .clone()
-    else {
-        panic!("the rejected row must retain decoded text");
-    };
-    assert_eq!(alias.as_str(), invalid);
-    assert!(alias.heap_size() > 0);
+    assert_eq!(rows.len(), 1);
     assert_eq!(
-        alias.legacy_heap_size(),
-        0,
-        "real source decoding must own its allocation grant after run teardown"
-    );
-    drop(report);
-    assert_eq!(alias.as_str(), invalid);
-    assert_eq!(
-        alias.legacy_heap_size(),
-        0,
-        "a detached alias must keep its allocation owner"
+        rows[0].field("value"),
+        Some(invalid.as_str()),
+        "the rejected row must retain decoded text"
     );
 }
 
 #[test]
-fn decode_physical_files_preserve_latin1_bytes_and_owned_rejections() {
+fn decode_physical_files_preserve_latin1_bytes_and_rejected_text() {
+    // Decode-time ownership is covered at the coercion layer by schema_coerce.rs tests csv_multirecord_projection_moves_nested_owners_and_logical_names and csv_multirecord_projection_uses_local_repeated_text_policy.
     let root = tempfile::tempdir().unwrap();
     let invalid = "é".repeat(100);
     let mut first = b"value\n42\n".to_vec();
@@ -2139,34 +2157,33 @@ fn decode_physical_files_preserve_latin1_bytes_and_owned_rejections() {
     let mut second = b"value\n43\n".to_vec();
     second.extend(std::iter::repeat_n(0xe9, 100));
     second.push(b'\n');
-    let report = decode_file_run(
+    let (report, rows) = decode_file_run_collecting(
         root.path(),
         &[&first, &second],
         "      options: { encoding: iso-8859-1 }",
         "        - { name: value, type: int }",
         "256M",
-        None,
     )
     .unwrap();
     assert_eq!(report.counters.total_count, 4);
-    assert_eq!(report.dlq_entries.len(), 2);
+    assert_eq!(report.counters.dlq_count, 2);
+    assert_eq!(rows.len(), 2);
     assert_eq!(
         std::fs::read(root.path().join("output.csv")).unwrap(),
         b"value\n42\n43\n"
     );
-    for entry in &report.dlq_entries {
-        let clinker_record::Value::String(value) = entry.original_record.get("value").unwrap()
-        else {
-            panic!("original decoded text must survive each physical reader");
-        };
-        assert_eq!(value.as_str(), invalid);
-        assert!(value.heap_size() > 0);
-        assert_eq!(value.legacy_heap_size(), 0);
+    for row in &rows {
+        assert_eq!(
+            row.field("value"),
+            Some(invalid.as_str()),
+            "original decoded text must survive each physical reader"
+        );
     }
 }
 
 #[test]
-fn decode_split_json_rejection_retains_nested_original_owners() {
+fn decode_split_json_rejection_dead_letters_nested_original_values() {
+    // Decode-time ownership is covered at the coercion layer by schema_coerce.rs tests csv_multirecord_projection_moves_nested_owners_and_logical_names and csv_multirecord_projection_uses_local_repeated_text_policy.
     for json in [false, true] {
         let root = tempfile::tempdir().unwrap();
         let long = "invalid-integer-".repeat(20);
@@ -2181,37 +2198,33 @@ fn decode_split_json_rejection_retains_nested_original_owners() {
                 "      split_values: [{ field: value, delimiter: ';' }]",
             )
         };
-        let report = decode_file_run(
+        let (report, rows) = decode_file_run_collecting(
             root.path(),
             &[input.as_bytes()],
             options,
             "        - { name: value, type: int, multiple: true }",
             "256M",
-            None,
         )
         .unwrap();
-        assert_eq!(report.dlq_entries.len(), 1);
+        assert_eq!(report.counters.dlq_count, 1);
+        assert_eq!(rows.len(), 1);
         assert!(
             std::fs::read(root.path().join("output.csv"))
                 .unwrap()
                 .is_empty()
         );
-        let clinker_record::Value::Array(values) =
-            report.dlq_entries[0].original_record.get("value").unwrap()
-        else {
-            panic!("rejection must retain the decoded array");
+        // The dead-letter cell is the decoded array as the encoder writes it:
+        // two elements, the first the decoded text, the second null for JSON.
+        let expected = if json {
+            format!("[{{\"String\":\"{long}\"}},\"Null\"]")
+        } else {
+            format!("[{{\"String\":\"{long}\"}},{{\"String\":\"42\"}}]")
         };
-        assert_eq!(values.len(), 2);
-        if json {
-            assert_eq!(values[1], clinker_record::Value::Null);
-        }
-        let clinker_record::Value::String(alias) = values[0].clone() else {
-            panic!("decoded nested text must survive");
-        };
-        drop(report);
-        assert_eq!(alias.as_str(), long);
-        assert!(alias.heap_size() > 0);
-        assert_eq!(alias.legacy_heap_size(), 0);
+        assert_eq!(
+            rows[0].field("value"),
+            Some(expected.as_str()),
+            "rejection must retain the decoded array"
+        );
     }
 }
 
@@ -2414,6 +2427,7 @@ nodes:
                 .into(),
                 WriterRegistry {
                     single: [("result".into(), Box::new(output) as Box<dyn Write + Send>)].into(),
+                    dlq_sink: Some(Arc::new(clinker_exec::dlq::DiscardingDlqSink)),
                     ..Default::default()
                 },
                 &PipelineRunParams {
