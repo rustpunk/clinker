@@ -119,7 +119,7 @@ struct WarningCount {
 
 /// DLQ columns that legitimately differ between two runs of identical input,
 /// and lead every DLQ header: `_cxl_dlq_id` (a per-row UUID),
-/// `_cxl_dlq_failure_id` (the UUID of the row's failure's trigger row) and
+/// `_cxl_dlq_trigger_id` (the UUID of the row's failure's trigger row) and
 /// `_cxl_dlq_timestamp` (a wall-clock stamp). They are blanked before
 /// comparison. Every other DLQ column — source row, triggering value, error
 /// category and the full original record — is compared verbatim.

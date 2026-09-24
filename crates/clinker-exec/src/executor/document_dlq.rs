@@ -1134,7 +1134,7 @@ fn reject_document_now(
     };
 
     // Collaterals are condemned by the document's trigger and carry its
-    // failure id. Both callers reject only a document whose trigger is in
+    // trigger id. Both callers reject only a document whose trigger is in
     // the failed map, so a rejection always takes one; were it ever to take
     // none, there would be no failure to name and each collateral would
     // stand alone under its own id.

@@ -210,8 +210,8 @@ fn cell<'a>(row: &'a Row, column: &str) -> &'a str {
 
 /// The failure a row belongs to: the `_cxl_dlq_id` of that failure's
 /// trigger row.
-fn failure_id(row: &Row) -> &str {
-    cell(row, "_cxl_dlq_failure_id")
+fn trigger_id(row: &Row) -> &str {
+    cell(row, "_cxl_dlq_trigger_id")
 }
 
 /// The one file of a single-bucket run, holding `rows` rows.
@@ -491,7 +491,7 @@ nodes:
     assert_eq!(cell(row, "_cxl_dlq_source_record"), "");
     for row in &dlq.rows {
         assert_eq!(
-            failure_id(row),
+            trigger_id(row),
             cell(row, "_cxl_dlq_id"),
             "a failure that wrote one row carries its own id: {row:?}"
         );
@@ -1071,12 +1071,12 @@ nodes:
     let driver_row = &probe.rows[0];
     let build_row = &build.rows[0];
     assert_eq!(
-        failure_id(driver_row),
+        trigger_id(driver_row),
         cell(driver_row, "_cxl_dlq_id"),
         "the driver row is the failure's trigger: {driver_row:?}"
     );
     assert_eq!(
-        failure_id(build_row),
+        trigger_id(build_row),
         cell(driver_row, "_cxl_dlq_id"),
         "the build row pairs with the driver row of the same failure: {build_row:?}"
     );
@@ -1455,7 +1455,7 @@ nodes:
     );
 
     assert_eq!(
-        failure_id(trigger),
+        trigger_id(trigger),
         cell(trigger, "_cxl_dlq_id"),
         "the trigger carries its own id: {trigger:?}"
     );
@@ -1469,7 +1469,7 @@ nodes:
     for row in collateral {
         assert_eq!(cell(row, "_cxl_dlq_error_category"), "correlated");
         assert_eq!(
-            failure_id(row),
+            trigger_id(row),
             cell(trigger, "_cxl_dlq_id"),
             "a collateral pairs with its group's first trigger: {row:?}"
         );
@@ -1553,7 +1553,7 @@ nodes:
         "group_size_exceeded"
     );
     assert_eq!(
-        failure_id(overflow),
+        trigger_id(overflow),
         cell(overflow, "_cxl_dlq_id"),
         "the overflow row carries its own id: {overflow:?}"
     );
@@ -1566,7 +1566,7 @@ nodes:
     for row in collateral {
         assert_eq!(cell(row, "_cxl_dlq_error_category"), "correlated");
         assert_eq!(
-            failure_id(row),
+            trigger_id(row),
             cell(overflow, "_cxl_dlq_id"),
             "an overflowed row pairs with the group_size_exceeded row: {row:?}"
         );
@@ -1657,7 +1657,7 @@ nodes:
     let trigger = triggers[0];
     assert_eq!(cell(trigger, "id"), "2");
     assert_eq!(
-        failure_id(trigger),
+        trigger_id(trigger),
         cell(trigger, "_cxl_dlq_id"),
         "the document trigger carries its own id: {trigger:?}"
     );
@@ -1677,7 +1677,7 @@ nodes:
         );
         assert_eq!(cell(row, "_cxl_dlq_error_category"), "document_rejected");
         assert_eq!(
-            failure_id(row),
+            trigger_id(row),
             cell(trigger, "_cxl_dlq_id"),
             "a rejected document's other records pair with its trigger: {row:?}"
         );

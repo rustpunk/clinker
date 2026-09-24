@@ -239,8 +239,8 @@ nodes:
         .header();
     assert_eq!(header[0], "_cxl_dlq_id");
     assert_eq!(
-        header[1], "_cxl_dlq_failure_id",
-        "the failure id sits directly after the id it refers to"
+        header[1], "_cxl_dlq_trigger_id",
+        "the trigger id sits directly after the id it refers to"
     );
     assert_eq!(header[2], "_cxl_dlq_timestamp");
     assert_eq!(&header[header.len() - 5..], user_columns(layout, "src"));

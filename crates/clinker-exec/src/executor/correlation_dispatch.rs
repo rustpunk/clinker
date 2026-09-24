@@ -113,7 +113,7 @@ fn commit_one_group(
         // un-projected original alongside).
         // The group is condemned here, at commit. The `group_size_exceeded`
         // row is the overflow's trigger; every later row is condemned by it
-        // and carries its failure id.
+        // and carries its trigger id.
         let mut overflow_stamp: Option<DlqFailureStamp> = None;
         let group_repr = format_group_key(group_key);
         let overflow_msg = PipelineError::CorrelationGroupOverflow {
@@ -209,7 +209,7 @@ fn commit_one_group(
     // `error_messages`; collaterals come from `records` (rows that
     // succeeded their leg but get rolled back because the group failed).
     // The group's first parked error is the failure its collaterals are
-    // attributed to: their detail quotes its message, and their failure id
+    // attributed to: their detail quotes its message, and their trigger id
     // is its trigger row's id. `group_dirty` guarantees it exists.
     let Some(first_err) = error_messages.first() else {
         return Err(PipelineError::Internal {

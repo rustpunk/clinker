@@ -250,9 +250,9 @@ fn id(row: &DlqRow) -> &str {
         .expect("every dead-letter header carries _cxl_dlq_id")
 }
 
-fn failure_id(row: &DlqRow) -> &str {
-    row.field("_cxl_dlq_failure_id")
-        .expect("every dead-letter header carries _cxl_dlq_failure_id")
+fn trigger_id(row: &DlqRow) -> &str {
+    row.field("_cxl_dlq_trigger_id")
+        .expect("every dead-letter header carries _cxl_dlq_trigger_id")
 }
 
 fn describe(rows: &[DlqRow]) -> Vec<(String, u64, bool, Option<String>)> {
@@ -309,7 +309,7 @@ fn assert_driver_then_build(tag: &str, trigger: &DlqRow, build: &DlqRow, did: u6
     );
     assert!(trigger.trigger(), "[{tag}] the failing driver is a trigger");
     assert_eq!(
-        failure_id(trigger),
+        trigger_id(trigger),
         id(trigger),
         "[{tag}] the driver is its own failure's trigger"
     );
@@ -339,7 +339,7 @@ fn assert_driver_then_build(tag: &str, trigger: &DlqRow, build: &DlqRow, did: u6
         "[{tag}] the build row is a collateral of the failing driver's group"
     );
     assert_eq!(
-        failure_id(build),
+        trigger_id(build),
         id(trigger),
         "[{tag}] the build row pairs with its own driver's failure"
     );
@@ -467,7 +467,7 @@ fn failing_driver_still_condemns_its_own_group() {
             "[{tag}] the condemned output is a collateral"
         );
         assert_eq!(
-            failure_id(condemned),
+            trigger_id(condemned),
             id(trigger),
             "[{tag}] the condemned output pairs with group A's failing driver"
         );

@@ -416,28 +416,28 @@ const DETERMINISM_INPUT: &str = "id,amount,d\n\
 1,1,5\n2,0,5\n3,3,0\n4,4,20\n5,0,1\n6,6,2\n7,7,0\n8,8,0\n9,0,4\n10,10,50\n";
 
 /// The bytes of the DLQ file at `path` with every `_cxl_dlq_id`,
-/// `_cxl_dlq_failure_id` and `_cxl_dlq_timestamp` cell replaced by a fixed
+/// `_cxl_dlq_trigger_id` and `_cxl_dlq_timestamp` cell replaced by a fixed
 /// placeholder, and how many data rows it has.
 ///
 /// Each cell is found by parsing the file under its own header, so the
 /// columns are located by name. Each parsed value is then replaced in the
 /// raw bytes, after checking it occurs there exactly as often as in those
 /// cells, so no other byte of the file can be rewritten. Every id and
-/// failure id must be a version-7 UUID and every timestamp RFC 3339.
+/// trigger id must be a version-7 UUID and every timestamp RFC 3339.
 ///
-/// A failure id repeats an id (a standalone failure is its own), so each
+/// A trigger id repeats an id (a standalone failure is its own), so each
 /// distinct UUID becomes `<uuid-N>`, numbered by first appearance: the
 /// masked bytes still show which rows share a failure.
 fn masked_dead_letters(path: &Path) -> (Vec<u8>, usize) {
     let ids = column_values(path, "_cxl_dlq_id");
-    let failure_ids = column_values(path, "_cxl_dlq_failure_id");
+    let trigger_ids = column_values(path, "_cxl_dlq_trigger_id");
     let timestamps = column_values(path, "_cxl_dlq_timestamp");
-    assert_eq!(ids.len(), failure_ids.len());
+    assert_eq!(ids.len(), trigger_ids.len());
     assert_eq!(ids.len(), timestamps.len());
     let mut bytes = std::fs::read_to_string(path).expect("read DLQ");
     let mut uuids: Vec<&String> = Vec::new();
-    for (id, failure_id) in ids.iter().zip(&failure_ids) {
-        for uuid in [id, failure_id] {
+    for (id, trigger_id) in ids.iter().zip(&trigger_ids) {
+        for uuid in [id, trigger_id] {
             let parsed = uuid::Uuid::parse_str(uuid).unwrap_or_else(|e| panic!("{uuid:?}: {e}"));
             assert_eq!(parsed.get_version_num(), 7, "{uuid} is a version-7 UUID");
             if !uuids.contains(&uuid) {
@@ -450,11 +450,11 @@ fn masked_dead_letters(path: &Path) -> (Vec<u8>, usize) {
     distinct_ids.dedup();
     assert_eq!(distinct_ids.len(), ids.len(), "every row has its own id");
     for (ordinal, uuid) in uuids.iter().enumerate() {
-        let cells = ids.iter().chain(&failure_ids).filter(|v| v == uuid).count();
+        let cells = ids.iter().chain(&trigger_ids).filter(|v| v == uuid).count();
         assert_eq!(
             bytes.matches(uuid.as_str()).count(),
             cells,
-            "{uuid} occurs only in its id and failure-id cells"
+            "{uuid} occurs only in its id and trigger-id cells"
         );
         bytes = bytes.replace(uuid.as_str(), &format!("<uuid-{}>", ordinal + 1));
     }
@@ -519,7 +519,7 @@ fn two_runs_produce_identical_dlq_bytes_modulo_id_and_timestamp() {
     assert_eq!(
         String::from_utf8_lossy(first),
         String::from_utf8_lossy(second),
-        "the files are byte-identical once ids, failure ids and timestamps are masked"
+        "the files are byte-identical once ids, trigger ids and timestamps are masked"
     );
     assert_eq!(first, second);
 }

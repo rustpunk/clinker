@@ -94,7 +94,7 @@ impl DlqRowEncoder {
     /// One CSV row for `entry` under `bucket`'s header, terminator included.
     ///
     /// The engine columns carry the entry's identity and reason; the id,
-    /// failure id and timestamp columns render the entry's
+    /// trigger id and timestamp columns render the entry's
     /// [`DlqEntry::failed_at`] stamp, so encoding an entry twice yields the
     /// same row; each user
     /// column is placed at its header position, and a header column the
@@ -125,7 +125,7 @@ impl DlqRowEncoder {
         writer.get_ref().0.set(buffer);
 
         let record = &entry.original_record;
-        // The id, failure id and time were stamped where the failure was
+        // The id, trigger id and time were stamped where the failure was
         // observed; the encoder renders them and never generates its own.
         let mut id = uuid::Uuid::encode_buffer();
         writer
@@ -135,7 +135,7 @@ impl DlqRowEncoder {
             .write_field(
                 entry
                     .failed_at
-                    .failure_id()
+                    .trigger_id()
                     .hyphenated()
                     .encode_lower(&mut id),
             )
@@ -723,7 +723,7 @@ nodes:\n- type: source\n  name: src\n  config:\n    name: src\n    type: csv\n  
 
     const ENGINE: [&str; 13] = [
         "_cxl_dlq_id",
-        "_cxl_dlq_failure_id",
+        "_cxl_dlq_trigger_id",
         "_cxl_dlq_timestamp",
         "_cxl_dlq_source_file",
         "_cxl_dlq_source_name",
@@ -1046,16 +1046,16 @@ nodes:
         let stamp = entry.failed_at;
         for row in &rows {
             assert_eq!(row[0], stamp.id().hyphenated().to_string());
-            assert_eq!(row[1], stamp.failure_id().hyphenated().to_string());
+            assert_eq!(row[1], stamp.trigger_id().hyphenated().to_string());
             assert_eq!(row[2], stamp.at().to_rfc3339());
         }
         assert_eq!(rows[0], rows[1], "encoding an entry twice yields one row");
     }
 
-    /// The failure id is the second cell, next to the id it refers to. A
+    /// The trigger id is the second cell, next to the id it refers to. A
     /// collateral renders its cause's id there and its own id first.
     #[test]
-    fn row_renders_the_failure_id_as_the_second_cell() {
+    fn row_renders_the_trigger_id_as_the_second_cell() {
         let layout = compiled_layout(&one_source_pipeline(
             "    path: rejects.csv\n",
             &["name", "value"],
