@@ -17,8 +17,10 @@ use clinker_exec::executor::{PipelineExecutor, PipelineRunParams};
 use clinker_exec::source::multi_file::FileSlot;
 use clinker_plan::config::{CompileContext, parse_config};
 
-#[path = "common/dlq_encode.rs"]
-mod dlq_encode;
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
+
+use dlq_sink::{CollectingDlqSink, DlqRow};
 
 /// A three-record-type fixed-width payment file: one `H` header (batch id), two
 /// `D` detail rows (id + amount), and a `T` trailer claiming 2 body records.
@@ -163,12 +165,14 @@ fn run_files(
 /// Run a discriminator-driven source directly into one CSV sink. The
 /// `continue` strategy in the fixtures makes a misplaced reader-proof failure
 /// observable as a DLQ row instead of aborting before the assertions can
-/// compare successful and rejected population.
+/// compare successful and rejected population. Returns the report, the Sink
+/// output, and the dead-letter rows the executor wrote.
+#[allow(clippy::type_complexity)]
 fn run_typed_multi_record(
     yaml: &str,
     file_name: &str,
     fixture: &str,
-) -> Result<(clinker_exec::executor::ExecutionReport, String), String> {
+) -> Result<(clinker_exec::executor::ExecutionReport, String, Vec<DlqRow>), String> {
     let config = parse_config(yaml).map_err(|e| format!("parse: {e:?}"))?;
     let plan = config
         .compile(&CompileContext::default())
@@ -190,9 +194,15 @@ fn run_typed_multi_record(
         batch_id: "batch".to_string(),
         ..Default::default()
     };
-    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
-        .map_err(|e| format!("run: {e:?}"))?;
-    Ok((report, out.as_string()))
+    let sink = CollectingDlqSink::new();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        dlq_sink::registry(writers, &sink),
+        &params,
+    )
+    .map_err(|e| format!("run: {e:?}"))?;
+    Ok((report, out.as_string(), sink.rows()))
 }
 
 fn fixed_width_typed_proof_yaml(first: &str, second: &str) -> String {
@@ -268,11 +278,15 @@ nodes:
     )
 }
 
-fn assert_two_typed_rows_succeed(report: &clinker_exec::executor::ExecutionReport, output: &str) {
+fn assert_two_typed_rows_succeed(
+    report: &clinker_exec::executor::ExecutionReport,
+    output: &str,
+    dlq_rows: &[DlqRow],
+) {
     assert_eq!(report.counters.total_count, 2, "output={output}");
     assert_eq!(report.counters.ok_count, 2, "output={output}");
     assert_eq!(report.counters.dlq_count, 0, "output={output}");
-    assert!(report.dlq_entries.is_empty(), "output={output}");
+    assert!(dlq_rows.is_empty(), "output={output}");
     assert_eq!(
         output.lines().count(),
         3,
@@ -283,13 +297,14 @@ fn assert_two_typed_rows_succeed(report: &clinker_exec::executor::ExecutionRepor
 fn assert_one_alias_row(
     report: &clinker_exec::executor::ExecutionReport,
     output: &str,
+    dlq_rows: &[DlqRow],
     expected_headers: &[&str],
     expected_values: &[&str],
 ) {
     assert_eq!(report.counters.total_count, 1, "output={output}");
     assert_eq!(report.counters.ok_count, 1, "output={output}");
     assert_eq!(report.counters.dlq_count, 0, "output={output}");
-    assert!(report.dlq_entries.is_empty(), "output={output}");
+    assert!(dlq_rows.is_empty(), "output={output}");
 
     let mut csv = csv::Reader::from_reader(output.as_bytes());
     assert_eq!(
@@ -337,11 +352,12 @@ nodes:
       path: out.csv
 "#;
 
-    let (report, output) = run_typed_multi_record(yaml, "input.txt", "007042\n")
+    let (report, output, dlq_rows) = run_typed_multi_record(yaml, "input.txt", "007042\n")
         .expect("fixed-width aliases must retain reader-emitted logical fields");
     assert_one_alias_row(
         &report,
         &output,
+        &dlq_rows,
         &["required_alias", "nullable_alias"],
         &["7", "42"],
     );
@@ -382,11 +398,12 @@ nodes:
       path: out.csv
 "#;
 
-    let (report, output) = run_typed_multi_record(yaml, "input.txt", "D007042\n")
+    let (report, output, dlq_rows) = run_typed_multi_record(yaml, "input.txt", "D007042\n")
         .expect("multi-record fixed-width aliases must retain logical fields");
     assert_one_alias_row(
         &report,
         &output,
+        &dlq_rows,
         &["record_type", "required_alias", "nullable_alias"],
         &["detail", "7", "42"],
     );
@@ -430,11 +447,12 @@ nodes:
       path: out.csv
 "#;
 
-    let (report, output) = run_typed_multi_record(yaml, "input.csv", "D,7,42\n")
+    let (report, output, dlq_rows) = run_typed_multi_record(yaml, "input.csv", "D,7,42\n")
         .expect("multi-record CSV aliases must retain logical fields");
     assert_one_alias_row(
         &report,
         &output,
+        &dlq_rows,
         &["record_type", "kind", "required_alias", "nullable_alias"],
         &["detail", "D", "7", "42"],
     );
@@ -488,9 +506,10 @@ fn fixed_width_int_float_widening_succeeds_in_both_declaration_orders() {
 
     for (first, second) in [(integer, floating), (floating, integer)] {
         let yaml = fixed_width_typed_proof_yaml(first, second);
-        let (report, output) = run_typed_multi_record(&yaml, "input.txt", "I00007\nF01.50\n")
-            .expect("valid fixed-width widened rows");
-        assert_two_typed_rows_succeed(&report, &output);
+        let (report, output, dlq_rows) =
+            run_typed_multi_record(&yaml, "input.txt", "I00007\nF01.50\n")
+                .expect("valid fixed-width widened rows");
+        assert_two_typed_rows_succeed(&report, &output, &dlq_rows);
     }
 }
 
@@ -509,9 +528,9 @@ fn csv_int_float_widening_succeeds_in_both_declaration_orders() {
 
     for (first, second) in [(integer, floating), (floating, integer)] {
         let yaml = csv_typed_proof_yaml(first, second);
-        let (report, output) = run_typed_multi_record(&yaml, "input.csv", "I,7\nF,1.5\n")
+        let (report, output, dlq_rows) = run_typed_multi_record(&yaml, "input.csv", "I,7\nF,1.5\n")
             .expect("valid multi-record CSV widened rows");
-        assert_two_typed_rows_succeed(&report, &output);
+        assert_two_typed_rows_succeed(&report, &output, &dlq_rows);
     }
 }
 
@@ -526,9 +545,10 @@ fn fixed_width_decimal_rows_use_their_local_precision_and_scale() {
             columns:
               - { name: amount, type: decimal, precision: 7, scale: 3, start: 1, width: 8 }"#;
     let yaml = fixed_width_typed_proof_yaml(narrow, wider);
-    let (report, output) = run_typed_multi_record(&yaml, "input.txt", "N00012.34\nW0123.456\n")
-        .expect("valid fixed-width decimals under local declarations");
-    assert_two_typed_rows_succeed(&report, &output);
+    let (report, output, dlq_rows) =
+        run_typed_multi_record(&yaml, "input.txt", "N00012.34\nW0123.456\n")
+            .expect("valid fixed-width decimals under local declarations");
+    assert_two_typed_rows_succeed(&report, &output, &dlq_rows);
 }
 
 #[test]
@@ -544,9 +564,10 @@ fn csv_decimal_rows_use_their_local_precision_and_scale() {
               - { name: kind, type: string }
               - { name: amount, type: decimal, precision: 7, scale: 3 }"#;
     let yaml = csv_typed_proof_yaml(narrow, wider);
-    let (report, output) = run_typed_multi_record(&yaml, "input.csv", "N,12.34\nW,123.456\n")
-        .expect("valid multi-record CSV decimals under local declarations");
-    assert_two_typed_rows_succeed(&report, &output);
+    let (report, output, dlq_rows) =
+        run_typed_multi_record(&yaml, "input.csv", "N,12.34\nW,123.456\n")
+            .expect("valid multi-record CSV decimals under local declarations");
+    assert_two_typed_rows_succeed(&report, &output, &dlq_rows);
 }
 
 #[test]
@@ -642,6 +663,8 @@ pipeline:
   name: multi_record_dlq
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: payments
@@ -678,21 +701,25 @@ nodes:
 }
 
 /// Run one in-memory fixed-width file through the document-DLQ pipeline,
-/// returning the execution report and the success-sink contents. The run
-/// itself must complete: under `dlq_granularity: document` a structural
-/// failure condemns the file, not the run.
-fn run_document_dlq(fixture: &str) -> (clinker_exec::executor::ExecutionReport, String) {
+/// returning the execution report, the success-sink contents, and the
+/// dead-letter rows. The run itself must complete: under
+/// `dlq_granularity: document` a structural failure condemns the file, not
+/// the run.
+fn run_document_dlq(
+    fixture: &str,
+) -> (clinker_exec::executor::ExecutionReport, String, Vec<DlqRow>) {
     run_document_dlq_multi(&[("bad.txt", fixture)])
 }
 
 /// Run an ordered list of `(name, body)` in-memory fixed-width files through
 /// the document-DLQ pipeline as a single multi-file glob source, returning the
-/// execution report and the success-sink contents. Files stream in the given
+/// execution report, the success-sink contents, and the dead-letter rows.
+/// Files stream in the given
 /// order (the multi-file reader preserves slot order), so this exercises
 /// cross-file document boundaries under the `document` opt-in.
 fn run_document_dlq_multi(
     files: &[(&str, &str)],
-) -> (clinker_exec::executor::ExecutionReport, String) {
+) -> (clinker_exec::executor::ExecutionReport, String, Vec<DlqRow>) {
     let config = parse_config(document_dlq_yaml()).expect("parse dlq pipeline");
     let plan = config
         .compile(&CompileContext::default())
@@ -722,9 +749,15 @@ fn run_document_dlq_multi(
         shutdown_token: None,
         ..Default::default()
     };
-    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
-        .expect("document-DLQ run must complete, not abort");
-    (report, out.as_string())
+    let sink = CollectingDlqSink::new();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        dlq_sink::registry(writers, &sink),
+        &params,
+    )
+    .expect("document-DLQ run must complete, not abort");
+    (report, out.as_string(), sink.rows())
 }
 
 /// A record-DLQ variant without a trailer constraint. An undeclared tag is one
@@ -761,7 +794,7 @@ nodes:
 "#
 }
 
-fn run_record_dlq(fixture: &str) -> (clinker_exec::executor::ExecutionReport, String, String) {
+fn run_record_dlq(fixture: &str) -> (clinker_exec::executor::ExecutionReport, String, Vec<DlqRow>) {
     let config = parse_config(record_dlq_yaml()).expect("parse record-DLQ pipeline");
     let plan = config
         .compile(&CompileContext::default())
@@ -786,11 +819,15 @@ fn run_record_dlq(fixture: &str) -> (clinker_exec::executor::ExecutionReport, St
         shutdown_token: None,
         ..Default::default()
     };
-    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
-        .expect("record-grained E345 must reject one row and continue");
-
-    let dlq = dlq_encode::dlq_csv(&plan, &report.dlq_entries);
-    (report, out.as_string(), dlq)
+    let sink = CollectingDlqSink::new();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        dlq_sink::registry(writers, &sink),
+        &params,
+    )
+    .expect("record-grained E345 must reject one row and continue");
+    (report, out.as_string(), sink.rows())
 }
 
 #[test]
@@ -799,21 +836,19 @@ fn unknown_tag_under_record_dlq_rejects_only_that_line_and_continues() {
 
     assert_eq!(report.counters.total_count, 3);
     assert_eq!(report.counters.dlq_count, 1);
-    assert_eq!(report.dlq_entries.len(), 1);
-    let rejected = &report.dlq_entries[0];
+    assert_eq!(dlq.len(), 1);
+    let rejected = &dlq[0];
     assert_eq!(
-        rejected.category,
-        clinker_core_types::dlq::DlqErrorCategory::StructuralValidation
+        rejected.category(),
+        Some(clinker_core_types::dlq::DlqErrorCategory::StructuralValidation.as_str())
     );
-    assert!(rejected.error_message.contains("E345"));
-    assert_eq!(
-        rejected.original_record.get("record_type"),
-        Some(&clinker_record::Value::from("X"))
+    assert!(
+        rejected
+            .error_detail()
+            .is_some_and(|detail| detail.contains("E345"))
     );
-    assert_eq!(
-        rejected.original_record.get("_cxl_dlq_source_record"),
-        Some(&clinker_record::Value::from("X99999 999"))
-    );
+    assert_eq!(rejected.field("record_type"), Some("X"));
+    assert_eq!(rejected.field("_cxl_dlq_source_record"), Some("X99999 999"));
 
     assert!(
         sink.contains("detail,1,100"),
@@ -828,8 +863,9 @@ fn unknown_tag_under_record_dlq_rejects_only_that_line_and_continues() {
         "rejected row reached success Sink: {sink}"
     );
     assert!(
-        dlq.contains("_cxl_dlq_source_record") && dlq.contains("X99999 999"),
-        "DLQ must carry the rejected physical line: {dlq}"
+        dlq.iter()
+            .any(|row| row.field("_cxl_dlq_source_record") == Some("X99999 999")),
+        "DLQ must carry the rejected physical line: {dlq:?}"
     );
 }
 
@@ -868,20 +904,17 @@ nodes:
       type: csv
       path: out.csv
 "#;
-    let (report, output) =
+    let (report, output, dlq_rows) =
         run_typed_multi_record(yaml, "input.csv", "D,1,100\nX,\"quoted, cell\",\nD,2,200\n")
             .expect("record-grained CSV E345 must reject one row and continue");
 
     assert_eq!(report.counters.total_count, 3);
     assert_eq!(report.counters.dlq_count, 1);
-    let rejected = &report.dlq_entries[0];
+    let rejected = &dlq_rows[0];
+    assert_eq!(rejected.field("record_type"), Some("X"));
     assert_eq!(
-        rejected.original_record.get("record_type"),
-        Some(&clinker_record::Value::from("X"))
-    );
-    assert_eq!(
-        rejected.original_record.get("_cxl_dlq_source_record"),
-        Some(&clinker_record::Value::from(r#"["X","quoted, cell",""]"#))
+        rejected.field("_cxl_dlq_source_record"),
+        Some(r#"["X","quoted, cell",""]"#)
     );
     assert!(
         output.contains("detail,D,1,100"),
@@ -917,32 +950,32 @@ fn unknown_tag_under_document_dlq_condemns_the_file_not_the_run() {
     // in the DLQ instead of the success sink.
     //
     // One detail, then an unknown `X` tag → the document is condemned.
-    let (report, sink) = run_document_dlq("D00001 100\nX99999 999\n");
-    let triggers: Vec<_> = report.dlq_entries.iter().filter(|e| e.trigger).collect();
+    let (_, sink, dlq) = run_document_dlq("D00001 100\nX99999 999\n");
+    let triggers: Vec<_> = dlq.iter().filter(|r| r.trigger()).collect();
     assert_eq!(
         triggers.len(),
         1,
         "exactly one root-cause trigger for the condemned file"
     );
     assert_eq!(
-        triggers[0].category,
-        clinker_core_types::dlq::DlqErrorCategory::StructuralValidation
+        triggers[0].category(),
+        Some(clinker_core_types::dlq::DlqErrorCategory::StructuralValidation.as_str())
     );
     assert!(
-        triggers[0].error_message.contains("E345")
-            && triggers[0]
-                .error_message
-                .contains("unknown record-type discriminator"),
+        triggers[0]
+            .error_detail()
+            .is_some_and(|detail| detail.contains("E345")
+                && detail.contains("unknown record-type discriminator")),
         "the trigger names the unknown tag, got {:?}",
-        triggers[0].error_message
+        triggers[0].error_detail()
     );
     assert_eq!(
-        report.dlq_entries.iter().filter(|e| !e.trigger).count(),
+        dlq.iter().filter(|r| !r.trigger()).count(),
         0,
         "the one already-streamed detail row is the selected structural trigger, not a duplicate collateral"
     );
     assert_eq!(
-        report.dlq_entries.len(),
+        dlq.len(),
         1,
         "the selected representative accounts for the file's one decoded row exactly once"
     );
@@ -961,29 +994,31 @@ fn trailer_count_mismatch_under_document_dlq_condemns_the_file_not_the_run() {
     // `dlq_granularity: document` the count mismatch condemns the file to the
     // DLQ — the same disposition as an unknown tag — and the run completes
     // instead of aborting.
-    let (report, sink) = run_document_dlq("D00001 100\nD00002 200\nT00005    \n");
-    let triggers: Vec<_> = report.dlq_entries.iter().filter(|e| e.trigger).collect();
+    let (_, sink, dlq) = run_document_dlq("D00001 100\nD00002 200\nT00005    \n");
+    let triggers: Vec<_> = dlq.iter().filter(|r| r.trigger()).collect();
     assert_eq!(
         triggers.len(),
         1,
         "exactly one root-cause trigger for the condemned file"
     );
     assert_eq!(
-        triggers[0].category,
-        clinker_core_types::dlq::DlqErrorCategory::StructuralValidation
+        triggers[0].category(),
+        Some(clinker_core_types::dlq::DlqErrorCategory::StructuralValidation.as_str())
     );
     assert!(
-        triggers[0].error_message.contains("declares count 5"),
+        triggers[0]
+            .error_detail()
+            .is_some_and(|detail| detail.contains("declares count 5")),
         "the trigger names the count mismatch, got {:?}",
-        triggers[0].error_message
+        triggers[0].error_detail()
     );
     assert_eq!(
-        report.dlq_entries.iter().filter(|e| !e.trigger).count(),
+        dlq.iter().filter(|r| !r.trigger()).count(),
         1,
         "the selected first detail is the trigger and the second detail is its collateral"
     );
     assert_eq!(
-        report.dlq_entries.len(),
+        dlq.len(),
         2,
         "each decoded row in the condemned file is accounted for exactly once"
     );
@@ -1007,7 +1042,7 @@ fn bad_first_line_in_later_file_condemns_that_file_not_the_clean_predecessor() {
     // file's row must reach the success sink and only the bad file must
     // dead-letter, with no collaterals (no record of the bad file ever
     // streamed).
-    let (report, sink) = run_document_dlq_multi(&[
+    let (_, sink, dlq) = run_document_dlq_multi(&[
         ("good.txt", "D00001 100\nT00001    \n"),
         ("bad.txt", "X99999 999\n"),
     ]);
@@ -1023,26 +1058,26 @@ fn bad_first_line_in_later_file_condemns_that_file_not_the_clean_predecessor() {
 
     // Exactly one root-cause trigger, for the bad file's unknown tag, and no
     // collaterals: the bad file streamed no record before failing.
-    let triggers: Vec<_> = report.dlq_entries.iter().filter(|e| e.trigger).collect();
+    let triggers: Vec<_> = dlq.iter().filter(|r| r.trigger()).collect();
     assert_eq!(
         triggers.len(),
         1,
         "exactly one trigger, for the actually-malformed file"
     );
     assert_eq!(
-        triggers[0].category,
-        clinker_core_types::dlq::DlqErrorCategory::StructuralValidation
+        triggers[0].category(),
+        Some(clinker_core_types::dlq::DlqErrorCategory::StructuralValidation.as_str())
     );
     assert!(
-        triggers[0].error_message.contains("E345")
-            && triggers[0]
-                .error_message
-                .contains("unknown record-type discriminator"),
+        triggers[0]
+            .error_detail()
+            .is_some_and(|detail| detail.contains("E345")
+                && detail.contains("unknown record-type discriminator")),
         "the trigger names the unknown tag, got {:?}",
-        triggers[0].error_message
+        triggers[0].error_detail()
     );
     assert_eq!(
-        report.dlq_entries.iter().filter(|e| !e.trigger).count(),
+        dlq.iter().filter(|r| !r.trigger()).count(),
         0,
         "the bad file streamed no record before failing, so it has no collaterals \
          and the clean file's record is not swept in as one"

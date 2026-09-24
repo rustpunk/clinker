@@ -2,12 +2,19 @@
 
 use std::collections::BTreeSet;
 use std::io::Write;
+use std::sync::Arc;
 
+use clinker_exec::dlq::{DiscardingDlqSink, DlqSink};
 use clinker_exec::executor::{
     ExecutionReport, PipelineExecutor, PipelineRunParams, WriterRegistry,
 };
 use clinker_exec::source::{SourceInput, multi_file::FileSlot};
 use clinker_plan::config::{CompileContext, parse_config};
+
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
+
+use dlq_sink::{CollectingDlqSink, DlqRow};
 
 // This list is intentionally independent of the loops that execute the matrix.
 // Each row includes an ordered source and an intervening rejected record.
@@ -116,7 +123,9 @@ nodes:
     )
 }
 
-fn run_files(yaml: &str, inputs: &[Vec<u8>]) -> (ExecutionReport, Vec<u8>) {
+/// Run `yaml` over physical input files: the report, the Sink's bytes, and
+/// the dead-letter rows.
+fn run_files(yaml: &str, inputs: &[Vec<u8>]) -> (ExecutionReport, Vec<u8>, Vec<DlqRow>) {
     let root = tempfile::tempdir().unwrap();
     let plan = parse_config(yaml)
         .unwrap()
@@ -132,12 +141,14 @@ fn run_files(yaml: &str, inputs: &[Vec<u8>]) -> (ExecutionReport, Vec<u8>) {
         })
         .collect();
     let output = root.path().join("output.csv");
+    let sink = CollectingDlqSink::new();
     let writers = WriterRegistry {
         single: [(
             "out".into(),
             Box::new(std::fs::File::create(&output).unwrap()) as Box<dyn Write + Send>,
         )]
         .into(),
+        dlq_sink: Some(Arc::clone(&sink) as Arc<dyn DlqSink>),
         ..Default::default()
     };
     let report = PipelineExecutor::run_plan_with_readers_writers(
@@ -147,7 +158,7 @@ fn run_files(yaml: &str, inputs: &[Vec<u8>]) -> (ExecutionReport, Vec<u8>) {
         &PipelineRunParams::default(),
     )
     .unwrap();
-    (report, std::fs::read(output).unwrap())
+    (report, std::fs::read(output).unwrap(), sink.rows())
 }
 
 #[test]
@@ -197,7 +208,8 @@ fn reader_csv_expected_rows_equal_executed_rows() {
                         };
                         inputs.push(bytes);
                     }
-                    let (report, output) = run_files(&pipeline(encoding, mode, header), &inputs);
+                    let (report, output, dlq) =
+                        run_files(&pipeline(encoding, mode, header), &inputs);
                     let first = match mode {
                         "single" => "key,label\n1,Café\n2,Crème\n",
                         "multi" => {
@@ -227,39 +239,28 @@ fn reader_csv_expected_rows_equal_executed_rows() {
                         "{id}"
                     );
                     assert_eq!(report.counters.dlq_count, file_count as u64, "{id}");
-                    assert_eq!(report.dlq_entries.len(), file_count, "{id}");
-                    for (index, entry) in report.dlq_entries.iter().enumerate() {
+                    assert_eq!(dlq.len(), file_count, "{id}");
+                    for (index, row) in dlq.iter().enumerate() {
                         assert_eq!(
-                            entry.category.as_str(),
-                            if mode == "single" {
+                            row.category(),
+                            Some(if mode == "single" {
                                 "type_coercion_failure"
                             } else {
                                 "structural_validation"
-                            },
+                            }),
                             "{id}"
                         );
-                        let row = &entry.original_record;
                         assert!(
-                            row.doc_ctx()
-                                .source_file()
-                                .ends_with(&format!("input-{index}.csv")),
-                            "{id}"
+                            row.source_file().ends_with(&format!("input-{index}.csv")),
+                            "{id}: {row:?}"
                         );
                         if mode == "single" {
-                            assert_eq!(
-                                row.get("key"),
-                                Some(&clinker_record::Value::from("bad")),
-                                "{id}: {row:?}"
-                            );
-                            assert_eq!(
-                                row.get("label"),
-                                Some(&clinker_record::Value::from("refusé")),
-                                "{id}"
-                            );
+                            assert_eq!(row.field("key"), Some("bad"), "{id}: {row:?}");
+                            assert_eq!(row.field("label"), Some("refusé"), "{id}");
                         } else {
                             assert_eq!(
-                                row.get("_cxl_dlq_source_record"),
-                                Some(&clinker_record::Value::from(r#"["Xé","0","refusé"]"#)),
+                                row.field("_cxl_dlq_source_record"),
+                                Some(r#"["Xé","0","refusé"]"#),
                                 "{id}"
                             );
                         }
@@ -307,6 +308,7 @@ fn reader_csv_multi_record_repeated_values_remain_rejected() {
 
 #[test]
 fn reader_csv_rejected_aliases_preserve_fields_before_and_after_failure() {
+    // Decode-time ownership is covered at the coercion layer by schema_coerce.rs tests csv_multirecord_projection_moves_nested_owners_and_logical_names and csv_multirecord_projection_uses_local_repeated_text_policy.
     let yaml = pipeline("utf-8", "single", true).replace(
         "        - { name: key, source_name: key, type: int }\n        - { name: label, source_name: label, type: string }",
         "        - { name: label, source_name: raw_label, type: string }\n        - { name: key, source_name: raw_key, type: int }\n        - { name: tail, source_name: raw_tail, type: string }",
@@ -314,22 +316,14 @@ fn reader_csv_rejected_aliases_preserve_fields_before_and_after_failure() {
     let before = "before-invalid-decoded-value-".repeat(20);
     let after = "after-invalid-decoded-value-".repeat(20);
     let input = format!("raw_label,raw_key,raw_tail\n{before},bad,{after}\nok,1,end\n");
-    let (report, output) = run_files(&yaml, &[input.into_bytes()]);
+    let (report, output, dlq) = run_files(&yaml, &[input.into_bytes()]);
     assert_eq!(output, b"label,key,tail\nok,1,end\n");
     assert_eq!(report.counters.total_count, 2);
     assert_eq!(report.counters.dlq_count, 1);
-    let row = &report.dlq_entries[0].original_record;
-    assert_eq!(row.get("key"), Some(&clinker_record::Value::from("bad")));
-    let before_alias = row.get("label").unwrap().clone();
-    let after_alias = row.get("tail").unwrap().clone();
-    drop(report);
-    for (value, expected) in [(before_alias, before), (after_alias, after)] {
-        let clinker_record::Value::String(text) = value else {
-            panic!("decoded text")
-        };
-        assert_eq!(text.as_str(), expected);
-        assert_eq!(text.legacy_heap_size(), 0);
-    }
+    let row = &dlq[0];
+    assert_eq!(row.field("key"), Some("bad"));
+    assert_eq!(row.field("label"), Some(before.as_str()));
+    assert_eq!(row.field("tail"), Some(after.as_str()));
 }
 
 #[test]
@@ -340,20 +334,14 @@ fn reader_csv_no_header_rejection_preserves_unaliased_fields() {
             "        - { name: key, source_name: col_0, type: int }\n        - { name: label, source_name: col_1, type: string }",
             "        - { name: col_0, type: string }\n        - { name: col_1, type: int }\n        - { name: col_2, type: string }",
         );
-    let (report, output) = run_files(&yaml, &[b"before,bad,after\nok,1,end\n".to_vec()]);
+    let (report, output, dlq) = run_files(&yaml, &[b"before,bad,after\nok,1,end\n".to_vec()]);
     assert_eq!(output, b"col_0,col_1,col_2\nok,1,end\n");
     assert_eq!(report.counters.total_count, 2);
     assert_eq!(report.counters.dlq_count, 1);
-    let row = &report.dlq_entries[0].original_record;
-    assert_eq!(
-        row.get("col_0"),
-        Some(&clinker_record::Value::from("before"))
-    );
-    assert_eq!(row.get("col_1"), Some(&clinker_record::Value::from("bad")));
-    assert_eq!(
-        row.get("col_2"),
-        Some(&clinker_record::Value::from("after"))
-    );
+    let row = &dlq[0];
+    assert_eq!(row.field("col_0"), Some("before"));
+    assert_eq!(row.field("col_1"), Some("bad"));
+    assert_eq!(row.field("col_2"), Some("after"));
 }
 
 #[test]
@@ -367,7 +355,7 @@ fn reader_csv_latin1_bom_shaped_data_survives_each_physical_file() {
         } else {
             b"\xef\xbb\xbffirst,one\n".as_slice()
         };
-        let (report, output) = run_files(&yaml, &[input.to_vec(), input.to_vec()]);
+        let (report, output, _) = run_files(&yaml, &[input.to_vec(), input.to_vec()]);
         assert_eq!(report.counters.total_count, 2);
         assert_eq!(report.counters.dlq_count, 0);
         assert_eq!(
@@ -381,7 +369,7 @@ fn reader_csv_latin1_bom_shaped_data_survives_each_physical_file() {
     }
     let yaml = pipeline("iso-8859-1", "multi", false).replace("tag: Dé", "tag: ï»¿Dé");
     let input = b"\xef\xbb\xbfD\xe9,1,Caf\xe9\n".to_vec();
-    let (report, output) = run_files(&yaml, &[input.clone(), input]);
+    let (report, output, _) = run_files(&yaml, &[input.clone(), input]);
     assert_eq!(report.counters.total_count, 2);
     assert_eq!(report.counters.dlq_count, 0);
     assert_eq!(
@@ -441,6 +429,7 @@ mode = "none"
                     Box::new(std::fs::File::create(&destination).unwrap()) as Box<dyn Write + Send>,
                 )]
                 .into(),
+                dlq_sink: Some(Arc::new(DiscardingDlqSink)),
                 ..Default::default()
             };
             let readers = [(
