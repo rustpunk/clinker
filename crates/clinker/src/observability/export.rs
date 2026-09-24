@@ -1849,6 +1849,12 @@ fn metric_name(key: MetricKey) -> &'static str {
         MetricKey::WriterCleanupCompleted => "clinker.writer.cleanup.completed",
         MetricKey::WriterCleanupFailed => "clinker.writer.cleanup.failed",
         MetricKey::WriterCleanupInterrupted => "clinker.writer.cleanup.interrupted",
+        MetricKey::DeadLetterStarted => "clinker.dead_letter.started",
+        MetricKey::DeadLetterCompleted => "clinker.dead_letter.completed",
+        MetricKey::DeadLetterFailed => "clinker.dead_letter.failed",
+        MetricKey::DeadLetterInterrupted => "clinker.dead_letter.interrupted",
+        MetricKey::DeadLetterRecords => "clinker.dead_letter.records",
+        MetricKey::DeadLetterBytes => "clinker.dead_letter.bytes",
     }
 }
 
@@ -1866,6 +1872,7 @@ fn span_name(name: SpanName) -> &'static str {
         SpanName::WriterStage => "clinker.writer.stage",
         SpanName::WriterSpill => "clinker.writer.spill",
         SpanName::WriterCleanup => "clinker.writer.cleanup",
+        SpanName::DeadLetter => "clinker.dead_letter",
     }
 }
 
@@ -2545,6 +2552,18 @@ action = "allow"
                 MetricKey::WriterCleanupInterrupted,
                 "clinker.writer.cleanup.interrupted",
             ),
+            (MetricKey::DeadLetterStarted, "clinker.dead_letter.started"),
+            (
+                MetricKey::DeadLetterCompleted,
+                "clinker.dead_letter.completed",
+            ),
+            (MetricKey::DeadLetterFailed, "clinker.dead_letter.failed"),
+            (
+                MetricKey::DeadLetterInterrupted,
+                "clinker.dead_letter.interrupted",
+            ),
+            (MetricKey::DeadLetterRecords, "clinker.dead_letter.records"),
+            (MetricKey::DeadLetterBytes, "clinker.dead_letter.bytes"),
         ];
         assert_eq!(metric_names.len(), MetricKey::COUNT);
         for (key, expected) in metric_names {
@@ -2564,6 +2583,7 @@ action = "allow"
             (SpanName::WriterStage, "clinker.writer.stage"),
             (SpanName::WriterSpill, "clinker.writer.spill"),
             (SpanName::WriterCleanup, "clinker.writer.cleanup"),
+            (SpanName::DeadLetter, "clinker.dead_letter"),
         ];
         for (name, expected) in span_names {
             assert_eq!(span_name(name), expected, "stable name for {name:?}");
@@ -2636,6 +2656,12 @@ action = "allow"
                 "clinker.writer.cleanup.failed",
                 "clinker.writer.cleanup.interrupted",
                 "clinker.sink.truncations",
+                "clinker.dead_letter.started",
+                "clinker.dead_letter.completed",
+                "clinker.dead_letter.failed",
+                "clinker.dead_letter.interrupted",
+                "clinker.dead_letter.records",
+                "clinker.dead_letter.bytes",
             ]
         );
         assert_eq!(
@@ -2653,6 +2679,7 @@ action = "allow"
                 "clinker.writer.stage",
                 "clinker.writer.spill",
                 "clinker.writer.cleanup",
+                "clinker.dead_letter",
             ]
         );
     }

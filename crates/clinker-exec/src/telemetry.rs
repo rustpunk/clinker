@@ -172,11 +172,25 @@ pub enum MetricKey {
     WriterCleanupInterrupted,
     /// Values a Sink cut to fit a `truncation: warn` column.
     SinkTruncations,
+    /// One dead-letter bucket file of the run began receiving rows.
+    DeadLetterStarted,
+    /// A dead-letter bucket file was written in full and handed back for
+    /// publication.
+    DeadLetterCompleted,
+    /// A dead-letter bucket file failed to write or was abandoned by a failed
+    /// run.
+    DeadLetterFailed,
+    /// A dead-letter bucket file was abandoned by an interrupted run.
+    DeadLetterInterrupted,
+    /// Rows written to a dead-letter bucket file.
+    DeadLetterRecords,
+    /// Bytes a dead-letter bucket file accepted, its header included.
+    DeadLetterBytes,
 }
 
 impl MetricKey {
     /// Every fixed metric key in stable counter-index order.
-    pub const ALL: [Self; 55] = [
+    pub const ALL: [Self; 61] = [
         Self::TransformStarted,
         Self::TransformCompleted,
         Self::TransformRecords,
@@ -232,6 +246,12 @@ impl MetricKey {
         Self::WriterCleanupFailed,
         Self::WriterCleanupInterrupted,
         Self::SinkTruncations,
+        Self::DeadLetterStarted,
+        Self::DeadLetterCompleted,
+        Self::DeadLetterFailed,
+        Self::DeadLetterInterrupted,
+        Self::DeadLetterRecords,
+        Self::DeadLetterBytes,
     ];
     /// Number of entries in [`Self::ALL`].
     pub const COUNT: usize = Self::ALL.len();
@@ -295,6 +315,12 @@ impl MetricKey {
             Self::WriterCleanupFailed => 52,
             Self::WriterCleanupInterrupted => 53,
             Self::SinkTruncations => 54,
+            Self::DeadLetterStarted => 55,
+            Self::DeadLetterCompleted => 56,
+            Self::DeadLetterFailed => 57,
+            Self::DeadLetterInterrupted => 58,
+            Self::DeadLetterRecords => 59,
+            Self::DeadLetterBytes => 60,
         }
     }
 }
@@ -315,11 +341,13 @@ pub enum SpanName {
     WriterStage,
     WriterSpill,
     WriterCleanup,
+    /// One dead-letter bucket file, from its first row to its hand-back.
+    DeadLetter,
 }
 
 impl SpanName {
     /// Every span name in stable index order.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Transform,
         Self::CredentialResolve,
         Self::ResourceOpen,
@@ -332,6 +360,7 @@ impl SpanName {
         Self::WriterStage,
         Self::WriterSpill,
         Self::WriterCleanup,
+        Self::DeadLetter,
     ];
 
     /// Return this name's stable slot in the closed span vocabulary.
@@ -350,6 +379,7 @@ impl SpanName {
             Self::WriterStage => 9,
             Self::WriterSpill => 10,
             Self::WriterCleanup => 11,
+            Self::DeadLetter => 12,
         }
     }
 }
@@ -2078,6 +2108,12 @@ mod tests {
             MetricKey::WriterCleanupFailed,
             MetricKey::WriterCleanupInterrupted,
             MetricKey::SinkTruncations,
+            MetricKey::DeadLetterStarted,
+            MetricKey::DeadLetterCompleted,
+            MetricKey::DeadLetterFailed,
+            MetricKey::DeadLetterInterrupted,
+            MetricKey::DeadLetterRecords,
+            MetricKey::DeadLetterBytes,
         ];
 
         assert_eq!(MetricKey::COUNT, expected.len());

@@ -2612,7 +2612,10 @@ nodes:
         let header = layout.buckets()[0].header().join(",");
 
         let staging = dead_letter_attempt_staging(root.path());
-        let sink = Arc::new(crate::output::dlq_sink::StagedDlqSink::new(staging.clone()));
+        let sink = Arc::new(crate::output::dlq_sink::StagedDlqSink::new(
+            staging.clone(),
+            None,
+        ));
         let report = run_every_row_fails(&config, &staging, sink.clone());
 
         assert_eq!(report.counters.dlq_count, 7, "every row dead-letters");
@@ -2653,7 +2656,10 @@ nodes:
         ));
 
         let staging = dead_letter_attempt_staging(root.path());
-        let sink = Arc::new(crate::output::dlq_sink::StagedDlqSink::new(staging.clone()));
+        let sink = Arc::new(crate::output::dlq_sink::StagedDlqSink::new(
+            staging.clone(),
+            None,
+        ));
         let report = run_every_row_fails(&config, &staging, sink.clone());
 
         assert_eq!(report.counters.dlq_count, 7, "every failure counts");
@@ -2748,7 +2754,10 @@ nodes:
         let dlq_path = root.path().join("dlq.csv");
         let plan = every_row_collides_plan(&dlq_path);
         let staging = dead_letter_attempt_staging(root.path());
-        let sink = Arc::new(crate::output::dlq_sink::StagedDlqSink::new(staging.clone()));
+        let sink = Arc::new(crate::output::dlq_sink::StagedDlqSink::new(
+            staging.clone(),
+            None,
+        ));
         let writers = WriterRegistry {
             single: HashMap::from([(
                 "out".to_string(),
@@ -2807,7 +2816,10 @@ nodes:
                 move |_| Ok(staged_out.clone()),
             )
             .expect("stage the primary output");
-        let sink = Arc::new(crate::output::dlq_sink::StagedDlqSink::new(staging.clone()));
+        let sink = Arc::new(crate::output::dlq_sink::StagedDlqSink::new(
+            staging.clone(),
+            None,
+        ));
         let writers = WriterRegistry {
             single: HashMap::from([(
                 "out".to_string(),
