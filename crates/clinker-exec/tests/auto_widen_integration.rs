@@ -16,6 +16,9 @@ use std::sync::{Arc, Mutex};
 use clinker_exec::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams};
 use clinker_plan::config::{CompileContext, PipelineConfig, parse_config};
 
+#[path = "common/dlq_encode.rs"]
+mod dlq_encode;
+
 #[derive(Clone, Default)]
 struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
 
@@ -847,8 +850,8 @@ fn h6b_record_round_trips_through_sort_spill() {
 /// `original_record` retains the source's auto_widen schema — the
 /// `$widened` sidecar column is part of `Record::schema()`, and the
 /// in-flight payload survives end-to-end so the failure context is
-/// preserved. The on-disk DLQ CSV (driven by `dlq::write_dlq`) does
-/// NOT include the literal `$widened` column: a `Value::Map` has no
+/// preserved. The on-disk DLQ CSV (the compiled header, encoded by
+/// `dlq::DlqRowEncoder`) does NOT include the literal `$widened` column: a `Value::Map` has no
 /// canonical scalar serialization and would silently JSON-encode into
 /// a single cell, hiding routing bugs the same way the regular
 /// non-JSON writer's silent map-degrade did before commit
@@ -861,6 +864,8 @@ pipeline:
   name: h7_dlq
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src
@@ -920,13 +925,16 @@ nodes:
         record_schema.columns()
     );
 
-    // The on-disk DLQ CSV (via `dlq::write_dlq`) DROPS `$widened`
-    // — see `dlq::dlq_user_columns`. Drive `write_dlq` directly
-    // against the entry to verify the on-disk shape.
-    let mut buf = Vec::new();
-    clinker_exec::dlq::write_dlq(&mut buf, std::slice::from_ref(entry), true, true)
-        .expect("write_dlq");
-    let dlq_csv = String::from_utf8(buf).expect("utf8 dlq csv");
+    // The on-disk DLQ CSV DROPS `$widened` — see
+    // `dlq_layout::dlq_user_columns`. Encode the entry under the
+    // compiled plan's header, as `clinker run` does, to verify the
+    // on-disk shape.
+    let plan = PipelineConfig::compile(
+        &parse_config(yaml).expect("parse pipeline yaml"),
+        &CompileContext::default(),
+    )
+    .expect("compile");
+    let dlq_csv = dlq_encode::dlq_csv(&plan, std::slice::from_ref(entry));
     let header_line = dlq_csv.lines().next().expect("dlq csv has header");
     assert!(
         !header_line.split(',').any(|c| c.trim() == "$widened"),

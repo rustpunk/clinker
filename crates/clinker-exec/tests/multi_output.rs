@@ -13,6 +13,9 @@ mod multi_output_fixtures;
 #[path = "common/pipeline_resource_fixtures.rs"]
 mod resource_fixtures;
 
+#[path = "common/dlq_encode.rs"]
+mod dlq_encode;
+
 use clinker_record::owned_storage::SharedStorage;
 use std::collections::HashMap;
 
@@ -1825,7 +1828,35 @@ nodes:
 #[test]
 fn test_dlq_columns_in_csv() {
     // Verify that DLQ CSV output includes _cxl_dlq_stage and _cxl_dlq_route columns.
-    use clinker_exec::dlq::write_dlq;
+    let plan = clinker_plan::config::parse_config(
+        r#"
+pipeline:
+  name: test_dlq_columns
+error_handling:
+  strategy: continue
+  dlq:
+    path: rejected.csv
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+    schema:
+      - { name: name, type: string }
+- type: sink
+  name: out
+  input: src
+  config:
+    name: out
+    path: out.csv
+    type: csv
+"#,
+    )
+    .unwrap()
+    .compile(&clinker_plan::config::CompileContext::default())
+    .unwrap();
 
     let schema = SharedStorage::from_arc(std::sync::Arc::new(clinker_record::Schema::new(vec![
         "name".into(),
@@ -1844,9 +1875,7 @@ fn test_dlq_columns_in_csv() {
         triggering_value: None,
     }];
 
-    let mut buf = Vec::new();
-    write_dlq(&mut buf, &entries, true, true).unwrap();
-    let output = String::from_utf8(buf).unwrap();
+    let output = dlq_encode::dlq_csv(&plan, &entries);
 
     let header = output.lines().next().unwrap();
     assert!(
@@ -1874,6 +1903,8 @@ pipeline:
   name: test_dlq_compat
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src
@@ -1918,11 +1949,13 @@ nodes:
         "single-output DLQ should have null route"
     );
 
-    // Verify the DLQ CSV includes new columns
-    use clinker_exec::dlq::write_dlq;
-    let mut buf = Vec::new();
-    write_dlq(&mut buf, &dlq, true, true).unwrap();
-    let output = String::from_utf8(buf).unwrap();
+    // Verify the DLQ CSV, written under the compiled header, includes
+    // the new columns.
+    let plan = clinker_plan::config::parse_config(yaml)
+        .unwrap()
+        .compile(&clinker_plan::config::CompileContext::default())
+        .unwrap();
+    let output = dlq_encode::dlq_csv(&plan, &dlq);
     let header = output.lines().next().unwrap();
     assert!(header.contains("_cxl_dlq_stage"));
     assert!(header.contains("_cxl_dlq_route"));

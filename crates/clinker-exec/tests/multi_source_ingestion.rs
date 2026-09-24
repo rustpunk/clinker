@@ -29,6 +29,9 @@ use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, SourceReaders}
 use clinker_exec::source::multi_file::FileSlot;
 use clinker_plan::config::{CompileContext, parse_config};
 
+#[path = "common/dlq_encode.rs"]
+mod dlq_encode;
+
 fn slot(name: &str, csv: &str) -> FileSlot {
     FileSlot::new(
         PathBuf::from(format!("{name}.csv")),
@@ -272,6 +275,8 @@ pipeline:
   name: dlq_attribution_sidecar
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: src_a
@@ -337,12 +342,9 @@ nodes:
             .expect("pipeline must complete under Continue strategy");
     assert_eq!(report.counters.dlq_count, 3);
 
-    // Round-trip the DLQ vector through the CSV writer and read the
+    // Encode the DLQ vector under the compiled plan's header and read the
     // header + body back to assert column-level attribution.
-    let mut buf = Vec::new();
-    clinker_exec::dlq::write_dlq(&mut buf, &report.dlq_entries, true, true)
-        .expect("write_dlq must succeed");
-    let csv = String::from_utf8(buf).unwrap();
+    let csv = dlq_encode::dlq_csv(&plan, &report.dlq_entries);
     let mut lines = csv.lines();
     let header: Vec<&str> = lines.next().unwrap().split(',').collect();
     let name_col = header
