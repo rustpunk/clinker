@@ -147,12 +147,13 @@ error_handling:
     assert_eq!(report.counters.dlq_count, 5, "5 src_b rows fail");
     assert_eq!(rows.len() as u64, report.counters.dlq_count);
     assert_eq!(
-        sink.header_for("dlq.csv").expect("the bucket received rows"),
+        sink.header_for("dlq.csv")
+            .expect("the bucket received rows"),
         layout.bucket(bucket).header()
     );
     assert!(
         rows.iter()
-            .all(|row| row.bucket_path() == PathBuf::from("dlq.csv")
+            .all(|row| row.bucket_path() == std::path::Path::new("dlq.csv")
                 && row.source_name() == "src_b")
     );
 }
@@ -378,7 +379,8 @@ error_handling:
     // none in the pipeline-wide one.
     assert!(sink.rows_for("dlq.csv").is_empty());
     assert_eq!(
-        sink.header_for("dlq_b.csv").expect("src_b's file received rows"),
+        sink.header_for("dlq_b.csv")
+            .expect("src_b's file received rows"),
         layout.bucket(own).header()
     );
     let rows = sink.rows_for("dlq_b.csv");
