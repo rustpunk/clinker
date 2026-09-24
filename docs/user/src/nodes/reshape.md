@@ -118,9 +118,11 @@ synthesize:
 For each trigger row, `synthesize` emits one new row:
 
 - `copy_from: trigger` — the new row starts as a copy of the trigger row's values, then `overrides` are applied on top.
-- `copy_from: none` — the new row starts all-null; `overrides` must supply every column (enforced at compile time, so a synthesized row is never silently empty).
+- `copy_from: none` — the new row's columns start null; `overrides` must supply every column (enforced at compile time, so a synthesized row is never silently empty).
 
 Each `overrides:` entry is `field: <CXL expression>`, evaluated against the trigger row.
+
+Whichever `copy_from` a rule uses, a synthesized row keeps its trigger row's [`$source.*`](../cxl/system-variables.md) identity — `$source.name`, `$source.file`, and `$source.event_time`. Downstream, `$source.name` on a synthesized row names the Source its trigger came from, and if a later stage dead-letters the row, the entry is attributed to that Source: it counts toward that Source's `per_source` rate limit and is written to that Source's `per_source` dead-letter file when one is configured. See [Error Handling & DLQ](../pipelines/error-handling.md).
 
 ## No cascade
 
