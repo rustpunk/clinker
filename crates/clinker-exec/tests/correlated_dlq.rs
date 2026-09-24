@@ -9,17 +9,21 @@
 mod common;
 #[path = "common/dlq_fixtures.rs"]
 mod dlq_fixtures;
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_exec::executor::{DlqEntry, PipelineRunParams};
+use clinker_core_types::dlq::DlqErrorCategory;
+use clinker_exec::executor::PipelineRunParams;
 use clinker_plan::error::PipelineError;
 use clinker_record::PipelineCounters;
+use dlq_sink::DlqRow;
 use std::collections::HashMap;
 
 fn run_correlated_pipeline(
     yaml: &str,
     csv_input: &str,
-) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
+) -> Result<(PipelineCounters, Vec<DlqRow>, String), PipelineError> {
     let config = clinker_plan::config::parse_config(yaml).unwrap();
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
@@ -44,8 +48,8 @@ fn run_correlated_pipeline(
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report = common::run_config(&config, readers, writers, &params)?;
-    Ok((report.counters, report.dlq_entries, buf.as_string()))
+    let (report, rows) = dlq_sink::run_config_with_dlq(&config, readers, writers, &params)?;
+    Ok((report.counters, rows, buf.as_string()))
 }
 
 fn base_yaml(correlation_key: &str) -> String {
@@ -60,14 +64,14 @@ fn base_yaml(correlation_key: &str) -> String {
 fn one_fail_dlqs_whole_group() {
     let yaml = base_yaml("employee_id");
     let csv = "employee_id,value\nA,100\nA,bad\nA,300\nB,400\n";
-    let (counters, dlq_entries, output) = run_correlated_pipeline(&yaml, csv).unwrap();
+    let (counters, rows, output) = run_correlated_pipeline(&yaml, csv).unwrap();
 
     assert_eq!(
         counters.dlq_count, 3,
         "all 3 records in group A should be DLQ'd"
     );
     assert_eq!(counters.ok_count, 1, "only group B emitted");
-    assert_eq!(dlq_entries.len(), 3);
+    assert_eq!(rows.len(), 3);
     assert!(output.contains("B"), "output should contain group B");
     assert!(
         !output.contains(",bad"),
@@ -79,11 +83,11 @@ fn one_fail_dlqs_whole_group() {
 fn good_groups_emit_bad_groups_dlq() {
     let yaml = base_yaml("employee_id");
     let csv = "employee_id,value\nA,100\nA,200\nB,bad\nB,300\nC,500\nC,600\n";
-    let (counters, dlq_entries, output) = run_correlated_pipeline(&yaml, csv).unwrap();
+    let (counters, rows, output) = run_correlated_pipeline(&yaml, csv).unwrap();
 
     assert_eq!(counters.ok_count, 4, "groups A and C emitted (4 records)");
     assert_eq!(counters.dlq_count, 2, "group B DLQ'd (2 records)");
-    assert_eq!(dlq_entries.len(), 2);
+    assert_eq!(rows.len(), 2);
     assert!(output.contains("A,100"), "output has group A");
     assert!(output.contains("C,500"), "output has group C");
 }
@@ -92,22 +96,22 @@ fn good_groups_emit_bad_groups_dlq() {
 fn trigger_marks_root_cause_only() {
     let yaml = base_yaml("employee_id");
     let csv = "employee_id,value\nA,100\nA,bad\nA,300\n";
-    let (_counters, dlq_entries, _output) = run_correlated_pipeline(&yaml, csv).unwrap();
+    let (_counters, rows, _output) = run_correlated_pipeline(&yaml, csv).unwrap();
 
-    assert_eq!(dlq_entries.len(), 3);
+    assert_eq!(rows.len(), 3);
 
-    let triggers: Vec<bool> = dlq_entries.iter().map(|e| e.trigger).collect();
+    let triggers: Vec<bool> = rows.iter().map(DlqRow::trigger).collect();
     let root_causes = triggers.iter().filter(|&&t| t).count();
     let collaterals = triggers.iter().filter(|&&t| !t).count();
 
     assert_eq!(root_causes, 1, "exactly one root cause");
     assert_eq!(collaterals, 2, "two collateral records");
 
-    let root = dlq_entries.iter().find(|e| e.trigger).unwrap();
+    let root = rows.iter().find(|r| r.trigger()).unwrap();
+    let root_detail = root.error_detail().unwrap();
     assert!(
-        root.error_message.contains("convert") || root.error_message.contains("Int"),
-        "root cause should mention conversion failure: {}",
-        root.error_message
+        root_detail.contains("convert") || root_detail.contains("Int"),
+        "root cause should mention conversion failure: {root_detail}"
     );
 }
 
@@ -118,20 +122,18 @@ fn collateral_carries_correlated_category() {
     // deleted impl).
     let yaml = base_yaml("employee_id");
     let csv = "employee_id,value\nA,100\nA,bad\n";
-    let (_counters, dlq_entries, _output) = run_correlated_pipeline(&yaml, csv).unwrap();
+    let (_counters, rows, _output) = run_correlated_pipeline(&yaml, csv).unwrap();
 
-    let collateral = dlq_entries.iter().find(|e| !e.trigger).unwrap();
+    let collateral = rows.iter().find(|r| !r.trigger()).unwrap();
     assert_eq!(
-        collateral.category,
-        clinker_core_types::dlq::DlqErrorCategory::Correlated,
+        collateral.category(),
+        Some(DlqErrorCategory::Correlated.as_str()),
         "collateral should carry the Correlated category"
     );
+    let collateral_detail = collateral.error_detail().unwrap();
     assert!(
-        collateral
-            .error_message
-            .contains("correlated with failure in group"),
-        "collateral message should mention correlation: {}",
-        collateral.error_message
+        collateral_detail.contains("correlated with failure in group"),
+        "collateral message should mention correlation: {collateral_detail}"
     );
 }
 
@@ -139,12 +141,12 @@ fn collateral_carries_correlated_category() {
 fn null_key_records_are_per_record_groups() {
     let yaml = base_yaml("employee_id");
     let csv = "employee_id,value\n,100\n,bad\n,300\nA,400\n";
-    let (counters, dlq_entries, _output) = run_correlated_pipeline(&yaml, csv).unwrap();
+    let (counters, rows, _output) = run_correlated_pipeline(&yaml, csv).unwrap();
 
     assert_eq!(counters.ok_count, 3, "three good records emitted");
     assert_eq!(counters.dlq_count, 1, "only the bad null-key record DLQ'd");
-    assert_eq!(dlq_entries.len(), 1);
-    assert!(dlq_entries[0].trigger, "individual rejection is root cause");
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].trigger(), "individual rejection is root cause");
 }
 
 #[test]
@@ -154,6 +156,8 @@ pipeline:
   name: compound_key_test
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src
@@ -190,11 +194,11 @@ nodes:
     include_unmapped: true
 "#;
     let csv = "employee_id,dept,value\nA,HR,100\nA,HR,bad\nA,ENG,200\nB,HR,300\n";
-    let (counters, dlq_entries, output) = run_correlated_pipeline(yaml, csv).unwrap();
+    let (counters, rows, output) = run_correlated_pipeline(yaml, csv).unwrap();
 
     assert_eq!(counters.dlq_count, 2, "group (A,HR) DLQ'd");
     assert_eq!(counters.ok_count, 2, "groups (A,ENG) and (B,HR) emitted");
-    assert_eq!(dlq_entries.len(), 2);
+    assert_eq!(rows.len(), 2);
     assert!(output.contains("A,ENG"), "output has (A,ENG)");
     assert!(output.contains("B,HR"), "output has (B,HR)");
 }
@@ -203,12 +207,12 @@ nodes:
 fn empty_input_zero_dlq_zero_emit() {
     let yaml = base_yaml("employee_id");
     let csv = "employee_id,value\n";
-    let (counters, dlq_entries, output) = run_correlated_pipeline(&yaml, csv).unwrap();
+    let (counters, rows, output) = run_correlated_pipeline(&yaml, csv).unwrap();
 
     assert_eq!(counters.total_count, 0);
     assert_eq!(counters.dlq_count, 0);
     assert_eq!(counters.ok_count, 0);
-    assert!(dlq_entries.is_empty());
+    assert!(rows.is_empty());
     let lines: Vec<&str> = output.lines().collect();
     assert!(lines.len() <= 1, "empty or header-only output");
 }
@@ -221,6 +225,8 @@ pipeline:
 error_handling:
   strategy: continue
   max_group_buffer: 3
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src
@@ -256,27 +262,28 @@ nodes:
     // becomes a DLQ entry: one root-cause with category=GroupSizeExceeded,
     // the rest collaterals with category=Correlated.
     let csv = "employee_id,value\nA,100\nA,200\nA,300\nA,400\nA,500\nB,600\n";
-    let (counters, dlq_entries, _output) = run_correlated_pipeline(yaml, csv).unwrap();
+    let (counters, rows, _output) = run_correlated_pipeline(yaml, csv).unwrap();
 
     assert_eq!(
         counters.dlq_count, 5,
         "all 5 records of group A DLQ'd post-overflow"
     );
     assert_eq!(counters.ok_count, 1, "only group B emitted");
+    assert_eq!(rows.len(), 5);
 
-    let triggers = dlq_entries.iter().filter(|e| e.trigger).count();
+    let triggers = rows.iter().filter(|r| r.trigger()).count();
     assert_eq!(triggers, 1, "exactly one root-cause entry");
-    let trigger_entry = dlq_entries.iter().find(|e| e.trigger).unwrap();
+    let trigger_entry = rows.iter().find(|r| r.trigger()).unwrap();
     assert_eq!(
-        trigger_entry.category,
-        clinker_core_types::dlq::DlqErrorCategory::GroupSizeExceeded,
+        trigger_entry.category(),
+        Some(DlqErrorCategory::GroupSizeExceeded.as_str()),
     );
-    let collateral_count = dlq_entries.iter().filter(|e| !e.trigger).count();
+    let collateral_count = rows.iter().filter(|r| !r.trigger()).count();
     assert_eq!(collateral_count, 4);
-    for collateral in dlq_entries.iter().filter(|e| !e.trigger) {
+    for collateral in rows.iter().filter(|r| !r.trigger()) {
         assert_eq!(
-            collateral.category,
-            clinker_core_types::dlq::DlqErrorCategory::Correlated,
+            collateral.category(),
+            Some(DlqErrorCategory::Correlated.as_str()),
         );
     }
 }
@@ -543,6 +550,8 @@ pipeline:
   name: aggregate_correlation_meta
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src
@@ -585,7 +594,7 @@ nodes:
     include_unmapped: true
 "#;
     let csv = "employee_id,value\nA,1\nA,bad\nA,3\nB,7\nB,11\n";
-    let (counters, dlq_entries, output) = run_correlated_pipeline(yaml, csv).unwrap();
+    let (counters, rows, output) = run_correlated_pipeline(yaml, csv).unwrap();
 
     assert_eq!(
         counters.dlq_count, 2,
@@ -593,18 +602,18 @@ nodes:
     );
     assert_eq!(counters.ok_count, 1, "only group B's aggregate row emitted");
 
-    let triggers = dlq_entries.iter().filter(|e| e.trigger).count();
-    let collaterals = dlq_entries.iter().filter(|e| !e.trigger).count();
+    let triggers = rows.iter().filter(|r| r.trigger()).count();
+    let collaterals = rows.iter().filter(|r| !r.trigger()).count();
     assert_eq!(triggers, 1, "exactly one trigger for the bad source row");
     assert_eq!(
         collaterals, 1,
         "exactly one collateral for the aggregate output row"
     );
 
-    let collateral = dlq_entries.iter().find(|e| !e.trigger).unwrap();
+    let collateral = rows.iter().find(|r| !r.trigger()).unwrap();
     assert_eq!(
-        collateral.category,
-        clinker_core_types::dlq::DlqErrorCategory::Correlated,
+        collateral.category(),
+        Some(DlqErrorCategory::Correlated.as_str()),
         "aggregate-output collateral carries the Correlated category"
     );
 
@@ -670,7 +679,7 @@ nodes:
     // ingest-time-identity contract says only the original-A group's
     // 3 records get DLQ'd.
     let csv = "employee_id,value\nA,1\nA,bad\nA,3\nB,4\n";
-    let (counters, _dlq_entries, _output) = run_correlated_pipeline(yaml, csv).unwrap();
+    let (counters, _rows, _output) = run_correlated_pipeline(yaml, csv).unwrap();
 
     assert_eq!(
         counters.dlq_count, 3,
@@ -736,7 +745,7 @@ nodes:
     include_unmapped: true
 "#;
     let csv = "employee_id,value\nA,1\nA,3\nB,7\n";
-    let (counters, _dlq_entries, output) = run_correlated_pipeline(yaml, csv).unwrap();
+    let (counters, _rows, output) = run_correlated_pipeline(yaml, csv).unwrap();
 
     assert_eq!(counters.dlq_count, 0, "no bad records → no DLQ");
     assert_eq!(
@@ -786,6 +795,8 @@ pipeline:
   name: combine_correlation_meta
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: orders
@@ -878,7 +889,7 @@ nodes:
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report = common::run_config(&config, readers, writers, &params).unwrap();
+    let (report, rows) = dlq_sink::run_config_with_dlq(&config, readers, writers, &params).unwrap();
     let output = buf.as_string();
 
     // Group A driver records: A,1 (clean) and A,3 (clean) survive
@@ -895,18 +906,18 @@ nodes:
         "group B's combined row (B,7,ENG) is the only emission"
     );
 
-    let triggers = report.dlq_entries.iter().filter(|e| e.trigger).count();
-    let collaterals = report.dlq_entries.iter().filter(|e| !e.trigger).count();
+    let triggers = rows.iter().filter(|r| r.trigger()).count();
+    let collaterals = rows.iter().filter(|r| !r.trigger()).count();
     assert_eq!(triggers, 1, "one trigger for the bad source row");
     assert_eq!(
         collaterals, 2,
         "two collaterals for the surviving driver-side combined output rows"
     );
 
-    for c in report.dlq_entries.iter().filter(|e| !e.trigger) {
+    for c in rows.iter().filter(|r| !r.trigger()) {
         assert_eq!(
-            c.category,
-            clinker_core_types::dlq::DlqErrorCategory::Correlated,
+            c.category(),
+            Some(DlqErrorCategory::Correlated.as_str()),
             "combined-output collateral carries the Correlated category"
         );
     }
@@ -949,6 +960,8 @@ pipeline:
   name: combine_chain_correlation_meta
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: orders
@@ -1065,7 +1078,7 @@ nodes:
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report = common::run_config(&config, readers, writers, &params).unwrap();
+    let (report, rows) = dlq_sink::run_config_with_dlq(&config, readers, writers, &params).unwrap();
     let output = buf.as_string();
 
     // Department A: O1 and O3 succeed validate; O2 fails (trigger).
@@ -1083,8 +1096,8 @@ nodes:
         "department B's combined row (O4) is the only emission"
     );
 
-    let triggers = report.dlq_entries.iter().filter(|e| e.trigger).count();
-    let collaterals = report.dlq_entries.iter().filter(|e| !e.trigger).count();
+    let triggers = rows.iter().filter(|r| r.trigger()).count();
+    let collaterals = rows.iter().filter(|r| !r.trigger()).count();
     assert_eq!(triggers, 1, "one trigger for the bad source row");
     assert_eq!(
         collaterals, 2,
@@ -1119,6 +1132,8 @@ pipeline:
   name: route_eval_error_test
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src
@@ -1150,15 +1165,16 @@ nodes:
     include_unmapped: true
 "#;
     let csv = "employee_id,amount\nA,1\nA,bad\nA,3\nB,4\n";
-    let (counters, dlq_entries, output) = run_correlated_pipeline(yaml, csv).unwrap();
+    let (counters, rows, output) = run_correlated_pipeline(yaml, csv).unwrap();
 
     assert_eq!(
         counters.dlq_count, 3,
         "group A: 1 trigger (bad route eval) + 2 collaterals (A,1 and A,3)"
     );
     assert_eq!(counters.ok_count, 1, "only B,4 emitted");
+    assert_eq!(rows.len(), 3);
 
-    let triggers = dlq_entries.iter().filter(|e| e.trigger).count();
+    let triggers = rows.iter().filter(|r| r.trigger()).count();
     assert_eq!(triggers, 1, "one trigger for the route eval failure");
 
     assert!(output.contains("B,4"), "output should contain B: {output}");
@@ -1187,6 +1203,8 @@ pipeline:
   name: combine_iejoin_correlation_meta
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: orders
@@ -1282,7 +1300,7 @@ nodes:
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report = common::run_config(&config, readers, writers, &params).unwrap();
+    let (report, rows) = dlq_sink::run_config_with_dlq(&config, readers, writers, &params).unwrap();
     let output = buf.as_string();
 
     assert_eq!(
@@ -1294,8 +1312,8 @@ nodes:
         "only group B's combined row emitted"
     );
 
-    let triggers = report.dlq_entries.iter().filter(|e| e.trigger).count();
-    let collaterals = report.dlq_entries.iter().filter(|e| !e.trigger).count();
+    let triggers = rows.iter().filter(|r| r.trigger()).count();
+    let collaterals = rows.iter().filter(|r| !r.trigger()).count();
     assert_eq!(triggers, 1, "one trigger for the bad source row");
     assert_eq!(collaterals, 2, "two collaterals for IEJoin output rows");
 

@@ -17,13 +17,18 @@
 //! `executor::tests::correlated_dlq::one_fail_dlqs_whole_group` and
 //! `executor::tests::correlated_dlq::group_identity_fixed_at_ingest_when_transform_rewrites_key`.
 
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
+
 use std::collections::HashMap;
 use std::io::{self, Cursor, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use clinker_core_types::dlq::DlqErrorCategory;
 use clinker_exec::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams};
 use clinker_plan::config::{CompileContext, parse_config};
+use dlq_sink::{CollectingDlqSink, DlqRow};
 
 #[derive(Clone, Default)]
 struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
@@ -65,7 +70,7 @@ fn test_params() -> PipelineRunParams {
     }
 }
 
-fn run_with_composition(yaml: &str, csv_input: &str) -> (ExecutionReport, String) {
+fn run_with_composition(yaml: &str, csv_input: &str) -> (ExecutionReport, Vec<DlqRow>, String) {
     let config = parse_config(yaml).expect("parse pipeline yaml");
     let root = fixture_workspace_root();
     let ctx = CompileContext::with_pipeline_dir(&root, PathBuf::from("pipelines"));
@@ -86,10 +91,15 @@ fn run_with_composition(yaml: &str, csv_input: &str) -> (ExecutionReport, String
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
 
-    let report =
-        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
-            .expect("pipeline run");
-    (report, buf.as_string())
+    let sink = CollectingDlqSink::new();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        dlq_sink::registry(writers, &sink),
+        &test_params(),
+    )
+    .expect("pipeline run");
+    (report, sink.rows(), buf.as_string())
 }
 
 #[test]
@@ -118,6 +128,8 @@ pipeline:
   name: correlation_composition_validate
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: src
@@ -145,7 +157,7 @@ nodes:
       include_unmapped: true
 "#;
     let csv = "employee_id,value\nA,100\nA,bad\nA,300\nB,400\n";
-    let (report, output) = run_with_composition(yaml, csv);
+    let (report, rows, output) = run_with_composition(yaml, csv);
 
     assert_eq!(
         report.counters.dlq_count, 3,
@@ -156,18 +168,18 @@ nodes:
         "only group B's body output reaches the writer"
     );
 
-    let triggers = report.dlq_entries.iter().filter(|e| e.trigger).count();
-    let collaterals = report.dlq_entries.iter().filter(|e| !e.trigger).count();
+    let triggers = rows.iter().filter(|r| r.trigger()).count();
+    let collaterals = rows.iter().filter(|r| !r.trigger()).count();
     assert_eq!(triggers, 1, "one trigger for the bad source row");
     assert_eq!(
         collaterals, 2,
         "two collaterals for the surviving group-A body outputs"
     );
 
-    for c in report.dlq_entries.iter().filter(|e| !e.trigger) {
+    for c in rows.iter().filter(|r| !r.trigger()) {
         assert_eq!(
-            c.category,
-            clinker_core_types::dlq::DlqErrorCategory::Correlated,
+            c.category(),
+            Some(DlqErrorCategory::Correlated.as_str()),
             "body-output collateral carries the Correlated category"
         );
     }
@@ -206,6 +218,8 @@ pipeline:
   name: correlation_composition_rewrite
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: src
@@ -233,7 +247,7 @@ nodes:
       include_unmapped: true
 "#;
     let csv = "employee_id,value\nA,1\nA,bad\nA,3\nB,4\n";
-    let (report, _output) = run_with_composition(yaml, csv);
+    let (report, rows, _output) = run_with_composition(yaml, csv);
 
     assert_eq!(
         report.counters.dlq_count, 3,
@@ -244,6 +258,7 @@ nodes:
         "the original-B group's body output emits cleanly"
     );
 
-    let triggers = report.dlq_entries.iter().filter(|e| e.trigger).count();
+    assert_eq!(rows.len(), 3);
+    let triggers = rows.iter().filter(|r| r.trigger()).count();
     assert_eq!(triggers, 1, "one trigger for the bad source row");
 }
