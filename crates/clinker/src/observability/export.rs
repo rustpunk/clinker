@@ -1855,6 +1855,7 @@ fn metric_name(key: MetricKey) -> &'static str {
         MetricKey::DeadLetterInterrupted => "clinker.dead_letter.interrupted",
         MetricKey::DeadLetterRecords => "clinker.dead_letter.records",
         MetricKey::DeadLetterBytes => "clinker.dead_letter.bytes",
+        MetricKey::CorrelationGroupOverflows => "clinker.correlation.group_overflows",
     }
 }
 
@@ -2564,6 +2565,10 @@ action = "allow"
             ),
             (MetricKey::DeadLetterRecords, "clinker.dead_letter.records"),
             (MetricKey::DeadLetterBytes, "clinker.dead_letter.bytes"),
+            (
+                MetricKey::CorrelationGroupOverflows,
+                "clinker.correlation.group_overflows",
+            ),
         ];
         assert_eq!(metric_names.len(), MetricKey::COUNT);
         for (key, expected) in metric_names {
@@ -2662,6 +2667,7 @@ action = "allow"
                 "clinker.dead_letter.interrupted",
                 "clinker.dead_letter.records",
                 "clinker.dead_letter.bytes",
+                "clinker.correlation.group_overflows",
             ]
         );
         assert_eq!(

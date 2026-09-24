@@ -233,7 +233,7 @@ Every DLQ record includes these metadata columns:
 |--------|-------------|
 | `_cxl_dlq_id` | UUID v7 (time-ordered unique identifier), unique to the row. It is taken together with `_cxl_dlq_timestamp`, so ids order the same way as timestamps. |
 | `_cxl_dlq_trigger_id` | The `_cxl_dlq_id` of the trigger row whose failure produced this row. A trigger row points to itself, so `_cxl_dlq_trigger` is `true` exactly when this value equals `_cxl_dlq_id`; every row one failure produced carries the same value. See [Pairing the rows one failure produced](#pairing-the-rows-one-failure-produced). |
-| `_cxl_dlq_timestamp` | RFC 3339 timestamp of when the failure was observed, not of when the row was written. A collateral row (`correlated`, `document_rejected`) and every row of a `group_size_exceeded` group carry the time their correlation group or document was condemned. |
+| `_cxl_dlq_timestamp` | RFC 3339 timestamp of when the failure was observed, not of when the row was written. A collateral row (`correlated`, `document_rejected`) carries the time its correlation group or document was condemned. A `group_size_exceeded` row carries the time its group went over `max_group_buffer`. |
 | `_cxl_dlq_source_file` | Input filename carried by that failing record's `$source.file` provenance (or `<merged>` when no source-file provenance exists) |
 | `_cxl_dlq_source_name` | Name of the Source the failing record came from (or `<merged>` when the record carries no Source identity) |
 | `_cxl_dlq_source_row` | 1-based row number in the source file |
@@ -265,7 +265,8 @@ One failure can dead-letter several rows:
 - a failing row in a correlation group takes the rest of its group with it as
   `correlated` rows;
 - a group larger than `max_group_buffer` writes a `group_size_exceeded` row
-  and its group as `correlated` rows;
+  and the rest of its group as `correlated` rows (the group's own failures
+  keep their own trigger rows, see below);
 - under `dlq_granularity: document`, a failing record rejects the rest of its
   document as `document_rejected` rows.
 
@@ -292,7 +293,16 @@ repeats across the rows of one failure.
 When a correlation group holds several failing rows, each failing row is a
 trigger and keeps its own id as its trigger id. The group's `correlated` rows
 carry the trigger id of the group's first failing row, the one whose error
-their `_cxl_dlq_error_detail` quotes. A rejected document has one trigger, its
+their `_cxl_dlq_error_detail` quotes.
+
+A group larger than `max_group_buffer` can hold failing rows too. Each of
+them is still written as its own trigger, with its own category and id, and
+before the rest of the group. The group's other rows follow under one
+`group_size_exceeded` trigger, the first of them, and the remaining ones are
+`correlated` rows carrying its id. A row is written once: a row that failed
+on one Route branch and reached a Sink on another is written as its own
+failure. A group whose rows all failed writes no `group_size_exceeded` row,
+because the overflow took nothing with it that had not already failed. A rejected document has one trigger, its
 first failing record; its other records, including any that failed after it,
 carry that trigger's id.
 
@@ -466,7 +476,11 @@ Limit the number of records buffered per correlation group:
   max_group_buffer: 100000     # Default: 100,000
 ```
 
-Groups exceeding this limit are DLQ'd entirely with a `group_size_exceeded` summary entry.
+A group that goes over this limit is dead-lettered whole. Its failing rows
+are written as their own triggers; its other rows are written under one
+`group_size_exceeded` row, as `correlated` rows. The limit counts held
+entries, not distinct rows: see
+[Correlation Keys](correlation-keys.md#group-buffering).
 
 ### Document-level DLQ
 

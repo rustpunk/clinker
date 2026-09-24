@@ -1037,8 +1037,8 @@ pub(crate) fn buffer_key_for_record(
 /// parked under the record's group cell — the caller must NOT also
 /// call [`push_dlq`] for it. Returns `false`
 /// when the buffer is unconfigured, signaling the caller to take the
-/// per-record DLQ path. Buffer admission bumps `total_records`,
-/// tripping the overflow flag once `max_group_buffer` is exceeded.
+/// per-record DLQ path. Buffer admission counts one held entry,
+/// stamping the group's overflow once `max_group_buffer` is exceeded.
 /// Null-keyed records get a row-number-disambiguated cell so each is
 /// its own group of one. `failed_at` is the stamp the caller took when it
 /// observed the failure; the parked error keeps it until the group commits.
@@ -1063,10 +1063,7 @@ pub(crate) fn record_error_to_buffer_if_grouped(
         .as_mut()
         .expect("checked buffers Some above");
     let entry = buffers.entry(key).or_default();
-    entry.total_records += 1;
-    if max_buf > 0 && entry.total_records > max_buf {
-        entry.overflowed = true;
-    }
+    entry.admit_entry(max_buf);
     entry.error_rows.insert(row_num);
     entry.error_messages.push(CorrelationErrorRecord {
         row_num,
@@ -5078,16 +5075,21 @@ pub(crate) fn dispatch_plan_node(
 
 /// Correlation-group buffer entry.
 ///
-/// One per `(group_key, output_name)` cell in
+/// One per correlation-key group cell in
 /// [`ExecutorContext::correlation_buffers`]. `records` holds projected
-/// output rows captured by the Output arm before any writer commit;
-/// `error_set` carries source-row IDs of records that failed somewhere
-/// in the pipeline, with the first-error message held alongside for the
-/// trigger entry. `total_records` counts every distinct source row that
-/// passed through the group (including failures and successes), so the
-/// `CorrelationCommit` arm can detect overflow against the configured
-/// `max_group_buffer`. `overflowed` short-circuits further admissions
-/// once the cap has fired.
+/// output rows captured by the Sink arm before any writer commit, one per
+/// Sink a row reaches; `error_rows` carries the source-row IDs of records
+/// that failed somewhere in the pipeline, and `error_messages` holds each
+/// parked failure in parking order for the trigger entries.
+///
+/// `held_entries` counts held entries, not distinct source rows: every
+/// Sink slot and every parked failure is one entry, so a row an inclusive
+/// Route sends to two Sinks counts twice. [`Self::admit_entry`] bumps it
+/// and, the first time it passes `max_group_buffer`, stamps `overflowed_at`
+/// with the failure stamp of the group's `group_size_exceeded` row. Crossing
+/// the cap changes nothing at admission: later rows are still projected and
+/// buffered, and later failures still parked, until the group commits. The
+/// stamp only decides the commit's disposition.
 ///
 /// `Clone` is derived so the relaxed-CK orchestrator can snapshot the
 /// forward-pass baseline state and restore it at the top of each
@@ -5099,8 +5101,36 @@ pub(crate) struct CorrelationGroupBuffer {
     pub(crate) records: Vec<CorrelationRecordSlot>,
     pub(crate) error_rows: HashSet<crate::executor::stream_event::SourceRowId>,
     pub(crate) error_messages: Vec<CorrelationErrorRecord>,
-    pub(crate) total_records: u64,
-    pub(crate) overflowed: bool,
+    pub(crate) held_entries: u64,
+    /// Taken when `held_entries` first passed `max_group_buffer`; `Some`
+    /// exactly when the group has overflowed.
+    pub(crate) overflowed_at: Option<DlqFailureStamp>,
+}
+
+impl CorrelationGroupBuffer {
+    /// Count one more held entry against `max_group_buffer` (`0` is
+    /// unbounded), stamping the overflow the first time the count passes it.
+    /// The caller pushes the entry itself.
+    pub(crate) fn admit_entry(&mut self, max_group_buffer: u64) {
+        self.held_entries += 1;
+        if max_group_buffer > 0
+            && self.held_entries > max_group_buffer
+            && self.overflowed_at.is_none()
+        {
+            self.overflowed_at = Some(DlqFailureStamp::now());
+        }
+    }
+
+    /// Fold another view of this group's overflow into this one, keeping
+    /// the earlier crossing. Ids come from one process-wide UUIDv7
+    /// generator, so the smaller id is the stamp taken first.
+    pub(crate) fn note_overflow(&mut self, other: Option<DlqFailureStamp>) {
+        self.overflowed_at = match (self.overflowed_at, other) {
+            (Some(ours), Some(theirs)) if theirs.id() < ours.id() => Some(theirs),
+            (None, theirs) => theirs,
+            (ours, _) => ours,
+        };
+    }
 }
 
 /// One buffered output record awaiting commit.
@@ -5243,6 +5273,48 @@ mod dlq_capture_tests {
         );
         let mark = state.arm_capture();
         assert_eq!(take(&mut state, mark), Vec::<SourceRowId>::new());
+    }
+}
+
+#[cfg(test)]
+mod correlation_group_overflow_tests {
+    use super::*;
+
+    #[test]
+    fn the_overflow_is_stamped_once_when_the_count_first_passes_the_cap() {
+        let mut group = CorrelationGroupBuffer::default();
+        group.admit_entry(2);
+        group.admit_entry(2);
+        assert!(group.overflowed_at.is_none(), "two entries fit a cap of 2");
+        group.admit_entry(2);
+        let crossing = group.overflowed_at.expect("the third entry crosses");
+        group.admit_entry(2);
+        assert_eq!(group.overflowed_at, Some(crossing), "later entries keep it");
+        assert_eq!(group.held_entries, 4);
+
+        let mut unbounded = CorrelationGroupBuffer::default();
+        for _ in 0..10 {
+            unbounded.admit_entry(0);
+        }
+        assert!(unbounded.overflowed_at.is_none(), "a cap of 0 never fires");
+    }
+
+    #[test]
+    fn folding_overflows_keeps_the_earlier_crossing() {
+        let earlier = DlqFailureStamp::now();
+        let later = DlqFailureStamp::now();
+
+        let mut group = CorrelationGroupBuffer::default();
+        group.note_overflow(None);
+        assert!(group.overflowed_at.is_none());
+        group.note_overflow(Some(later));
+        assert_eq!(group.overflowed_at, Some(later));
+        group.note_overflow(Some(earlier));
+        assert_eq!(group.overflowed_at, Some(earlier));
+        group.note_overflow(Some(later));
+        assert_eq!(group.overflowed_at, Some(earlier));
+        group.note_overflow(None);
+        assert_eq!(group.overflowed_at, Some(earlier));
     }
 }
 

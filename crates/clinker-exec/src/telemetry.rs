@@ -186,11 +186,15 @@ pub enum MetricKey {
     DeadLetterRecords,
     /// Bytes a dead-letter bucket file accepted, its header included.
     DeadLetterBytes,
+    /// Correlation-key groups that held more than `max_group_buffer` entries
+    /// when the run committed them, one per group, whether or not the
+    /// overflow wrote a `group_size_exceeded` row.
+    CorrelationGroupOverflows,
 }
 
 impl MetricKey {
     /// Every fixed metric key in stable counter-index order.
-    pub const ALL: [Self; 61] = [
+    pub const ALL: [Self; 62] = [
         Self::TransformStarted,
         Self::TransformCompleted,
         Self::TransformRecords,
@@ -252,6 +256,7 @@ impl MetricKey {
         Self::DeadLetterInterrupted,
         Self::DeadLetterRecords,
         Self::DeadLetterBytes,
+        Self::CorrelationGroupOverflows,
     ];
     /// Number of entries in [`Self::ALL`].
     pub const COUNT: usize = Self::ALL.len();
@@ -321,6 +326,7 @@ impl MetricKey {
             Self::DeadLetterInterrupted => 58,
             Self::DeadLetterRecords => 59,
             Self::DeadLetterBytes => 60,
+            Self::CorrelationGroupOverflows => 61,
         }
     }
 }
@@ -2203,6 +2209,7 @@ mod tests {
             MetricKey::DeadLetterInterrupted,
             MetricKey::DeadLetterRecords,
             MetricKey::DeadLetterBytes,
+            MetricKey::CorrelationGroupOverflows,
         ];
 
         assert_eq!(MetricKey::COUNT, expected.len());

@@ -24,7 +24,8 @@ use clinker_exec::executor::{
     single_file_reader,
 };
 use clinker_exec::source::multi_file::FileSlot;
-use clinker_plan::config::{CompileContext, parse_config};
+use clinker_exec::telemetry::{MetricKey, TelemetryArena, TelemetryReceiver};
+use clinker_plan::config::{ClinkerToml, CompileContext, parse_config};
 use clinker_plan::error::PipelineError;
 use dlq_sink::{CollectingDlqSink, DlqRow};
 
@@ -69,6 +70,46 @@ fn run(
         params,
     )?;
     Ok((report, sink.rows()))
+}
+
+/// Run parameters with a telemetry producer, and the receiver that drains it.
+fn run_params_with_telemetry() -> (PipelineRunParams, TelemetryReceiver) {
+    let config = ClinkerToml::parse(
+        r#"
+[observability]
+arena_bytes = "768KB"
+ordinary_lane_bytes = "512KB"
+high_severity_lane_bytes = "256KB"
+max_batch_bytes = "8KB"
+rate_limit_per_second = 100000
+rate_limit_burst = 100000
+[observability.otlp]
+endpoint = "https://collector.invalid"
+[observability.otlp.auth]
+mode = "none"
+"#,
+    )
+    .expect("parse observability policy");
+    let (producer, receiver) = TelemetryArena::reserve(
+        &config
+            .resolve_observability(None)
+            .expect("resolve observability"),
+    )
+    .expect("reserve the arena");
+    let params = PipelineRunParams {
+        telemetry_producer: Some(producer),
+        ..run_params()
+    };
+    (params, receiver)
+}
+
+/// The run's total for `key`, summed over every batch the receiver holds.
+fn metric_total(receiver: &TelemetryReceiver, key: MetricKey) -> u64 {
+    let mut total = 0;
+    while let Some(batch) = receiver.try_recv_batch() {
+        total += batch.metric(key);
+    }
+    total
 }
 
 fn one_source(name: &str, csv: &str) -> SourceReaders {
@@ -217,12 +258,19 @@ fn overflow_writes_a_held_transform_failure_as_its_own_trigger() {
 
 /// Group A holds only failures, three of them over a cap of 2. Every failure
 /// is written as its own trigger and no `group_size_exceeded` row is
-/// invented: the overflow condemned nothing that had not already failed.
+/// invented: the overflow condemned nothing that had not already failed. The
+/// overflow is still counted.
 #[test]
 fn a_failures_only_group_over_the_cap_writes_every_failure_and_no_overflow_row() {
     let yaml = validate_pipeline(2, "");
     let csv = "employee_id,value\nA,bad1\nA,bad2\nA,bad3\nB,100\n";
-    let (report, rows) = run(&yaml, one_source("src", csv), &["out"], &run_params()).unwrap();
+    let (params, receiver) = run_params_with_telemetry();
+    let (report, rows) = run(&yaml, one_source("src", csv), &["out"], &params).unwrap();
+    assert_eq!(
+        metric_total(&receiver, MetricKey::CorrelationGroupOverflows),
+        1,
+        "the one overflowed group is counted"
+    );
 
     assert_eq!(
         describe(&rows),
@@ -532,44 +580,42 @@ nodes:
 }
 
 /// The `group_size_exceeded` row is stamped when its group crosses the cap,
-/// not when the group is committed. Group `Z` crosses a cap of 2 at its
-/// third row, before group `A` does at its own third row, but commits after
-/// `A` (groups commit in key order). Ids are UUIDv7 from one process-wide
-/// generator, so they increase in the order stamps are taken: `Z`'s overflow
-/// id sorts before `A`'s only if each was taken at its crossing.
+/// not when the group is committed. Groups `A` and `Z` both cross a cap of 2
+/// while the Sink buffers them; the commit then walks the groups in key
+/// order, condemning each group's `correlated` rows as it reaches it. Ids are
+/// UUIDv7 from one process-wide generator, so they increase in the order
+/// stamps are taken. Every overflow id therefore sorts before every
+/// `correlated` id, including `A`'s, which were condemned before the commit
+/// reached `Z`; an overflow stamped at commit would put `Z`'s after them.
 #[test]
 fn the_overflow_is_stamped_when_the_group_crosses_the_cap() {
     let yaml = validate_pipeline(2, "");
-    let csv = "employee_id,value\nZ,1\nZ,2\nZ,3\nA,4\nA,5\nA,6\n";
+    let csv = "employee_id,value\nA,1\nA,2\nA,3\nZ,4\nZ,5\nZ,6\n";
     let (_report, rows) = run(&yaml, one_source("src", csv), &["out"], &run_params()).unwrap();
 
-    let overflow_of = |key_first_row: u64| -> &DlqRow {
+    let with_category = |category: DlqErrorCategory| -> Vec<&DlqRow> {
         rows.iter()
-            .find(|r| {
-                r.source_row() == key_first_row
-                    && r.category() == Some(DlqErrorCategory::GroupSizeExceeded.as_str())
-            })
-            .unwrap_or_else(|| panic!("row {key_first_row} is an overflow: {:?}", describe(&rows)))
+            .filter(|r| r.category() == Some(category.as_str()))
+            .collect()
     };
-    let z = overflow_of(1);
-    let a = overflow_of(4);
-    assert!(
-        uuid_of(id(z)) < uuid_of(id(a)),
-        "Z crossed the cap first, so its overflow id sorts first: Z={} A={}",
-        id(z),
-        id(a)
-    );
-    let z_at = z.field("_cxl_dlq_timestamp").unwrap();
-    let a_at = a.field("_cxl_dlq_timestamp").unwrap();
-    let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap();
-    assert!(parse(z_at) <= parse(a_at), "Z={z_at} A={a_at}");
+    let overflows = with_category(DlqErrorCategory::GroupSizeExceeded);
+    let correlated = with_category(DlqErrorCategory::Correlated);
+    assert_eq!(overflows.len(), 2, "{:?}", describe(&rows));
+    assert_eq!(correlated.len(), 4, "{:?}", describe(&rows));
 
-    // The group's correlated rows are condemned at commit, after the
-    // crossing, so they sort after the overflow they pair with.
-    for row in rows
-        .iter()
-        .filter(|r| trigger_id(r) == id(z) && !r.trigger())
-    {
-        assert!(uuid_of(id(z)) < uuid_of(id(row)));
+    let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap();
+    let at = |r: &DlqRow| parse(r.field("_cxl_dlq_timestamp").unwrap());
+    for overflow in &overflows {
+        for condemned in &correlated {
+            assert!(
+                uuid_of(id(overflow)) < uuid_of(id(condemned)),
+                "overflow of row {} was stamped before the commit condemned row {}: {} vs {}",
+                overflow.source_row(),
+                condemned.source_row(),
+                id(overflow),
+                id(condemned)
+            );
+            assert!(at(overflow) <= at(condemned));
+        }
     }
 }

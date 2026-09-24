@@ -668,6 +668,13 @@ no rows emits nothing, and neither do dead letters that have no destination:
 count those with `records_dlq`. Preview runs write no DLQ file and emit no
 dead-letter signals.
 
+`clinker.correlation.group_overflows` counts the correlation-key groups that
+went over `error_handling.max_group_buffer`, one per group when the run
+commits it. It counts a group whose rows all failed on their own too, which
+writes no `group_size_exceeded` row, so it can exceed the number of
+`group_size_exceeded` rows in the DLQ. See
+[Correlation Keys](../pipelines/correlation-keys.md#group-buffering).
+
 An instrument that recorded nothing in an interval carries no points for it.
 That is an ordinary interval, not a malformed export: the batch is delivered
 and the points its other instruments did record arrive intact.

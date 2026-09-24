@@ -4419,10 +4419,11 @@ pub struct ErrorHandlingConfig {
     pub dlq: Option<DlqConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub type_error_threshold: Option<f64>,
-    /// Maximum buffered records per correlation group. Once a group reaches
-    /// this cap, the group is DLQ'd with a `group_size_exceeded` root-cause
-    /// entry plus collateral entries for every other buffered record of the
-    /// group. Default: 100_000.
+    /// Maximum entries a correlation group may hold: one per Sink a row
+    /// reaches plus one per failure, not distinct rows. A group that goes
+    /// over this cap is DLQ'd whole at commit: its failures as their own
+    /// triggers, its other rows under one `group_size_exceeded` trigger as
+    /// collateral. Default: 100_000.
     #[serde(
         default = "default_max_group_buffer",
         skip_serializing_if = "Option::is_none"

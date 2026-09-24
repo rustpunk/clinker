@@ -68,9 +68,9 @@ The engine identifies origin per record via the engine-stamped `$source.name` co
 
 Records that carry no single-source attribution — synthetic aggregate emits and Combine output rows — are NOT spared by per-source narrowing. They flow through the existing collateral path because their stamp falls back to the merged-source identity which is ambiguous about origin.
 
-The engine also surfaces a `per_source_rollback_cursors` map on the `ExecutionReport`, keyed by source name and carrying the highest source row number that cleanly exited a forward operator. The map advances per record at the clean exit of Transform / Route / Aggregate, and rewinds per contributing source on `max_group_buffer` overflow to the lowest `row_num` any group member of that source contributed. Sources whose records all DLQ never land in the map. The map is the replay anchor for per-source resume: a downstream rerun reads each source's cursor as the floor for what must be reprocessed.
+The engine also surfaces a `per_source_rollback_cursors` map on the `ExecutionReport`, keyed by source name and carrying the highest source row number that cleanly exited a forward operator. The map advances per record at the clean exit of Transform / Route / Aggregate, and rewinds per contributing source on `max_group_buffer` overflow to the lowest `row_num` any group member of that source contributed, whether the member was buffered at a Sink or parked as a failure. A source whose records all DLQ lands in the map only through such an overflow rewind. The map is the replay anchor for per-source resume: a downstream rerun reads each source's cursor as the floor for what must be reprocessed.
 
-On `max_group_buffer` overflow, every record in the overflowing group still lands in DLQ (one `GroupSizeExceeded` trigger plus per-row collaterals), but the per-source rollback cursor rewinds independently per contributing source. Attributing the overflow failure itself to one source would be a fiction — every contributing source shared blame proportionally — so the DLQ shape stays group-wide while the rewind narrows per source.
+On `max_group_buffer` overflow, every record in the overflowing group still lands in DLQ (its parked failures as their own triggers, then one `GroupSizeExceeded` trigger over the remaining buffered rows as collaterals), but the per-source rollback cursor rewinds independently per contributing source, over parked failures as well as buffered rows. Attributing the overflow failure itself to one source would be a fiction — every contributing source shared blame proportionally — so the DLQ shape stays group-wide while the rewind narrows per source.
 
 The relaxed-CK aggregator's per-row lineage carries `(row_id, source_name)` pairs so a finalize-time retract scoped to one source rewinds only that source's contributions to each affected group. The source half of the pair is load-bearing under multi-source ingest: each source numbers its rows from its own monotonic counter, so two sources that both feed the same aggregate group can contribute records at identical `row_id` values. Pairing the row id with its source keeps `src_a`'s row 1 distinct from `src_b`'s row 1 when both land in one group, so a retract that must remove both reaches each one instead of collapsing the colliding ids and stranding the second source's contribution.
 
@@ -85,7 +85,17 @@ error_handling:
   max_group_buffer: 100000     # Default: 100,000
 ```
 
-Groups that exceed the cap are DLQ'd entirely with a `group_size_exceeded` trigger plus a collateral entry per buffered record. This is a backpressure boundary, not a hard error. The interaction with the `per_source_rollback_cursors` map on overflow is described under [Per-source rollback narrowing](#per-source-rollback-narrowing) above: the DLQ shape stays group-wide while the cursor rewind narrows per contributing source.
+The cap counts held entries, not distinct source rows: every Sink slot a row occupies and every parked failure is one entry (`CorrelationGroupBuffer::admit_entry`). The first admission that takes a group over the cap stamps the group's overflow (`overflowed_at`), which becomes the failure stamp of its `group_size_exceeded` row, so that row's timestamp and id record when the group crossed the cap rather than when it committed. The relaxed-CK archive and merge keep the earliest crossing.
+
+Crossing the cap changes nothing at admission. Later rows are still projected and buffered at their Sinks and later failures still parked, so the group keeps buffering until commit and the cap does not bound its memory today. Bounding memory at the cap is tracked separately.
+
+At commit an overflowed group is DLQ'd entirely, as the dirty path would write it and more:
+
+1. Every parked failure is written first, in parking order and once per source row, by the same code the dirty path uses: its own category, message, stage, route and failure stamp, so it stays its own trigger (or, for a second row of another failure, keeps that failure's trigger id).
+2. The buffered rows not already written follow: the first becomes the `group_size_exceeded` trigger, stamped at the crossing, and the rest are `correlated` collaterals condemned by it. Overflow spares nothing, so neither per-source narrowing nor the fan-out policy applies. A row that is both a parked failure and buffered (an inclusive Route fan-out, a Combine driver failing on one match and succeeding on another) was written in step 1 and is skipped here.
+3. If no buffered row is left unwritten (a group of failures only), no `group_size_exceeded` row is written; the overflow is still counted by the `clinker.correlation.group_overflows` metric.
+
+Every row goes through the ordinary DLQ push, so it counts toward `dlq_count` and the E315/E316 rate limits. It is not a hard error. The interaction with the `per_source_rollback_cursors` map on overflow is described under [Per-source rollback narrowing](#per-source-rollback-narrowing) above: the DLQ shape stays group-wide while the cursor rewind narrows per contributing source.
 
 ## See also
 
