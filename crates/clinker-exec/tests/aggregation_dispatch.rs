@@ -13,17 +13,15 @@ mod common;
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
 
-use clinker_exec::executor::{DlqEntry, PipelineRunParams, SourceReaders, single_file_reader};
+use clinker_exec::executor::{PipelineRunParams, SourceReaders, single_file_reader};
 use clinker_plan::config::parse_config;
 use clinker_plan::error::PipelineError;
 use clinker_record::PipelineCounters;
 
 /// Run a single-source, single-output pipeline with the given YAML config
-/// and CSV input. Returns `(counters, dlq_entries, output_csv)`.
-fn run_test(
-    yaml: &str,
-    csv_input: &str,
-) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
+/// and CSV input. Returns `(counters, output_csv)`; dead letters are read
+/// from `counters.dlq_count`.
+fn run_test(yaml: &str, csv_input: &str) -> Result<(PipelineCounters, String), PipelineError> {
     let config = parse_config(yaml).unwrap();
     let output_buf = clinker_bench_support::io::SharedBuffer::new();
 
@@ -49,7 +47,7 @@ fn run_test(
     };
 
     let report = common::run_config(&config, readers, writers, &params)?;
-    Ok((report.counters, report.dlq_entries, output_buf.as_string()))
+    Ok((report.counters, output_buf.as_string()))
 }
 
 #[test]
@@ -91,8 +89,8 @@ nodes:
     include_unmapped: true
 "#;
     let csv = "dept,salary\neng,100\neng,200\nsales,50\n";
-    let (counters, dlq, output) = run_test(yaml, csv).expect("pipeline runs");
-    assert_eq!(dlq.len(), 0, "no DLQ entries expected");
+    let (counters, output) = run_test(yaml, csv).expect("pipeline runs");
+    assert_eq!(counters.dlq_count, 0, "no DLQ entries expected");
     assert_eq!(counters.ok_count, 2, "two output groups");
 
     // Set-equality on output rows (order is hash-table arbitrary).
@@ -142,8 +140,8 @@ nodes:
 "#;
     // Header-only input — zero data rows.
     let csv = "x\n";
-    let (counters, dlq, output) = run_test(yaml, csv).expect("pipeline runs");
-    assert_eq!(dlq.len(), 0);
+    let (counters, output) = run_test(yaml, csv).expect("pipeline runs");
+    assert_eq!(counters.dlq_count, 0);
     assert_eq!(
         counters.ok_count, 1,
         "global fold emits one row even on empty input"

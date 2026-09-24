@@ -31,6 +31,10 @@ use clinker_core_types::dlq::DlqErrorCategory;
 use clinker_exec::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams};
 use clinker_plan::config::{CompileContext, PipelineConfig, parse_config};
 
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
+use dlq_sink::{CollectingDlqSink, DlqRow};
+
 #[derive(Clone, Default)]
 struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
 
@@ -65,7 +69,7 @@ fn test_params() -> PipelineRunParams {
 fn run_pipeline(
     yaml: &str,
     sources: &[(&str, &str, &str)], // (source_name, file_label, csv)
-) -> (ExecutionReport, String) {
+) -> (ExecutionReport, String, Vec<DlqRow>) {
     let config = parse_config(yaml).expect("parse_config");
     let params = test_params();
 
@@ -86,15 +90,16 @@ fn run_pipeline(
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
 
+    let sink = CollectingDlqSink::new();
     let report = PipelineExecutor::run_plan_with_readers_writers(
         &PipelineConfig::compile(&config, &CompileContext::default()).expect("compile"),
         readers,
-        writers,
+        dlq_sink::registry(writers, &sink),
         &params,
     )
     .expect("run");
 
-    (report, buf.as_string())
+    (report, buf.as_string(), sink.rows())
 }
 
 fn sorted_body_lines(output: &str) -> Vec<String> {
@@ -170,7 +175,7 @@ u2,2026-05-14T09:20:00\n";
 u1,2026-05-14T09:30:00\n\
 u2,2026-05-14T09:40:00\n";
 
-    let (report, output) = run_pipeline(
+    let (report, output, _) = run_pipeline(
         yaml,
         &[("src_a", "a.csv", csv_a), ("src_b", "b.csv", csv_b)],
     );
@@ -186,7 +191,7 @@ u2,2026-05-14T09:40:00\n";
         vec!["u1,3".to_string(), "u2,2".to_string()],
         "output (sorted by user_id): {lines:?}",
     );
-    assert_eq!(report.dlq_entries.len(), 0, "no late records expected");
+    assert_eq!(report.counters.dlq_count, 0, "no late records expected");
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -240,7 +245,7 @@ error_handling:
 "#;
     let csv = "user_id,event_ts\nu1,2026-05-14T10:00:00\n";
 
-    let (report, _output) = run_pipeline(yaml, &[("clicks", "in.csv", csv)]);
+    let (report, _output, _) = run_pipeline(yaml, &[("clicks", "in.csv", csv)]);
 
     let per_source = report
         .per_source_watermarks
@@ -324,6 +329,8 @@ nodes:
     path: out.csv
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 "#
         )
     }
@@ -340,14 +347,13 @@ error_handling:
     let csv_b = "user_id,event_ts\nu1,2026-05-14T09:30:00\n";
 
     // Case A: allowed_lateness = 0 → late record.
-    let (report_a, _out_a) = run_pipeline(
+    let (_report_a, _out_a, rows_a) = run_pipeline(
         &pipeline("0s"),
         &[("src_a", "a.csv", csv_a), ("src_b", "b.csv", csv_b)],
     );
-    let late_count_a = report_a
-        .dlq_entries
+    let late_count_a = rows_a
         .iter()
-        .filter(|d| d.category == DlqErrorCategory::LateRecord)
+        .filter(|d| d.category() == Some(DlqErrorCategory::LateRecord.as_str()))
         .count();
     assert_eq!(
         late_count_a, 1,
@@ -355,19 +361,22 @@ error_handling:
     );
 
     // Case B: allowed_lateness = 30m → admitted.
-    let (report_b, output_b) = run_pipeline(
+    let (report_b, output_b, rows_b) = run_pipeline(
         &pipeline("30m"),
         &[("src_a", "a.csv", csv_a), ("src_b", "b.csv", csv_b)],
     );
-    let late_count_b = report_b
-        .dlq_entries
+    assert_eq!(
+        rows_b.len() as u64,
+        report_b.counters.dlq_count,
+        "every dead letter has a destination, so the rows cover them all"
+    );
+    let late_count_b = rows_b
         .iter()
-        .filter(|d| d.category == DlqErrorCategory::LateRecord)
+        .filter(|d| d.category() == Some(DlqErrorCategory::LateRecord.as_str()))
         .count();
     assert_eq!(
         late_count_b, 0,
-        "with allowed_lateness=30m the same record must be admitted (DLQ entries: {:?})",
-        report_b.dlq_entries
+        "with allowed_lateness=30m the same record must be admitted (DLQ rows: {rows_b:?})"
     );
     // Two u1 records in [09:00, 10:00): src_a@9:00 + src_b@9:30 = 2.
     // One u1 record in [10:00, 11:00): src_a@10:25 = 1.
@@ -418,37 +427,36 @@ nodes:
     path: out.csv
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 "#;
     // Records: 09:00, 10:30 (advances watermark past 10:00), 09:30
     // (out-of-order; window [09:00, 10:00) already closed).
     let csv = "user_id,event_ts\nu1,2026-05-14T09:00:00\nu1,2026-05-14T10:30:00\nu1,2026-05-14T09:30:00\n";
 
-    let (report, _output) = run_pipeline(yaml, &[("clicks", "in.csv", csv)]);
-    let late_entries: Vec<_> = report
-        .dlq_entries
+    let (_report, _output, rows) = run_pipeline(yaml, &[("clicks", "in.csv", csv)]);
+    let late_entries: Vec<_> = rows
         .iter()
-        .filter(|d| d.category == DlqErrorCategory::LateRecord)
+        .filter(|d| d.category() == Some(DlqErrorCategory::LateRecord.as_str()))
         .collect();
     assert_eq!(
         late_entries.len(),
         1,
-        "expected exactly one LateRecord DLQ entry; got {:?}",
-        report.dlq_entries
+        "expected exactly one LateRecord DLQ entry; got {rows:?}"
     );
     let entry = late_entries[0];
     assert!(
         entry
-            .stage
-            .as_deref()
+            .stage()
             .map(|s| s.starts_with("time_window:"))
             .unwrap_or(false),
         "LateRecord stage should be `time_window:<node>`; got {:?}",
-        entry.stage
+        entry.stage()
     );
+    let detail = entry.error_detail().unwrap_or_default();
     assert!(
-        entry.error_message.contains("[") && entry.error_message.contains(")"),
-        "LateRecord detail should carry the window bounds; got {:?}",
-        entry.error_message
+        detail.contains("[") && detail.contains(")"),
+        "LateRecord detail should carry the window bounds; got {detail:?}"
     );
 }
 
@@ -494,8 +502,8 @@ error_handling:
   strategy: fail_fast
 "#;
     let csv = "user_id\nu1\nu1\nu1\nu2\nu2\n";
-    let (report, output) = run_pipeline(yaml, &[("clicks", "in.csv", csv)]);
-    assert_eq!(report.dlq_entries.len(), 0);
+    let (report, output, _) = run_pipeline(yaml, &[("clicks", "in.csv", csv)]);
+    assert_eq!(report.counters.dlq_count, 0);
     let lines = sorted_body_lines(&output);
     assert_eq!(lines, vec!["u1,3".to_string(), "u2,2".to_string()]);
 }
@@ -552,8 +560,8 @@ error_handling:
     // So 2 windows; 2 emit rows. (w_start = 8:50 ends at 9:00 which
     // does NOT contain 9:00 by the half-open convention.)
     let csv = "user_id,event_ts\nu1,2026-05-14T09:00:00\n";
-    let (report, output) = run_pipeline(yaml, &[("clicks", "in.csv", csv)]);
-    assert_eq!(report.dlq_entries.len(), 0);
+    let (report, output, _) = run_pipeline(yaml, &[("clicks", "in.csv", csv)]);
+    assert_eq!(report.counters.dlq_count, 0);
     let lines = sorted_body_lines(&output);
     assert_eq!(
         lines.len(),
@@ -614,8 +622,8 @@ u2,2026-05-14T09:10:00\n\
 u1,2026-05-14T09:20:00\n\
 u1,2026-05-14T09:22:00\n";
 
-    let (report, output) = run_pipeline(yaml, &[("logins", "in.csv", csv)]);
-    assert_eq!(report.dlq_entries.len(), 0);
+    let (report, output, _) = run_pipeline(yaml, &[("logins", "in.csv", csv)]);
+    assert_eq!(report.counters.dlq_count, 0);
     let lines = sorted_body_lines(&output);
     // u1: two sessions (counts 3 and 2). u2: one session (count 1).
     // Sorted lexically: "u1,2", "u1,3", "u2,1".
