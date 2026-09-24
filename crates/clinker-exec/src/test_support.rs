@@ -405,6 +405,9 @@ struct CaptureState {
     buckets: std::collections::BTreeMap<clinker_plan::plan::DlqBucketId, CaptureBucket>,
     open_writers: usize,
     finished: bool,
+    opened_parts: Vec<crate::dlq::DlqOrigin>,
+    parts_holding_rows: u64,
+    parts_spliced: u64,
 }
 
 struct CaptureBucket {
@@ -412,6 +415,45 @@ struct CaptureBucket {
     raw_header: Vec<u8>,
     header: std::sync::Arc<[String]>,
     rows: Vec<Vec<String>>,
+}
+
+impl CaptureBucket {
+    /// A bucket opened by `target`'s first row or splice.
+    fn open(target: &crate::dlq::DlqBucketTarget<'_>) -> Result<Self, PipelineError> {
+        Ok(Self {
+            path: target.path.to_path_buf(),
+            raw_header: target.header.to_vec(),
+            header: parse_capture_record(target.header)?.into(),
+            rows: Vec::new(),
+        })
+    }
+
+    /// Refuse `target` when it names another destination or header than the
+    /// one this bucket was opened with.
+    fn check(&self, target: &crate::dlq::DlqBucketTarget<'_>) -> Result<(), PipelineError> {
+        if self.path != target.path || self.raw_header != target.header {
+            return Err(capture_error(format!(
+                "bucket {:?} was handed a different destination or header than its first row",
+                target.id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Parse `row` and refuse it when its field count differs from the
+    /// header's.
+    fn parse_row(&self, row: &[u8]) -> Result<Vec<String>, PipelineError> {
+        let cells = parse_capture_record(row)?;
+        if cells.len() != self.header.len() {
+            return Err(capture_error(format!(
+                "a row of {} has {} fields under a {}-column header",
+                self.path.display(),
+                cells.len(),
+                self.header.len()
+            )));
+        }
+        Ok(cells)
+    }
 }
 
 /// One captured dead-letter row, with its bucket's header.
@@ -429,7 +471,9 @@ impl CaptureDlqSink {
         })
     }
 
-    /// Every row written so far, in bucket order, then in arrival order.
+    /// Every row written so far, in bucket order, then within a bucket in
+    /// final file order: walk rows as written and each part's rows where it
+    /// was spliced.
     pub(crate) fn rows(&self) -> Vec<CapturedDlqRow> {
         let state = self.state.lock().expect("dead-letter capture state");
         state
@@ -442,6 +486,15 @@ impl CaptureDlqSink {
                 })
             })
             .collect()
+    }
+
+    /// The origin of every part writer opened so far, in opening order.
+    pub(crate) fn opened_parts(&self) -> Vec<crate::dlq::DlqOrigin> {
+        self.state
+            .lock()
+            .expect("dead-letter capture state")
+            .opened_parts
+            .clone()
     }
 
     /// A writer registry over `writers` whose dead-letter rows go to this
@@ -468,8 +521,29 @@ impl crate::dlq::DlqSink for CaptureDlqSink {
         }))
     }
 
+    fn open_part_writer(
+        &self,
+        origin: crate::dlq::DlqOrigin,
+    ) -> Result<Box<dyn crate::dlq::DlqPartWriter>, PipelineError> {
+        self.state
+            .lock()
+            .expect("dead-letter capture state")
+            .opened_parts
+            .push(origin);
+        Ok(Box::new(CapturePartWriter {
+            state: std::sync::Arc::clone(&self.state),
+            parts: std::collections::BTreeMap::new(),
+        }))
+    }
+
     fn finish(&self) -> Result<Vec<crate::dlq::DlqArtifact>, PipelineError> {
         let mut state = self.state.lock().expect("dead-letter capture state");
+        if state.parts_holding_rows != state.parts_spliced {
+            return Err(capture_error(format!(
+                "{} dead-letter part(s) holding rows were never spliced",
+                state.parts_holding_rows - state.parts_spliced
+            )));
+        }
         if state.open_writers != 0 || state.finished {
             return Err(capture_error(format!(
                 "finish called with {} writer(s) open, finished = {}",
@@ -506,28 +580,10 @@ impl crate::dlq::DlqRowWriter for CaptureWriter {
         }
         let bucket = match state.buckets.entry(target.id) {
             Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => entry.insert(CaptureBucket {
-                path: target.path.to_path_buf(),
-                raw_header: target.header.to_vec(),
-                header: parse_capture_record(target.header)?.into(),
-                rows: Vec::new(),
-            }),
+            Entry::Vacant(entry) => entry.insert(CaptureBucket::open(target)?),
         };
-        if bucket.path != target.path || bucket.raw_header != target.header {
-            return Err(capture_error(format!(
-                "bucket {:?} was handed a different destination or header than its first row",
-                target.id
-            )));
-        }
-        let cells = parse_capture_record(row)?;
-        if cells.len() != bucket.header.len() {
-            return Err(capture_error(format!(
-                "a row of {} has {} fields under a {}-column header",
-                target.path.display(),
-                cells.len(),
-                bucket.header.len()
-            )));
-        }
+        bucket.check(target)?;
+        let cells = bucket.parse_row(row)?;
         bucket.rows.push(cells);
         Ok(())
     }
@@ -538,6 +594,96 @@ impl crate::dlq::DlqRowWriter for CaptureWriter {
             .expect("dead-letter capture state")
             .open_writers -= 1;
         Ok(())
+    }
+
+    fn splice(
+        &mut self,
+        target: &crate::dlq::DlqBucketTarget<'_>,
+        segment: crate::dlq::DlqPartSegment,
+    ) -> Result<u64, PipelineError> {
+        use std::collections::btree_map::Entry;
+        if segment.bucket() != target.id {
+            return Err(capture_error(format!(
+                "a part of bucket {:?} was spliced into bucket {:?}",
+                segment.bucket(),
+                target.id
+            )));
+        }
+        let part = segment
+            .into_part::<CapturePart>()
+            .map_err(|_| capture_error("a part from another sink was spliced".into()))?;
+        let mut state = self.state.lock().expect("dead-letter capture state");
+        if state.finished {
+            return Err(capture_error("a part arrived after finish".into()));
+        }
+        let bucket = match state.buckets.entry(target.id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(CaptureBucket::open(target)?),
+        };
+        bucket.check(target)?;
+        if part.raw_header != bucket.raw_header {
+            return Err(capture_error(format!(
+                "a part of {} was written under a different header",
+                target.path.display()
+            )));
+        }
+        let rows = part.rows.len() as u64;
+        bucket.rows.extend(part.rows);
+        state.parts_spliced += 1;
+        Ok(rows)
+    }
+}
+
+/// A side thread's rows for one bucket, waiting for their splice.
+struct CapturePart {
+    raw_header: Vec<u8>,
+    rows: Vec<Vec<String>>,
+}
+
+struct CapturePartWriter {
+    state: std::sync::Arc<std::sync::Mutex<CaptureState>>,
+    parts:
+        std::collections::BTreeMap<clinker_plan::plan::DlqBucketId, (CaptureBucket, CapturePart)>,
+}
+
+impl crate::dlq::DlqPartWriter for CapturePartWriter {
+    fn write_row(
+        &mut self,
+        target: &crate::dlq::DlqBucketTarget<'_>,
+        row: &[u8],
+    ) -> Result<(), PipelineError> {
+        use std::collections::btree_map::Entry;
+        let (bucket, part) = match self.parts.entry(target.id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let bucket = CaptureBucket::open(target)?;
+                self.state
+                    .lock()
+                    .expect("dead-letter capture state")
+                    .parts_holding_rows += 1;
+                entry.insert((
+                    bucket,
+                    CapturePart {
+                        raw_header: target.header.to_vec(),
+                        rows: Vec::new(),
+                    },
+                ))
+            }
+        };
+        bucket.check(target)?;
+        part.rows.push(bucket.parse_row(row)?);
+        Ok(())
+    }
+
+    fn close(self: Box<Self>) -> Result<crate::dlq::DlqPartReceipt, PipelineError> {
+        Ok(crate::dlq::DlqPartReceipt::new(
+            self.parts
+                .into_iter()
+                .map(|(id, (_, part))| {
+                    crate::dlq::DlqPartSegment::new(id, part.rows.len() as u64, part)
+                })
+                .collect(),
+        ))
     }
 }
 
@@ -622,5 +768,60 @@ impl CapturedDlqRow {
             })
             .collect();
         (self.header.to_vec(), cells)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CaptureDlqSink;
+    use crate::dlq::{DlqBucketTarget, DlqOrigin, DlqSink};
+    use clinker_plan::config::{CompileContext, parse_config};
+
+    /// The capture sink reads back in final file order: walk rows as they
+    /// were written and each part's rows where it was spliced. It records the
+    /// origin of every part writer opened.
+    #[test]
+    fn capture_sink_rows_follow_splice_order() {
+        let plan = parse_config(
+            "pipeline:\n  name: capture\nerror_handling:\n  strategy: continue\n  dlq:\n    path: dlq.csv\n\
+nodes:\n- type: source\n  name: src\n  config:\n    name: src\n    type: csv\n    path: in.csv\n    schema:\n      - { name: id, type: string }\n\
+- type: sink\n  name: out\n  input: src\n  config:\n    name: out\n    type: csv\n    path: out.csv\n",
+        )
+        .expect("pipeline parses")
+        .compile(&CompileContext::default())
+        .expect("pipeline compiles");
+        let layout = plan.dlq_layout().expect("a DLQ block yields a layout");
+        let id = layout.bucket_for_source("src").expect("bucket");
+        let target = DlqBucketTarget {
+            id,
+            path: std::path::Path::new("dlq.csv"),
+            header: b"_cxl_dlq_source_row\n",
+        };
+        let sink = CaptureDlqSink::new();
+        let origin = DlqOrigin::AggregateIngest {
+            node: "agg".to_owned(),
+        };
+
+        let mut part = sink.open_part_writer(origin.clone()).expect("part");
+        part.write_row(&target, b"2\n").expect("part row");
+        part.write_row(&target, b"3\n").expect("part row");
+        let receipt = part.close().expect("close part");
+        let mut walk = sink.open_walk_writer().expect("walk");
+        walk.write_row(&target, b"1\n").expect("walk row");
+        for segment in receipt.into_segments() {
+            assert_eq!(walk.splice(&target, segment).expect("splice"), 2);
+        }
+        walk.write_row(&target, b"4\n").expect("walk row");
+        walk.close().expect("close walk");
+
+        assert_eq!(
+            sink.rows()
+                .iter()
+                .map(super::CapturedDlqRow::source_row)
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4]
+        );
+        assert_eq!(sink.opened_parts(), [origin]);
+        assert_eq!(sink.finish().expect("finish")[0].rows, 4);
     }
 }

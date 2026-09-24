@@ -41,7 +41,10 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use clinker_exec::dlq::{DlqArtifact, DlqBucketTarget, DlqRowWriter, DlqSink};
+use clinker_exec::dlq::{
+    DlqArtifact, DlqBucketTarget, DlqOrigin, DlqPartReceipt, DlqPartSegment, DlqPartWriter,
+    DlqRowWriter, DlqSink,
+};
 use clinker_exec::executor::{
     PipelineExecutor, PipelineRunParams, SourceInput, SourceReaders, WriterRegistry,
 };
@@ -200,6 +203,13 @@ impl DlqSink for RetainingSink {
         }))
     }
 
+    fn open_part_writer(&self, origin: DlqOrigin) -> Result<Box<dyn DlqPartWriter>, PipelineError> {
+        Ok(Box::new(RetainingPartWriter {
+            inner: self.inner.open_part_writer(origin)?,
+            retained: Arc::clone(&self.retained),
+        }))
+    }
+
     fn finish(&self) -> Result<Vec<DlqArtifact>, PipelineError> {
         self.inner.finish()
     }
@@ -215,6 +225,35 @@ impl DlqRowWriter for RetainingWriter {
     }
 
     fn close(self: Box<Self>) -> Result<(), PipelineError> {
+        self.inner.close()
+    }
+
+    fn splice(
+        &mut self,
+        target: &DlqBucketTarget<'_>,
+        segment: DlqPartSegment,
+    ) -> Result<u64, PipelineError> {
+        self.inner.splice(target, segment)
+    }
+}
+
+/// A side thread's writer of the retention control: it keeps a copy of
+/// every row it hands to the staged sink's part writer.
+struct RetainingPartWriter {
+    inner: Box<dyn DlqPartWriter>,
+    retained: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+impl DlqPartWriter for RetainingPartWriter {
+    fn write_row(&mut self, target: &DlqBucketTarget<'_>, row: &[u8]) -> Result<(), PipelineError> {
+        self.retained
+            .lock()
+            .expect("retained rows lock")
+            .push(row.to_vec());
+        self.inner.write_row(target, row)
+    }
+
+    fn close(self: Box<Self>) -> Result<DlqPartReceipt, PipelineError> {
         self.inner.close()
     }
 }

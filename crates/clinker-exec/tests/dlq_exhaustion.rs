@@ -9,7 +9,9 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
-use clinker_exec::dlq::{DlqBucketTarget, DlqRowWriter, DlqSink};
+use clinker_exec::dlq::{
+    DlqBucketTarget, DlqOrigin, DlqPartSegment, DlqPartWriter, DlqRowWriter, DlqSink,
+};
 use clinker_exec::executor::{
     PipelineExecutor, PipelineRunParams, SourceReaders, WriterRegistry, single_file_reader,
 };
@@ -280,6 +282,10 @@ impl DlqSink for InterruptOnClose {
         }))
     }
 
+    fn open_part_writer(&self, origin: DlqOrigin) -> Result<Box<dyn DlqPartWriter>, PipelineError> {
+        self.inner.open_part_writer(origin)
+    }
+
     fn finish(&self) -> Result<Vec<clinker_exec::dlq::DlqArtifact>, PipelineError> {
         self.inner.finish()
     }
@@ -295,6 +301,14 @@ impl DlqRowWriter for InterruptingWriter {
         let closed = inner.close();
         token.request();
         closed
+    }
+
+    fn splice(
+        &mut self,
+        target: &DlqBucketTarget<'_>,
+        segment: DlqPartSegment,
+    ) -> Result<u64, PipelineError> {
+        self.inner.splice(target, segment)
     }
 }
 

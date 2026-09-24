@@ -373,6 +373,189 @@ pub trait DlqRowWriter: Send {
     /// Returns [`PipelineError`] when a flush fails; the I/O error kind is
     /// preserved. The bucket files are then not handed back.
     fn close(self: Box<Self>) -> Result<(), PipelineError>;
+
+    /// Place one side thread's part of `target`'s bucket here, after every
+    /// row this writer has written to that bucket and before every row it
+    /// writes later.
+    ///
+    /// Called on the walk writer, where the rows of the thread that wrote
+    /// the part would otherwise have been replayed, so the bucket keeps the
+    /// order those rows had. A bucket this writer has not written yet is
+    /// opened first and receives `target.header` exactly as its first row
+    /// would; a bucket written only through parts therefore gets one header.
+    /// The part's rows are copied as they were encoded, never re-encoded,
+    /// and the part is released before this returns, on every path. Blocks
+    /// for the copy. Returns the rows placed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError::Internal`] when `segment` belongs to another
+    /// bucket or another sink, and [`PipelineError`] with the I/O error kind
+    /// preserved when the bucket cannot be opened, the copy fails or the
+    /// part cannot be released. The bucket is then incomplete and the run
+    /// must not publish it.
+    fn splice(
+        &mut self,
+        target: &DlqBucketTarget<'_>,
+        segment: DlqPartSegment,
+    ) -> Result<u64, PipelineError>;
+}
+
+/// The side thread a dead-letter part belongs to. It names the part in
+/// diagnostics; the walk is not an origin, because it writes its buckets
+/// directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DlqOrigin {
+    /// The writer thread of a streaming Output node.
+    StreamingOutput {
+        /// The Output node's name.
+        output: String,
+    },
+    /// The ingest thread of an Aggregate node.
+    AggregateIngest {
+        /// The Aggregate node's name.
+        node: String,
+    },
+    /// The probe thread of a Combine node.
+    CombineProbe {
+        /// The Combine node's name.
+        node: String,
+    },
+}
+
+impl std::fmt::Display for DlqOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StreamingOutput { output } => write!(f, "streaming output {output}"),
+            Self::AggregateIngest { node } => write!(f, "aggregate {node} ingest"),
+            Self::CombineProbe { node } => write!(f, "combine {node} probe"),
+        }
+    }
+}
+
+/// One side thread's handle for writing dead-letter rows into parts, one
+/// part per bucket it writes.
+///
+/// Owned by exactly one side thread and never shared. A part holds rows
+/// only, never the bucket's header: the walk writer places each part into
+/// its bucket with [`DlqRowWriter::splice`], which writes the header when
+/// the bucket needs one. Rows stream through a fixed per-part buffer; the
+/// writer keeps no rows. Dropped without [`Self::close`], it releases every
+/// part it holds.
+pub trait DlqPartWriter: Send {
+    /// Append one encoded row to this writer's part of `target`'s bucket.
+    ///
+    /// The first row for a bucket creates the part. `row` must be one
+    /// complete CSV row under `target.header`, terminator included; the
+    /// header itself is never written here. May block on file I/O when the
+    /// part's buffer fills.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError`] when the part cannot be created or a write
+    /// fails; the I/O error kind is preserved. Every later row and the
+    /// close are then refused.
+    fn write_row(&mut self, target: &DlqBucketTarget<'_>, row: &[u8]) -> Result<(), PipelineError>;
+
+    /// Flush every part and hand them over as a receipt. Runs on the owning
+    /// side thread and blocks until every buffer is flushed. A writer that
+    /// wrote nothing returns an empty receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError`] when a flush fails or an earlier write
+    /// failed; the I/O error kind is preserved and every part is released.
+    fn close(self: Box<Self>) -> Result<DlqPartReceipt, PipelineError>;
+}
+
+/// The parts a closed [`DlqPartWriter`] wrote, one segment per bucket, in
+/// bucket order.
+///
+/// Crosses from the side thread to the walk thread, which splices each
+/// segment into its bucket. Dropping the receipt releases every part it
+/// still holds, and a part that held rows then counts as never spliced.
+#[must_use = "a dead-letter part that is never spliced is missing from its bucket"]
+#[derive(Debug, Default)]
+pub struct DlqPartReceipt {
+    segments: Vec<DlqPartSegment>,
+}
+
+impl DlqPartReceipt {
+    /// A receipt over `segments`, ordered by bucket. For sink implementors.
+    pub fn new(mut segments: Vec<DlqPartSegment>) -> Self {
+        segments.sort_by_key(|segment| segment.bucket);
+        Self { segments }
+    }
+
+    /// Whether the writer wrote no row at all.
+    pub fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    /// The segments, in bucket order.
+    pub fn into_segments(self) -> std::vec::IntoIter<DlqPartSegment> {
+        self.segments.into_iter()
+    }
+}
+
+/// One bucket's part of a [`DlqPartReceipt`]: the bucket, the rows the part
+/// holds, and the sink's own handle on the part's bytes.
+///
+/// Opaque to the executor, which only hands it to
+/// [`DlqRowWriter::splice`]. Dropped without a splice, the sink's handle
+/// releases the part.
+#[must_use = "a dead-letter part that is never spliced is missing from its bucket"]
+pub struct DlqPartSegment {
+    bucket: DlqBucketId,
+    rows: u64,
+    part: Box<dyn std::any::Any + Send>,
+}
+
+impl std::fmt::Debug for DlqPartSegment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DlqPartSegment")
+            .field("bucket", &self.bucket)
+            .field("rows", &self.rows)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DlqPartSegment {
+    /// A segment of `rows` rows for `bucket`, carrying the sink's `part`
+    /// handle. For sink implementors: `part` must release what it holds when
+    /// dropped.
+    pub fn new<P: std::any::Any + Send>(bucket: DlqBucketId, rows: u64, part: P) -> Self {
+        Self {
+            bucket,
+            rows,
+            part: Box::new(part),
+        }
+    }
+
+    /// The bucket this part belongs to.
+    pub fn bucket(&self) -> DlqBucketId {
+        self.bucket
+    }
+
+    /// The rows this part holds.
+    pub fn rows(&self) -> u64 {
+        self.rows
+    }
+
+    /// The sink's handle, when it is a `P`; otherwise the segment unchanged.
+    /// For sink implementors, in [`DlqRowWriter::splice`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the segment itself when its handle is not a `P`, for example
+    /// when it came from another sink.
+    pub fn into_part<P: std::any::Any>(self) -> Result<P, Self> {
+        let Self { bucket, rows, part } = self;
+        match part.downcast::<P>() {
+            Ok(part) => Ok(*part),
+            Err(part) => Err(Self { bucket, rows, part }),
+        }
+    }
 }
 
 /// Where a run's dead-letter rows go: the seam the executor writes through,
@@ -389,18 +572,27 @@ pub trait DlqSink: Send + Sync {
     /// Returns [`PipelineError`] when the sink cannot accept another writer.
     fn open_walk_writer(&self) -> Result<Box<dyn DlqRowWriter>, PipelineError>;
 
+    /// A new part writer for the side thread named by `origin`. Creates no
+    /// file until the writer's first row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError`] when the sink cannot accept another writer.
+    fn open_part_writer(&self, origin: DlqOrigin) -> Result<Box<dyn DlqPartWriter>, PipelineError>;
+
     /// The artifacts written during the run, one per bucket that received a
     /// row, in bucket order.
     ///
     /// Called exactly once, by the owner of publication, after every writer
-    /// this sink opened has closed. It never promotes, renames or removes
-    /// anything itself: publication stays with that owner.
+    /// this sink opened has closed and every part has been spliced. It never
+    /// promotes, renames or removes anything itself: publication stays with
+    /// that owner.
     ///
     /// # Errors
     ///
-    /// Returns [`PipelineError::Internal`] when a writer is still open or
-    /// `finish` was already called, since the artifact set would then not be
-    /// established.
+    /// Returns [`PipelineError::Internal`] when a part that held rows was
+    /// never spliced, a writer is still open or `finish` was already called,
+    /// since the artifact set would then not be established.
     fn finish(&self) -> Result<Vec<DlqArtifact>, PipelineError>;
 }
 
@@ -435,10 +627,39 @@ impl DlqRowWriter for DiscardingDlqSink {
     fn close(self: Box<Self>) -> Result<(), PipelineError> {
         Ok(())
     }
+
+    fn splice(
+        &mut self,
+        _target: &DlqBucketTarget<'_>,
+        _segment: DlqPartSegment,
+    ) -> Result<u64, PipelineError> {
+        Ok(0)
+    }
+}
+
+impl DlqPartWriter for DiscardingDlqSink {
+    fn write_row(
+        &mut self,
+        _target: &DlqBucketTarget<'_>,
+        _row: &[u8],
+    ) -> Result<(), PipelineError> {
+        Ok(())
+    }
+
+    fn close(self: Box<Self>) -> Result<DlqPartReceipt, PipelineError> {
+        Ok(DlqPartReceipt::default())
+    }
 }
 
 impl DlqSink for DiscardingDlqSink {
     fn open_walk_writer(&self) -> Result<Box<dyn DlqRowWriter>, PipelineError> {
+        Ok(Box::new(DiscardingDlqSink))
+    }
+
+    fn open_part_writer(
+        &self,
+        _origin: DlqOrigin,
+    ) -> Result<Box<dyn DlqPartWriter>, PipelineError> {
         Ok(Box::new(DiscardingDlqSink))
     }
 

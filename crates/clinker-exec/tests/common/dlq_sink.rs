@@ -20,7 +20,10 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use clinker_exec::dlq::{DiscardingDlqSink, DlqArtifact, DlqBucketTarget, DlqRowWriter, DlqSink};
+use clinker_exec::dlq::{
+    DiscardingDlqSink, DlqArtifact, DlqBucketTarget, DlqOrigin, DlqPartReceipt, DlqPartSegment,
+    DlqPartWriter, DlqRowWriter, DlqSink,
+};
 use clinker_exec::executor::{
     ExecutionReport, PipelineExecutor, PipelineRunParams, SourceReaders, WriterRegistry,
 };
@@ -30,10 +33,11 @@ use clinker_plan::plan::DlqBucketId;
 
 /// A [`DlqSink`] that keeps every row it is given, parsed, per bucket.
 ///
-/// Rows are recorded as each writer writes them, so [`Self::rows`] reads
-/// what was written so far, including after a failed run. `finish` follows
-/// the trait contract: it refuses while a writer is open or on a second
-/// call.
+/// Walk rows are recorded as the walk writes them and a side thread's part
+/// where the walk splices it, so [`Self::rows`] reads what was written so
+/// far in final file order, including after a failed run. `finish` follows
+/// the trait contract: it refuses while a part holding rows was never
+/// spliced, while a writer is open, or on a second call.
 pub struct CollectingDlqSink {
     state: Arc<Mutex<State>>,
 }
@@ -43,6 +47,9 @@ struct State {
     buckets: BTreeMap<DlqBucketId, Bucket>,
     open_writers: usize,
     finished: bool,
+    opened_parts: Vec<DlqOrigin>,
+    parts_holding_rows: u64,
+    parts_spliced: u64,
 }
 
 struct Bucket {
@@ -68,8 +75,9 @@ impl CollectingDlqSink {
         })
     }
 
-    /// Every row written so far, in bucket order, then in arrival order
-    /// within a bucket.
+    /// Every row written so far, in bucket order, then within a bucket in
+    /// final file order: walk rows as written and each part's rows where it
+    /// was spliced.
     #[allow(dead_code)] // Each integration target uses only the accessors it asserts on.
     pub fn rows(&self) -> Vec<DlqRow> {
         let state = self.state.lock().expect("dead-letter sink state");
@@ -100,9 +108,56 @@ impl CollectingDlqSink {
             .find(|bucket| *bucket.path == *path.as_ref())
             .map(|bucket| bucket.header.to_vec())
     }
+
+    /// The origin of every part writer opened so far, in opening order.
+    #[allow(dead_code)] // Each integration target uses only the accessors it asserts on.
+    pub fn opened_parts(&self) -> Vec<DlqOrigin> {
+        self.state
+            .lock()
+            .expect("dead-letter sink state")
+            .opened_parts
+            .clone()
+    }
 }
 
 impl Bucket {
+    /// A bucket opened by `target`'s first row or splice.
+    fn open(target: &DlqBucketTarget<'_>) -> Result<Self, PipelineError> {
+        Ok(Self {
+            path: Arc::from(target.path),
+            raw_header: target.header.to_vec(),
+            header: parse_record(target.header)?.into(),
+            rows: Vec::new(),
+        })
+    }
+
+    /// Refuse `target` when it names another destination or header than the
+    /// one this bucket was opened with.
+    fn check(&self, target: &DlqBucketTarget<'_>) -> Result<(), PipelineError> {
+        if *self.path != *target.path || self.raw_header != target.header {
+            return Err(internal(format!(
+                "bucket {:?} was handed a different destination or header than its first row",
+                target.id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Parse `row` and refuse it when its field count differs from the
+    /// header's.
+    fn parse_row(&self, row: &[u8]) -> Result<Vec<String>, PipelineError> {
+        let cells = parse_record(row)?;
+        if cells.len() != self.header.len() {
+            return Err(internal(format!(
+                "a row of {} has {} fields under a {}-column header",
+                self.path.display(),
+                cells.len(),
+                self.header.len()
+            )));
+        }
+        Ok(cells)
+    }
+
     fn rows(&self) -> impl Iterator<Item = DlqRow> + '_ {
         self.rows.iter().map(|cells| DlqRow {
             bucket_path: Arc::clone(&self.path),
@@ -123,8 +178,26 @@ impl DlqSink for CollectingDlqSink {
         }))
     }
 
+    fn open_part_writer(&self, origin: DlqOrigin) -> Result<Box<dyn DlqPartWriter>, PipelineError> {
+        self.state
+            .lock()
+            .expect("dead-letter sink state")
+            .opened_parts
+            .push(origin);
+        Ok(Box::new(CollectingPartWriter {
+            state: Arc::clone(&self.state),
+            parts: BTreeMap::new(),
+        }))
+    }
+
     fn finish(&self) -> Result<Vec<DlqArtifact>, PipelineError> {
         let mut state = self.state.lock().expect("dead-letter sink state");
+        if state.parts_holding_rows != state.parts_spliced {
+            return Err(internal(format!(
+                "{} dead-letter part(s) holding rows were never spliced",
+                state.parts_holding_rows - state.parts_spliced
+            )));
+        }
         if state.open_writers != 0 || state.finished {
             return Err(internal(format!(
                 "finish called with {} writer(s) open, finished = {}",
@@ -156,28 +229,10 @@ impl DlqRowWriter for CollectingWriter {
         }
         let bucket = match state.buckets.entry(target.id) {
             Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => entry.insert(Bucket {
-                path: Arc::from(target.path),
-                raw_header: target.header.to_vec(),
-                header: parse_record(target.header)?.into(),
-                rows: Vec::new(),
-            }),
+            Entry::Vacant(entry) => entry.insert(Bucket::open(target)?),
         };
-        if *bucket.path != *target.path || bucket.raw_header != target.header {
-            return Err(internal(format!(
-                "bucket {:?} was handed a different destination or header than its first row",
-                target.id
-            )));
-        }
-        let cells = parse_record(row)?;
-        if cells.len() != bucket.header.len() {
-            return Err(internal(format!(
-                "a row of {} has {} fields under a {}-column header",
-                target.path.display(),
-                cells.len(),
-                bucket.header.len()
-            )));
-        }
+        bucket.check(target)?;
+        let cells = bucket.parse_row(row)?;
         bucket.rows.push(cells);
         Ok(())
     }
@@ -188,6 +243,87 @@ impl DlqRowWriter for CollectingWriter {
             .expect("dead-letter sink state")
             .open_writers -= 1;
         Ok(())
+    }
+
+    fn splice(
+        &mut self,
+        target: &DlqBucketTarget<'_>,
+        segment: DlqPartSegment,
+    ) -> Result<u64, PipelineError> {
+        if segment.bucket() != target.id {
+            return Err(internal(format!(
+                "a part of bucket {:?} was spliced into bucket {:?}",
+                segment.bucket(),
+                target.id
+            )));
+        }
+        let part = segment
+            .into_part::<CollectedPart>()
+            .map_err(|_| internal("a part from another sink was spliced".into()))?;
+        let mut state = self.state.lock().expect("dead-letter sink state");
+        if state.finished {
+            return Err(internal("a part arrived after finish".into()));
+        }
+        let bucket = match state.buckets.entry(target.id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(Bucket::open(target)?),
+        };
+        bucket.check(target)?;
+        if part.raw_header != bucket.raw_header {
+            return Err(internal(format!(
+                "a part of {} was written under a different header",
+                target.path.display()
+            )));
+        }
+        let rows = part.rows.len() as u64;
+        bucket.rows.extend(part.rows);
+        state.parts_spliced += 1;
+        Ok(rows)
+    }
+}
+
+/// A side thread's rows for one bucket, waiting for their splice.
+struct CollectedPart {
+    raw_header: Vec<u8>,
+    rows: Vec<Vec<String>>,
+}
+
+struct CollectingPartWriter {
+    state: Arc<Mutex<State>>,
+    parts: BTreeMap<DlqBucketId, (Bucket, CollectedPart)>,
+}
+
+impl DlqPartWriter for CollectingPartWriter {
+    fn write_row(&mut self, target: &DlqBucketTarget<'_>, row: &[u8]) -> Result<(), PipelineError> {
+        let (bucket, part) = match self.parts.entry(target.id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let bucket = Bucket::open(target)?;
+                self.state
+                    .lock()
+                    .expect("dead-letter sink state")
+                    .parts_holding_rows += 1;
+                entry.insert((
+                    bucket,
+                    CollectedPart {
+                        raw_header: target.header.to_vec(),
+                        rows: Vec::new(),
+                    },
+                ))
+            }
+        };
+        bucket.check(target)?;
+        part.rows.push(bucket.parse_row(row)?);
+        Ok(())
+    }
+
+    fn close(self: Box<Self>) -> Result<DlqPartReceipt, PipelineError> {
+        Ok(DlqPartReceipt::new(
+            self.parts
+                .into_iter()
+                .map(|(id, (_, part))| DlqPartSegment::new(id, part.rows.len() as u64, part))
+                .collect(),
+        ))
     }
 }
 

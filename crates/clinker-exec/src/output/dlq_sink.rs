@@ -16,7 +16,9 @@ use clinker_plan::plan::dlq_layout::DlqBucketId;
 
 use super::attempt::ArtifactKind;
 use super::staging::OutputStagingRegistry;
-use crate::dlq::{DlqArtifact, DlqBucketTarget, DlqRowWriter, DlqSink};
+use crate::dlq::{
+    DlqArtifact, DlqBucketTarget, DlqOrigin, DlqPartSegment, DlqPartWriter, DlqRowWriter, DlqSink,
+};
 use crate::pipeline::shutdown::ShutdownToken;
 use crate::telemetry::{DeadLetterSignal, TelemetryProducer};
 
@@ -57,6 +59,8 @@ struct UnitConfig {
     shutdown: Option<ShutdownToken>,
     #[cfg(feature = "test-utils")]
     fault: Option<WriteFault>,
+    #[cfg(feature = "test-utils")]
+    copy_fault: Option<std::io::ErrorKind>,
 }
 
 /// State shared between the sink and its writers. Touched when a writer
@@ -216,6 +220,16 @@ impl StagedDlqSink {
         self
     }
 
+    /// Fail every copy of a part into its bucket with `kind`, as a
+    /// destination that fills up during a splice does.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_copy_fault_for_testing(mut self, kind: std::io::ErrorKind) -> Self {
+        self.units.copy_fault = Some(kind);
+        self
+    }
+
     fn state(&self) -> MutexGuard<'_, SinkState> {
         lock(&self.shared)
     }
@@ -235,6 +249,12 @@ impl StagedDlqSink {
 impl DlqSink for StagedDlqSink {
     fn open_walk_writer(&self) -> Result<Box<dyn DlqRowWriter>, PipelineError> {
         Ok(Box::new(self.walk_writer()))
+    }
+
+    fn open_part_writer(&self, origin: DlqOrigin) -> Result<Box<dyn DlqPartWriter>, PipelineError> {
+        Err(sink_invariant(format!(
+            "dead-letter parts are not supported yet ({origin})"
+        )))
     }
 
     fn finish(&self) -> Result<Vec<DlqArtifact>, PipelineError> {
@@ -410,6 +430,16 @@ impl DlqRowWriter for StagedDlqRowWriter {
         state.closed.extend(closed);
         Ok(())
     }
+
+    fn splice(
+        &mut self,
+        _target: &DlqBucketTarget<'_>,
+        _segment: DlqPartSegment,
+    ) -> Result<u64, PipelineError> {
+        Err(sink_invariant(
+            "splicing a dead-letter part is not supported yet",
+        ))
+    }
 }
 
 /// The error for a row or close after this writer's first failed write.
@@ -445,13 +475,19 @@ mod tests {
 
     use super::*;
     use crate::dlq::DiscardingDlqSink;
-    use crate::output::attempt::RunAttemptPublication;
+    use crate::output::attempt::{AttemptManifest, AttemptState, RunAttemptPublication};
 
     const HEADER: &[u8] = b"_cxl_dlq_id,id\n";
 
     /// A staging registry attached to a fresh run attempt whose only
     /// destination root is `root`.
     fn attempt_staging(root: &Path) -> OutputStagingRegistry {
+        attempt_run(root).1
+    }
+
+    /// A fresh run attempt whose only destination root is `root`, a staging
+    /// registry attached to it, and the attempt's directory.
+    fn attempt_run(root: &Path) -> (RunAttemptPublication, OutputStagingRegistry, PathBuf) {
         let policy = ClinkerToml::parse(
             "[storage.publication]\nfailed_retention_seconds = 300\nmax_attempt_bytes = \"1MB\"\n",
         )
@@ -466,15 +502,59 @@ mod tests {
             .as_millis()
             .try_into()
             .expect("milliseconds fit u64");
+        let execution_id = uuid::Uuid::now_v7().to_string();
         let attempt = RunAttemptPublication::create(
             policy,
-            &uuid::Uuid::now_v7().to_string(),
+            &execution_id,
             now,
             now + 300_000,
             vec![validate_path(Path::new("."), root, false).expect("destination root")],
         )
         .expect("create run attempt");
-        OutputStagingRegistry::for_run_attempt(attempt)
+        let staging = OutputStagingRegistry::for_run_attempt(attempt.clone());
+        let dir = root.join(".clinker-attempts").join(execution_id);
+        (attempt, staging, dir)
+    }
+
+    /// The attempt manifest as persisted in the attempt directory `dir`.
+    fn persisted_manifest(dir: &Path) -> AttemptManifest {
+        AttemptManifest::read(&dir.join("manifest.json"), u64::MAX)
+            .expect("read the persisted attempt manifest")
+    }
+
+    /// The scratch files present in the attempt directory `dir`.
+    fn scratch_files(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .expect("list the attempt directory")
+            .map(|entry| {
+                entry
+                    .expect("attempt directory entry")
+                    .file_name()
+                    .into_string()
+                    .expect("UTF-8 leaf")
+            })
+            .filter(|name| name.starts_with("scratch-"))
+            .collect()
+    }
+
+    fn origin(output: &str) -> DlqOrigin {
+        DlqOrigin::StreamingOutput {
+            output: output.to_owned(),
+        }
+    }
+
+    /// Close `part` and splice every segment of its receipt into `walk`
+    /// under `target`, returning the rows placed.
+    fn splice_all(
+        walk: &mut dyn DlqRowWriter,
+        target: &DlqBucketTarget<'_>,
+        part: Box<dyn DlqPartWriter>,
+    ) -> u64 {
+        part.close()
+            .expect("close part writer")
+            .into_segments()
+            .map(|segment| walk.splice(target, segment).expect("splice part"))
+            .sum()
     }
 
     /// The two bucket ids a compiled plan assigns when `src_b` has its own
@@ -716,5 +796,286 @@ nodes:\n- type: source\n  name: src_a\n  config:\n    name: src_a\n    type: csv
             sink.finish().is_err(),
             "a second finish cannot report an artifact set"
         );
+    }
+
+    /// A part lands exactly where the walk splices it: after the walk rows
+    /// already written to the bucket and before the ones written later.
+    #[test]
+    fn splice_places_part_rows_where_it_is_called() {
+        let root = tempfile::tempdir().expect("destination root");
+        let staging = attempt_staging(root.path());
+        let (id, _) = two_bucket_ids();
+        let path = root.path().join("dlq.csv");
+        let bucket = target(id, &path);
+        let sink = StagedDlqSink::new(staging.clone(), None);
+
+        // Both parts are written and closed before the walk splices either,
+        // so only the splice calls can put them in place.
+        let mut part_a = sink.open_part_writer(origin("a")).expect("open part a");
+        part_a.write_row(&bucket, b"a1\n").expect("part a row");
+        let mut part_b = sink.open_part_writer(origin("b")).expect("open part b");
+        part_b.write_row(&bucket, b"b1\n").expect("part b row");
+        part_b.write_row(&bucket, b"b2\n").expect("part b row");
+
+        let mut walk = sink.open_walk_writer().expect("open walk writer");
+        walk.write_row(&bucket, b"w1\n").expect("walk row");
+        walk.write_row(&bucket, b"w2\n").expect("walk row");
+        assert_eq!(splice_all(walk.as_mut(), &bucket, part_a), 1);
+        walk.write_row(&bucket, b"w3\n").expect("walk row");
+        assert_eq!(splice_all(walk.as_mut(), &bucket, part_b), 2);
+        walk.close().expect("close walk writer");
+
+        assert_eq!(
+            sink.finish().expect("finish"),
+            [DlqArtifact {
+                bucket: id,
+                final_path: path.clone(),
+                rows: 6,
+            }],
+            "spliced rows count in the bucket's row total"
+        );
+        assert_eq!(
+            staged_bytes(&staging, &path),
+            b"_cxl_dlq_id,id\nw1\nw2\na1\nw3\nb1\nb2\n"
+        );
+    }
+
+    /// A bucket the walk never wrote is staged by its first splice and gets
+    /// one header, then every part's rows in splice order.
+    #[test]
+    fn part_only_bucket_gets_one_header() {
+        let root = tempfile::tempdir().expect("destination root");
+        let staging = attempt_staging(root.path());
+        let (wide, own) = two_bucket_ids();
+        let wide_path = root.path().join("dlq.csv");
+        let own_path = root.path().join("dlq_b.csv");
+        let own_bucket = target(own, &own_path);
+        let sink = StagedDlqSink::new(staging.clone(), None);
+
+        let mut walk = sink.open_walk_writer().expect("open walk writer");
+        walk.write_row(&target(wide, &wide_path), b"w1\n")
+            .expect("walk row to the other bucket");
+        for (name, rows) in [
+            ("first", [&b"p1\n"[..], b"p2\n"]),
+            ("second", [b"q1\n", b"q2\n"]),
+        ] {
+            let mut part = sink.open_part_writer(origin(name)).expect("open part");
+            for row in rows {
+                part.write_row(&own_bucket, row).expect("part row");
+            }
+            assert_eq!(splice_all(walk.as_mut(), &own_bucket, part), 2);
+        }
+        walk.close().expect("close walk writer");
+
+        let artifacts = sink.finish().expect("finish");
+        assert_eq!(
+            artifacts
+                .iter()
+                .map(|artifact| (artifact.bucket, artifact.rows))
+                .collect::<Vec<_>>(),
+            [(wide, 1), (own, 4)]
+        );
+        assert_eq!(
+            staged_bytes(&staging, &own_path),
+            b"_cxl_dlq_id,id\np1\np2\nq1\nq2\n",
+            "one header, then both parts in splice order"
+        );
+    }
+
+    /// A part writer that wrote nothing hands back an empty receipt, and
+    /// splicing it stages nothing and records nothing.
+    #[test]
+    fn empty_part_stages_nothing() {
+        let root = tempfile::tempdir().expect("destination root");
+        let (_attempt, staging, dir) = attempt_run(root.path());
+        let (id, _) = two_bucket_ids();
+        let path = root.path().join("dlq.csv");
+        let sink = StagedDlqSink::new(staging.clone(), None);
+
+        let mut walk = sink.open_walk_writer().expect("open walk writer");
+        let part = sink.open_part_writer(origin("idle")).expect("open part");
+        let receipt = part.close().expect("close part writer");
+        assert!(receipt.is_empty(), "{receipt:?}");
+        for segment in receipt.into_segments() {
+            walk.splice(&target(id, &path), segment)
+                .expect("splice an empty part");
+        }
+        walk.close().expect("close walk writer");
+
+        assert_eq!(sink.finish().expect("finish"), []);
+        assert!(staging.partials().is_empty(), "no bucket is staged");
+        assert!(persisted_manifest(&dir).scratch().is_empty());
+        assert!(scratch_files(&dir).is_empty());
+    }
+
+    /// A part is a recorded scratch file until its splice, and the splice
+    /// releases it: the file is removed and its record dropped.
+    #[test]
+    fn part_is_released_after_its_splice() {
+        let root = tempfile::tempdir().expect("destination root");
+        let (_attempt, staging, dir) = attempt_run(root.path());
+        let (id, _) = two_bucket_ids();
+        let path = root.path().join("dlq.csv");
+        let bucket = target(id, &path);
+        let sink = StagedDlqSink::new(staging.clone(), None);
+
+        let mut part = sink.open_part_writer(origin("out")).expect("open part");
+        part.write_row(&bucket, b"p1\n").expect("part row");
+        let receipt = part.close().expect("close part writer");
+        assert_eq!(
+            persisted_manifest(&dir).scratch().len(),
+            1,
+            "the part is recorded while it waits for its splice"
+        );
+        assert_eq!(scratch_files(&dir).len(), 1);
+
+        let mut walk = sink.open_walk_writer().expect("open walk writer");
+        for segment in receipt.into_segments() {
+            assert_eq!((segment.bucket(), segment.rows()), (id, 1));
+            walk.splice(&bucket, segment).expect("splice part");
+        }
+        assert!(
+            persisted_manifest(&dir).scratch().is_empty(),
+            "the splice drops the part's record"
+        );
+        assert!(
+            scratch_files(&dir).is_empty(),
+            "the splice removes the part's file"
+        );
+        walk.close().expect("close walk writer");
+        sink.finish().expect("finish");
+        assert_eq!(staged_bytes(&staging, &path), b"_cxl_dlq_id,id\np1\n");
+    }
+
+    /// A receipt dropped without a splice, and a part writer dropped without
+    /// its close, each release their part.
+    #[test]
+    fn dropped_part_is_released() {
+        let root = tempfile::tempdir().expect("destination root");
+        let (_attempt, staging, dir) = attempt_run(root.path());
+        let (wide, own) = two_bucket_ids();
+        let wide_path = root.path().join("dlq.csv");
+        let own_path = root.path().join("dlq_b.csv");
+        let sink = StagedDlqSink::new(staging, None);
+
+        let mut closed = sink.open_part_writer(origin("closed")).expect("open part");
+        closed
+            .write_row(&target(wide, &wide_path), b"p1\n")
+            .expect("part row");
+        closed
+            .write_row(&target(own, &own_path), b"p2\n")
+            .expect("part row");
+        let receipt = closed.close().expect("close part writer");
+        assert_eq!(scratch_files(&dir).len(), 2);
+        drop(receipt);
+        assert!(scratch_files(&dir).is_empty());
+        assert!(persisted_manifest(&dir).scratch().is_empty());
+
+        let mut abandoned = sink
+            .open_part_writer(origin("abandoned"))
+            .expect("open part");
+        abandoned
+            .write_row(&target(wide, &wide_path), b"p3\n")
+            .expect("part row");
+        assert_eq!(scratch_files(&dir).len(), 1);
+        drop(abandoned);
+        assert!(scratch_files(&dir).is_empty());
+        assert!(persisted_manifest(&dir).scratch().is_empty());
+    }
+
+    /// A failed copy fails the splice. The run then abandons its attempt
+    /// instead of publishing, as the CLI does: nothing reaches the final
+    /// destination and the part is released.
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn part_splice_failure_publishes_nothing() {
+        let root = tempfile::tempdir().expect("destination root");
+        let (attempt, staging, dir) = attempt_run(root.path());
+        let (id, _) = two_bucket_ids();
+        let path = root.path().join("dlq.csv");
+        let bucket = target(id, &path);
+        let sink = StagedDlqSink::new(staging, None)
+            .with_copy_fault_for_testing(std::io::ErrorKind::StorageFull);
+
+        let mut part = sink.open_part_writer(origin("out")).expect("open part");
+        part.write_row(&bucket, b"p1\n").expect("part row");
+        let receipt = part.close().expect("close part writer");
+        let mut walk = sink.open_walk_writer().expect("open walk writer");
+        walk.write_row(&bucket, b"w1\n").expect("walk row");
+        for segment in receipt.into_segments() {
+            let failed = walk
+                .splice(&bucket, segment)
+                .expect_err("the copy is refused");
+            assert!(
+                matches!(&failed, PipelineError::Io(io) if io.kind() == std::io::ErrorKind::StorageFull),
+                "{failed:?}"
+            );
+        }
+        assert!(
+            walk.write_row(&bucket, b"w2\n").is_err(),
+            "the incomplete bucket refuses later rows"
+        );
+        assert!(
+            walk.close().is_err(),
+            "the incomplete bucket refuses its close"
+        );
+        attempt.abandon().expect("abandon the failed attempt");
+
+        assert!(!path.exists(), "no dead-letter file is published");
+        let manifest = persisted_manifest(&dir);
+        assert_eq!(manifest.state(), AttemptState::Abandoned);
+        assert!(manifest.scratch().is_empty(), "{manifest:?}");
+        assert!(scratch_files(&dir).is_empty());
+    }
+
+    /// A part that held rows and was never spliced keeps its rows out of the
+    /// bucket, so `finish` refuses to report an artifact set.
+    #[test]
+    fn finish_refuses_an_unspliced_part() {
+        let root = tempfile::tempdir().expect("destination root");
+        let staging = attempt_staging(root.path());
+        let (id, _) = two_bucket_ids();
+        let path = root.path().join("dlq.csv");
+        let bucket = target(id, &path);
+        let sink = StagedDlqSink::new(staging, None);
+
+        let mut walk = sink.open_walk_writer().expect("open walk writer");
+        walk.write_row(&bucket, b"w1\n").expect("walk row");
+        walk.close().expect("close walk writer");
+        let mut part = sink.open_part_writer(origin("out")).expect("open part");
+        part.write_row(&bucket, b"p1\n").expect("part row");
+        drop(part.close().expect("close part writer"));
+
+        match sink.finish() {
+            Err(PipelineError::Internal { op, detail, .. }) => {
+                assert_eq!(op, "dead-letter");
+                assert!(detail.contains("never spliced"), "{detail}");
+            }
+            other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+
+    /// A segment is spliced only into its own bucket.
+    #[test]
+    fn splice_refuses_a_segment_of_another_bucket() {
+        let root = tempfile::tempdir().expect("destination root");
+        let (_attempt, staging, dir) = attempt_run(root.path());
+        let (wide, own) = two_bucket_ids();
+        let wide_path = root.path().join("dlq.csv");
+        let own_path = root.path().join("dlq_b.csv");
+        let sink = StagedDlqSink::new(staging, None);
+
+        let mut part = sink.open_part_writer(origin("out")).expect("open part");
+        part.write_row(&target(wide, &wide_path), b"p1\n")
+            .expect("part row");
+        let receipt = part.close().expect("close part writer");
+        let mut walk = sink.open_walk_writer().expect("open walk writer");
+        for segment in receipt.into_segments() {
+            assert!(matches!(
+                walk.splice(&target(own, &own_path), segment),
+                Err(PipelineError::Internal { .. })
+            ));
+        }
+        assert!(scratch_files(&dir).is_empty());
     }
 }
