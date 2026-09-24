@@ -88,6 +88,32 @@ pub(crate) fn single_csv_document_metadata_bytes(
     bytes as u64
 }
 
+/// Pair each build fixture record with the row id its Source would mint:
+/// ordinal `index + 1` under Source node 1.
+///
+/// Build fixtures take a Source node other than node 0, which driver fixtures
+/// use through the test-only `From<u64>` for `SourceRowId`. A kernel test
+/// that confused a build row's identity with a driver's would therefore see a
+/// different Source, not just a different ordinal.
+pub(crate) fn with_build_row_ids(
+    records: Vec<clinker_record::Record>,
+) -> Vec<(
+    clinker_record::Record,
+    crate::executor::stream_event::SourceRowId,
+)> {
+    let source = <clinker_plan::plan::PlanNodeId as clinker_plan::plan::EntityRef>::new(1);
+    records
+        .into_iter()
+        .enumerate()
+        .map(|(index, record)| {
+            (
+                record,
+                crate::executor::stream_event::SourceRowId::new(source, index as u64 + 1),
+            )
+        })
+        .collect()
+}
+
 /// Eagerly decode single-file CSV fixtures before execution, using the compiled
 /// source body's parser, schema and coercion policy. The returned sources own
 /// already-materialized external records; no decoder runs under the test's
