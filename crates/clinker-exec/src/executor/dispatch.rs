@@ -353,6 +353,11 @@ pub(crate) struct DlqWalkState<'a> {
     pub(crate) report: crate::dlq::DlqReport,
 }
 
+/// An open capture of [`DlqWalkState::arm_capture`], closed by
+/// [`DlqWalkState::take_capture`].
+#[must_use = "an armed capture is closed by take_capture"]
+pub(crate) struct DlqCaptureMark(usize);
+
 /// Where the walk's writer is in its life.
 enum DlqWalkWriter {
     /// The run has no layout or its caller supplied no sink: rows are counted
@@ -461,6 +466,22 @@ impl<'a> DlqWalkState<'a> {
         writer.write_row(&target, row)?;
         self.report.record_bucket_row(id, bucket.path());
         Ok(())
+    }
+
+    /// Start collecting the `source_row` of every dead letter pushed until
+    /// the matching [`Self::take_capture`].
+    pub(crate) fn arm_capture(&mut self) -> DlqCaptureMark {
+        DlqCaptureMark(0)
+    }
+
+    /// End the capture `mark` opened and hand each captured `source_row` to
+    /// `out`, in push order.
+    pub(crate) fn take_capture(
+        &mut self,
+        mark: DlqCaptureMark,
+        out: impl FnMut(crate::executor::stream_event::SourceRowId),
+    ) {
+        let _ = (mark, out);
     }
 
     /// Flush and close the walk's writer, handing its bucket files back to
@@ -5015,6 +5036,115 @@ pub(crate) struct CorrelationErrorRecord {
     pub(crate) error_message: String,
     pub(crate) stage: Option<String>,
     pub(crate) route: Option<String>,
+}
+
+#[cfg(test)]
+mod dlq_capture_tests {
+    use super::*;
+    use crate::executor::stream_event::SourceRowId;
+    use clinker_plan::plan::PlanNodeId;
+
+    fn row(ordinal: u64) -> SourceRowId {
+        SourceRowId::new(PlanNodeId::new(0), ordinal)
+    }
+
+    fn entry(ordinal: u64) -> DlqEntry {
+        let schema = SharedStorage::from_arc(Arc::new(clinker_record::Schema::new(vec![
+            "id".into(),
+        ])));
+        DlqEntry {
+            source_row: row(ordinal),
+            category: clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
+            error_message: "bad".to_string(),
+            original_record: Record::new(schema, vec![Value::Integer(ordinal as i64)]),
+            stage: Some("transform:t".to_string()),
+            route: None,
+            trigger: true,
+            source_name: Arc::from("src"),
+            triggering_field: None,
+            triggering_value: None,
+        }
+    }
+
+    /// The run-scoped state a push updates, owned by the test.
+    struct Accounts {
+        counters: PipelineCounters,
+        dlq_per_source: HashMap<Arc<str>, u64>,
+        total_per_source: HashMap<Arc<str>, u64>,
+        entries: Vec<DlqEntry>,
+    }
+
+    impl Accounts {
+        fn new() -> Self {
+            Self {
+                counters: PipelineCounters::default(),
+                dlq_per_source: HashMap::new(),
+                total_per_source: HashMap::new(),
+                entries: Vec::new(),
+            }
+        }
+
+        fn push(&mut self, state: &mut DlqWalkState<'_>, ordinal: u64) {
+            let mut accounts = DlqAccounts {
+                counters: &mut self.counters,
+                dlq_per_source: &mut self.dlq_per_source,
+                total_per_source: &self.total_per_source,
+                config: None,
+                entries: &mut self.entries,
+            };
+            state
+                .push(entry(ordinal), &mut accounts)
+                .expect("a dead letter with no destination is counted");
+        }
+    }
+
+    fn take(state: &mut DlqWalkState<'_>, mark: DlqCaptureMark) -> Vec<SourceRowId> {
+        let mut rows = Vec::new();
+        state.take_capture(mark, |source_row| rows.push(source_row));
+        rows
+    }
+
+    #[test]
+    fn commit_capture_is_empty_between_dispatch_calls() {
+        let mut state = DlqWalkState::open(None, None).expect("no layout opens");
+        let mut accounts = Accounts::new();
+
+        // A push outside any dispatch call is counted and never captured.
+        accounts.push(&mut state, 1);
+        let mark = state.arm_capture();
+        accounts.push(&mut state, 2);
+        accounts.push(&mut state, 3);
+        assert_eq!(take(&mut state, mark), vec![row(2), row(3)]);
+
+        accounts.push(&mut state, 4);
+        let mark = state.arm_capture();
+        assert_eq!(
+            take(&mut state, mark),
+            Vec::<SourceRowId>::new(),
+            "the ids of one call never reach the next"
+        );
+        assert_eq!(accounts.counters.dlq_count, 4, "every push counts");
+    }
+
+    #[test]
+    fn nested_commit_capture_keeps_inner_rows_for_the_outer_call() {
+        let mut state = DlqWalkState::open(None, None).expect("no layout opens");
+        let mut accounts = Accounts::new();
+
+        let outer = state.arm_capture();
+        accounts.push(&mut state, 1);
+        let inner = state.arm_capture();
+        accounts.push(&mut state, 2);
+        assert_eq!(take(&mut state, inner), vec![row(2)]);
+        accounts.push(&mut state, 3);
+        assert_eq!(
+            take(&mut state, outer),
+            vec![row(1), row(2), row(3)],
+            "a call nested in a dispatch call still counts toward the outer call"
+        );
+        let mark = state.arm_capture();
+        assert_eq!(take(&mut state, mark), Vec::<SourceRowId>::new());
+    }
 }
 
 #[cfg(test)]
