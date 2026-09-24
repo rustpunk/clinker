@@ -3,9 +3,11 @@
 //! Under `dlq_granularity: document` a document marked failed stays failed
 //! for the whole run: no Sink writes any of its records, however many Sinks
 //! read them, and no Sink runs before an operator that could still condemn
-//! a document it holds. These tests pin that guarantee on the two shapes
-//! that broke it: two Sinks reading one Transform, and a Sink whose sibling
-//! branch condemns the document.
+//! a document it holds. Each row of a rejected document is dead-lettered
+//! once, by whichever Sink first held it. These tests pin that guarantee on
+//! the shapes that broke it: two Sinks reading one Transform, a Sink whose
+//! sibling branch condemns the document, and a Route that splits one
+//! document's rows between two Sinks.
 //!
 //! Every pipeline reads one CSV Source `events` over two in-memory files.
 //! `a.csv` holds `a1,1`, `a2,bad`, `a3,3`, so an integer coercion fails on
@@ -99,6 +101,28 @@ fn sibling_branches() -> String {
     yaml.push_str(&sink("out2", "t2"));
     yaml.push_str(&transform("t1", "events", PASS_CXL));
     yaml.push_str(&sink("out1", "t1"));
+    yaml
+}
+
+/// Shape (c): `validate` feeds a Route `split` that sends `a1` to
+/// `out_first` and every other record to `out_second`, so each Sink holds
+/// rows of document `a.csv` the other never sees.
+fn route_splits_one_document() -> String {
+    let mut yaml = preamble("path: rejected.csv");
+    yaml.push_str(&transform("validate", "events", VALIDATE_CXL));
+    yaml.push_str(
+        r#"  - type: route
+    name: split
+    input: validate
+    config:
+      mode: exclusive
+      conditions:
+        first: "id == 'a1'"
+      default: second
+"#,
+    );
+    yaml.push_str(&sink("out_first", "split.first"));
+    yaml.push_str(&sink("out_second", "split.second"));
     yaml
 }
 
@@ -287,6 +311,30 @@ fn dlq_count_counts_each_row_once_across_sinks() {
         3,
         "the dead-letter rows name three distinct source rows"
     );
+}
+
+/// A row of a rejected document that reached only the Sink rejecting it
+/// second is still dead-lettered, and no row is dead-lettered twice.
+#[test]
+fn row_routed_only_to_a_later_sink_is_dead_lettered_once() {
+    let (counters, rows, bodies) = run_fanout(
+        &route_splits_one_document(),
+        &[("a.csv", A_CSV), ("b.csv", B_CSV)],
+        &["out_first", "out_second"],
+    );
+
+    assert!(
+        ids(&bodies["out_first"]).is_empty(),
+        "out_first holds only a row of the rejected document and writes nothing"
+    );
+    assert_eq!(
+        ids(&bodies["out_second"]),
+        ["b1", "b2"],
+        "out_second writes only the clean document"
+    );
+    assert_rejected_once(&rows, &["a1", "a2", "a3"]);
+    assert_eq!(counters.ok_count, 2, "ok_count counts no rejected row");
+    assert_eq!(counters.dlq_count, 3, "each rejected row is counted once");
 }
 
 /// `--explain` lists the nodes in the order the run dispatches them, so
