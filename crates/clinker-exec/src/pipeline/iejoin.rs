@@ -535,7 +535,9 @@ pub(crate) struct IEJoinExec<'a> {
     pub name: &'a str,
     pub build_qualifier: &'a str,
     pub driver_records: Vec<(Record, RecordOrder)>,
-    pub build_records: Vec<Record>,
+    /// Each build record with the row id its Source minted, which a
+    /// build-side dead letter reports.
+    pub build_records: Vec<(Record, RecordOrder)>,
     pub decomposed: &'a DecomposedPredicate,
     pub body_program: Option<&'a Arc<TypedProgram>>,
     pub resolver_mapping: &'a CombineResolverMapping,
@@ -773,7 +775,7 @@ pub(crate) fn execute_combine_iejoin(
 
     let build_scans: Vec<RecordScan> = build_records
         .par_iter()
-        .map(|rec| {
+        .map(|(rec, _)| {
             scan_record(
                 &build_extractor,
                 &build_range_extractor,
@@ -883,14 +885,17 @@ struct DriverRef<'a> {
 }
 
 /// The per-call inputs to [`emit_pairs`]: the kernel's local pair indices, the
-/// driver and build slices they index, and each local build's original input
+/// driver and build slices they index, each local build's original input
 /// index, which drives the block-band's deterministic `First` selection,
-/// `Collect` ordering, and final output sort.
+/// `Collect` ordering, and final output sort, and each local build's row id,
+/// which a build-side dead letter reports. `build_idx` and `build_row` align
+/// with `build_slice`.
 struct EmitBatch<'a> {
     pairs: &'a [(usize, usize)],
     driver_slice: &'a [DriverRef<'a>],
     build_slice: &'a [&'a Record],
     build_idx: &'a [u64],
+    build_row: &'a [RecordOrder],
 }
 
 /// One accumulated collect-array element, ordered by a build-order key so a
@@ -941,6 +946,21 @@ fn record_unaccounted_held_cost(
 ) -> u64 {
     (std::mem::size_of::<Record>() + record.unaccounted_heap_size(resources)) as u64
 }
+
+/// Resident byte cost of one held build candidate: the cloned record plus the
+/// build row id held beside it.
+fn candidate_held_cost(record: &Record) -> u64 {
+    record_held_cost(record) + std::mem::size_of::<RecordOrder>() as u64
+}
+
+/// [`candidate_held_cost`] net of the record heap the allocation resources
+/// already account for.
+fn candidate_unaccounted_held_cost(
+    record: &Record,
+    resources: &clinker_record::owned_storage::AllocationResources,
+) -> u64 {
+    record_unaccounted_held_cost(record, resources) + std::mem::size_of::<RecordOrder>() as u64
+}
 fn collect_entry_unaccounted_cost(
     entry: &CollectEntry,
     resources: &clinker_record::owned_storage::AllocationResources,
@@ -948,8 +968,10 @@ fn collect_entry_unaccounted_cost(
     (std::mem::size_of::<CollectEntry>() + entry.value.unaccounted_heap_size(resources)) as u64
 }
 
-/// Keep the `(idx, record)` with the smallest `idx` for `key` in `map`,
-/// adjusting `held_bytes` for whichever record is now resident. Shared by the
+/// Keep the `candidate` — a build's `(idx, record, row)` — with the smallest
+/// `idx` for `key` in `map`, adjusting `held_bytes` for whichever record and
+/// row id are now resident.
+/// Shared by the
 /// `First`-mode candidate and the collect `$ck` build so the min-selection rule
 /// (determinism-critical) lives in one place. A free function so the caller can
 /// pass two disjoint `MatchState` fields (`&mut self.first_match`,
@@ -957,30 +979,30 @@ fn collect_entry_unaccounted_cost(
 fn keep_min(
     resources: &clinker_record::owned_storage::AllocationResources,
     unaccounted_bytes: &mut u64,
-    map: &mut HashMap<usize, (u64, Record)>,
+    map: &mut HashMap<usize, (u64, Record, RecordOrder)>,
     held_bytes: &mut u64,
     key: usize,
-    idx: u64,
-    record: &Record,
+    candidate: (u64, &Record, RecordOrder),
 ) {
+    let (idx, record, row) = candidate;
     match map.entry(key) {
         std::collections::hash_map::Entry::Occupied(mut e) if idx < e.get().0 => {
             let cloned = record.clone();
-            *held_bytes = held_bytes.saturating_sub(record_held_cost(&e.get().1));
-            *held_bytes = held_bytes.saturating_add(record_held_cost(&cloned));
+            *held_bytes = held_bytes.saturating_sub(candidate_held_cost(&e.get().1));
+            *held_bytes = held_bytes.saturating_add(candidate_held_cost(&cloned));
             *unaccounted_bytes = unaccounted_bytes
-                .saturating_sub(record_unaccounted_held_cost(&e.get().1, resources));
-            *unaccounted_bytes =
-                unaccounted_bytes.saturating_add(record_unaccounted_held_cost(&cloned, resources));
-            e.insert((idx, cloned));
+                .saturating_sub(candidate_unaccounted_held_cost(&e.get().1, resources));
+            *unaccounted_bytes = unaccounted_bytes
+                .saturating_add(candidate_unaccounted_held_cost(&cloned, resources));
+            e.insert((idx, cloned, row));
         }
         std::collections::hash_map::Entry::Occupied(_) => {}
         std::collections::hash_map::Entry::Vacant(e) => {
             let cloned = record.clone();
-            *held_bytes = held_bytes.saturating_add(record_held_cost(&cloned));
-            *unaccounted_bytes =
-                unaccounted_bytes.saturating_add(record_unaccounted_held_cost(&cloned, resources));
-            e.insert((idx, cloned));
+            *held_bytes = held_bytes.saturating_add(candidate_held_cost(&cloned));
+            *unaccounted_bytes = unaccounted_bytes
+                .saturating_add(candidate_unaccounted_held_cost(&cloned, resources));
+            e.insert((idx, cloned, row));
         }
     }
 }
@@ -1006,12 +1028,13 @@ struct MatchState<'a> {
     /// a pure function of the data on the block path (min build input index),
     /// and the first-visited build on the equi+range path (min insertion
     /// counter) — matching that path's prior behavior.
-    first_collected_builds: HashMap<usize, (u64, Record)>,
+    first_collected_builds: HashMap<usize, (u64, Record, RecordOrder)>,
     /// The block path's `First`-mode candidate per driver: the residual-passing
     /// match with the smallest build input index, held until the driver block
-    /// finalizes and emits it. Empty on the equi+range path, which emits the
-    /// first-visited match immediately. Bounded by one build record per driver.
-    first_match: HashMap<usize, (u64, Record)>,
+    /// finalizes and emits it, with the build row id its dead letter reports.
+    /// Empty on the equi+range path, which emits the first-visited match
+    /// immediately. Bounded by one build record per driver.
+    first_match: HashMap<usize, (u64, Record, RecordOrder)>,
     /// Running byte total of every cloned build record and collect entry held
     /// above (`first_match`, `first_collected_builds`, and the `collect_accum`
     /// heaps). Both paths fold it into their pre-output budget gates so a
@@ -1058,15 +1081,20 @@ impl<'a> MatchState<'a> {
     /// user fields, keep the bounded smallest-`order_key` set, and track the
     /// min-`order_key` build for `$ck`. Marking a driver truncated once its
     /// heap is full and a further match cannot displace a kept element.
-    fn record_collect_match(&mut self, key: usize, order_key: u64, build_record: &Record) {
+    fn record_collect_match(
+        &mut self,
+        key: usize,
+        order_key: u64,
+        build_record: &Record,
+        build_row: RecordOrder,
+    ) {
         keep_min(
             self.allocation_resources,
             &mut self.unaccounted_held_bytes,
             &mut self.first_collected_builds,
             &mut self.held_bytes,
             key,
-            order_key,
-            build_record,
+            (order_key, build_record, build_row),
         );
         // Build-side records contribute only their user-declared field values:
         // `iter_user_fields` filters every engine-stamped column (`$ck.*`
@@ -1134,16 +1162,17 @@ impl<'a> MatchState<'a> {
                 None => Vec::new(),
             };
         let truncated = self.collect_truncated.remove(&key).is_some();
-        let first_build = match self.first_collected_builds.remove(&key) {
-            Some((_, r)) => {
-                self.held_bytes = self.held_bytes.saturating_sub(record_held_cost(&r));
-                self.unaccounted_held_bytes = self
-                    .unaccounted_held_bytes
-                    .saturating_sub(record_unaccounted_held_cost(&r, self.allocation_resources));
-                Some(r)
-            }
-            None => None,
-        };
+        let first_build =
+            match self.first_collected_builds.remove(&key) {
+                Some((_, r, _)) => {
+                    self.held_bytes = self.held_bytes.saturating_sub(candidate_held_cost(&r));
+                    self.unaccounted_held_bytes = self.unaccounted_held_bytes.saturating_sub(
+                        candidate_unaccounted_held_cost(&r, self.allocation_resources),
+                    );
+                    Some(r)
+                }
+                None => None,
+            };
         CollectFlush {
             arr,
             truncated,
@@ -1154,27 +1183,35 @@ impl<'a> MatchState<'a> {
     /// Record one residual-passing `First`-mode candidate for the block path:
     /// keep the match with the smallest build input index, held until the
     /// driver block finalizes.
-    fn note_first_candidate(&mut self, key: usize, build_idx: u64, build_record: &Record) {
+    fn note_first_candidate(
+        &mut self,
+        key: usize,
+        build_idx: u64,
+        build_record: &Record,
+        build_row: RecordOrder,
+    ) {
         keep_min(
             self.allocation_resources,
             &mut self.unaccounted_held_bytes,
             &mut self.first_match,
             &mut self.held_bytes,
             key,
-            build_idx,
-            build_record,
+            (build_idx, build_record, build_row),
         );
     }
 
     /// Remove and return this driver's held `First` candidate, releasing its
     /// held-byte charge. Used by the block path's driver-block finalize.
-    fn take_first_candidate(&mut self, key: usize) -> Option<(u64, Record)> {
+    fn take_first_candidate(&mut self, key: usize) -> Option<(u64, Record, RecordOrder)> {
         let taken = self.first_match.remove(&key);
-        if let Some((_, ref r)) = taken {
-            self.held_bytes = self.held_bytes.saturating_sub(record_held_cost(r));
-            self.unaccounted_held_bytes = self
-                .unaccounted_held_bytes
-                .saturating_sub(record_unaccounted_held_cost(r, self.allocation_resources));
+        if let Some((_, ref r, _)) = taken {
+            self.held_bytes = self.held_bytes.saturating_sub(candidate_held_cost(r));
+            self.unaccounted_held_bytes =
+                self.unaccounted_held_bytes
+                    .saturating_sub(candidate_unaccounted_held_cost(
+                        r,
+                        self.allocation_resources,
+                    ));
         }
         taken
     }
@@ -1358,6 +1395,9 @@ fn emit_pairs(
         // for the final deterministic output sort — all pure functions of the
         // data rather than the memory-derived block layout.
         let bidx = batch.build_idx[bi_local];
+        // The row the build's Source minted, from the same position, so a
+        // build-side dead letter reports the build's own row.
+        let build_row = batch.build_row[bi_local];
 
         // 3+ range conjuncts: the residual re-checks the full predicate over
         // the merged row (the kernel verified only the first two axes). See
@@ -1384,7 +1424,7 @@ fn emit_pairs(
                         CombineOutputEvalFailure {
                             probe_record: driver_record.clone(),
                             row: driver_order,
-                            matched_build: Some(build_record.clone()),
+                            matched_build: Some((build_record.clone(), build_row)),
                             error: e,
                             failed_at: crate::executor::DlqFailureStamp::now(),
                         },
@@ -1401,7 +1441,7 @@ fn emit_pairs(
             MatchMode::Collect => {
                 // Order key: the build's input index, so the kept set and array
                 // order are a deterministic function of the data.
-                state.record_collect_match(key, bidx, build_record);
+                state.record_collect_match(key, bidx, build_record, build_row);
                 // Bound the collect accumulators as they grow: they hold up to
                 // COLLECT_PER_GROUP_CAP cloned build records per driver, are never
                 // spilled, and drain only at the driver-block finalize — so a hot
@@ -1423,10 +1463,10 @@ fn emit_pairs(
                 // Hold the minimum-build-index candidate; emit at the driver
                 // block's finalize, so the selection is the same regardless of
                 // which block the winning build landed in.
-                state.note_first_candidate(key, bidx, build_record);
+                state.note_first_candidate(key, bidx, build_record, build_row);
             }
             MatchMode::All => {
-                if emit_match_row(cfg, evals, dref, build_record, bidx, sink)? {
+                if emit_match_row(cfg, evals, dref, build_record, bidx, build_row, sink)? {
                     state.matched[key] = true;
                 }
             }
@@ -1438,15 +1478,17 @@ fn emit_pairs(
 /// Materialize and push one `(driver, build)` output row for `First` / `All`:
 /// the body eval (or, for a body-less synthetic decomposition step, the
 /// driver-then-build value concat) and `$ck` propagation. The row is tagged
-/// with `build_idx` for the final deterministic output sort. Returns `true` if
-/// a row was pushed, `false` if the body eval skipped it or a recoverable eval
-/// failure was deferred.
+/// with `build_idx` for the final deterministic output sort; a deferred
+/// failure carries `build_row`, the row the build's Source minted. Returns
+/// `true` if a row was pushed, `false` if the body eval skipped it or a
+/// recoverable eval failure was deferred.
 fn emit_match_row(
     cfg: &EmitConfig<'_>,
     evals: &mut Evaluators,
     driver: &DriverRef<'_>,
     build_record: &Record,
     build_idx: u64,
+    build_row: RecordOrder,
     sink: &mut EmitSink<'_>,
 ) -> Result<bool, PipelineError> {
     let driver_record = driver.record;
@@ -1489,7 +1531,7 @@ fn emit_match_row(
                     CombineOutputEvalFailure {
                         probe_record: driver_record.clone(),
                         row: driver_order,
-                        matched_build: Some(build_record.clone()),
+                        matched_build: Some((build_record.clone(), build_row)),
                         error: e,
                         failed_at: crate::executor::DlqFailureStamp::now(),
                     },
@@ -1985,12 +2027,12 @@ mod tests {
                 .first_match
                 .values()
                 .chain(state.first_collected_builds.values())
-                .map(|(_, record)| record);
+                .map(|(_, record, _)| record);
             let mut physical = 0;
             let mut relative = 0;
             for record in records {
-                physical += record_held_cost(record);
-                relative += record_unaccounted_held_cost(record, state.allocation_resources);
+                physical += candidate_held_cost(record);
+                relative += candidate_unaccounted_held_cost(record, state.allocation_resources);
             }
             for entry in state.collect_accum.values().flat_map(|heap| heap.iter()) {
                 physical += collect_entry_cost(entry);
@@ -2037,11 +2079,12 @@ mod tests {
                 let mut first = MatchState::new(1, &resources);
                 let mut collect = MatchState::new(1, &resources);
                 for index in [9, 7, 4, 1] {
-                    first.note_first_candidate(0, index, &input);
-                    collect.record_collect_match(0, index, &input);
+                    first.note_first_candidate(0, index, &input, index.into());
+                    collect.record_collect_match(0, index, &input, index.into());
                     assert_retained(&first);
                     assert_retained(&collect);
                     assert_eq!(first.first_match[&0].0, index);
+                    assert_eq!(first.first_match[&0].2, RecordOrder::from(index));
                     assert_eq!(collect.first_collected_builds[&0].0, index);
                     assert!(first.unaccounted_held_bytes() > 0);
                     assert!(collect.unaccounted_held_bytes() > 0);
@@ -2051,7 +2094,7 @@ mod tests {
                         assert!(first.held_bytes() > first.unaccounted_held_bytes());
                     }
                     // Discarding a worse candidate leaves the retained winner intact.
-                    first.note_first_candidate(0, index + 1, &input);
+                    first.note_first_candidate(0, index + 1, &input, (index + 1).into());
                     assert_retained(&first);
                     assert_eq!(first.first_match[&0].0, index);
                     assert_eq!(owner.used(), original_charge);
@@ -2069,6 +2112,7 @@ mod tests {
                     (0, 0)
                 );
                 assert_eq!(taken.0, 1);
+                assert_eq!(taken.2, RecordOrder::from(1));
                 assert_eq!(collected.arr.len(), 4);
                 assert!(!collected.truncated);
                 assert!(collected.first_build.is_some());
@@ -2121,7 +2165,7 @@ mod tests {
             )),
         };
         let floor = 71;
-        let actual_peak = floor + record_held_cost(&stored) + collect_entry_cost(&entry);
+        let actual_peak = floor + candidate_held_cost(&stored) + collect_entry_cost(&entry);
         assert!(record_held_cost(&input) > record_held_cost(&stored));
         let stable = StableEvalContext::test_default();
         let ctx = EvalContext::test_default_borrowed(&stable);
@@ -2158,6 +2202,7 @@ mod tests {
                 driver_slice: &driver,
                 build_slice: &[&input],
                 build_idx: &[0],
+                build_row: &[RecordOrder::from(0)],
             };
             let mut buffer = SortBuffer::new_payload_ordered(
                 usize::MAX,

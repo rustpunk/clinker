@@ -641,7 +641,8 @@ pub(super) struct BlockBandExec<'a> {
     pub(super) build_qualifier: &'a str,
     pub(super) driver_records: Vec<(Record, RecordOrder)>,
     pub(super) driver_scans: Vec<RecordScan>,
-    pub(super) build_records: Vec<Record>,
+    /// Each build record with the row id its Source minted.
+    pub(super) build_records: Vec<(Record, RecordOrder)>,
     pub(super) build_scans: Vec<RecordScan>,
     pub(super) op1: RangeOp,
     pub(super) op2: Option<RangeOp>,
@@ -1016,7 +1017,8 @@ fn execute_block_band_inner(exec: BlockBandExec<'_>) -> Result<BlockBandOutput, 
             // pair's scratch for any spilled block loaded here (zero for a
             // borrowed resident block, already in the baseline), the build-side
             // vectors held across the kernel and emit (its range-key column
-            // sized per mode, the `build_idx` and `build_slice` vecs), the
+            // sized per mode, the `build_idx`, `build_row` and `build_slice`
+            // vecs), the
             // kernel's O(n) sort state (the two-conjunct IEJoin arrays or the
             // leaner PWMJ index vecs), the First / collect candidates held so far
             // in this driver block, and the in-block miss pile's CURRENT resident
@@ -1040,6 +1042,7 @@ fn execute_block_band_inner(exec: BlockBandExec<'_>) -> Result<BlockBandOutput, 
             let build_vecs_bytes = (build_block.len
                 * (range_key_width(op2)
                     + std::mem::size_of::<u64>()
+                    + std::mem::size_of::<RecordOrder>()
                     + std::mem::size_of::<&Record>())) as u64;
             let aux_kernel = match op2 {
                 Some(_) => iejoin_numeric_state_bytes(driver_block.len, build_block.len),
@@ -1077,6 +1080,7 @@ fn execute_block_band_inner(exec: BlockBandExec<'_>) -> Result<BlockBandOutput, 
                 continue;
             }
             let build_idx: Vec<u64> = build_loaded.iter().map(|(_, p)| p.build_idx).collect();
+            let build_row: Vec<RecordOrder> = build_loaded.iter().map(|(_, p)| p.row).collect();
             charge_working_set(
                 consumer,
                 baseline_unaccounted,
@@ -1150,6 +1154,7 @@ fn execute_block_band_inner(exec: BlockBandExec<'_>) -> Result<BlockBandOutput, 
                         driver_slice: &driver_slice,
                         build_slice: &build_slice,
                         build_idx: &build_idx,
+                        build_row: &build_row,
                     };
                     // Fixed working-set floor (everything but the live held bytes the
                     // collect poll adds), so a hot `match: collect` pair bounds its
@@ -1254,6 +1259,7 @@ fn execute_block_band_inner(exec: BlockBandExec<'_>) -> Result<BlockBandOutput, 
                             driver_slice: &driver_slice,
                             build_slice: &build_slice,
                             build_idx: &build_idx,
+                            build_row: &build_row,
                         };
                         emit_pairs(&emit_cfg, evals, &batch, state, sink, &pair_budget)
                     };
@@ -1477,12 +1483,18 @@ fn spilled_scratch_bytes<P>(block: &Block<P>) -> u64 {
 /// (canonical equality bytes, carried only for the per-pair re-verify) never
 /// participates in the order — keeping the `Ord`/`Eq` contract intact even
 /// though two distinct keys can share `eq_hash`.
+///
+/// `row` is the row id the build record's Source minted, which a build-side
+/// dead letter reports. It sits after the unique `build_idx`, so the derived
+/// order never reaches it either. It is inline, so the payload's
+/// `size_of`, and with it the sort, block and resident charge, includes it.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 struct BuildPayload {
     eq_hash: u64,
     k1: i128,
     k2: i128,
     build_idx: u64,
+    row: RecordOrder,
     eq: Vec<u8>,
 }
 
@@ -1625,12 +1637,12 @@ fn drain_driver_side(
 /// downstream First / Collect selection and the output ordering a pure function
 /// of the data. Unmatched builds are dropped (no build-side on_miss).
 fn drain_build_side(
-    build_records: Vec<Record>,
+    build_records: Vec<(Record, RecordOrder)>,
     build_scans: Vec<RecordScan>,
     ctx: &DrainCtx<'_>,
     resident: &mut ResidentBudget,
 ) -> Result<BuildBlocks, PipelineError> {
-    let Some(first) = build_records.first() else {
+    let Some((first, _)) = build_records.first() else {
         return Ok(Vec::new());
     };
     let schema = first.schema().clone();
@@ -1641,7 +1653,8 @@ fn drain_build_side(
         schema.clone(),
         ctx.allocation_resources.clone(),
     );
-    for (build_idx, (record, scan)) in build_records.into_iter().zip(build_scans).enumerate() {
+    for (build_idx, ((record, row), scan)) in build_records.into_iter().zip(build_scans).enumerate()
+    {
         if let RecordScan::Matched {
             eq_hash,
             eq,
@@ -1656,6 +1669,7 @@ fn drain_build_side(
                     k1,
                     k2,
                     build_idx: build_idx as u64,
+                    row,
                     eq,
                 },
                 ctx,
@@ -1995,14 +2009,14 @@ fn finalize_driver_block(
                     // body is a post-match projection. Run it once and discard
                     // the emit/skip result — a body skip drops only this output
                     // row, it does not turn a matched driver into a miss.
-                    Some((bidx, build)) => {
+                    Some((bidx, build, build_row)) => {
                         let dref = DriverRef {
                             record,
                             order: payload.order,
                             key: di,
                             driver_idx: payload.driver_idx,
                         };
-                        emit_match_row(cfg, evals, &dref, &build, bidx, sink)?;
+                        emit_match_row(cfg, evals, &dref, &build, bidx, build_row, sink)?;
                     }
                     // No candidate held: the driver matched no build predicate,
                     // a genuine zero-match routed to the deferred on_miss
@@ -2287,6 +2301,7 @@ mod tests {
             k1: 0,
             k2: 0,
             build_idx: 0,
+            row: RecordOrder::from(0),
             eq: Vec::new(),
         }
     }
@@ -2516,7 +2531,7 @@ mod tests {
             build_qualifier: "b",
             driver_records,
             driver_scans,
-            build_records,
+            build_records: crate::test_support::with_build_row_ids(build_records),
             build_scans,
             op1: cfg.op1,
             op2: cfg.op2,
@@ -3742,7 +3757,7 @@ mod tests {
             build_qualifier: "b",
             driver_records,
             driver_scans,
-            build_records,
+            build_records: crate::test_support::with_build_row_ids(build_records),
             build_scans,
             op1: cfg.op1,
             op2: cfg.op2,
@@ -4060,7 +4075,7 @@ mod tests {
                 build_qualifier: "b",
                 driver_records,
                 driver_scans,
-                build_records,
+                build_records: crate::test_support::with_build_row_ids(build_records),
                 build_scans,
                 op1: RangeOp::Le,
                 op2: Some(RangeOp::Ge),
@@ -4159,7 +4174,7 @@ mod tests {
                 build_qualifier: "b",
                 driver_records,
                 driver_scans,
-                build_records,
+                build_records: crate::test_support::with_build_row_ids(build_records),
                 build_scans,
                 op1: RangeOp::Le,
                 op2: Some(RangeOp::Ge),
@@ -4282,7 +4297,7 @@ mod tests {
             build_qualifier: "b",
             driver_records,
             driver_scans,
-            build_records,
+            build_records: crate::test_support::with_build_row_ids(build_records),
             build_scans,
             op1: RangeOp::Le,
             op2: Some(RangeOp::Ge),
@@ -4538,7 +4553,7 @@ mod tests {
             build_qualifier: "b",
             driver_records,
             driver_scans,
-            build_records,
+            build_records: crate::test_support::with_build_row_ids(build_records),
             build_scans,
             op1: RangeOp::Le,
             op2: Some(RangeOp::Ge),
@@ -4776,7 +4791,7 @@ mod tests {
             build_qualifier: "b",
             driver_records,
             driver_scans,
-            build_records,
+            build_records: crate::test_support::with_build_row_ids(build_records),
             build_scans,
             op1: RangeOp::Le,
             op2: Some(RangeOp::Ge),
@@ -4948,8 +4963,10 @@ mod tests {
         let driver_vecs =
             (driver.len() * (range_key_width(op2) + std::mem::size_of::<DriverRef<'_>>())) as u64;
         let build_vecs = (build.len()
-            * (range_key_width(op2) + std::mem::size_of::<u64>() + std::mem::size_of::<&Record>()))
-            as u64;
+            * (range_key_width(op2)
+                + std::mem::size_of::<u64>()
+                + std::mem::size_of::<RecordOrder>()
+                + std::mem::size_of::<&Record>())) as u64;
         let aux = iejoin_numeric_state_bytes(driver.len(), build.len()) as u64;
         let pairs_bytes =
             (driver.len() * build.len() * std::mem::size_of::<(usize, usize)>()) as u64;
@@ -5240,7 +5257,7 @@ mod tests {
             build_qualifier: "b",
             driver_records,
             driver_scans,
-            build_records,
+            build_records: crate::test_support::with_build_row_ids(build_records),
             build_scans,
             op1: cfg.op1,
             op2: cfg.op2,
@@ -5774,6 +5791,7 @@ mod tests {
             k1: 1,
             k2: 2,
             build_idx: 0,
+            row: RecordOrder::from(0),
             eq: vec![1, 2, 3],
         };
         let budget = MemoryArbitrator::with_policy(
@@ -5949,6 +5967,7 @@ mod tests {
                 k1: k as i128,
                 k2: 0,
                 build_idx: k as u64,
+                row: RecordOrder::from(k as u64),
                 eq: vec![],
             };
             one_block = pair_bytes(&record, &payload) as u64;

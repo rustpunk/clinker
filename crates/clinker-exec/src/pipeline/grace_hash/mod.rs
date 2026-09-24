@@ -188,7 +188,7 @@ pub(crate) struct GraceHashExec<'a> {
     pub name: &'a str,
     pub build_qualifier: &'a str,
     pub driver_records: Vec<(Record, RecordOrder)>,
-    pub build_records: Vec<Record>,
+    pub build_records: Vec<(Record, RecordOrder)>,
     pub decomposed: &'a DecomposedPredicate,
     pub body_program: Option<&'a Arc<TypedProgram>>,
     pub resolver_mapping: &'a CombineResolverMapping,
@@ -758,6 +758,9 @@ pub(crate) fn execute_combine_grace_hash(
     }
     let driver_extractor = KeyExtractor::new(driver_progs);
     let build_extractor = KeyExtractor::new(build_progs);
+
+    // The partitions do not carry the build row ids yet.
+    let build_records: Vec<Record> = build_records.into_iter().map(|(r, _)| r).collect();
 
     // Determine the build-side schema, falling back to the output schema
     // so the spill reader has something to attach even on empty input.

@@ -678,8 +678,8 @@ where
             // never lingers in the arbitrator's registry.
             let result = (|| -> Result<(), PipelineError> {
                 // Advance per-source `rollback_cursors` for every
-                // build-side record before its `row_num` is dropped
-                // in the `(r, _)` map. Source→Combine direct paths
+                // build-side record before `build_buf` moves into the
+                // kernel with its row ids. Source→Combine direct paths
                 // (no intermediate Transform/Aggregate to advance the
                 // cursor on the way through) would otherwise leave
                 // the build source's cursor anchored at zero. Same
@@ -691,13 +691,12 @@ where
                 for (rec, rn) in &build_buf {
                     advance_cursor(ctx, &source_name_arc_of(rec), *rn);
                 }
-                let build_records: Vec<Record> = build_buf.into_iter().map(|(r, _)| r).collect();
-                let build_records_in = build_records.len() as u64;
+                let build_records_in = build_buf.len() as u64;
                 let build_timer =
                     stage_metrics::StageTimer::new(stage_metrics::StageName::CombineBuild {
                         name: name.clone(),
                     });
-                let build_records_out = build_records.len() as u64;
+                let build_records_out = build_buf.len() as u64;
                 ctx.collector
                     .record(build_timer.finish(build_records_in, build_records_out));
                 let probe_records_in = driver_buf.len() as u64;
@@ -723,7 +722,7 @@ where
                 let iejoin_ctx = ctx.merged_eval_ctx();
                 // CPU-bound block-band IEJoin kernel — external-sort +
                 // block-band range walk over a bounded working set. The
-                // kernel owns its inputs (`driver_buf`, `build_records`)
+                // kernel owns its inputs (`driver_buf`, `build_buf`)
                 // and borrows only `&ctx.memory_budget` + the local
                 // `iejoin_ctx`, so it runs on the shared Rayon pool. Row
                 // order is the deterministic `(driver order, driver_idx,
@@ -737,7 +736,7 @@ where
                                 name,
                                 build_qualifier: &build_qualifier,
                                 driver_records: driver_buf,
-                                build_records,
+                                build_records: build_buf,
                                 decomposed,
                                 body_program: body_typed,
                                 resolver_mapping: &resolver_mapping,
@@ -855,13 +854,12 @@ where
                 for (rec, rn) in &build_buf {
                     advance_cursor(ctx, &source_name_arc_of(rec), *rn);
                 }
-                let build_records: Vec<Record> = build_buf.into_iter().map(|(r, _)| r).collect();
-                let build_records_in = build_records.len() as u64;
+                let build_records_in = build_buf.len() as u64;
                 let build_timer =
                     stage_metrics::StageTimer::new(stage_metrics::StageName::CombineBuild {
                         name: name.clone(),
                     });
-                let build_records_out = build_records.len() as u64;
+                let build_records_out = build_buf.len() as u64;
                 ctx.collector
                     .record(build_timer.finish(build_records_in, build_records_out));
                 let probe_records_in = driver_buf.len() as u64;
@@ -895,7 +893,7 @@ where
                         name,
                         build_qualifier: &build_qualifier,
                         driver_records: driver_buf,
-                        build_records,
+                        build_records: build_buf,
                         decomposed,
                         body_program: body_typed,
                         resolver_mapping: &resolver_mapping,
@@ -931,7 +929,7 @@ where
                         node_idx,
                         &f.probe_record,
                         f.row,
-                        f.matched_build.as_ref().map(|record| (record, f.row)),
+                        f.matched_build.as_ref().map(|(record, row)| (record, *row)),
                         name,
                         f.error,
                         f.failed_at,
@@ -1000,13 +998,12 @@ where
                 for (rec, rn) in &build_buf {
                     advance_cursor(ctx, &source_name_arc_of(rec), *rn);
                 }
-                let build_records: Vec<Record> = build_buf.into_iter().map(|(r, _)| r).collect();
-                let build_records_in = build_records.len() as u64;
+                let build_records_in = build_buf.len() as u64;
                 let build_timer =
                     stage_metrics::StageTimer::new(stage_metrics::StageName::CombineBuild {
                         name: name.clone(),
                     });
-                let build_records_out = build_records.len() as u64;
+                let build_records_out = build_buf.len() as u64;
                 ctx.collector
                     .record(build_timer.finish(build_records_in, build_records_out));
                 let probe_records_in = driver_buf.len() as u64;
@@ -1040,7 +1037,7 @@ where
                         name,
                         build_qualifier: &build_qualifier,
                         driver_records: driver_buf,
-                        build_records,
+                        build_records: build_buf,
                         decomposed,
                         body_program: body_typed,
                         resolver_mapping: &resolver_mapping,
@@ -2259,7 +2256,7 @@ fn dispatch_combine_output_errors(
             node_idx,
             &f.probe_record,
             f.row,
-            f.matched_build.as_ref().map(|record| (record, f.row)),
+            f.matched_build.as_ref().map(|(record, row)| (record, *row)),
             combine_name,
             f.error,
             f.failed_at,

@@ -102,9 +102,14 @@ pub(crate) type RecordOrder = crate::executor::stream_event::SourceRowId;
 // Match window
 // ──────────────────────────────────────────────────────────────────────
 
+/// A build row's tag: its input index, which orders the build, then the row
+/// its Source minted, which names it in a dead letter. The index is unique,
+/// so ordering by the tag equals ordering by the index.
+type BuildTag = (u64, RecordOrder);
+
 /// One build row buffered in the [`MatchWindow`]: the record, its range key,
-/// and its unique global input index.
-type WindowEntry = (Record, Value, u64);
+/// and its [`BuildTag`].
+type WindowEntry = (Record, Value, BuildTag);
 
 /// Shared spill / charge context for a [`MatchWindow`] mutation and the output
 /// sink. Bundled so the window methods stay under clippy's argument cap and
@@ -128,12 +133,12 @@ struct MergeSpill<'a> {
 
 /// A sealed [`MatchWindow`] segment: resident entries, or a spilled
 /// postcard+LZ4 run re-decoded on replay. The spill carries each entry's
-/// `(key, build_idx)` as the payload so both survive off-process without a
+/// `(key, build tag)` as the payload so both survive off-process without a
 /// synthetic sort column — the key need not be re-derivable from a record field
 /// (an expression range axis has none).
 enum WindowSegment {
     Resident(Vec<WindowEntry>),
-    Spilled(SpillFile<(Value, u64)>),
+    Spilled(SpillFile<(Value, BuildTag)>),
 }
 
 /// Spillable, front-droppable, replayable buffer holding the *current matching
@@ -207,7 +212,7 @@ impl MatchWindow {
         std::mem::size_of::<Record>()
             + entry.0.estimated_heap_size()
             + std::mem::size_of::<Value>()
-            + std::mem::size_of::<u64>()
+            + std::mem::size_of::<BuildTag>()
     }
 
     fn unaccounted_entry_bytes(
@@ -217,7 +222,7 @@ impl MatchWindow {
         std::mem::size_of::<Record>()
             + entry.0.unaccounted_heap_size(resources)
             + std::mem::size_of::<Value>()
-            + std::mem::size_of::<u64>()
+            + std::mem::size_of::<BuildTag>()
     }
 
     /// Append one matching build row, charging its in-memory growth into the
@@ -285,12 +290,12 @@ impl MatchWindow {
             .schema
             .clone()
             .expect("a non-empty window recorded its schema on first push");
-        let mut writer: SpillWriter<(Value, u64)> =
+        let mut writer: SpillWriter<(Value, BuildTag)> =
             SpillWriter::new(schema, Some(ctx.spill_dir), ctx.spill_compress)
                 .map_err(|e| spill_io_error(ctx.name, "match-window spill open failed", e))?;
-        for (record, key, build_idx) in live {
+        for (record, key, tag) in live {
             writer
-                .write_pair(record, &(key.clone(), *build_idx))
+                .write_pair(record, &(key.clone(), *tag))
                 .map_err(|e| spill_io_error(ctx.name, "match-window spill write failed", e))?;
         }
         let (file, written) = writer
@@ -336,9 +341,9 @@ impl MatchWindow {
         let mut bytes: u64 = 0;
         let mut physical: u64 = 0;
         for item in reader {
-            let (record, (key, build_idx)) =
+            let (record, (key, tag)) =
                 item.map_err(|e| spill_io_error(ctx.name, "match-window replay decode failed", e))?;
-            let entry = (record, key, build_idx);
+            let entry = (record, key, tag);
             physical += Self::entry_bytes(&entry) as u64;
             bytes += Self::unaccounted_entry_bytes(&entry, ctx.allocation_resources) as u64;
             v.push(entry);
@@ -404,7 +409,7 @@ impl MatchWindow {
     }
 
     /// Replay the current run front-to-back (build-index ascending) as
-    /// `(record, key, build_idx)`. Resident segments clone; a spilled segment
+    /// `(record, key, build tag)`. Resident segments clone; a spilled segment
     /// opens its reader lazily as the walk reaches it, so at most one spill
     /// reader is live and the run is never re-materialized whole.
     fn replay<'a>(
@@ -420,7 +425,7 @@ impl MatchWindow {
                     WindowSegment::Resident(v) => Box::new(v[start..].iter().cloned().map(Ok)),
                     WindowSegment::Spilled(file) => match file.reader() {
                         Ok(reader) => Box::new(reader.map(move |item| {
-                            item.map(|(record, (key, build_idx))| (record, key, build_idx))
+                            item.map(|(record, (key, tag))| (record, key, tag))
                                 .map_err(|e| {
                                     spill_io_error(name, "match-window replay decode failed", e)
                                 })
@@ -606,7 +611,9 @@ pub(crate) struct SortMergeExec<'a> {
     pub name: &'a str,
     pub build_qualifier: &'a str,
     pub driver_records: Vec<(Record, RecordOrder)>,
-    pub build_records: Vec<Record>,
+    /// Each build record with the row id its Source minted, which a
+    /// build-side dead letter reports.
+    pub build_records: Vec<(Record, RecordOrder)>,
     pub decomposed: &'a DecomposedPredicate,
     pub body_program: Option<&'a Arc<TypedProgram>>,
     pub resolver_mapping: &'a CombineResolverMapping,
@@ -927,10 +934,10 @@ fn execute_combine_sort_merge_inner(
         }
     }
 
-    let build_keyed: Vec<(Record, u64, Option<Value>)> = build_records
+    let build_keyed: Vec<(Record, BuildTag, Option<Value>)> = build_records
         .into_par_iter()
         .enumerate()
-        .map(|(build_idx, record)| {
+        .map(|(build_idx, (record, row))| {
             let mut range_buf: Vec<Value> = Vec::new();
             let key = extract_range_key(
                 &build_extractor,
@@ -941,13 +948,13 @@ fn execute_combine_sort_merge_inner(
                 &mut range_buf,
             )
             .map_err(|e| key_eval_error(name, "build", e))?;
-            Ok::<_, PipelineError>((record, build_idx as u64, key))
+            Ok::<_, PipelineError>((record, (build_idx as u64, row), key))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut build_pairs: Vec<(Record, Value, u64)> = Vec::new();
-    for (record, build_idx, key) in build_keyed {
+    let mut build_pairs: Vec<(Record, Value, BuildTag)> = Vec::new();
+    for (record, tag, key) in build_keyed {
         if let Some(k) = key {
-            build_pairs.push((record, k, build_idx));
+            build_pairs.push((record, k, tag));
         }
     }
 
@@ -1062,7 +1069,7 @@ fn execute_combine_sort_merge_inner(
     let mut build_iter = build_cursor;
     // One-record lookahead: a build that does not yet match the current driver
     // (prefix ops) waits here for a later, larger-key driver rather than dropping.
-    let mut pending_build: Option<(Record, Value, u64)> = None;
+    let mut pending_build: Option<WindowEntry> = None;
     // Lowest `RecordOrder` among zero-match drivers, for `on_miss: error`. A
     // single value, so a sparse left join records misses in O(1) resident state
     // (never a resident vector of every unmatched driver).
@@ -1230,7 +1237,7 @@ fn execute_combine_sort_merge_inner(
 /// Inputs to [`sort_side_stream`], bundled so the signature stays under
 /// clippy's `too_many_arguments` cap. Generic over the spill-envelope payload
 /// `P` the side carries verbatim — `(RecordOrder, driver_idx)` for the driver
-/// side, `build_idx` for the build side.
+/// side, the [`BuildTag`] for the build side.
 struct SideStreamBuild<'a, P> {
     allocation_resources: &'a clinker_record::owned_storage::AllocationResources,
     /// `(record, key, payload)` tuples for the side.
@@ -1253,7 +1260,7 @@ struct SideStreamBuild<'a, P> {
 /// [`SideStream::InMemory`] vector: the record, its heap, and the inline key and
 /// payload words. Folds the driver- and build-side per-record estimators into
 /// one — they differed only by payload width, captured here by `size_of::<P>()`.
-/// For the build side (`P = u64`) this equals [`MatchWindow::entry_bytes`], the
+/// For the build side (`P = BuildTag`) this equals [`MatchWindow::entry_bytes`], the
 /// metric the window re-charges each pulled build with, keeping the
 /// cursor→window hand-off netting exact.
 fn side_entry_bytes<P>(record: &Record) -> u64 {
@@ -1869,7 +1876,7 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
             let mut first_build: Option<Record> = None;
             let mut truncated = false;
             for entry in window.replay(mspill) {
-                let (inner, _build_key, build_idx) = entry?;
+                let (inner, _build_key, (build_idx, build_row)) = entry?;
                 if let Some(residual) = decomposed.residual.as_ref() {
                     let resolver =
                         CombineResolver::new(resolver_mapping, driver_record, Some(&inner));
@@ -1891,7 +1898,7 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
                             failures.push(CombineOutputEvalFailure {
                                 probe_record: driver_record.clone(),
                                 row: driver_order,
-                                matched_build: Some(inner.clone()),
+                                matched_build: Some((inner.clone(), build_row)),
                                 error: e,
                                 failed_at: crate::executor::DlqFailureStamp::now(),
                             });
@@ -1949,7 +1956,7 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
             // post-match projection; All scans every window entry.
             let select_first = matches!(match_mode, MatchMode::First);
             for entry in window.replay(mspill) {
-                let (inner, _build_key, build_idx) = entry?;
+                let (inner, _build_key, (build_idx, build_row)) = entry?;
                 let out_key = (driver_order, driver_idx, build_idx);
 
                 if let Some(residual) = decomposed.residual.as_ref() {
@@ -1973,7 +1980,7 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
                             failures.push(CombineOutputEvalFailure {
                                 probe_record: driver_record.clone(),
                                 row: driver_order,
-                                matched_build: Some(inner.clone()),
+                                matched_build: Some((inner.clone(), build_row)),
                                 error: e,
                                 failed_at: crate::executor::DlqFailureStamp::now(),
                             });
@@ -2035,7 +2042,7 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
                             failures.push(CombineOutputEvalFailure {
                                 probe_record: driver_record.clone(),
                                 row: driver_order,
-                                matched_build: Some(inner.clone()),
+                                matched_build: Some((inner.clone(), build_row)),
                                 error: e,
                                 failed_at: crate::executor::DlqFailureStamp::now(),
                             });
@@ -2530,7 +2537,7 @@ mod tests {
             name: "sm_test",
             build_qualifier: rk.build_qual,
             driver_records,
-            build_records: rk.build_records,
+            build_records: crate::test_support::with_build_row_ids(rk.build_records),
             decomposed: &rk.decomposed,
             body_program: rk.body_program,
             resolver_mapping: &resolver_mapping,
@@ -3897,13 +3904,17 @@ mod tests {
     fn phase_a_build_spill_past_disk_cap_fails_with_spill_cap_exceeded() {
         let schema = schema_with(&["k", "pad"]);
         let pad = "x".repeat(1024);
-        let pairs: Vec<(Record, Value, u64)> = (0..64i64)
+        let pairs: Vec<(Record, Value, BuildTag)> = (0..64i64)
             .map(|i| {
                 let r = rec(
                     &schema,
                     vec![Value::Integer(i), Value::String(pad.as_str().into())],
                 );
-                (r, Value::Integer(i), i as u64)
+                (
+                    r,
+                    Value::Integer(i),
+                    (i as u64, RecordOrder::from(i as u64 + 1)),
+                )
             })
             .collect();
         let budget = MemoryArbitrator::with_policy(1024, 0.80, 0.70, Box::new(NoOpPolicy));
@@ -4537,7 +4548,7 @@ mod tests {
         values.try_push(Value::Integer(1), &scope).unwrap();
         values.try_push(Value::String(text), &scope).unwrap();
         let record = Record::from_owned_values(schema, values).unwrap();
-        let entry = (record, Value::Integer(1), 0);
+        let entry = (record, Value::Integer(1), (0, RecordOrder::from(1)));
         let physical = MatchWindow::entry_bytes(&entry) as u64;
         let relative = MatchWindow::unaccounted_entry_bytes(&entry, &resources) as u64;
         assert!(physical > relative);

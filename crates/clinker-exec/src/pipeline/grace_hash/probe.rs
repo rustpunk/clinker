@@ -137,7 +137,7 @@ pub(super) fn emit_for_probe<'a>(
                             sink.failures.push(CombineOutputEvalFailure {
                                 probe_record: probe_record.clone(),
                                 row: rn,
-                                matched_build: Some(cand.record.clone()),
+                                matched_build: Some((cand.record.clone(), rn)),
                                 error: e,
                                 failed_at: crate::executor::DlqFailureStamp::now(),
                             });
@@ -212,7 +212,7 @@ pub(super) fn emit_for_probe<'a>(
                                 sink.failures.push(CombineOutputEvalFailure {
                                     probe_record: probe_record.clone(),
                                     row: rn,
-                                    matched_build: Some(cand.record.clone()),
+                                    matched_build: Some((cand.record.clone(), rn)),
                                     error: e,
                                     failed_at: crate::executor::DlqFailureStamp::now(),
                                 });
@@ -325,7 +325,7 @@ pub(super) fn emit_for_probe<'a>(
                             sink.failures.push(CombineOutputEvalFailure {
                                 probe_record: probe_record.clone(),
                                 row: rn,
-                                matched_build: Some(m.clone()),
+                                matched_build: Some((m.clone(), rn)),
                                 error: e,
                                 failed_at: crate::executor::DlqFailureStamp::now(),
                             });
