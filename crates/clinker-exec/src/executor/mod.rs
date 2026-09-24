@@ -152,6 +152,9 @@ pub(crate) struct DispatchOutcome {
     /// Every DLQ entry produced across every dispatcher arm, in
     /// observation order. Empty when the run had no failures.
     pub(crate) dlq_entries: Vec<DlqEntry>,
+    /// Dead-letter counters by stage and category, and rows written per
+    /// bucket. Bounded by the plan.
+    pub(crate) dead_letters: crate::dlq::DlqReport,
     /// Peak process RSS observed across chunk boundaries. `None` on
     /// platforms where RSS measurement is unavailable.
     pub(crate) peak_rss_bytes: Option<u64>,
@@ -239,6 +242,9 @@ struct DagExecInputs<'a> {
     params: &'a PipelineRunParams,
     /// Resolved scheduler/preview policy for this run.
     run_policy: RunPolicy,
+    /// The compiled dead-letter layout: each bucket, its header, and the rule
+    /// routing a source's rows to one. `None` without a dead-letter block.
+    dlq_layout: Option<&'a clinker_plan::plan::dlq_layout::DlqLayout>,
 }
 
 struct RunExecutionContext<'a> {
@@ -1192,6 +1198,7 @@ impl PipelineExecutor {
                 statistics: validated_plan.statistics(),
                 params,
                 run_policy,
+                dlq_layout: validated_plan.dlq_layout(),
             },
             DagExecResources {
                 writer_resources,
@@ -1224,6 +1231,7 @@ impl PipelineExecutor {
         let DispatchOutcome {
             counters,
             dlq_entries,
+            dead_letters,
             peak_rss_bytes,
             mut watermarks,
             per_source_rollback_cursors,
@@ -1331,7 +1339,7 @@ impl PipelineExecutor {
         Ok(ExecutionReport {
             counters,
             dlq_entries,
-            dead_letters: crate::dlq::DlqReport::default(),
+            dead_letters,
             execution_summary,
             required_arena,
             peak_rss_bytes,
@@ -1440,6 +1448,7 @@ impl PipelineExecutor {
             statistics,
             params,
             run_policy,
+            dlq_layout,
         } = inputs;
         let DagExecResources {
             writer_resources,
@@ -1675,6 +1684,12 @@ impl PipelineExecutor {
         // same worker set rather than spinning up a pool per operator.
         let kernel_pool = build_kernel_pool(run_policy)?;
 
+        // The walk's dead-letter writer, opened before any thread is spawned
+        // so a refusal leaves nothing to join. Rows stream through it from the
+        // first dead letter; it is closed once the walk's last dead letter is
+        // pushed, and dropped unclosed on every error return.
+        let dlq = dispatch::DlqWalkState::open(dlq_layout, writers.dlq_sink.as_deref())?;
+
         // Streaming-Output setup (issue #72). For every fused
         // `Merge.interleave → single Output` chain that satisfies the
         // eligibility predicate, take the writer out of `writers.single`
@@ -1818,6 +1833,7 @@ impl PipelineExecutor {
             output_staging: writers.output_staging,
             counters: std::mem::take(counters),
             dlq_entries: std::mem::take(dlq_entries),
+            dlq,
             dlq_per_source: HashMap::new(),
             total_per_source,
             records_pending_publish: 0,
@@ -2143,6 +2159,13 @@ impl PipelineExecutor {
             _ => return Err(PipelineError::Multiple(output_errors)),
         }
 
+        // Every dead letter of the walk has been pushed: the streaming Sink
+        // threads were joined and folded above, and the document terminal
+        // sweep has run. Close the walk's writer so its rows are flushed into
+        // the staged files before the caller can publish them. A flush error
+        // fails the run.
+        ctx.dlq.close()?;
+
         // Clean-exit teardown of the spill directory. Dropping the guard here —
         // after every operator-side spill path has been drained and the metrics
         // flushed — releases the held `.lock` and then removes the directory, in
@@ -2176,6 +2199,7 @@ impl PipelineExecutor {
         Ok(DispatchOutcome {
             counters: std::mem::take(counters),
             dlq_entries: std::mem::take(dlq_entries),
+            dead_letters: ctx.dlq.report,
             peak_rss_bytes: rss_bytes(),
             watermarks: ctx.watermarks,
             per_source_rollback_cursors: rollback_cursors,
