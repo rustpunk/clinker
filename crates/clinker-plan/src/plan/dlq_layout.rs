@@ -23,7 +23,7 @@ use clinker_record::{FieldMetadata, Schema, SchemaBuilder};
 use petgraph::Direction;
 use petgraph::graph::{DiGraph, NodeIndex};
 
-use super::composition_body::CompositionBodies;
+use super::composition_body::{BoundBody, CompositionBodies};
 use super::deferred_region::DeferredRegion;
 use super::execution::{ExecutionPlanDag, PlanEdge, PlanNode, PlanSinkPayload};
 use crate::config::pipeline_node::{
@@ -139,10 +139,39 @@ impl DlqLayout {
         self.fallback == Some(id)
     }
 
-    /// Derive the layout from the final plan. `None` without a DLQ block.
+    /// Derive the layout from the final plan. `Ok(None)` without a DLQ block.
     ///
     /// Runs after every structural rewrite, body binding and deferred-region
     /// detection, so the schemas it reads are the ones the runtime carries.
+    /// The walk visits every scope in plan topological order, a composition
+    /// body at its call site's position, and each node whose runtime arm can
+    /// dead-letter under the pipeline's strategy adds the schemas of the
+    /// records it received.
+    ///
+    /// **Attribution.** A record reaches the bucket of the Source its
+    /// `$source.name` stamp names, so a schema with that stamp is added to
+    /// the bucket of every Source whose stamp can ride on it, and a schema
+    /// without it to the pipeline-wide file alone. Stamps are traced per input
+    /// edge: a Combine's probe row and matched build row are separate entries,
+    /// each attributed to its own input's Sources, and downstream of a
+    /// Combine a stamp can only be the driver's, because the output row is
+    /// built on the driving row. Every other node passes on the stamps of all
+    /// its inputs. A composition's output rows are the body's output-port
+    /// rows, whose engine columns keep their metadata.
+    ///
+    /// **Empty global fold.** A global fold (no `group_by`) whose finalize
+    /// fails under `continue` with no buffered record dead-letters an empty
+    /// row of the Aggregate's own output schema, attributed to the node name,
+    /// so that schema is added to the pipeline-wide file. This branch is
+    /// structurally reachable: a global fold owes one defaulted row even for
+    /// empty input, and the empty-input sentinel drain finalizes it with no
+    /// record to attribute. A runtime reproduction is left to the
+    /// end-to-end suite.
+    ///
+    /// Fails, naming the member and column, when a deferred region prunes
+    /// commit-pass rows to a buffer column the wide input does not carry: that
+    /// is a planner defect, and it would otherwise put a header column no
+    /// record can fill.
     pub(crate) fn derive(
         dag: &ExecutionPlanDag,
         bodies: &CompositionBodies,
@@ -166,14 +195,7 @@ impl DlqLayout {
                 facts: &facts,
                 union: &mut union,
             };
-            let top = Scope {
-                graph: &dag.graph,
-                topo: &dag.topo_order,
-                deferred: &dag.deferred_regions,
-                root_inputs: Vec::new(),
-                root_sources: BTreeSet::new(),
-            };
-            walker.walk(&top);
+            walker.walk(&Scope::top(dag, bodies))?;
         }
         for (bucket, columns) in layout.buckets.iter_mut().zip(union) {
             bucket.user_columns = columns.names;
@@ -366,14 +388,56 @@ struct Scope<'a> {
     graph: &'a DiGraph<PlanNode, PlanEdge>,
     topo: &'a [NodeIndex],
     deferred: &'a HashMap<NodeIndex, DeferredRegion>,
+    bodies: &'a CompositionBodies,
     /// Schemas arriving at a body-root node from its call site. Empty at the
     /// top level, where every root is a Source.
     root_inputs: Vec<SharedStorage<Schema>>,
-    /// Declared Sources upstream of the call site. Empty at the top level.
-    root_sources: BTreeSet<String>,
+    /// Sources whose stamp a record entering the body from its call site can
+    /// carry. Empty at the top level.
+    root_stamps: BTreeSet<String>,
+    /// Every declared Source upstream of the call site. Empty at the top
+    /// level.
+    root_ancestors: BTreeSet<String>,
 }
 
-impl Scope<'_> {
+/// Which upstream edges a Source walk follows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lineage {
+    /// Every upstream edge: the Sources a node depends on at all.
+    Ancestors,
+    /// Only the edges a record's `$source.name` stamp can travel: through a
+    /// Combine, the driving (probe) input alone, because a Combine's output
+    /// row is built on the driver's row and never on a build row.
+    Stamp,
+}
+
+impl<'a> Scope<'a> {
+    fn top(dag: &'a ExecutionPlanDag, bodies: &'a CompositionBodies) -> Self {
+        Scope {
+            graph: &dag.graph,
+            topo: &dag.topo_order,
+            deferred: &dag.deferred_regions,
+            bodies,
+            root_inputs: Vec::new(),
+            root_stamps: BTreeSet::new(),
+            root_ancestors: BTreeSet::new(),
+        }
+    }
+
+    /// The scope of the body a Composition node at `idx` calls, seeded with
+    /// what arrives at the call site.
+    fn body(&self, idx: NodeIndex, bound: &'a BoundBody) -> Scope<'a> {
+        Scope {
+            graph: &bound.graph,
+            topo: &bound.topo_order,
+            deferred: &bound.deferred_regions,
+            bodies: self.bodies,
+            root_inputs: self.input_schemas(idx),
+            root_stamps: self.sources(idx, Lineage::Stamp),
+            root_ancestors: self.sources(idx, Lineage::Ancestors),
+        }
+    }
+
     /// Upstream nodes of `idx`, deduplicated, in index order.
     fn upstreams(&self, idx: NodeIndex) -> Vec<NodeIndex> {
         let mut ups: Vec<NodeIndex> = self
@@ -388,27 +452,51 @@ impl Scope<'_> {
     /// Every schema a record arriving at `idx` can carry: each upstream's
     /// emitted schema, or the call site's inputs for a body-root node.
     fn input_schemas(&self, idx: NodeIndex) -> Vec<SharedStorage<Schema>> {
-        let ups = self.upstreams(idx);
-        if ups.is_empty() {
-            return self.root_inputs.clone();
-        }
-        ups.into_iter()
-            .flat_map(|up| self.output_schemas(up))
+        self.inputs(idx)
+            .into_iter()
+            .flat_map(|(schemas, _)| schemas)
             .collect()
     }
 
-    /// The schema `idx` emits. Row-preserving nodes (Route, Sort, Sink,
+    /// The records arriving at `idx`, one entry per input edge: the schemas
+    /// that edge can carry and the Sources whose stamp those records can
+    /// bear. A body-root node's single entry is its call site's.
+    fn inputs(&self, idx: NodeIndex) -> Vec<(Vec<SharedStorage<Schema>>, BTreeSet<String>)> {
+        let ups = self.upstreams(idx);
+        if ups.is_empty() {
+            return vec![(self.root_inputs.clone(), self.root_stamps.clone())];
+        }
+        ups.into_iter()
+            .map(|up| (self.output_schemas(up), self.sources(up, Lineage::Stamp)))
+            .collect()
+    }
+
+    /// The schemas `idx` emits. Row-preserving nodes (Route, Sort, Sink,
     /// CorrelationCommit) carry none of their own and emit what they receive.
+    /// A Composition emits what its body's output-port nodes emit: those rows
+    /// keep the body's engine-column metadata, which the call-site node's own
+    /// port-row schema does not record.
     fn output_schemas(&self, idx: NodeIndex) -> Vec<SharedStorage<Schema>> {
+        if let PlanNode::Composition { body, .. } = &self.graph[idx]
+            && let Some(bound) = self.bodies.get(body)
+        {
+            let inner = self.body(idx, bound);
+            return bound
+                .output_port_to_node_idx
+                .values()
+                .flat_map(|&port| inner.output_schemas(port))
+                .collect();
+        }
         match self.graph[idx].stored_output_schema() {
             Some(schema) => vec![schema.clone()],
             None => self.input_schemas(idx),
         }
     }
 
-    /// Declared Sources that are `idx` itself or upstream of it, including a
-    /// body's call-site ancestors when the walk reaches a body-root node.
-    fn ancestor_sources(&self, idx: NodeIndex) -> BTreeSet<String> {
+    /// Declared Sources that are `idx` itself or upstream of it along
+    /// `lineage`, including a body's call-site Sources at a body-root node
+    /// and the Sources authored inside a called body.
+    fn sources(&self, idx: NodeIndex, lineage: Lineage) -> BTreeSet<String> {
         let mut sources = BTreeSet::new();
         let mut visited = HashSet::new();
         let mut stack = vec![idx];
@@ -416,15 +504,67 @@ impl Scope<'_> {
             if !visited.insert(node) {
                 continue;
             }
-            let ups = self.upstreams(node);
-            if let PlanNode::Source { name, .. } = &self.graph[node] {
-                sources.insert(name.clone());
-            } else if ups.is_empty() {
-                sources.extend(self.root_sources.iter().cloned());
+            let mut ups = self.upstreams(node);
+            match &self.graph[node] {
+                PlanNode::Source { name, .. } => {
+                    sources.insert(name.clone());
+                }
+                PlanNode::Combine {
+                    driving_upstream: Some(driver),
+                    ..
+                } if lineage == Lineage::Stamp && ups.contains(driver) => {
+                    ups = vec![*driver];
+                }
+                PlanNode::Composition { body, .. } => {
+                    if let Some(bound) = self.bodies.get(body) {
+                        body_source_names(self.bodies, bound, &mut sources);
+                    }
+                }
+                _ => {}
+            }
+            if ups.is_empty() && !matches!(self.graph[node], PlanNode::Source { .. }) {
+                sources.extend(
+                    match lineage {
+                        Lineage::Stamp => &self.root_stamps,
+                        Lineage::Ancestors => &self.root_ancestors,
+                    }
+                    .iter()
+                    .cloned(),
+                );
             }
             stack.extend(ups);
         }
         sources
+    }
+
+    /// Whether records arriving at `idx` from `up` are commit-pass rows of
+    /// `region`, pruned to its buffer columns. The runtime prunes the
+    /// producer's emitted rows, and a row-preserving member passes them on
+    /// unchanged; any other member builds its output on its own schema.
+    fn carries_narrow_rows(&self, region: &DeferredRegion, up: NodeIndex) -> bool {
+        if up == region.producer {
+            return true;
+        }
+        region.members.contains(&up)
+            && self.graph[up].stored_output_schema().is_none()
+            && self
+                .upstreams(up)
+                .into_iter()
+                .any(|before| self.carries_narrow_rows(region, before))
+    }
+}
+
+/// Every Source authored in `bound` or in a body it calls.
+fn body_source_names(bodies: &CompositionBodies, bound: &BoundBody, out: &mut BTreeSet<String>) {
+    for node in bound.graph.node_weights() {
+        if let PlanNode::Source { name, .. } = node {
+            out.insert(name.clone());
+        }
+    }
+    for nested in &bound.nested_body_ids {
+        if let Some(inner) = bodies.get(nested) {
+            body_source_names(bodies, inner, out);
+        }
     }
 }
 
@@ -439,7 +579,7 @@ struct SiteWalker<'a> {
 }
 
 impl SiteWalker<'_> {
-    fn walk(&mut self, scope: &Scope<'_>) {
+    fn walk(&mut self, scope: &Scope<'_>) -> Result<(), String> {
         let continuing = self.strategy == ErrorStrategy::Continue;
         for &idx in scope.topo {
             // A global fold whose failing window buffered no record
@@ -466,7 +606,10 @@ impl SiteWalker<'_> {
                     false
                 }
                 // Evaluation failures dead-letter only under `continue`; the
-                // arms return the error under `fail_fast`.
+                // arms return the error under `fail_fast`. A Combine failure
+                // dead-letters the probe row and the matched build row as two
+                // entries, each carrying its own input's schema and stamp,
+                // which the per-input attribution below keeps apart.
                 PlanNode::Transform { .. } | PlanNode::Route { .. } | PlanNode::Combine { .. } => {
                     continuing
                 }
@@ -490,20 +633,13 @@ impl SiteWalker<'_> {
                         && sink_can_dead_letter_collision(resolved.as_deref()))
                         || self.facts.correlation
                         || scope
-                            .ancestor_sources(idx)
+                            .sources(idx, Lineage::Ancestors)
                             .iter()
                             .any(|s| self.facts.document_sources.contains(s))
                 }
                 PlanNode::Composition { body, .. } => {
                     if let Some(bound) = self.bodies.get(body) {
-                        let inner = Scope {
-                            graph: &bound.graph,
-                            topo: &bound.topo_order,
-                            deferred: &bound.deferred_regions,
-                            root_inputs: scope.input_schemas(idx),
-                            root_sources: scope.ancestor_sources(idx),
-                        };
-                        self.walk(&inner);
+                        self.walk(&scope.body(idx, bound))?;
                     }
                     false
                 }
@@ -514,20 +650,30 @@ impl SiteWalker<'_> {
                 | PlanNode::CorrelationCommit { .. } => false,
             };
             if input_site {
-                let sources = scope.ancestor_sources(idx);
-                let inputs = scope.input_schemas(idx);
-                for schema in &inputs {
-                    self.contribute(schema, &sources);
-                }
-                // A deferred-region member re-runs in the commit pass on rows
-                // pruned to the region's buffer columns, which carry their own
-                // narrow schema.
-                if let Some(region) = scope.deferred.get(&idx)
-                    && region.producer != idx
-                {
-                    for schema in &inputs {
-                        let narrow = project_to_buffer_schema(schema, &region.buffer_schema);
-                        self.contribute(&narrow, &sources);
+                let region = scope
+                    .deferred
+                    .get(&idx)
+                    .filter(|region| region.producer != idx);
+                let ups = scope.upstreams(idx);
+                for (position, (schemas, sources)) in scope.inputs(idx).into_iter().enumerate() {
+                    for schema in &schemas {
+                        self.contribute(schema, &sources);
+                    }
+                    // A deferred-region member re-runs in the commit pass on
+                    // rows pruned to the region's buffer columns, which carry
+                    // their own narrow schema.
+                    if let Some(region) = region
+                        && let Some(&up) = ups.get(position)
+                        && scope.carries_narrow_rows(region, up)
+                    {
+                        for schema in &schemas {
+                            let narrow = project_to_buffer_schema(
+                                schema,
+                                &region.buffer_schema,
+                                scope.graph[idx].name(),
+                            )?;
+                            self.contribute(&narrow, &sources);
+                        }
                     }
                 }
             }
@@ -535,12 +681,13 @@ impl SiteWalker<'_> {
                 self.union[fallback.0].extend(output);
             }
         }
+        Ok(())
     }
 
     /// Feed `schema` into every bucket it can reach. A schema carrying the
-    /// per-record Source stamp reaches the bucket of each ancestor Source; one
-    /// without it is attributed to no Source and reaches the pipeline-wide
-    /// file only.
+    /// per-record Source stamp reaches the bucket of each Source in `sources`;
+    /// one without it is attributed to no Source and reaches the
+    /// pipeline-wide file only.
     fn contribute(&mut self, schema: &Schema, sources: &BTreeSet<String>) {
         let stamped = (0..schema.column_count())
             .any(|i| matches!(schema.field_metadata(i), Some(FieldMetadata::SourceName)));
@@ -579,18 +726,31 @@ fn reader_shape(output_schema: &Schema) -> SharedStorage<Schema> {
 
 /// The narrow schema a commit-pass row carries: the region's buffer columns,
 /// each keeping the metadata the wide schema gives it.
-fn project_to_buffer_schema(wide: &Schema, buffer_schema: &[String]) -> SharedStorage<Schema> {
+///
+/// The buffer is a projection of the producer's emitted row, so every buffer
+/// column is a column of `wide`. A column `wide` lacks would put a header
+/// column no record can fill; it is a planner defect, refused here rather
+/// than written.
+fn project_to_buffer_schema(
+    wide: &Schema,
+    buffer_schema: &[String],
+    member: &str,
+) -> Result<SharedStorage<Schema>, String> {
     let mut builder = SchemaBuilder::with_capacity(buffer_schema.len());
     for column in buffer_schema {
-        let metadata = wide
-            .index(column)
-            .and_then(|i| wide.field_metadata(i).cloned());
-        builder = match metadata {
-            Some(meta) => builder.with_field_meta(column.as_str(), meta),
+        let Some(index) = wide.index(column) else {
+            return Err(format!(
+                "deferred-region member {member:?} receives commit-pass rows pruned to \
+                 buffer column {column:?}, which its input schema {:?} does not carry",
+                wide.columns()
+            ));
+        };
+        builder = match wide.field_metadata(index) {
+            Some(meta) => builder.with_field_meta(column.as_str(), meta.clone()),
             None => builder.with_field(column.as_str()),
         };
     }
-    builder.build()
+    Ok(builder.build())
 }
 
 /// Whether a Sink's writer can reject a record with a `join_values`
