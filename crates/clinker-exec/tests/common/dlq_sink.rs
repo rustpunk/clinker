@@ -14,9 +14,10 @@
 //! only under `tests/` and is never compiled into a runtime path. Include it
 //! with `#[path = "common/dlq_sink.rs"] mod dlq_sink;`.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use clinker_exec::dlq::{DiscardingDlqSink, DlqArtifact, DlqBucketTarget, DlqRowWriter, DlqSink};
@@ -149,7 +150,35 @@ struct CollectingWriter {
 
 impl DlqRowWriter for CollectingWriter {
     fn write_row(&mut self, target: &DlqBucketTarget<'_>, row: &[u8]) -> Result<(), PipelineError> {
-        let _ = (target, row);
+        let mut state = self.state.lock().expect("dead-letter sink state");
+        if state.finished {
+            return Err(internal("a row arrived after finish".into()));
+        }
+        let bucket = match state.buckets.entry(target.id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(Bucket {
+                path: Arc::from(target.path),
+                raw_header: target.header.to_vec(),
+                header: parse_record(target.header)?.into(),
+                rows: Vec::new(),
+            }),
+        };
+        if *bucket.path != *target.path || bucket.raw_header != target.header {
+            return Err(internal(format!(
+                "bucket {:?} was handed a different destination or header than its first row",
+                target.id
+            )));
+        }
+        let cells = parse_record(row)?;
+        if cells.len() != bucket.header.len() {
+            return Err(internal(format!(
+                "a row of {} has {} fields under a {}-column header",
+                target.path.display(),
+                cells.len(),
+                bucket.header.len()
+            )));
+        }
+        bucket.rows.push(cells);
         Ok(())
     }
 
