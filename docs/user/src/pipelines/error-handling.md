@@ -28,7 +28,7 @@ There are exactly two, because the engine makes exactly one decision at each rec
 
 The safest strategy. Any record-level error (type coercion failure, validation error, missing required field) halts the pipeline immediately, with a non-zero exit and no DLQ file. Use this when data quality is critical and you prefer to fix issues before reprocessing.
 
-Some failures abort the run under **either** strategy, because they are not record-scoped: an unwritable output path, a config or CXL compile error, and the DLQ-rate ceiling ([`dlq.max_rate`](#dlq-configuration), E315/E316) all end the run regardless of the strategy.
+Some failures abort the run under **either** strategy, because they are not record-scoped: an unwritable output path, a config or CXL compile error, and the DLQ-rate ceiling ([`dlq.max_rate`](#bounding-how-much-can-dead-letter), E315/E316) all end the run regardless of the strategy.
 
 CSV, JSON and XML resource failures are also fatal under either strategy. Memory or disk
 admission refusal, allocation failure, descriptor exhaustion and temporary-storage
@@ -88,9 +88,142 @@ The DLQ is always written as CSV, regardless of the pipeline's input/output form
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `path` | No | -- | File path for DLQ output. If omitted, DLQ records are logged but not written to file. The `dlq:` block itself is required to continue past a declared source-type failure. |
+| `path` | No | -- | The pipeline-wide DLQ file. It receives the dead letters of every Source without its own [`per_source`](#per-source-dlq-settings) path. A dead letter with neither this `path` nor a `per_source` path for its Source is counted in the run's dead-letter totals, sets exit code 2 and counts toward `max_rate`, but is written nowhere. The `dlq:` block itself is required to continue past a declared source-type failure. |
 | `include_reason` | No | `true` | Include `_cxl_dlq_error_category` and `_cxl_dlq_error_detail` columns. |
 | `include_source_row` | No | `true` | Include the failing record's columns after the `_cxl_dlq_*` columns. Which record columns each DLQ file carries is fixed when the pipeline compiles; see [How the DLQ columns are chosen](#how-the-dlq-columns-are-chosen). With `false`, only the `_cxl_dlq_*` columns are written. |
+| `max_rate` | No | none | Stop the run (E315, exit code 3) once the dead-lettered rows reach this fraction of the source rows read so far, both counted across the whole run. Must be greater than `0.0` and at most `1.0` (E318). Without it, the run is never stopped for its dead-letter rate. See [Bounding how much can dead-letter](#bounding-how-much-can-dead-letter). |
+| `min_records` | No | `100` | How many source rows must have been read before `max_rate` is checked, so the first failures of a run cannot trip it on a tiny denominator. Also the default for each `per_source` `min_records`. |
+| `per_source` | No | -- | Settings for individual Sources, keyed by Source node name: a separate DLQ file, and a rate ceiling of their own. See [Per-source DLQ settings](#per-source-dlq-settings). |
+
+### Per-source DLQ settings
+
+`per_source` gives a Source its own DLQ file, its own rate ceiling, or both.
+Each key is the name of a Source node:
+
+```yaml
+error_handling:
+  strategy: continue
+  dlq:
+    path: ./output/errors.csv
+    max_rate: 0.05
+    per_source:
+      vendor_feed:
+        path: ./output/vendor_feed_errors.csv
+        max_rate: 0.20
+        min_records: 500
+      orders:
+        max_rate: 0.01
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `path` | -- | A separate DLQ file for this Source's dead letters. They are written only there and do not appear in the pipeline-wide file. Without it, the Source's dead letters go to the pipeline-wide `path`. |
+| `max_rate` | none | Stop the run (E316, exit code 3) once this Source's dead-lettered rows reach this fraction of the rows read from this Source so far. Must be greater than `0.0` and at most `1.0` (E318). |
+| `min_records` | the pipeline-wide `min_records`, else `100` | How many rows must have been read from this Source before its `max_rate` is checked. |
+
+A Source's own `max_rate` is checked first, so a breach names that Source.
+The pipeline-wide `max_rate`, when set, still applies to the run as a whole.
+In the example, `vendor_feed` may dead-letter up to 20% of its own rows, but
+the run still stops when all dead letters together reach 5% of all rows read.
+
+A key that does not name a declared Source is rejected at compile time
+(E317). Two DLQ paths that name one file are rejected too (E318), including
+paths that differ only in case on a case-insensitive filesystem, or in being
+written relatively and absolutely. A DLQ path that names the same file as a
+Sink's path is rejected with E322.
+
+Which record columns each file carries follows from the Sources routed to it;
+see [How the DLQ columns are chosen](#how-the-dlq-columns-are-chosen).
+
+### How DLQ output is written
+
+Dead-letter rows are written while the run executes, not collected until it
+ends. Each row is formatted under its file's header, which is fixed when the
+pipeline compiles (see
+[How the DLQ columns are chosen](#how-the-dlq-columns-are-chosen)), and written into
+a staged copy of that file in the run's publication attempt: in quarantine
+next to the destination by default, or under `local_spool_dir` with
+`mode = "local_then_publish"` (see
+[Output publication](../ops/storage.md#output-publication-and-retained-attempts)).
+Each open DLQ file writes through one fixed 64 KiB buffer, so the memory the
+DLQ files use does not grow with the number of failures.
+
+- A DLQ file is created when its first row arrives. A file no row reaches is
+  not created, and no empty file is published.
+- DLQ files are published only if the run succeeds, by the same publication
+  step as the pipeline's other outputs. A failed or interrupted run publishes
+  no DLQ file.
+- The failures that are counted but have no destination (see `path` above)
+  are never formatted or written.
+- Three kinds of dead letter are held in memory until the stage that found
+  them finishes, and written then:
+  - a `join_values` collision at a Sink that writes on its own thread;
+  - an Aggregate `add_record` failure found while the Aggregate reads its
+    input on its own thread;
+  - a Combine output-row failure found while the Combine streams its driver
+    on its own thread, or inside a grace-hash, sort-merge or IEJoin join.
+
+  A Sink that writes on its own thread stops the run with an internal error
+  once 65,536 collisions are waiting this way.
+- Under a [correlation key](#correlation-key) or
+  [`dlq_granularity: document`](#document-level-dlq), records are held until
+  their group or document is decided. That is those features' own state,
+  described in their sections, not DLQ output; the rows they dead-letter are
+  then written like any other.
+
+Disk bounds how much DLQ output a run can produce: the free space at the
+staging location, and the publication attempt's byte ceiling
+(`storage.publication.max_attempt_bytes`, and no more than
+`retained_byte_limit`), which every staged file of the run counts toward,
+DLQ files included. An attempt larger than that ceiling is refused at
+publication and nothing is published.
+
+When the staging location fills, the run fails with an I/O error (exit code
+4) and publishes nothing. After the destination's own error text, the message
+names the DLQ file, the number of rows dead-lettered so far, and the stage
+and category with the most rows, and suggests a breaker:
+
+```text
+<destination error>: dead-letter output ./output/errors.csv could not be written after 1048576 dead-lettered rows (most from stage transform:validate_orders, category validation_failure)
+
+help: stop the run before dead letters fill the destination, for example:
+
+  error_handling:
+    type_error_threshold: 0.05
+    dlq:
+      max_rate: 0.05
+
+These breakers bound how many rows can dead-letter; disk at the staging destination bounds their volume.
+```
+
+### Bounding how much can dead-letter
+
+Disk bounds the volume of dead-letter output; the breakers bound how many rows
+can dead-letter in the first place. Set one wherever a wrong schema could make
+most rows fail, for example when a feed can change its columns or types
+without notice:
+
+```yaml
+error_handling:
+  strategy: continue
+  type_error_threshold: 0.05
+  dlq:
+    path: ./output/errors.csv
+    max_rate: 0.05
+```
+
+- `dlq.max_rate` (E315) and `dlq.per_source.<name>.max_rate` (E316) stop the
+  run when the fraction of dead-lettered rows crosses the ceiling, once
+  `min_records` rows have been read. Every dead-lettered row counts,
+  collateral rows included, whether or not it has a DLQ file to go to.
+- [`type_error_threshold`](#type-error-threshold) (E368) stops the run when
+  the fraction of declared source-type failures crosses the threshold. It
+  catches a schema mismatch at the Source, before the failing rows reach
+  later stages.
+
+A rate ceiling is checked each time a dead letter is counted, so the row that
+crosses it is itself counted and written before the run stops. A stopped run
+exits with code 3 and publishes nothing. No breaker is set by default.
 
 ## DLQ columns
 
@@ -98,8 +231,8 @@ Every DLQ record includes these metadata columns:
 
 | Column | Description |
 |--------|-------------|
-| `_cxl_dlq_id` | UUID v7 (time-ordered unique identifier) |
-| `_cxl_dlq_timestamp` | RFC 3339 timestamp of when the error occurred |
+| `_cxl_dlq_id` | UUID v7 (time-ordered unique identifier), unique to the row. It is taken together with `_cxl_dlq_timestamp`, so ids order the same way as timestamps. |
+| `_cxl_dlq_timestamp` | RFC 3339 timestamp of when the failure was observed, not of when the row was written. A collateral row (`correlated`, `document_rejected`) and every row of a `group_size_exceeded` group carry the time their correlation group or document was condemned. |
 | `_cxl_dlq_source_file` | Input filename carried by that failing record's `$source.file` provenance (or `<merged>` when no source-file provenance exists) |
 | `_cxl_dlq_source_name` | Name of the Source the failing record came from (or `<merged>` when the record carries no Source identity) |
 | `_cxl_dlq_source_row` | 1-based row number in the source file |
@@ -109,6 +242,12 @@ Every DLQ record includes these metadata columns:
 | `_cxl_dlq_route` | Route branch name (if the error occurred after routing) |
 | `_cxl_dlq_trigger` | Validation rule name that triggered the rejection |
 | `_cxl_dlq_source_record` | One of the record columns rather than a metadata column: present in any file a Source rejection can reach under `strategy: continue`, and filled only for a record-grained E345 rejection. Contains the fixed-width line text or a JSON array of decoded CSV cells, preserving the physical row without assigning it a declared record shape. |
+
+Timestamps need not increase down a file. A failure can be held before its
+row is written, for example in a correlation group that commits later, or by
+a stage listed under [How DLQ output is written](#how-dlq-output-is-written),
+so its row can follow rows observed after it. Sort on `_cxl_dlq_timestamp` or
+`_cxl_dlq_id` to read failures in the order they were observed.
 
 When `include_reason: true` is set, two additional columns appear:
 

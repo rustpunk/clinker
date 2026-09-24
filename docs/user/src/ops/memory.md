@@ -186,6 +186,35 @@ You don't manage memory by hand — the engine does it within the budget you set
 
 Some stages **stream** (they hold only a small in-flight slice of records) and some **materialize** (they hold a whole stage's worth before emitting). `clinker run --explain` annotates each node with `buffer: streaming` or `buffer: materialized` so you can see which stages will dominate the budget before you run. See [Streaming vs. Blocking Stages](streaming-vs-blocking.md) for which is which.
 
+## Dead-letter output
+
+Dead-lettered rows are not collected in memory until the run ends. Each row
+is formatted under its DLQ file's header, which is fixed when the pipeline
+compiles, and written straight into a staged copy of that file. Each open DLQ
+file costs one fixed 64 KiB write buffer, and the number of DLQ files is fixed
+by the pipeline. Apart from the held failures described below, a run whose
+every row fails therefore uses about as much memory for dead letters as a run
+where none do. That is why the DLQ writers are not charged to the memory
+budget: they do not grow with input.
+
+What does grow with failures is the DLQ files themselves, and they are
+bounded by disk: free space at the staging location, and the publication
+attempt's byte ceiling (`storage.publication.max_attempt_bytes`). To stop a
+run before it produces a large DLQ, set a breaker: `dlq.max_rate` and
+`dlq.per_source.<name>.max_rate` (E315/E316), or `type_error_threshold`
+(E368). See
+[How DLQ output is written](../pipelines/error-handling.md#how-dlq-output-is-written),
+[Bounding how much can dead-letter](../pipelines/error-handling.md#bounding-how-much-can-dead-letter)
+and [How the DLQ columns are chosen](../pipelines/error-handling.md#how-the-dlq-columns-are-chosen).
+
+Some failures are held in memory, uncharged, until the stage that found them
+finishes, and are written then: `join_values` collisions at a Sink that writes
+on its own thread, Aggregate `add_record` failures found on the Aggregate's
+input thread, and Combine output-row failures found on the Combine's driver
+thread or inside a grace-hash, sort-merge or IEJoin join. Records a correlation key
+or `dlq_granularity: document` holds until their group or document is decided
+are that feature's own state, not DLQ output.
+
 ## Sizing guidelines
 
 | Workload | Recommended limit | Notes |
