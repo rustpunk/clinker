@@ -145,6 +145,11 @@ are inlined before the body binds. A body Sink therefore rounds
 `decimal` columns to their declared [`scale`](../nodes/sink.md#rounding-decimals-to-a-declared-scale)
 at the write boundary exactly as a top-level Sink does.
 
+A body `sink` cannot be combined with a Source that declares
+`dlq_granularity: document`: document-level dead-lettering needs every Sink at
+pipeline level, and the pipeline fails compilation with `E378`. Run
+`clinker explain --code E378` for how to move the Sink out of the body.
+
 ### Executable example corpus
 
 The five fragments under `examples/pipelines/compositions/` are executable

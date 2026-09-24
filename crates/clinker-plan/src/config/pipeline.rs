@@ -2349,16 +2349,30 @@ impl PipelineConfig {
         // and the Source activation seal below see the final order. The
         // executor activates its document state from the same predicate, so
         // the plan and the run read one fact.
-        if self.any_source_has_document_dlq()
-            && let Err(unreached) = crate::plan::execution::order_sinks_after_operators(&mut dag)
-        {
-            let cycle_path = crate::plan::execution::extract_cycle_path(&dag.graph, unreached);
-            diags.push(Diagnostic::error(
-                "E003",
-                format!("cycle detected while ordering Sinks after operators: {cycle_path}"),
-                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+        //
+        // E378 — a Sink inside a composition body runs inside its
+        // composition's dispatch, which this ordering cannot delay, so the
+        // combination is refused. The fatal-error check after E152 returns
+        // it. The diagnostic names the first document-granularity Source in
+        // declaration order, as E344 does.
+        if self.any_source_has_document_dlq() {
+            let source = self
+                .source_configs()
+                .find(|s| s.dlq_granularity == DlqGranularity::Document)
+                .map(|s| s.name.as_str())
+                .unwrap_or_default();
+            diags.extend(crate::plan::execution::diagnose_document_dlq_body_sinks(
+                &dag, &artifacts, source,
             ));
-            return Err(diags);
+            if let Err(unreached) = crate::plan::execution::order_sinks_after_operators(&mut dag) {
+                let cycle_path = crate::plan::execution::extract_cycle_path(&dag.graph, unreached);
+                diags.push(Diagnostic::error(
+                    "E003",
+                    format!("cycle detected while ordering Sinks after operators: {cycle_path}"),
+                    LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                ));
+                return Err(diags);
+            }
         }
 
         // E152 — every PlanNode::Composition's incoming edges must carry

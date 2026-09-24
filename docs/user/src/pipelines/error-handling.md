@@ -495,13 +495,15 @@ nodes:
       dlq_granularity: document   # record (default) | document
 ```
 
-Under `dlq_granularity: document` and the `continue` strategy, when any record of a document fails:
+Under `dlq_granularity: document` and the `continue` strategy, a document is rejected when one of its records fails at the Source (against its declared type, or a structural rule), in a Transform, or in a Route. Then:
 
 - the failing record becomes the **root-cause** DLQ entry (`_cxl_dlq_trigger = true`, carrying its original error category);
-- every other record of the same document becomes a **collateral** entry (`_cxl_dlq_trigger = false`, category `document_rejected`);
-- **no** record of that document reaches the success sink.
+- every other record of the document that reaches a Sink becomes a **collateral** entry (`_cxl_dlq_trigger = false`, category `document_rejected`); a record dropped before any Sink is not written;
+- **no** record of that document is written by any Sink, however many Sinks read it.
 
 Clean documents in the same run stream through untouched, and records from sibling sources still on the default `record` granularity keep per-record semantics — the policy is per source.
+
+**Sinks run last.** Every Sink runs after every other node, so a document's verdict is final before any Sink writes one of its records. `--explain` lists the Sinks last. Dead-letter rows that other nodes write directly come before the rows a Sink writes.
 
 This is the document-shaped analogue of [correlation keys](#correlation-key): use it when partial processing of a document (an EDI interchange, a batch file with a header/trailer) is worse than rejecting the whole document. Unlike correlation keys, which group across files by a key value, document-level DLQ scopes rejection to a single document's records.
 
@@ -523,6 +525,18 @@ populations, so a pipeline containing both `dlq_granularity: document` and any
 `correlation_key` is rejected at compile time (E370). Remove every
 `correlation_key` to keep document rejection, or set `dlq_granularity: record`
 to keep correlation rejection.
+
+**Composition restriction.** A composition body may not declare a Sink when any
+Source uses `dlq_granularity: document` (E378): a body Sink runs inside its
+composition, where it cannot be held back until every document's verdict is
+final. Move the Sink to the pipeline and feed it through a composition output
+port, or use `dlq_granularity: record`. Run `clinker explain --code E378` for
+the step-by-step fix.
+
+**Not covered.** A row failure inside an Aggregate, Combine or Reshape
+dead-letters only that row and does not reject its document. A document is
+identified by its file path, so two Sources reading the same file share one
+verdict.
 
 **Spilling stages.** Document identity survives memory pressure end to end. The per-document buffer identifies each document before buffering and spills under the memory budget, and a blocking stage (Sort, hash Aggregate, grace-hash Combine) between the source and the output preserves each record's document context — including the source file the grain keys on — across its own spill round-trip. A document whose records pass through a spilling stage is therefore still grouped and rejected as one document under memory pressure, exactly as it would be in memory.
 

@@ -461,6 +461,149 @@ pub(crate) fn diagnose_untagged_composition_edges(
     out
 }
 
+/// E378: refuse a Sink inside any composition body while a Source declares
+/// `dlq_granularity: document`.
+///
+/// Document granularity guarantees that no Sink writes a record of a
+/// document that is rejected. The plan and the scheduler hold that
+/// guarantee by running every Sink after every other node, so each
+/// document's verdict is final before any Sink writes. A body Sink runs
+/// inside its composition's dispatch, in the middle of the top-level walk,
+/// where that ordering cannot reach it; it could write a document that a
+/// later operator condemns. The combination is refused rather than
+/// guaranteed for some Sinks only. How body Sinks are wired is tracked in
+/// issue #1242.
+///
+/// The caller runs this only when a Source declares document granularity;
+/// `source` names the first such Source in declaration order. The walk
+/// covers nested bodies because `artifacts.composition_bodies` is flat:
+/// every bound body, at any depth, is one entry, and its owning
+/// composition node sits in the top-level graph or in another body's
+/// graph. Returns one diagnostic per body Sink.
+pub(crate) fn diagnose_document_dlq_body_sinks(
+    dag: &ExecutionPlanDag,
+    artifacts: &crate::plan::bind_schema::CompileArtifacts,
+    source: &str,
+) -> Vec<clinker_core_types::Diagnostic> {
+    use clinker_core_types::{Diagnostic, LabeledSpan};
+    use petgraph::Direction;
+
+    /// The composition node that owns a body: its call-site name and span,
+    /// and whether it is called from the pipeline itself.
+    struct CallSite<'a> {
+        name: &'a str,
+        span: clinker_core_types::Span,
+        top_level: bool,
+    }
+
+    fn collect_call_sites<'a>(
+        graph: &'a DiGraph<PlanNode, PlanEdge>,
+        top_level: bool,
+        out: &mut HashMap<crate::plan::composition_body::CompositionBodyId, CallSite<'a>>,
+    ) {
+        for node in graph.node_weights() {
+            if let PlanNode::Composition {
+                name, span, body, ..
+            } = node
+            {
+                out.insert(
+                    *body,
+                    CallSite {
+                        name,
+                        span: *span,
+                        top_level,
+                    },
+                );
+            }
+        }
+    }
+
+    let mut call_sites = HashMap::new();
+    collect_call_sites(&dag.graph, true, &mut call_sites);
+    for body in artifacts.composition_bodies.values() {
+        collect_call_sites(&body.graph, false, &mut call_sites);
+    }
+
+    let mut out = Vec::new();
+    for (body_id, body) in &artifacts.composition_bodies {
+        let Some(call_site) = call_sites.get(body_id) else {
+            continue;
+        };
+        for idx in body.graph.node_indices() {
+            let PlanNode::Sink {
+                name: sink,
+                span: sink_span,
+                ..
+            } = &body.graph[idx]
+            else {
+                continue;
+            };
+            // The reference the Sink reads, as authored (`route.branch` for a
+            // Route branch); the graph predecessor stands in when the body
+            // recorded none.
+            let feeding = body
+                .node_input_refs
+                .get(sink)
+                .and_then(|refs| refs.first().cloned())
+                .or_else(|| {
+                    body.graph
+                        .neighbors_directed(idx, Direction::Incoming)
+                        .next()
+                        .map(|pred| body.graph[pred].name().to_owned())
+                })
+                .unwrap_or_else(|| "<the node the Sink reads>".to_owned());
+            let call = call_site.name;
+            let message = format!(
+                "composition '{call}' declares Sink '{sink}' in its body, but source \
+                 '{source}' declares `dlq_granularity: document`, which needs every Sink \
+                 declared at pipeline level"
+            );
+            let mut help = format!(
+                "move the Sink to the pipeline: in the composition file, under \
+                 `_compose.outputs:`, add `{sink}: {feeding}` and remove Sink '{sink}' from \
+                 its `nodes:`; then under the pipeline's `nodes:` add\n  - type: sink\n    \
+                 name: {sink}\n    input: {call}.{sink}\n    config: <the body Sink's \
+                 `config:`, unchanged>"
+            );
+            if let [(only_port, _)] = body
+                .output_port_to_node_idx
+                .iter()
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                help.push_str(&format!(
+                    "\nthe composition then has two output ports, so a node that reads it \
+                     as `input: {call}` must read `input: {call}.{only_port}`"
+                ));
+            }
+            if !call_site.top_level {
+                help.push_str(&format!(
+                    "\n'{call}' is itself called inside a composition body, so also surface \
+                     the new port through each enclosing composition's `_compose.outputs:` \
+                     up to the pipeline"
+                ));
+            }
+            help.push_str(&format!(
+                "\nor set `dlq_granularity: record` on source '{source}'\nSinks inside \
+                 composition bodies are tracked in issue #1242"
+            ));
+            out.push(
+                Diagnostic::error(
+                    "E378",
+                    message,
+                    LabeledSpan::primary(*sink_span, "Sink declared inside a composition body"),
+                )
+                .with_secondary(LabeledSpan::primary(
+                    call_site.span,
+                    "composition invoked here",
+                ))
+                .with_help(help),
+            );
+        }
+    }
+    out
+}
+
 /// Extract the cycle path from a DFS back-edge detection.
 ///
 /// Uses `depth_first_search` with `DfsEvent::BackEdge` + predecessor map

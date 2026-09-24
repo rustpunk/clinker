@@ -414,6 +414,7 @@ diagnostic_registry! {
     "E375", Error, "One `log` event name is declared with two different field sets in the same plan";
     "E376", Error, "Terminal node uses the retired `type: output` spelling";
     "E377", Error, "Ordinary composition call uses rejected inert `alias` or `outputs` state";
+    "E378", Error, "A composition body declares a Sink while a source declares `dlq_granularity: document`, which needs every Sink at pipeline level";
     // ── Path security ───────────────────────────────────────────────────
     "E-SEC-001", Error, "Path security violation (escape, symlink, etc.)";
     // ── Warnings ────────────────────────────────────────────────────────
