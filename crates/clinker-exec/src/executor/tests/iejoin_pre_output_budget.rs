@@ -203,14 +203,15 @@ fn run_pipeline_yaml(
     bands: String,
     arb: &Arc<crate::pipeline::memory::MemoryArbitrator>,
 ) -> (Result<(), PipelineError>, String) {
-    let (result, output) = run_pipeline_capture(yaml, orders, bands, "iejoin-block-band", arb);
+    let (result, output, _) = run_pipeline_capture(yaml, orders, bands, "iejoin-block-band", arb);
     (result.map(|_report| ()), output.as_string())
 }
 
 /// Shared execution harness for the two-source (`orders` / `bands`) pipelines:
-/// eagerly decode the CSV fixtures, wire the captured output writer, run under `arb` with the
-/// given `execution_id`, and return the full execution result alongside the
-/// captured output CSV. Both the `(Result<()>, String)` entry point above and
+/// eagerly decode the CSV fixtures, wire the captured output writer and a
+/// dead-letter capture sink, run under `arb` with the given `execution_id`, and
+/// return the full execution result alongside the captured output CSV and the
+/// dead-letter rows the run wrote. Both the `(Result<()>, String)` entry point above and
 /// the report-returning [`run_pipeline_report`] project from this one body, so
 /// their reader / writer / params setup never drifts apart.
 fn run_pipeline_capture(
@@ -222,6 +223,7 @@ fn run_pipeline_capture(
 ) -> (
     Result<crate::executor::ExecutionReport, PipelineError>,
     SharedBuffer,
+    Vec<crate::test_support::CapturedDlqRow>,
 ) {
     let config = clinker_plan::config::parse_config(yaml).expect("parse pipeline YAML");
     let readers = crate::test_support::predecoded_csv_readers(
@@ -241,15 +243,16 @@ fn run_pipeline_capture(
         ..Default::default()
     };
 
+    let sink = crate::test_support::CaptureDlqSink::new();
     let result = PipelineExecutor::run_with_readers_writers_with_arbitrator(
         &config,
         readers,
-        writers.into(),
+        sink.registry(writers),
         &params,
         clinker_plan::config::CompileContext::default(),
         Arc::clone(arb),
     );
-    (result, out)
+    (result, out, sink.rows())
 }
 
 #[test]
@@ -466,7 +469,7 @@ fn range_output_frontier_refusal_precedes_json_lines_writer_publication() {
     );
     assert_ne!(yaml, EXPLODE_YAML);
     let arb = no_op_arbitrator(TIGHT_LIMIT);
-    let (result, output) = run_pipeline_capture(
+    let (result, output, _) = run_pipeline_capture(
         &yaml,
         explode_orders_csv(60),
         explode_bands_csv(60),
@@ -1177,6 +1180,7 @@ pipeline:
   name: iejoin_block_band_dlq
 error_handling:
   strategy: continue
+  dlq: { path: dlq.csv }
 nodes:
 - type: source
   name: orders
@@ -1257,17 +1261,24 @@ fn dlq_bands_csv(b: usize, pad_len: usize) -> String {
 }
 
 /// Run `yaml` over the given CSV inputs against `arb`, returning the full
-/// execution report (so a test can inspect its dead-letter entries). Shares the
+/// execution report and the dead-letter rows the run wrote. Shares the
 /// reader / writer / params setup with [`run_pipeline_yaml`] through
 /// [`run_pipeline_capture`]; the captured output CSV is produced there too, but
-/// this entry point's callers only need the report.
+/// this entry point's callers only need the report and the rows.
 fn run_pipeline_report(
     yaml: &str,
     orders: String,
     bands: String,
     arb: &Arc<crate::pipeline::memory::MemoryArbitrator>,
-) -> Result<crate::executor::ExecutionReport, PipelineError> {
-    run_pipeline_capture(yaml, orders, bands, "iejoin-block-band-dlq", arb).0
+) -> Result<
+    (
+        crate::executor::ExecutionReport,
+        Vec<crate::test_support::CapturedDlqRow>,
+    ),
+    PipelineError,
+> {
+    let (result, _, rows) = run_pipeline_capture(yaml, orders, bands, "iejoin-block-band-dlq", arb);
+    result.map(|report| (report, rows))
 }
 
 #[test]
@@ -1301,35 +1312,34 @@ fn block_band_dlq_order_is_identical_across_memory_limits() {
     type DlqSequences = (Vec<(u64, bool)>, Vec<(u64, u64)>);
     let dlq_sequences = |limit: u64| -> DlqSequences {
         let arb = no_op_arbitrator(limit);
-        let report = run_pipeline_report(
+        let (_report, dlq_rows) = run_pipeline_report(
             DLQ_YAML,
             dlq_orders_csv(60, 1024),
             dlq_bands_csv(N_BANDS, 1024),
             &arb,
         )
         .expect("the continue-strategy run completes, routing failures to the DLQ");
-        let rows: Vec<_> = report
-            .dlq_entries
+        let rows: Vec<_> = dlq_rows
             .iter()
-            .filter(|e| e.category == clinker_core_types::dlq::DlqErrorCategory::CombineOutputRow)
+            .filter(|e| {
+                e.category()
+                    == Some(clinker_core_types::dlq::DlqErrorCategory::CombineOutputRow.as_str())
+            })
             .collect();
-        let full: Vec<(u64, bool)> = rows
-            .iter()
-            .map(|e| (e.source_row.ordinal(), e.trigger))
-            .collect();
+        let full: Vec<(u64, bool)> = rows.iter().map(|e| (e.source_row(), e.trigger())).collect();
         let builds: Vec<(u64, u64)> = rows
             .iter()
-            .filter(|e| !e.trigger)
+            .filter(|e| !e.trigger())
             .map(|e| {
-                let band = match e.original_record.get("band_id") {
-                    Some(clinker_record::Value::String(s)) => s.to_string(),
+                let band = match e.field("band_id") {
+                    Some(band) if !band.is_empty() => band.to_string(),
                     other => panic!("a build-side DLQ entry must carry band_id; got {other:?}"),
                 };
                 let idx = band
                     .strip_prefix('b')
                     .and_then(|d| d.parse::<u64>().ok())
                     .unwrap_or_else(|| panic!("band_id must be b<input-index>; got {band:?}"));
-                (e.source_row.ordinal(), idx)
+                (e.source_row(), idx)
             })
             .collect();
         (full, builds)

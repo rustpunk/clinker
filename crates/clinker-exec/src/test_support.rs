@@ -1,4 +1,7 @@
-//! Process isolation and predecoded fixtures for memory-boundary tests.
+//! Process isolation and predecoded fixtures for memory-boundary tests, and a
+//! dead-letter capture sink for executor tests.
+
+use clinker_plan::error::PipelineError;
 
 /// Measure the retained metadata for exactly one nonempty, unordered CSV file.
 /// Other fixture sources must be header-only: without an order barrier they do
@@ -355,4 +358,219 @@ pub(crate) fn run_isolated(test_path: &str, probe: impl FnOnce()) {
          matched no test (likely a stale test-path literal). \
          child stdout:\n{stdout}"
     );
+}
+
+/// A dead-letter sink for in-crate executor tests: it keeps the header each
+/// bucket was handed and every row the executor encoded, parsed back from
+/// CSV, so a test reads what the dead-letter file would contain.
+///
+/// The in-crate counterpart of the integration tests' collecting sink,
+/// which `#[cfg(test)]` code cannot reach. Rows are recorded as they are
+/// written; a row whose field count differs from its bucket's header, or a
+/// header that changes within a bucket, fails the run with
+/// [`PipelineError::Internal`]. Its residency grows only with the test's
+/// input.
+pub(crate) struct CaptureDlqSink {
+    state: std::sync::Arc<std::sync::Mutex<CaptureState>>,
+}
+
+#[derive(Default)]
+struct CaptureState {
+    buckets: std::collections::BTreeMap<clinker_plan::plan::DlqBucketId, CaptureBucket>,
+    open_writers: usize,
+    finished: bool,
+}
+
+struct CaptureBucket {
+    path: std::path::PathBuf,
+    raw_header: Vec<u8>,
+    header: std::sync::Arc<[String]>,
+    rows: Vec<Vec<String>>,
+}
+
+/// One captured dead-letter row, with its bucket's header.
+#[derive(Debug, Clone)]
+pub(crate) struct CapturedDlqRow {
+    header: std::sync::Arc<[String]>,
+    cells: Vec<String>,
+}
+
+impl CaptureDlqSink {
+    /// A new, empty sink.
+    pub(crate) fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            state: Default::default(),
+        })
+    }
+
+    /// Every row written so far, in bucket order, then in arrival order.
+    pub(crate) fn rows(&self) -> Vec<CapturedDlqRow> {
+        let state = self.state.lock().expect("dead-letter capture state");
+        state
+            .buckets
+            .values()
+            .flat_map(|bucket| {
+                bucket.rows.iter().map(|cells| CapturedDlqRow {
+                    header: std::sync::Arc::clone(&bucket.header),
+                    cells: cells.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// A writer registry over `writers` whose dead-letter rows go to this
+    /// sink.
+    pub(crate) fn registry(
+        self: &std::sync::Arc<Self>,
+        writers: std::collections::HashMap<String, Box<dyn std::io::Write + Send>>,
+    ) -> crate::executor::WriterRegistry {
+        crate::executor::WriterRegistry {
+            dlq_sink: Some(std::sync::Arc::clone(self) as std::sync::Arc<dyn crate::dlq::DlqSink>),
+            ..crate::executor::WriterRegistry::from(writers)
+        }
+    }
+}
+
+impl crate::dlq::DlqSink for CaptureDlqSink {
+    fn open_walk_writer(&self) -> Result<Box<dyn crate::dlq::DlqRowWriter>, PipelineError> {
+        self.state
+            .lock()
+            .expect("dead-letter capture state")
+            .open_writers += 1;
+        Ok(Box::new(CaptureWriter {
+            state: std::sync::Arc::clone(&self.state),
+        }))
+    }
+
+    fn finish(&self) -> Result<Vec<crate::dlq::DlqArtifact>, PipelineError> {
+        let mut state = self.state.lock().expect("dead-letter capture state");
+        if state.open_writers != 0 || state.finished {
+            return Err(capture_error(format!(
+                "finish called with {} writer(s) open, finished = {}",
+                state.open_writers, state.finished
+            )));
+        }
+        state.finished = true;
+        Ok(state
+            .buckets
+            .iter()
+            .map(|(id, bucket)| crate::dlq::DlqArtifact {
+                bucket: *id,
+                final_path: bucket.path.clone(),
+                rows: bucket.rows.len() as u64,
+            })
+            .collect())
+    }
+}
+
+struct CaptureWriter {
+    state: std::sync::Arc<std::sync::Mutex<CaptureState>>,
+}
+
+impl crate::dlq::DlqRowWriter for CaptureWriter {
+    fn write_row(
+        &mut self,
+        target: &crate::dlq::DlqBucketTarget<'_>,
+        row: &[u8],
+    ) -> Result<(), PipelineError> {
+        use std::collections::btree_map::Entry;
+        let mut state = self.state.lock().expect("dead-letter capture state");
+        if state.finished {
+            return Err(capture_error("a row arrived after finish".into()));
+        }
+        let bucket = match state.buckets.entry(target.id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(CaptureBucket {
+                path: target.path.to_path_buf(),
+                raw_header: target.header.to_vec(),
+                header: parse_capture_record(target.header)?.into(),
+                rows: Vec::new(),
+            }),
+        };
+        if bucket.path != target.path || bucket.raw_header != target.header {
+            return Err(capture_error(format!(
+                "bucket {:?} was handed a different destination or header than its first row",
+                target.id
+            )));
+        }
+        let cells = parse_capture_record(row)?;
+        if cells.len() != bucket.header.len() {
+            return Err(capture_error(format!(
+                "a row of {} has {} fields under a {}-column header",
+                target.path.display(),
+                cells.len(),
+                bucket.header.len()
+            )));
+        }
+        bucket.rows.push(cells);
+        Ok(())
+    }
+
+    fn close(self: Box<Self>) -> Result<(), PipelineError> {
+        self.state
+            .lock()
+            .expect("dead-letter capture state")
+            .open_writers -= 1;
+        Ok(())
+    }
+}
+
+/// Parse `bytes` as exactly one CSV record.
+fn parse_capture_record(bytes: &[u8]) -> Result<Vec<String>, PipelineError> {
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .from_reader(bytes);
+    let mut records = reader.records();
+    let record = records
+        .next()
+        .ok_or_else(|| capture_error("an encoded dead-letter line holds no record".into()))?
+        .map_err(|error| {
+            capture_error(format!("an encoded dead-letter line is not CSV: {error}"))
+        })?;
+    if records.next().is_some() {
+        return Err(capture_error(
+            "an encoded dead-letter line holds more than one record".into(),
+        ));
+    }
+    Ok(record.iter().map(str::to_owned).collect())
+}
+
+fn capture_error(detail: String) -> PipelineError {
+    PipelineError::Internal {
+        op: "dead-letter",
+        node: "capture test sink".to_owned(),
+        detail,
+    }
+}
+
+impl CapturedDlqRow {
+    /// The cell under `column`, or `None` when the bucket's header has no
+    /// such column. A null value is the empty cell.
+    pub(crate) fn field(&self, column: &str) -> Option<&str> {
+        let index = self.header.iter().position(|name| name == column)?;
+        Some(&self.cells[index])
+    }
+
+    /// `_cxl_dlq_error_category`, or `None` under `include_reason: false`.
+    pub(crate) fn category(&self) -> Option<&str> {
+        self.field("_cxl_dlq_error_category")
+    }
+
+    /// `_cxl_dlq_trigger`: whether this row's record triggered the failure.
+    pub(crate) fn trigger(&self) -> bool {
+        match self.field("_cxl_dlq_trigger") {
+            Some("true") => true,
+            Some("false") => false,
+            other => panic!("_cxl_dlq_trigger must be true or false; got {other:?}"),
+        }
+    }
+
+    /// `_cxl_dlq_source_row`: the row ordinal within its source.
+    pub(crate) fn source_row(&self) -> u64 {
+        let cell = self
+            .field("_cxl_dlq_source_row")
+            .expect("every dead-letter header carries _cxl_dlq_source_row");
+        cell.parse()
+            .unwrap_or_else(|_| panic!("_cxl_dlq_source_row must be an ordinal; got {cell:?}"))
+    }
 }
