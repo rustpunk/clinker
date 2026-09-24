@@ -10,6 +10,8 @@
 //! `executor/tests/deferred_dispatch.rs`.
 
 mod common;
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
 #[path = "common/pipeline_resource_fixtures.rs"]
 mod resource_fixtures;
 
@@ -23,7 +25,7 @@ use clinker_plan::error::PipelineError;
 
 /// Run a parsed `config` resolving source/composition paths against an
 /// explicit compile anchor (a temp workspace root), returning the full
-/// [`ExecutionReport`]. The composition tests need a non-CWD anchor so the
+/// [`ExecutionReport`] and every dead-letter row written. The composition tests need a non-CWD anchor so the
 /// `use:`-relative `_compose:` loader resolves bodies without mutating CWD
 /// (unsafe under cargo's parallel runner). Forwards to the public
 /// in-context `&CompiledPlan` entry point.
@@ -33,11 +35,19 @@ fn run_in_context(
     writers: HashMap<String, Box<dyn Write + Send>>,
     params: &PipelineRunParams,
     ctx: CompileContext,
-) -> Result<ExecutionReport, PipelineError> {
+) -> Result<(ExecutionReport, Vec<dlq_sink::DlqRow>), PipelineError> {
     let plan = config
         .compile(&ctx)
         .expect("integration-test pipeline must compile");
-    PipelineExecutor::run_plan_with_readers_writers_in_context(&plan, readers, writers, params, ctx)
+    let sink = dlq_sink::CollectingDlqSink::new();
+    let report = PipelineExecutor::run_plan_with_readers_writers_in_context(
+        &plan,
+        readers,
+        dlq_sink::registry(writers, &sink),
+        params,
+        ctx,
+    )?;
+    Ok((report, sink.rows()))
 }
 
 const DEFERRED_PIPELINE: &str = r#"
@@ -785,7 +795,7 @@ o6,ENG,300
         shutdown_token: None,
         ..Default::default()
     };
-    let report = run_in_context(&config, readers, writers, &params, ctx)
+    let (report, _) = run_in_context(&config, readers, writers, &params, ctx)
         .expect("nested composition + parent continuation must run without error");
 
     assert_eq!(
@@ -909,6 +919,8 @@ pipeline:
   name: composition_harvest_cascading_retract
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: src
@@ -982,7 +994,7 @@ o6,ENG,300
         shutdown_token: None,
         ..Default::default()
     };
-    let report = run_in_context(&config, readers, writers, &params, ctx)
+    let (report, dlq_rows) = run_in_context(&config, readers, writers, &params, ctx)
         .expect("nested composition + cascading retract must run without error");
 
     // The parent Transform's /0 on HR routes the error into the
@@ -997,16 +1009,13 @@ o6,ENG,300
         "the parent Transform's /0 on HR's body emit must surface in the DLQ via the cross-scope retraction path; got {}",
         report.counters.dlq_count
     );
-    let hr_dlq = report.dlq_entries.iter().find(|e| {
-        e.original_record
-            .values()
-            .iter()
-            .any(|v| matches!(v, clinker_record::Value::String(s) if s.as_str() == "HR"))
-    });
+    assert_eq!(dlq_rows.len() as u64, report.counters.dlq_count);
+    let hr_dlq = dlq_rows
+        .iter()
+        .find(|row| row.field("department") == Some("HR"));
     assert!(
         hr_dlq.is_some(),
-        "DLQ must carry an entry whose original_record references HR; got: {:?}",
-        report.dlq_entries
+        "DLQ must carry a row whose record references HR; got: {dlq_rows:?}"
     );
 
     let written = buf.as_string();
@@ -1161,7 +1170,7 @@ o6,ENG,300
         shutdown_token: None,
         ..Default::default()
     };
-    let report = run_in_context(&config, readers, writers, &params, ctx)
+    let (report, _) = run_in_context(&config, readers, writers, &params, ctx)
         .expect("bare-Aggregate body + parent continuation must run without error");
 
     assert_eq!(

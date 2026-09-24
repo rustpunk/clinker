@@ -1,3 +1,6 @@
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
+
 use clinker_record::owned_storage::OwnedValues;
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
@@ -272,8 +275,14 @@ fn run_transform_dispatch(
         telemetry_producer: producer.clone(),
         ..Default::default()
     };
-    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
-        .expect("recoverable transform error completes the run");
+    let sink = dlq_sink::CollectingDlqSink::new();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        dlq_sink::registry(writers, &sink),
+        &params,
+    )
+    .expect("recoverable transform error completes the run");
 
     let etl = EtlSignature {
         output: output.contents(),
@@ -286,15 +295,17 @@ fn run_transform_dispatch(
             report.counters.distinct_count,
             format!("{:?}", report.counters.retraction),
         ),
-        dlq: report
-            .dlq_entries
+        dlq: sink
+            .rows()
             .iter()
-            .map(|entry| {
+            .map(|row| {
                 (
-                    entry.source_row.ordinal(),
-                    format!("{:?}", entry.category),
-                    entry.stage.clone(),
-                    entry.source_name.to_string(),
+                    row.source_row(),
+                    row.category()
+                        .expect("include_reason is on, so every row carries a category")
+                        .to_string(),
+                    row.stage().map(str::to_string),
+                    row.source_name().to_string(),
                 )
             })
             .collect(),

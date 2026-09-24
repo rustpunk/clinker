@@ -4,10 +4,10 @@
 //! format reader/writer based on `InputFormat`/`OutputFormat` config enums.
 //! Uses small in-memory payloads (5-10 records) for correctness, not benchmarks.
 
-use crate::common;
+use crate::dlq_sink;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_exec::executor::{DlqEntry, PipelineRunParams};
+use clinker_exec::executor::PipelineRunParams;
 use clinker_plan::error::PipelineError;
 use clinker_record::PipelineCounters;
 use std::collections::HashMap;
@@ -54,12 +54,12 @@ fn test_params() -> PipelineRunParams {
 }
 
 /// Run a pipeline with an arbitrary in-memory reader, YAML config, and CSV output.
-/// Returns (counters, dlq_entries, output_string).
+/// Returns (counters, dead-letter rows written, output_string).
 fn run_format_test(
     yaml: &str,
     input_name: &str,
     input_data: Cursor<Vec<u8>>,
-) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
+) -> Result<(PipelineCounters, Vec<dlq_sink::DlqRow>, String), PipelineError> {
     let config = clinker_plan::config::parse_config(yaml).unwrap();
     let output_buf = SharedBuffer::new();
 
@@ -73,10 +73,10 @@ fn run_format_test(
     )]);
 
     let params = test_params();
-    let report = common::run_config(&config, readers, writers, &params)?;
+    let (report, dlq_rows) = dlq_sink::run_config_with_dlq(&config, readers, writers, &params)?;
 
     let output = output_buf.as_string();
-    Ok((report.counters, report.dlq_entries, output))
+    Ok((report.counters, dlq_rows, output))
 }
 
 #[test]
@@ -122,11 +122,10 @@ nodes:
         serde_json::json!({"name": "Diana", "age": "28"}),
         serde_json::json!({"name": "Eve", "age": "22"}),
     ]);
-    let (counters, dlq, output) = run_format_test(yaml, "src", input_data).unwrap();
+    let (counters, _, output) = run_format_test(yaml, "src", input_data).unwrap();
     assert_eq!(counters.total_count, 5, "expected 5 records");
     assert_eq!(counters.ok_count, 5);
     assert_eq!(counters.dlq_count, 0);
-    assert!(dlq.is_empty());
     assert!(output.contains("Alice"), "output missing Alice: {output}");
     assert!(output.contains("Eve"), "output missing Eve: {output}");
 }
@@ -167,11 +166,10 @@ nodes:
             vec![("name", "Bob"), ("age", "25")],
         ],
     );
-    let (counters, dlq, output) = run_format_test(yaml, "src", input_data).unwrap();
+    let (counters, _, output) = run_format_test(yaml, "src", input_data).unwrap();
     assert_eq!(counters.total_count, 2, "expected 2 records");
     assert_eq!(counters.ok_count, 2);
     assert_eq!(counters.dlq_count, 0);
-    assert!(dlq.is_empty());
     assert!(output.contains("Alice"), "output missing Alice: {output}");
     assert!(output.contains("Bob"), "output missing Bob: {output}");
 }
@@ -409,7 +407,7 @@ nodes:
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
     let params = test_params();
-    let report = common::run_config(&config, readers, writers, &params)
+    let (report, _) = dlq_sink::run_config_with_dlq(&config, readers, writers, &params)
         .expect("a condemned first file must not abort the run");
     assert!(
         report.counters.dlq_count >= 1,
@@ -604,11 +602,10 @@ nodes:
 "#;
     let csv_input = "name,age\nAlice,30\nBob,25\nCharlie,35\n";
     let input_data = Cursor::new(csv_input.as_bytes().to_vec());
-    let (counters, dlq, output) = run_format_test(yaml, "src", input_data).unwrap();
+    let (counters, _, output) = run_format_test(yaml, "src", input_data).unwrap();
     assert_eq!(counters.total_count, 3, "expected 3 records");
     assert_eq!(counters.ok_count, 3);
     assert_eq!(counters.dlq_count, 0);
-    assert!(dlq.is_empty());
     assert!(output.contains("Alice"), "output missing Alice: {output}");
     assert!(
         output.contains("Charlie"),
@@ -645,11 +642,10 @@ nodes:
     include_unmapped: true
 "#;
     let input_data = fixed_width_input(&["Alice     00030", "Bob       00025"]);
-    let (counters, dlq, output) = run_format_test(yaml, "src", input_data).unwrap();
+    let (counters, _, output) = run_format_test(yaml, "src", input_data).unwrap();
     assert_eq!(counters.total_count, 2, "expected 2 records");
     assert_eq!(counters.ok_count, 2);
     assert_eq!(counters.dlq_count, 0);
-    assert!(dlq.is_empty());
     assert!(output.contains("Alice"), "output missing Alice: {output}");
     assert!(output.contains("Bob"), "output missing Bob: {output}");
 }
