@@ -16,6 +16,10 @@ use std::sync::{Arc, Mutex};
 use clinker_exec::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams};
 use clinker_plan::config::{CompileContext, PipelineConfig, parse_config};
 
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
+use dlq_sink::{CollectingDlqSink, DlqRow};
+
 #[derive(Clone, Default)]
 struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
 
@@ -47,7 +51,13 @@ fn test_params() -> PipelineRunParams {
     }
 }
 
-fn run_with_payload(yaml: &str, src_path: &str, payload: &[u8]) -> (ExecutionReport, String) {
+/// Run `yaml` over `payload`; the report, the sink output, and every
+/// dead-letter row written.
+fn run_with_payload(
+    yaml: &str,
+    src_path: &str,
+    payload: &[u8],
+) -> (ExecutionReport, String, Vec<DlqRow>) {
     let config = parse_config(yaml).expect("parse pipeline yaml");
     let plan = PipelineConfig::compile(&config, &CompileContext::default()).expect("compile");
     let src_name = config.source_configs().next().unwrap().name.clone();
@@ -63,10 +73,15 @@ fn run_with_payload(yaml: &str, src_path: &str, payload: &[u8]) -> (ExecutionRep
         config.sink_configs().next().unwrap().name.clone(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
-    let report =
-        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
-            .expect("pipeline run");
-    (report, buf.as_string())
+    let sink = CollectingDlqSink::new();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        dlq_sink::registry(writers, &sink),
+        &test_params(),
+    )
+    .expect("pipeline run");
+    (report, buf.as_string(), sink.rows())
 }
 
 /// Closure-bearing array builtins (`.filter`, `.map`) running against
@@ -112,7 +127,7 @@ nodes:
     let payload =
         br#"{"items":[{"sku":"a","price":10},{"sku":"b","price":20},{"sku":"c","price":5}]}
 "#;
-    let (_report, output) = run_with_payload(yaml, "rows.ndjson", payload);
+    let (_report, output, _) = run_with_payload(yaml, "rows.ndjson", payload);
     let line = output.lines().next().expect("at least one record");
     let parsed: serde_json::Value = serde_json::from_str(line).expect("ndjson output parses");
     let kept = parsed.get("kept").and_then(|v| v.as_array()).expect("kept");
@@ -173,7 +188,7 @@ nodes:
     let payload =
         br#"{"items":[{"sku":"a","price":10},{"sku":"b","price":20},{"sku":"c","price":5}]}
 "#;
-    let (_report, output) = run_with_payload(yaml, "rows.ndjson", payload);
+    let (_report, output, _) = run_with_payload(yaml, "rows.ndjson", payload);
     let lines: Vec<&str> = output.lines().filter(|l| !l.is_empty()).collect();
     assert_eq!(lines.len(), 3, "one record per array element: {output:?}");
     let records: Vec<serde_json::Value> = lines
@@ -239,7 +254,7 @@ nodes:
 "#;
     let payload = br#"{"groups":[[1,2],[3],[4,5,6]]}
 "#;
-    let (_report, output) = run_with_payload(yaml, "rows.ndjson", payload);
+    let (_report, output, _) = run_with_payload(yaml, "rows.ndjson", payload);
     let lines: Vec<&str> = output.lines().filter(|l| !l.is_empty()).collect();
     assert_eq!(
         lines.len(),
@@ -267,6 +282,8 @@ pipeline:
   name: nested_overflow
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: rows
@@ -302,15 +319,13 @@ nodes:
     // Three groups of two = six leaves; a cap of 5 trips on the sixth.
     let payload = br#"{"groups":[[1,2],[3,4],[5,6]]}
 "#;
-    let (report, _output) = run_with_payload(yaml, "rows.ndjson", payload);
-    let saw_expansion = report
-        .dlq_entries
+    let (_report, _output, rows) = run_with_payload(yaml, "rows.ndjson", payload);
+    let saw_expansion = rows
         .iter()
-        .any(|e| e.category.as_str() == "expansion_limit_exceeded");
+        .any(|e| e.category() == Some("expansion_limit_exceeded"));
     assert!(
         saw_expansion,
-        "cumulative nesting overflow must route to expansion_limit_exceeded: {:#?}",
-        report.dlq_entries
+        "cumulative nesting overflow must route to expansion_limit_exceeded: {rows:#?}"
     );
 }
 
@@ -325,6 +340,8 @@ pipeline:
   name: emit_each_overflow
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: rows
@@ -357,15 +374,13 @@ nodes:
 "#;
     let payload = br#"{"items":[1,2,3,4,5,6,7,8,9,10]}
 "#;
-    let (report, _output) = run_with_payload(yaml, "rows.ndjson", payload);
-    let saw_expansion = report
-        .dlq_entries
+    let (_report, _output, rows) = run_with_payload(yaml, "rows.ndjson", payload);
+    let saw_expansion = rows
         .iter()
-        .any(|e| e.category.as_str() == "expansion_limit_exceeded");
+        .any(|e| e.category() == Some("expansion_limit_exceeded"));
     assert!(
         saw_expansion,
-        "DLQ entries should carry expansion_limit_exceeded: {:#?}",
-        report.dlq_entries
+        "DLQ entries should carry expansion_limit_exceeded: {rows:#?}"
     );
 }
 
@@ -419,7 +434,7 @@ nodes:
 "#;
     let payload = br#"{"items":[{"sku":"a","price":10,"internal_id":"ix-1","meta":{"flag":true,"keep":1}},{"sku":"b","price":20,"internal_id":"ix-2","meta":{"flag":true,"keep":1}}]}
 "#;
-    let (_report, output) = run_with_payload(yaml, "rows.ndjson", payload);
+    let (_report, output, _) = run_with_payload(yaml, "rows.ndjson", payload);
     let line = output.lines().next().expect("at least one record");
     let parsed: serde_json::Value = serde_json::from_str(line).expect("ndjson parses");
     let key_sets = parsed
@@ -526,7 +541,7 @@ nodes:
     let payload =
         br#"{"items":[{"sku":"a","price":10},{"sku":"b","price":20},{"sku":"c","price":5}]}
 "#;
-    let (_report, output) = run_with_payload(yaml, "rows.ndjson", payload);
+    let (_report, output, _) = run_with_payload(yaml, "rows.ndjson", payload);
     let parsed: serde_json::Value =
         serde_json::from_str(output.lines().next().expect("a record")).expect("parses");
     let first = parsed

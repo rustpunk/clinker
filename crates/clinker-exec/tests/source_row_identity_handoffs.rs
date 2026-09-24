@@ -5,6 +5,11 @@
 //! fixtures terminate otherwise-successful operator paths in a failing
 //! Transform so the assertions can observe the exact [`SourceRowId`] that
 //! arrived at the end of each path without adding a test-only runtime hook.
+//! The identity is read from each written dead-letter row as its
+//! `(source_name, source_row)` pair.
+
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
 
 use clinker_record::owned_storage::SharedStorage;
 use std::collections::HashMap;
@@ -21,6 +26,7 @@ use clinker_plan::plan::CompiledPlan;
 use clinker_plan::plan::execution::PlanNode;
 use clinker_plan::plan::{EntityRef, PlanNodeId};
 use clinker_record::{Record, Schema, Value};
+use dlq_sink::{CollectingDlqSink, DlqRow};
 
 fn compile(yaml: &str) -> CompiledPlan {
     parse_config(yaml)
@@ -54,7 +60,12 @@ fn readers(inputs: &[(&str, &str)]) -> SourceReaders {
         .collect()
 }
 
-fn run(plan: &CompiledPlan, inputs: &[(&str, &str)], outputs: &[&str]) -> ExecutionReport {
+/// Run `plan` to completion; the report and every dead-letter row written.
+fn run(
+    plan: &CompiledPlan,
+    inputs: &[(&str, &str)],
+    outputs: &[&str],
+) -> (ExecutionReport, Vec<DlqRow>) {
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = outputs
         .iter()
         .map(|name| {
@@ -69,8 +80,29 @@ fn run(plan: &CompiledPlan, inputs: &[(&str, &str)], outputs: &[&str]) -> Execut
         batch_id: "source-row-handoffs".to_string(),
         ..Default::default()
     };
-    PipelineExecutor::run_plan_with_readers_writers(plan, readers(inputs), writers, &params)
-        .expect("identity handoff fixture must complete under continue strategy")
+    let sink = CollectingDlqSink::new();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        plan,
+        readers(inputs),
+        dlq_sink::registry(writers, &sink),
+        &params,
+    )
+    .expect("identity handoff fixture must complete under continue strategy");
+    (report, sink.rows())
+}
+
+/// A dead-letter row's source identity: `(source_name, source_row)`.
+type RowIdentity = (String, u64);
+
+/// The identity `row` was written with.
+fn row_identity(row: &DlqRow) -> RowIdentity {
+    (row.source_name().to_string(), row.source_row())
+}
+
+/// The `(source_name, source_row)` pair a row carrying the plan-level
+/// `identity` of Source `name` is written with.
+fn expected_identity(name: &str, identity: SourceRowId) -> RowIdentity {
+    (name.to_string(), identity.ordinal())
 }
 
 #[test]
@@ -81,6 +113,8 @@ pipeline:
   name: source_transform_identity
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: src_a
@@ -128,18 +162,20 @@ nodes:
     let expected_a = source_identity(&plan, "src_a", 1);
     let expected_b = source_identity(&plan, "src_b", 1);
 
-    let report = run(
+    let (_, rows) = run(
         &plan,
         &[("src_a", "id\n10\n"), ("src_b", "id\n20\n")],
         &["out"],
     );
-    let observed: Vec<SourceRowId> = report
-        .dlq_entries
-        .iter()
-        .map(|entry| entry.source_row)
-        .collect();
+    let observed: Vec<RowIdentity> = rows.iter().map(row_identity).collect();
 
-    assert_eq!(observed, vec![expected_a, expected_b]);
+    assert_eq!(
+        observed,
+        vec![
+            expected_identity("src_a", expected_a),
+            expected_identity("src_b", expected_b)
+        ]
+    );
     assert_ne!(expected_a, expected_b);
     assert_eq!(expected_a.ordinal(), expected_b.ordinal());
 }
@@ -152,6 +188,8 @@ pipeline:
   name: route_identity
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: src
@@ -198,14 +236,16 @@ nodes:
     );
     let expected = source_identity(&plan, "src", 1);
 
-    let report = run(&plan, &[("src", "id\n7\n")], &["left_out", "right_out"]);
-    let observed: Vec<SourceRowId> = report
-        .dlq_entries
-        .iter()
-        .map(|entry| entry.source_row)
-        .collect();
+    let (_, rows) = run(&plan, &[("src", "id\n7\n")], &["left_out", "right_out"]);
+    let observed: Vec<RowIdentity> = rows.iter().map(row_identity).collect();
 
-    assert_eq!(observed, vec![expected, expected]);
+    assert_eq!(
+        observed,
+        vec![
+            expected_identity("src", expected),
+            expected_identity("src", expected)
+        ]
+    );
 }
 
 #[test]
@@ -216,6 +256,8 @@ pipeline:
   name: cull_identity
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: src
@@ -264,22 +306,17 @@ nodes:
     let removed = source_identity(&plan, "src", 1);
     let kept = source_identity(&plan, "src", 2);
 
-    let report = run(
+    let (_, rows) = run(
         &plan,
         &[("src", "account,status\nA,error\nB,ok\n")],
         &["kept_out", "removed_out"],
     );
-    let mut observed: Vec<(String, SourceRowId)> = report
-        .dlq_entries
+    let mut observed: Vec<(String, RowIdentity)> = rows
         .iter()
-        .map(|entry| {
+        .map(|row| {
             (
-                entry
-                    .original_record
-                    .get("account")
-                    .expect("account field")
-                    .to_string(),
-                entry.source_row,
+                row.field("account").expect("account field").to_string(),
+                row_identity(row),
             )
         })
         .collect();
@@ -287,7 +324,10 @@ nodes:
 
     assert_eq!(
         observed,
-        vec![("A".to_string(), removed), ("B".to_string(), kept)]
+        vec![
+            ("A".to_string(), expected_identity("src", removed)),
+            ("B".to_string(), expected_identity("src", kept))
+        ]
     );
 }
 
@@ -321,6 +361,8 @@ pipeline:
   memory: {{ limit: "{memory_limit}", backpressure: spill }}
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: src
@@ -389,24 +431,19 @@ fn fanout_resident_and_node_buffer_spill_keep_identical_typed_membership() {
     let csv = fanout_spill_csv(ROWS);
     let resident_plan = fanout_spill_pipeline("1G");
     let spilled_plan = fanout_spill_pipeline("1M");
-    let resident = run(&resident_plan, &[("src", &csv)], &["out"]);
-    let spilled = run(&spilled_plan, &[("src", &csv)], &["out"]);
+    let (resident, resident_rows) = run(&resident_plan, &[("src", &csv)], &["out"]);
+    let (spilled, spilled_rows) = run(&spilled_plan, &[("src", &csv)], &["out"]);
 
-    let resident_membership: Vec<SourceRowId> = resident
-        .dlq_entries
-        .iter()
-        .map(|entry| entry.source_row)
-        .collect();
-    let spilled_membership: Vec<SourceRowId> = spilled
-        .dlq_entries
-        .iter()
-        .map(|entry| entry.source_row)
-        .collect();
+    let resident_membership: Vec<RowIdentity> = resident_rows.iter().map(row_identity).collect();
+    let spilled_membership: Vec<RowIdentity> = spilled_rows.iter().map(row_identity).collect();
 
     assert_eq!(resident_membership, spilled_membership);
     assert_eq!(resident_membership.len(), ROWS as usize);
-    assert_eq!(resident_membership[0].ordinal(), 1);
-    assert_eq!(resident_membership.last().unwrap().ordinal(), ROWS);
+    assert_eq!(resident_membership[0], ("src".to_string(), 1));
+    assert_eq!(
+        *resident_membership.last().unwrap(),
+        ("src".to_string(), ROWS)
+    );
     assert_eq!(resident.cumulative_spill_bytes, 0);
     assert!(
         spilled.cumulative_spill_bytes > 0,
@@ -512,6 +549,8 @@ pipeline:
   name: merge_identity
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: src_a
@@ -548,24 +587,20 @@ nodes:
     ))
 }
 
-fn ordering_merge_identities(mode_config: &str) -> (Vec<SourceRowId>, Vec<SourceRowId>) {
+fn ordering_merge_identities(mode_config: &str) -> (Vec<RowIdentity>, Vec<RowIdentity>) {
     let plan = ordering_merge_plan(mode_config);
     let expected = vec![
-        source_identity(&plan, "src_a", 1),
-        source_identity(&plan, "src_a", 2),
-        source_identity(&plan, "src_b", 1),
-        source_identity(&plan, "src_b", 2),
+        expected_identity("src_a", source_identity(&plan, "src_a", 1)),
+        expected_identity("src_a", source_identity(&plan, "src_a", 2)),
+        expected_identity("src_b", source_identity(&plan, "src_b", 1)),
+        expected_identity("src_b", source_identity(&plan, "src_b", 2)),
     ];
-    let report = run(
+    let (_, rows) = run(
         &plan,
         &[("src_a", "id\n1\n2\n"), ("src_b", "id\n10\n20\n")],
         &["out"],
     );
-    let observed = report
-        .dlq_entries
-        .iter()
-        .map(|entry| entry.source_row)
-        .collect();
+    let observed = rows.iter().map(row_identity).collect();
     (observed, expected)
 }
 
