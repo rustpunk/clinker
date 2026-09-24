@@ -552,6 +552,95 @@ impl Drop for SinkSignal {
     }
 }
 
+/// One dead-letter bucket file's fixed-cardinality lifecycle observation,
+/// from its first row until the file is handed back complete or abandoned.
+///
+/// Mirrors [`SinkSignal`]: construction records the start metric; each
+/// terminal records the row and byte counts, one terminal metric and one
+/// closed span; dropping an unfinished observation records a failure. The
+/// logical node is a fixed `dead_letter` label with the bucket index, never a
+/// path or a record value.
+pub(crate) struct DeadLetterSignal {
+    producer: TelemetryProducer,
+    logical_node: Box<str>,
+    started_at_unix_nanos: u64,
+    records: u64,
+    bytes: u64,
+    closed: bool,
+}
+
+impl DeadLetterSignal {
+    /// Begin the work unit of the dead-letter bucket at `bucket_index`, when
+    /// its file is staged.
+    pub(crate) fn new(producer: TelemetryProducer, bucket_index: usize) -> Self {
+        let started_at_unix_nanos = unix_nanos_now();
+        producer.record_metric(MetricKey::DeadLetterStarted, 1);
+        Self {
+            producer,
+            logical_node: format!("dead_letter[{bucket_index}]").into_boxed_str(),
+            started_at_unix_nanos,
+            records: 0,
+            bytes: 0,
+            closed: false,
+        }
+    }
+
+    /// Add rows written to the bucket file.
+    pub(crate) fn record_records(&mut self, records: u64) {
+        self.records = self.records.saturating_add(records);
+    }
+
+    /// Add bytes the bucket file's writer accepted.
+    pub(crate) fn record_bytes(&mut self, bytes: u64) {
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    /// Close a bucket file handed back complete.
+    pub(crate) fn complete(mut self) {
+        self.close(MetricKey::DeadLetterCompleted, SpanStatus::Ok);
+    }
+
+    /// Close a bucket file whose write failed or whose run failed.
+    pub(crate) fn fail(mut self) {
+        self.close(MetricKey::DeadLetterFailed, SpanStatus::Error);
+    }
+
+    /// Close a bucket file abandoned by an interrupted run.
+    pub(crate) fn interrupt(mut self) {
+        self.close(MetricKey::DeadLetterInterrupted, SpanStatus::Unset);
+    }
+
+    fn close(&mut self, terminal: MetricKey, status: SpanStatus) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        if self.records > 0 {
+            self.producer
+                .record_metric(MetricKey::DeadLetterRecords, self.records);
+        }
+        if self.bytes > 0 {
+            self.producer
+                .record_metric(MetricKey::DeadLetterBytes, self.bytes);
+        }
+        self.producer.record_metric(terminal, 1);
+        let ended_at_unix_nanos = unix_nanos_now().max(self.started_at_unix_nanos);
+        let _ = self.producer.emit_span(SpanFact {
+            name: SpanName::DeadLetter,
+            status,
+            logical_node: &self.logical_node,
+            started_at_unix_nanos: self.started_at_unix_nanos,
+            ended_at_unix_nanos,
+        });
+    }
+}
+
+impl Drop for DeadLetterSignal {
+    fn drop(&mut self) {
+        self.close(MetricKey::DeadLetterFailed, SpanStatus::Error);
+    }
+}
+
 impl Serialize for SpanFact<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -2044,10 +2133,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        AdmissionLane, AdmissionOutcome, DrainOutcome, DropReason, LogEvent, MAX_IDENTITY_BYTES,
-        MetricKey, RunCorrelation, Severity, SignalField, SinkSignal, SpanFact, SpanName,
-        SpanStatus, TRUNCATION_MARKER, TelemetryArena, TelemetryProducer, TelemetryReceiver,
-        bounded_utf8,
+        AdmissionLane, AdmissionOutcome, DeadLetterSignal, DrainOutcome, DropReason, LogEvent,
+        MAX_IDENTITY_BYTES, MetricKey, RunCorrelation, Severity, SignalField, SinkSignal, SpanFact,
+        SpanName, SpanStatus, TRUNCATION_MARKER, TelemetryArena, TelemetryProducer,
+        TelemetryReceiver, bounded_utf8,
     };
 
     #[test]
@@ -2129,6 +2218,61 @@ mod tests {
                 "{key:?} appears more than once"
             );
         }
+    }
+
+    #[test]
+    fn dead_letter_lifecycle_closes_each_terminal_outcome_with_one_span() {
+        let cases = [
+            (MetricKey::DeadLetterCompleted, SpanStatus::Ok),
+            (MetricKey::DeadLetterFailed, SpanStatus::Error),
+            (MetricKey::DeadLetterInterrupted, SpanStatus::Unset),
+        ];
+        for (terminal, expected_status) in cases {
+            let (producer, receiver) = arena("256B");
+            let mut signal = DeadLetterSignal::new(producer, 2);
+            signal.record_records(3);
+            signal.record_bytes(41);
+            match terminal {
+                MetricKey::DeadLetterCompleted => signal.complete(),
+                MetricKey::DeadLetterFailed => signal.fail(),
+                MetricKey::DeadLetterInterrupted => signal.interrupt(),
+                _ => unreachable!("test covers only dead-letter terminal outcomes"),
+            }
+
+            let batch = receiver
+                .try_recv_batch()
+                .expect("an isolated dead-letter lifecycle is admitted");
+            assert_eq!(batch.metric(MetricKey::DeadLetterStarted), 1);
+            assert_eq!(batch.metric(terminal), 1);
+            assert_eq!(
+                batch.metric(MetricKey::DeadLetterCompleted)
+                    + batch.metric(MetricKey::DeadLetterFailed)
+                    + batch.metric(MetricKey::DeadLetterInterrupted),
+                1
+            );
+            assert_eq!(batch.metric(MetricKey::DeadLetterRecords), 3);
+            assert_eq!(batch.metric(MetricKey::DeadLetterBytes), 41);
+            assert_eq!(batch.traces().len(), 1);
+            assert_eq!(batch.traces()[0].name, SpanName::DeadLetter);
+            assert_eq!(batch.traces()[0].status, expected_status);
+            assert_eq!(
+                batch.traces()[0].logical_node.as_str(),
+                "dead_letter[2]",
+                "a fixed label and the bucket index, never a path"
+            );
+        }
+    }
+
+    #[test]
+    fn dropped_dead_letter_unit_reports_failure() {
+        let (producer, receiver) = arena("256B");
+        drop(DeadLetterSignal::new(producer, 0));
+        let batch = receiver
+            .try_recv_batch()
+            .expect("an abandoned dead-letter unit is admitted");
+        assert_eq!(batch.metric(MetricKey::DeadLetterFailed), 1);
+        assert_eq!(batch.traces().len(), 1);
+        assert_eq!(batch.traces()[0].status, SpanStatus::Error);
     }
 
     #[test]

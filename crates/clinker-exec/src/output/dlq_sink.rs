@@ -17,6 +17,8 @@ use clinker_plan::plan::dlq_layout::DlqBucketId;
 use super::attempt::ArtifactKind;
 use super::staging::OutputStagingRegistry;
 use crate::dlq::{DlqArtifact, DlqBucketTarget, DlqRowWriter, DlqSink};
+use crate::pipeline::shutdown::ShutdownToken;
+use crate::telemetry::{DeadLetterSignal, TelemetryProducer};
 
 /// Capacity of each open bucket's write buffer. One buffer per open bucket
 /// per writer, and the bucket count is fixed by the compiled plan, so the
@@ -37,9 +39,24 @@ const DLQ_PRODUCER_LABEL: &str = "dead-letter output";
 /// ledger. The sink holds no rows: writers stream through fixed buffers, and
 /// the sink keeps only one file handle per closed bucket until
 /// [`DlqSink::finish`].
+///
+/// With a telemetry producer, each staged bucket file is one dead-letter work
+/// unit: started when the file is staged, completed by `finish`, failed on a
+/// write or flush error, and, when the file is abandoned without `finish`,
+/// interrupted if the run's shutdown token is requested and failed otherwise.
 pub struct StagedDlqSink {
     staging: OutputStagingRegistry,
     shared: Arc<Mutex<SinkState>>,
+    units: UnitConfig,
+}
+
+/// What every bucket file of this sink is opened with.
+#[derive(Clone, Default)]
+struct UnitConfig {
+    telemetry: Option<TelemetryProducer>,
+    shutdown: Option<ShutdownToken>,
+    #[cfg(feature = "test-utils")]
+    fault: Option<WriteFault>,
 }
 
 /// State shared between the sink and its writers. Touched when a writer
@@ -51,43 +68,151 @@ struct SinkState {
     finished: bool,
 }
 
-/// A bucket file a closed writer handed back, flushed.
+/// A bucket file a closed writer handed back, flushed. Dropped without
+/// `finish`, its work unit reports the file abandoned.
 struct ClosedBucket {
     id: DlqBucketId,
     final_path: PathBuf,
     file: File,
     rows: u64,
+    unit: BucketUnit,
+}
+
+/// One bucket file's telemetry work unit. Dropped before it is completed or
+/// failed, it reports the file abandoned: interrupted when the shutdown
+/// token is requested, failed otherwise.
+struct BucketUnit {
+    signal: Option<DeadLetterSignal>,
+    shutdown: Option<ShutdownToken>,
+}
+
+impl BucketUnit {
+    fn start(units: &UnitConfig, id: DlqBucketId) -> Self {
+        Self {
+            signal: units
+                .telemetry
+                .clone()
+                .map(|producer| DeadLetterSignal::new(producer, id.index())),
+            shutdown: units.shutdown.clone(),
+        }
+    }
+
+    fn record(&mut self, rows: u64, bytes: u64) {
+        if let Some(signal) = &mut self.signal {
+            signal.record_records(rows);
+            signal.record_bytes(bytes);
+        }
+    }
+
+    fn complete(mut self) {
+        if let Some(signal) = self.signal.take() {
+            signal.complete();
+        }
+    }
+
+    fn fail(mut self) {
+        if let Some(signal) = self.signal.take() {
+            signal.fail();
+        }
+    }
+}
+
+impl Drop for BucketUnit {
+    fn drop(&mut self) {
+        let Some(signal) = self.signal.take() else {
+            return;
+        };
+        if self
+            .shutdown
+            .as_ref()
+            .is_some_and(ShutdownToken::is_requested)
+        {
+            signal.interrupt();
+        } else {
+            signal.fail();
+        }
+    }
+}
+
+/// A write fault injected by [`StagedDlqSink::with_write_fault_for_testing`].
+#[cfg(feature = "test-utils")]
+#[derive(Clone, Copy)]
+struct WriteFault {
+    after_bytes: u64,
+    kind: std::io::ErrorKind,
+}
+
+/// A bucket's staged file behind its write buffer.
+struct BucketFile {
+    file: File,
+    #[cfg(feature = "test-utils")]
+    fault: Option<WriteFault>,
+    #[cfg(feature = "test-utils")]
+    accepted: u64,
+}
+
+impl Write for BucketFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        #[cfg(feature = "test-utils")]
+        if let Some(fault) = self.fault {
+            let room = fault.after_bytes.saturating_sub(self.accepted);
+            if room == 0 {
+                return Err(std::io::Error::new(
+                    fault.kind,
+                    "injected dead-letter write fault",
+                ));
+            }
+            let take = usize::try_from(room).map_or(buf.len(), |room| room.min(buf.len()));
+            let written = self.file.write(&buf[..take])?;
+            self.accepted += written as u64;
+            return Ok(written);
+        }
+        self.file.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
 }
 
 impl StagedDlqSink {
     /// A sink staging into `staging`, which must be attached to a run
     /// attempt ([`OutputStagingRegistry::for_run_attempt`]); without one, the
     /// first row fails with [`PipelineError::Internal`].
-    pub fn new(
-        staging: OutputStagingRegistry,
-        telemetry: Option<crate::telemetry::TelemetryProducer>,
-    ) -> Self {
-        let _ = telemetry;
+    ///
+    /// `telemetry`, when supplied, receives one dead-letter work unit per
+    /// staged bucket file.
+    pub fn new(staging: OutputStagingRegistry, telemetry: Option<TelemetryProducer>) -> Self {
         Self {
             staging,
             shared: Arc::new(Mutex::new(SinkState::default())),
+            units: UnitConfig {
+                telemetry,
+                ..UnitConfig::default()
+            },
         }
     }
 
-    /// Report a bucket abandoned while `token` is requested as interrupted.
+    /// Report a bucket file abandoned while `token` is requested as
+    /// interrupted rather than failed. Takes effect for files staged after
+    /// this call, so it is set before the sink is handed to a run.
     #[must_use]
-    pub fn with_shutdown_token(self, token: crate::pipeline::shutdown::ShutdownToken) -> Self {
-        let _ = token;
+    pub fn with_shutdown_token(mut self, token: ShutdownToken) -> Self {
+        self.units.shutdown = Some(token);
         self
     }
 
-    /// Fail every bucket file's writes with `kind` once it has accepted
-    /// `after_bytes` bytes.
+    /// Fail each bucket file's writes with `kind` once the file has accepted
+    /// `after_bytes` bytes, as a destination that fills up does.
     #[cfg(feature = "test-utils")]
     #[doc(hidden)]
     #[must_use]
-    pub fn with_write_fault_for_testing(self, after_bytes: u64, kind: std::io::ErrorKind) -> Self {
-        let _ = (after_bytes, kind);
+    pub fn with_write_fault_for_testing(
+        mut self,
+        after_bytes: u64,
+        kind: std::io::ErrorKind,
+    ) -> Self {
+        self.units.fault = Some(WriteFault { after_bytes, kind });
         self
     }
 
@@ -100,7 +225,9 @@ impl StagedDlqSink {
         StagedDlqRowWriter {
             staging: self.staging.clone(),
             shared: Arc::clone(&self.shared),
+            units: self.units.clone(),
             buckets: Vec::new(),
+            failed: None,
         }
     }
 }
@@ -135,6 +262,7 @@ impl DlqSink for StagedDlqSink {
             .into_iter()
             .map(|bucket| {
                 drop(bucket.file);
+                bucket.unit.complete();
                 DlqArtifact {
                     bucket: bucket.id,
                     final_path: bucket.final_path,
@@ -147,22 +275,31 @@ impl DlqSink for StagedDlqSink {
 
 /// The walk thread's writer of a [`StagedDlqSink`]: one open bucket per
 /// slot, indexed by bucket, each behind a [`DLQ_WRITE_BUFFER_BYTES`] buffer.
+/// After its first I/O failure it refuses every later row and its close
+/// with the same error kind.
 struct StagedDlqRowWriter {
     staging: OutputStagingRegistry,
     shared: Arc<Mutex<SinkState>>,
+    units: UnitConfig,
     buckets: Vec<Option<OpenBucket>>,
+    /// Set by the first write that fails. The failed file is incomplete, so
+    /// every later row and the close are refused with the same kind rather
+    /// than restaging the bucket or reporting it written.
+    failed: Option<std::io::ErrorKind>,
 }
 
 struct OpenBucket {
     id: DlqBucketId,
     final_path: PathBuf,
-    out: BufWriter<File>,
+    out: BufWriter<BucketFile>,
     rows: u64,
+    unit: BucketUnit,
 }
 
 /// Stage `target`'s file through `staging` and write its header.
 fn open_bucket(
     staging: &OutputStagingRegistry,
+    units: &UnitConfig,
     target: &DlqBucketTarget<'_>,
 ) -> Result<OpenBucket, PipelineError> {
     let bare = target.path.to_path_buf();
@@ -176,46 +313,96 @@ fn open_bucket(
             Ok(bare.clone())
         },
     )?;
+    let mut unit = BucketUnit::start(units, target.id);
+    let file = BucketFile {
+        file,
+        #[cfg(feature = "test-utils")]
+        fault: units.fault,
+        #[cfg(feature = "test-utils")]
+        accepted: 0,
+    };
     let mut out = BufWriter::with_capacity(DLQ_WRITE_BUFFER_BYTES, file);
-    out.write_all(target.header).map_err(PipelineError::Io)?;
+    if let Err(error) = out.write_all(target.header) {
+        unit.fail();
+        return Err(PipelineError::Io(error));
+    }
+    unit.record(0, target.header.len() as u64);
     Ok(OpenBucket {
         id: target.id,
         final_path,
         out,
         rows: 0,
+        unit,
     })
 }
 
 impl DlqRowWriter for StagedDlqRowWriter {
     fn write_row(&mut self, target: &DlqBucketTarget<'_>, row: &[u8]) -> Result<(), PipelineError> {
+        if let Some(kind) = self.failed {
+            return Err(earlier_write_failed(kind));
+        }
         let index = target.id.index();
         if self.buckets.len() <= index {
             self.buckets.resize_with(index + 1, || None);
         }
         let bucket = match &mut self.buckets[index] {
             Some(open) => open,
-            slot @ None => slot.insert(open_bucket(&self.staging, target)?),
+            slot @ None => match open_bucket(&self.staging, &self.units, target) {
+                Ok(open) => slot.insert(open),
+                Err(error) => {
+                    if let PipelineError::Io(io) = &error {
+                        self.failed = Some(io.kind());
+                    }
+                    return Err(error);
+                }
+            },
         };
-        bucket.out.write_all(row).map_err(PipelineError::Io)?;
+        if let Err(error) = bucket.out.write_all(row) {
+            // The file is incomplete from here on: close its unit as failed
+            // and drop it, so nothing can report it written.
+            if let Some(failed) = self.buckets[index].take() {
+                failed.unit.fail();
+            }
+            self.failed = Some(error.kind());
+            return Err(PipelineError::Io(error));
+        }
         bucket.rows += 1;
+        bucket.unit.record(1, row.len() as u64);
         Ok(())
     }
 
     fn close(self: Box<Self>) -> Result<(), PipelineError> {
         let Self {
-            shared, buckets, ..
+            shared,
+            buckets,
+            failed,
+            ..
         } = *self;
+        if let Some(kind) = failed {
+            return Err(earlier_write_failed(kind));
+        }
         let mut closed = Vec::with_capacity(buckets.iter().flatten().count());
         for bucket in buckets.into_iter().flatten() {
-            let file = bucket
-                .out
-                .into_inner()
-                .map_err(|error| PipelineError::Io(error.into_error()))?;
+            let OpenBucket {
+                id,
+                final_path,
+                out,
+                rows,
+                unit,
+            } = bucket;
+            let file = match out.into_inner() {
+                Ok(file) => file.file,
+                Err(error) => {
+                    unit.fail();
+                    return Err(PipelineError::Io(error.into_error()));
+                }
+            };
             closed.push(ClosedBucket {
-                id: bucket.id,
-                final_path: bucket.final_path,
+                id,
+                final_path,
                 file,
-                rows: bucket.rows,
+                rows,
+                unit,
             });
         }
         let mut state = lock(&shared);
@@ -223,6 +410,14 @@ impl DlqRowWriter for StagedDlqRowWriter {
         state.closed.extend(closed);
         Ok(())
     }
+}
+
+/// The error for a row or close after this writer's first failed write.
+fn earlier_write_failed(kind: std::io::ErrorKind) -> PipelineError {
+    PipelineError::Io(std::io::Error::new(
+        kind,
+        "an earlier write to this dead-letter output failed",
+    ))
 }
 
 fn lock(shared: &Mutex<SinkState>) -> MutexGuard<'_, SinkState> {
@@ -347,6 +542,49 @@ nodes:\n- type: source\n  name: src_a\n  config:\n    name: src_a\n    type: csv
         assert!(
             !path.exists(),
             "the sink stages; it never publishes the final path"
+        );
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn failed_write_refuses_later_rows_and_close() {
+        let root = tempfile::tempdir().expect("destination root");
+        let staging = attempt_staging(root.path());
+        let (id, other) = two_bucket_ids();
+        let path = root.path().join("dlq.csv");
+        let other_path = root.path().join("dlq_b.csv");
+        let sink = StagedDlqSink::new(staging, None)
+            .with_write_fault_for_testing(16, std::io::ErrorKind::StorageFull);
+
+        let mut writer = sink.open_walk_writer().expect("open writer");
+        // Larger than the write buffer, so it reaches the file and fails.
+        let row = vec![b'x'; DLQ_WRITE_BUFFER_BYTES + 1];
+        let first = writer
+            .write_row(&target(id, &path), &row)
+            .expect_err("the destination is full");
+        assert!(
+            matches!(&first, PipelineError::Io(io) if io.kind() == std::io::ErrorKind::StorageFull),
+            "{first:?}"
+        );
+        for later in [
+            writer.write_row(&target(id, &path), b"1,a\n"),
+            writer.write_row(&target(other, &other_path), b"1,a\n"),
+        ] {
+            assert!(
+                matches!(&later, Err(PipelineError::Io(io)) if io.kind() == std::io::ErrorKind::StorageFull),
+                "a later row is refused, never restaged: {later:?}"
+            );
+        }
+        let closed = writer
+            .close()
+            .expect_err("close refuses an incomplete file");
+        assert!(
+            matches!(&closed, PipelineError::Io(io) if io.kind() == std::io::ErrorKind::StorageFull),
+            "{closed:?}"
+        );
+        assert!(
+            sink.finish().is_err(),
+            "finish cannot report a bucket whose writer never closed"
         );
     }
 

@@ -2173,7 +2173,7 @@ impl PipelineExecutor {
         // sweep has run. Close the walk's writer so its rows are flushed into
         // the staged files before the caller can publish them. A flush error
         // fails the run.
-        ctx.dlq.close()?;
+        ctx.dlq.close(counters.dlq_count)?;
 
         // Clean-exit teardown of the spill directory. Dropping the guard here —
         // after every operator-side spill path has been drained and the metrics
