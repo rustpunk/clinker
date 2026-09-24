@@ -347,7 +347,13 @@ impl PauseSignal {
     /// Flip to resumed and wake every parked waiter. Producers
     /// re-check the flag inside the `wait` loop so a spurious wake
     /// stays a no-op.
+    ///
+    /// The flag is cleared while holding the mutex that
+    /// `wait_while_paused` checks it under. A waiter that has read
+    /// `paused` but not yet parked still holds that mutex, so this
+    /// resume cannot land in the gap and lose its notification.
     pub fn resume(&self) {
+        let _guard = self.mu.lock().unwrap();
         self.paused.store(false, Ordering::Release);
         self.cv.notify_all();
     }
