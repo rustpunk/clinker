@@ -44,9 +44,9 @@ use petgraph::visit::{EdgeRef, Topo};
 use super::DlqEvent;
 use super::detect::RetractScope;
 use crate::executor::dispatch::{
-    ExecutorContext, NodeBufferKey, admit_node_buffer, admit_node_buffer_transferred,
-    admit_node_buffer_with_readers, dispatch_plan_node, drain_node_buffer_slot,
-    estimate_node_buffer_unaccounted_bytes, node_buffer_spill_allowed,
+    DlqCaptureMark, ExecutorContext, NodeBufferKey, admit_node_buffer,
+    admit_node_buffer_transferred, admit_node_buffer_with_readers, dispatch_plan_node,
+    drain_node_buffer_slot, estimate_node_buffer_unaccounted_bytes, node_buffer_spill_allowed,
     planned_materialized_reader_counts, require_node_buffer_input,
     validate_completed_node_buffer_scope,
 };
@@ -75,9 +75,9 @@ use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 /// drift (`PipelineError::Compilation` from `check_input_schema`),
 /// memory-budget overruns from `tee_emit_to_region_input_buffers`,
 /// downstream Combine/Aggregate engine errors. `FailFast` strategy
-/// short-circuits the walk; `Continue` routes per-record failures to
-/// `ctx.dlq_entries` (which the dispatcher captures into the returned
-/// [`DlqEvent`] vec).
+/// short-circuits the walk; `Continue` routes per-record failures
+/// through `push_dlq` (whose source rows the dispatcher captures into the
+/// returned [`DlqEvent`] vec).
 pub(crate) fn dispatch_deferred_subdag(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
@@ -257,7 +257,7 @@ fn dispatch_one_region(
             continue;
         }
         seed_cross_region_inputs_for(ctx, current_dag, idx, region, active_body)?;
-        let dlq_len_before = ctx.dlq_entries.len();
+        let capture = ctx.dlq.arm_capture();
         // Count one partition emit per windowed-Transform member
         // dispatched on the commit pass. Each such Transform
         // re-evaluates a partition slice over the post-recompute
@@ -275,30 +275,27 @@ fn dispatch_one_region(
         if is_windowed_transform {
             ctx.counters.retraction.partitions_dispatched += 1;
         }
-        harvest_dlq_events(ctx, dlq_len_before, events);
+        drain_dlq_capture(ctx, capture, events);
     }
 
     Ok(())
 }
 
-/// Append a [`DlqEvent`] for every entry pushed onto `ctx.dlq_entries`
-/// since `dlq_len_before` was snapshotted (the length captured just
-/// before a `dispatch_plan_node` call). Aggregate-finalize and similar
-/// non-buffer-routed arms push directly to `dlq_entries`; this lifts the
-/// newly-appended tail into the orchestrator's event stream so its
-/// outer loop can widen the retract scope. Buffer-routed errors carry
-/// richer lineage through the buffered cell's synthetic-CK column and are
-/// recovered separately by `detect_retract_scope`.
-fn harvest_dlq_events(
-    ctx: &ExecutorContext<'_>,
-    dlq_len_before: usize,
+/// Append a [`DlqEvent`] for every dead letter pushed while `capture` was
+/// armed, which the caller does around one `dispatch_plan_node` call.
+/// Aggregate-finalize and similar non-buffer-routed arms push dead letters
+/// directly through `push_dlq`; this lifts their source rows into the
+/// orchestrator's event stream so its outer loop can widen the retract
+/// scope. Buffer-routed errors carry richer lineage through the buffered
+/// cell's synthetic-CK column and are recovered separately by
+/// `detect_retract_scope`.
+fn drain_dlq_capture(
+    ctx: &mut ExecutorContext<'_>,
+    capture: DlqCaptureMark,
     events: &mut Vec<DlqEvent>,
 ) {
-    for entry in &ctx.dlq_entries[dlq_len_before..] {
-        events.push(DlqEvent {
-            source_row: entry.source_row,
-        });
-    }
+    ctx.dlq
+        .take_capture(capture, |source_row| events.push(DlqEvent { source_row }));
 }
 
 /// For each in-edge of `consumer_idx` whose source is OUTSIDE the
@@ -711,9 +708,9 @@ fn dispatch_continuation(
         if idx == continuation.composition_idx {
             continue;
         }
-        let dlq_len_before = ctx.dlq_entries.len();
+        let capture = ctx.dlq.arm_capture();
         dispatch_plan_node(ctx, parent_dag, idx)?;
-        harvest_dlq_events(ctx, dlq_len_before, events);
+        drain_dlq_capture(ctx, capture, events);
     }
 
     Ok(())
