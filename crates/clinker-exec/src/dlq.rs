@@ -430,6 +430,73 @@ impl DlqSink for DiscardingDlqSink {
     }
 }
 
+/// Why a run stopped when its dead-letter output could not be written: the
+/// staging destination refused a row or a flush, typically because the disk
+/// filled.
+///
+/// Carried as the payload of a [`PipelineError::Io`] whose
+/// [`std::io::ErrorKind`] is the refused write's, so exit-code and retry
+/// classification see the original failure. The walk builds it from the
+/// run's counters when it wraps a sink write or close error; a sink never
+/// builds it, because it holds no counts. Nothing is published after it.
+#[derive(Debug)]
+pub struct DlqWriteFailure {
+    /// The dead-letter files the refused write could have been for: the one
+    /// bucket a row was written to, or every bucket written so far when the
+    /// final flush failed.
+    pub artifacts: Vec<PathBuf>,
+    /// Rows dead-lettered when the write failed, the refused row included.
+    pub dead_letters: u64,
+    /// The stage with the most dead-lettered rows; empty when those rows
+    /// carry no stage.
+    pub top_stage: String,
+    /// The category with the most dead-lettered rows at `top_stage`.
+    pub top_category: Option<DlqErrorCategory>,
+    /// The destination's error.
+    pub source: std::io::Error,
+}
+
+impl std::fmt::Display for DlqWriteFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let artifacts = self
+            .artifacts
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let stage = if self.top_stage.is_empty() {
+            "(none)"
+        } else {
+            self.top_stage.as_str()
+        };
+        let category = self
+            .top_category
+            .map_or("(none)", |category| category.as_str());
+        write!(
+            f,
+            "{}: dead-letter output {artifacts} could not be written after {} dead-lettered rows \
+             (most from stage {stage}, category {category})\n\
+             \n\
+             help: stop the run before dead letters fill the destination, for example:\n\
+             \n\
+             \x20 error_handling:\n\
+             \x20   type_error_threshold: 0.05\n\
+             \x20   dlq:\n\
+             \x20     max_rate: 0.05\n\
+             \n\
+             These breakers bound how many rows can dead-letter; disk at the staging \
+             destination bounds their volume.",
+            self.source, self.dead_letters,
+        )
+    }
+}
+
+impl std::error::Error for DlqWriteFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// Dead-letter counters of one run: rows per stage and category, and rows
 /// per bucket file.
 ///
@@ -506,6 +573,39 @@ mod tests {
     use clinker_record::owned_storage::OwnedValues;
     use clinker_record::{Record, SchemaBuilder};
     use std::sync::Arc;
+
+    #[test]
+    fn write_failure_names_the_file_count_top_pair_and_guard() {
+        let failure = DlqWriteFailure {
+            artifacts: vec![PathBuf::from("out/rejects.csv")],
+            dead_letters: 812,
+            top_stage: "transform:tfm".to_string(),
+            top_category: Some(DlqErrorCategory::TypeCoercionFailure),
+            source: std::io::Error::new(std::io::ErrorKind::StorageFull, "no space left"),
+        };
+        assert_eq!(
+            failure.to_string(),
+            "no space left: dead-letter output out/rejects.csv could not be written after 812 \
+             dead-lettered rows (most from stage transform:tfm, category type_coercion_failure)\n\
+             \n\
+             help: stop the run before dead letters fill the destination, for example:\n\
+             \n\
+             \x20 error_handling:\n\
+             \x20   type_error_threshold: 0.05\n\
+             \x20   dlq:\n\
+             \x20     max_rate: 0.05\n\
+             \n\
+             These breakers bound how many rows can dead-letter; disk at the staging \
+             destination bounds their volume."
+        );
+        let snippet = failure.to_string();
+        let yaml = &snippet[snippet.find("  error_handling:").expect("snippet")
+            ..snippet.find("\n\nThese").expect("snippet end")];
+        let parsed: serde_json::Value =
+            serde_saphyr::from_str(yaml).expect("the snippet is valid YAML");
+        assert_eq!(parsed["error_handling"]["dlq"]["max_rate"], 0.05);
+        assert_eq!(parsed["error_handling"]["type_error_threshold"], 0.05);
+    }
 
     /// The dead-letter layout the compiler derives for `yaml`. Every header
     /// these tests encode under comes from here, never from the entries.

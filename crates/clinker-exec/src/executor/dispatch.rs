@@ -359,6 +359,37 @@ pub(crate) struct DlqWalkState<'a> {
     capture_depth: usize,
 }
 
+/// Wrap a sink I/O error as the run's dead-letter exhaustion failure: a
+/// [`PipelineError::Io`] of the same [`std::io::ErrorKind`] whose payload
+/// names the dead-letter files, the rows dead-lettered so far, and the
+/// stage and category most of them came from. Any other error is returned
+/// unchanged.
+fn dlq_write_failure(
+    error: PipelineError,
+    artifacts: Vec<std::path::PathBuf>,
+    dead_letters: u64,
+    report: &crate::dlq::DlqReport,
+) -> PipelineError {
+    let PipelineError::Io(source) = error else {
+        return error;
+    };
+    let (top_stage, top_category) = report
+        .top_stage_category()
+        .map_or((String::new(), None), |(stage, category, _)| {
+            (stage.to_owned(), Some(category))
+        });
+    PipelineError::Io(std::io::Error::new(
+        source.kind(),
+        crate::dlq::DlqWriteFailure {
+            artifacts,
+            dead_letters,
+            top_stage,
+            top_category,
+            source,
+        },
+    ))
+}
+
 /// An open capture of [`DlqWalkState::arm_capture`], closed by
 /// [`DlqWalkState::take_capture`].
 #[must_use = "an armed capture is closed by take_capture"]
@@ -431,7 +462,7 @@ impl<'a> DlqWalkState<'a> {
             .entry(Arc::clone(&source_name))
             .or_insert(0) += 1;
         self.report.record(entry.stage.as_deref(), entry.category);
-        self.write(&entry)?;
+        self.write(&entry, accounts.counters.dlq_count)?;
         if self.capture_depth > 0 {
             self.capture.push(entry.source_row);
         }
@@ -447,8 +478,11 @@ impl<'a> DlqWalkState<'a> {
     ///
     /// Returns [`PipelineError::Internal`] when the record carries a column
     /// its bucket's compiled header does not admit, or when a row arrives
-    /// after [`Self::close`]; any write error of the sink is returned as is.
-    fn write(&mut self, entry: &DlqEntry) -> Result<(), PipelineError> {
+    /// after [`Self::close`]. A sink I/O error is returned as
+    /// [`PipelineError::Io`] of the same kind carrying a
+    /// [`DlqWriteFailure`](crate::dlq::DlqWriteFailure) that names the bucket
+    /// and the run's `dead_letters` so far; any other sink error as is.
+    fn write(&mut self, entry: &DlqEntry, dead_letters: u64) -> Result<(), PipelineError> {
         let Some(layout) = self.layout else {
             return Ok(());
         };
@@ -474,7 +508,14 @@ impl<'a> DlqWalkState<'a> {
             path: bucket.path(),
             header: &self.headers[id.index()],
         };
-        writer.write_row(&target, row)?;
+        writer.write_row(&target, row).map_err(|error| {
+            dlq_write_failure(
+                error,
+                vec![bucket.path().to_path_buf()],
+                dead_letters,
+                &self.report,
+            )
+        })?;
         self.report.record_bucket_row(id, bucket.path());
         Ok(())
     }
@@ -520,14 +561,23 @@ impl<'a> DlqWalkState<'a> {
     ///
     /// # Errors
     ///
-    /// Returns the sink's flush error; the run then fails and nothing is
-    /// published.
-    pub(crate) fn close(&mut self) -> Result<(), PipelineError> {
+    /// Returns the sink's flush error, an I/O error wrapped as in
+    /// [`Self::write`] with every bucket written so far and the run's
+    /// `dead_letters`; the run then fails and nothing is published.
+    pub(crate) fn close(&mut self, dead_letters: u64) -> Result<(), PipelineError> {
         if let DlqWalkWriter::Absent = self.writer {
             return Ok(());
         }
         match std::mem::replace(&mut self.writer, DlqWalkWriter::Closed) {
-            DlqWalkWriter::Open(writer) => writer.close(),
+            DlqWalkWriter::Open(writer) => writer.close().map_err(|error| {
+                let artifacts = self
+                    .report
+                    .bucket_rows()
+                    .iter()
+                    .map(|(path, _)| path.clone())
+                    .collect();
+                dlq_write_failure(error, artifacts, dead_letters, &self.report)
+            }),
             DlqWalkWriter::Absent | DlqWalkWriter::Closed => Ok(()),
         }
     }
