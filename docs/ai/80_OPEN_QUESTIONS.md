@@ -730,6 +730,106 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
   failure and empty-file publication in execution tests.
 - Implementation owner: Planner and executor maintainers.
 
+## Dead-letter output findings
+
+### 64. The relaxed-correlation retraction loop's dead-letter event list is uncharged
+
+- Filed: 2026-09-24.
+- Status: Open.
+- Priority: Medium.
+- Evidence: With a relaxed correlation-key Aggregate, the commit pass re-runs
+  the deferred region until it converges. Each iteration collects a
+  `Vec<DlqEvent>` (one 16-byte `SourceRowId` per dead letter that iteration
+  pushed, plus every source row the post-dispatch detect saw) and folds it
+  into the retract scope, whose trigger set grows with the failures of the
+  whole commit pass. Neither is registered with the memory arbitrator. The
+  per-call capture that feeds the list (`DlqWalkState::arm_capture` /
+  `take_capture`) holds only one dispatch call's ids and is empty between
+  calls, so the dead-letter writer adds nothing here; the growth is retraction
+  operator state, outside the dead-letter subset of MEM-01.
+- Files/modules involved: `crates/clinker-exec/src/executor/commit/mod.rs`
+  (the convergence loop and `DlqEvent`),
+  `crates/clinker-exec/src/executor/commit/dispatch.rs`,
+  `crates/clinker-exec/src/executor/commit/detect.rs`
+  (`expand_with_dlq_events`).
+- Suggested way to resolve it: Decide whether the retract scope is charged as
+  operator state under the run's memory budget, like the correlation buffer,
+  or bounded by the relaxed-CK group limits; then add a residency test that
+  sweeps the commit-pass failure fraction.
+- Implementation owner: Executor maintainers.
+
+### 65. A per-document Aggregate finalize failure is dead-lettered or fatal depending on the arm
+
+- Filed: 2026-09-24.
+- Status: Open; needs a maintainer decision.
+- Priority: Medium.
+- Evidence: Under `strategy: continue`, an Aggregate whose accumulator fails
+  at finalize (for example a `sum` that overflows) while flushing a document's
+  group behaves differently by execution arm. The materialized arm routes the
+  failure to the DLQ as `aggregate_finalize` (`route_document_flush_result`);
+  the streaming-ingest arm propagates it as a hard error and the run fails.
+  The doc comment on `finalize_bucket` in
+  `crates/clinker-exec/src/executor/aggregate_dispatch.rs` records the split
+  as intentional, because the ingest thread holds no executor context and
+  cannot reach the DLQ. Which arm runs is a planner choice the author does not
+  make, so one pipeline can dead-letter the row on one input and fail on
+  another.
+- Files/modules involved:
+  `crates/clinker-exec/src/executor/aggregate_dispatch.rs`
+  (`finalize_bucket`, `flush_closing_document`, `drain_remaining`).
+- Suggested way to resolve it: Once side threads write dead letters through
+  their own part files, the streaming arm can reach the DLQ; decide whether it
+  then dead-letters the row like the materialized arm, and pin both arms with
+  one test.
+- Implementation owner: Executor maintainers.
+
+### 66. Combine join kernels hold output-row failures until the join returns
+
+- Filed: 2026-09-24.
+- Status: Open.
+- Priority: High.
+- Evidence: The grace-hash, IEJoin and sort-merge join kernels collect every
+  recoverable output-row failure as a `CombineOutputEvalFailure`, which owns a
+  clone of the probe record and of the matched build record, into
+  `output_eval_failures`. The dispatcher dead-letters them only after the
+  whole kernel returns, including its spilled partitions. The list grows with
+  the number of failures, is not charged to the memory arbitrator, and is not
+  among the dead-letter holding places the bounded dead-letter work removes
+  (the streaming Sink, buffered Sink, Aggregate streaming ingest, Combine
+  streaming probe and correlation buffer). A Combine whose body fails on most
+  rows therefore still holds a record pair per failure.
+- Files/modules involved: `crates/clinker-exec/src/pipeline/combine.rs`
+  (`CombineOutputEvalFailure`), `crates/clinker-exec/src/pipeline/iejoin.rs`,
+  `crates/clinker-exec/src/pipeline/sort_merge_join.rs`,
+  `crates/clinker-exec/src/pipeline/grace_hash/probe.rs`,
+  `crates/clinker-exec/src/executor/combine_dispatch.rs`.
+- Suggested way to resolve it: Write kernel failures through a dead-letter
+  part file as the side threads do, or hand them to the walk in bounded
+  batches; add the kernels to the dead-letter-fraction residency sweep.
+- Implementation owner: Executor maintainers.
+
+### 67. E315 names two different failures, and E318's registry text states the wrong range
+
+- Filed: 2026-09-24.
+- Status: Open.
+- Priority: Low.
+- Evidence: The diagnostic registry in
+  `crates/clinker-core-types/src/diagnostic.rs` defines E315 as the
+  pipeline-wide DLQ rate breach, and `PipelineError::DlqRateExceeded` renders
+  it so. The planner also emits E315 at compile time when Merge inputs
+  disagree on the `$widened` sidecar policy
+  (`crates/clinker-plan/src/plan/bind_schema.rs`), and
+  `docs/user/src/formats/auto-widen.md` documents that meaning. Separately,
+  the registry describes E318 as "`max_rate` out of `[0.0, 1.0]`", while
+  `validate_dlq_per_source` accepts only `(0.0, 1.0]` and rejects `0.0`.
+- Files/modules involved: `crates/clinker-core-types/src/diagnostic.rs`,
+  `crates/clinker-plan/src/plan/bind_schema.rs`,
+  `docs/user/src/formats/auto-widen.md`.
+- Suggested way to resolve it: Give the Merge policy disagreement its own
+  code (a user-visible diagnostic change), and correct E318's registry text to
+  `(0.0, 1.0]`.
+- Implementation owner: Planner maintainers.
+
 ## Resolved Archive
 
 ### 61. Decoded allocation ownership
@@ -958,17 +1058,19 @@ Numbers are never reused. One line per entry: the answer and its evidence.
   rather than a repair to one of them. (The event-shape rule left the family
   with question 47 and now carries E375; its span is synthetic for a different
   reason -- a cross-scope conflict has two locations and no single offence.)
-- **49 (filed 2026-08-09, needs a maintainer decision):** A dead-lettered
-  record whose source has no `per_source` DLQ override, in a pipeline with no
-  top-level `error_handling.dlq.path`, has no destination and is dropped.
-  That is the documented contract of the compiled dead-letter layout's bucket
-  rule (`DlqLayout::bucket_for_source` returns no bucket), but nothing tells
-  the operator: the run counts the record as dead-lettered and writes it
-  nowhere. The right place to catch it is admission -- a pipeline that can
-  dead-letter from a source it has given no sidecar is a configuration gap
-  detectable before any record is read -- which needs the set of
-  dead-letterable sources. The plan-time layout already walks every
-  dead-letter site, so that set is available where the bucket rule now lives.
+- **49 (filed 2026-08-09; Resolved 2026-09-24 by maintainer decision):** A
+  dead-lettered record whose source has no `per_source` DLQ override, in a
+  pipeline with no top-level `error_handling.dlq.path`, has no destination
+  (`DlqLayout::bucket_for_source` returns no bucket). The maintainer decided
+  this is the contract, not a gap to reject at admission: such a record is
+  counted in `dlq_count`, the per-source count and the per-stage and
+  per-category counts, sets exit code 2 and feeds the `max_rate` breaker, but
+  is never formatted or written. The error-handling guide now says so in the
+  `path` row of its DLQ configuration table, replacing its earlier claim that
+  such records were "logged". Evidence: `DlqWalkState::push` in
+  `crates/clinker-exec/src/executor/dispatch.rs` writes only when the entry's
+  source has a bucket; `no_destination_rows_count_and_write_nothing` in
+  `crates/clinker/tests/dlq_streaming.rs`.
 - **50 (filed 2026-08-09):** `destination_identity` falls back to the
   unresolved path when `current_dir()` fails. Every caller then falls back
   identically, so two relative spellings still agree with each other; what
@@ -988,6 +1090,13 @@ Numbers are never reused. One line per entry: the answer and its evidence.
   deciding when a run's destination identities are fixed -- most likely a
   resolution pass at admission whose results every later question is answered
   from, rather than a memo inside the function.
+  Updated 2026-09-24: dead-letter bucket identity is now resolved once, at
+  compile time. `bucket_rule` in `crates/clinker-plan/src/plan/dlq_layout.rs`
+  keys each configured DLQ path through `destination_identity` while the
+  compiled layout is built, and every dead-lettered row is routed by that
+  layout's bucket id, never by asking the identity again during the run. The
+  staging registry and the attempt ledger still resolve identities afresh, so
+  the question stays open for them.
 - **52 (filed 2026-08-09; closed 2026-08-12):** Two destinations spelled
   `out/data.csv` and `out/pending/../data.csv`, where `pending` does not exist
   yet, got two identities, so both producers were admitted for one file.

@@ -653,6 +653,21 @@ correlation-deferred writers all use the same counter names and one closed
 the destination rejected the flush; the failed terminal counter remains the
 authoritative outcome.
 
+Each dead-letter (DLQ) file a run writes is a work unit of its own. It emits
+one `clinker.dead_letter.started` when the file receives its first row, and
+exactly one of `clinker.dead_letter.completed` (the file was written in full
+and handed to publication), `clinker.dead_letter.failed` (a write or flush
+failed, or the run failed), or `clinker.dead_letter.interrupted` (the run was
+interrupted). `clinker.dead_letter.records` and `clinker.dead_letter.bytes`
+report the rows written to the file and the bytes its writer accepted, header
+included. Each unit closes one `clinker.dead_letter` span whose
+`clinker.logical_node` attribute is `dead_letter[<n>]`, where `<n>` is the
+file's position, counting from 0, in the `=== Dead-Letter Output ===` section
+of `clinker run --explain`; the path never appears. A DLQ file that receives
+no rows emits nothing, and neither do dead letters that have no destination:
+count those with `records_dlq`. Preview runs write no DLQ file and emit no
+dead-letter signals.
+
 An instrument that recorded nothing in an interval carries no points for it.
 That is an ordinary interval, not a malformed export: the batch is delivered
 and the points its other instruments did record arrive intact.
