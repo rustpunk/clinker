@@ -729,7 +729,7 @@ fn dispatch_sink_work(
     // collected: the helpers push each through `fan_ctx.dlq` where it happens.
     let mut written_rows: Vec<crate::executor::stream_event::SourceRowId> = Vec::new();
     let output_staging = ctx.output_staging.clone();
-    {
+    let dlq_fatal = {
         let mut fan_ctx = FanOutContext {
             writer_resources: ctx.writer_resources.clone(),
             truncation_ledger: ctx.truncation_ledger.clone(),
@@ -751,6 +751,7 @@ fn dispatch_sink_work(
                     config: ctx.config.error_handling.dlq.as_ref(),
                 },
             },
+            dlq_fatal: None,
             written_rows: &mut written_rows,
             output_staging: &output_staging,
             sink_byte_counter: ctx.sink_byte_counter.clone(),
@@ -770,6 +771,14 @@ fn dispatch_sink_work(
         } else if let Some(raw_writer) = single_writer {
             emit_single_writer(&mut fan_ctx, raw_writer, &unbuffered, scan_timer);
         }
+        fan_ctx.dlq_fatal
+    };
+    // A collision dead letter the funnel refused (a rate breach or a
+    // dead-letter write failure) ends the walk here, as every other
+    // `push_dlq` site does, so the run reports that error itself rather than
+    // folding it into the collected Output errors.
+    if let Some(error) = dlq_fatal {
+        return Err(error);
     }
     // With a writer present, count ok / written / emitted from the records
     // actually written — one entry in `written_rows` per successful
@@ -1417,8 +1426,11 @@ struct FanOutContext<'a, 'l> {
     /// fields this struct holds, so a collision is counted, written and
     /// rate-checked at the record that collided. A push error (a rate breach
     /// or a dead-letter write failure) is fatal for the run: the helper
-    /// records it in `output_errors` and stops writing.
+    /// stores it in [`Self::dlq_fatal`] and stops writing.
     dlq: crate::executor::dispatch::DlqFunnel<'a, 'l>,
+    /// The push error that stopped this Output, returned by the caller as the
+    /// walk's error once the helper's borrows end.
+    dlq_fatal: Option<PipelineError>,
     /// The source `row_num` of every record actually written, in write order —
     /// one entry per successful `write_record`, so a `combine match: all`
     /// fan-out that emits several output records for one driver row contributes
@@ -1488,7 +1500,7 @@ fn emit_single_writer(
                             sink_collision_dlq_entry(record, &projected, *rn, fan_ctx.name, &e)
                     {
                         if let Err(error) = fan_ctx.dlq.push(entry) {
-                            fan_ctx.output_errors.push(error);
+                            fan_ctx.dlq_fatal = Some(error);
                             write_failed = true;
                             break;
                         }
@@ -1645,9 +1657,8 @@ fn emit_fan_out(
             {
                 if let Err(error) = fan_ctx.dlq.push(entry) {
                     // Fatal for the run: no further record of this Output is
-                    // written, and the error surfaces with the other output
-                    // errors at the end of the walk.
-                    fan_ctx.output_errors.push(error);
+                    // written, and the caller returns the error as the walk's.
+                    fan_ctx.dlq_fatal = Some(error);
                     break;
                 }
                 continue;
