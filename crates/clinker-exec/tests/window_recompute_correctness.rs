@@ -49,10 +49,11 @@
 //! own total + mutation) means deferred dispatch keyed off an empty
 //! partition, which would itself be a bug.
 
-mod common;
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_exec::executor::{DlqEntry, PipelineRunParams};
+use clinker_exec::executor::PipelineRunParams;
 use clinker_plan::error::PipelineError;
 use clinker_record::PipelineCounters;
 use std::collections::HashMap;
@@ -60,7 +61,7 @@ use std::collections::HashMap;
 fn run_pipeline(
     yaml: &str,
     csv_input: &str,
-) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
+) -> Result<(PipelineCounters, Vec<dlq_sink::DlqRow>, String), PipelineError> {
     let config = clinker_plan::config::parse_config(yaml).unwrap();
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
@@ -85,8 +86,8 @@ fn run_pipeline(
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report = common::run_config(&config, readers, writers, &params)?;
-    Ok((report.counters, report.dlq_entries, buf.as_string()))
+    let (report, rows) = dlq_sink::run_config_with_dlq(&config, readers, writers, &params)?;
+    Ok((report.counters, rows, buf.as_string()))
 }
 
 /// `gate`'s emit deliberately mutates `running_total` on the success
@@ -116,6 +117,8 @@ pipeline:
   name: window_recompute_correctness
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src
@@ -239,26 +242,20 @@ fn post_aggregate_window_recompute_corrects_running_total() {
     assert_eq!(dlq.len(), 1);
 
     let trigger = &dlq[0];
-    assert!(trigger.trigger, "the single DLQ entry is the trigger");
+    assert!(trigger.trigger(), "the single DLQ entry is the trigger");
+    let detail = trigger.error_detail().unwrap_or_default();
     assert!(
-        trigger.error_message.ends_with("division by zero"),
-        "trigger error must end with the eval-kind text; got: {}",
-        trigger.error_message
+        detail.ends_with("division by zero"),
+        "trigger error must end with the eval-kind text; got: {detail}"
     );
-    assert!(
-        trigger
-            .original_record
-            .values()
-            .iter()
-            .any(|v| matches!(v, clinker_record::Value::String(s) if s.as_str() == "HR")),
+    assert_eq!(
+        trigger.field("department"),
+        Some("HR"),
         "trigger record must carry department=HR"
     );
-    assert!(
-        trigger
-            .original_record
-            .values()
-            .iter()
-            .any(|v| matches!(v, clinker_record::Value::String(s) if s.as_str() == "north")),
+    assert_eq!(
+        trigger.field("region"),
+        Some("north"),
         "trigger record must carry region=north"
     );
 

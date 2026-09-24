@@ -1,5 +1,7 @@
 //! Source-scoped identity coverage for failure evidence and retraction state.
 
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
 #[path = "common/pipeline_resource_fixtures.rs"]
 mod resource_fixtures;
 
@@ -11,13 +13,13 @@ use std::time::Duration;
 
 use clinker_bench_support::io::SharedBuffer;
 use clinker_exec::executor::{
-    DlqEntry, ExecutionReport, PipelineExecutor, PipelineRunParams, SourceInput, SourceReaders,
-    SourceRowId,
+    ExecutionReport, PipelineExecutor, PipelineRunParams, SourceInput, SourceReaders,
 };
 use clinker_exec::source::multi_file::FileSlot;
 use clinker_format::FormatError;
 use clinker_plan::config::{CompileContext, ConcurrencyConfig, parse_config};
 use clinker_plan::plan::CompiledPlan;
+use dlq_sink::{CollectingDlqSink, DlqRow};
 
 fn compile_failure_pipeline(granularity: &str, memory_limit: &str) -> CompiledPlan {
     let yaml = format!(
@@ -27,6 +29,8 @@ pipeline:
   memory: {{ limit: "{memory_limit}", backpressure: spill }}
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: src_a
@@ -83,7 +87,7 @@ fn run_failure_pipeline(
     plan: &CompiledPlan,
     src_a: String,
     src_b: String,
-) -> (ExecutionReport, String) {
+) -> (ExecutionReport, String, Vec<DlqRow>) {
     let readers: SourceReaders = HashMap::from([
         (
             "src_a".to_string(),
@@ -100,7 +104,7 @@ fn run_failure_pipeline(
 fn run_failure_pipeline_with_readers(
     plan: &CompiledPlan,
     readers: SourceReaders,
-) -> (ExecutionReport, String) {
+) -> (ExecutionReport, String, Vec<DlqRow>) {
     let output = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
         "out".to_string(),
@@ -113,9 +117,15 @@ fn run_failure_pipeline_with_readers(
         shutdown_token: None,
         ..Default::default()
     };
-    let report = PipelineExecutor::run_plan_with_readers_writers(plan, readers, writers, &params)
-        .expect("failure pipeline executes");
-    (report, output.as_string())
+    let sink = CollectingDlqSink::new();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        plan,
+        readers,
+        dlq_sink::registry(writers, &sink),
+        &params,
+    )
+    .expect("failure pipeline executes");
+    (report, output.as_string(), sink.rows())
 }
 
 fn small_source(prefix: &str, failing: bool) -> String {
@@ -123,13 +133,15 @@ fn small_source(prefix: &str, failing: bool) -> String {
     format!("id,value,note\n{prefix}1,{first},first\n{prefix}2,20,second\n")
 }
 
-fn identities_by_source(entries: &[DlqEntry]) -> BTreeMap<String, BTreeSet<SourceRowId>> {
-    let mut identities = BTreeMap::<String, BTreeSet<SourceRowId>>::new();
-    for entry in entries {
+/// Each source's dead-letter row identities, as `(source_name, source_row)`
+/// pairs keyed by source name.
+fn identities_by_source(rows: &[DlqRow]) -> BTreeMap<String, BTreeSet<(String, u64)>> {
+    let mut identities = BTreeMap::<String, BTreeSet<(String, u64)>>::new();
+    for row in rows {
         identities
-            .entry(entry.source_name.to_string())
+            .entry(row.source_name().to_string())
             .or_default()
-            .insert(entry.source_row);
+            .insert((row.source_name().to_string(), row.source_row()));
     }
     identities
 }
@@ -137,45 +149,43 @@ fn identities_by_source(entries: &[DlqEntry]) -> BTreeMap<String, BTreeSet<Sourc
 #[test]
 fn dlq_row_and_document_evidence_distinguish_same_ordinals() {
     let row_plan = compile_failure_pipeline("record", "1G");
-    let (row_report, _) =
+    let (row_report, _, row_rows) =
         run_failure_pipeline(&row_plan, small_source("a", true), small_source("b", true));
-    assert_eq!(row_report.dlq_entries.len(), 2);
-    assert!(row_report.dlq_entries.iter().all(|entry| entry.trigger));
-    let row_ids = identities_by_source(&row_report.dlq_entries);
+    assert_eq!(row_report.counters.dlq_count, 2);
+    assert_eq!(row_rows.len(), 2);
+    assert!(row_rows.iter().all(|row| row.trigger()));
+    let row_ids = identities_by_source(&row_rows);
     assert_eq!(row_ids["src_a"].len(), 1);
     assert_eq!(row_ids["src_b"].len(), 1);
-    let a_row = *row_ids["src_a"].first().expect("src_a row identity");
-    let b_row = *row_ids["src_b"].first().expect("src_b row identity");
-    assert_eq!(a_row.ordinal(), b_row.ordinal());
-    assert_ne!(a_row.source(), b_row.source());
+    let (a_source, a_ordinal) = row_ids["src_a"].first().expect("src_a row identity");
+    let (b_source, b_ordinal) = row_ids["src_b"].first().expect("src_b row identity");
+    assert_eq!(a_ordinal, b_ordinal);
+    assert_ne!(a_source, b_source);
 
     let document_plan = compile_failure_pipeline("document", "1G");
-    let (document_report, output) = run_failure_pipeline(
+    let (document_report, output, document_rows) = run_failure_pipeline(
         &document_plan,
         small_source("a", true),
         small_source("b", true),
     );
-    assert_eq!(document_report.dlq_entries.len(), 4);
+    assert_eq!(document_report.counters.dlq_count, 4);
+    assert_eq!(document_rows.len(), 4);
     assert_eq!(document_report.counters.ok_count, 0);
     assert!(output.lines().nth(1).is_none());
-    let document_ids = identities_by_source(&document_report.dlq_entries);
+    let document_ids = identities_by_source(&document_rows);
     assert_eq!(document_ids["src_a"].len(), 2);
     assert_eq!(document_ids["src_b"].len(), 2);
     assert_eq!(
         document_ids
             .values()
             .flatten()
-            .copied()
+            .cloned()
             .collect::<BTreeSet<_>>()
             .len(),
         4
     );
     assert_eq!(
-        document_report
-            .dlq_entries
-            .iter()
-            .filter(|entry| entry.trigger)
-            .count(),
+        document_rows.iter().filter(|row| row.trigger()).count(),
         2,
         "each source document keeps its own root cause"
     );
@@ -356,12 +366,15 @@ fn dlq_document_collateral_preserves_identity_and_records_when_spilled() {
             })
             .collect()
     };
-    let (resident, _) = run_failure_pipeline_with_readers(&resident_plan, readers(&resident_plan));
-    let (spilled, output) =
+    let (resident, _, resident_rows) =
+        run_failure_pipeline_with_readers(&resident_plan, readers(&resident_plan));
+    let (spilled, output, spilled_rows) =
         run_failure_pipeline_with_readers(&spilled_plan, readers(&spilled_plan));
 
-    assert_eq!(resident.dlq_entries.len(), 640);
-    assert_eq!(spilled.dlq_entries.len(), resident.dlq_entries.len());
+    assert_eq!(resident.counters.dlq_count, 640);
+    assert_eq!(resident_rows.len(), 640);
+    assert_eq!(spilled.counters.dlq_count, resident.counters.dlq_count);
+    assert_eq!(spilled_rows.len(), resident_rows.len());
     assert_eq!(spilled.counters.ok_count, 0);
     assert!(output.lines().nth(1).is_none());
     assert!(
@@ -373,36 +386,25 @@ fn dlq_document_collateral_preserves_identity_and_records_when_spilled() {
         spilled.per_stage_spill_bytes
     );
 
-    let evidence = |entries: &[DlqEntry]| {
-        entries
-            .iter()
-            .map(|entry| {
-                let id = entry
-                    .original_record
-                    .get("id")
-                    .expect("id field")
-                    .to_string();
-                let note = entry
-                    .original_record
-                    .get("note")
-                    .expect("note field")
-                    .to_string();
-                (id, note.len(), entry.source_row, entry.trigger)
+    let evidence = |rows: &[DlqRow]| {
+        rows.iter()
+            .map(|row| {
+                let id = row.field("id").expect("id field").to_string();
+                let note = row.field("note").expect("note field");
+                (
+                    id,
+                    note.len(),
+                    (row.source_name().to_string(), row.source_row()),
+                    row.trigger(),
+                )
             })
             .collect::<BTreeSet<_>>()
     };
-    assert_eq!(
-        evidence(&spilled.dlq_entries),
-        evidence(&resident.dlq_entries)
-    );
+    assert_eq!(evidence(&spilled_rows), evidence(&resident_rows));
     assert!(
-        spilled.dlq_entries.iter().all(|entry| entry
-            .original_record
-            .get("note")
-            .expect("note field")
-            .to_string()
-            .len()
-            == 8 * 1024),
+        spilled_rows
+            .iter()
+            .all(|row| row.field("note").expect("note field").len() == 8 * 1024),
         "spill must retain each complete original record"
     );
 }
@@ -410,14 +412,14 @@ fn dlq_document_collateral_preserves_identity_and_records_when_spilled() {
 #[test]
 fn dlq_retry_reuses_compiled_plan_with_fresh_attempt_state() {
     let plan = compile_failure_pipeline("document", "1G");
-    let (failed, failed_output) =
+    let (failed, failed_output, _) =
         run_failure_pipeline(&plan, small_source("a", true), small_source("b", true));
-    assert_eq!(failed.dlq_entries.len(), 4);
+    assert_eq!(failed.counters.dlq_count, 4);
     assert!(failed_output.lines().nth(1).is_none());
 
-    let (retried, retried_output) =
+    let (retried, retried_output, _) =
         run_failure_pipeline(&plan, small_source("a", false), small_source("b", false));
-    assert!(retried.dlq_entries.is_empty());
+    assert_eq!(retried.counters.dlq_count, 0);
     assert_eq!(retried.counters.ok_count, 4);
     assert_eq!(retried_output.lines().skip(1).count(), 4);
 }
