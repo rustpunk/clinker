@@ -2674,6 +2674,163 @@ nodes:
         assert_eq!(artifacts[0].rows, 3);
     }
 
+    /// A JSON source feeding a CSV Sink directly, which dispatches on the
+    /// buffered Sink arm. Every row's `tags` value contains the join
+    /// delimiter, so every row is a `join_values` collision at the Sink.
+    fn every_row_collides_plan(dlq_path: &std::path::Path) -> clinker_plan::plan::CompiledPlan {
+        clinker_plan::config::parse_config(&format!(
+            r#"
+pipeline:
+  name: buffered_sink_collisions
+error_handling:
+  strategy: continue
+  dlq:
+    path: {}
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: json
+      path: ./in.json
+      schema:
+        - {{ name: order_id, type: string }}
+        - {{ name: tags, type: string, multiple: true }}
+  - type: sink
+    name: out
+    input: orders
+    config:
+      name: out
+      type: csv
+      path: ./out.csv
+      mapping:
+        - order_id
+        - tags
+"#,
+            dlq_path.display()
+        ))
+        .expect("pipeline parses")
+        .compile(&clinker_plan::config::CompileContext::default())
+        .expect("pipeline compiles")
+    }
+
+    /// `rows` JSON orders, each with a tag holding the CSV join delimiter.
+    fn colliding_orders(rows: usize) -> SourceReaders {
+        let mut json = String::from("[");
+        for id in 0..rows {
+            if id > 0 {
+                json.push(',');
+            }
+            json.push_str(&format!(r#"{{"order_id":"{id}","tags":["a;b","c"]}}"#));
+        }
+        json.push(']');
+        HashMap::from([(
+            "orders".to_string(),
+            single_file_reader("in.json", Box::new(std::io::Cursor::new(json.into_bytes()))),
+        )])
+    }
+
+    #[test]
+    fn buffered_sink_collisions_stream_without_pending_entries() {
+        use crate::dlq::DlqSink as _;
+
+        const COLLISIONS: usize = 10_000;
+        let root = tempfile::tempdir().expect("destination root");
+        let dlq_path = root.path().join("dlq.csv");
+        let plan = every_row_collides_plan(&dlq_path);
+        let staging = dead_letter_attempt_staging(root.path());
+        let sink = Arc::new(crate::output::dlq_sink::StagedDlqSink::new(staging.clone()));
+        let writers = WriterRegistry {
+            single: HashMap::from([(
+                "out".to_string(),
+                Box::new(std::io::sink()) as Box<dyn std::io::Write + Send>,
+            )]),
+            output_staging: staging.clone(),
+            auto_commit_staged: false,
+            dlq_sink: Some(sink.clone()),
+            ..WriterRegistry::default()
+        };
+        let report = PipelineExecutor::run_plan_with_readers_writers(
+            &plan,
+            colliding_orders(COLLISIONS),
+            writers,
+            &PipelineRunParams::default(),
+        )
+        .expect("collisions dead-letter under continue");
+
+        assert_eq!(report.counters.dlq_count, COLLISIONS as u64);
+        assert_eq!(report.counters.records_written, 0, "no row was written");
+        let at_sink: Vec<_> = report.dead_letters.for_stage("output:out").collect();
+        assert_eq!(
+            at_sink,
+            vec![(
+                clinker_core_types::dlq::DlqErrorCategory::MultiValueJoinCollision,
+                COLLISIONS as u64
+            )]
+        );
+        let staged = staged_dead_letters(&staging, &dlq_path);
+        assert_eq!(
+            staged.lines().count(),
+            COLLISIONS + 1,
+            "the header plus one row per collision"
+        );
+        let artifacts = sink.finish().expect("the walk writer closed before return");
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].rows, COLLISIONS as u64);
+    }
+
+    #[test]
+    fn auto_commit_publishes_dlq_with_outputs() {
+        use crate::dlq::DlqSink as _;
+
+        let root = tempfile::tempdir().expect("destination root");
+        let dlq_path = root.path().join("dlq.csv");
+        let out_path = root.path().join("out.csv");
+        let plan = every_row_collides_plan(&dlq_path);
+        let staging = dead_letter_attempt_staging(root.path());
+        let staged_out = out_path.clone();
+        let (_, out_file) = staging
+            .stage_attempt_output(
+                crate::output::attempt::ArtifactKind::Primary,
+                "out",
+                clinker_plan::config::IfExistsPolicy::Overwrite,
+                false,
+                move |_| Ok(staged_out.clone()),
+            )
+            .expect("stage the primary output");
+        let sink = Arc::new(crate::output::dlq_sink::StagedDlqSink::new(staging.clone()));
+        let writers = WriterRegistry {
+            single: HashMap::from([(
+                "out".to_string(),
+                Box::new(out_file) as Box<dyn std::io::Write + Send>,
+            )]),
+            output_staging: staging.clone(),
+            auto_commit_staged: true,
+            dlq_sink: Some(sink.clone()),
+            ..WriterRegistry::default()
+        };
+        let report = PipelineExecutor::run_plan_with_readers_writers(
+            &plan,
+            colliding_orders(3),
+            writers,
+            &PipelineRunParams::default(),
+        )
+        .expect("an auto-commit run publishes");
+
+        assert_eq!(report.counters.dlq_count, 3);
+        let published = std::fs::read_to_string(&dlq_path).expect("the DLQ file is published");
+        assert_eq!(published.lines().count(), 4, "header plus three rows");
+        assert!(out_path.exists(), "the primary output is published with it");
+        assert!(
+            staging.partials().is_empty(),
+            "nothing is left staged after an auto-commit"
+        );
+        assert!(
+            sink.finish().is_err(),
+            "the executor finished the sink before it committed, so the caller must not"
+        );
+    }
+
     mod aggregation;
     mod combine_consumer_lifecycle;
     mod composition_port_admission_overshoot;
