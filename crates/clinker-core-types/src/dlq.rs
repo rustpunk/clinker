@@ -4,8 +4,9 @@
 
 /// DLQ error categories. Passed from the error site — no string
 /// matching. Each error path constructs the correct variant at the
-/// point of failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// point of failure. The ordering is declaration order; it fixes the order
+/// in which per-category counters are reported and carries no severity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DlqErrorCategory {
     MissingRequiredField,
     TypeCoercionFailure,

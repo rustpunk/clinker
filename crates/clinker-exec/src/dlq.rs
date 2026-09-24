@@ -5,17 +5,23 @@
 //! [`clinker_core_types::dlq`]; the buckets, the rule that routes a row to
 //! one, and each bucket's header live in
 //! [`clinker_plan::plan::dlq_layout::DlqLayout`]. This module owns the row
-//! encoder that turns one [`DlqEntry`] into the on-disk CSV shape.
+//! encoder that turns one [`DlqEntry`] into the on-disk CSV shape, the
+//! [`DlqSink`] seam the encoded rows stream through, and the run's
+//! [`DlqReport`] counters. The staged-file sink lives in
+//! [`crate::output::dlq_sink`].
 
 use clinker_record::owned_storage::{OwnedMap, SharedStorage};
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 
+use clinker_core_types::dlq::DlqErrorCategory;
 use clinker_record::{FieldMetadata, Schema, Value};
 
 use crate::executor::DlqEntry;
 use clinker_plan::error::PipelineError;
-use clinker_plan::plan::dlq_layout::{DlqBucket, DlqLayout, dlq_user_columns};
+use clinker_plan::plan::dlq_layout::{DlqBucket, DlqBucketId, DlqLayout, dlq_user_columns};
 
 /// Encodes dead-letter output one row at a time under the header a compiled
 /// [`DlqLayout`] fixed for each bucket.
@@ -297,6 +303,172 @@ struct BorrowedMap<'a>(&'a OwnedMap);
 impl serde::Serialize for BorrowedMap<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_map(self.0.iter().map(|(key, value)| (key.as_ref(), value)))
+    }
+}
+
+/// Everything a [`DlqRowWriter`] needs to open one dead-letter bucket on its
+/// first row: the bucket's identity, its destination, and its encoded header
+/// line.
+///
+/// The executor builds a target from its own compiled [`DlqLayout`] for every
+/// row it writes, so a sink holds no layout of its own and cannot disagree
+/// with the plan the run executes. The caller must pass the same `path` and
+/// `header` for every row of one `id`; a writer reads them only when the
+/// bucket is not open yet.
+#[derive(Debug, Clone, Copy)]
+pub struct DlqBucketTarget<'a> {
+    /// The bucket's identity in the compiled layout.
+    pub id: DlqBucketId,
+    /// The bucket's final destination path.
+    pub path: &'a Path,
+    /// The bucket's CSV header line, terminator included, as
+    /// [`DlqRowEncoder::header`] encodes it.
+    pub header: &'a [u8],
+}
+
+/// One thread's handle for writing dead-letter rows into their buckets.
+///
+/// A writer is owned by exactly one thread and is never shared, so rows of
+/// one writer land in the order that thread wrote them. It streams: each row
+/// goes into a fixed per-bucket buffer and on to the bucket's file, and no
+/// writer keeps rows or entries. The number of buckets it can hold open is
+/// fixed by the compiled plan.
+pub trait DlqRowWriter: Send {
+    /// Append one encoded row to `target`'s bucket.
+    ///
+    /// The first row for a bucket opens it and writes `target.header` once,
+    /// before the row; later rows only append. `row` must be one complete
+    /// CSV row under that header, terminator included. May block on file
+    /// I/O when the bucket's buffer fills.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError`] when the bucket cannot be opened or a write
+    /// fails; the I/O error kind is preserved.
+    fn write_row(&mut self, target: &DlqBucketTarget<'_>, row: &[u8]) -> Result<(), PipelineError>;
+
+    /// Flush every bucket this writer opened and hand the bucket files back
+    /// to the sink that opened the writer. Blocks until every buffer is
+    /// flushed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError`] when a flush fails; the I/O error kind is
+    /// preserved. The bucket files are then not handed back.
+    fn close(self: Box<Self>) -> Result<(), PipelineError>;
+}
+
+/// Where a run's dead-letter rows go: the seam the executor writes through,
+/// supplied by its caller.
+///
+/// The CLI supplies a sink that stages real files; preview and throughput
+/// harnesses supply [`DiscardingDlqSink`]. Counts never come from a sink:
+/// the executor keeps them in its own [`DlqReport`].
+pub trait DlqSink: Send + Sync {
+    /// A new writer for the walk thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError`] when the sink cannot accept another writer.
+    fn open_walk_writer(&self) -> Result<Box<dyn DlqRowWriter>, PipelineError>;
+
+    /// The artifacts written during the run, one per bucket that received a
+    /// row, in bucket order.
+    ///
+    /// Called exactly once, by the owner of publication, after every writer
+    /// this sink opened has closed. It never promotes, renames or removes
+    /// anything itself: publication stays with that owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError::Internal`] when a writer is still open or
+    /// `finish` was already called, since the artifact set would then not be
+    /// established.
+    fn finish(&self) -> Result<Vec<DlqArtifact>, PipelineError>;
+}
+
+/// One dead-letter bucket file a run wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DlqArtifact {
+    /// The bucket's identity in the compiled layout.
+    pub bucket: DlqBucketId,
+    /// Where the bucket's file is published if the run succeeds.
+    pub final_path: PathBuf,
+    /// Rows written to the bucket, the header not counted.
+    pub rows: u64,
+}
+
+/// A [`DlqSink`] that accepts every row and keeps nothing.
+///
+/// For preview and throughput harnesses that run pipelines with a
+/// dead-letter block but need only the counts, which the executor's
+/// [`DlqReport`] carries. It holds no state and stages no file.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DiscardingDlqSink;
+
+impl DlqRowWriter for DiscardingDlqSink {
+    fn write_row(
+        &mut self,
+        _target: &DlqBucketTarget<'_>,
+        _row: &[u8],
+    ) -> Result<(), PipelineError> {
+        Ok(())
+    }
+
+    fn close(self: Box<Self>) -> Result<(), PipelineError> {
+        Ok(())
+    }
+}
+
+impl DlqSink for DiscardingDlqSink {
+    fn open_walk_writer(&self) -> Result<Box<dyn DlqRowWriter>, PipelineError> {
+        Ok(Box::new(DiscardingDlqSink))
+    }
+
+    fn finish(&self) -> Result<Vec<DlqArtifact>, PipelineError> {
+        Ok(Vec::new())
+    }
+}
+
+/// Dead-letter counters of one run: rows per stage and category, and rows
+/// per bucket file.
+///
+/// Holds no rows or entries. Its size is bounded by the plan: one counter per
+/// (stage, category) pair that occurred, one per bucket written.
+#[derive(Debug, Default, Clone)]
+pub struct DlqReport {
+    by_stage_category: BTreeMap<String, BTreeMap<DlqErrorCategory, u64>>,
+    bucket_ids: Vec<DlqBucketId>,
+    bucket_rows: Vec<(PathBuf, u64)>,
+}
+
+impl DlqReport {
+    /// Count one dead-lettered row at `stage` (`None` when the failure has
+    /// no stage) with `category`.
+    pub fn record(&mut self, _stage: Option<&str>, _category: DlqErrorCategory) {}
+
+    /// Count one row written to bucket `id`, whose file is `path`.
+    pub fn record_bucket_row(&mut self, _id: DlqBucketId, _path: &Path) {}
+
+    /// The categories counted at `stage` and their counts, in category
+    /// order. The empty string names rows with no stage.
+    pub fn for_stage(&self, stage: &str) -> impl Iterator<Item = (DlqErrorCategory, u64)> + '_ {
+        self.by_stage_category
+            .get(stage)
+            .into_iter()
+            .flat_map(|categories| categories.iter().map(|(c, n)| (*c, *n)))
+    }
+
+    /// The (stage, category) pair with the most rows, and its count. A tie
+    /// goes to the pair first in stage-then-category order; the empty stage
+    /// names rows with no stage.
+    pub fn top_stage_category(&self) -> Option<(&str, DlqErrorCategory, u64)> {
+        None
+    }
+
+    /// Rows per bucket file, in bucket order.
+    pub fn bucket_rows(&self) -> &[(PathBuf, u64)] {
+        &self.bucket_rows
     }
 }
 
@@ -843,5 +1015,60 @@ nodes:
         assert_eq!(rows[0][col("$ck.employee_id")], "E001");
         assert_eq!(rows[0].len(), header.len());
         assert!(rows[0].iter().all(|cell| !cell.contains("region")));
+    }
+
+    /// The report counts rows per (stage, category) and per bucket, and
+    /// names the most frequent pair, breaking a tie by stage-then-category
+    /// order.
+    #[test]
+    fn report_counts_stage_category_pairs_and_bucket_rows() {
+        let layout = compiled_layout(
+            "pipeline:\n  name: dlq_report\nerror_handling:\n  strategy: continue\n  dlq:\n    path: dlq.csv\n    per_source:\n      src_b:\n        path: dlq_b.csv\n\
+nodes:\n- type: source\n  name: src_a\n  config:\n    name: src_a\n    type: csv\n    path: a.csv\n    schema:\n      - { name: id, type: string }\n\
+- type: source\n  name: src_b\n  config:\n    name: src_b\n    type: csv\n    path: b.csv\n    schema:\n      - { name: id, type: string }\n\
+- type: merge\n  name: m\n  inputs: [src_a, src_b]\n\
+- type: sink\n  name: out\n  input: m\n  config:\n    name: out\n    type: csv\n    path: out.csv\n",
+        );
+        let wide = layout.bucket_for_source("src_a").expect("pipeline bucket");
+        let own = layout.bucket_for_source("src_b").expect("per-source bucket");
+        let (first, second) = if wide < own { (wide, own) } else { (own, wide) };
+
+        let mut report = DlqReport::default();
+        assert_eq!(report.top_stage_category(), None);
+        report.record(Some("tfm"), DlqErrorCategory::ValidationFailure);
+        report.record(Some("tfm"), DlqErrorCategory::TypeCoercionFailure);
+        report.record(None, DlqErrorCategory::TypeCoercionFailure);
+        report.record(Some("tfm"), DlqErrorCategory::ValidationFailure);
+        report.record(None, DlqErrorCategory::TypeCoercionFailure);
+
+        assert_eq!(
+            report.for_stage("tfm").collect::<Vec<_>>(),
+            [
+                (DlqErrorCategory::TypeCoercionFailure, 1),
+                (DlqErrorCategory::ValidationFailure, 2),
+            ]
+        );
+        assert_eq!(
+            report.for_stage("").collect::<Vec<_>>(),
+            [(DlqErrorCategory::TypeCoercionFailure, 2)]
+        );
+        assert_eq!(report.for_stage("absent").count(), 0);
+        assert_eq!(
+            report.top_stage_category(),
+            Some(("", DlqErrorCategory::TypeCoercionFailure, 2)),
+            "a tie goes to the pair first in stage order"
+        );
+
+        report.record_bucket_row(second, Path::new("second.csv"));
+        report.record_bucket_row(first, Path::new("first.csv"));
+        report.record_bucket_row(second, Path::new("second.csv"));
+        assert_eq!(
+            report.bucket_rows(),
+            [
+                (PathBuf::from("first.csv"), 1),
+                (PathBuf::from("second.csv"), 2),
+            ],
+            "bucket rows are reported in bucket order, whatever order they arrived in"
+        );
     }
 }

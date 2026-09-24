@@ -8,6 +8,7 @@
 
 pub mod attempt;
 pub mod containment;
+pub mod dlq_sink;
 pub mod open;
 pub mod sidecar;
 pub mod staging;
