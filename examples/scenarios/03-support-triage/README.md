@@ -93,7 +93,7 @@ first match wins and the `default:` catches the rest.
 
 ## Reading the DLQ
 
-`output/rejected.csv` has 6 rows and 23 columns. The engine-stamped ones carry
+`output/rejected.csv` has 6 rows and 24 columns. The engine-stamped ones carry
 the diagnosis — this is the first entry:
 
 | column | value |

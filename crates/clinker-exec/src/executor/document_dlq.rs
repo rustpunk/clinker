@@ -719,14 +719,14 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
         source_row: SourceRowId,
     ) -> Result<(), PipelineError> {
         if self.decided.contains(&key) {
-            let is_failed = ctx
+            let cause = ctx
                 .document_dlq
                 .as_ref()
-                .is_some_and(|s| s.failed.contains_key(&key));
-            if is_failed {
-                push_document_collateral(ctx, &key, record, source_row)?;
-            } else {
-                self.write_through(ctx, record, source_row)?;
+                .and_then(|s| s.failed.get(&key))
+                .map(|trigger| trigger.failed_at);
+            match cause {
+                Some(cause) => push_document_collateral(ctx, &key, record, source_row, &cause)?,
+                None => self.write_through(ctx, record, source_row)?,
             }
             return Ok(());
         }
@@ -1001,12 +1001,14 @@ fn spill_bucket_in_place(
 
 /// Emit one `DocumentRejected` collateral for a single late record that
 /// arrived after its document was already decided-failed. Counts toward the
-/// DLQ rate like every other collateral.
+/// DLQ rate like every other collateral. `cause` is the document trigger's
+/// stamp: the record is condemned now, by that failure.
 fn push_document_collateral(
     ctx: &mut ExecutorContext<'_>,
     key: &DocKey,
     record: Record,
     source_row: SourceRowId,
+    cause: &DlqFailureStamp,
 ) -> Result<(), PipelineError> {
     let source_name = source_name_arc_of(&record);
     push_dlq(
@@ -1022,7 +1024,7 @@ fn push_document_collateral(
             source_name,
             triggering_field: None,
             triggering_value: None,
-            failed_at: DlqFailureStamp::now(),
+            failed_at: DlqFailureStamp::condemned_by(cause),
         },
     )
 }
@@ -1131,6 +1133,12 @@ fn reject_document_now(
         return Ok(());
     };
 
+    // Collaterals are condemned by the document's trigger and carry its
+    // failure id. Both callers reject only a document whose trigger is in
+    // the failed map, so a rejection always takes one; were it ever to take
+    // none, there would be no failure to name and each collateral would
+    // stand alone under its own id.
+    let cause = trigger.as_ref().map(|t| t.failed_at);
     if let Some(t) = trigger {
         push_dlq(
             ctx,
@@ -1152,6 +1160,10 @@ fn reject_document_now(
     // Collaterals are stamped as the document is rejected: that is when
     // the engine condemns them, not when a sibling failed.
     for (record, source_row, source_name) in collaterals {
+        let failed_at = match &cause {
+            Some(cause) => DlqFailureStamp::condemned_by(cause),
+            None => DlqFailureStamp::now(),
+        };
         push_dlq(
             ctx,
             DlqEntry {
@@ -1165,7 +1177,7 @@ fn reject_document_now(
                 source_name,
                 triggering_field: None,
                 triggering_value: None,
-                failed_at: DlqFailureStamp::now(),
+                failed_at,
             },
         )?;
     }
