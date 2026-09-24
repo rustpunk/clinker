@@ -702,6 +702,7 @@ pipeline:
   name: composition_relaxed_runtime
 error_handling:
   strategy: continue
+  dlq: { path: dlq.csv }
 nodes:
   - type: source
     name: src
@@ -791,10 +792,11 @@ o6,ENG,300
     // touching CWD — `CompileContext::default()` reads CWD at call
     // time, which is not safe under cargo's default parallel test
     // runner.
+    let sink = crate::test_support::CaptureDlqSink::new();
     let report = PipelineExecutor::run_with_readers_writers_in_context(
         &config,
         readers,
-        writers.into(),
+        sink.registry(writers),
         &params,
         ctx,
     )
@@ -806,16 +808,14 @@ o6,ENG,300
          correlation_buffers + body-scoped detect/recompute path; got {}",
         report.counters.dlq_count
     );
-    let hr_dlq = report.dlq_entries.iter().find(|e| {
-        e.original_record
-            .values()
-            .iter()
-            .any(|v| matches!(v, clinker_record::Value::String(s) if s.as_str() == "HR"))
-    });
+    let dlq_rows = sink.rows();
+    let hr_dlq = dlq_rows
+        .iter()
+        .find(|row| row.field("department") == Some("HR"));
     assert!(
         hr_dlq.is_some(),
-        "DLQ must carry an entry whose original_record references HR; got: {:?}",
-        report.dlq_entries
+        "DLQ must carry a row whose source record references HR; got: {:?}",
+        dlq_rows
     );
 
     // Body→parent harvest + continuation dispatch: ENG's surviving
@@ -948,6 +948,7 @@ pipeline:
   name: recursive_composition_runtime
 error_handling:
   strategy: continue
+  dlq: { path: dlq.csv }
 nodes:
   - type: source
     name: src
@@ -1026,10 +1027,11 @@ o6,ENG,300
         shutdown_token: None,
         ..Default::default()
     };
+    let sink = crate::test_support::CaptureDlqSink::new();
     let report = PipelineExecutor::run_with_readers_writers_in_context(
         &config,
         readers,
-        writers.into(),
+        sink.registry(writers),
         &params,
         ctx,
     )
@@ -1047,17 +1049,15 @@ o6,ENG,300
          recursive commit-time dispatch path; got {}",
         report.counters.dlq_count
     );
-    let hr_dlq = report.dlq_entries.iter().find(|e| {
-        e.original_record
-            .values()
-            .iter()
-            .any(|v| matches!(v, clinker_record::Value::String(s) if s.as_str() == "HR"))
-    });
+    let dlq_rows = sink.rows();
+    let hr_dlq = dlq_rows
+        .iter()
+        .find(|row| row.field("department") == Some("HR"));
     assert!(
         hr_dlq.is_some(),
         "DLQ must carry the HR-tagged trigger from the inner body's \
          deferred region; got: {:?}",
-        report.dlq_entries
+        dlq_rows
     );
 
     // Body→parent harvest chains across both nesting levels: the
