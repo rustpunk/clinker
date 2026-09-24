@@ -15,7 +15,7 @@ spill handling, DLQ behavior, metrics/reporting, and runtime I/O handoff.
 - Drive finite Source nodes through `RecordSource` / `SourceInput`.
 - Dispatch runtime operators: source, transform, aggregate, combine, route, merge, reshape, cull, envelope, composition, output, and correlation commit.
 - Preserve bounded-memory behavior through `MemoryArbitrator`, node buffers, streaming handoff, backpressure, and spill.
-- Own runtime reports: counters, DLQ entries, stage metrics, watermarks, rollback cursors, spill totals, RSS peaks, and interrupted status.
+- Own runtime reports: counters, DLQ counts (per source, and per stage, category and bucket in `DlqReport`), stage metrics, watermarks, rollback cursors, spill totals, RSS peaks, and interrupted status.
 - Keep runtime execution synchronous with `std::thread`, bounded `crossbeam_channel`, and Rayon CPU kernels.
 
 ## Important public APIs
@@ -25,6 +25,8 @@ spill handling, DLQ behavior, metrics/reporting, and runtime I/O handoff.
 - `PipelineExecutor::{explain_plan, explain_plan_dag}`.
 - `executor::{PipelineRunParams, ExecutionReport, WriterRegistry, SourceReaders}`.
 - `executor::single_file_reader`.
+- `dlq::{DlqSink, DlqRowWriter, DiscardingDlqSink, DlqReport}`: the caller-supplied dead-letter seam; the executor streams each dead-lettered row through the sink and the report keeps only counts.
+- `output::dlq_sink::StagedDlqSink`: the staged-file `DlqSink` the CLI supplies.
 - `source::{RecordSource, SourceInput}`.
 - `executor::storage_validate::{validate_storage_config, ResolvedStorage, StorageValidationError, FreeSpaceWarning, CapHeadroomWarning}`.
 - `pipeline::memory::{MemoryArbitrator, MemoryConsumer, ArbitrationPolicy, ConsumerHandle, build_policy}`.
