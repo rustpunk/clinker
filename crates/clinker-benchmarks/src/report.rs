@@ -400,6 +400,7 @@ mod tests {
         let mut report = ExecutionReport {
             counters: Default::default(),
             dlq_entries: Vec::new(),
+            dead_letters: clinker_exec::dlq::DlqReport::default(),
             execution_summary: "Streaming".to_string(),
             required_arena: false,
             peak_rss_bytes: Some(25_000_000),
@@ -500,6 +501,7 @@ mod tests {
         let report = ExecutionReport {
             counters: Default::default(),
             dlq_entries: Vec::new(),
+            dead_letters: clinker_exec::dlq::DlqReport::default(),
             execution_summary: String::new(),
             required_arena: false,
             peak_rss_bytes: None,

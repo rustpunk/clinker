@@ -756,6 +756,7 @@ fn preview_writer_registry(
         fan_out_paths: std::collections::HashMap::new(),
         output_staging: Default::default(),
         auto_commit_staged: false,
+        dlq_sink: None,
     })
 }
 
@@ -3789,6 +3790,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         fan_out_paths,
         output_staging: output_staging.clone(),
         auto_commit_staged: false,
+        dlq_sink: None,
     };
     let run_params = clinker_exec::executor::PipelineRunParams {
         execution_id: execution_id.clone(),
