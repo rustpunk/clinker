@@ -2689,6 +2689,106 @@ nodes:
         assert_eq!(artifacts[0].rows, 3);
     }
 
+    /// `src → tfm → out` under a pipeline-wide dead-letter `path`, where
+    /// `tfm` divides by `d`: a row with `d = 0` dead-letters into the bucket.
+    /// Runs `csv` with no dead-letter sink supplied.
+    fn run_without_dlq_sink(
+        dlq_path: &std::path::Path,
+        csv: &str,
+    ) -> Result<ExecutionReport, PipelineError> {
+        let config = clinker_plan::config::parse_config(&format!(
+            r#"
+pipeline:
+  name: missing_dead_letter_sink
+error_handling:
+  strategy: continue
+  dlq:
+    path: {}
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: src.csv
+      schema:
+        - {{ name: id, type: int }}
+        - {{ name: amt, type: int }}
+        - {{ name: d, type: int }}
+  - type: transform
+    name: tfm
+    input: src
+    config:
+      cxl: |
+        emit id = id
+        emit ratio = amt / d
+  - type: sink
+    name: out
+    input: tfm
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#,
+            dlq_path.display()
+        ))
+        .expect("pipeline parses");
+        let readers: SourceReaders = HashMap::from([(
+            "src".to_string(),
+            SourceInput::Files(vec![crate::source::multi_file::FileSlot::new(
+                std::path::PathBuf::from("src.csv"),
+                Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+            )]),
+        )]);
+        let writers = WriterRegistry {
+            single: HashMap::from([(
+                "out".to_string(),
+                Box::new(std::io::sink()) as Box<dyn std::io::Write + Send>,
+            )]),
+            auto_commit_staged: false,
+            ..WriterRegistry::default()
+        };
+        assert!(writers.dlq_sink.is_none(), "the caller supplies no sink");
+        PipelineExecutor::run_with_readers_writers(
+            &config,
+            readers,
+            writers,
+            &PipelineRunParams::default(),
+        )
+    }
+
+    #[test]
+    fn missing_sink_with_a_bucketed_row_is_internal() {
+        let root = tempfile::tempdir().expect("destination root");
+        let dlq_path = root.path().join("rejects.csv");
+        let error = run_without_dlq_sink(&dlq_path, "id,amt,d\n1,10,2\n2,20,0\n3,30,3\n")
+            .expect_err("a dead letter with a destination and no sink fails the run");
+        let PipelineError::Internal { op, node, detail } = &error else {
+            panic!("expected PipelineError::Internal, got {error:?}");
+        };
+        assert_eq!(*op, "dead-letter", "{error}");
+        assert_eq!(node, &dlq_path.display().to_string(), "names the bucket");
+        assert!(detail.contains("no dead-letter sink"), "{detail}");
+        assert!(
+            error.to_string().contains(&dlq_path.display().to_string()),
+            "the rendered error names the bucket path: {error}"
+        );
+        assert!(!dlq_path.exists(), "nothing is written or published");
+    }
+
+    #[test]
+    fn missing_sink_without_dead_letters_runs_clean() {
+        let root = tempfile::tempdir().expect("destination root");
+        let dlq_path = root.path().join("rejects.csv");
+        let report = run_without_dlq_sink(&dlq_path, "id,amt,d\n1,10,2\n2,20,4\n3,30,3\n")
+            .expect("a run with no dead letters needs no sink");
+        assert_eq!(report.counters.total_count, 3);
+        assert_eq!(report.counters.ok_count, 3);
+        assert_eq!(report.counters.dlq_count, 0);
+        assert!(report.dead_letters.bucket_rows().is_empty());
+        assert!(!dlq_path.exists());
+    }
+
     /// A JSON source feeding a CSV Sink directly, which dispatches on the
     /// buffered Sink arm. Every row's `tags` value contains the join
     /// delimiter, so every row is a `join_values` collision at the Sink.
