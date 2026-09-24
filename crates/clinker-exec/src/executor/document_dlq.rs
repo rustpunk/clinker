@@ -2715,4 +2715,292 @@ mod tests {
             "the clean Mixed bucket drains in arrival order (spilled head, then resident tail)"
         );
     }
+
+    /// A document state over `arbitrator` whose held log spills into `root`,
+    /// polling the soft threshold every `batch_size` holds.
+    fn held_state(
+        arbitrator: &Arc<MemoryArbitrator>,
+        root: &std::path::Path,
+        batch_size: usize,
+    ) -> DocumentDlqState {
+        DocumentDlqState::new(
+            HashSet::from([Arc::from("orders")]),
+            Arc::clone(arbitrator),
+            HeldLogConfig {
+                spill_root: Arc::from(root),
+                compress: CompressMode::Auto,
+                batch_size,
+            },
+        )
+    }
+
+    /// Hold row `ordinal` of document `doc` as a failure at `validate`.
+    fn hold_row(
+        state: &mut DocumentDlqState,
+        doc: &DocKey,
+        ordinal: u64,
+    ) -> Result<(), PipelineError> {
+        let source_name: Arc<str> = Arc::from("orders");
+        let bytes = format!("{doc},{ordinal},{}\n", "x".repeat(160)).into_bytes();
+        state.hold(
+            Arc::clone(doc),
+            &HeldRow {
+                source_row: row(1, ordinal),
+                source_name: &source_name,
+                stage: Some("transform:validate"),
+                category: clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
+                failed_at: DlqFailureStamp::now(),
+            },
+            Some(&bytes),
+            "validate",
+        )
+    }
+
+    fn doc_key(n: usize) -> DocKey {
+        Arc::from(format!("d{n:02}.csv"))
+    }
+
+    fn files_in(root: &std::path::Path) -> usize {
+        std::fs::read_dir(root).expect("spill root").count()
+    }
+
+    #[test]
+    fn held_rows_flush_on_a_spill_request() {
+        let root = tempfile::tempdir().expect("spill root");
+        let arbitrator = ledger_arbitrator(1 << 30);
+        let mut state = held_state(&arbitrator, root.path(), 1 << 20);
+        let docs: Vec<DocKey> = (0..3).map(doc_key).collect();
+        let mut ordinal = 0;
+        for doc in &docs {
+            for _ in 0..4 {
+                ordinal += 1;
+                hold_row(&mut state, doc, ordinal).expect("hold");
+            }
+        }
+        let fixed = state.held.index_bytes() + 3 * FAILED_DOCUMENT_BYTES;
+        assert!(state.held.resident_bytes() > 0);
+        assert_eq!(
+            arbitrator.sum_consumer_usage(),
+            state.held.resident_bytes() + fixed,
+            "the resident rows, the index and the failed-document slots are charged"
+        );
+        assert_eq!(files_in(root.path()), 0, "nothing spills without a signal");
+
+        // The arbitrator elects the state's consumer; the next hold answers.
+        arbitrator.spill_reclaimable(1);
+        ordinal += 1;
+        hold_row(&mut state, &docs[0], ordinal).expect("hold");
+        assert_eq!(files_in(root.path()), 1, "the held rows moved to one file");
+        assert!(arbitrator.cumulative_spill_bytes() > 0);
+        let new_frame = state.held.resident_bytes();
+        assert!(
+            new_frame > 0,
+            "the frame held after the flush stays resident"
+        );
+        assert_eq!(
+            arbitrator.sum_consumer_usage(),
+            fixed + new_frame,
+            "usage drops to the index and slots plus the new frame"
+        );
+        assert_eq!(
+            arbitrator.per_stage_spill_bytes().get("validate").copied(),
+            Some(arbitrator.cumulative_spill_bytes()),
+            "the flush is attributed to the failing node"
+        );
+        let expected: Vec<SourceRowId> = (1..=4).chain([13]).map(|n| row(1, n)).collect();
+        assert_eq!(take_held_rows(&mut state, &docs[0]), expected);
+    }
+
+    #[test]
+    fn held_rows_flush_before_the_hard_limit() {
+        let root = tempfile::tempdir().expect("spill root");
+        // Every held frame is about 190 bytes; 600 of them are well past the
+        // limit, and three index entries and slots are well inside it. No
+        // policy elects a victim and the soft threshold is polled only at a
+        // decision, so every flush here is the hard-limit preflight's.
+        let limit = 32 * 1024;
+        let arbitrator = ledger_arbitrator(limit);
+        let mut state = held_state(&arbitrator, root.path(), usize::MAX);
+        let docs: Vec<DocKey> = (0..3).map(doc_key).collect();
+        let mut held: HashMap<DocKey, Vec<SourceRowId>> = HashMap::new();
+        for ordinal in 1..=600u64 {
+            let doc = &docs[(ordinal % 3) as usize];
+            hold_row(&mut state, doc, ordinal).expect("every failure is held");
+            held.entry(Arc::clone(doc))
+                .or_default()
+                .push(row(1, ordinal));
+            assert!(
+                arbitrator.sum_consumer_usage() <= limit,
+                "the charge never passes the hard limit"
+            );
+        }
+        assert!(
+            arbitrator.cumulative_spill_bytes() > 190 * 600 / 2,
+            "most held rows went to disk"
+        );
+        assert_eq!(files_in(root.path()), 1);
+        for doc in &docs {
+            assert_eq!(
+                take_held_rows(&mut state, doc),
+                held[doc],
+                "a rejection replays every held row in order"
+            );
+        }
+    }
+
+    #[test]
+    fn held_log_entry_growth_past_the_hard_limit_is_e310() {
+        let root = tempfile::tempdir().expect("spill root");
+        let arbitrator = ledger_arbitrator(1 << 30);
+        let mut state = held_state(&arbitrator, root.path(), usize::MAX);
+        let (first, second) = (doc_key(0), doc_key(1));
+        hold_row(&mut state, &first, 1).expect("hold");
+        let charged = arbitrator.sum_consumer_usage();
+        // Room for the first document's slot and entry, and for its row once
+        // it is flushed, but not for a second document's slot and entry.
+        arbitrator
+            .set_limit(charged + FAILED_DOCUMENT_BYTES / 2)
+            .expect("limit");
+        match hold_row(&mut state, &second, 2) {
+            Err(PipelineError::MemoryBudgetExceeded {
+                node,
+                source,
+                detail,
+                ..
+            }) => {
+                assert_eq!(node, "validate");
+                assert_eq!(source, clinker_plan::BudgetCategory::Arena);
+                assert!(
+                    detail.is_some_and(|d| d.contains("held dead-letter rows")),
+                    "the detail names the held rows"
+                );
+            }
+            other => panic!("expected E310, got {other:?}"),
+        }
+        assert!(
+            !state.failed.contains_key(&second),
+            "the document is not marked"
+        );
+        assert!(!state.held.contains(&second), "nothing is held for it");
+        assert_eq!(
+            take_held_rows(&mut state, &first),
+            [row(1, 1)],
+            "the first document's row survives the refusal's flush"
+        );
+    }
+
+    #[test]
+    fn held_log_past_the_disk_cap_is_e320() {
+        let root = tempfile::tempdir().expect("spill root");
+        let arbitrator = ledger_arbitrator(1 << 30);
+        arbitrator.set_max_spill_bytes(16).expect("cap");
+        let mut state = held_state(&arbitrator, root.path(), usize::MAX);
+        let doc = doc_key(0);
+        hold_row(&mut state, &doc, 1).expect("hold");
+        arbitrator.spill_reclaimable(1);
+        match hold_row(&mut state, &doc, 2) {
+            Err(PipelineError::SpillCapExceeded { node, cap, .. }) => {
+                assert_eq!(node, "validate");
+                assert_eq!(cap, 16);
+            }
+            other => panic!("expected E320, got {other:?}"),
+        }
+        drop(state);
+        assert_eq!(
+            files_in(root.path()),
+            0,
+            "the refused run leaves no held file"
+        );
+    }
+
+    #[test]
+    fn dropping_the_state_removes_the_held_file_and_consumer() {
+        let root = tempfile::tempdir().expect("spill root");
+        let arbitrator = ledger_arbitrator(1 << 30);
+        let consumers_before = arbitrator.consumer_count();
+        let usage_before = arbitrator.sum_consumer_usage();
+        let mut state = held_state(&arbitrator, root.path(), usize::MAX);
+        hold_row(&mut state, &doc_key(0), 1).expect("hold");
+        arbitrator.spill_reclaimable(1);
+        hold_row(&mut state, &doc_key(1), 2).expect("hold");
+        assert_eq!(files_in(root.path()), 1, "the flush created the held file");
+        drop(state);
+        assert_eq!(
+            files_in(root.path()),
+            0,
+            "the held file goes with the state"
+        );
+        assert_eq!(arbitrator.consumer_count(), consumers_before);
+        assert_eq!(arbitrator.sum_consumer_usage(), usage_before);
+    }
+
+    /// While it holds resident rows the state's consumer is elected with the
+    /// node buffers, ahead of any consumer that cannot spill, and a spill
+    /// request flushes them; holding only ledgers, it behaves as a consumer
+    /// that cannot spill and never shadows a node buffer.
+    #[test]
+    fn held_log_consumer_is_elected_with_node_buffers_while_it_holds_rows() {
+        use crate::pipeline::memory::{ArbitrationPolicy, BackPressurePreferred, Priority};
+
+        let root = tempfile::tempdir().expect("spill root");
+        let arbitrator = ledger_arbitrator(1 << 30);
+        let mut state = held_state(&arbitrator, root.path(), usize::MAX);
+        for ordinal in 1..=100 {
+            hold_row(&mut state, &doc_key(0), ordinal).expect("hold");
+        }
+        let held_consumer =
+            DocumentDlqConsumer::new(Arc::clone(&state.handle), state.held.resident_gauge());
+        let node_handle = ConsumerHandle::new();
+        node_handle.set_bytes(16);
+        let node_consumer = crate::executor::node_buffer::NodeBufferConsumer::new(node_handle);
+        let ledger_handle = ConsumerHandle::new();
+        ledger_handle.set_bytes(1 << 20);
+        let ledger_only = DocumentDlqConsumer::new(ledger_handle, Arc::new(AtomicU64::new(0)));
+        let node_id = arbitrator.register_consumer(Arc::new(
+            crate::executor::node_buffer::NodeBufferConsumer::new(ConsumerHandle::new()),
+        ));
+        let ledger_id = arbitrator.register_consumer(Arc::new(
+            crate::executor::node_buffer::NodeBufferConsumer::new(ConsumerHandle::new()),
+        ));
+        let snapshot: [(ConsumerId, &dyn MemoryConsumer); 3] = [
+            (ledger_id, &ledger_only),
+            (node_id, &node_consumer),
+            (state.consumer_id, &held_consumer),
+        ];
+
+        assert_eq!(held_consumer.spill_priority(), 0);
+        assert_eq!(ledger_only.spill_priority(), i32::MAX);
+        assert_eq!(
+            Priority.select_victim(&snapshot, 1 << 20),
+            Some(state.consumer_id)
+        );
+        assert_eq!(
+            BackPressurePreferred::wrapping(Priority).select_victim(&snapshot, 1 << 20),
+            Some(state.consumer_id)
+        );
+        let resident = state.held.resident_bytes();
+        match held_consumer.try_spill(1 << 30) {
+            Err(ConsumerSpillError::BelowTarget { freed, .. }) => assert_eq!(freed, resident),
+            other => panic!("the held rows are what it frees: {other:?}"),
+        }
+        assert!(!held_consumer.can_back_pressure());
+
+        // The request is answered on the next hold, which flushes.
+        hold_row(&mut state, &doc_key(0), 101).expect("hold");
+        state
+            .held
+            .flush_all(&arbitrator, "validate")
+            .expect("flush");
+        assert_eq!(state.held.resident_bytes(), 0);
+        assert_eq!(held_consumer.spill_priority(), i32::MAX);
+        assert_eq!(Priority.select_victim(&snapshot, 1 << 20), Some(node_id));
+        match held_consumer.try_spill(1) {
+            Err(ConsumerSpillError::BelowTarget { freed, .. }) => assert_eq!(freed, 0),
+            other => panic!("with no resident rows it frees nothing: {other:?}"),
+        }
+        assert!(
+            !state.handle.take_spill_request(),
+            "with no resident rows it raises no request"
+        );
+    }
 }
