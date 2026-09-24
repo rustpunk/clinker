@@ -51,7 +51,7 @@ use context::{SourceRuntimePolicy, build_stable_eval_context};
 #[cfg(feature = "test-utils")]
 #[doc(hidden)]
 pub use dispatch::DispatchFaultGuard;
-pub use dlq::DlqEntry;
+pub use dlq::{DlqEntry, DlqFailureStamp};
 pub(crate) use dlq::{SourceRejectionEvent, SourceRejectionKind};
 pub use ingest::build_source_format_reader;
 use ingest::{IngestTaskOutcome, ingest_source};

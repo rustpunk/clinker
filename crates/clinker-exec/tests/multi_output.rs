@@ -20,7 +20,9 @@ use clinker_record::owned_storage::SharedStorage;
 use std::collections::HashMap;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_exec::executor::{DlqEntry, ExecutionReport, PipelineRunParams, SourceRowId};
+use clinker_exec::executor::{
+    DlqEntry, DlqFailureStamp, ExecutionReport, PipelineRunParams, SourceRowId,
+};
 use clinker_exec::pipeline::shutdown::ShutdownToken;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::{EntityRef, PlanNodeId};
@@ -1592,6 +1594,7 @@ fn test_dlq_stage_source() {
         source_name: std::sync::Arc::from("test_source"),
         triggering_field: None,
         triggering_value: None,
+        failed_at: DlqFailureStamp::now(),
     };
     assert_eq!(entry.stage, Some("source".to_string()));
     assert_eq!(entry.route, None);
@@ -1755,6 +1758,7 @@ fn test_dlq_stage_output() {
         source_name: std::sync::Arc::from("test_source"),
         triggering_field: None,
         triggering_value: None,
+        failed_at: DlqFailureStamp::now(),
     };
     assert_eq!(entry.stage, Some("output:results".to_string()));
     assert_eq!(entry.route, Some("high_value".to_string()));
@@ -1873,6 +1877,7 @@ nodes:
         source_name: std::sync::Arc::from("test_source"),
         triggering_field: None,
         triggering_value: None,
+        failed_at: DlqFailureStamp::now(),
     }];
 
     let output = dlq_encode::dlq_csv(&plan, &entries);

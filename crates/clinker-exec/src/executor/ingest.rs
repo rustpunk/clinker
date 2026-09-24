@@ -1495,6 +1495,7 @@ fn drive_record_source(
                             record: rep_record,
                             row_num: rejected_row_id,
                             message: other.to_string(),
+                            failed_at: crate::executor::DlqFailureStamp::now(),
                         };
                         emit_structural_reject_close(
                             &mut stream,

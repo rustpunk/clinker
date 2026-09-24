@@ -93,7 +93,9 @@ impl DlqRowEncoder {
 
     /// One CSV row for `entry` under `bucket`'s header, terminator included.
     ///
-    /// The engine columns carry the entry's identity and reason; each user
+    /// The engine columns carry the entry's identity and reason; the id and
+    /// timestamp columns render the entry's [`DlqEntry::failed_at`] stamp, so
+    /// encoding an entry twice yields the same row; each user
     /// column is placed at its header position, and a header column the
     /// record lacks is an empty cell. A user column of the record that the
     /// bucket's compiled header does not admit is a planner defect: it returns
@@ -122,10 +124,15 @@ impl DlqRowEncoder {
         writer.get_ref().0.set(buffer);
 
         let record = &entry.original_record;
-        let id = uuid::Uuid::now_v7().to_string();
-        let timestamp = chrono::Utc::now().to_rfc3339();
-        writer.write_field(id).map_err(csv_error)?;
-        writer.write_field(timestamp).map_err(csv_error)?;
+        // The id and time were stamped where the failure was observed; the
+        // encoder renders them and never generates its own.
+        let mut id = uuid::Uuid::encode_buffer();
+        writer
+            .write_field(entry.failed_at.id().hyphenated().encode_lower(&mut id))
+            .map_err(csv_error)?;
+        writer
+            .write_field(entry.failed_at.at().to_rfc3339())
+            .map_err(csv_error)?;
         writer
             .write_field(source_file_of(entry))
             .map_err(csv_error)?;
@@ -650,6 +657,7 @@ nodes:\n- type: source\n  name: src\n  config:\n    name: src\n    type: csv\n  
             source_name: Arc::from(source),
             triggering_field: None,
             triggering_value: None,
+            failed_at: crate::executor::DlqFailureStamp::now(),
         }
     }
 
@@ -1012,8 +1020,24 @@ nodes:
         assert!(ids.iter().all(|id| id.get_version_num() == 7));
         assert!(
             ids.windows(2).all(|w| w[0] < w[1]),
-            "ids increase in write order, so they are also distinct"
+            "ids increase in the order the entries were stamped, so they are also distinct"
         );
+    }
+
+    #[test]
+    fn row_renders_the_failure_stamp_and_generates_nothing() {
+        let layout = compiled_layout(&one_source_pipeline(
+            "    path: rejects.csv\n",
+            &["name", "value"],
+        ));
+        let entry = name_value_entry(1, DlqErrorCategory::TypeCoercionFailure, "e");
+        let (_, rows) = encode(&layout, &[entry.clone(), entry.clone()]);
+        let stamp = entry.failed_at;
+        for row in &rows {
+            assert_eq!(row[0], stamp.id().hyphenated().to_string());
+            assert_eq!(row[1], stamp.at().to_rfc3339());
+        }
+        assert_eq!(rows[0], rows[1], "encoding an entry twice yields one row");
     }
 
     #[test]

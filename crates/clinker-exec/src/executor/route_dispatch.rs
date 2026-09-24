@@ -20,7 +20,7 @@ use crate::executor::dispatch::{
     source_name_arc_of, stream_linear_producer_emit,
 };
 use crate::executor::schema_check::check_input_schema;
-use crate::executor::{CompiledRoute, DlqEntry};
+use crate::executor::{CompiledRoute, DlqEntry, DlqFailureStamp};
 use clinker_plan::BudgetCategory;
 use clinker_plan::config::ErrorStrategy;
 use clinker_plan::error::PipelineError;
@@ -244,6 +244,7 @@ where
                 if ctx.strategy == ErrorStrategy::FailFast {
                     return Err(route_err.into());
                 }
+                let failed_at = DlqFailureStamp::now();
                 let stage = Some(DlqEntry::stage_route_eval());
                 let routed = record_error_to_buffer_if_grouped(
                     ctx,
@@ -253,6 +254,7 @@ where
                     route_err.to_string(),
                     stage.clone(),
                     None,
+                    failed_at,
                 );
                 let triggering_field = route_err.triggering_field.clone();
                 let triggering_value = route_err.triggering_value();
@@ -271,6 +273,7 @@ where
                         None,
                         triggering_field.clone(),
                         triggering_value.clone(),
+                        failed_at,
                     );
                 if !routed && !marked {
                     let source_name = source_name_arc_of(&record);
@@ -288,6 +291,7 @@ where
                             source_name,
                             triggering_field,
                             triggering_value,
+                            failed_at,
                         },
                     )?;
                 }

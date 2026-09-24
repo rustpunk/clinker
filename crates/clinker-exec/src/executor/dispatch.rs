@@ -844,6 +844,7 @@ fn route_source_rejection(
                     source_name: event.source_name,
                     triggering_field: Some(Arc::from(event.triggering_field)),
                     triggering_value: Some(event.triggering_value),
+                    failed_at: event.failed_at,
                 };
                 push_dlq(ctx, entry)?;
             }
@@ -1031,7 +1032,9 @@ pub(crate) fn buffer_key_for_record(
 /// per-record DLQ path. Buffer admission bumps `total_records`,
 /// tripping the overflow flag once `max_group_buffer` is exceeded.
 /// Null-keyed records get a row-number-disambiguated cell so each is
-/// its own group of one.
+/// its own group of one. `failed_at` is the stamp the caller took when it
+/// observed the failure; the parked error keeps it until the group commits.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_error_to_buffer_if_grouped(
     ctx: &mut ExecutorContext<'_>,
     record: &Record,
@@ -1040,6 +1043,7 @@ pub(crate) fn record_error_to_buffer_if_grouped(
     error_message: String,
     stage: Option<String>,
     route: Option<String>,
+    failed_at: DlqFailureStamp,
 ) -> bool {
     if ctx.correlation_buffers.is_none() {
         return false;
@@ -1063,6 +1067,7 @@ pub(crate) fn record_error_to_buffer_if_grouped(
         error_message,
         stage,
         route,
+        failed_at,
     });
     true
 }
@@ -1099,6 +1104,7 @@ pub(crate) fn dispatch_transform_eval_error(
         }
         _ => clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
     };
+    let failed_at = DlqFailureStamp::now();
     let stage = Some(DlqEntry::stage_transform(&transform_name));
     let routed = record_error_to_buffer_if_grouped(
         ctx,
@@ -1108,6 +1114,7 @@ pub(crate) fn dispatch_transform_eval_error(
         eval_err.to_string(),
         stage.clone(),
         None,
+        failed_at,
     );
     if routed {
         return Ok(());
@@ -1128,6 +1135,7 @@ pub(crate) fn dispatch_transform_eval_error(
         None,
         triggering_field.clone(),
         triggering_value.clone(),
+        failed_at,
     );
     if marked {
         return Ok(());
@@ -1146,6 +1154,7 @@ pub(crate) fn dispatch_transform_eval_error(
             source_name,
             triggering_field,
             triggering_value,
+            failed_at,
         },
     )
 }
@@ -1223,12 +1232,13 @@ pub(crate) fn sink_collision_dlq_entry(
         source_name: source_name_arc_of(record),
         triggering_field: Some(Arc::from(column)),
         triggering_value: Some(value),
+        failed_at: DlqFailureStamp::now(),
     })
 }
 
 use crate::executor::node_buffer::{NodeBuffer, TransientNodeBufferReservation};
 use crate::executor::schema_check::check_input_schema;
-use crate::executor::{DlqEntry, evaluate_single_transform, stage_metrics};
+use crate::executor::{DlqEntry, DlqFailureStamp, evaluate_single_transform, stage_metrics};
 use clinker_plan::BudgetCategory;
 use clinker_plan::plan::composition_body::CompositionBodies;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
@@ -5117,6 +5127,9 @@ pub(crate) struct CorrelationErrorRecord {
     pub(crate) error_message: String,
     pub(crate) stage: Option<String>,
     pub(crate) route: Option<String>,
+    /// Taken when the failure was observed; the trigger entry the commit
+    /// emits for this row carries it.
+    pub(crate) failed_at: DlqFailureStamp,
 }
 
 #[cfg(test)]
@@ -5143,6 +5156,7 @@ mod dlq_capture_tests {
             source_name: Arc::from("src"),
             triggering_field: None,
             triggering_value: None,
+            failed_at: DlqFailureStamp::now(),
         }
     }
 

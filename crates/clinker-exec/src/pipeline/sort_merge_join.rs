@@ -1752,6 +1752,7 @@ fn handle_on_miss(
                         row: driver.order,
                         matched_build: None,
                         error: e,
+                        failed_at: crate::executor::DlqFailureStamp::now(),
                     });
                     fail.failure_tags
                         .push((driver.order, driver.idx, MISS_BUILD_TAG));
@@ -1892,6 +1893,7 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
                                 row: driver_order,
                                 matched_build: Some(inner.clone()),
                                 error: e,
+                                failed_at: crate::executor::DlqFailureStamp::now(),
                             });
                             failure_tags.push((driver_order, driver_idx, build_idx));
                             continue;
@@ -1973,6 +1975,7 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
                                 row: driver_order,
                                 matched_build: Some(inner.clone()),
                                 error: e,
+                                failed_at: crate::executor::DlqFailureStamp::now(),
                             });
                             failure_tags.push(out_key);
                             continue;
@@ -2034,6 +2037,7 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
                                 row: driver_order,
                                 matched_build: Some(inner.clone()),
                                 error: e,
+                                failed_at: crate::executor::DlqFailureStamp::now(),
                             });
                             failure_tags.push(out_key);
                             // First already committed to this build; the deferred
