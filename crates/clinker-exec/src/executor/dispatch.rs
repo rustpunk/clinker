@@ -317,6 +317,16 @@ impl DlqFunnel<'_, '_> {
     pub(crate) fn push(&mut self, entry: DlqEntry) -> Result<(), PipelineError> {
         self.state.push(entry, &mut self.accounts)
     }
+
+    /// Count, write and rate-check one dead letter whose row was encoded
+    /// earlier; see [`DlqWalkState::account_row`].
+    ///
+    /// # Errors
+    ///
+    /// As [`DlqWalkState::account_row`].
+    pub(crate) fn account_row(&mut self, row: AccountedRow<'_>) -> Result<(), PipelineError> {
+        self.state.account_row(row, &mut self.accounts)
+    }
 }
 
 impl<'a> ExecutorContext<'a> {
@@ -356,6 +366,20 @@ pub(crate) struct DlqWalkState<'a> {
     capture: Vec<crate::executor::stream_event::SourceRowId>,
     /// How many captures are armed.
     capture_depth: usize,
+    /// The row [`Self::push`] encodes, kept between pushes so a push
+    /// allocates nothing per row. Holds one row at most.
+    row_scratch: Vec<u8>,
+}
+
+/// One dead letter as [`DlqWalkState::account_row`] counts and writes it: its
+/// identity, what the report records, and its encoded row, `None` when it
+/// has no destination.
+pub(crate) struct AccountedRow<'r> {
+    pub(crate) source_row: crate::executor::stream_event::SourceRowId,
+    pub(crate) source_name: &'r Arc<str>,
+    pub(crate) stage: Option<&'r str>,
+    pub(crate) category: clinker_core_types::dlq::DlqErrorCategory,
+    pub(crate) bytes: Option<&'r [u8]>,
 }
 
 /// Wrap a sink I/O error as the run's dead-letter exhaustion failure: a
@@ -398,7 +422,7 @@ pub(crate) struct DlqCaptureMark(usize);
 enum DlqWalkWriter {
     /// The run has no layout, or its caller supplied no sink. Without a
     /// layout no row has a destination; without a sink the first row that
-    /// has one fails the run (see [`DlqWalkState::write`]).
+    /// has one fails the run (see [`DlqWalkState::account_row`]).
     Absent,
     Open(Box<dyn crate::dlq::DlqRowWriter>),
     /// Closed at the end of the walk; no row may arrive after this.
@@ -439,56 +463,128 @@ impl<'a> DlqWalkState<'a> {
             report: crate::dlq::DlqReport::default(),
             capture: Vec::new(),
             capture_depth: 0,
+            row_scratch: Vec::new(),
         })
     }
 
-    /// The one implementation behind [`push_dlq`]: count `entry` in
-    /// `accounts` and the report, write its row, then check the rate
-    /// ceilings, in that order (see [`push_dlq`] for why). May block on the
-    /// sink's file I/O.
+    /// The one implementation behind [`push_dlq`]: encode `entry`'s row, then
+    /// count it, write it and check the rate ceilings through
+    /// [`Self::account_row`] (see [`push_dlq`] for the order). The row is
+    /// encoded into a buffer the state reuses, so a push allocates nothing
+    /// per row. May block on the sink's file I/O.
     ///
     /// # Errors
     ///
-    /// As [`push_dlq`]: a write error, or [`PipelineError::DlqRateExceeded`].
+    /// As [`Self::encode_row`] and [`Self::account_row`].
     pub(crate) fn push(
         &mut self,
         entry: DlqEntry,
         accounts: &mut DlqAccounts<'_>,
     ) -> Result<(), PipelineError> {
-        let source_name = Arc::clone(&entry.source_name);
-        accounts.counters.dlq_count += 1;
-        *accounts
-            .dlq_per_source
-            .entry(Arc::clone(&source_name))
-            .or_insert(0) += 1;
-        self.report.record(entry.stage.as_deref(), entry.category);
-        self.write(&entry, accounts.counters.dlq_count)?;
-        if self.capture_depth > 0 {
-            self.capture.push(entry.source_row);
-        }
-        check_dlq_rate(accounts, &source_name)
+        let mut row = std::mem::take(&mut self.row_scratch);
+        row.clear();
+        let has_row = match self.encode_row(&entry) {
+            Ok(Some(bytes)) => {
+                row.extend_from_slice(bytes);
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                self.row_scratch = row;
+                return Err(error);
+            }
+        };
+        let result = self.account_row(
+            AccountedRow {
+                source_row: entry.source_row,
+                source_name: &entry.source_name,
+                stage: entry.stage.as_deref(),
+                category: entry.category,
+                bytes: has_row.then_some(row.as_slice()),
+            },
+            accounts,
+        );
+        self.row_scratch = row;
+        result
     }
 
-    /// Encode `entry` under its bucket's header and write it, then count the
-    /// row against the bucket. An entry whose source has no bucket, or a run
-    /// whose plan has no dead-letter block, writes nothing. May block on the
-    /// sink's file I/O.
+    /// Encode `entry` as its dead-letter row under its bucket's header, or
+    /// `None` when the plan has no dead-letter block or the entry's source has
+    /// no bucket: such an entry is counted and never formatted. The bytes live
+    /// in the encoder's reusable buffer until the next encode. Touches no
+    /// counter and no writer, so a row may be encoded where its failure is
+    /// observed and accounted later (see [`Self::account_row`]).
     ///
     /// # Errors
     ///
-    /// Returns [`PipelineError::Internal`] when the record carries a column
-    /// its bucket's compiled header does not admit, when the entry has a
-    /// bucket but the caller supplied no sink (the row would otherwise be
-    /// counted and dropped), or when a row arrives after [`Self::close`]. A sink I/O error is returned as
-    /// [`PipelineError::Io`] of the same kind carrying a
-    /// [`DlqWriteFailure`](crate::dlq::DlqWriteFailure) that names the bucket
-    /// and the run's `dead_letters` so far; any other sink error as is.
-    fn write(&mut self, entry: &DlqEntry, dead_letters: u64) -> Result<(), PipelineError> {
+    /// [`PipelineError::Internal`] when the record carries a column its
+    /// bucket's compiled header does not admit.
+    pub(crate) fn encode_row(&mut self, entry: &DlqEntry) -> Result<Option<&[u8]>, PipelineError> {
         let Some(layout) = self.layout else {
-            return Ok(());
+            return Ok(None);
         };
         let Some(id) = layout.bucket_for_source(&entry.source_name) else {
-            return Ok(());
+            return Ok(None);
+        };
+        self.encoder.row(layout, layout.bucket(id), entry).map(Some)
+    }
+
+    /// Count one dead letter in `accounts` and the report, write its encoded
+    /// row when it has one, record the capture, then check the rate
+    /// ceilings, in that order (see [`push_dlq`] for why). The row is routed
+    /// to the bucket of its source, as [`Self::encode_row`] chose it. May
+    /// block on the sink's file I/O.
+    ///
+    /// # Errors
+    ///
+    /// [`PipelineError::Internal`] when a row arrives whose source has no
+    /// bucket, when the row has a bucket but the caller supplied no sink (the
+    /// row would otherwise be counted and dropped), or when a row arrives
+    /// after [`Self::close`]. A sink I/O error is returned as
+    /// [`PipelineError::Io`] of the same kind carrying a
+    /// [`DlqWriteFailure`](crate::dlq::DlqWriteFailure) that names the bucket
+    /// and the run's `dead_letters` so far; any other sink error as is. Then
+    /// [`PipelineError::DlqRateExceeded`] from the rate check.
+    pub(crate) fn account_row(
+        &mut self,
+        row: AccountedRow<'_>,
+        accounts: &mut DlqAccounts<'_>,
+    ) -> Result<(), PipelineError> {
+        accounts.counters.dlq_count += 1;
+        *accounts
+            .dlq_per_source
+            .entry(Arc::clone(row.source_name))
+            .or_insert(0) += 1;
+        self.report.record(row.stage, row.category);
+        if let Some(bytes) = row.bytes {
+            self.write_row_bytes(&row, bytes, accounts.counters.dlq_count)?;
+        }
+        if self.capture_depth > 0 {
+            self.capture.push(row.source_row);
+        }
+        check_dlq_rate(accounts, row.source_name)
+    }
+
+    /// Write one encoded row into its source's bucket and count it against
+    /// the bucket. See [`Self::account_row`] for the errors.
+    fn write_row_bytes(
+        &mut self,
+        row: &AccountedRow<'_>,
+        bytes: &[u8],
+        dead_letters: u64,
+    ) -> Result<(), PipelineError> {
+        let Some((layout, id)) = self
+            .layout
+            .and_then(|layout| Some((layout, layout.bucket_for_source(row.source_name)?)))
+        else {
+            return Err(PipelineError::Internal {
+                op: "dead-letter",
+                node: row.stage.unwrap_or_default().to_string(),
+                detail: format!(
+                    "an encoded dead-letter row of source {:?} has no bucket",
+                    row.source_name
+                ),
+            });
         };
         let writer = match &mut self.writer {
             DlqWalkWriter::Absent => {
@@ -504,20 +600,19 @@ impl<'a> DlqWalkState<'a> {
             DlqWalkWriter::Closed => {
                 return Err(PipelineError::Internal {
                     op: "dead-letter-write",
-                    node: entry.stage.clone().unwrap_or_default(),
+                    node: row.stage.unwrap_or_default().to_string(),
                     detail: "a dead-letter row arrived after the walk closed its writer"
                         .to_string(),
                 });
             }
         };
         let bucket = layout.bucket(id);
-        let row = self.encoder.row(layout, bucket, entry)?;
         let target = crate::dlq::DlqBucketTarget {
             id,
             path: bucket.path(),
             header: &self.headers[id.index()],
         };
-        writer.write_row(&target, row).map_err(|error| {
+        writer.write_row(&target, bytes).map_err(|error| {
             dlq_write_failure(
                 error,
                 vec![bucket.path().to_path_buf()],
@@ -842,7 +937,7 @@ fn route_source_rejection(
                     ctx,
                     &event,
                     diagnostic.clone(),
-                );
+                )?;
             if !document_marked {
                 let entry = DlqEntry {
                     source_row: event.source_row,
@@ -1094,7 +1189,8 @@ pub(crate) fn dispatch_transform_eval_error(
         failure.triggering_field.clone(),
         failure.triggering_value.clone(),
         failure.failed_at,
-    );
+        &transform_name,
+    )?;
     if marked {
         return Ok(());
     }
@@ -4082,7 +4178,11 @@ pub(crate) fn merge_fused_interleave(
                 // A structural-count close condemns its whole file; mark it
                 // failed before the reconcile so the Output arm's per-file
                 // buffer rejects every already-streamed record of the file.
-                crate::executor::document_dlq::mark_structural_reject_if_present(ctx, &p);
+                crate::executor::document_dlq::mark_structural_reject_if_present(
+                    ctx,
+                    &p,
+                    &states[i].source_name_arc,
+                )?;
                 collected_puncts.push(p);
                 continue;
             }
@@ -4505,7 +4605,11 @@ pub(crate) fn transform_fused_consume(
                     // it failed before forwarding so the Output arm's
                     // per-file buffer rejects every already-streamed record
                     // of the file at this close.
-                    crate::executor::document_dlq::mark_structural_reject_if_present(ctx, &p);
+                    crate::executor::document_dlq::mark_structural_reject_if_present(
+                        ctx,
+                        &p,
+                        &source_name_arc,
+                    )?;
                     event_batcher.push_punctuation(p)?;
                     continue;
                 }

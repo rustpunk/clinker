@@ -376,7 +376,11 @@ where
                     // Mark a structural-count close failed BEFORE forwarding it,
                     // so the Output arm's per-file buffer rejects the file at
                     // this close rather than flushing it.
-                    crate::executor::document_dlq::mark_structural_reject_if_present(ctx, &p);
+                    crate::executor::document_dlq::mark_structural_reject_if_present(
+                        ctx,
+                        &p,
+                        name.as_str(),
+                    )?;
                     drained_puncts.push(p);
                 }
                 Some(crate::executor::dispatch::ConsumedSourceEvent::Population) => {}

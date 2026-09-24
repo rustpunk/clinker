@@ -273,7 +273,8 @@ where
                             failure.triggering_field.clone(),
                             failure.triggering_value.clone(),
                             failure.failed_at,
-                        );
+                            name,
+                        )?;
                     if !marked {
                         crate::executor::held_failure::write_failure(ctx, failure)?;
                     }

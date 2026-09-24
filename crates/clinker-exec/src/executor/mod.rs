@@ -17,6 +17,7 @@ mod dlq;
 pub(crate) mod document_dlq;
 pub(crate) mod envelope;
 pub(crate) mod envelope_dispatch;
+pub(crate) mod extent_log;
 pub(crate) mod held_failure;
 mod ingest;
 pub(crate) mod invariant;
@@ -1573,6 +1574,14 @@ impl PipelineExecutor {
             Some(crate::executor::document_dlq::DocumentDlqState::new(
                 doc_sources,
                 Arc::clone(&memory_budget),
+                crate::executor::document_dlq::HeldLogConfig {
+                    spill_root: Arc::clone(&spill_root_path),
+                    compress: params.spill_compress,
+                    batch_size: config
+                        .pipeline
+                        .batch_size
+                        .unwrap_or(crate::executor::batch_handoff::DEFAULT_BATCH_SIZE),
+                },
             ))
         } else {
             None

@@ -59,14 +59,17 @@
 //! governed by the policy.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use clinker_record::{DocumentId, Record};
 
 use crate::executor::dispatch::{
-    ExecutorContext, MERGED_SOURCE_FILE, mapping_probe, push_dlq, source_file_arc_of,
+    AccountedRow, ExecutorContext, MERGED_SOURCE_FILE, mapping_probe, push_dlq, source_file_arc_of,
     source_name_arc_of,
 };
+use crate::executor::extent_log::ExtentLog;
 use crate::executor::node_buffer::NodeBuffer;
 use crate::executor::sink_dispatch::OrderedWriterBoundary;
 use crate::executor::stream_event::{SourceRowId, StreamEvent};
@@ -75,7 +78,8 @@ use crate::executor::{DlqEntry, DlqFailureStamp, build_format_writer};
 use crate::pipeline::memory::{
     ConsumerHandle, ConsumerId, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
 };
-use clinker_plan::config::SinkConfig;
+use clinker_core_types::dlq::DlqErrorCategory;
+use clinker_plan::config::{CompressMode, SinkConfig};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::PlanNodeId;
 use roaring::RoaringTreemap;
@@ -85,35 +89,17 @@ use roaring::RoaringTreemap;
 /// this `Arc<str>`, so it is the grain a failure rejects at.
 type DocKey = Arc<str>;
 
-/// Root-cause failure captured for a document the first time one of its
-/// records (or an out-of-band validation) fails. Replayed as the single
-/// `trigger: true` DLQ entry when the document is rejected.
-struct DocTrigger {
-    source_row: SourceRowId,
-    category: clinker_core_types::dlq::DlqErrorCategory,
-    error_message: String,
-    original_record: Record,
-    stage: Option<String>,
-    route: Option<String>,
-    source_name: Arc<str>,
-    triggering_field: Option<Arc<str>>,
-    triggering_value: Option<clinker_record::Value>,
-    /// Taken when the failure marked the document; the trigger entry
-    /// emitted at the document's reject carries it.
-    failed_at: DlqFailureStamp,
-}
-
 /// A document's run-wide failed verdict. Once a document is marked failed it
 /// stays failed until the run ends: every Sink holding any of its records
 /// rejects it, however many Sinks read them.
+///
+/// The document's own failing records are not kept here: each is encoded as
+/// its dead-letter row when it fails and held in the state's held log until
+/// the document's first rejection writes it (see [`DocumentDlqState`]).
 struct FailedDocument {
     /// The stamp of the document's first failure. Every collateral of the
     /// document, at any Sink and at any time, is condemned by it.
     cause: DlqFailureStamp,
-    /// The first failure, until its trigger entry is written. The first
-    /// rejection takes it; a document still holding it at the end of the
-    /// run never reached a Sink and is rejected by the end sweep.
-    trigger: Option<DocTrigger>,
     /// The rows of this document already written to the dead-letter output,
     /// so each is written once however many Sinks hold it.
     emitted: EmittedRows,
@@ -387,62 +373,105 @@ fn treemap_heap_bound(rows: &RoaringTreemap) -> (u64, bool) {
     (bytes, has_runs)
 }
 
+/// Where and how the state's held log spills, and how often it polls the
+/// arbitrator's soft threshold.
+pub(crate) struct HeldLogConfig {
+    /// The run's spill directory, where the held log's one file is created.
+    pub(crate) spill_root: Arc<Path>,
+    pub(crate) compress: CompressMode,
+    /// Appends between two polls of the soft threshold: the run's batch size.
+    pub(crate) batch_size: usize,
+}
+
 /// Run-scoped document-DLQ state: which sources opt into the policy, the
-/// run-wide failed verdict of each document with its captured root-cause
-/// trigger, and the ledger of rows each failed document has already written
-/// to the dead-letter output.
+/// run-wide failed verdict of each document, the held dead-letter rows of
+/// each failed document's failing records, and the ledger of rows each failed
+/// document has already written to the dead-letter output.
 ///
 /// `Some(..)` on [`ExecutorContext::document_dlq`] iff at least one source
 /// declares `dlq_granularity: document`; `None` otherwise (the dominant
 /// per-record path, zero overhead). The per-document RECORD buffers live in
 /// the Output arm's single invocation (a local driver), not here. Only the
-/// cross-stage failure marks and the emitted-row ledgers are run-scoped,
-/// because an upstream Transform / Route failure must be visible to the
-/// Output at the document's close and a later Sink must see which rows an
-/// earlier one wrote.
+/// cross-stage failure marks, the held rows and the emitted-row ledgers are
+/// run-scoped, because an upstream Transform / Route failure must be visible
+/// to the Output at the document's close and a later Sink must see which
+/// rows an earlier one wrote.
 ///
-/// The ledgers are charged to the run's arbitrator through one consumer the
-/// state registers at construction and unregisters on drop.
+/// ## Held rows
+///
+/// A failing record of a failed document is dead-lettered at the document's
+/// first rejection, so its row's place in the dead-letter output is fixed
+/// there. It is encoded as that row when it fails (the trigger with its own
+/// stamp, every later one condemned by the trigger's failure) and held,
+/// behind a small header, in the held log: one chain per failed document of
+/// resident frames and, once flushed, extents in one spill file. No
+/// [`Record`] of it is kept. The first rejection streams the chain row by
+/// row through the emitted-row ledger into the dead-letter writer.
+///
+/// ## Memory
+///
+/// The held log's resident frames and index, the failed-document slots and
+/// the ledgers are charged to the run's arbitrator through one consumer the
+/// state registers at construction and unregisters on drop. Held frames
+/// leave memory only on the arbitrator's signals (see
+/// [`crate::executor::extent_log`]): the consumer's election, polled on
+/// every append and at every decision; the soft threshold, polled every
+/// `batch_size` appends and at every decision; and the hard-limit preflight
+/// on every append, which flushes before it refuses with E310.
 pub(crate) struct DocumentDlqState {
     /// Source-node names declaring `dlq_granularity: document`. A record is
     /// governed by the policy only when its originating source is in this
     /// set; records from `record`-granularity sources in the same run
     /// stream through untouched.
     doc_sources: HashSet<Arc<str>>,
-    /// Documents marked failed, keyed by source file, with the root-cause
-    /// trigger captured at the FIRST failure. Run-scoped so an upstream
-    /// failure (Transform / Route, before any Output) is visible to every
-    /// Output at the document's close, and never cleared: a document's
-    /// first rejection takes its trigger but leaves the verdict, so every
+    /// Documents marked failed, keyed by source file. Run-scoped so an
+    /// upstream failure (Transform / Route, before any Output) is visible to
+    /// every Output at the document's close, and never cleared: a document's
+    /// first rejection takes its held rows but leaves the verdict, so every
     /// later Sink holding the document rejects it too.
     failed: HashMap<DocKey, FailedDocument>,
-    /// Records of a failed document that ALSO failed (the 2nd, 3rd, … failure
-    /// in the same document), keyed by source file. Only the first failure
-    /// becomes the trigger; a later failing record never reaches an Output
-    /// (it was suppressed at its Transform / Route failure site), so it is
-    /// captured here and emitted as a `DocumentRejected` collateral at the
-    /// document's reject — preserving the invariant that every record of a
-    /// rejected N-record document contributes exactly one DLQ entry.
-    extra_collaterals: HashMap<DocKey, Vec<(Record, SourceRowId)>>,
+    /// The held rows of every failed document whose chain no rejection has
+    /// taken yet, one chain per document.
+    held: ExtentLog<DocKey>,
+    /// The names a held frame's header refers to by index.
+    names: HeldNames,
+    /// The frame being held, kept between holds so a hold allocates nothing
+    /// per row. Holds one row at most.
+    frame: Vec<u8>,
+    /// Frames held so far, for the soft-threshold poll cadence.
+    appends: u64,
+    batch_size: u64,
     arbitrator: Arc<MemoryArbitrator>,
     consumer_id: ConsumerId,
-    /// The bytes charged for every ledger in `failed`.
+    /// The bytes charged for the held log, the failed-document slots and
+    /// every ledger in `failed`.
     handle: Arc<ConsumerHandle>,
 }
 
 impl DocumentDlqState {
     /// Build the run-scoped state from the set of document-granularity
-    /// source names, registering the one consumer its ledgers are charged
-    /// through with `arbitrator`. Empty marks — the first marked failure
-    /// populates them.
-    pub(crate) fn new(doc_sources: HashSet<Arc<str>>, arbitrator: Arc<MemoryArbitrator>) -> Self {
+    /// source names, registering the one consumer it is charged through with
+    /// `arbitrator`. Empty: the first marked failure populates it. The held
+    /// log creates no file until the arbitrator first asks it to spill.
+    pub(crate) fn new(
+        doc_sources: HashSet<Arc<str>>,
+        arbitrator: Arc<MemoryArbitrator>,
+        held: HeldLogConfig,
+    ) -> Self {
         let handle = ConsumerHandle::new();
-        let consumer_id =
-            arbitrator.register_consumer(Arc::new(DocumentDlqConsumer::new(Arc::clone(&handle))));
+        let log = ExtentLog::new(held.spill_root, held.compress, Arc::clone(&handle));
+        let consumer_id = arbitrator.register_consumer(Arc::new(DocumentDlqConsumer::new(
+            Arc::clone(&handle),
+            log.resident_gauge(),
+        )));
         Self {
             doc_sources,
             failed: HashMap::new(),
-            extra_collaterals: HashMap::new(),
+            held: log,
+            names: HeldNames::default(),
+            frame: Vec::new(),
+            appends: 0,
+            batch_size: held.batch_size.max(1) as u64,
             arbitrator,
             consumer_id,
             handle,
@@ -536,21 +565,104 @@ impl DocumentDlqState {
         self.arbitrator.sample_peak_consumer_usage();
     }
 
-    /// Mark document `key` failed with its first failure `trigger`, charging
-    /// the document's fixed map slot.
-    fn insert_failed(&mut self, key: DocKey, trigger: DocTrigger) {
+    /// Mark document `key` failed with its first failure's stamp `cause`,
+    /// charging the document's fixed map slot.
+    fn insert_failed(&mut self, key: DocKey, cause: DlqFailureStamp) {
         self.handle.add_bytes(FAILED_DOCUMENT_BYTES);
         self.failed.insert(
             key,
             FailedDocument {
-                cause: trigger.failed_at,
-                trigger: Some(trigger),
+                cause,
                 emitted: EmittedRows::new(),
             },
         );
     }
 
-    /// Bytes charged to the arbitrator for every ledger.
+    /// Hold one failing record of document `key` as its encoded dead-letter
+    /// row `bytes` (`None` when the row has no destination) behind `row`'s
+    /// header, marking the document failed if this is its first failure.
+    ///
+    /// The frame, and on a first failure the document's slot and index
+    /// entry, are preflighted against the hard limit, flushing every held
+    /// tail first if they do not fit. After the append the arbitrator's
+    /// signals are polled: the consumer's election every time, the soft
+    /// threshold every `batch_size` appends. `node` is the failing node, for
+    /// E310 and for the spill attribution of any flush.
+    ///
+    /// # Errors
+    ///
+    /// [`PipelineError::MemoryBudgetExceeded`] (E310, `Arena`) when the frame
+    /// does not fit even with every held row on disk; nothing is held and the
+    /// document is not marked. A flush's spill errors, including E320.
+    fn hold(
+        &mut self,
+        key: DocKey,
+        row: &HeldRow<'_>,
+        bytes: Option<&[u8]>,
+        node: &str,
+    ) -> Result<(), PipelineError> {
+        let mut frame = std::mem::take(&mut self.frame);
+        let result = self.hold_frame(key, row, bytes, node, &mut frame);
+        self.frame = frame;
+        result
+    }
+
+    fn hold_frame(
+        &mut self,
+        key: DocKey,
+        row: &HeldRow<'_>,
+        bytes: Option<&[u8]>,
+        node: &str,
+        frame: &mut Vec<u8>,
+    ) -> Result<(), PipelineError> {
+        self.names.encode(frame, row, bytes)?;
+        let first = !self.failed.contains_key(&key);
+        let extra = if first { FAILED_DOCUMENT_BYTES } else { 0 };
+        self.held.admit_charge(
+            &self.arbitrator,
+            &key,
+            frame.len(),
+            extra,
+            node,
+            "the held dead-letter rows of the failed documents",
+        )?;
+        if first {
+            self.insert_failed(Arc::clone(&key), row.failed_at);
+        }
+        self.held.append(&key, frame)?;
+        debug_assert!(
+            self.handle.bytes() >= self.held.resident_bytes() + self.held.index_bytes(),
+            "the state's charge covers its held rows"
+        );
+        self.arbitrator.sample_peak_consumer_usage();
+        self.appends += 1;
+        self.held.relieve(
+            &self.arbitrator,
+            node,
+            self.appends.is_multiple_of(self.batch_size),
+        )?;
+        Ok(())
+    }
+
+    /// Take failed document `key`'s held rows for its first rejection at
+    /// `node`, after polling the arbitrator's signals as a decision does.
+    /// `None` when an earlier rejection took them. The chain leaves the log
+    /// here, so whatever happens to the reader, no later pass replays it.
+    ///
+    /// # Errors
+    ///
+    /// A flush's spill errors, including E320; a read-side open error.
+    fn take_held(
+        &mut self,
+        key: &DocKey,
+        node: &str,
+    ) -> Result<Option<crate::executor::extent_log::ChainReader>, PipelineError> {
+        self.held.relieve(&self.arbitrator, node, true)?;
+        self.held.take(key)
+    }
+
+    /// Bytes charged to the arbitrator for the held log, the failed-document
+    /// slots and every ledger.
     #[cfg(test)]
     fn charged_bytes(&self) -> u64 {
         self.handle.bytes()
@@ -575,23 +687,201 @@ impl Drop for DocumentDlqState {
     }
 }
 
-/// The arbitrator's view of the document-DLQ ledgers.
+/// What a held frame's header records about its row besides the encoded
+/// bytes: what [`AccountedRow`] needs to count and route it, and, for a
+/// document's first failure, the stamp its collaterals are condemned by.
+struct HeldRow<'r> {
+    source_row: SourceRowId,
+    source_name: &'r Arc<str>,
+    stage: Option<&'r str>,
+    category: DlqErrorCategory,
+    failed_at: DlqFailureStamp,
+}
+
+/// A held frame decoded: its header's fields and its row bytes.
+struct DecodedHeld<'f> {
+    source_row: SourceRowId,
+    source_name: Arc<str>,
+    stage: Option<Arc<str>>,
+    category: DlqErrorCategory,
+    bytes: Option<&'f [u8]>,
+}
+
+/// A held frame's fixed little-endian header: the Source node index (`u32`),
+/// the row ordinal (`u64`), the source-name index (`u32`), the stage index
+/// (`u32`, [`NO_STAGE`] for none), the category index (`u16`) and whether an
+/// encoded row follows (`u8`).
+const HELD_FRAME_HEADER_BYTES: usize = 4 + 8 + 4 + 4 + 2 + 1;
+
+/// The stage index of a held row that names no stage.
+const NO_STAGE: u32 = u32::MAX;
+
+/// The source names, stages and categories held frames refer to by index.
+/// Each is bounded by the compiled plan: its Sources, its nodes, and the
+/// category enum.
+#[derive(Default)]
+struct HeldNames {
+    source_names: Vec<Arc<str>>,
+    source_index: HashMap<Arc<str>, u32>,
+    stages: Vec<Arc<str>>,
+    stage_index: HashMap<Arc<str>, u32>,
+    categories: Vec<DlqErrorCategory>,
+}
+
+impl HeldNames {
+    /// Encode `row`'s header and `bytes` into `frame`, interning its names.
+    fn encode(
+        &mut self,
+        frame: &mut Vec<u8>,
+        row: &HeldRow<'_>,
+        bytes: Option<&[u8]>,
+    ) -> Result<(), PipelineError> {
+        let source = index_u32(clinker_plan::plan::EntityRef::index(
+            row.source_row.source(),
+        ))?;
+        let source_name = intern(
+            &mut self.source_names,
+            &mut self.source_index,
+            row.source_name,
+        )?;
+        let stage = match row.stage {
+            Some(stage) => intern(&mut self.stages, &mut self.stage_index, stage)?,
+            None => NO_STAGE,
+        };
+        let category = match self.categories.iter().position(|c| *c == row.category) {
+            Some(index) => index,
+            None => {
+                self.categories.push(row.category);
+                self.categories.len() - 1
+            }
+        };
+        let category =
+            u16::try_from(category).map_err(|_| held_frame_error("too many categories"))?;
+        frame.clear();
+        frame.reserve(HELD_FRAME_HEADER_BYTES + bytes.map_or(0, <[u8]>::len));
+        frame.extend_from_slice(&source.to_le_bytes());
+        frame.extend_from_slice(&row.source_row.ordinal().to_le_bytes());
+        frame.extend_from_slice(&source_name.to_le_bytes());
+        frame.extend_from_slice(&stage.to_le_bytes());
+        frame.extend_from_slice(&category.to_le_bytes());
+        frame.push(u8::from(bytes.is_some()));
+        if let Some(bytes) = bytes {
+            frame.extend_from_slice(bytes);
+        }
+        Ok(())
+    }
+
+    /// Decode a frame [`Self::encode`] wrote.
+    fn decode<'f>(&self, frame: &'f [u8]) -> Result<DecodedHeld<'f>, PipelineError> {
+        if frame.len() < HELD_FRAME_HEADER_BYTES {
+            return Err(held_frame_error("a held frame is shorter than its header"));
+        }
+        let u32_at = |at: usize| u32::from_le_bytes(frame[at..at + 4].try_into().expect("4 bytes"));
+        let source = u32_at(0);
+        let ordinal = u64::from_le_bytes(frame[4..12].try_into().expect("8 bytes"));
+        let source_name = u32_at(12);
+        let stage = u32_at(16);
+        let category = u16::from_le_bytes(frame[20..22].try_into().expect("2 bytes"));
+        let has_row = match frame[22] {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(held_frame_error(
+                    "a held frame's row flag is neither 0 nor 1",
+                ));
+            }
+        };
+        let rest = &frame[HELD_FRAME_HEADER_BYTES..];
+        if !has_row && !rest.is_empty() {
+            return Err(held_frame_error("a held frame without a row carries bytes"));
+        }
+        let lookup = |names: &[Arc<str>], index: u32| {
+            names
+                .get(index as usize)
+                .cloned()
+                .ok_or_else(|| held_frame_error("a held frame names an unknown index"))
+        };
+        Ok(DecodedHeld {
+            source_row: SourceRowId::new(
+                <PlanNodeId as clinker_plan::plan::EntityRef>::new(source as usize),
+                ordinal,
+            ),
+            source_name: lookup(&self.source_names, source_name)?,
+            stage: if stage == NO_STAGE {
+                None
+            } else {
+                Some(lookup(&self.stages, stage)?)
+            },
+            category: *self
+                .categories
+                .get(usize::from(category))
+                .ok_or_else(|| held_frame_error("a held frame names an unknown category"))?,
+            bytes: has_row.then_some(rest),
+        })
+    }
+}
+
+/// The index of `name` in `names`, adding it on first sight.
+fn intern(
+    names: &mut Vec<Arc<str>>,
+    index: &mut HashMap<Arc<str>, u32>,
+    name: &str,
+) -> Result<u32, PipelineError> {
+    if let Some(&at) = index.get(name) {
+        return Ok(at);
+    }
+    let at = index_u32(names.len())?;
+    let name: Arc<str> = Arc::from(name);
+    names.push(Arc::clone(&name));
+    index.insert(name, at);
+    Ok(at)
+}
+
+fn index_u32(index: usize) -> Result<u32, PipelineError> {
+    u32::try_from(index)
+        .ok()
+        .filter(|index| *index != NO_STAGE)
+        .ok_or_else(|| held_frame_error("a held frame index exceeds u32"))
+}
+
+fn held_frame_error(detail: &str) -> PipelineError {
+    PipelineError::Internal {
+        op: "document dead-letter",
+        node: String::new(),
+        detail: detail.to_string(),
+    }
+}
+
+/// The arbitrator's view of the document dead-letter state: the held log's
+/// resident frames, the failed-document slots and the emitted-row ledgers.
 ///
-/// The ledgers are exact dedup state and cannot spill, and no producer feeds
-/// them that the arbitrator could pause, so `try_spill` frees nothing and
-/// `can_back_pressure` is false. Their growth is refused at the hard limit
-/// instead (see [`DocumentDlqState::admit_emitted`]). `spill_priority` is
-/// `i32::MAX`, the value other non-reclaimable consumers use: the `Priority`
-/// policy elects the lowest priority first, so it elects this consumer only
-/// when every registered consumer is equally non-reclaimable, and a
-/// best-effort spill sweep in priority order reaches it last.
+/// Only the held frames can leave memory. While any are resident the
+/// consumer reports `spill_priority` 0, alongside the node buffers: the held
+/// log spills them with one sequential write per document, as cheap as a
+/// node buffer's spill. `try_spill` then raises the handle's spill request,
+/// which the state answers on its next append or decision by flushing every
+/// held tail, and reports the resident frame bytes as what it frees
+/// (`BelowTarget` when fewer than asked).
+///
+/// With no frame resident the rest is exact state that cannot spill, so the
+/// consumer then reports `i32::MAX`, the value other non-reclaimable
+/// consumers use, and `try_spill` frees nothing and raises no request: the
+/// `Priority` policy elects the lowest priority first, so a state holding
+/// only ledgers is elected only when every registered consumer is equally
+/// non-reclaimable, and never shadows a node buffer that could spill. Growth
+/// that cannot be relieved is refused at the hard limit with E310.
+///
+/// No producer feeds the state that the arbitrator could pause, so
+/// `can_back_pressure` is false and the consumer is never paused.
 struct DocumentDlqConsumer {
     handle: Arc<ConsumerHandle>,
+    /// The held log's resident frame bytes.
+    resident: Arc<AtomicU64>,
 }
 
 impl DocumentDlqConsumer {
-    fn new(handle: Arc<ConsumerHandle>) -> Self {
-        Self { handle }
+    fn new(handle: Arc<ConsumerHandle>, resident: Arc<AtomicU64>) -> Self {
+        Self { handle, resident }
     }
 }
 
@@ -601,14 +891,26 @@ impl MemoryConsumer for DocumentDlqConsumer {
     }
 
     fn spill_priority(&self) -> i32 {
-        i32::MAX
+        if self.resident.load(Ordering::Relaxed) > 0 {
+            0
+        } else {
+            i32::MAX
+        }
     }
 
     fn try_spill(&self, target_bytes: u64) -> Result<u64, ConsumerSpillError> {
-        Err(ConsumerSpillError::BelowTarget {
-            target: target_bytes,
-            freed: 0,
-        })
+        let resident = self.resident.load(Ordering::Relaxed);
+        if resident > 0 {
+            self.handle.request_spill();
+        }
+        if resident >= target_bytes && resident > 0 {
+            Ok(resident)
+        } else {
+            Err(ConsumerSpillError::BelowTarget {
+                target: target_bytes,
+                freed: resident,
+            })
+        }
     }
 
     fn can_back_pressure(&self) -> bool {
@@ -623,16 +925,18 @@ pub(crate) fn is_concrete_file(file: &Arc<str>) -> bool {
     !file.is_empty() && file.as_ref() != MERGED_SOURCE_FILE.as_ref()
 }
 
-/// Mark a document failed and capture its root-cause trigger, returning
+/// Mark a document failed and hold this failure's dead-letter row, returning
 /// `true` iff the failure was absorbed into the document-DLQ state (the
 /// caller must NOT also push a per-record DLQ entry). Returns `false` when
 /// the buffer is inactive or the record is not under the `document` policy,
 /// signaling the caller to take its per-record DLQ path.
 ///
-/// The first failure for a document wins the trigger slot; later failures
-/// of the same document are swallowed (the document is already doomed), so
-/// the trigger always names the earliest root cause. Mirrors
-/// `held_failure::hold_failure_if_grouped`, the correlation-buffer sibling.
+/// The first failure for a document is its trigger; a later failure of the
+/// same document is held as a `DocumentRejected` collateral condemned by the
+/// trigger's failure, so every failing record contributes one row, written
+/// at the document's first rejection in failure order after the trigger.
+/// Mirrors `held_failure::hold_failure_if_grouped`, the correlation-buffer
+/// sibling.
 ///
 /// This is the routable reject-document seam: `category` is parameterized,
 /// so a non-record-eval validator (an envelope / checksum check that
@@ -641,7 +945,12 @@ pub(crate) fn is_concrete_file(file: &Arc<str>) -> bool {
 /// the document failed — it need not be a CXL-eval failure. The engine
 /// reserves [`clinker_core_types::dlq::DlqErrorCategory::DocumentRejected`]
 /// for the `trigger: false` collateral siblings; the trigger carries
-/// whatever `category` the caller supplies.
+/// whatever `category` the caller supplies. `node` is the failing node, for
+/// E310 and spill attribution.
+///
+/// # Errors
+///
+/// As [`mark_document_failed`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_error_to_document_buffer_if_doc_dlq(
     ctx: &mut ExecutorContext<'_>,
@@ -654,73 +963,84 @@ pub(crate) fn record_error_to_document_buffer_if_doc_dlq(
     triggering_field: Option<Arc<str>>,
     triggering_value: Option<clinker_record::Value>,
     failed_at: DlqFailureStamp,
-) -> bool {
+    node: &str,
+) -> Result<bool, PipelineError> {
     let Some(state) = ctx.document_dlq.as_ref() else {
-        return false;
+        return Ok(false);
     };
     let Some(key) = state.governing_key(record) else {
-        return false;
+        return Ok(false);
     };
     let source_name = source_name_arc_of(record);
     mark_document_failed(
         ctx,
         key,
-        DocTrigger {
+        DlqEntry {
             source_row,
             category,
             error_message,
             original_record: record.clone(),
             stage,
             route,
+            trigger: true,
             source_name,
             triggering_field,
             triggering_value,
             failed_at,
         },
-    );
-    true
+        node,
+    )?;
+    Ok(true)
 }
 
 /// Mark the document containing a source declared-type failure. The rejected
 /// row has its document context, but it has not passed the ordinary source
 /// stamping path, so source and file identity must come from the
-/// [`crate::executor::dlq::SourceRejectionEvent`] itself.
+/// [`crate::executor::dlq::SourceRejectionEvent`] itself. The Source is the
+/// failing node.
+///
+/// # Errors
+///
+/// As [`mark_document_failed`].
 pub(crate) fn record_source_rejection_to_document_buffer_if_doc_dlq(
     ctx: &mut ExecutorContext<'_>,
     event: &crate::executor::dlq::SourceRejectionEvent,
     diagnostic: String,
-) -> bool {
+) -> Result<bool, PipelineError> {
     let Some(state) = ctx.document_dlq.as_ref() else {
-        return false;
+        return Ok(false);
     };
     if event.original_record.doc_ctx().id() == DocumentId::SYNTHETIC
         || !state.doc_sources.contains(&event.source_name)
         || !is_concrete_file(&event.source_file)
     {
-        return false;
+        return Ok(false);
     }
     mark_document_failed(
         ctx,
         Arc::clone(&event.source_file),
-        DocTrigger {
+        DlqEntry {
             source_row: event.source_row,
             category: event.category(),
             error_message: diagnostic,
             original_record: event.original_record.clone(),
             stage: Some(DlqEntry::stage_source()),
             route: None,
+            trigger: true,
             source_name: Arc::clone(&event.source_name),
             triggering_field: Some(Arc::from(event.triggering_field.as_ref())),
             triggering_value: Some(event.triggering_value.clone()),
             failed_at: event.failed_at,
         },
-    );
-    true
+        &event.source_name,
+    )?;
+    Ok(true)
 }
 
 /// Mark a document failed for an envelope structural-count failure if `p`
 /// is a file-level close carrying a [`crate::executor::stream_event::StructuralReject`]
-/// payload. A no-op for every ordinary boundary.
+/// payload. A no-op for every ordinary boundary. Returns whether a document
+/// was marked.
 ///
 /// Called at every raw source-channel punctuation-drain site that holds
 /// `ctx` — the non-fused Source arm, the fused Source→Transform arm, and the
@@ -729,13 +1049,19 @@ pub(crate) fn record_source_rejection_to_document_buffer_if_doc_dlq(
 /// reject is keyed by the representative record's `$source.file` stamp, so
 /// the file grain is correct independent of the carrying close's level. The
 /// close still forwards downstream unchanged; #97's per-file Output buffer
-/// rejects every already-streamed record of the file at that close.
+/// rejects every already-streamed record of the file at that close. `node`
+/// is the Source whose channel carried the close.
+///
+/// # Errors
+///
+/// As [`mark_document_failed`].
 pub(crate) fn mark_structural_reject_if_present(
     ctx: &mut ExecutorContext<'_>,
     p: &crate::executor::stream_event::Punctuation,
-) {
+    node: &str,
+) -> Result<bool, PipelineError> {
     let Some(reject) = p.structural_reject() else {
-        return;
+        return Ok(false);
     };
     record_error_to_document_buffer_if_doc_dlq(
         ctx,
@@ -748,28 +1074,64 @@ pub(crate) fn mark_structural_reject_if_present(
         None,
         None,
         reject.failed_at,
-    );
+        node,
+    )
 }
 
-/// Mark document `key` failed by `trigger`. The FIRST failure becomes the
-/// document's root-cause trigger; a later failure of an already-failed
-/// document stashes its record as an extra collateral (the trigger slot is
-/// taken), so that record still contributes a `DocumentRejected` entry at
-/// the document's reject rather than vanishing — every record of a rejected
-/// document is accounted for as the trigger or a collateral.
-fn mark_document_failed(ctx: &mut ExecutorContext<'_>, key: DocKey, trigger: DocTrigger) {
+/// Mark document `key` failed by the failure `entry` describes, and hold the
+/// failure's dead-letter row until the document's first rejection writes it.
+///
+/// The FIRST failure is the document's root-cause trigger and is held as
+/// `entry` is. A later failure of an already-failed document is held as a
+/// `DocumentRejected` collateral (`trigger: false`, stage `document_dlq`)
+/// condemned by the trigger's failure: it is stamped now, when it fails, and
+/// carries the trigger's id. Either way the row is encoded here through the
+/// walk's encoder and no record is kept.
+///
+/// # Errors
+///
+/// [`PipelineError::Internal`] when the row cannot be encoded;
+/// [`PipelineError::MemoryBudgetExceeded`] (E310, `Arena`) naming `node`
+/// when the held row does not fit under the hard limit even with every held
+/// row on disk; a spill error, including E320, from a flush.
+fn mark_document_failed(
+    ctx: &mut ExecutorContext<'_>,
+    key: DocKey,
+    entry: DlqEntry,
+    node: &str,
+) -> Result<(), PipelineError> {
     let Some(state) = ctx.document_dlq.as_mut() else {
-        return;
+        return Ok(());
     };
-    if state.failed.contains_key(&key) {
-        state
-            .extra_collaterals
-            .entry(key)
-            .or_default()
-            .push((trigger.original_record, trigger.source_row));
-    } else {
-        state.insert_failed(key, trigger);
-    }
+    let entry = match state.failed.get(&key) {
+        None => entry,
+        Some(failed) => DlqEntry {
+            source_row: entry.source_row,
+            category: clinker_core_types::dlq::DlqErrorCategory::DocumentRejected,
+            error_message: format!("document {key:?} rejected: a sibling record failed"),
+            original_record: entry.original_record,
+            stage: Some("document_dlq".to_string()),
+            route: None,
+            trigger: false,
+            source_name: entry.source_name,
+            triggering_field: None,
+            triggering_value: None,
+            failed_at: DlqFailureStamp::condemned_by(&failed.cause),
+        },
+    };
+    let bytes = ctx.dlq.encode_row(&entry)?;
+    state.hold(
+        key,
+        &HeldRow {
+            source_row: entry.source_row,
+            source_name: &entry.source_name,
+            stage: entry.stage.as_deref(),
+            category: entry.category,
+            failed_at: entry.failed_at,
+        },
+        bytes,
+        node,
+    )
 }
 
 /// One per-document record bucket inside the Output-arm driver: a spillable
@@ -785,16 +1147,6 @@ struct DocBucket {
     /// `DocumentClose`. The file's outermost close is the one that returns
     /// this to zero; a nested-level close leaves it positive.
     depth: i64,
-}
-
-/// What one rejection pass takes out of a failed document before it streams
-/// the document's rows: the trigger if no earlier pass wrote it, the other
-/// failing records captured at their failure sites, and the stamp every
-/// collateral is condemned by.
-struct RejectionParts {
-    trigger: Option<DocTrigger>,
-    extra_collaterals: Vec<(Record, SourceRowId)>,
-    cause: DlqFailureStamp,
 }
 
 /// Claim the one decision slot for `key` in this Output invocation.
@@ -1295,17 +1647,19 @@ impl Drop for DocumentDlqDriver<'_> {
     }
 }
 
-/// End-of-DAG sweep: reject every failed document the run never emitted —
-/// a document marked failed upstream whose close never arrived AND whose
-/// records were all suppressed before any Output (so no Output-arm bucket
-/// carried them). Emits the captured root-cause trigger with no collaterals,
-/// once each. Runs once after every Output arm; a document whose records DID
-/// reach an Output was rejected there, which took its trigger, so it is
-/// skipped. A no-op when the document-DLQ buffer is inactive.
+/// End-of-DAG sweep: reject every failed document whose held rows no
+/// rejection wrote — a document marked failed upstream whose close never
+/// arrived AND whose records were all suppressed before any Output (so no
+/// Output-arm bucket carried them). Writes the document's held rows (its
+/// trigger and its other failing records), once each. Runs once after every
+/// Output arm; a document whose records DID reach an Output was rejected
+/// there, which took its held rows, so it is skipped. A no-op when the
+/// document-DLQ buffer is inactive.
 ///
 /// # Errors
 ///
-/// Surfaces any DLQ-rate error a trigger push trips as a [`PipelineError`].
+/// Surfaces held-log read and spill errors, E310 from the emitted-row ledger
+/// and any DLQ-rate error as a [`PipelineError`].
 pub(crate) fn reject_unclosed_failed_documents(
     ctx: &mut ExecutorContext<'_>,
 ) -> Result<(), PipelineError> {
@@ -1314,9 +1668,9 @@ pub(crate) fn reject_unclosed_failed_documents(
     };
     let mut pending: Vec<DocKey> = state
         .failed
-        .iter()
-        .filter(|(_, failed)| failed.trigger.is_some())
-        .map(|(key, _)| Arc::clone(key))
+        .keys()
+        .filter(|key| state.held.contains(key))
+        .cloned()
         .collect();
     pending.sort_unstable();
     for key in pending {
@@ -1514,37 +1868,6 @@ fn document_state<'a>(
         })
 }
 
-/// Take what one rejection pass over failed document `key` writes before its
-/// rows: the trigger (only the document's first pass finds it), the extra
-/// failing records, and the stamp that condemns every collateral. The
-/// verdict itself stays for the run.
-///
-/// # Errors
-///
-/// [`PipelineError::Internal`] when `key` is not a failed document.
-fn take_rejection_parts(
-    state: &mut DocumentDlqState,
-    key: &DocKey,
-    node: &str,
-) -> Result<RejectionParts, PipelineError> {
-    let failed = state
-        .failed
-        .get_mut(key)
-        .ok_or_else(|| PipelineError::Internal {
-            op: "document dead-letter",
-            node: node.to_string(),
-            detail: format!("document {key:?} is rejected but was never marked failed"),
-        })?;
-    let trigger = failed.trigger.take();
-    let cause = failed.cause;
-    let extra_collaterals = state.extra_collaterals.remove(key).unwrap_or_default();
-    Ok(RejectionParts {
-        trigger,
-        extra_collaterals,
-        cause,
-    })
-}
-
 /// Reject failed document `key` at `node`: write each of its rows that no
 /// earlier rejection wrote, then release `bucket`'s arbitrator consumer on
 /// every exit.
@@ -1580,13 +1903,14 @@ fn reject_document_now(
 }
 
 /// One streaming rejection pass over failed document `key`, in this order:
-/// the root-cause trigger (`trigger: true`, its own category) if no earlier
-/// pass wrote it, then a `DocumentRejected` collateral (`trigger: false`) for
-/// each extra failing record and each record of `buffer`. Every row is
+/// the document's held rows if no earlier pass took them (the root-cause
+/// trigger, `trigger: true` with its own category, then a `DocumentRejected`
+/// collateral for each of its other failing records, in failure order), then
+/// a `DocumentRejected` collateral for each record of `buffer`. Every row is
 /// admitted to the document's emitted-row ledger before it is written, and
 /// only a row no earlier rejection wrote is written, so each row of the
-/// document reaches the dead-letter output once across every Sink. Records
-/// are drained one at a time; nothing is collected first. The ledger settles
+/// document reaches the dead-letter output once across every Sink. Rows are
+/// streamed one at a time; nothing is collected first. The ledger settles
 /// on every exit.
 fn stream_document_rejection(
     ctx: &mut ExecutorContext<'_>,
@@ -1594,39 +1918,17 @@ fn stream_document_rejection(
     buffer: Option<NodeBuffer>,
     node: &str,
 ) -> Result<(), PipelineError> {
-    let RejectionParts {
-        trigger,
-        extra_collaterals,
-        cause,
-    } = take_rejection_parts(document_state(ctx, node)?, key, node)?;
+    let cause = document_state(ctx, node)?
+        .failed
+        .get(key)
+        .map(|failed| failed.cause)
+        .ok_or_else(|| PipelineError::Internal {
+            op: "document dead-letter",
+            node: node.to_string(),
+            detail: format!("document {key:?} is rejected but was never marked failed"),
+        })?;
     let result = (|| {
-        if let Some(t) = trigger
-            && document_state(ctx, node)?.admit_emitted(key, t.source_row, node)?
-        {
-            push_dlq(
-                ctx,
-                DlqEntry {
-                    source_row: t.source_row,
-                    category: t.category,
-                    error_message: t.error_message,
-                    original_record: t.original_record,
-                    stage: t.stage,
-                    route: t.route,
-                    trigger: true,
-                    source_name: t.source_name,
-                    triggering_field: t.triggering_field,
-                    triggering_value: t.triggering_value,
-                    failed_at: t.failed_at,
-                },
-            )?;
-        }
-        // A non-first failing record was suppressed at its failure site, so
-        // it never reached a Sink's bucket; it is written here.
-        for (record, source_row) in extra_collaterals {
-            if document_state(ctx, node)?.admit_emitted(key, source_row, node)? {
-                push_document_collateral(ctx, key, record, source_row, &cause)?;
-            }
-        }
+        replay_held(ctx, key, node)?;
         if let Some(buffer) = buffer {
             for event in buffer.drain() {
                 match event? {
@@ -1645,6 +1947,40 @@ fn stream_document_rejection(
         state.settle_emitted(key);
     }
     result
+}
+
+/// Write failed document `key`'s held rows at its first rejection at `node`,
+/// in the order they were held. Each row is admitted to the emitted-row
+/// ledger, then counted, written through the walk's writer and rate-checked,
+/// without being decoded or re-encoded. A no-op when an earlier rejection
+/// took them. The rows leave the held log before the first is written, so an
+/// error part-way leaves nothing a later pass would write twice.
+///
+/// # Errors
+///
+/// Held-log read and spill errors, E310 from the ledger, and the dead-letter
+/// write and rate errors of [`crate::executor::dispatch::DlqWalkState::account_row`].
+fn replay_held(
+    ctx: &mut ExecutorContext<'_>,
+    key: &DocKey,
+    node: &str,
+) -> Result<(), PipelineError> {
+    let Some(mut reader) = document_state(ctx, node)?.take_held(key, node)? else {
+        return Ok(());
+    };
+    while let Some(frame) = reader.next_frame()? {
+        let held = document_state(ctx, node)?.names.decode(frame)?;
+        if document_state(ctx, node)?.admit_emitted(key, held.source_row, node)? {
+            ctx.dlq_funnel().account_row(AccountedRow {
+                source_row: held.source_row,
+                source_name: &held.source_name,
+                stage: held.stage.as_deref(),
+                category: held.category,
+                bytes: held.bytes,
+            })?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1709,26 +2045,27 @@ mod tests {
         let mut state = DocumentDlqState::new(
             HashSet::from([Arc::clone(&source_name)]),
             Arc::clone(&arbitrator),
+            held_config(&std::env::temp_dir()),
         );
-        state.insert_failed(
-            Arc::clone(&key),
-            DocTrigger {
-                source_row: trigger_row,
-                category: clinker_core_types::dlq::DlqErrorCategory::ValidationFailure,
-                error_message: "document validation failed".to_string(),
-                original_record: trigger_record.clone(),
-                stage: Some("validate".to_string()),
-                route: None,
-                source_name,
-                triggering_field: None,
-                triggering_value: None,
-                failed_at: DlqFailureStamp::now(),
-            },
-        );
+        let trigger = HeldRow {
+            source_row: trigger_row,
+            source_name: &source_name,
+            stage: Some("validate"),
+            category: clinker_core_types::dlq::DlqErrorCategory::ValidationFailure,
+            failed_at: DlqFailureStamp::now(),
+        };
+        state
+            .hold(
+                Arc::clone(&key),
+                &trigger,
+                Some(b"trigger row\n"),
+                "validate",
+            )
+            .expect("hold the trigger");
         assert_eq!(
             state.charged_bytes(),
-            FAILED_DOCUMENT_BYTES,
-            "marking a document failed charges its map slot"
+            FAILED_DOCUMENT_BYTES + state.held.resident_bytes() + state.held.index_bytes(),
+            "marking a document failed charges its map slot and its held row"
         );
 
         let handle = ConsumerHandle::new();
@@ -1747,28 +2084,47 @@ mod tests {
         (arbitrator, state, HashMap::from([(key, bucket)]), doc)
     }
 
+    /// Where a test's document state holds its rows.
+    fn held_config(spill_root: &std::path::Path) -> HeldLogConfig {
+        HeldLogConfig {
+            spill_root: Arc::from(spill_root),
+            compress: CompressMode::Auto,
+            batch_size: 1024,
+        }
+    }
+
+    /// The source rows of `key`'s held rows, in the order a rejection writes
+    /// them, taking them as the first rejection does.
+    fn take_held_rows(state: &mut DocumentDlqState, key: &DocKey) -> Vec<SourceRowId> {
+        let mut rows = Vec::new();
+        if let Some(mut reader) = state.take_held(key, "out").expect("take held rows") {
+            while let Some(frame) = reader.next_frame().expect("held frame") {
+                rows.push(state.names.decode(frame).expect("decode").source_row);
+            }
+        }
+        rows
+    }
+
     /// The rows one rejection pass over `key` writes, decided at the same
     /// seams the executor pass uses but without an executor context: whether
-    /// the trigger is written, then each collateral row the ledger admits.
-    /// Releases `bucket`'s consumer and settles the ledger, as the pass does.
+    /// the held trigger is written, then each other held row and each
+    /// collateral row the ledger admits. Releases `bucket`'s consumer and
+    /// settles the ledger, as the pass does.
     fn rejection_pass_rows(
         state: &mut DocumentDlqState,
         arbitrator: &MemoryArbitrator,
         key: &DocKey,
         bucket: Option<DocBucket>,
     ) -> (bool, Vec<SourceRowId>) {
-        let RejectionParts {
-            trigger,
-            extra_collaterals,
-            ..
-        } = take_rejection_parts(state, key, "out").expect("a failed document");
-        let trigger_written = trigger.is_some_and(|t| {
+        let held = take_held_rows(state, key);
+        let mut held = held.into_iter();
+        let trigger_written = held.next().is_some_and(|row| {
             state
-                .admit_emitted(key, t.source_row, "out")
+                .admit_emitted(key, row, "out")
                 .expect("trigger admission")
         });
         let mut collaterals = Vec::new();
-        for (_, row) in extra_collaterals {
+        for row in held {
             if state.admit_emitted(key, row, "out").expect("admission") {
                 collaterals.push(row);
             }
@@ -1814,11 +2170,8 @@ mod tests {
         }
 
         assert!(
-            state
-                .failed
-                .get(&key)
-                .is_some_and(|failed| failed.trigger.is_none()),
-            "the rejection takes the trigger and keeps the run-wide verdict"
+            state.failed.contains_key(&key) && !state.held.contains(&key),
+            "the rejection takes the held rows and keeps the run-wide verdict"
         );
         assert_eq!(decided, HashSet::from([key.clone()]));
         assert_eq!(rejections.len(), 1, "a duplicate close cannot reject twice");
@@ -1891,13 +2244,15 @@ mod tests {
     /// A document state charged to `arbitrator` holding one failed document.
     fn ledger_state(arbitrator: &Arc<MemoryArbitrator>) -> (DocumentDlqState, DocKey) {
         let key: DocKey = Arc::from("orders.csv");
-        let mut state =
-            DocumentDlqState::new(HashSet::from([Arc::from("orders")]), Arc::clone(arbitrator));
+        let mut state = DocumentDlqState::new(
+            HashSet::from([Arc::from("orders")]),
+            Arc::clone(arbitrator),
+            held_config(&std::env::temp_dir()),
+        );
         state.failed.insert(
             Arc::clone(&key),
             FailedDocument {
                 cause: DlqFailureStamp::now(),
-                trigger: None,
                 emitted: EmittedRows::new(),
             },
         );
@@ -2131,7 +2486,8 @@ mod tests {
         ));
         let (state, _key) = ledger_state(&arbitrator);
         state.handle.set_bytes(1 << 20);
-        let ledger_consumer = DocumentDlqConsumer::new(Arc::clone(&state.handle));
+        let ledger_consumer =
+            DocumentDlqConsumer::new(Arc::clone(&state.handle), state.held.resident_gauge());
 
         let snapshot: [(ConsumerId, &dyn MemoryConsumer); 2] = [
             (state.consumer_id, &ledger_consumer),
