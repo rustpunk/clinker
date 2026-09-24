@@ -2018,13 +2018,34 @@ fn wait_for_admission_child(child: &mut Child) -> std::process::ExitStatus {
 #[cfg(target_os = "linux")]
 fn wait_for_admission_results(paths: &[&Path]) {
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    while !paths.iter().all(|path| path.is_file()) {
+    // A result is complete only once it holds its newline-terminated
+    // outcome; a remote mount can expose a file before its contents.
+    let complete =
+        |path: &&Path| std::fs::read(path).is_ok_and(|bytes| bytes.last() == Some(&b'\n'));
+    while !paths.iter().all(complete) {
         assert!(
             std::time::Instant::now() < deadline,
             "admission workers did not report outcomes before the deadline"
         );
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// Write a worker outcome under a temporary name, sync it, then rename it
+/// into place, so the parent never observes the result path before its
+/// contents.
+#[cfg(target_os = "linux")]
+fn publish_admission_result(result: &Path, outcome: &[u8]) {
+    use std::io::Write as _;
+    let mut partial = result.as_os_str().to_owned();
+    partial.push(".partial");
+    let partial = std::path::PathBuf::from(partial);
+    let mut file = std::fs::File::create(&partial).expect("create partial worker result");
+    file.write_all(outcome)
+        .expect("write partial worker result");
+    file.sync_all().expect("sync partial worker result");
+    drop(file);
+    std::fs::rename(&partial, result).expect("publish worker result");
 }
 
 #[cfg(target_os = "linux")]
@@ -2247,7 +2268,7 @@ fn remote_filesystem_admission_worker() {
     );
     match outcome {
         Ok(attempt) => {
-            std::fs::write(result, b"admitted\n").expect("write admitted worker result");
+            publish_admission_result(&result, b"admitted\n");
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             while !release.is_file() {
                 assert!(
@@ -2262,7 +2283,7 @@ fn remote_filesystem_admission_worker() {
             clinker_exec::output::attempt::AttemptError::RetainedAttemptLimitExceeded { .. }
             | clinker_exec::output::attempt::AttemptError::RetainedByteLimitExceeded { .. },
         ) => {
-            std::fs::write(result, b"rejected\n").expect("write rejected worker result");
+            publish_admission_result(&result, b"rejected\n");
         }
         Err(error) => panic!("unexpected mounted admission failure: {error}"),
     }
