@@ -14,6 +14,7 @@ mod dedup_node_rooted;
 mod deferred_region;
 mod dlq_layout;
 mod doc_paths;
+mod document_dlq_body_sinks;
 mod dup_body_node_name;
 mod envelope_synthesis;
 mod explain_buffer_class;
