@@ -50,7 +50,7 @@ written is a location and is excluded; *whether* they are written is not — a
 pipeline with no `error_handling.dlq.path` and no per-source override
 discards them, and reads as a different plan from one that keeps them.
 
-The `version` field carries the fingerprint schema, currently `2`. A digest
+The `version` field carries the fingerprint schema, currently `3`. A digest
 is comparable only with another digest of the same version: when the schema
 changes, the same pipeline yields a different digest, and the version is how
 a consumer holding a pinned value tells that apart from a changed plan.

@@ -35,11 +35,14 @@ impl SemanticFingerprint {
     /// Canonical semantic identity schema version.
     ///
     /// Version 2 reduces composition bodies and dead-letter destinations
-    /// from typed values instead of authored bytes and key names. A plan
-    /// that produced a version-1 digest generally produces a different
-    /// version-2 one; the version travels with every digest so a consumer
-    /// holding a pinned value can tell a schema change from a plan change.
-    pub const VERSION: u32 = 2;
+    /// from typed values instead of authored bytes and key names. Version 3
+    /// encodes bound source schemas in their authored shape (a bare column
+    /// sequence rather than a `Columns`-tagged map), so every pipeline with a
+    /// source schema gets a new digest. A plan that produced a digest under
+    /// one version generally produces a different one under the next; the
+    /// version travels with every digest so a consumer holding a pinned value
+    /// can tell a schema change from a plan change.
+    pub const VERSION: u32 = 3;
     /// Digest algorithm used by every version so far.
     pub const ALGORITHM: &'static str = "blake3";
 
