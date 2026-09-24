@@ -24,11 +24,18 @@ use clinker_exec::executor::{ExecutionReport, PipelineExecutor, PipelineRunParam
 use clinker_exec::source::multi_file::FileSlot;
 use clinker_plan::config::{CompileContext, parse_config};
 
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
+use dlq_sink::{CollectingDlqSink, DlqRow};
+
 /// Run `yaml` over a set of in-memory CSV files, each fed as a distinct
 /// `FileSlot` (hence a distinct document) through the `events` source.
-/// Returns the sorted output body lines (header stripped) and the run's
-/// full [`ExecutionReport`] so a caller can inspect DLQ entries.
-fn run_multi_file(yaml: &str, files: &[(&str, &str)]) -> (Vec<String>, ExecutionReport) {
+/// Returns the sorted output body lines (header stripped), the run's
+/// full [`ExecutionReport`], and the dead-letter rows the executor wrote.
+fn run_multi_file(
+    yaml: &str,
+    files: &[(&str, &str)],
+) -> (Vec<String>, ExecutionReport, Vec<DlqRow>) {
     let config = parse_config(yaml).expect("parse pipeline");
     let plan = config
         .compile(&CompileContext::default())
@@ -62,13 +69,19 @@ fn run_multi_file(yaml: &str, files: &[(&str, &str)]) -> (Vec<String>, Execution
         ..Default::default()
     };
 
-    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
-        .expect("run pipeline");
+    let sink = CollectingDlqSink::new();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        dlq_sink::registry(writers, &sink),
+        &params,
+    )
+    .expect("run pipeline");
 
     let output = buf.as_string();
     let mut body: Vec<String> = output.lines().skip(1).map(|s| s.to_string()).collect();
     body.sort();
-    (body, report)
+    (body, report, sink.rows())
 }
 
 /// Group-by `sum(amount)` over a multi-file glob, with `continue` error
@@ -79,6 +92,8 @@ pipeline:
   name: sum_by_category
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: events
@@ -123,7 +138,7 @@ fn finalize_failure_attributes_dlq_to_the_failing_document() {
     let doc_a = "category,amount\na,1\na,2\n".to_string();
     let doc_b = format!("category,amount\nb,{i64_max}\nb,{i64_max}\n");
 
-    let (body, report) = run_multi_file(
+    let (body, report, rows) = run_multi_file(
         SUM_BY_CATEGORY_YAML,
         &[("a.csv", doc_a.as_str()), ("b.csv", doc_b.as_str())],
     );
@@ -131,25 +146,38 @@ fn finalize_failure_attributes_dlq_to_the_failing_document() {
     // Document A still emits its clean group row; document B's overflow
     // landed in the DLQ instead of an output row.
     assert_eq!(body, vec!["a,3".to_string()], "document A sums cleanly");
-    assert_eq!(report.dlq_entries.len(), 1, "one finalize DLQ entry");
+    assert_eq!(report.counters.dlq_count, 1, "one finalize DLQ entry");
+    assert_eq!(rows.len(), 1, "one finalize DLQ row written");
 
-    let entry = &report.dlq_entries[0];
+    let entry = &rows[0];
     assert_eq!(
-        entry.category,
-        clinker_core_types::dlq::DlqErrorCategory::AggregateFinalize,
+        entry.category(),
+        Some(clinker_core_types::dlq::DlqErrorCategory::AggregateFinalize.as_str()),
         "finalize-time overflow is an aggregate-finalize DLQ entry",
     );
+    let detail = entry
+        .error_detail()
+        .expect("include_reason defaults to true");
     assert!(
-        entry.error_message.contains("SumOverflow"),
-        "the failure is an integer sum overflow, got: {}",
-        entry.error_message,
+        detail.contains("SumOverflow"),
+        "the failure is an integer sum overflow, got: {detail}",
+    );
+    // A finalize failure carries a synthetic source row, not a real ordinal:
+    // the encoder writes it as the text `0` under the source that fed the
+    // aggregate.
+    assert_eq!(entry.field("_cxl_dlq_source_row"), Some("0"));
+    assert_eq!(entry.source_name(), "events");
+    assert_eq!(
+        entry.source_file(),
+        "b.csv",
+        "the finalize row names the failing document's file",
     );
     // The decisive attribution check: the entry's original record belongs to
     // the FAILING document (B, category "b"), not the batch's first document
     // (A, category "a"). Before the fix this was always "a".
     assert_eq!(
-        entry.original_record.get("category"),
-        Some(&clinker_record::Value::from("b")),
+        entry.field("category"),
+        Some("b"),
         "DLQ entry must be attributed to the failing document's record, \
          not the batch's first document",
     );
@@ -232,8 +260,8 @@ fn whole_empty_input_emits_global_fold_default_row() {
     // fallback emits — `count(*) == 0`. This guards the `flushed.is_empty()`
     // gate added alongside the per-document empty-document fix: the whole-empty
     // path must still produce exactly one global-fold row.
-    let (body, report) = run_multi_file(COUNT_GLOBAL_YAML, &[("empty.csv", "category\n")]);
-    assert_eq!(report.dlq_entries.len(), 0, "no DLQ entries expected");
+    let (body, report, _) = run_multi_file(COUNT_GLOBAL_YAML, &[("empty.csv", "category\n")]);
+    assert_eq!(report.counters.dlq_count, 0, "no DLQ entries expected");
     assert_eq!(
         body,
         vec!["0".to_string()],
@@ -246,8 +274,8 @@ fn whole_empty_input_emits_nothing_for_grouped_fold() {
     // The control for the global-fold case: a whole-empty grouped fold owns
     // no group, so it emits nothing — the synthetic sentinel must not
     // synthesize a phantom grouped row.
-    let (body, report) = run_multi_file(COUNT_GROUPED_YAML, &[("empty.csv", "category\n")]);
-    assert_eq!(report.dlq_entries.len(), 0, "no DLQ entries expected");
+    let (body, report, _) = run_multi_file(COUNT_GROUPED_YAML, &[("empty.csv", "category\n")]);
+    assert_eq!(report.counters.dlq_count, 0, "no DLQ entries expected");
     assert!(
         body.is_empty(),
         "a whole-empty grouped fold emits nothing, got: {body:?}",
@@ -261,7 +289,7 @@ fn multi_document_global_fold_emits_one_row_per_document() {
     // This guards the `flushed` de-duplication and the punct-loop global-fold
     // flush against emitting a phantom extra row for a document that
     // contributed records.
-    let (body, report) = run_multi_file(
+    let (body, report, _) = run_multi_file(
         COUNT_GLOBAL_YAML,
         &[
             ("a.csv", "category\nx\ny\n"),
@@ -269,7 +297,7 @@ fn multi_document_global_fold_emits_one_row_per_document() {
             ("c.csv", "category\np\nq\nr\n"),
         ],
     );
-    assert_eq!(report.dlq_entries.len(), 0, "no DLQ entries expected");
+    assert_eq!(report.counters.dlq_count, 0, "no DLQ entries expected");
     assert_eq!(
         body,
         vec!["1".to_string(), "2".to_string(), "3".to_string()],
