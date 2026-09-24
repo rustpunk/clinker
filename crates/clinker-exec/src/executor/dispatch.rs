@@ -280,17 +280,59 @@ pub(crate) fn push_dlq(
     ctx: &mut ExecutorContext<'_>,
     entry: DlqEntry,
 ) -> Result<(), PipelineError> {
-    let source_name = Arc::clone(&entry.source_name);
-    ctx.counters.dlq_count += 1;
-    *ctx.dlq_per_source
-        .entry(Arc::clone(&source_name))
-        .or_insert(0) += 1;
-    ctx.dlq
-        .report
-        .record(entry.stage.as_deref(), entry.category);
-    ctx.dlq.write(&entry)?;
-    ctx.dlq_entries.push(entry); // Removed when the executor test suite reads the DLQ sink.
-    check_dlq_rate(ctx, &source_name)
+    ctx.dlq_funnel().push(entry)
+}
+
+/// The run-scoped dead-letter counters [`DlqWalkState::push`] updates, and
+/// the configuration its rate check reads.
+///
+/// Each field is borrowed from [`ExecutorContext`] on its own, so a caller
+/// that already holds other fields of the context (the buffered Sink arm's
+/// writer helpers) can still push a dead letter at the site it happens.
+pub(crate) struct DlqAccounts<'b> {
+    pub(crate) counters: &'b mut PipelineCounters,
+    pub(crate) dlq_per_source: &'b mut HashMap<Arc<str>, u64>,
+    /// The rate denominator; see [`ExecutorContext::total_per_source`].
+    pub(crate) total_per_source: &'b HashMap<Arc<str>, u64>,
+    pub(crate) config: Option<&'b clinker_plan::config::DlqConfig>,
+    pub(crate) entries: &'b mut Vec<DlqEntry>,
+}
+
+/// A dead-letter push handle: the walk's [`DlqWalkState`] and the accounts
+/// it updates, borrowed disjointly from the rest of [`ExecutorContext`].
+///
+/// [`push_dlq`] builds one from the whole context; a site holding other
+/// context fields builds one from the fields directly. Holds borrows only.
+pub(crate) struct DlqFunnel<'b, 'l> {
+    pub(crate) state: &'b mut DlqWalkState<'l>,
+    pub(crate) accounts: DlqAccounts<'b>,
+}
+
+impl DlqFunnel<'_, '_> {
+    /// Count, write and rate-check one dead letter; see [`push_dlq`].
+    ///
+    /// # Errors
+    ///
+    /// As [`push_dlq`].
+    pub(crate) fn push(&mut self, entry: DlqEntry) -> Result<(), PipelineError> {
+        self.state.push(entry, &mut self.accounts)
+    }
+}
+
+impl<'a> ExecutorContext<'a> {
+    /// A push handle over this context's dead-letter state and accounts.
+    pub(crate) fn dlq_funnel(&mut self) -> DlqFunnel<'_, 'a> {
+        DlqFunnel {
+            state: &mut self.dlq,
+            accounts: DlqAccounts {
+                counters: &mut self.counters,
+                dlq_per_source: &mut self.dlq_per_source,
+                total_per_source: &self.total_per_source,
+                config: self.config.error_handling.dlq.as_ref(),
+                entries: &mut self.dlq_entries,
+            },
+        }
+    }
 }
 
 /// The walk thread's dead-letter output: the compiled layout, each bucket's
@@ -354,6 +396,31 @@ impl<'a> DlqWalkState<'a> {
             writer,
             report: crate::dlq::DlqReport::default(),
         })
+    }
+
+    /// The one implementation behind [`push_dlq`]: count `entry` in
+    /// `accounts` and the report, write its row, then check the rate
+    /// ceilings, in that order (see [`push_dlq`] for why). May block on the
+    /// sink's file I/O.
+    ///
+    /// # Errors
+    ///
+    /// As [`push_dlq`]: a write error, or [`PipelineError::DlqRateExceeded`].
+    pub(crate) fn push(
+        &mut self,
+        entry: DlqEntry,
+        accounts: &mut DlqAccounts<'_>,
+    ) -> Result<(), PipelineError> {
+        let source_name = Arc::clone(&entry.source_name);
+        accounts.counters.dlq_count += 1;
+        *accounts
+            .dlq_per_source
+            .entry(Arc::clone(&source_name))
+            .or_insert(0) += 1;
+        self.report.record(entry.stage.as_deref(), entry.category);
+        self.write(&entry)?;
+        accounts.entries.push(entry); // Removed when the executor test suite reads the DLQ sink.
+        check_dlq_rate(accounts, &source_name)
     }
 
     /// Encode `entry` under its bucket's header and write it, then count the
@@ -726,8 +793,8 @@ pub(crate) fn advance_cursor(
 /// fraction exceeds it. Per-source thresholds win against pipeline-wide
 /// when set. Both branches honor `min_records` to avoid 1/1 = 100%
 /// false positives on the very first failure.
-fn check_dlq_rate(ctx: &ExecutorContext<'_>, source: &Arc<str>) -> Result<(), PipelineError> {
-    let Some(dlq) = ctx.config.error_handling.dlq.as_ref() else {
+fn check_dlq_rate(accounts: &DlqAccounts<'_>, source: &Arc<str>) -> Result<(), PipelineError> {
+    let Some(dlq) = accounts.config else {
         return Ok(());
     };
     let pipeline_min = dlq
@@ -737,8 +804,8 @@ fn check_dlq_rate(ctx: &ExecutorContext<'_>, source: &Arc<str>) -> Result<(), Pi
     if let Some(per) = dlq.per_source.get(source.as_ref())
         && let Some(max) = per.max_rate
     {
-        let total = ctx.total_per_source.get(source).copied().unwrap_or(0);
-        let observed = ctx.dlq_per_source.get(source).copied().unwrap_or(0);
+        let total = accounts.total_per_source.get(source).copied().unwrap_or(0);
+        let observed = accounts.dlq_per_source.get(source).copied().unwrap_or(0);
         let min = per.min_records.unwrap_or(pipeline_min);
         if total >= min && total > 0 {
             let rate = observed as f64 / total as f64;
@@ -755,8 +822,8 @@ fn check_dlq_rate(ctx: &ExecutorContext<'_>, source: &Arc<str>) -> Result<(), Pi
     }
 
     if let Some(max) = dlq.max_rate {
-        let total: u64 = ctx.total_per_source.values().sum();
-        let observed = ctx.counters.dlq_count;
+        let total: u64 = accounts.total_per_source.values().sum();
+        let observed = accounts.counters.dlq_count;
         if total >= pipeline_min && total > 0 {
             let rate = observed as f64 / total as f64;
             if rate >= max {
