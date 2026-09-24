@@ -2770,6 +2770,15 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                     "{}",
                     staging_plan_explain(&pipeline_config, &staging_policy, &discovery_anchor)
                 );
+                // Dead-letter files and their compiled headers: an author can
+                // read exactly which columns each file will carry before any
+                // data is read. Absent without an `error_handling.dlq` block.
+                if let Some(layout) = compiled_plan.dlq_layout() {
+                    print!(
+                        "{}",
+                        clinker_plan::plan::execution::dead_letter_explain_text(layout)
+                    );
+                }
             }
             ExplainFormat::Json => {
                 // Storage observability at parity with the text path: the
@@ -2785,7 +2794,8 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                     &args.config,
                 );
                 let view = clinker_plan::plan::execution::ExplainJson::new(dag, statistics)
-                    .with_storage_summary(storage_summary);
+                    .with_storage_summary(storage_summary)
+                    .with_dead_letter_layout(compiled_plan.dlq_layout());
                 let json = serde_json::to_string_pretty(&view).map_err(|e| {
                     PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
                         "JSON serialization failed: {e}"

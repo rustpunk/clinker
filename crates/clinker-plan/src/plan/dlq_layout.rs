@@ -98,6 +98,16 @@ impl DlqLayout {
         &self.buckets
     }
 
+    /// Every bucket paired with its identity, in [`Self::buckets`] order, so
+    /// a caller can ask [`Self::sources_for`] and [`Self::is_fallback`] about
+    /// each one.
+    pub fn iter(&self) -> impl Iterator<Item = (DlqBucketId, &DlqBucket)> {
+        self.buckets
+            .iter()
+            .enumerate()
+            .map(|(index, bucket)| (DlqBucketId(index), bucket))
+    }
+
     /// The bucket `id` names. `id` must come from this layout.
     pub fn bucket(&self, id: DlqBucketId) -> &DlqBucket {
         &self.buckets[id.0]

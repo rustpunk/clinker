@@ -187,7 +187,9 @@ fn text_buckets(stdout: &str) -> Vec<ReportedBucket> {
     let start = stdout
         .find(SECTION)
         .unwrap_or_else(|| panic!("explain text lacks {SECTION:?}:\n{stdout}"));
-    let mut lines = stdout[start + SECTION.len()..].lines().skip_while(|l| l.is_empty());
+    let mut lines = stdout[start + SECTION.len()..]
+        .lines()
+        .skip_while(|l| l.is_empty());
     let mut buckets = Vec::new();
     while let Some(path_line) = lines.next() {
         let Some(path) = path_line.strip_prefix("  ") else {
