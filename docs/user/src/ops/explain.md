@@ -75,10 +75,10 @@ columns before any data is read:
 
   rejects.csv
     sources: (pipeline-wide fallback)
-    columns: _cxl_dlq_id, _cxl_dlq_timestamp, _cxl_dlq_source_file, _cxl_dlq_source_name, _cxl_dlq_source_row, _cxl_dlq_triggering_field, _cxl_dlq_triggering_value, _cxl_dlq_error_category, _cxl_dlq_error_detail, _cxl_dlq_stage, _cxl_dlq_route, _cxl_dlq_trigger, order_id, order_total, _cxl_dlq_source_record
+    columns: _cxl_dlq_id, _cxl_dlq_failure_id, _cxl_dlq_timestamp, _cxl_dlq_source_file, _cxl_dlq_source_name, _cxl_dlq_source_row, _cxl_dlq_triggering_field, _cxl_dlq_triggering_value, _cxl_dlq_error_category, _cxl_dlq_error_detail, _cxl_dlq_stage, _cxl_dlq_route, _cxl_dlq_trigger, order_id, order_total, _cxl_dlq_source_record
   refunds_rejects.csv
     sources: refunds
-    columns: _cxl_dlq_id, _cxl_dlq_timestamp, _cxl_dlq_source_file, _cxl_dlq_source_name, _cxl_dlq_source_row, _cxl_dlq_triggering_field, _cxl_dlq_triggering_value, _cxl_dlq_error_category, _cxl_dlq_error_detail, _cxl_dlq_stage, _cxl_dlq_route, _cxl_dlq_trigger, refund_id, refund_amount, reason, _cxl_dlq_source_record
+    columns: _cxl_dlq_id, _cxl_dlq_failure_id, _cxl_dlq_timestamp, _cxl_dlq_source_file, _cxl_dlq_source_name, _cxl_dlq_source_row, _cxl_dlq_triggering_field, _cxl_dlq_triggering_value, _cxl_dlq_error_category, _cxl_dlq_error_detail, _cxl_dlq_stage, _cxl_dlq_route, _cxl_dlq_trigger, refund_id, refund_amount, reason, _cxl_dlq_source_record
 ```
 
 Each entry gives:
@@ -129,13 +129,13 @@ Its `buckets` array has one entry per DLQ file, in the same order:
       "path": "rejects.csv",
       "sources": [],
       "fallback": true,
-      "header": ["_cxl_dlq_id", "_cxl_dlq_timestamp", "...", "order_id", "order_total", "_cxl_dlq_source_record"]
+      "header": ["_cxl_dlq_id", "_cxl_dlq_failure_id", "_cxl_dlq_timestamp", "...", "order_id", "order_total", "_cxl_dlq_source_record"]
     },
     {
       "path": "refunds_rejects.csv",
       "sources": ["refunds"],
       "fallback": false,
-      "header": ["_cxl_dlq_id", "_cxl_dlq_timestamp", "...", "refund_id", "refund_amount", "reason", "_cxl_dlq_source_record"]
+      "header": ["_cxl_dlq_id", "_cxl_dlq_failure_id", "_cxl_dlq_timestamp", "...", "refund_id", "refund_amount", "reason", "_cxl_dlq_source_record"]
     }
   ]
 }
