@@ -119,28 +119,78 @@ struct FailedDocument {
     emitted: EmittedRows,
 }
 
-/// Growth charged for an admitted row: the two bytes an array container
-/// stores per value, or the four an interval adds, doubled because a
-/// container's vector may hold twice its length after growing.
+// The ledger's charge model. Each figure is derived from the roaring 0.11.5
+// source (paths under its `src/`) and is an upper bound on the heap the
+// structure holds, so the charge stays at or above the ledger's heap between
+// settles. Vectors there grow by doubling, so a vector holds at most
+// `max(4, 2 * len)` elements; the model charges that capacity.
+
+/// Heap of one ordered-map node in a treemap: `RoaringTreemap` is a
+/// `BTreeMap<u32, RoaringBitmap>` (`treemap/mod.rs:40-42`). An internal node
+/// holds a parent pointer, two `u16` counters, 11 keys, 11 values and 12 edge
+/// pointers; a leaf holds less. A B-tree has no more nodes than keys, so one
+/// node per upper-32-bit key bounds the map.
+const BTREE_NODE_BYTES: u64 =
+    (8 + 4 + 11 * 4 + 11 * std::mem::size_of::<roaring::RoaringBitmap>() + 12 * 8) as u64;
+
+/// One container slot in a bitmap's `Vec<Container>` (`bitmap/mod.rs:48-50`):
+/// a `u16` key and a `Store` (`bitmap/container.rs:17-20`), whose largest
+/// variant is one vector (`bitmap/store/mod.rs:28-32`), plus a tag the
+/// compiler may not fold into a niche, rounded to 8-byte alignment.
+const CONTAINER_BYTES: u64 = (2 + std::mem::size_of::<Vec<u16>>() + 8).next_multiple_of(8) as u64;
+
+/// A bitmap container's fixed `Box<[u64; 1024]>` (`bitmap/store/bitmap_store.rs:15-22`).
+/// An array container becomes one past 4,096 values (`bitmap/container.rs:9`,
+/// `:225-241`), when its 4,096 recorded rows were already charged more.
+const BITMAP_CONTAINER_BYTES: u64 = 8192;
+
+/// Growth charged for an admitted row. An array container stores a `u16` per
+/// value (`bitmap/store/array_store/mod.rs:24-26`, inserted at `:127-129`); a
+/// run container adds at most one 4-byte interval per insert
+/// (`bitmap/store/interval_store.rs:63-103`, `:907-910`). Doubled for vector
+/// capacity, the larger is 8 bytes.
 const ROW_ADMISSION_BYTES: u64 = 8;
 
-/// Growth charged for a row that may open a new 65,536-value container: one
-/// container slot, doubled for the containers vector's growth.
-const NEW_CONTAINER_BYTES: u64 = 80;
+/// Growth charged for a row that may open a new 65,536-value container
+/// (`bitmap/inherent.rs:187-197`): one container slot, doubled for the
+/// containers vector's capacity.
+const NEW_CONTAINER_BYTES: u64 = 2 * CONTAINER_BYTES;
 
-/// Growth charged for a row that may open a new upper-32-bit bitmap in the
-/// treemap: one ordered-map node and the new bitmap's first containers
-/// vector.
-const NEW_HIGH_KEY_BYTES: u64 = 672;
+/// Growth charged for a row that may open a new upper-32-bit bitmap
+/// (`treemap/inherent.rs:51-54`): one map node and the new bitmap's first
+/// containers vector, which holds four slots.
+const NEW_HIGH_KEY_BYTES: u64 = BTREE_NODE_BYTES + 4 * CONTAINER_BYTES;
 
-/// The most one admission can add to the ledger's charge: a row that opens a
-/// new Source entry, bitmap and container. Every admission preflights its own
-/// growth, which never exceeds this.
-const MAX_ADMISSION_BYTES: u64 =
-    ROW_ADMISSION_BYTES + NEW_CONTAINER_BYTES + NEW_HIGH_KEY_BYTES + 4 * SOURCE_ENTRY_BYTES;
+/// Growth charged for a row whose two neighbours in its container are
+/// already recorded while the treemap holds a run container. In a run
+/// container that insert merges two intervals and removes one without
+/// shrinking the vector (`bitmap/store/interval_store.rs:85`), so the freed
+/// interval's capacity stays charged until a settle finds no run container,
+/// or finds this slack larger than the rest of the ledger and rebuilds the
+/// treemap with exact capacities (a clone of a vector keeps only its length).
+const MERGED_INTERVAL_BYTES: u64 = 8;
 
 /// One `(Source, rows)` slot of [`EmittedRows::sources`].
 const SOURCE_ENTRY_BYTES: u64 = std::mem::size_of::<(PlanNodeId, SourceEmittedRows)>() as u64;
+
+/// The most one admission can add to the ledger's charge: a merging row that
+/// opens a new Source entry, bitmap and container. Every admission
+/// preflights its own growth, which never exceeds this.
+const MAX_ADMISSION_BYTES: u64 = ROW_ADMISSION_BYTES
+    + MERGED_INTERVAL_BYTES
+    + NEW_CONTAINER_BYTES
+    + NEW_HIGH_KEY_BYTES
+    + 4 * SOURCE_ENTRY_BYTES;
+
+/// A ledger settles after this many admissions within one rejection pass, as
+/// well as at the end of every pass, so the per-admission charges a long pass
+/// accumulates are replaced by the compressed size.
+const SETTLE_EVERY_ADMISSIONS: u64 = 65_536;
+
+/// Fixed charge for each failed document's map slot, taken when the document
+/// is first marked failed and released with the state. A hash map holds at
+/// most about 2.3 slots per entry after growing, so three are charged.
+const FAILED_DOCUMENT_BYTES: u64 = 3 * (std::mem::size_of::<(DocKey, FailedDocument)>() as u64 + 1);
 
 /// Which rows of one rejected document have been dead-lettered, as one
 /// [`RoaringTreemap`] per Source keyed by the row's absolute
@@ -150,8 +200,21 @@ const SOURCE_ENTRY_BYTES: u64 = std::mem::size_of::<(PlanNodeId, SourceEmittedRo
 /// mints one ordinal per row across every file it reads, so one document's
 /// rows are one contiguous run of its Source's ordinals, whichever Sink sees
 /// them first. The ordinals are `u64`, so the 64-bit treemap rather than the
-/// 32-bit bitmap holds them. A contiguous run compresses to a single interval
-/// once the treemap is optimized.
+/// 32-bit bitmap holds them.
+///
+/// Roaring splits the ordinals into 65,536-value containers and keeps each as
+/// a sorted array (2 bytes per value), a bitmap (8 KiB) or a list of runs,
+/// whichever is smaller once the treemap is optimized. A contiguous document
+/// settles to one run per container, a few dozen bytes; no shape costs more
+/// than about 2 bytes per recorded row plus a container header of a few dozen
+/// bytes per 65,536 rows of the document.
+///
+/// The ledger is exact dedup state and does not spill. Its charge is an upper
+/// bound on its heap: each admission is charged its worst-case growth (at
+/// most [`MAX_ADMISSION_BYTES`]) and preflighted against the hard limit, and
+/// [`EmittedRows::settle`] replaces the accumulated admissions with the
+/// compressed structure's bound. Growth past the hard limit fails the run
+/// with E310 rather than spilling.
 ///
 /// There is more than one entry only when two Sources read the same file
 /// path, which then names one document (#1233).
@@ -159,6 +222,8 @@ struct EmittedRows {
     sources: Vec<(PlanNodeId, SourceEmittedRows)>,
     /// Bytes charged for this ledger to the document state's consumer.
     charged: u64,
+    /// Admissions since the last settle.
+    unsettled: u64,
 }
 
 /// One Source's recorded rows of a rejected document.
@@ -167,6 +232,18 @@ struct SourceEmittedRows {
     /// `ordinal >> 16` of the last admitted row. Its container exists, so the
     /// next row in the same container cannot open a new one.
     last_container: Option<u64>,
+    /// Interval capacity merges may have left behind in run containers.
+    merged_slack: u64,
+    /// Whether the last settle left a run container. Containers become runs
+    /// only when a settle optimizes them, so until then no merge can leave
+    /// interval capacity behind.
+    has_runs: bool,
+}
+
+/// What admitting one row costs.
+struct Admission {
+    growth: u64,
+    merges: bool,
 }
 
 impl EmittedRows {
@@ -174,12 +251,13 @@ impl EmittedRows {
         Self {
             sources: Vec::new(),
             charged: 0,
+            unsettled: 0,
         }
     }
 
-    /// The bytes admitting `row` may add to the ledger, or `None` when the row
-    /// is already recorded and admitting it is a no-op.
-    fn admission_growth(&self, row: SourceRowId) -> Option<u64> {
+    /// What admitting `row` may add to the ledger, or `None` when the row is
+    /// already recorded and admitting it is a no-op.
+    fn admission(&self, row: SourceRowId) -> Option<Admission> {
         let ordinal = row.ordinal();
         let container = ordinal >> 16;
         let Some((_, source)) = self.sources.iter().find(|(id, _)| *id == row.source()) else {
@@ -188,7 +266,10 @@ impl EmittedRows {
             } else {
                 2 * SOURCE_ENTRY_BYTES
             };
-            return Some(ROW_ADMISSION_BYTES + NEW_CONTAINER_BYTES + NEW_HIGH_KEY_BYTES + entry);
+            return Some(Admission {
+                growth: ROW_ADMISSION_BYTES + NEW_CONTAINER_BYTES + NEW_HIGH_KEY_BYTES + entry,
+                merges: false,
+            });
         };
         if source.rows.contains(ordinal) {
             return None;
@@ -198,11 +279,22 @@ impl EmittedRows {
             Some(last) if last >> 16 == container >> 16 => NEW_CONTAINER_BYTES,
             _ => NEW_CONTAINER_BYTES + NEW_HIGH_KEY_BYTES,
         };
-        Some(ROW_ADMISSION_BYTES + opens)
+        // Neighbours only merge within one container.
+        let low = ordinal & 0xFFFF;
+        let merges = source.has_runs
+            && low != 0
+            && low != 0xFFFF
+            && source.rows.contains(ordinal - 1)
+            && source.rows.contains(ordinal + 1);
+        let merged = if merges { MERGED_INTERVAL_BYTES } else { 0 };
+        Some(Admission {
+            growth: ROW_ADMISSION_BYTES + opens + merged,
+            merges,
+        })
     }
 
-    /// Record `row`, whose admission was charged `growth` bytes.
-    fn record(&mut self, row: SourceRowId, growth: u64) {
+    /// Record `row`, whose admission was charged as `admission`.
+    fn record(&mut self, row: SourceRowId, admission: &Admission) {
         let index = match self.sources.iter().position(|(id, _)| *id == row.source()) {
             Some(index) => index,
             None => {
@@ -211,6 +303,8 @@ impl EmittedRows {
                     SourceEmittedRows {
                         rows: RoaringTreemap::new(),
                         last_container: None,
+                        merged_slack: 0,
+                        has_runs: false,
                     },
                 ));
                 self.sources.len() - 1
@@ -219,15 +313,76 @@ impl EmittedRows {
         let source = &mut self.sources[index].1;
         source.rows.insert(row.ordinal());
         source.last_container = Some(row.ordinal() >> 16);
-        self.charged = self.charged.saturating_add(growth);
+        if admission.merges {
+            source.merged_slack += MERGED_INTERVAL_BYTES;
+        }
+        self.charged = self.charged.saturating_add(admission.growth);
+        self.unsettled += 1;
     }
 
-    /// Compress every treemap after a rejection pass.
-    fn settle(&mut self) {
+    /// Compress every treemap and replace the charge with a bound on the
+    /// compressed heap. Returns the new charge. Optimizing converts a
+    /// container to runs only when that is smaller, but the new run vector
+    /// may keep doubling slack, so the new charge can exceed the old one by
+    /// that slack; it is reported, and the next admission's preflight sees
+    /// it.
+    ///
+    /// Merge slack larger than the treemap's own bound is shed by rebuilding
+    /// the treemap as a clone, whose vectors hold exactly their length. The
+    /// rebuild briefly holds both copies, which the slack being dropped
+    /// already covers.
+    fn settle(&mut self) -> u64 {
+        let slots = if self.sources.is_empty() {
+            0
+        } else {
+            (2 * self.sources.len() as u64).max(4)
+        };
+        let mut charged = slots * SOURCE_ENTRY_BYTES;
         for (_, source) in &mut self.sources {
             source.rows.optimize();
+            let (heap, has_runs) = treemap_heap_bound(&source.rows);
+            source.has_runs = has_runs;
+            if !has_runs {
+                source.merged_slack = 0;
+            } else if source.merged_slack > heap {
+                source.rows = source.rows.clone();
+                source.merged_slack = 0;
+            }
+            charged += heap + source.merged_slack;
         }
+        self.charged = charged;
+        self.unsettled = 0;
+        charged
     }
+}
+
+/// An upper bound on `rows`' heap from its containers' statistics
+/// (`bitmap/statistics.rs`), and whether it holds any run container.
+fn treemap_heap_bound(rows: &RoaringTreemap) -> (u64, bool) {
+    let mut bytes = 0;
+    let mut has_runs = false;
+    for (_, bitmap) in rows.bitmaps() {
+        let stats = bitmap.statistics();
+        let containers = u64::from(stats.n_containers);
+        let arrays = u64::from(stats.n_array_containers);
+        let runs = u64::from(stats.n_run_containers);
+        let bitmaps = u64::from(stats.n_bitset_containers);
+        // A run container's statistic is its serialized size, 2 bytes plus 4
+        // per interval (`bitmap/store/interval_store.rs:35-41`).
+        let intervals = stats.n_bytes_run_containers.saturating_sub(2 * runs) / 4;
+        bytes += BTREE_NODE_BYTES
+            + CONTAINER_BYTES * (2 * containers).max(4)
+            // An array of `len` values holds at most max(4, 2 * len) `u16`s,
+            // at most 4 * len + 4 bytes.
+            + 4 * arrays
+            + 4 * u64::from(stats.n_values_array_containers)
+            + BITMAP_CONTAINER_BYTES * bitmaps
+            // A run container's vector: at most max(4, 2 * intervals) intervals.
+            + 16 * runs
+            + 8 * intervals;
+        has_runs |= runs > 0;
+    }
+    (bytes, has_runs)
 }
 
 /// Run-scoped document-DLQ state: which sources opt into the policy, the
@@ -342,9 +497,10 @@ impl DocumentDlqState {
                 node: node.to_string(),
                 detail: format!("document {key:?} is rejected but was never marked failed"),
             })?;
-        let Some(growth) = failed.emitted.admission_growth(row) else {
+        let Some(admission) = failed.emitted.admission(row) else {
             return Ok(false);
         };
+        let growth = admission.growth;
         debug_assert!(growth <= MAX_ADMISSION_BYTES);
         let charged_pressure = self.arbitrator.sum_consumer_usage();
         let projected_pressure = charged_pressure.saturating_add(growth);
@@ -360,23 +516,53 @@ impl DocumentDlqState {
                 )),
             });
         }
-        failed.emitted.record(row, growth);
+        failed.emitted.record(row, &admission);
         self.handle.add_bytes(growth);
+        if failed.emitted.unsettled >= SETTLE_EVERY_ADMISSIONS {
+            settle_ledger(&self.handle, &mut failed.emitted);
+        }
         self.arbitrator.sample_peak_consumer_usage();
         Ok(true)
     }
 
-    /// Compress document `key`'s ledger after a rejection pass.
+    /// Settle document `key`'s ledger after a rejection pass: compress it and
+    /// charge its compressed size in place of the pass's admissions.
     fn settle_emitted(&mut self, key: &DocKey) {
         if let Some(failed) = self.failed.get_mut(key) {
-            failed.emitted.settle();
+            settle_ledger(&self.handle, &mut failed.emitted);
         }
+        self.arbitrator.sample_peak_consumer_usage();
+    }
+
+    /// Mark document `key` failed with its first failure `trigger`, charging
+    /// the document's fixed map slot.
+    fn insert_failed(&mut self, key: DocKey, trigger: DocTrigger) {
+        self.handle.add_bytes(FAILED_DOCUMENT_BYTES);
+        self.failed.insert(
+            key,
+            FailedDocument {
+                cause: trigger.failed_at,
+                trigger: Some(trigger),
+                emitted: EmittedRows::new(),
+            },
+        );
     }
 
     /// Bytes charged to the arbitrator for every ledger.
     #[cfg(test)]
     fn charged_bytes(&self) -> u64 {
         self.handle.bytes()
+    }
+}
+
+/// Settle `emitted` and move `handle` by the change in its charge.
+fn settle_ledger(handle: &ConsumerHandle, emitted: &mut EmittedRows) {
+    let before = emitted.charged;
+    let after = emitted.settle();
+    if after >= before {
+        handle.add_bytes(after - before);
+    } else {
+        handle.sub_bytes(before - after);
     }
 }
 
@@ -573,21 +759,14 @@ fn mark_document_failed(ctx: &mut ExecutorContext<'_>, key: DocKey, trigger: Doc
     let Some(state) = ctx.document_dlq.as_mut() else {
         return;
     };
-    match state.failed.entry(key.clone()) {
-        std::collections::hash_map::Entry::Vacant(v) => {
-            v.insert(FailedDocument {
-                cause: trigger.failed_at,
-                trigger: Some(trigger),
-                emitted: EmittedRows::new(),
-            });
-        }
-        std::collections::hash_map::Entry::Occupied(_) => {
-            state
-                .extra_collaterals
-                .entry(key)
-                .or_default()
-                .push((trigger.original_record, trigger.source_row));
-        }
+    if state.failed.contains_key(&key) {
+        state
+            .extra_collaterals
+            .entry(key)
+            .or_default()
+            .push((trigger.original_record, trigger.source_row));
+    } else {
+        state.insert_failed(key, trigger);
     }
 }
 
@@ -1529,25 +1708,25 @@ mod tests {
             HashSet::from([Arc::clone(&source_name)]),
             Arc::clone(&arbitrator),
         );
-        let failed_at = DlqFailureStamp::now();
-        state.failed.insert(
+        state.insert_failed(
             Arc::clone(&key),
-            FailedDocument {
-                cause: failed_at,
-                trigger: Some(DocTrigger {
-                    source_row: trigger_row,
-                    category: clinker_core_types::dlq::DlqErrorCategory::ValidationFailure,
-                    error_message: "document validation failed".to_string(),
-                    original_record: trigger_record.clone(),
-                    stage: Some("validate".to_string()),
-                    route: None,
-                    source_name,
-                    triggering_field: None,
-                    triggering_value: None,
-                    failed_at,
-                }),
-                emitted: EmittedRows::new(),
+            DocTrigger {
+                source_row: trigger_row,
+                category: clinker_core_types::dlq::DlqErrorCategory::ValidationFailure,
+                error_message: "document validation failed".to_string(),
+                original_record: trigger_record.clone(),
+                stage: Some("validate".to_string()),
+                route: None,
+                source_name,
+                triggering_field: None,
+                triggering_value: None,
+                failed_at: DlqFailureStamp::now(),
             },
+        );
+        assert_eq!(
+            state.charged_bytes(),
+            FAILED_DOCUMENT_BYTES,
+            "marking a document failed charges its map slot"
         );
 
         let handle = ConsumerHandle::new();
@@ -1905,6 +2084,33 @@ mod tests {
             }
             other => panic!("expected E310, got {other:?}"),
         }
+    }
+
+    /// Rows split between two Sinks by a Route, every other row to each,
+    /// meet in the ledger as the second Sink fills every gap the first left.
+    /// Each fill merges two runs; the settles shed the capacity the merges
+    /// leave, so the charge stays near the compressed size.
+    #[test]
+    fn interleaved_rows_from_two_sinks_settle_compactly() {
+        let arbitrator = ledger_arbitrator(1 << 30);
+        let (mut state, key) = ledger_state(&arbitrator);
+        let baseline = state.charged_bytes();
+        for first in [1, 2] {
+            for ordinal in (first..=400_000).step_by(2) {
+                assert!(
+                    state
+                        .admit_emitted(&key, row(1, ordinal), "out")
+                        .expect("admission")
+                );
+            }
+            state.settle_emitted(&key);
+        }
+        assert_eq!(recorded(&state, &key, 1).len(), 400_000);
+        let charged = state.charged_bytes() - baseline;
+        assert!(
+            charged <= 2048,
+            "400,000 contiguous rows settle to a few runs, charged {charged}"
+        );
     }
 
     /// The ledger's consumer frees nothing, so the default policy never
