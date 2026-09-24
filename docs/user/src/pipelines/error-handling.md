@@ -232,7 +232,7 @@ Every DLQ record includes these metadata columns:
 | Column | Description |
 |--------|-------------|
 | `_cxl_dlq_id` | UUID v7 (time-ordered unique identifier), unique to the row. It is taken together with `_cxl_dlq_timestamp`, so ids order the same way as timestamps. |
-| `_cxl_dlq_failure_id` | The `_cxl_dlq_id` of the trigger row of the failure that produced this row. A row whose own failure dead-lettered it alone carries its own id; every row one failure produced carries the same value. See [Pairing the rows one failure produced](#pairing-the-rows-one-failure-produced). |
+| `_cxl_dlq_trigger_id` | The `_cxl_dlq_id` of the trigger row whose failure produced this row. A trigger row points to itself, so `_cxl_dlq_trigger` is `true` exactly when this value equals `_cxl_dlq_id`; every row one failure produced carries the same value. See [Pairing the rows one failure produced](#pairing-the-rows-one-failure-produced). |
 | `_cxl_dlq_timestamp` | RFC 3339 timestamp of when the failure was observed, not of when the row was written. A collateral row (`correlated`, `document_rejected`) and every row of a `group_size_exceeded` group carry the time their correlation group or document was condemned. |
 | `_cxl_dlq_source_file` | Input filename carried by that failing record's `$source.file` provenance (or `<merged>` when no source-file provenance exists) |
 | `_cxl_dlq_source_name` | Name of the Source the failing record came from (or `<merged>` when the record carries no Source identity) |
@@ -269,26 +269,29 @@ One failure can dead-letter several rows:
 - under `dlq_granularity: document`, a failing record rejects the rest of its
   document as `document_rejected` rows.
 
-Every row carries `_cxl_dlq_failure_id`, the `_cxl_dlq_id` of the row whose
-failure produced it. Group by it to see everything one failure took with it.
+Every row carries `_cxl_dlq_trigger_id`, the `_cxl_dlq_id` of the trigger row
+whose failure produced it. A trigger row points to itself, so `_cxl_dlq_trigger`
+is `true` exactly when `_cxl_dlq_trigger_id` equals `_cxl_dlq_id`. Group by
+`_cxl_dlq_trigger_id` to see everything one failure took with it.
 In this excerpt (other columns omitted), the first two rows are a Combine
 driver row and its build row, and the last two are a correlation trigger and
 one of its collaterals:
 
 ```csv
-_cxl_dlq_id,_cxl_dlq_failure_id,_cxl_dlq_source_name,_cxl_dlq_error_category,_cxl_dlq_trigger
+_cxl_dlq_id,_cxl_dlq_trigger_id,_cxl_dlq_source_name,_cxl_dlq_error_category,_cxl_dlq_trigger
 01928f3a-6c10-7b21-8a4e-3f1c2d9e0a01,01928f3a-6c10-7b21-8a4e-3f1c2d9e0a01,orders,combine_output_row,true
 01928f3a-6c10-7b22-9f07-51e6a8b4c302,01928f3a-6c10-7b21-8a4e-3f1c2d9e0a01,rates,combine_output_row,false
 01928f3a-6c14-7c03-b2d8-0a9e7f615203,01928f3a-6c14-7c03-b2d8-0a9e7f615203,employees,type_coercion_failure,true
 01928f3a-6c19-7d40-8c11-6e2b90d3f404,01928f3a-6c14-7c03-b2d8-0a9e7f615203,employees,correlated,false
 ```
 
-A row whose failure wrote nothing else carries its own id. Every row has its
-own `_cxl_dlq_id`, so the value only repeats across the rows of one failure.
+A trigger whose failure wrote nothing else carries its own id and shares it
+with no other row. Every row has its own `_cxl_dlq_id`, so the value only
+repeats across the rows of one failure.
 
 When a correlation group holds several failing rows, each failing row is a
-trigger and keeps its own id as its failure id. The group's `correlated` rows
-carry the failure id of the group's first failing row, the one whose error
+trigger and keeps its own id as its trigger id. The group's `correlated` rows
+carry the trigger id of the group's first failing row, the one whose error
 their `_cxl_dlq_error_detail` quotes. A rejected document has one trigger, its
 first failing record; its other records, including any that failed after it,
 carry that trigger's id.
@@ -305,7 +308,7 @@ failed in: every time a pipeline writes a given DLQ file, that file has the
 same columns in the same order.
 
 A header starts with the `_cxl_dlq_*` metadata columns, always in this order:
-`_cxl_dlq_id`, `_cxl_dlq_failure_id`, `_cxl_dlq_timestamp`, `_cxl_dlq_source_file`,
+`_cxl_dlq_id`, `_cxl_dlq_trigger_id`, `_cxl_dlq_timestamp`, `_cxl_dlq_source_file`,
 `_cxl_dlq_source_name`, `_cxl_dlq_source_row`, `_cxl_dlq_triggering_field`,
 `_cxl_dlq_triggering_value`, then `_cxl_dlq_error_category` and
 `_cxl_dlq_error_detail` when `include_reason` is on, then `_cxl_dlq_stage`,

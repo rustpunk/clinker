@@ -1169,16 +1169,16 @@ fn canonical_dlq_bytes(path: &Path) -> Vec<u8> {
     let header = lines.next().expect("DLQ header");
     // The three run-local columns lead every DLQ header. Their values are
     // UUIDs and an RFC 3339 time, none of which holds a comma.
-    assert!(header.starts_with(b"_cxl_dlq_id,_cxl_dlq_failure_id,_cxl_dlq_timestamp,"));
+    assert!(header.starts_with(b"_cxl_dlq_id,_cxl_dlq_trigger_id,_cxl_dlq_timestamp,"));
     let mut canonical = header.to_vec();
     canonical.push(b'\n');
     for line in lines.filter(|line| !line.is_empty()) {
         let mut rest = line;
-        for column in ["DLQ id", "DLQ failure id", "DLQ timestamp"] {
+        for column in ["DLQ id", "DLQ trigger id", "DLQ timestamp"] {
             let comma = rest.iter().position(|byte| *byte == b',').expect(column);
             rest = &rest[comma + 1..];
         }
-        canonical.extend_from_slice(b"<run-local-id>,<run-local-failure-id>,<run-local-time>,");
+        canonical.extend_from_slice(b"<run-local-id>,<run-local-trigger-id>,<run-local-time>,");
         canonical.extend_from_slice(rest);
         canonical.push(b'\n');
     }

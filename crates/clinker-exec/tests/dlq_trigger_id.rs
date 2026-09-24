@@ -1,4 +1,4 @@
-//! `_cxl_dlq_failure_id` pairs every dead-letter row one failure produced.
+//! `_cxl_dlq_trigger_id` pairs every dead-letter row one failure produced.
 //!
 //! The column holds the `_cxl_dlq_id` of the trigger row of the failure
 //! behind a row. A failure that wrote one row carries its own id. A
@@ -28,7 +28,7 @@ use dlq_sink::DlqRow;
 
 fn run_params() -> PipelineRunParams {
     PipelineRunParams {
-        execution_id: "failure-id".to_string(),
+        execution_id: "trigger-id".to_string(),
         batch_id: "batch".to_string(),
         pipeline_vars: indexmap::IndexMap::new(),
         shutdown_token: None,
@@ -85,9 +85,9 @@ fn id(row: &DlqRow) -> &str {
         .expect("every dead-letter header carries _cxl_dlq_id")
 }
 
-fn failure_id(row: &DlqRow) -> &str {
-    row.field("_cxl_dlq_failure_id")
-        .expect("every dead-letter header carries _cxl_dlq_failure_id")
+fn trigger_id(row: &DlqRow) -> &str {
+    row.field("_cxl_dlq_trigger_id")
+        .expect("every dead-letter header carries _cxl_dlq_trigger_id")
 }
 
 fn describe(rows: &[DlqRow]) -> Vec<(u64, bool, Option<&str>, Option<&str>)> {
@@ -97,20 +97,20 @@ fn describe(rows: &[DlqRow]) -> Vec<(u64, bool, Option<&str>, Option<&str>)> {
                 row.source_row(),
                 row.trigger(),
                 row.category(),
-                row.field("_cxl_dlq_failure_id"),
+                row.field("_cxl_dlq_trigger_id"),
             )
         })
         .collect()
 }
 
 /// A correlation group with two failing rows and one clean row. Each
-/// trigger keeps its own failure id; the collateral carries the first
+/// trigger keeps its own trigger id; the collateral carries the first
 /// trigger's, and its detail quotes that trigger's message.
 #[test]
 fn multi_trigger_group_collaterals_pair_with_the_first_trigger() {
     let yaml = r#"
 pipeline:
-  name: failure_id_multi_trigger
+  name: trigger_id_multi_trigger
 error_handling:
   strategy: continue
   dlq:
@@ -165,9 +165,9 @@ nodes:
     assert_eq!(triggers.len(), 2, "{:?}", describe(&rows));
     for trigger in &triggers {
         assert_eq!(
-            failure_id(trigger),
+            trigger_id(trigger),
             id(trigger),
-            "each trigger of a multi-trigger group keeps its own failure id"
+            "each trigger of a multi-trigger group keeps its own trigger id"
         );
     }
     let first = triggers[0];
@@ -182,7 +182,7 @@ nodes:
     );
     assert_eq!(collateral.source_row(), 2);
     assert_eq!(
-        failure_id(collateral),
+        trigger_id(collateral),
         id(first),
         "the collateral pairs with the group's first trigger"
     );
@@ -205,7 +205,7 @@ nodes:
 fn document_extra_failure_pairs_with_the_document_trigger() {
     let yaml = r#"
 pipeline:
-  name: failure_id_document
+  name: trigger_id_document
 error_handling:
   strategy: continue
   dlq:
@@ -261,7 +261,7 @@ nodes:
     assert_eq!(triggers.len(), 1, "{:?}", describe(&rows));
     let trigger = triggers[0];
     assert_eq!(trigger.source_row(), 1, "the first failure is the trigger");
-    assert_eq!(failure_id(trigger), id(trigger));
+    assert_eq!(trigger_id(trigger), id(trigger));
 
     let mut collaterals: Vec<&DlqRow> = rows.iter().filter(|row| !row.trigger()).collect();
     collaterals.sort_by_key(|row| row.source_row());
@@ -279,7 +279,7 @@ nodes:
             Some(DlqErrorCategory::DocumentRejected.as_str())
         );
         assert_eq!(
-            failure_id(row),
+            trigger_id(row),
             id(trigger),
             "row {} pairs with the document's trigger",
             row.source_row()
@@ -293,10 +293,10 @@ nodes:
 /// fall in different groups. However the build row's group commits, it
 /// carries the driver trigger's id.
 #[test]
-fn combine_build_row_held_by_a_correlation_group_keeps_the_driver_failure_id() {
+fn combine_build_row_held_by_a_correlation_group_keeps_the_driver_trigger_id() {
     let yaml = r#"
 pipeline:
-  name: failure_id_combine_build
+  name: trigger_id_combine_build
 error_handling:
   strategy: continue
   dlq:
@@ -367,25 +367,25 @@ nodes:
             )
         });
     assert_eq!(
-        failure_id(driver),
+        trigger_id(driver),
         id(driver),
         "the driver is the failure's trigger"
     );
     assert_eq!(
-        failure_id(build),
+        trigger_id(build),
         id(driver),
-        "the build row keeps its driver's failure id through its correlation group"
+        "the build row keeps its driver's trigger id through its correlation group"
     );
     assert_ne!(id(build), id(driver), "the build row has its own id");
 }
 
 /// Transform and Route failures with no correlation key each write one
-/// row, which carries its own id as its failure id.
+/// row, which carries its own id as its trigger id.
 #[test]
 fn standalone_triggers_carry_their_own_id() {
     let yaml = r#"
 pipeline:
-  name: failure_id_standalone
+  name: trigger_id_standalone
 error_handling:
   strategy: continue
   dlq:
@@ -453,16 +453,16 @@ nodes:
     for row in &rows {
         assert!(row.trigger(), "a standalone failure is its own trigger");
         assert_eq!(
-            failure_id(row),
+            trigger_id(row),
             id(row),
-            "row {} carries its own id as its failure id",
+            "row {} carries its own id as its trigger id",
             row.source_row()
         );
-        let parsed = uuid::Uuid::parse_str(failure_id(row)).expect("the failure id is a UUID");
+        let parsed = uuid::Uuid::parse_str(trigger_id(row)).expect("the trigger id is a UUID");
         assert_eq!(
             parsed.get_version_num(),
             7,
-            "the failure id is a version-7 UUID"
+            "the trigger id is a version-7 UUID"
         );
     }
 }
