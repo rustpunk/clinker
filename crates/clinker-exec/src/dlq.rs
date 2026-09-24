@@ -93,9 +93,10 @@ impl DlqRowEncoder {
 
     /// One CSV row for `entry` under `bucket`'s header, terminator included.
     ///
-    /// The engine columns carry the entry's identity and reason; the id and
-    /// timestamp columns render the entry's [`DlqEntry::failed_at`] stamp, so
-    /// encoding an entry twice yields the same row; each user
+    /// The engine columns carry the entry's identity and reason; the id,
+    /// failure id and timestamp columns render the entry's
+    /// [`DlqEntry::failed_at`] stamp, so encoding an entry twice yields the
+    /// same row; each user
     /// column is placed at its header position, and a header column the
     /// record lacks is an empty cell. A user column of the record that the
     /// bucket's compiled header does not admit is a planner defect: it returns
@@ -124,11 +125,20 @@ impl DlqRowEncoder {
         writer.get_ref().0.set(buffer);
 
         let record = &entry.original_record;
-        // The id and time were stamped where the failure was observed; the
-        // encoder renders them and never generates its own.
+        // The id, failure id and time were stamped where the failure was
+        // observed; the encoder renders them and never generates its own.
         let mut id = uuid::Uuid::encode_buffer();
         writer
             .write_field(entry.failed_at.id().hyphenated().encode_lower(&mut id))
+            .map_err(csv_error)?;
+        writer
+            .write_field(
+                entry
+                    .failed_at
+                    .failure_id()
+                    .hyphenated()
+                    .encode_lower(&mut id),
+            )
             .map_err(csv_error)?;
         writer
             .write_field(entry.failed_at.at().to_rfc3339())
@@ -711,8 +721,9 @@ nodes:\n- type: source\n  name: src\n  config:\n    name: src\n    type: csv\n  
         (header, lines.collect())
     }
 
-    const ENGINE: [&str; 12] = [
+    const ENGINE: [&str; 13] = [
         "_cxl_dlq_id",
+        "_cxl_dlq_failure_id",
         "_cxl_dlq_timestamp",
         "_cxl_dlq_source_file",
         "_cxl_dlq_source_name",
@@ -766,12 +777,12 @@ nodes:\n- type: source\n  name: src\n  config:\n    name: src\n    type: csv\n  
             ],
         );
         let (header, rows) = encode(&layout, &[entry(record, "src")]);
-        assert_eq!(header[..12], ENGINE);
+        assert_eq!(header[..13], ENGINE);
         assert_eq!(
-            header[12..],
+            header[13..],
             ["zulu", "alpha", "mike", "_cxl_dlq_source_record"]
         );
-        assert_eq!(rows[0][12..], ["Z", "A", "M", ""]);
+        assert_eq!(rows[0][13..], ["Z", "A", "M", ""]);
     }
 
     /// Two Sources with different schemas reach one pipeline-wide bucket.
@@ -868,17 +879,17 @@ nodes:
         );
         let (header, rows) = encode(layout, &[beta, alpha]);
         assert_eq!(
-            header[12..],
+            header[13..],
             ["id", first_own, "_cxl_dlq_source_record", second_own],
             "first-seen union over sites in plan order; `id` appears once"
         );
         assert!(!header.iter().any(|c| c == "$source.file"));
         let col = |name: &str| header.iter().position(|c| c == name).unwrap();
-        assert_eq!(rows[0][2], "inputs/beta.csv");
+        assert_eq!(rows[0][3], "inputs/beta.csv");
         assert_eq!(rows[0][col("id")], "2");
         assert_eq!(rows[0][col("alpha")], "");
         assert_eq!(rows[0][col("beta")], "B");
-        assert_eq!(rows[1][2], "inputs/alpha.csv");
+        assert_eq!(rows[1][3], "inputs/alpha.csv");
         assert_eq!(rows[1][col("id")], "1");
         assert_eq!(rows[1][col("alpha")], "A");
         assert_eq!(rows[1][col("beta")], "");
@@ -991,16 +1002,16 @@ nodes:
         entries[0].route = Some("high".to_owned());
         entries[0].trigger = false;
         let (header, rows) = encode(&layout, &entries);
-        assert_eq!(header[..12], ENGINE);
+        assert_eq!(header[..13], ENGINE);
         for (row, category) in rows.iter().zip(categories) {
-            assert_eq!(row[3], "src");
-            assert_eq!(row[4], "3");
-            assert_eq!(row[7], category.as_str());
-            assert_eq!(row[8], "why it failed");
+            assert_eq!(row[4], "src");
+            assert_eq!(row[5], "3");
+            assert_eq!(row[8], category.as_str());
+            assert_eq!(row[9], "why it failed");
         }
-        assert_eq!(rows[0][9..12], ["transform:calc", "high", "false"]);
-        assert_eq!(rows[1][9..12], ["", "", "true"]);
-        assert_eq!(rows[0][2], "<merged>", "no `$source.file` stamp");
+        assert_eq!(rows[0][10..13], ["transform:calc", "high", "false"]);
+        assert_eq!(rows[1][10..13], ["", "", "true"]);
+        assert_eq!(rows[0][3], "<merged>", "no `$source.file` stamp");
     }
 
     #[test]
@@ -1035,9 +1046,36 @@ nodes:
         let stamp = entry.failed_at;
         for row in &rows {
             assert_eq!(row[0], stamp.id().hyphenated().to_string());
-            assert_eq!(row[1], stamp.at().to_rfc3339());
+            assert_eq!(row[1], stamp.failure_id().hyphenated().to_string());
+            assert_eq!(row[2], stamp.at().to_rfc3339());
         }
         assert_eq!(rows[0], rows[1], "encoding an entry twice yields one row");
+    }
+
+    /// The failure id is the second cell, next to the id it refers to. A
+    /// collateral renders its cause's id there and its own id first.
+    #[test]
+    fn row_renders_the_failure_id_as_the_second_cell() {
+        let layout = compiled_layout(&one_source_pipeline(
+            "    path: rejects.csv\n",
+            &["name", "value"],
+        ));
+        let trigger = name_value_entry(1, DlqErrorCategory::TypeCoercionFailure, "e");
+        let cause = trigger.failed_at;
+        let collateral = DlqEntry {
+            source_row: 2.into(),
+            category: DlqErrorCategory::Correlated,
+            trigger: false,
+            failed_at: crate::executor::DlqFailureStamp::condemned_by(&cause),
+            ..trigger.clone()
+        };
+        let (header, rows) = encode(&layout, &[trigger, collateral]);
+        assert_eq!(header[..3], ENGINE[..3]);
+        let trigger_id = cause.id().hyphenated().to_string();
+        assert_eq!(rows[0][0], trigger_id);
+        assert_eq!(rows[0][1], trigger_id, "a trigger is its own failure");
+        assert_ne!(rows[1][0], trigger_id, "a collateral has its own id");
+        assert_eq!(rows[1][1], trigger_id, "a collateral names its cause");
     }
 
     #[test]
@@ -1054,7 +1092,7 @@ nodes:
                 "e",
             )],
         );
-        chrono::DateTime::parse_from_rfc3339(&rows[0][1])
+        chrono::DateTime::parse_from_rfc3339(&rows[0][2])
             .expect("timestamp should be valid RFC 3339");
     }
 
@@ -1068,8 +1106,8 @@ nodes:
         e.triggering_field = Some(Arc::from("amount"));
         e.triggering_value = Some(Value::String("not-a-number".into()));
         let (_, rows) = encode(&layout, &[e]);
-        assert_eq!(rows[0][5], "amount");
-        assert_eq!(rows[0][6], "not-a-number");
+        assert_eq!(rows[0][6], "amount");
+        assert_eq!(rows[0][7], "not-a-number");
     }
 
     #[test]
@@ -1089,11 +1127,11 @@ nodes:
         assert!(!header.iter().any(|c| c == "_cxl_dlq_error_category"));
         assert!(!header.iter().any(|c| c == "_cxl_dlq_error_detail"));
         assert_eq!(
-            header[7..10],
+            header[8..11],
             ["_cxl_dlq_stage", "_cxl_dlq_route", "_cxl_dlq_trigger"]
         );
-        assert_eq!(header[10..12], ["name", "value"]);
-        assert_eq!(rows[0][10..12], ["Alice", "bad"]);
+        assert_eq!(header[11..13], ["name", "value"]);
+        assert_eq!(rows[0][11..13], ["Alice", "bad"]);
         assert_eq!(rows[0].len(), header.len());
     }
 

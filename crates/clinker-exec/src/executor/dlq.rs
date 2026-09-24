@@ -186,8 +186,9 @@ impl SourceRejectionEvent {
     }
 }
 
-/// The identity and time of one observed failure: the `_cxl_dlq_id` and
-/// `_cxl_dlq_timestamp` of the dead-letter row it becomes.
+/// The identity and time of one dead-letter row, and the failure it belongs
+/// to: the `_cxl_dlq_id`, `_cxl_dlq_failure_id` and `_cxl_dlq_timestamp` of
+/// the row it becomes.
 ///
 /// Taken with [`Self::now`] where the engine observes the failure, and
 /// carried unchanged through every place that holds the failure before its
@@ -195,17 +196,29 @@ impl SourceRejectionEvent {
 /// replays, combine kernels and the source ordering barrier. The row encoder
 /// only renders it. The id is a UUIDv7 from the process-wide generator, so
 /// ids are unique and increase in the order stamps are taken, on any thread.
+///
+/// The failure id is the `_cxl_dlq_id` of the trigger row of the failure
+/// that produced this row, so every row one failure produced shares it. A
+/// trigger's failure id is its own id ([`Self::now`]). A second row of the
+/// same observed failure, such as a Combine build row, keeps it
+/// ([`Self::sibling`]). A row the engine condemns because of another row's
+/// failure, a correlation collateral or a rejected document's other record,
+/// takes its cause's ([`Self::condemned_by`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DlqFailureStamp {
     id: uuid::Uuid,
+    failure: uuid::Uuid,
     at: chrono::DateTime<chrono::Utc>,
 }
 
 impl DlqFailureStamp {
-    /// A fresh id and the current UTC time.
+    /// A fresh id and the current UTC time, for a trigger: the row is its
+    /// own failure, so its failure id is its id.
     pub fn now() -> Self {
+        let id = uuid::Uuid::now_v7();
         Self {
-            id: uuid::Uuid::now_v7(),
+            id,
+            failure: id,
             at: chrono::Utc::now(),
         }
     }
@@ -215,24 +228,49 @@ impl DlqFailureStamp {
         self.id
     }
 
+    /// The `_cxl_dlq_id` of the trigger row of the failure this row belongs
+    /// to: the row's `_cxl_dlq_failure_id`.
+    pub fn failure_id(&self) -> uuid::Uuid {
+        self.failure
+    }
+
     /// When the failure was observed: the row's `_cxl_dlq_timestamp`.
     pub fn at(&self) -> chrono::DateTime<chrono::Utc> {
         self.at
     }
 
     /// A stamp for a second dead letter produced by the same observed
-    /// failure: the same time under a fresh id, because every row's id is
-    /// unique.
+    /// failure: the same time and failure id under a fresh id, because every
+    /// row's id is unique.
     pub(crate) fn sibling(&self) -> Self {
         Self {
             id: uuid::Uuid::now_v7(),
+            failure: self.failure,
             at: self.at,
         }
     }
 
-    /// Rebuild a stamp from the parts a spill payload kept.
+    /// A stamp for a row condemned now by `cause`'s failure: a fresh id and
+    /// the current time, because the engine condemns the row here, and
+    /// `cause`'s failure id, because that failure took the row with it.
+    pub(crate) fn condemned_by(cause: &DlqFailureStamp) -> Self {
+        Self {
+            id: uuid::Uuid::now_v7(),
+            failure: cause.failure,
+            at: chrono::Utc::now(),
+        }
+    }
+
+    /// Rebuild a trigger stamp from the parts a spill payload kept: its
+    /// failure id is `id`. Its only caller, the source ordering barrier,
+    /// spills source rejections, and every source rejection is its own
+    /// trigger, stamped by [`Self::now`].
     pub(crate) fn from_parts(id: uuid::Uuid, at: chrono::DateTime<chrono::Utc>) -> Self {
-        Self { id, at }
+        Self {
+            id,
+            failure: id,
+            at,
+        }
     }
 }
 
@@ -269,10 +307,12 @@ pub struct DlqEntry {
     /// index, mismatched arity). `None` otherwise. Serialized as
     /// `_cxl_dlq_triggering_value`.
     pub triggering_value: Option<clinker_record::Value>,
-    /// When the failure behind this entry was observed, and the row's id.
-    /// A trigger carries the stamp taken at its failure; a collateral entry
-    /// carries one taken when its correlation group or document was
-    /// condemned. Serialized as `_cxl_dlq_id` and `_cxl_dlq_timestamp`.
+    /// When the failure behind this entry was observed, the row's id, and
+    /// the id of the failure it belongs to. A trigger carries the stamp
+    /// taken at its failure; a collateral entry carries one taken when its
+    /// correlation group or document was condemned, naming the failure that
+    /// condemned it. Serialized as `_cxl_dlq_id`, `_cxl_dlq_failure_id` and
+    /// `_cxl_dlq_timestamp`.
     pub failed_at: DlqFailureStamp,
 }
 
@@ -301,5 +341,62 @@ impl DlqEntry {
     /// or body eval for one driver row).
     pub fn stage_combine(name: &str) -> String {
         format!("combine:{name}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DlqFailureStamp;
+
+    #[test]
+    fn stamp_now_is_its_own_failure() {
+        let stamp = DlqFailureStamp::now();
+        assert_eq!(stamp.failure_id(), stamp.id());
+        assert_eq!(stamp.id().get_version_num(), 7);
+    }
+
+    #[test]
+    fn sibling_keeps_the_failure_under_a_new_id() {
+        let trigger = DlqFailureStamp::now();
+        let sibling = trigger.sibling();
+        assert_ne!(sibling.id(), trigger.id(), "every row has its own id");
+        assert_eq!(sibling.failure_id(), trigger.id());
+        assert_eq!(sibling.at(), trigger.at(), "the same observed failure");
+        assert_eq!(
+            sibling.sibling().failure_id(),
+            trigger.id(),
+            "a sibling of a sibling still names the trigger"
+        );
+    }
+
+    #[test]
+    fn condemned_by_takes_the_cause_failure_with_its_own_id_and_time() {
+        let trigger = DlqFailureStamp::now();
+        let collateral = DlqFailureStamp::condemned_by(&trigger);
+        assert_ne!(collateral.id(), trigger.id(), "every row has its own id");
+        assert!(
+            collateral.id() > trigger.id(),
+            "the collateral is stamped after its cause"
+        );
+        assert!(
+            collateral.at() >= trigger.at(),
+            "condemned now, not at the cause's time"
+        );
+        assert_eq!(collateral.failure_id(), trigger.id());
+
+        let build = trigger.sibling();
+        assert_eq!(
+            DlqFailureStamp::condemned_by(&build).failure_id(),
+            trigger.id(),
+            "a row condemned by a sibling names the original trigger"
+        );
+    }
+
+    #[test]
+    fn from_parts_rebuilds_a_trigger_stamp() {
+        let trigger = DlqFailureStamp::now();
+        let rebuilt = DlqFailureStamp::from_parts(trigger.id(), trigger.at());
+        assert_eq!(rebuilt, trigger);
+        assert_eq!(rebuilt.failure_id(), rebuilt.id());
     }
 }

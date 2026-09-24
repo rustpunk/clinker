@@ -267,9 +267,15 @@ fn bucket_rule(dlq: &DlqConfig) -> DlqLayout {
 
 /// The `_cxl_dlq_*` engine prelude, in the order the runtime writes it.
 /// Category and detail appear only when `include_reason`.
+///
+/// The three generated columns lead: the row's id, the id of the failure
+/// it belongs to (its trigger row's `_cxl_dlq_id`), and the time the
+/// failure was observed. `_cxl_dlq_failure_id` sits next to the id it
+/// refers to, and a consumer comparing runs masks one fixed leading prefix.
 fn engine_columns(include_reason: bool) -> Vec<String> {
     let mut header: Vec<String> = [
         "_cxl_dlq_id",
+        "_cxl_dlq_failure_id",
         "_cxl_dlq_timestamp",
         "_cxl_dlq_source_file",
         "_cxl_dlq_source_name",

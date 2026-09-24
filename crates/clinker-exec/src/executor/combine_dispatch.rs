@@ -2902,7 +2902,8 @@ fn dispatch_combine_output_error(
     // build record with an unrelated row id.
     if let Some((build_record, build_row_num)) = matched_build {
         // One failure, two dead letters: the build side keeps the failure's
-        // time under its own id.
+        // time and failure id under its own id, so it pairs with the driver
+        // row wherever it is held.
         let build_failed_at = failed_at.sibling();
         let build_routed = record_error_to_buffer_if_grouped(
             ctx,

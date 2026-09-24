@@ -1167,18 +1167,19 @@ fn canonical_dlq_bytes(path: &Path) -> Vec<u8> {
     let bytes = std::fs::read(path).expect("DLQ bytes");
     let mut lines = bytes.split(|byte| *byte == b'\n');
     let header = lines.next().expect("DLQ header");
-    assert!(header.starts_with(b"_cxl_dlq_id,_cxl_dlq_timestamp,"));
+    // The three run-local columns lead every DLQ header. Their values are
+    // UUIDs and an RFC 3339 time, none of which holds a comma.
+    assert!(header.starts_with(b"_cxl_dlq_id,_cxl_dlq_failure_id,_cxl_dlq_timestamp,"));
     let mut canonical = header.to_vec();
     canonical.push(b'\n');
     for line in lines.filter(|line| !line.is_empty()) {
-        let first = line.iter().position(|byte| *byte == b',').expect("DLQ id");
-        let second = line[first + 1..]
-            .iter()
-            .position(|byte| *byte == b',')
-            .map(|offset| first + 1 + offset)
-            .expect("DLQ timestamp");
-        canonical.extend_from_slice(b"<run-local-id>,<run-local-time>");
-        canonical.extend_from_slice(&line[second..]);
+        let mut rest = line;
+        for column in ["DLQ id", "DLQ failure id", "DLQ timestamp"] {
+            let comma = rest.iter().position(|byte| *byte == b',').expect(column);
+            rest = &rest[comma + 1..];
+        }
+        canonical.extend_from_slice(b"<run-local-id>,<run-local-failure-id>,<run-local-time>,");
+        canonical.extend_from_slice(rest);
         canonical.push(b'\n');
     }
     canonical
