@@ -3,7 +3,6 @@
 use clinker_record::owned_storage::SharedStorage;
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};
-#[cfg(test)]
 use std::sync::Arc;
 
 use clinker_record::Schema;
@@ -32,6 +31,8 @@ use clinker_format::xml::writer::{XmlEncoder, XmlEncoderConfig, XmlEncoderOption
 use clinker_plan::config::{OutputFormat, SinkConfig};
 use clinker_plan::error::PipelineError;
 
+use crate::dlq::DlqSink;
+
 /// Output writer registry. Holds two parallel maps:
 ///
 /// - `single`: one writer per output name (the legacy shape; matches
@@ -56,6 +57,14 @@ pub struct WriterRegistry {
     /// Standalone executor callers have no outer publication owner, so their
     /// registry commits staged split files after every writer has closed.
     pub auto_commit_staged: bool,
+    /// Where the run's dead-letter rows are written, supplied by the caller.
+    ///
+    /// The walk thread opens one writer from it at run start and closes that
+    /// writer before the executor returns `Ok`, so the caller may call
+    /// [`DlqSink::finish`] once the run has returned. A run whose plan has a
+    /// dead-letter bucket needs a sink to write rows; with `None` the run
+    /// still counts every dead letter in its report and writes none.
+    pub dlq_sink: Option<Arc<dyn DlqSink>>,
 }
 
 impl Default for WriterRegistry {
@@ -66,6 +75,7 @@ impl Default for WriterRegistry {
             fan_out_paths: HashMap::new(),
             output_staging: crate::output::staging::OutputStagingRegistry::default(),
             auto_commit_staged: true,
+            dlq_sink: None,
         }
     }
 }

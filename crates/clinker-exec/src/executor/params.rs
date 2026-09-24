@@ -9,6 +9,7 @@ use clinker_record::{PipelineCounters, Value};
 use indexmap::IndexMap;
 
 use super::{DlqEntry, stage_metrics};
+use crate::dlq::DlqReport;
 
 /// Whether an admitted run executes normally or reads a bounded preview.
 ///
@@ -143,6 +144,11 @@ pub struct ExecutionReport {
     pub counters: PipelineCounters,
     /// Records that were routed to the dead-letter queue.
     pub dlq_entries: Vec<DlqEntry>,
+    /// Dead-letter counters: rows per stage and category, and rows written
+    /// per dead-letter file. Holds counts only, never rows; its size is
+    /// bounded by the plan. The rows themselves went to the caller's
+    /// [`crate::dlq::DlqSink`] while the run executed.
+    pub dead_letters: DlqReport,
     /// Human-readable execution summary (e.g., "Streaming", "TwoPass").
     pub execution_summary: String,
     /// Whether any transform required arena allocation (window functions).
