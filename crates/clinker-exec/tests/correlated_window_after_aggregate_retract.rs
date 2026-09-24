@@ -17,18 +17,20 @@
 //! `correlated_post_aggregate_retract.rs` covers the no-window case
 //! for the same Aggregate (relaxed) lattice.
 
-mod common;
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_exec::executor::{DlqEntry, PipelineRunParams};
+use clinker_exec::executor::PipelineRunParams;
 use clinker_plan::error::PipelineError;
 use clinker_record::PipelineCounters;
+use dlq_sink::DlqRow;
 use std::collections::HashMap;
 
 fn run_pipeline(
     yaml: &str,
     csv_input: &str,
-) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
+) -> Result<(PipelineCounters, Vec<DlqRow>, String), PipelineError> {
     let config = clinker_plan::config::parse_config(yaml).unwrap();
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
@@ -53,8 +55,8 @@ fn run_pipeline(
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report = common::run_config(&config, readers, writers, &params)?;
-    Ok((report.counters, report.dlq_entries, buf.as_string()))
+    let (report, rows) = dlq_sink::run_config_with_dlq(&config, readers, writers, &params)?;
+    Ok((report.counters, rows, buf.as_string()))
 }
 
 const D7_PIPELINE: &str = r#"
@@ -258,6 +260,8 @@ pipeline:
   name: agg_then_window_buffer_recompute
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src
@@ -324,25 +328,21 @@ O6,ENG,300
     // The DLQ trigger is the HR aggregate row carrying the synthetic
     // CK column.
     let trigger = &dlq[0];
-    assert!(trigger.trigger, "the single DLQ entry is the trigger");
-    assert!(
-        trigger
-            .original_record
-            .values()
-            .iter()
-            .any(|v| matches!(v, clinker_record::Value::String(s) if s.as_str() == "HR")),
+    assert!(trigger.trigger(), "the single DLQ entry is the trigger");
+    assert_eq!(
+        trigger.field("department"),
+        Some("HR"),
         "trigger record must be the HR aggregate output row"
     );
+    let detail = trigger.error_detail().unwrap();
     assert!(
-        trigger.error_message.ends_with("division by zero"),
-        "trigger error must end with the eval-kind text; got: {}",
-        trigger.error_message
+        detail.ends_with("division by zero"),
+        "trigger error must end with the eval-kind text; got: {detail}"
     );
     assert!(
         trigger
-            .original_record
-            .schema()
-            .contains("$ck.aggregate.dept_totals"),
+            .field("$ck.aggregate.dept_totals")
+            .is_some_and(|cell| !cell.is_empty()),
         "trigger record must carry the synthetic CK column the relaxed \
          aggregate stamped at finalize"
     );
