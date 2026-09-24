@@ -1768,6 +1768,39 @@ mod tests {
     }
 
     #[test]
+    fn pause_signal_resume_between_check_and_park_still_wakes_the_waiter() {
+        // Hold the waiter's window open: the flag has been read as paused
+        // under the mutex, but the waiter has not yet parked on the
+        // condvar. A resume that lands in this window must still wake it.
+        let signal = Arc::new(PauseSignal::new());
+        signal.pause();
+        let guard = signal.mu.lock().unwrap();
+        assert!(signal.is_paused());
+
+        let resumer = {
+            let signal = signal.clone();
+            std::thread::spawn(move || signal.resume())
+        };
+        // Give a resume that bypasses the mutex time to store and notify
+        // before this thread parks.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Park without re-checking the flag first, exactly as the waiter
+        // does once it has seen `paused`.
+        let (guard, wait) = signal
+            .cv
+            .wait_timeout(guard, std::time::Duration::from_secs(2))
+            .unwrap();
+        assert!(
+            !wait.timed_out(),
+            "a resume between the waiter's check and its park was lost"
+        );
+        drop(guard);
+        resumer.join().expect("resumer thread should join cleanly");
+        assert!(!signal.is_paused());
+    }
+
+    #[test]
     fn consumer_handle_pause_routes_through_pause_signal() {
         let handle = ConsumerHandle::new();
         assert!(!handle.is_paused());
