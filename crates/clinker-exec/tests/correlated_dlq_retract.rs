@@ -22,20 +22,22 @@
 //!   gap above the per-aggregator and per-accumulator retract unit
 //!   tests.
 
-mod common;
 #[path = "common/dlq_fixtures.rs"]
 mod dlq_fixtures;
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
 #[path = "common/pipeline_resource_fixtures.rs"]
 mod resource_fixtures;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_exec::executor::{DlqEntry, PipelineRunParams};
+use clinker_exec::executor::PipelineRunParams;
 use clinker_plan::error::PipelineError;
 use clinker_record::PipelineCounters;
+use dlq_sink::DlqRow;
 use std::collections::HashMap;
 
-/// Successful run yields counters, the DLQ entries, and the rendered output.
-type RunOutput = (PipelineCounters, Vec<DlqEntry>, String);
+/// Successful run yields counters, the dead-letter rows, and the rendered output.
+type RunOutput = (PipelineCounters, Vec<DlqRow>, String);
 
 fn run_pipeline(yaml: &str, csv_input: &str) -> Result<RunOutput, PipelineError> {
     run_pipeline_input(yaml, csv_input, false)
@@ -80,8 +82,8 @@ fn run_pipeline_input(
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report = common::run_config(&config, readers, writers, &params)?;
-    Ok((report.counters, report.dlq_entries, buf.as_string()))
+    let (report, rows) = dlq_sink::run_config_with_dlq(&config, readers, writers, &params)?;
+    Ok((report.counters, rows, buf.as_string()))
 }
 
 /// Strict pipeline (every aggregate has `group_by ⊇ correlation_key`,
@@ -97,12 +99,12 @@ fn strict_pipeline_zero_overhead_short_circuits_to_fast_path() {
         "      - { name: employee_id, type: string }\n      - { name: value, type: string }\n",
     );
     let csv = "employee_id,value\nA,100\nA,bad\nB,200\n";
-    let (counters, dlq_entries, output) = run_pipeline(&yaml, csv).unwrap();
+    let (counters, rows, output) = run_pipeline(&yaml, csv).unwrap();
 
     // Group A is dirty (one bad record); group B is clean.
     assert_eq!(counters.dlq_count, 2, "group A DLQ'd as a unit (2 records)");
     assert_eq!(counters.ok_count, 1, "only group B emitted");
-    assert_eq!(dlq_entries.len(), 2);
+    assert_eq!(rows.len(), 2);
     assert!(output.contains("B,200"), "output has group B");
     assert!(
         !output.contains(",bad"),
@@ -154,7 +156,7 @@ nodes:
     include_unmapped: true
 "#;
     let csv = "emp_id,dept,amount\nE1,HR,10\nE2,HR,20\nE3,ENG,100\n";
-    let (counters, _dlq_entries, output) = run_pipeline(yaml, csv).unwrap();
+    let (counters, _rows, output) = run_pipeline(yaml, csv).unwrap();
 
     assert_eq!(counters.dlq_count, 0, "no failures expected");
     // sum(amount) per dept: HR=30, ENG=100. Output rows materialize
@@ -183,6 +185,8 @@ pipeline:
 error_handling:
   strategy: continue
   correlation_fanout_policy: all
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src
@@ -213,11 +217,11 @@ nodes:
     include_unmapped: true
 "#;
     let csv = "emp_id,value\nA,100\nA,bad\nB,200\n";
-    let (counters, dlq_entries, _output) = run_pipeline(yaml, csv).unwrap();
+    let (counters, rows, _output) = run_pipeline(yaml, csv).unwrap();
     // Pipeline-level All policy still rolls back the whole A group
     // because every collateral slot's CK matches the trigger fully.
     assert_eq!(counters.dlq_count, 2);
-    assert_eq!(dlq_entries.len(), 2);
+    assert_eq!(rows.len(), 2);
 }
 
 /// Per-Output `Primary` override should resolve through the orchestrator
@@ -262,7 +266,7 @@ nodes:
     correlation_fanout_policy: primary
 "#;
     let csv = "emp_id,value\nA,100\nB,200\n";
-    let (counters, _dlq_entries, output) = run_pipeline(yaml, csv).unwrap();
+    let (counters, _rows, output) = run_pipeline(yaml, csv).unwrap();
     // No failures, so the policy resolution does not affect emission;
     // the test verifies the override field parses end-to-end and
     // doesn't break the strict-path emission shape.
@@ -291,6 +295,8 @@ pipeline:
   name: retract_reversible
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src
@@ -392,7 +398,7 @@ O12,HR,60
         1,
         "exactly one DLQ entry — the bad O7 row's to_int failure"
     );
-    assert!(dlq[0].trigger, "the bad row is the trigger");
+    assert!(dlq[0].trigger(), "the bad row is the trigger");
     assert_eq!(counters.dlq_count, 1);
 
     // Bit-for-bit equivalence on the writer payload. The CSV writer
@@ -444,6 +450,8 @@ pipeline:
   name: retract_buffer_required
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src
@@ -519,7 +527,7 @@ O8,HR,50
 
     assert_eq!(baseline_dlq.len(), 0, "baseline has no failures");
     assert_eq!(dlq.len(), 1, "one DLQ entry for the bad O3 row");
-    assert!(dlq[0].trigger);
+    assert!(dlq[0].trigger());
     assert_eq!(counters.dlq_count, 1);
 
     fn sort_body(s: &str) -> Vec<String> {
@@ -563,6 +571,8 @@ pipeline:
   name: retract_downstream_transform
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src
@@ -650,7 +660,7 @@ O8,HR,40
 
     assert_eq!(baseline_dlq.len(), 0, "baseline has no failures");
     assert_eq!(dlq.len(), 1, "one DLQ entry for the bad O4 row");
-    assert!(dlq[0].trigger);
+    assert!(dlq[0].trigger());
     assert_eq!(counters.dlq_count, 1);
 
     fn sort_body(s: &str) -> Vec<String> {
@@ -700,6 +710,8 @@ pipeline:
   name: empty_group_retract
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src
@@ -770,7 +782,7 @@ O6,ENG,300
         "three DLQ entries — one per bad row, all triggers"
     );
     assert!(
-        dlq.iter().all(|d| d.trigger),
+        dlq.iter().all(|d| d.trigger()),
         "every DLQ entry is a trigger"
     );
     assert_eq!(counters.dlq_count, 3);
@@ -827,6 +839,8 @@ pipeline:
   name: idempotent_retract
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src
@@ -916,15 +930,10 @@ O6,ENG,200,6
     // dedupes by source_row at detect time. We expect exactly ONE
     // trigger DLQ entry for O3 — anything more indicates the dedup
     // step missed.
-    let triggers_for_o3: Vec<&DlqEntry> =
-        dlq.iter()
-            .filter(|d| {
-                d.trigger
-                    && d.original_record.values().iter().any(
-                        |v| matches!(v, clinker_record::Value::String(s) if s.as_str() == "O3"),
-                    )
-            })
-            .collect();
+    let triggers_for_o3: Vec<&DlqRow> = dlq
+        .iter()
+        .filter(|d| d.trigger() && d.field("order_id") == Some("O3"))
+        .collect();
     assert!(
         !triggers_for_o3.is_empty(),
         "expected at least one trigger DLQ entry for the multi-failure row, got: {dlq:#?}"
@@ -977,6 +986,8 @@ pipeline:
 error_handling:
   strategy: continue
   correlation_fanout_policy: any
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src
@@ -1034,7 +1045,7 @@ O5,ENG,200
     // orchestrator's recompute phase still corrects the HR sum to
     // its survivors, but the trigger row's own DLQ entry counts.
     assert_eq!(dlq.len(), 1, "one trigger DLQ entry for the BAD row");
-    assert!(dlq[0].trigger, "trigger flag set on the failing row");
+    assert!(dlq[0].trigger(), "trigger flag set on the failing row");
     assert_eq!(counters.dlq_count, 1);
     // HR survivors after retract: {10, 20} → total = 30. ENG is clean.
     assert!(
@@ -1062,6 +1073,8 @@ pipeline:
 error_handling:
   strategy: continue
   correlation_fanout_policy: all
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src
@@ -1145,6 +1158,8 @@ pipeline:
 error_handling:
   strategy: continue
   correlation_fanout_policy: primary
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src
