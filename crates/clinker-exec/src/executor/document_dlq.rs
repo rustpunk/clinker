@@ -372,6 +372,12 @@ impl DocumentDlqState {
             failed.emitted.settle();
         }
     }
+
+    /// Bytes charged to the arbitrator for every ledger.
+    #[cfg(test)]
+    fn charged_bytes(&self) -> u64 {
+        self.handle.bytes()
+    }
 }
 
 impl Drop for DocumentDlqState {
@@ -1681,6 +1687,258 @@ mod tests {
             1,
             "the bucket's consumer is released; only the state's remains"
         );
+    }
+
+    /// Row `ordinal` of Source node `source`.
+    fn row(source: usize, ordinal: u64) -> SourceRowId {
+        SourceRowId::new(
+            <PlanNodeId as clinker_plan::plan::EntityRef>::new(source),
+            ordinal,
+        )
+    }
+
+    /// An arbitrator with hard limit `limit` that never elects a victim.
+    fn ledger_arbitrator(limit: u64) -> Arc<MemoryArbitrator> {
+        Arc::new(MemoryArbitrator::with_policy(
+            limit,
+            0.8,
+            0.6,
+            Box::new(crate::pipeline::memory::NoOpPolicy),
+        ))
+    }
+
+    /// A document state charged to `arbitrator` holding one failed document.
+    fn ledger_state(arbitrator: &Arc<MemoryArbitrator>) -> (DocumentDlqState, DocKey) {
+        let key: DocKey = Arc::from("orders.csv");
+        let mut state =
+            DocumentDlqState::new(HashSet::from([Arc::from("orders")]), Arc::clone(arbitrator));
+        state.failed.insert(
+            Arc::clone(&key),
+            FailedDocument {
+                cause: DlqFailureStamp::now(),
+                trigger: None,
+                emitted: EmittedRows::new(),
+            },
+        );
+        (state, key)
+    }
+
+    /// The ordinals document `key` has recorded for Source node `source`.
+    fn recorded(state: &DocumentDlqState, key: &DocKey, source: usize) -> Vec<u64> {
+        let source = <PlanNodeId as clinker_plan::plan::EntityRef>::new(source);
+        state.failed[key]
+            .emitted
+            .sources
+            .iter()
+            .find(|(id, _)| *id == source)
+            .map(|(_, rows)| rows.rows.iter().collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn ledger_admission_is_idempotent_in_any_order() {
+        let arbitrator = ledger_arbitrator(1 << 30);
+        let orders: [Vec<u64>; 3] = [
+            (1..=300).collect(),
+            (1..=300).rev().collect(),
+            vec![70_000, 5, 1 << 33, 6, 65_535, 65_536, 4, 1 << 40],
+        ];
+        for order in orders {
+            let (mut state, key) = ledger_state(&arbitrator);
+            for &ordinal in &order {
+                assert!(
+                    state
+                        .admit_emitted(&key, row(1, ordinal), "out")
+                        .expect("admission"),
+                    "the first admission of {ordinal} is new"
+                );
+            }
+            state.settle_emitted(&key);
+            for &ordinal in &order {
+                assert!(
+                    !state
+                        .admit_emitted(&key, row(1, ordinal), "out")
+                        .expect("admission"),
+                    "a repeated admission of {ordinal} is a no-op"
+                );
+            }
+            let mut admitted = order.clone();
+            admitted.sort_unstable();
+            assert_eq!(recorded(&state, &key, 1), admitted);
+        }
+    }
+
+    #[test]
+    fn a_later_sink_admits_only_rows_no_earlier_rejection_wrote() {
+        let arbitrator = ledger_arbitrator(1 << 30);
+        let (mut state, key) = ledger_state(&arbitrator);
+        let mut admit = |source: usize, ordinal: u64| {
+            state
+                .admit_emitted(&key, row(source, ordinal), "out")
+                .expect("admission")
+        };
+
+        let first_sink: Vec<bool> = (1..=3).map(|ordinal| admit(1, ordinal)).collect();
+        assert_eq!(first_sink, [true, true, true]);
+        let later_sink: Vec<bool> = (2..=4).map(|ordinal| admit(1, ordinal)).collect();
+        assert_eq!(
+            later_sink,
+            [false, false, true],
+            "a later Sink writes only the row no earlier rejection wrote"
+        );
+        assert!(
+            admit(2, 2),
+            "the same ordinal under another Source is another row"
+        );
+    }
+
+    #[test]
+    fn emitted_row_ledger_is_charged_to_the_arbitrator() {
+        let arbitrator = ledger_arbitrator(1 << 30);
+        let consumers_before = arbitrator.consumer_count();
+        let usage_before = arbitrator.sum_consumer_usage();
+
+        let (mut state, key) = ledger_state(&arbitrator);
+        let baseline_usage = arbitrator.sum_consumer_usage();
+        let baseline_charge = state.charged_bytes();
+        for ordinal in 1..=10_000 {
+            assert!(
+                state
+                    .admit_emitted(&key, row(1, ordinal), "out")
+                    .expect("admission")
+            );
+        }
+        state.settle_emitted(&key);
+        let charged = state.charged_bytes() - baseline_charge;
+        assert_eq!(
+            arbitrator.sum_consumer_usage() - baseline_usage,
+            charged,
+            "the arbitrator sees exactly the ledger's charge"
+        );
+        let serialized = state.failed[&key].emitted.sources[0]
+            .1
+            .rows
+            .serialized_size() as u64;
+        assert!(
+            charged >= serialized,
+            "the charge {charged} covers at least the serialized {serialized} bytes"
+        );
+        assert!(
+            charged <= 1024,
+            "10,000 contiguous rows settle to at most 1 KiB, charged {charged}"
+        );
+        for ordinal in 1..=10_000 {
+            assert!(
+                !state
+                    .admit_emitted(&key, row(1, ordinal), "out")
+                    .expect("admission")
+            );
+        }
+        assert_eq!(
+            arbitrator.sum_consumer_usage() - baseline_usage,
+            charged,
+            "re-admitting recorded rows charges nothing"
+        );
+
+        let (mut sparse, sparse_key) = ledger_state(&arbitrator);
+        let sparse_baseline = sparse.charged_bytes();
+        for ordinal in (1..131_072).step_by(2) {
+            assert!(
+                sparse
+                    .admit_emitted(&sparse_key, row(1, ordinal), "out")
+                    .expect("admission")
+            );
+        }
+        sparse.settle_emitted(&sparse_key);
+        let sparse_charged = sparse.charged_bytes() - sparse_baseline;
+        assert!(
+            sparse_charged <= 131_072 / 8 + 2048,
+            "every other row over 131,072 settles to one bit per row plus headers, charged {sparse_charged}"
+        );
+
+        drop(sparse);
+        drop(state);
+        assert_eq!(arbitrator.consumer_count(), consumers_before);
+        assert_eq!(arbitrator.sum_consumer_usage(), usage_before);
+    }
+
+    #[test]
+    fn emitted_row_ledger_growth_past_the_hard_limit_is_e310() {
+        let arbitrator = ledger_arbitrator(1024);
+        let (mut state, key) = ledger_state(&arbitrator);
+        let mut refused = None;
+        for step in 0..64u64 {
+            let ordinal = 1 + step * (1 << 20);
+            let charged_before = state.charged_bytes();
+            match state.admit_emitted(&key, row(1, ordinal), "orders_out") {
+                Ok(admitted) => assert!(admitted, "each scattered row is new"),
+                Err(error) => {
+                    assert_eq!(
+                        state.charged_bytes(),
+                        charged_before,
+                        "the charge excludes the refused growth"
+                    );
+                    assert!(
+                        !recorded(&state, &key, 1).contains(&ordinal),
+                        "a refused row is not recorded"
+                    );
+                    refused = Some(error);
+                    break;
+                }
+            }
+        }
+        match refused.expect("scattered rows reach the 1 KiB hard limit") {
+            PipelineError::MemoryBudgetExceeded {
+                node,
+                limit,
+                source,
+                detail,
+                ..
+            } => {
+                assert_eq!(node, "orders_out");
+                assert_eq!(limit, 1024);
+                assert_eq!(source, clinker_plan::BudgetCategory::Arena);
+                assert!(
+                    detail.is_some_and(|d| d.contains("dead-letter ledger")),
+                    "the detail names the ledger"
+                );
+            }
+            other => panic!("expected E310, got {other:?}"),
+        }
+    }
+
+    /// The ledger's consumer frees nothing, so the default policy never
+    /// elects it while a reclaimable consumer is registered, however much
+    /// the ledger holds; asked to spill, it reports zero bytes freed.
+    #[test]
+    fn ledger_consumer_is_elected_only_after_every_reclaimable_consumer() {
+        use crate::pipeline::memory::{ArbitrationPolicy, BackPressurePreferred, Priority};
+
+        let arbitrator = ledger_arbitrator(1 << 30);
+        let node_handle = ConsumerHandle::new();
+        node_handle.set_bytes(16);
+        let node_consumer = crate::executor::node_buffer::NodeBufferConsumer::new(node_handle);
+        let node_id = arbitrator.register_consumer(Arc::new(
+            crate::executor::node_buffer::NodeBufferConsumer::new(ConsumerHandle::new()),
+        ));
+        let (state, _key) = ledger_state(&arbitrator);
+        state.handle.set_bytes(1 << 20);
+        let ledger_consumer = DocumentDlqConsumer::new(Arc::clone(&state.handle));
+
+        let snapshot: [(ConsumerId, &dyn MemoryConsumer); 2] = [
+            (state.consumer_id, &ledger_consumer),
+            (node_id, &node_consumer),
+        ];
+        assert_eq!(Priority.select_victim(&snapshot, 1 << 20), Some(node_id));
+        assert_eq!(
+            BackPressurePreferred::wrapping(Priority).select_victim(&snapshot, 1 << 20),
+            Some(node_id)
+        );
+        assert!(!ledger_consumer.can_back_pressure());
+        match ledger_consumer.try_spill(1 << 20) {
+            Err(ConsumerSpillError::BelowTarget { freed, .. }) => assert_eq!(freed, 0),
+            other => panic!("the ledger frees nothing: {other:?}"),
+        }
     }
 
     /// A per-document bucket that spills to disk round-trips every record
