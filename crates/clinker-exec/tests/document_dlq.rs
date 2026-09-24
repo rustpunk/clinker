@@ -20,10 +20,15 @@ use std::io::Cursor;
 use std::path::PathBuf;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_exec::executor::{DlqEntry, PipelineExecutor, PipelineRunParams};
+use clinker_exec::executor::{PipelineExecutor, PipelineRunParams};
 use clinker_exec::source::multi_file::FileSlot;
 use clinker_plan::config::{CompileContext, parse_config};
 use clinker_record::PipelineCounters;
+
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
+
+use dlq_sink::{CollectingDlqSink, DlqRow};
 
 /// A `validate` transform coerces `value` to an int, so a non-numeric cell
 /// triggers a per-record eval failure. The source's `dlq_granularity`
@@ -36,6 +41,8 @@ pipeline:
   name: doc_dlq
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: events
@@ -70,11 +77,11 @@ nodes:
 
 /// Run the validate pipeline over a set of in-memory CSV files, each fed as
 /// a distinct `FileSlot` (hence a distinct document). Returns the run
-/// counters, the DLQ entries, and the success-sink body lines.
+/// counters, the dead-letter rows, and the success-sink body lines.
 fn run_doc_dlq(
     dlq_granularity: &str,
     files: &[(&str, &str)],
-) -> (PipelineCounters, Vec<DlqEntry>, Vec<String>) {
+) -> (PipelineCounters, Vec<DlqRow>, Vec<String>) {
     let yaml = validate_yaml(dlq_granularity);
     let config = parse_config(&yaml).expect("parse document-dlq pipeline");
     let plan = config
@@ -109,13 +116,19 @@ fn run_doc_dlq(
         ..Default::default()
     };
 
-    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
-        .expect("run document-dlq pipeline");
+    let sink = CollectingDlqSink::new();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        dlq_sink::registry(writers, &sink),
+        &params,
+    )
+    .expect("run document-dlq pipeline");
 
     let output = buf.as_string();
     let mut body: Vec<String> = output.lines().skip(1).map(|s| s.to_string()).collect();
     body.sort();
-    (report.counters, report.dlq_entries, body)
+    (report.counters, sink.rows(), body)
 }
 
 #[test]
@@ -124,7 +137,7 @@ fn one_fail_rejects_whole_document() {
     // The whole document is dead-lettered: one trigger plus two
     // `document_rejected` collaterals, and zero records of document A reach
     // the success sink.
-    let (counters, dlq_entries, body) = run_doc_dlq(
+    let (counters, rows, body) = run_doc_dlq(
         "document",
         &[("a.csv", "id,value\na1,100\na2,bad\na3,300\n")],
     );
@@ -137,17 +150,17 @@ fn one_fail_rejects_whole_document() {
         counters.ok_count, 0,
         "no record of the rejected document emits"
     );
-    assert_eq!(dlq_entries.len(), 3);
+    assert_eq!(rows.len(), 3);
 
-    let triggers = dlq_entries.iter().filter(|e| e.trigger).count();
-    let collaterals = dlq_entries.iter().filter(|e| !e.trigger).count();
+    let triggers = rows.iter().filter(|r| r.trigger()).count();
+    let collaterals = rows.iter().filter(|r| !r.trigger()).count();
     assert_eq!(triggers, 1, "exactly one root-cause trigger");
     assert_eq!(collaterals, 2, "two collateral siblings");
 
-    for e in dlq_entries.iter().filter(|e| !e.trigger) {
+    for r in rows.iter().filter(|r| !r.trigger()) {
         assert_eq!(
-            e.category,
-            clinker_core_types::dlq::DlqErrorCategory::DocumentRejected,
+            r.category(),
+            Some(clinker_core_types::dlq::DlqErrorCategory::DocumentRejected.as_str()),
             "collateral carries the document_rejected category"
         );
     }
@@ -164,7 +177,7 @@ fn multiple_failing_records_all_accounted_for() {
     // failing record AND every clean sibling — is a collateral. The invariant
     // is that a rejected N-record document contributes exactly N entries, so a
     // non-first failing record must not vanish from both sink and DLQ.
-    let (counters, dlq_entries, body) = run_doc_dlq(
+    let (counters, dlq_rows, body) = run_doc_dlq(
         "document",
         &[(
             "a.csv",
@@ -176,14 +189,14 @@ fn multiple_failing_records_all_accounted_for() {
         counters.dlq_count, 5,
         "all 5 records of the document are accounted for as DLQ entries"
     );
-    assert_eq!(dlq_entries.len(), 5);
+    assert_eq!(dlq_rows.len(), 5);
     assert_eq!(
         counters.ok_count, 0,
         "no record of the rejected document emits"
     );
 
-    let triggers = dlq_entries.iter().filter(|e| e.trigger).count();
-    let collaterals = dlq_entries.iter().filter(|e| !e.trigger).count();
+    let triggers = dlq_rows.iter().filter(|r| r.trigger()).count();
+    let collaterals = dlq_rows.iter().filter(|r| !r.trigger()).count();
     assert_eq!(
         triggers, 1,
         "exactly one root-cause trigger (the FIRST failure), even with two failing records"
@@ -192,16 +205,16 @@ fn multiple_failing_records_all_accounted_for() {
         collaterals, 4,
         "the second failing record and all three clean siblings are collaterals"
     );
-    for e in dlq_entries.iter().filter(|e| !e.trigger) {
+    for r in dlq_rows.iter().filter(|r| !r.trigger()) {
         assert_eq!(
-            e.category,
-            clinker_core_types::dlq::DlqErrorCategory::DocumentRejected,
+            r.category(),
+            Some(clinker_core_types::dlq::DlqErrorCategory::DocumentRejected.as_str()),
             "every collateral — failing or clean — carries the document_rejected category"
         );
     }
     // Every source row 1..=5 appears exactly once across all entries: no row
     // is dropped and none is double-counted.
-    let mut rows: Vec<u64> = dlq_entries.iter().map(|e| e.source_row.ordinal()).collect();
+    let mut rows: Vec<u64> = dlq_rows.iter().map(DlqRow::source_row).collect();
     rows.sort_unstable();
     assert_eq!(
         rows,
@@ -218,7 +231,7 @@ fn multiple_failing_records_all_accounted_for() {
 fn clean_documents_stream_through() {
     // Document A fails on `a2`; document B is all-valid. B reaches the
     // success sink intact; `ok_count` counts only B's records.
-    let (counters, dlq_entries, body) = run_doc_dlq(
+    let (counters, rows, body) = run_doc_dlq(
         "document",
         &[
             ("a.csv", "id,value\na1,100\na2,bad\na3,300\n"),
@@ -240,7 +253,7 @@ fn clean_documents_stream_through() {
         !body.iter().any(|r| r.starts_with("a")),
         "no record of the rejected document A reaches the sink"
     );
-    assert_eq!(dlq_entries.len(), 3);
+    assert_eq!(rows.len(), 3);
 }
 
 #[test]
@@ -291,10 +304,11 @@ nodes:
         "out".to_string(),
         Box::new(output.clone()) as Box<dyn std::io::Write + Send>,
     )]);
+    let sink = CollectingDlqSink::new();
     let report = PipelineExecutor::run_plan_with_readers_writers(
         &plan,
         readers,
-        writers,
+        dlq_sink::registry(writers, &sink),
         &PipelineRunParams {
             execution_id: "declared-type-doc".to_string(),
             batch_id: "batch".to_string(),
@@ -302,30 +316,23 @@ nodes:
         },
     )
     .expect("run declared-type document-DLQ pipeline");
+    let rows = sink.rows();
 
     assert_eq!(report.counters.ok_count, 0);
     assert_eq!(report.counters.records_written, 0);
     assert_eq!(report.counters.dlq_count, 3);
     assert!(output.as_string().lines().skip(1).all(str::is_empty));
-    assert_eq!(report.dlq_entries.len(), 3);
-    let trigger = report
-        .dlq_entries
+    assert_eq!(rows.len(), 3);
+    let trigger = rows
         .iter()
-        .find(|entry| entry.trigger)
+        .find(|row| row.trigger())
         .expect("declared type failure is the document trigger");
     assert_eq!(
-        trigger.category,
-        clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure
+        trigger.category(),
+        Some(clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure.as_str())
     );
-    assert_eq!(trigger.source_row.ordinal(), 2);
-    assert_eq!(
-        report
-            .dlq_entries
-            .iter()
-            .filter(|entry| !entry.trigger)
-            .count(),
-        2
-    );
+    assert_eq!(trigger.source_row(), 2);
+    assert_eq!(rows.iter().filter(|row| !row.trigger()).count(), 2);
 }
 
 #[test]
@@ -333,19 +340,21 @@ fn record_level_policy_unchanged() {
     // The same input under the default `record` policy: only the failing
     // record (`a2`) is dead-lettered; its document siblings stream. No
     // document-level rejection, no regression.
-    let (counters, dlq_entries, body) =
+    let (counters, rows, body) =
         run_doc_dlq("record", &[("a.csv", "id,value\na1,100\na2,bad\na3,300\n")]);
 
     assert_eq!(counters.dlq_count, 1, "only the failing record is DLQ'd");
     assert_eq!(counters.ok_count, 2, "the two valid siblings stream");
-    assert_eq!(dlq_entries.len(), 1);
+    assert_eq!(rows.len(), 1);
     assert!(
-        dlq_entries[0].trigger,
+        rows[0].trigger(),
         "the failing record is its own root cause"
     );
     assert_ne!(
-        dlq_entries[0].category,
-        clinker_core_types::dlq::DlqErrorCategory::DocumentRejected,
+        rows[0]
+            .category()
+            .expect("include_reason defaults on, so the row carries a category"),
+        clinker_core_types::dlq::DlqErrorCategory::DocumentRejected.as_str(),
         "no document_rejected category under the record policy"
     );
     assert_eq!(
@@ -358,7 +367,7 @@ fn record_level_policy_unchanged() {
 #[test]
 fn all_clean_emits_nothing_to_dlq() {
     // A control: every document valid → zero DLQ, every record streams.
-    let (counters, dlq_entries, body) = run_doc_dlq(
+    let (counters, rows, body) = run_doc_dlq(
         "document",
         &[
             ("a.csv", "id,value\na1,100\na2,200\n"),
@@ -366,7 +375,7 @@ fn all_clean_emits_nothing_to_dlq() {
         ],
     );
     assert_eq!(counters.dlq_count, 0);
-    assert_eq!(dlq_entries.len(), 0);
+    assert_eq!(rows.len(), 0);
     assert_eq!(counters.ok_count, 3, "all three records stream");
     assert_eq!(
         body,
@@ -419,8 +428,13 @@ fn large_document_rejects_every_record() {
         shutdown_token: None,
         ..Default::default()
     };
-    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
-        .expect("run large-document pipeline");
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        dlq_sink::discarding_registry(writers),
+        &params,
+    )
+    .expect("run large-document pipeline");
 
     assert_eq!(
         report.counters.dlq_count, 201,
@@ -470,6 +484,8 @@ pipeline:
   name: x12_doc_dlq
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: interchange
@@ -499,8 +515,9 @@ nodes:
 "#;
 
 /// Run an X12 interchange fixture through the document-DLQ pipeline,
-/// returning the run counters and the success-sink body line count.
-fn run_x12_doc_dlq(fixture: &str) -> (PipelineCounters, Vec<DlqEntry>, usize) {
+/// returning the run counters, the dead-letter rows, and the success-sink
+/// body line count.
+fn run_x12_doc_dlq(fixture: &str) -> (PipelineCounters, Vec<DlqRow>, usize) {
     let config = parse_config(X12_DOC_DLQ_YAML).expect("parse x12 document-dlq pipeline");
     let plan = config
         .compile(&CompileContext::default())
@@ -526,10 +543,16 @@ fn run_x12_doc_dlq(fixture: &str) -> (PipelineCounters, Vec<DlqEntry>, usize) {
         shutdown_token: None,
         ..Default::default()
     };
-    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
-        .expect("run x12 document-dlq pipeline");
+    let sink = CollectingDlqSink::new();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        dlq_sink::registry(writers, &sink),
+        &params,
+    )
+    .expect("run x12 document-dlq pipeline");
     let body_lines = report.counters.ok_count.try_into().unwrap_or(usize::MAX);
-    (report.counters, report.dlq_entries, body_lines)
+    (report.counters, sink.rows(), body_lines)
 }
 
 #[test]
@@ -540,7 +563,7 @@ fn nested_envelope_failure_rejects_whole_interchange() {
     // not decided until the interchange's outermost close. This pins both
     // the outermost grain and robustness to a record arriving after an
     // inner-level boundary.
-    let (counters, dlq_entries, _) = run_x12_doc_dlq(&two_set_interchange("XX"));
+    let (counters, rows, _) = run_x12_doc_dlq(&two_set_interchange("XX"));
 
     assert_eq!(counters.ok_count, 0, "the whole interchange is rejected");
     assert!(
@@ -549,16 +572,19 @@ fn nested_envelope_failure_rejects_whole_interchange() {
          the failing first set's: {}",
         counters.dlq_count
     );
-    let triggers = dlq_entries.iter().filter(|e| e.trigger).count();
+    assert_eq!(
+        rows.len() as u64,
+        counters.dlq_count,
+        "every dead letter of the interchange is written as a row"
+    );
+    let triggers = rows.iter().filter(|r| r.trigger()).count();
     assert_eq!(
         triggers, 1,
         "exactly one root-cause trigger for the interchange"
     );
     assert!(
-        dlq_entries
-            .iter()
-            .filter(|e| !e.trigger)
-            .all(|e| e.category == clinker_core_types::dlq::DlqErrorCategory::DocumentRejected),
+        rows.iter().filter(|r| !r.trigger()).all(|r| r.category()
+            == Some(clinker_core_types::dlq::DlqErrorCategory::DocumentRejected.as_str())),
         "every collateral carries the document_rejected category"
     );
 }
@@ -567,12 +593,12 @@ fn nested_envelope_failure_rejects_whole_interchange() {
 fn nested_envelope_clean_interchange_streams_through() {
     // A control: every transaction set in the interchange is valid, so the
     // whole interchange streams to the sink with no DLQ entries.
-    let (counters, dlq_entries, ok) = run_x12_doc_dlq(&two_set_interchange("00"));
+    let (counters, rows, ok) = run_x12_doc_dlq(&two_set_interchange("00"));
     assert_eq!(
         counters.dlq_count, 0,
         "a clean interchange emits no DLQ entries"
     );
-    assert_eq!(dlq_entries.len(), 0);
+    assert_eq!(rows.len(), 0);
     assert!(ok > 0, "the clean interchange's records reach the sink");
 }
 
@@ -588,6 +614,8 @@ pipeline:
   name: x12_structural
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: interchange
@@ -673,11 +701,15 @@ fn x12_zero_body_iea_count(iea01: &str) -> String {
 
 /// Run an X12 fixture through the structural-count pipeline at the given
 /// granularity, returning the full run `Result` so a test can assert either
-/// a successful document-DLQ run or a run-aborting error.
+/// a successful document-DLQ run (its report and dead-letter rows) or a
+/// run-aborting error.
 fn run_x12_structural(
     dlq_granularity: &str,
     fixture: &str,
-) -> Result<clinker_exec::executor::ExecutionReport, clinker_plan::error::PipelineError> {
+) -> Result<
+    (clinker_exec::executor::ExecutionReport, Vec<DlqRow>),
+    clinker_plan::error::PipelineError,
+> {
     let yaml = x12_structural_yaml(dlq_granularity);
     let config = parse_config(&yaml).expect("parse x12 structural pipeline");
     let plan = config
@@ -703,18 +735,30 @@ fn run_x12_structural(
         shutdown_token: None,
         ..Default::default()
     };
-    PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+    let sink = CollectingDlqSink::new();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        dlq_sink::registry(writers, &sink),
+        &params,
+    )?;
+    Ok((report, sink.rows()))
 }
 
 /// Run several named X12 files as one multi-file glob source through the
 /// structural-count pipeline at the given granularity, returning the run
-/// `Result` plus the sorted success-sink body lines (each `seg_id,set_ref`).
+/// `Result` plus the sorted success-sink body lines (each `seg_id,set_ref`)
+/// and the dead-letter rows.
 #[allow(clippy::type_complexity)]
 fn run_x12_structural_multi(
     dlq_granularity: &str,
     files: &[(&str, String)],
 ) -> Result<
-    (clinker_exec::executor::ExecutionReport, Vec<String>),
+    (
+        clinker_exec::executor::ExecutionReport,
+        Vec<String>,
+        Vec<DlqRow>,
+    ),
     clinker_plan::error::PipelineError,
 > {
     let yaml = x12_structural_yaml(dlq_granularity);
@@ -747,10 +791,16 @@ fn run_x12_structural_multi(
         shutdown_token: None,
         ..Default::default()
     };
-    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)?;
+    let sink = CollectingDlqSink::new();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        dlq_sink::registry(writers, &sink),
+        &params,
+    )?;
     let mut body: Vec<String> = buf.as_string().lines().skip(1).map(String::from).collect();
     body.sort();
-    Ok((report, body))
+    Ok((report, body, sink.rows()))
 }
 
 #[test]
@@ -761,7 +811,7 @@ fn x12_multi_file_bad_in_the_middle_rejects_only_the_bad_file() {
     // the sink and ONLY the bad file's records dead-letter — silently
     // dropping the good tail (the way a `break`-the-source implementation
     // would) is a data-loss regression on the prior loud run-abort.
-    let (report, body) = run_x12_structural_multi(
+    let (report, body, rows) = run_x12_structural_multi(
         "document",
         &[
             ("a.x12", x12_se_count("4")),  // clean
@@ -782,7 +832,7 @@ fn x12_multi_file_bad_in_the_middle_rejects_only_the_bad_file() {
     );
     // Each clean single-set interchange emits the same body segments, so the
     // good output is exactly double a single clean file's output.
-    let (single_clean, _) =
+    let (single_clean, _, _) =
         run_x12_structural_multi("document", &[("solo.x12", x12_se_count("4"))])
             .expect("a single clean file runs");
     assert_eq!(
@@ -794,22 +844,22 @@ fn x12_multi_file_bad_in_the_middle_rejects_only_the_bad_file() {
 
     // Exactly one malformed file was dead-lettered: one StructuralValidation
     // trigger, its message naming the bad file's count mismatch.
-    let triggers: Vec<&DlqEntry> = report.dlq_entries.iter().filter(|e| e.trigger).collect();
+    let triggers: Vec<&DlqRow> = rows.iter().filter(|r| r.trigger()).collect();
     assert_eq!(
         triggers.len(),
         1,
         "exactly one file (the malformed middle one) is dead-lettered"
     );
     assert_eq!(
-        triggers[0].category,
-        clinker_core_types::dlq::DlqErrorCategory::StructuralValidation
+        triggers[0].category(),
+        Some(clinker_core_types::dlq::DlqErrorCategory::StructuralValidation.as_str())
     );
     assert!(
         triggers[0]
-            .error_message
-            .contains("SE segment count mismatch"),
+            .error_detail()
+            .is_some_and(|detail| detail.contains("SE segment count mismatch")),
         "got {:?}",
-        triggers[0].error_message
+        triggers[0].error_detail()
     );
 }
 
@@ -821,28 +871,28 @@ fn x12_zero_body_malformed_file_dead_letters() {
     // so the file's level stack never opened. The reject's document context is
     // synthesized from the file grain. One StructuralValidation trigger, no
     // collaterals (no record of the file streamed), nothing at the sink.
-    let report = run_x12_structural("document", &x12_zero_body_iea_count("5"))
+    let (report, rows) = run_x12_structural("document", &x12_zero_body_iea_count("5"))
         .expect("a zero-body malformed file dead-letters rather than aborting");
     assert_eq!(report.counters.ok_count, 0, "no record reaches the sink");
-    let triggers: Vec<&DlqEntry> = report.dlq_entries.iter().filter(|e| e.trigger).collect();
+    let triggers: Vec<&DlqRow> = rows.iter().filter(|r| r.trigger()).collect();
     assert_eq!(
         triggers.len(),
         1,
         "exactly one root-cause trigger for the zero-body malformed file"
     );
     assert_eq!(
-        triggers[0].category,
-        clinker_core_types::dlq::DlqErrorCategory::StructuralValidation
+        triggers[0].category(),
+        Some(clinker_core_types::dlq::DlqErrorCategory::StructuralValidation.as_str())
     );
     assert!(
         triggers[0]
-            .error_message
-            .contains("IEA functional-group count mismatch"),
+            .error_detail()
+            .is_some_and(|detail| detail.contains("IEA functional-group count mismatch")),
         "got {:?}",
-        triggers[0].error_message
+        triggers[0].error_detail()
     );
     assert_eq!(
-        report.dlq_entries.iter().filter(|e| !e.trigger).count(),
+        rows.iter().filter(|r| !r.trigger()).count(),
         0,
         "a zero-body file has no already-streamed records, so no collaterals"
     );
@@ -855,7 +905,7 @@ fn x12_zero_body_bad_then_good_continues() {
     // the good file. Before the synthesized-context fix the empty level stack
     // fell through to a loud run-abort, silently dropping the trailing good
     // file.
-    let (report, body) = run_x12_structural_multi(
+    let (report, body, rows) = run_x12_structural_multi(
         "document",
         &[
             ("bad.x12", x12_zero_body_iea_count("5")), // zero-body malformed
@@ -868,14 +918,14 @@ fn x12_zero_body_bad_then_good_continues() {
         !body.is_empty() && report.counters.ok_count > 0,
         "the good file after a zero-body malformed one still streams to the sink"
     );
-    let (single_clean, _) =
+    let (single_clean, _, _) =
         run_x12_structural_multi("document", &[("solo.x12", x12_se_count("4"))])
             .expect("a single clean file runs");
     assert_eq!(
         report.counters.ok_count, single_clean.counters.ok_count,
         "exactly the one clean file's records reach the sink"
     );
-    let triggers: Vec<&DlqEntry> = report.dlq_entries.iter().filter(|e| e.trigger).collect();
+    let triggers: Vec<&DlqRow> = rows.iter().filter(|r| r.trigger()).collect();
     assert_eq!(
         triggers.len(),
         1,
@@ -883,10 +933,10 @@ fn x12_zero_body_bad_then_good_continues() {
     );
     assert!(
         triggers[0]
-            .error_message
-            .contains("IEA functional-group count mismatch"),
+            .error_detail()
+            .is_some_and(|detail| detail.contains("IEA functional-group count mismatch")),
         "got {:?}",
-        triggers[0].error_message
+        triggers[0].error_detail()
     );
 }
 
@@ -894,7 +944,7 @@ fn x12_zero_body_bad_then_good_continues() {
 fn x12_multi_file_bad_first_then_good_continues() {
     // [bad, good]: the malformed FIRST file dead-letters and the good second
     // file streams. Guards the cursor-advance from the very first slot.
-    let (report, body) = run_x12_structural_multi(
+    let (report, body, rows) = run_x12_structural_multi(
         "document",
         &[
             ("bad.x12", x12_se_count("99")),
@@ -902,7 +952,7 @@ fn x12_multi_file_bad_first_then_good_continues() {
         ],
     )
     .expect("does not abort");
-    let (single_clean, _) =
+    let (single_clean, _, _) =
         run_x12_structural_multi("document", &[("solo.x12", x12_se_count("4"))])
             .expect("a single clean file runs");
     assert!(!body.is_empty(), "the good second file streams");
@@ -911,7 +961,7 @@ fn x12_multi_file_bad_first_then_good_continues() {
         "exactly the one clean file's records reach the sink"
     );
     assert_eq!(
-        report.dlq_entries.iter().filter(|e| e.trigger).count(),
+        rows.iter().filter(|r| r.trigger()).count(),
         1,
         "only the malformed first file is dead-lettered"
     );
@@ -922,23 +972,22 @@ fn x12_multi_file_all_bad_dead_letters_each_and_emits_nothing() {
     // [bad, bad]: every file is malformed — each dead-letters independently
     // (two triggers) and nothing reaches the sink. The run still does NOT
     // abort under the opt-in.
-    let (report, body) = run_x12_structural_multi(
+    let (report, body, rows) = run_x12_structural_multi(
         "document",
         &[("a.x12", x12_se_count("99")), ("b.x12", x12_ge_count("9"))],
     )
     .expect("does not abort even when every file is malformed");
     assert_eq!(report.counters.ok_count, 0, "nothing reaches the sink");
     assert!(body.is_empty());
-    let triggers: Vec<&DlqEntry> = report.dlq_entries.iter().filter(|e| e.trigger).collect();
+    let triggers: Vec<&DlqRow> = rows.iter().filter(|r| r.trigger()).collect();
     assert_eq!(
         triggers.len(),
         2,
         "each malformed file is dead-lettered independently"
     );
     assert!(
-        triggers
-            .iter()
-            .all(|e| e.category == clinker_core_types::dlq::DlqErrorCategory::StructuralValidation),
+        triggers.iter().all(|r| r.category()
+            == Some(clinker_core_types::dlq::DlqErrorCategory::StructuralValidation.as_str())),
         "both triggers carry the structural_validation category"
     );
 }
@@ -948,7 +997,7 @@ fn x12_multi_file_bad_bad_good_streams_only_the_good() {
     // [bad, bad, good]: two consecutive malformed files each dead-letter, and
     // the trailing good file still streams — the advance is robust across
     // back-to-back rejects.
-    let (report, body) = run_x12_structural_multi(
+    let (report, body, rows) = run_x12_structural_multi(
         "document",
         &[
             ("a.x12", x12_se_count("99")),
@@ -957,7 +1006,7 @@ fn x12_multi_file_bad_bad_good_streams_only_the_good() {
         ],
     )
     .expect("does not abort");
-    let (single_clean, _) =
+    let (single_clean, _, _) =
         run_x12_structural_multi("document", &[("solo.x12", x12_se_count("4"))])
             .expect("a single clean file runs");
     assert!(!body.is_empty(), "the trailing good file streams");
@@ -966,7 +1015,7 @@ fn x12_multi_file_bad_bad_good_streams_only_the_good() {
         "exactly the one clean file's records reach the sink"
     );
     assert_eq!(
-        report.dlq_entries.iter().filter(|e| e.trigger).count(),
+        rows.iter().filter(|r| r.trigger()).count(),
         2,
         "both malformed files are dead-lettered"
     );
@@ -980,7 +1029,7 @@ fn x12_se_count_mismatch_rejects_whole_document() {
     // ZERO records reach the success sink. The trailer count is only known
     // mid-stream, so the reject lands at the file's close — but no record of
     // the malformed envelope is ever written out.
-    let report = run_x12_structural("document", &x12_se_count("99"))
+    let (report, rows) = run_x12_structural("document", &x12_se_count("99"))
         .expect("structural-count failure dead-letters rather than aborting");
 
     assert_eq!(
@@ -992,26 +1041,28 @@ fn x12_se_count_mismatch_rejects_whole_document() {
         "the malformed interchange's already-streamed records dead-letter, got {}",
         report.counters.dlq_count
     );
-    let triggers: Vec<&DlqEntry> = report.dlq_entries.iter().filter(|e| e.trigger).collect();
+    let triggers: Vec<&DlqRow> = rows.iter().filter(|r| r.trigger()).collect();
     assert_eq!(triggers.len(), 1, "exactly one root-cause trigger");
     assert_eq!(
-        triggers[0].category,
-        clinker_core_types::dlq::DlqErrorCategory::StructuralValidation,
+        triggers[0].category(),
+        Some(clinker_core_types::dlq::DlqErrorCategory::StructuralValidation.as_str()),
         "the trigger carries the structural_validation category"
     );
     assert!(
         triggers[0]
-            .error_message
-            .contains("SE segment count mismatch"),
+            .error_detail()
+            .is_some_and(|detail| detail.contains("SE segment count mismatch")),
         "the trigger message names the count mismatch, got {:?}",
-        triggers[0].error_message
+        triggers[0].error_detail()
+    );
+    assert_eq!(
+        rows.len() as u64,
+        report.counters.dlq_count,
+        "every dead letter of the malformed interchange is written as a row"
     );
     assert!(
-        report
-            .dlq_entries
-            .iter()
-            .filter(|e| !e.trigger)
-            .all(|e| e.category == clinker_core_types::dlq::DlqErrorCategory::DocumentRejected),
+        rows.iter().filter(|r| !r.trigger()).all(|r| r.category()
+            == Some(clinker_core_types::dlq::DlqErrorCategory::DocumentRejected.as_str())),
         "every collateral carries the document_rejected category"
     );
 }
@@ -1020,42 +1071,42 @@ fn x12_se_count_mismatch_rejects_whole_document() {
 fn x12_ge_count_mismatch_rejects_at_file_grain() {
     // A GE functional-group count mismatch rejects the whole source file
     // (the outermost grain), not just the offending group.
-    let report = run_x12_structural("document", &x12_ge_count("9"))
+    let (report, rows) = run_x12_structural("document", &x12_ge_count("9"))
         .expect("GE count failure dead-letters rather than aborting");
     assert_eq!(report.counters.ok_count, 0, "the whole file dead-letters");
-    let triggers: Vec<&DlqEntry> = report.dlq_entries.iter().filter(|e| e.trigger).collect();
+    let triggers: Vec<&DlqRow> = rows.iter().filter(|r| r.trigger()).collect();
     assert_eq!(triggers.len(), 1);
     assert_eq!(
-        triggers[0].category,
-        clinker_core_types::dlq::DlqErrorCategory::StructuralValidation
+        triggers[0].category(),
+        Some(clinker_core_types::dlq::DlqErrorCategory::StructuralValidation.as_str())
     );
     assert!(
         triggers[0]
-            .error_message
-            .contains("GE transaction-set count mismatch"),
+            .error_detail()
+            .is_some_and(|detail| detail.contains("GE transaction-set count mismatch")),
         "got {:?}",
-        triggers[0].error_message
+        triggers[0].error_detail()
     );
 }
 
 #[test]
 fn x12_iea_count_mismatch_rejects_at_file_grain() {
     // An IEA interchange-level count mismatch rejects the whole file.
-    let report = run_x12_structural("document", &x12_iea_count("9"))
+    let (report, rows) = run_x12_structural("document", &x12_iea_count("9"))
         .expect("IEA count failure dead-letters rather than aborting");
     assert_eq!(report.counters.ok_count, 0, "the whole file dead-letters");
-    let triggers: Vec<&DlqEntry> = report.dlq_entries.iter().filter(|e| e.trigger).collect();
+    let triggers: Vec<&DlqRow> = rows.iter().filter(|r| r.trigger()).collect();
     assert_eq!(triggers.len(), 1);
     assert_eq!(
-        triggers[0].category,
-        clinker_core_types::dlq::DlqErrorCategory::StructuralValidation
+        triggers[0].category(),
+        Some(clinker_core_types::dlq::DlqErrorCategory::StructuralValidation.as_str())
     );
     assert!(
         triggers[0]
-            .error_message
-            .contains("IEA functional-group count mismatch"),
+            .error_detail()
+            .is_some_and(|detail| detail.contains("IEA functional-group count mismatch")),
         "got {:?}",
-        triggers[0].error_message
+        triggers[0].error_detail()
     );
 }
 
@@ -1064,7 +1115,7 @@ fn x12_clean_interchange_streams_under_structural_opt_in() {
     // The control: a well-formed interchange under the same `document`
     // opt-in streams normally with no DLQ entries — the opt-in only changes
     // behavior on a malformed envelope.
-    let report = run_x12_structural("document", &x12_se_count("4"))
+    let (report, _) = run_x12_structural("document", &x12_se_count("4"))
         .expect("a clean interchange runs without error");
     assert_eq!(
         report.counters.dlq_count, 0,
@@ -1125,7 +1176,10 @@ fn run_structural(
     dlq_granularity: &str,
     file_name: &str,
     fixture: &str,
-) -> Result<clinker_exec::executor::ExecutionReport, clinker_plan::error::PipelineError> {
+) -> Result<
+    (clinker_exec::executor::ExecutionReport, Vec<DlqRow>),
+    clinker_plan::error::PipelineError,
+> {
     let reference_field = match format {
         "edifact" => "msg_ref",
         _ => "set_ref",
@@ -1182,7 +1236,14 @@ nodes:
         shutdown_token: None,
         ..Default::default()
     };
-    PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+    let sink = CollectingDlqSink::new();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        dlq_sink::registry(writers, &sink),
+        &params,
+    )?;
+    Ok((report, sink.rows()))
 }
 
 /// One ORDERS interchange whose `UNT` segment count is templated (the right
@@ -1204,7 +1265,7 @@ fn edifact_unt_count_mismatch_rejects_whole_document() {
     // A wrong UNT segment count condemns the whole EDIFACT interchange under
     // the `document` opt-in: the body segments dead-letter (StructuralValidation
     // trigger + DocumentRejected collaterals) and no record reaches the sink.
-    let report = run_structural(
+    let (report, rows) = run_structural(
         "edifact",
         "document",
         "po.edifact",
@@ -1212,18 +1273,18 @@ fn edifact_unt_count_mismatch_rejects_whole_document() {
     )
     .expect("EDIFACT count failure dead-letters rather than aborting");
     assert_eq!(report.counters.ok_count, 0, "no record reaches the sink");
-    let triggers: Vec<&DlqEntry> = report.dlq_entries.iter().filter(|e| e.trigger).collect();
+    let triggers: Vec<&DlqRow> = rows.iter().filter(|r| r.trigger()).collect();
     assert_eq!(triggers.len(), 1);
     assert_eq!(
-        triggers[0].category,
-        clinker_core_types::dlq::DlqErrorCategory::StructuralValidation
+        triggers[0].category(),
+        Some(clinker_core_types::dlq::DlqErrorCategory::StructuralValidation.as_str())
     );
     assert!(
         triggers[0]
-            .error_message
-            .contains("UNT segment count mismatch"),
+            .error_detail()
+            .is_some_and(|detail| detail.contains("UNT segment count mismatch")),
         "got {:?}",
-        triggers[0].error_message
+        triggers[0].error_detail()
     );
 }
 
@@ -1231,7 +1292,7 @@ fn edifact_unt_count_mismatch_rejects_whole_document() {
 fn edifact_clean_interchange_streams_under_opt_in() {
     // The control: a well-formed UNT count streams normally under the same
     // opt-in.
-    let report = run_structural("edifact", "document", "po.edifact", &edifact_unt_count("4"))
+    let (report, _) = run_structural("edifact", "document", "po.edifact", &edifact_unt_count("4"))
         .expect("a clean EDIFACT interchange runs without error");
     assert_eq!(report.counters.dlq_count, 0);
     assert!(report.counters.ok_count > 0);
@@ -1270,21 +1331,21 @@ fn hl7_bts_count_mismatch_rejects_whole_document() {
     // `document` opt-in: the streamed message segments dead-letter
     // (StructuralValidation trigger + DocumentRejected collaterals) and no
     // record reaches the sink.
-    let report = run_structural("hl7", "document", "batch.hl7", &hl7_bts_count("99"))
+    let (report, rows) = run_structural("hl7", "document", "batch.hl7", &hl7_bts_count("99"))
         .expect("HL7 count failure dead-letters rather than aborting");
     assert_eq!(report.counters.ok_count, 0, "no record reaches the sink");
-    let triggers: Vec<&DlqEntry> = report.dlq_entries.iter().filter(|e| e.trigger).collect();
+    let triggers: Vec<&DlqRow> = rows.iter().filter(|r| r.trigger()).collect();
     assert_eq!(triggers.len(), 1);
     assert_eq!(
-        triggers[0].category,
-        clinker_core_types::dlq::DlqErrorCategory::StructuralValidation
+        triggers[0].category(),
+        Some(clinker_core_types::dlq::DlqErrorCategory::StructuralValidation.as_str())
     );
     assert!(
         triggers[0]
-            .error_message
-            .contains("BTS batch message count mismatch"),
+            .error_detail()
+            .is_some_and(|detail| detail.contains("BTS batch message count mismatch")),
         "got {:?}",
-        triggers[0].error_message
+        triggers[0].error_detail()
     );
 }
 
@@ -1453,6 +1514,8 @@ pipeline:
   memory: { limit: "2M", backpressure: spill }
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: events
@@ -1509,8 +1572,14 @@ nodes:
         shutdown_token: None,
         ..Default::default()
     };
-    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
-        .expect("run upstream-spill pipeline");
+    let sink = CollectingDlqSink::new();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        dlq_sink::registry(writers, &sink),
+        &params,
+    )
+    .expect("run upstream-spill pipeline");
 
     // An UPSTREAM stage must actually have spilled — otherwise this guards
     // nothing about the document-context-through-spill round-trip. Per-stage
@@ -1542,7 +1611,8 @@ nodes:
         report.counters.ok_count, 0,
         "no record of the rejected document reaches the sink across the spill"
     );
-    let trigger_count = report.dlq_entries.iter().filter(|e| e.trigger).count();
+    let rows = sink.rows();
+    let trigger_count = rows.iter().filter(|r| r.trigger()).count();
     assert_eq!(trigger_count, 1, "exactly one root-cause trigger");
     assert_eq!(
         report.counters.dlq_count as usize,
