@@ -84,6 +84,31 @@ impl PendingStage {
     }
 }
 
+/// Identity of one recorded scratch file in the run attempt's workspace.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AttemptScratchId(String);
+
+impl AttemptScratchId {
+    /// The file's leaf inside its attempt root.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// One recorded scratch file, open for writing.
+///
+/// The file lives in the attempt root that stages artifacts for its
+/// destination, and the attempt manifest names it before it exists. It holds
+/// no reservation on the destination and is never published: the holder
+/// retires it through [`OutputStagingRegistry::retire_attempt_scratch`] once
+/// its bytes have been copied where they belong, and on every error or
+/// cancellation path.
+#[derive(Debug)]
+pub struct AttemptScratch {
+    pub id: AttemptScratchId,
+    pub file: File,
+}
+
 /// An operator-visible partial retained after an unsuccessful run.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PartialOutput {
@@ -338,6 +363,62 @@ impl OutputStagingRegistry {
         }
     }
 
+    /// Create one recorded scratch file in the run attempt's workspace, in
+    /// the attempt root that stages artifacts for `destination`.
+    ///
+    /// `destination` is the final path of the artifact the scratch bytes
+    /// belong to; it is validated exactly as a staged artifact's destination
+    /// is, and must lie in one of the run's compiled roots. The attempt
+    /// manifest records the file before it exists. `label` names the producer
+    /// in diagnostics. Blocks on one manifest persist; call it once per file,
+    /// never per row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError::Internal`] when the registry has no run
+    /// attempt, and a validation or I/O error when the destination is
+    /// rejected or the file cannot be recorded and created.
+    pub fn create_attempt_scratch(
+        &self,
+        destination: &Path,
+        label: &str,
+    ) -> Result<AttemptScratch, PipelineError> {
+        let attempt = self.run_attempt(label)?;
+        let base = std::env::current_dir().map_err(PipelineError::Io)?;
+        let destination = validate_attempt_destination(destination, &base)?;
+        let (id, file) = attempt
+            .create_scratch(&destination)
+            .map_err(attempt_error_to_pipeline)?;
+        Ok(AttemptScratch {
+            id: AttemptScratchId(id),
+            file,
+        })
+    }
+
+    /// Remove one recorded scratch file, synchronize its directory, then
+    /// drop its record from the attempt manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry has no run attempt, the id is not
+    /// recorded by this run, or the removal or manifest write fails; the
+    /// record is kept whenever the file may still exist.
+    pub fn retire_attempt_scratch(&self, id: &AttemptScratchId) -> Result<(), PipelineError> {
+        self.run_attempt("attempt scratch")?
+            .retire_scratch(id.as_str())
+            .map_err(attempt_error_to_pipeline)
+    }
+
+    fn run_attempt(&self, name: &str) -> Result<&RunAttemptPublication, PipelineError> {
+        self.attempt
+            .as_ref()
+            .ok_or_else(|| PipelineError::Internal {
+                op: "attempt-publication",
+                node: name.to_owned(),
+                detail: "attempt-owned output registry has no run attempt".to_owned(),
+            })
+    }
+
     fn stage_attempt_candidate(
         &self,
         kind: ArtifactKind,
@@ -346,14 +427,7 @@ impl OutputStagingRegistry {
         final_path: PathBuf,
         base: Option<&Path>,
     ) -> Result<(PathBuf, File), PipelineError> {
-        let attempt = self
-            .attempt
-            .as_ref()
-            .ok_or_else(|| PipelineError::Internal {
-                op: "attempt-publication",
-                node: name.to_owned(),
-                detail: "attempt-owned output registry has no run attempt".to_owned(),
-            })?;
+        let attempt = self.run_attempt(name)?;
         // Resolved by the caller when it is walking candidates, so a search
         // over a directory already holding thousands of numbered files does
         // not ask the kernel for the same answer once per name.
@@ -365,13 +439,7 @@ impl OutputStagingRegistry {
                 &owned
             }
         };
-        let destination =
-            validate_path(&final_path, base, final_path.is_absolute()).map_err(|diagnostic| {
-                PipelineError::Config(ConfigError::Validation(format!(
-                    "{}: {}",
-                    diagnostic.code, diagnostic.message
-                )))
-            })?;
+        let destination = validate_attempt_destination(&final_path, base)?;
         let logical_leaf = final_path
             .file_name()
             .and_then(|leaf| leaf.to_str())
@@ -855,6 +923,17 @@ fn destination_key_in(path: &std::path::Path, base: &std::path::Path) -> String 
     clinker_plan::config::destination_identity(&absolute)
 }
 
+/// Validate an attempt-owned artifact's final path against the working
+/// directory, the one admission every attempt-owned file goes through.
+fn validate_attempt_destination(path: &Path, base: &Path) -> Result<ValidatedPath, PipelineError> {
+    validate_path(path, base, path.is_absolute()).map_err(|diagnostic| {
+        PipelineError::Config(ConfigError::Validation(format!(
+            "{}: {}",
+            diagnostic.code, diagnostic.message
+        )))
+    })
+}
+
 fn attempt_error_to_pipeline(error: AttemptError) -> PipelineError {
     match error {
         AttemptError::Containment(error) => containment_error(error),
@@ -913,6 +992,177 @@ mod tests {
     use clinker_plan::config::IfExistsPolicy;
 
     use super::{OutputStagingRegistry, PublicationOutcome};
+    use crate::output::attempt::{AttemptManifest, RunAttemptPublication, owned_root_identifier};
+
+    const SCRATCH_EXECUTION: &str = "018f47a2-9a41-7a27-b4d6-4f7137e3c159";
+
+    fn scratch_run(root: &std::path::Path) -> (RunAttemptPublication, OutputStagingRegistry) {
+        let policy = clinker_plan::config::ClinkerToml::parse("")
+            .expect("parse publication fixture")
+            .storage
+            .publication
+            .resolve(root, 1_024, 8_000_000_000)
+            .expect("resolve publication fixture");
+        let created = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_millis(),
+        )
+        .expect("clock fits u64")
+            - 1_000;
+        let attempt = RunAttemptPublication::create(
+            policy,
+            SCRATCH_EXECUTION,
+            created,
+            created,
+            vec![
+                clinker_plan::security::validate_path(std::path::Path::new("."), root, false)
+                    .expect("fixture root validates"),
+            ],
+        )
+        .expect("create run attempt");
+        let registry = OutputStagingRegistry::for_run_attempt(attempt.clone());
+        (attempt, registry)
+    }
+
+    fn scratch_attempt_dir(root: &std::path::Path) -> std::path::PathBuf {
+        root.join(".clinker-attempts").join(SCRATCH_EXECUTION)
+    }
+
+    fn persisted_manifest(root: &std::path::Path) -> AttemptManifest {
+        AttemptManifest::read(&scratch_attempt_dir(root).join("manifest.json"), u64::MAX)
+            .expect("read the persisted attempt manifest")
+    }
+
+    fn attempt_children(root: &std::path::Path) -> Vec<String> {
+        let mut names = std::fs::read_dir(scratch_attempt_dir(root))
+            .expect("list the attempt root")
+            .map(|entry| {
+                entry
+                    .expect("attempt root entry")
+                    .file_name()
+                    .into_string()
+                    .expect("UTF-8 leaf")
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn scratch_file_is_recorded_before_it_exists() {
+        let root = tempfile::tempdir().expect("destination root");
+        let (_attempt, registry) = scratch_run(root.path());
+        let mut scratch = registry
+            .create_attempt_scratch(&root.path().join("rejects.csv"), "rejects")
+            .expect("create recorded scratch file");
+        scratch.file.write_all(b"row\n").expect("write part rows");
+
+        let manifest = persisted_manifest(root.path());
+        assert_eq!(manifest.scratch().len(), 1, "{manifest:?}");
+        assert_eq!(manifest.scratch()[0].scratch_id(), scratch.id.as_str());
+        assert_eq!(
+            manifest.scratch()[0].root_identifier(),
+            owned_root_identifier(root.path()),
+            "the record names the destination root that holds the file"
+        );
+        assert!(
+            manifest.artifacts().is_empty(),
+            "a scratch file is not an artifact and claims no destination"
+        );
+        let id = scratch.id.as_str();
+        assert!(
+            id.len() == 16
+                && id.starts_with("scratch-")
+                && id[8..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "{id}"
+        );
+        assert_eq!(
+            std::fs::read(scratch_attempt_dir(root.path()).join(id)).expect("read scratch"),
+            b"row\n",
+            "the file lives in that attempt root"
+        );
+        assert!(
+            !root.path().join("rejects.csv").exists(),
+            "the destination itself is untouched"
+        );
+    }
+
+    #[test]
+    fn retired_scratch_leaves_no_file_or_record() {
+        let root = tempfile::tempdir().expect("destination root");
+        let (_attempt, registry) = scratch_run(root.path());
+        let first = registry
+            .create_attempt_scratch(&root.path().join("rejects.csv"), "rejects")
+            .expect("create first scratch file");
+        let second = registry
+            .create_attempt_scratch(&root.path().join("rejects.csv"), "rejects")
+            .expect("create second scratch file");
+        assert_ne!(first.id, second.id, "every scratch file has its own id");
+        let first_id = first.id.clone();
+        drop(first);
+
+        registry
+            .retire_attempt_scratch(&first_id)
+            .expect("retire the first scratch file");
+        assert!(
+            !scratch_attempt_dir(root.path())
+                .join(first_id.as_str())
+                .exists()
+        );
+        let manifest = persisted_manifest(root.path());
+        assert_eq!(
+            manifest
+                .scratch()
+                .iter()
+                .map(|entry| entry.scratch_id())
+                .collect::<Vec<_>>(),
+            vec![second.id.as_str()],
+            "only the retired record is gone"
+        );
+        assert!(
+            registry.retire_attempt_scratch(&first_id).is_err(),
+            "an id is retired once"
+        );
+
+        let second_id = second.id.clone();
+        drop(second);
+        registry
+            .retire_attempt_scratch(&second_id)
+            .expect("retire the second scratch file");
+        assert!(persisted_manifest(root.path()).scratch().is_empty());
+        assert_eq!(
+            attempt_children(root.path()),
+            vec!["live.lock".to_owned(), "manifest.json".to_owned()]
+        );
+    }
+
+    #[test]
+    fn scratch_is_rejected_outside_compiled_roots() {
+        let root = tempfile::tempdir().expect("destination root");
+        let elsewhere = tempfile::tempdir().expect("uncompiled root");
+        let (_attempt, registry) = scratch_run(root.path());
+        let error = registry
+            .create_attempt_scratch(&elsewhere.path().join("rejects.csv"), "rejects")
+            .expect_err("a destination outside the compiled roots is refused");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("outside the compiled run roots"),
+            "{rendered}"
+        );
+        assert!(persisted_manifest(root.path()).scratch().is_empty());
+        assert_eq!(
+            attempt_children(root.path()),
+            vec!["live.lock".to_owned(), "manifest.json".to_owned()]
+        );
+        assert!(
+            !elsewhere.path().join(".clinker-attempts").exists(),
+            "nothing is created under the uncompiled root"
+        );
+    }
 
     #[test]
     fn interrupted_execution_keeps_existing_final_and_quarantine() {

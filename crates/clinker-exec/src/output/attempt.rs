@@ -726,6 +726,36 @@ impl ArtifactManifest {
     }
 }
 
+/// Ownership record for one scratch file in a run attempt's workspace.
+///
+/// A scratch file is transient: it holds one side thread's dead-letter part
+/// for one bucket from that part's first row until the part is spliced into
+/// its bucket's staged file, or until an error or cancellation path releases
+/// it. Only a process death can leave one behind, and this record is what lets
+/// cleanup and purge recognise the leftover file as Clinker-owned instead of
+/// keeping the whole attempt for an unknown child. No size is recorded: the
+/// inventory measures the file itself through its contained handle.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScratchManifest {
+    scratch_id: String,
+    root_identifier: String,
+}
+
+impl ScratchManifest {
+    /// The file's leaf inside its attempt root: `scratch-` and eight
+    /// lowercase hexadecimal characters.
+    pub fn scratch_id(&self) -> &str {
+        &self.scratch_id
+    }
+
+    /// Path-free identifier of the destination root whose attempt directory
+    /// holds the file.
+    pub fn root_identifier(&self) -> &str {
+        &self.root_identifier
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AttemptManifest {
@@ -741,6 +771,11 @@ pub struct AttemptManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     root_receipt: Option<ManifestRootReceipt>,
     artifacts: Vec<ArtifactManifest>,
+    /// Recorded scratch files, strictly ordered by id. Absent from a manifest
+    /// that holds none, so a manifest written before scratch files existed
+    /// still reads in canonical form.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    scratch: Vec<ScratchManifest>,
 }
 
 impl AttemptManifest {
@@ -769,6 +804,7 @@ impl AttemptManifest {
             admitted_bytes: 0,
             root_receipt: None,
             artifacts,
+            scratch: Vec::new(),
         };
         manifest.validate(None)?;
         Ok(manifest)
@@ -843,6 +879,11 @@ impl AttemptManifest {
 
     pub fn artifacts(&self) -> &[ArtifactManifest] {
         &self.artifacts
+    }
+
+    /// Scratch files this attempt has created and not yet retired.
+    pub fn scratch(&self) -> &[ScratchManifest] {
+        &self.scratch
     }
 
     fn with_admitted_bytes(mut self, admitted_bytes: u64) -> Result<Self, AttemptError> {
@@ -3621,7 +3662,7 @@ fn continuation_binding(
     *hasher.finalize().as_bytes()
 }
 
-fn owned_root_identifier(path: &Path) -> String {
+pub(super) fn owned_root_identifier(path: &Path) -> String {
     blake3::hash(destination_root_key(path).as_bytes())
         .to_hex()
         .to_string()
@@ -3917,6 +3958,29 @@ impl RunAttemptPublication {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .stage_registered(registry, registration)
+    }
+
+    /// Create one recorded scratch file in the attempt root that stages an
+    /// artifact for `destination`.
+    ///
+    /// Blocks on one manifest persist (every root's copy) before the file
+    /// exists. Called once per part, never per row.
+    pub(crate) fn create_scratch(
+        &self,
+        destination: &ValidatedPath,
+    ) -> Result<(String, File), AttemptError> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .create_scratch(destination)
+    }
+
+    /// Remove one recorded scratch file, then its record.
+    pub(crate) fn retire_scratch(&self, scratch_id: &str) -> Result<(), AttemptError> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retire_scratch(scratch_id)
     }
 
     /// Synchronize every closed writer and persist the attempt as ready.
@@ -4515,6 +4579,23 @@ impl AttemptPublication {
             kind: registration.kind,
             file,
         })
+    }
+
+    fn create_scratch(
+        &mut self,
+        destination: &ValidatedPath,
+    ) -> Result<(String, File), AttemptError> {
+        let _ = destination;
+        Err(AttemptError::InvalidTransition(
+            "attempt scratch files are not supported",
+        ))
+    }
+
+    fn retire_scratch(&mut self, scratch_id: &str) -> Result<(), AttemptError> {
+        let _ = scratch_id;
+        Err(AttemptError::InvalidTransition(
+            "attempt scratch files are not supported",
+        ))
     }
 
     fn create_artifact_in_root(&self, root_key: &str, leaf: &str) -> Result<File, AttemptError> {
@@ -5663,5 +5744,207 @@ mod destination_root_key_tests {
                 "{name} names it once the filesystem can answer"
             );
         }
+    }
+}
+
+/// Recorded scratch files are owned children of their attempt: inventoried,
+/// purged and cleaned with it, and never a licence for an unrecorded child.
+#[cfg(test)]
+mod scratch_tests {
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use clinker_plan::config::{ClinkerToml, ResolvedPublicationPolicy};
+    use clinker_plan::security::{ValidatedPath, validate_path};
+
+    use super::{
+        ATTEMPT_NAMESPACE_LEAF, AttemptManifest, AttemptPublication, AttemptQuery, AttemptState,
+        CleanupDebtKind, CleanupDisposition, MANIFEST_SCHEMA, PurgeDisposition,
+        RunAttemptPublication,
+    };
+    use crate::output::staging::OutputStagingRegistry;
+    use crate::pipeline::shutdown::ShutdownToken;
+
+    const FIRST_EXECUTION: &str = "018f47a2-9a41-7a27-b4d6-4f7137e3c159";
+    const SECOND_EXECUTION: &str = "018f47a2-9a41-7a27-b4d6-4f7137e3c15a";
+    const PART_BYTES: &[u8] = b"row-1\nrow-2\n";
+
+    fn validated_root(root: &Path) -> ValidatedPath {
+        validate_path(Path::new("."), root, false).expect("fixture root validates")
+    }
+
+    fn policy(root: &Path) -> ResolvedPublicationPolicy {
+        ClinkerToml::parse("")
+            .expect("parse publication fixture")
+            .storage
+            .publication
+            .resolve(root, 1_024, 8_000_000_000)
+            .expect("resolve publication fixture")
+    }
+
+    fn created_unix_ms() -> u64 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_millis();
+        u64::try_from(now).expect("clock fits u64") - 1_000
+    }
+
+    fn attempt_dir(root: &Path, execution_id: &str) -> PathBuf {
+        root.join(ATTEMPT_NAMESPACE_LEAF).join(execution_id)
+    }
+
+    /// What a process death between a part's first row and its splice
+    /// leaves behind: an abandoned attempt holding one recorded scratch file
+    /// with bytes in it. Returns the scratch id.
+    fn abandoned_attempt_with_scratch(root: &Path, execution_id: &str, created: u64) -> String {
+        let attempt = RunAttemptPublication::create(
+            policy(root),
+            execution_id,
+            created,
+            created,
+            vec![validated_root(root)],
+        )
+        .expect("create run attempt");
+        let registry = OutputStagingRegistry::for_run_attempt(attempt.clone());
+        let mut scratch = registry
+            .create_attempt_scratch(&root.join("rejects.csv"), "rejects")
+            .expect("create recorded scratch file");
+        scratch.file.write_all(PART_BYTES).expect("write part rows");
+        let scratch_id = scratch.id.as_str().to_owned();
+        drop(scratch);
+        attempt.abandon().expect("retain the failed attempt");
+        drop(registry);
+        drop(attempt);
+        scratch_id
+    }
+
+    fn observed_after_retention(root: &Path, created: u64) -> u64 {
+        created + policy(root).failed_retention_seconds() * 1_000 + 1
+    }
+
+    #[test]
+    fn cleanup_removes_recorded_scratch_with_the_attempt() {
+        let root = tempfile::tempdir().expect("destination root");
+        let created = created_unix_ms();
+        let observed = observed_after_retention(root.path(), created);
+
+        // Purge through the plan-bound query, which also inventories.
+        let scratch_id = abandoned_attempt_with_scratch(root.path(), FIRST_EXECUTION, created);
+        let dir = attempt_dir(root.path(), FIRST_EXECUTION);
+        assert!(dir.join(&scratch_id).is_file(), "the part survives the run");
+        let policy = policy(root.path());
+        let query = AttemptQuery::for_admission(&policy, vec![validated_root(root.path())])
+            .expect("attempt query");
+        let root_id = query.owned_root_ids()[0].to_owned();
+        let inspection = query
+            .inspect(&root_id, FIRST_EXECUTION, observed)
+            .expect("inspect the retained attempt");
+        assert!(
+            inspection.cleanup_debt().is_empty(),
+            "a recorded scratch file is an owned child: {:?}",
+            inspection.cleanup_debt()
+        );
+        assert_eq!(inspection.state(), Some(AttemptState::Abandoned));
+        assert_eq!(
+            inspection.retained_bytes(),
+            Some(PART_BYTES.len() as u64),
+            "the scratch file's observed size counts toward retained bytes"
+        );
+        assert!(inspection.is_eligible());
+        let request = query
+            .purge_execution(&root_id, FIRST_EXECUTION)
+            .expect("purge selector");
+        let report = query
+            .execute(&request, observed, None, &ShutdownToken::new())
+            .expect("purge the attempt");
+        assert_eq!(
+            report.disposition(),
+            PurgeDisposition::Removed,
+            "{:?}",
+            report.cleanup_debt()
+        );
+        assert!(
+            !dir.exists(),
+            "purge removes the scratch file with its attempt"
+        );
+
+        // The single-root cleanup removes it the same way.
+        let scratch_id = abandoned_attempt_with_scratch(root.path(), SECOND_EXECUTION, created);
+        let dir = attempt_dir(root.path(), SECOND_EXECUTION);
+        assert!(dir.join(&scratch_id).is_file());
+        let cleaned =
+            AttemptPublication::cleanup(validated_root(root.path()), SECOND_EXECUTION, observed)
+                .expect("clean the attempt");
+        assert_eq!(cleaned.disposition(), CleanupDisposition::Removed);
+        assert!(
+            !dir.exists(),
+            "cleanup removes the scratch file with its attempt"
+        );
+    }
+
+    #[test]
+    fn cleanup_keeps_an_attempt_with_an_unrecorded_file() {
+        let root = tempfile::tempdir().expect("destination root");
+        let created = created_unix_ms();
+        let observed = observed_after_retention(root.path(), created);
+        let scratch_id = abandoned_attempt_with_scratch(root.path(), FIRST_EXECUTION, created);
+        let dir = attempt_dir(root.path(), FIRST_EXECUTION);
+        // Shaped like a scratch file, but no manifest names it.
+        let stray = dir.join("scratch-000000ff");
+        std::fs::write(&stray, b"unowned").expect("plant an unrecorded file");
+
+        let policy = policy(root.path());
+        let query = AttemptQuery::for_admission(&policy, vec![validated_root(root.path())])
+            .expect("attempt query");
+        let root_id = query.owned_root_ids()[0].to_owned();
+        let inspection = query
+            .inspect(&root_id, FIRST_EXECUTION, observed)
+            .expect("inspect the retained attempt");
+        assert!(
+            inspection
+                .cleanup_debt()
+                .iter()
+                .any(|debt| debt.kind() == CleanupDebtKind::UnknownChild),
+            "{:?}",
+            inspection.cleanup_debt()
+        );
+        assert!(!inspection.is_eligible());
+        let request = query
+            .purge_execution(&root_id, FIRST_EXECUTION)
+            .expect("purge selector");
+        let report = query
+            .execute(&request, observed, None, &ShutdownToken::new())
+            .expect("purge reports");
+        assert_ne!(report.disposition(), PurgeDisposition::Removed);
+        let cleaned =
+            AttemptPublication::cleanup(validated_root(root.path()), FIRST_EXECUTION, observed)
+                .expect("cleanup reports");
+        assert_eq!(cleaned.disposition(), CleanupDisposition::Kept);
+        assert!(stray.is_file(), "an unowned path is never deleted");
+        assert!(dir.join(&scratch_id).is_file(), "the attempt is kept whole");
+        assert!(dir.join("manifest.json").is_file());
+    }
+
+    #[test]
+    fn old_manifest_without_scratch_field_still_reads() {
+        let old = format!(
+            concat!(
+                "{{\"schema\":\"{}\",\"execution_id\":\"{}\",\"created_unix_ms\":1000,",
+                "\"eligible_after_unix_ms\":2000,\"state\":\"abandoned\",",
+                "\"artifact_count\":0,\"total_bytes\":0,\"artifacts\":[]}}"
+            ),
+            MANIFEST_SCHEMA, FIRST_EXECUTION
+        );
+        let manifest =
+            AttemptManifest::from_bytes(old.as_bytes(), 3_000).expect("pre-scratch manifest reads");
+        assert!(manifest.scratch().is_empty());
+        assert_eq!(manifest.state(), AttemptState::Abandoned);
+        assert_eq!(
+            manifest.to_bytes().expect("re-encode"),
+            old.as_bytes(),
+            "a manifest without scratch files keeps the pre-scratch encoding"
+        );
     }
 }
