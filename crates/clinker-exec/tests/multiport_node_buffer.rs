@@ -24,8 +24,8 @@ use clinker_plan::config::{CompileContext, parse_config};
 
 /// Run `yaml` with the given `(source_name, csv)` readers, capturing every
 /// named output writer. Returns each output's rendered string keyed by output
-/// node name. Panics on run failure.
-fn run(yaml: &str, sources: &[(&str, &str)], outputs: &[&str]) -> (HashMap<String, String>, usize) {
+/// node name, and the run's dead-letter count. Panics on run failure.
+fn run(yaml: &str, sources: &[(&str, &str)], outputs: &[&str]) -> (HashMap<String, String>, u64) {
     let config = parse_config(yaml).expect("fixture pipeline must parse");
     let plan = config
         .compile(&CompileContext::default())
@@ -69,7 +69,7 @@ fn run(yaml: &str, sources: &[(&str, &str)], outputs: &[&str]) -> (HashMap<Strin
         .into_iter()
         .map(|(name, buf)| (name, buf.as_string()))
         .collect();
-    (rendered, report.dlq_entries.len())
+    (rendered, report.counters.dlq_count)
 }
 
 /// Data rows (header stripped, blank lines dropped), sorted for multiset

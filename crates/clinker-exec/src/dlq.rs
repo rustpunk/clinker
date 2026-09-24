@@ -5,17 +5,23 @@
 //! [`clinker_core_types::dlq`]; the buckets, the rule that routes a row to
 //! one, and each bucket's header live in
 //! [`clinker_plan::plan::dlq_layout::DlqLayout`]. This module owns the row
-//! encoder that turns one [`DlqEntry`] into the on-disk CSV shape.
+//! encoder that turns one [`DlqEntry`] into the on-disk CSV shape, the
+//! [`DlqSink`] seam the encoded rows stream through, and the run's
+//! [`DlqReport`] counters. The staged-file sink lives in
+//! [`crate::output::dlq_sink`].
 
 use clinker_record::owned_storage::{OwnedMap, SharedStorage};
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 
+use clinker_core_types::dlq::DlqErrorCategory;
 use clinker_record::{FieldMetadata, Schema, Value};
 
 use crate::executor::DlqEntry;
 use clinker_plan::error::PipelineError;
-use clinker_plan::plan::dlq_layout::{DlqBucket, DlqLayout, dlq_user_columns};
+use clinker_plan::plan::dlq_layout::{DlqBucket, DlqBucketId, DlqLayout, dlq_user_columns};
 
 /// Encodes dead-letter output one row at a time under the header a compiled
 /// [`DlqLayout`] fixed for each bucket.
@@ -87,7 +93,10 @@ impl DlqRowEncoder {
 
     /// One CSV row for `entry` under `bucket`'s header, terminator included.
     ///
-    /// The engine columns carry the entry's identity and reason; each user
+    /// The engine columns carry the entry's identity and reason; the id,
+    /// trigger id and timestamp columns render the entry's
+    /// [`DlqEntry::failed_at`] stamp, so encoding an entry twice yields the
+    /// same row; each user
     /// column is placed at its header position, and a header column the
     /// record lacks is an empty cell. A user column of the record that the
     /// bucket's compiled header does not admit is a planner defect: it returns
@@ -116,10 +125,24 @@ impl DlqRowEncoder {
         writer.get_ref().0.set(buffer);
 
         let record = &entry.original_record;
-        let id = uuid::Uuid::now_v7().to_string();
-        let timestamp = chrono::Utc::now().to_rfc3339();
-        writer.write_field(id).map_err(csv_error)?;
-        writer.write_field(timestamp).map_err(csv_error)?;
+        // The id, trigger id and time were stamped where the failure was
+        // observed; the encoder renders them and never generates its own.
+        let mut id = uuid::Uuid::encode_buffer();
+        writer
+            .write_field(entry.failed_at.id().hyphenated().encode_lower(&mut id))
+            .map_err(csv_error)?;
+        writer
+            .write_field(
+                entry
+                    .failed_at
+                    .trigger_id()
+                    .hyphenated()
+                    .encode_lower(&mut id),
+            )
+            .map_err(csv_error)?;
+        writer
+            .write_field(entry.failed_at.at().to_rfc3339())
+            .map_err(csv_error)?;
         writer
             .write_field(source_file_of(entry))
             .map_err(csv_error)?;
@@ -300,6 +323,265 @@ impl serde::Serialize for BorrowedMap<'_> {
     }
 }
 
+/// Everything a [`DlqRowWriter`] needs to open one dead-letter bucket on its
+/// first row: the bucket's identity, its destination, and its encoded header
+/// line.
+///
+/// The executor builds a target from its own compiled [`DlqLayout`] for every
+/// row it writes, so a sink holds no layout of its own and cannot disagree
+/// with the plan the run executes. The caller must pass the same `path` and
+/// `header` for every row of one `id`; a writer reads them only when the
+/// bucket is not open yet.
+#[derive(Debug, Clone, Copy)]
+pub struct DlqBucketTarget<'a> {
+    /// The bucket's identity in the compiled layout.
+    pub id: DlqBucketId,
+    /// The bucket's final destination path.
+    pub path: &'a Path,
+    /// The bucket's CSV header line, terminator included, as
+    /// [`DlqRowEncoder::header`] encodes it.
+    pub header: &'a [u8],
+}
+
+/// One thread's handle for writing dead-letter rows into their buckets.
+///
+/// A writer is owned by exactly one thread and is never shared, so rows of
+/// one writer land in the order that thread wrote them. It streams: each row
+/// goes into a fixed per-bucket buffer and on to the bucket's file, and no
+/// writer keeps rows or entries. The number of buckets it can hold open is
+/// fixed by the compiled plan.
+pub trait DlqRowWriter: Send {
+    /// Append one encoded row to `target`'s bucket.
+    ///
+    /// The first row for a bucket opens it and writes `target.header` once,
+    /// before the row; later rows only append. `row` must be one complete
+    /// CSV row under that header, terminator included. May block on file
+    /// I/O when the bucket's buffer fills.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError`] when the bucket cannot be opened or a write
+    /// fails; the I/O error kind is preserved.
+    fn write_row(&mut self, target: &DlqBucketTarget<'_>, row: &[u8]) -> Result<(), PipelineError>;
+
+    /// Flush every bucket this writer opened and hand the bucket files back
+    /// to the sink that opened the writer. Blocks until every buffer is
+    /// flushed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError`] when a flush fails; the I/O error kind is
+    /// preserved. The bucket files are then not handed back.
+    fn close(self: Box<Self>) -> Result<(), PipelineError>;
+}
+
+/// Where a run's dead-letter rows go: the seam the executor writes through,
+/// supplied by its caller.
+///
+/// The CLI supplies a sink that stages real files; preview and throughput
+/// harnesses supply [`DiscardingDlqSink`]. Counts never come from a sink:
+/// the executor keeps them in its own [`DlqReport`].
+pub trait DlqSink: Send + Sync {
+    /// A new writer for the walk thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError`] when the sink cannot accept another writer.
+    fn open_walk_writer(&self) -> Result<Box<dyn DlqRowWriter>, PipelineError>;
+
+    /// The artifacts written during the run, one per bucket that received a
+    /// row, in bucket order.
+    ///
+    /// Called exactly once, by the owner of publication, after every writer
+    /// this sink opened has closed. It never promotes, renames or removes
+    /// anything itself: publication stays with that owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError::Internal`] when a writer is still open or
+    /// `finish` was already called, since the artifact set would then not be
+    /// established.
+    fn finish(&self) -> Result<Vec<DlqArtifact>, PipelineError>;
+}
+
+/// One dead-letter bucket file a run wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DlqArtifact {
+    /// The bucket's identity in the compiled layout.
+    pub bucket: DlqBucketId,
+    /// Where the bucket's file is published if the run succeeds.
+    pub final_path: PathBuf,
+    /// Rows written to the bucket, the header not counted.
+    pub rows: u64,
+}
+
+/// A [`DlqSink`] that accepts every row and keeps nothing.
+///
+/// For preview and throughput harnesses that run pipelines with a
+/// dead-letter block but need only the counts, which the executor's
+/// [`DlqReport`] carries. It holds no state and stages no file.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DiscardingDlqSink;
+
+impl DlqRowWriter for DiscardingDlqSink {
+    fn write_row(
+        &mut self,
+        _target: &DlqBucketTarget<'_>,
+        _row: &[u8],
+    ) -> Result<(), PipelineError> {
+        Ok(())
+    }
+
+    fn close(self: Box<Self>) -> Result<(), PipelineError> {
+        Ok(())
+    }
+}
+
+impl DlqSink for DiscardingDlqSink {
+    fn open_walk_writer(&self) -> Result<Box<dyn DlqRowWriter>, PipelineError> {
+        Ok(Box::new(DiscardingDlqSink))
+    }
+
+    fn finish(&self) -> Result<Vec<DlqArtifact>, PipelineError> {
+        Ok(Vec::new())
+    }
+}
+
+/// Why a run stopped when its dead-letter output could not be written: the
+/// staging destination refused a row or a flush, typically because the disk
+/// filled.
+///
+/// Carried as the payload of a [`PipelineError::Io`] whose
+/// [`std::io::ErrorKind`] is the refused write's, so exit-code and retry
+/// classification see the original failure. The walk builds it from the
+/// run's counters when it wraps a sink write or close error; a sink never
+/// builds it, because it holds no counts. Nothing is published after it.
+#[derive(Debug)]
+pub struct DlqWriteFailure {
+    /// The dead-letter files the refused write could have been for: the one
+    /// bucket a row was written to, or every bucket written so far when the
+    /// final flush failed.
+    pub artifacts: Vec<PathBuf>,
+    /// Rows dead-lettered when the write failed, the refused row included.
+    pub dead_letters: u64,
+    /// The stage with the most dead-lettered rows; empty when those rows
+    /// carry no stage.
+    pub top_stage: String,
+    /// The category with the most dead-lettered rows at `top_stage`.
+    pub top_category: Option<DlqErrorCategory>,
+    /// The destination's error.
+    pub source: std::io::Error,
+}
+
+impl std::fmt::Display for DlqWriteFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let artifacts = self
+            .artifacts
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let stage = if self.top_stage.is_empty() {
+            "(none)"
+        } else {
+            self.top_stage.as_str()
+        };
+        let category = self
+            .top_category
+            .map_or("(none)", |category| category.as_str());
+        write!(
+            f,
+            "{}: dead-letter output {artifacts} could not be written after {} dead-lettered rows \
+             (most from stage {stage}, category {category})\n\
+             \n\
+             help: stop the run before dead letters fill the destination, for example:\n\
+             \n\
+             \x20 error_handling:\n\
+             \x20   type_error_threshold: 0.05\n\
+             \x20   dlq:\n\
+             \x20     max_rate: 0.05\n\
+             \n\
+             These breakers bound how many rows can dead-letter; disk at the staging \
+             destination bounds their volume.",
+            self.source, self.dead_letters,
+        )
+    }
+}
+
+impl std::error::Error for DlqWriteFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Dead-letter counters of one run: rows per stage and category, and rows
+/// per bucket file.
+///
+/// Holds no rows or entries. Its size is bounded by the plan: one counter per
+/// (stage, category) pair that occurred, one per bucket written.
+#[derive(Debug, Default, Clone)]
+pub struct DlqReport {
+    by_stage_category: BTreeMap<String, BTreeMap<DlqErrorCategory, u64>>,
+    bucket_ids: Vec<DlqBucketId>,
+    bucket_rows: Vec<(PathBuf, u64)>,
+}
+
+impl DlqReport {
+    /// Count one dead-lettered row at `stage` (`None` when the failure has
+    /// no stage) with `category`.
+    ///
+    /// Allocates only the first time a stage is seen.
+    pub fn record(&mut self, stage: Option<&str>, category: DlqErrorCategory) {
+        let stage = stage.unwrap_or("");
+        let categories = match self.by_stage_category.get_mut(stage) {
+            Some(categories) => categories,
+            None => self.by_stage_category.entry(stage.to_owned()).or_default(),
+        };
+        *categories.entry(category).or_default() += 1;
+    }
+
+    /// Count one row written to bucket `id`, whose file is `path`. The path
+    /// is kept from the bucket's first row.
+    pub fn record_bucket_row(&mut self, id: DlqBucketId, path: &Path) {
+        match self.bucket_ids.binary_search(&id) {
+            Ok(slot) => self.bucket_rows[slot].1 += 1,
+            Err(slot) => {
+                self.bucket_ids.insert(slot, id);
+                self.bucket_rows.insert(slot, (path.to_path_buf(), 1));
+            }
+        }
+    }
+
+    /// The categories counted at `stage` and their counts, in category
+    /// order. The empty string names rows with no stage.
+    pub fn for_stage(&self, stage: &str) -> impl Iterator<Item = (DlqErrorCategory, u64)> + '_ {
+        self.by_stage_category
+            .get(stage)
+            .into_iter()
+            .flat_map(|categories| categories.iter().map(|(c, n)| (*c, *n)))
+    }
+
+    /// The (stage, category) pair with the most rows, and its count. A tie
+    /// goes to the pair first in stage-then-category order; the empty stage
+    /// names rows with no stage.
+    pub fn top_stage_category(&self) -> Option<(&str, DlqErrorCategory, u64)> {
+        let mut top: Option<(&str, DlqErrorCategory, u64)> = None;
+        for (stage, categories) in &self.by_stage_category {
+            for (category, count) in categories {
+                if top.is_none_or(|(_, _, best)| *count > best) {
+                    top = Some((stage, *category, *count));
+                }
+            }
+        }
+        top
+    }
+
+    /// Rows per bucket file, in bucket order.
+    pub fn bucket_rows(&self) -> &[(PathBuf, u64)] {
+        &self.bucket_rows
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,6 +590,39 @@ mod tests {
     use clinker_record::owned_storage::OwnedValues;
     use clinker_record::{Record, SchemaBuilder};
     use std::sync::Arc;
+
+    #[test]
+    fn write_failure_names_the_file_count_top_pair_and_guard() {
+        let failure = DlqWriteFailure {
+            artifacts: vec![PathBuf::from("out/rejects.csv")],
+            dead_letters: 812,
+            top_stage: "transform:tfm".to_string(),
+            top_category: Some(DlqErrorCategory::TypeCoercionFailure),
+            source: std::io::Error::new(std::io::ErrorKind::StorageFull, "no space left"),
+        };
+        assert_eq!(
+            failure.to_string(),
+            "no space left: dead-letter output out/rejects.csv could not be written after 812 \
+             dead-lettered rows (most from stage transform:tfm, category type_coercion_failure)\n\
+             \n\
+             help: stop the run before dead letters fill the destination, for example:\n\
+             \n\
+             \x20 error_handling:\n\
+             \x20   type_error_threshold: 0.05\n\
+             \x20   dlq:\n\
+             \x20     max_rate: 0.05\n\
+             \n\
+             These breakers bound how many rows can dead-letter; disk at the staging \
+             destination bounds their volume."
+        );
+        let snippet = failure.to_string();
+        let yaml = &snippet[snippet.find("  error_handling:").expect("snippet")
+            ..snippet.find("\n\nThese").expect("snippet end")];
+        let parsed: serde_json::Value =
+            serde_saphyr::from_str(yaml).expect("the snippet is valid YAML");
+        assert_eq!(parsed["error_handling"]["dlq"]["max_rate"], 0.05);
+        assert_eq!(parsed["error_handling"]["type_error_threshold"], 0.05);
+    }
 
     /// The dead-letter layout the compiler derives for `yaml`. Every header
     /// these tests encode under comes from here, never from the entries.
@@ -352,6 +667,7 @@ nodes:\n- type: source\n  name: src\n  config:\n    name: src\n    type: csv\n  
             source_name: Arc::from(source),
             triggering_field: None,
             triggering_value: None,
+            failed_at: crate::executor::DlqFailureStamp::now(),
         }
     }
 
@@ -405,8 +721,9 @@ nodes:\n- type: source\n  name: src\n  config:\n    name: src\n    type: csv\n  
         (header, lines.collect())
     }
 
-    const ENGINE: [&str; 12] = [
+    const ENGINE: [&str; 13] = [
         "_cxl_dlq_id",
+        "_cxl_dlq_trigger_id",
         "_cxl_dlq_timestamp",
         "_cxl_dlq_source_file",
         "_cxl_dlq_source_name",
@@ -460,12 +777,12 @@ nodes:\n- type: source\n  name: src\n  config:\n    name: src\n    type: csv\n  
             ],
         );
         let (header, rows) = encode(&layout, &[entry(record, "src")]);
-        assert_eq!(header[..12], ENGINE);
+        assert_eq!(header[..13], ENGINE);
         assert_eq!(
-            header[12..],
+            header[13..],
             ["zulu", "alpha", "mike", "_cxl_dlq_source_record"]
         );
-        assert_eq!(rows[0][12..], ["Z", "A", "M", ""]);
+        assert_eq!(rows[0][13..], ["Z", "A", "M", ""]);
     }
 
     /// Two Sources with different schemas reach one pipeline-wide bucket.
@@ -562,17 +879,17 @@ nodes:
         );
         let (header, rows) = encode(layout, &[beta, alpha]);
         assert_eq!(
-            header[12..],
+            header[13..],
             ["id", first_own, "_cxl_dlq_source_record", second_own],
             "first-seen union over sites in plan order; `id` appears once"
         );
         assert!(!header.iter().any(|c| c == "$source.file"));
         let col = |name: &str| header.iter().position(|c| c == name).unwrap();
-        assert_eq!(rows[0][2], "inputs/beta.csv");
+        assert_eq!(rows[0][3], "inputs/beta.csv");
         assert_eq!(rows[0][col("id")], "2");
         assert_eq!(rows[0][col("alpha")], "");
         assert_eq!(rows[0][col("beta")], "B");
-        assert_eq!(rows[1][2], "inputs/alpha.csv");
+        assert_eq!(rows[1][3], "inputs/alpha.csv");
         assert_eq!(rows[1][col("id")], "1");
         assert_eq!(rows[1][col("alpha")], "A");
         assert_eq!(rows[1][col("beta")], "");
@@ -685,16 +1002,16 @@ nodes:
         entries[0].route = Some("high".to_owned());
         entries[0].trigger = false;
         let (header, rows) = encode(&layout, &entries);
-        assert_eq!(header[..12], ENGINE);
+        assert_eq!(header[..13], ENGINE);
         for (row, category) in rows.iter().zip(categories) {
-            assert_eq!(row[3], "src");
-            assert_eq!(row[4], "3");
-            assert_eq!(row[7], category.as_str());
-            assert_eq!(row[8], "why it failed");
+            assert_eq!(row[4], "src");
+            assert_eq!(row[5], "3");
+            assert_eq!(row[8], category.as_str());
+            assert_eq!(row[9], "why it failed");
         }
-        assert_eq!(rows[0][9..12], ["transform:calc", "high", "false"]);
-        assert_eq!(rows[1][9..12], ["", "", "true"]);
-        assert_eq!(rows[0][2], "<merged>", "no `$source.file` stamp");
+        assert_eq!(rows[0][10..13], ["transform:calc", "high", "false"]);
+        assert_eq!(rows[1][10..13], ["", "", "true"]);
+        assert_eq!(rows[0][3], "<merged>", "no `$source.file` stamp");
     }
 
     #[test]
@@ -714,8 +1031,51 @@ nodes:
         assert!(ids.iter().all(|id| id.get_version_num() == 7));
         assert!(
             ids.windows(2).all(|w| w[0] < w[1]),
-            "ids increase in write order, so they are also distinct"
+            "ids increase in the order the entries were stamped, so they are also distinct"
         );
+    }
+
+    #[test]
+    fn row_renders_the_failure_stamp_and_generates_nothing() {
+        let layout = compiled_layout(&one_source_pipeline(
+            "    path: rejects.csv\n",
+            &["name", "value"],
+        ));
+        let entry = name_value_entry(1, DlqErrorCategory::TypeCoercionFailure, "e");
+        let (_, rows) = encode(&layout, &[entry.clone(), entry.clone()]);
+        let stamp = entry.failed_at;
+        for row in &rows {
+            assert_eq!(row[0], stamp.id().hyphenated().to_string());
+            assert_eq!(row[1], stamp.trigger_id().hyphenated().to_string());
+            assert_eq!(row[2], stamp.at().to_rfc3339());
+        }
+        assert_eq!(rows[0], rows[1], "encoding an entry twice yields one row");
+    }
+
+    /// The trigger id is the second cell, next to the id it refers to. A
+    /// collateral renders its cause's id there and its own id first.
+    #[test]
+    fn row_renders_the_trigger_id_as_the_second_cell() {
+        let layout = compiled_layout(&one_source_pipeline(
+            "    path: rejects.csv\n",
+            &["name", "value"],
+        ));
+        let trigger = name_value_entry(1, DlqErrorCategory::TypeCoercionFailure, "e");
+        let cause = trigger.failed_at;
+        let collateral = DlqEntry {
+            source_row: 2.into(),
+            category: DlqErrorCategory::Correlated,
+            trigger: false,
+            failed_at: crate::executor::DlqFailureStamp::condemned_by(&cause),
+            ..trigger.clone()
+        };
+        let (header, rows) = encode(&layout, &[trigger, collateral]);
+        assert_eq!(header[..3], ENGINE[..3]);
+        let trigger_id = cause.id().hyphenated().to_string();
+        assert_eq!(rows[0][0], trigger_id);
+        assert_eq!(rows[0][1], trigger_id, "a trigger is its own failure");
+        assert_ne!(rows[1][0], trigger_id, "a collateral has its own id");
+        assert_eq!(rows[1][1], trigger_id, "a collateral names its cause");
     }
 
     #[test]
@@ -732,7 +1092,7 @@ nodes:
                 "e",
             )],
         );
-        chrono::DateTime::parse_from_rfc3339(&rows[0][1])
+        chrono::DateTime::parse_from_rfc3339(&rows[0][2])
             .expect("timestamp should be valid RFC 3339");
     }
 
@@ -746,8 +1106,8 @@ nodes:
         e.triggering_field = Some(Arc::from("amount"));
         e.triggering_value = Some(Value::String("not-a-number".into()));
         let (_, rows) = encode(&layout, &[e]);
-        assert_eq!(rows[0][5], "amount");
-        assert_eq!(rows[0][6], "not-a-number");
+        assert_eq!(rows[0][6], "amount");
+        assert_eq!(rows[0][7], "not-a-number");
     }
 
     #[test]
@@ -767,11 +1127,11 @@ nodes:
         assert!(!header.iter().any(|c| c == "_cxl_dlq_error_category"));
         assert!(!header.iter().any(|c| c == "_cxl_dlq_error_detail"));
         assert_eq!(
-            header[7..10],
+            header[8..11],
             ["_cxl_dlq_stage", "_cxl_dlq_route", "_cxl_dlq_trigger"]
         );
-        assert_eq!(header[10..12], ["name", "value"]);
-        assert_eq!(rows[0][10..12], ["Alice", "bad"]);
+        assert_eq!(header[11..13], ["name", "value"]);
+        assert_eq!(rows[0][11..13], ["Alice", "bad"]);
         assert_eq!(rows[0].len(), header.len());
     }
 
@@ -843,5 +1203,62 @@ nodes:
         assert_eq!(rows[0][col("$ck.employee_id")], "E001");
         assert_eq!(rows[0].len(), header.len());
         assert!(rows[0].iter().all(|cell| !cell.contains("region")));
+    }
+
+    /// The report counts rows per (stage, category) and per bucket, and
+    /// names the most frequent pair, breaking a tie by stage-then-category
+    /// order.
+    #[test]
+    fn report_counts_stage_category_pairs_and_bucket_rows() {
+        let layout = compiled_layout(
+            "pipeline:\n  name: dlq_report\nerror_handling:\n  strategy: continue\n  dlq:\n    path: dlq.csv\n    per_source:\n      src_b:\n        path: dlq_b.csv\n\
+nodes:\n- type: source\n  name: src_a\n  config:\n    name: src_a\n    type: csv\n    path: a.csv\n    schema:\n      - { name: id, type: string }\n\
+- type: source\n  name: src_b\n  config:\n    name: src_b\n    type: csv\n    path: b.csv\n    schema:\n      - { name: id, type: string }\n\
+- type: merge\n  name: m\n  inputs: [src_a, src_b]\n\
+- type: sink\n  name: out\n  input: m\n  config:\n    name: out\n    type: csv\n    path: out.csv\n",
+        );
+        let wide = layout.bucket_for_source("src_a").expect("pipeline bucket");
+        let own = layout
+            .bucket_for_source("src_b")
+            .expect("per-source bucket");
+        let (first, second) = if wide < own { (wide, own) } else { (own, wide) };
+
+        let mut report = DlqReport::default();
+        assert_eq!(report.top_stage_category(), None);
+        report.record(Some("tfm"), DlqErrorCategory::ValidationFailure);
+        report.record(Some("tfm"), DlqErrorCategory::TypeCoercionFailure);
+        report.record(None, DlqErrorCategory::TypeCoercionFailure);
+        report.record(Some("tfm"), DlqErrorCategory::ValidationFailure);
+        report.record(None, DlqErrorCategory::TypeCoercionFailure);
+
+        assert_eq!(
+            report.for_stage("tfm").collect::<Vec<_>>(),
+            [
+                (DlqErrorCategory::TypeCoercionFailure, 1),
+                (DlqErrorCategory::ValidationFailure, 2),
+            ]
+        );
+        assert_eq!(
+            report.for_stage("").collect::<Vec<_>>(),
+            [(DlqErrorCategory::TypeCoercionFailure, 2)]
+        );
+        assert_eq!(report.for_stage("absent").count(), 0);
+        assert_eq!(
+            report.top_stage_category(),
+            Some(("", DlqErrorCategory::TypeCoercionFailure, 2)),
+            "a tie goes to the pair first in stage order"
+        );
+
+        report.record_bucket_row(second, Path::new("second.csv"));
+        report.record_bucket_row(first, Path::new("first.csv"));
+        report.record_bucket_row(second, Path::new("second.csv"));
+        assert_eq!(
+            report.bucket_rows(),
+            [
+                (PathBuf::from("first.csv"), 1),
+                (PathBuf::from("second.csv"), 2),
+            ],
+            "bucket rows are reported in bucket order, whatever order they arrived in"
+        );
     }
 }

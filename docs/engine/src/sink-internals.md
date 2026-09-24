@@ -396,14 +396,28 @@ Counter behavior under the streaming path matches the buffered Sink arm **exactl
 
 - `records_written` increments once per successful `Writer::write_record` call.
 - `ok_count` counts distinct source `row_num`s reaching the Sink.
-- `dlq_count` is unaffected — DLQ entries originate upstream.
+- `dlq_count` counts the Sink's own dead letters, its CSV `join_values`
+  `on_conflict: error` collisions under `strategy: continue`, the same way in
+  both arms; the arms
+  differ only in when a collision is pushed. The buffered arm pushes each
+  collision at the record that collided, through the run's dead-letter
+  funnel: it is counted, written into its bucket's staged DLQ file through
+  the walk's DLQ writer, and checked against the rate ceilings (E315/E316)
+  before the next record. The streaming arm's writer thread cannot reach the
+  run-scoped counters, so it keeps its collisions in a pending list, capped
+  at 65,536 entries (the cap fails the run with an internal error), and the
+  walk pushes them through the same funnel, in arrival order, when it joins
+  the thread at the end of the DAG.
 
 Stage metrics (`SchemaScan`, `Write`, `Projection`) accumulate into the same fields the buffered path uses. The dispatcher folds the streaming task's per-task accounting back into the run-wide totals at end of DAG, so a streaming run and a buffered run over the same input produce identical counter output.
 
 ## Memory, telemetry, and lineage
 
 A Sink does not retain an unbounded private collection. Incremental paths hold
-at most the bounded handoff channel described above. Materialized producers
+at most the bounded handoff channel described above, plus, on the streaming
+arm, the capped collision list described under Counter semantics. Dead-letter
+rows the Sink pushes are written through the run's DLQ writer, one fixed
+buffer per open DLQ file, and are not Sink state. Materialized producers
 charge their node buffer to the run-scoped memory authority, and an authored
 Sink `sort_order` uses the shared stable resident/spill sorter through the
 planning-owned `PhysicalWriterBoundary`. Document-DLQ, envelope, per-source,

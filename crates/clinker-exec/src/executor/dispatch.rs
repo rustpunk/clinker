@@ -254,9 +254,15 @@ pub(crate) fn source_name_arc_of(record: &Record) -> Arc<str> {
     }
 }
 
-/// Push a [`DlqEntry`] to the run-scoped DLQ vector, increment both the
-/// pipeline-wide and per-source DLQ counters, then check the configured
-/// rate ceilings. Returns [`PipelineError::DlqRateExceeded`] (E315 or
+/// Count one dead letter, write its row into its bucket, then check the
+/// configured rate ceilings, in that order.
+///
+/// Counting first and checking last means the row that trips a ceiling is
+/// itself counted and written, and the diagnostic's observed count equals
+/// the rows counted. The row is encoded under its bucket's compiled header
+/// and written through the walk's [`DlqRowWriter`](crate::dlq::DlqRowWriter)
+/// before this returns; an entry whose source has no bucket is counted and
+/// never formatted. Returns [`PipelineError::DlqRateExceeded`] (E315 or
 /// E316) when the per-source ratio crosses
 /// `error_handling.dlq.per_source.<name>.max_rate` or the pipeline-wide
 /// ratio crosses `error_handling.dlq.max_rate`. Per-source > pipeline-wide
@@ -274,13 +280,315 @@ pub(crate) fn push_dlq(
     ctx: &mut ExecutorContext<'_>,
     entry: DlqEntry,
 ) -> Result<(), PipelineError> {
-    let source_name = Arc::clone(&entry.source_name);
-    ctx.counters.dlq_count += 1;
-    *ctx.dlq_per_source
-        .entry(Arc::clone(&source_name))
-        .or_insert(0) += 1;
-    ctx.dlq_entries.push(entry);
-    check_dlq_rate(ctx, &source_name)
+    ctx.dlq_funnel().push(entry)
+}
+
+/// The run-scoped dead-letter counters [`DlqWalkState::push`] updates, and
+/// the configuration its rate check reads.
+///
+/// Each field is borrowed from [`ExecutorContext`] on its own, so a caller
+/// that already holds other fields of the context (the buffered Sink arm's
+/// writer helpers) can still push a dead letter at the site it happens.
+pub(crate) struct DlqAccounts<'b> {
+    pub(crate) counters: &'b mut PipelineCounters,
+    pub(crate) dlq_per_source: &'b mut HashMap<Arc<str>, u64>,
+    /// The rate denominator; see [`ExecutorContext::total_per_source`].
+    pub(crate) total_per_source: &'b HashMap<Arc<str>, u64>,
+    pub(crate) config: Option<&'b clinker_plan::config::DlqConfig>,
+}
+
+/// A dead-letter push handle: the walk's [`DlqWalkState`] and the accounts
+/// it updates, borrowed disjointly from the rest of [`ExecutorContext`].
+///
+/// [`push_dlq`] builds one from the whole context; a site holding other
+/// context fields builds one from the fields directly. Holds borrows only.
+pub(crate) struct DlqFunnel<'b, 'l> {
+    pub(crate) state: &'b mut DlqWalkState<'l>,
+    pub(crate) accounts: DlqAccounts<'b>,
+}
+
+impl DlqFunnel<'_, '_> {
+    /// Count, write and rate-check one dead letter; see [`push_dlq`].
+    ///
+    /// # Errors
+    ///
+    /// As [`push_dlq`].
+    pub(crate) fn push(&mut self, entry: DlqEntry) -> Result<(), PipelineError> {
+        self.state.push(entry, &mut self.accounts)
+    }
+}
+
+impl<'a> ExecutorContext<'a> {
+    /// A push handle over this context's dead-letter state and accounts.
+    pub(crate) fn dlq_funnel(&mut self) -> DlqFunnel<'_, 'a> {
+        DlqFunnel {
+            state: &mut self.dlq,
+            accounts: DlqAccounts {
+                counters: &mut self.counters,
+                dlq_per_source: &mut self.dlq_per_source,
+                total_per_source: &self.total_per_source,
+                config: self.config.error_handling.dlq.as_ref(),
+            },
+        }
+    }
+}
+
+/// The walk thread's dead-letter output: the compiled layout, each bucket's
+/// header encoded once, the row encoder, the walk's writer, and the run's
+/// counters.
+///
+/// Holds no rows or entries. Its size is fixed by the plan: one header per
+/// bucket, the encoder's reusable buffers and per-schema position cache, and
+/// the writer's fixed buffer per open bucket. Owned by the walk thread only.
+pub(crate) struct DlqWalkState<'a> {
+    /// The compiled layout; `None` when the pipeline has no dead-letter block.
+    layout: Option<&'a clinker_plan::plan::dlq_layout::DlqLayout>,
+    /// Each bucket's CSV header line, indexed by bucket id.
+    headers: Vec<Vec<u8>>,
+    encoder: crate::dlq::DlqRowEncoder,
+    writer: DlqWalkWriter,
+    /// Rows per stage and category, and rows written per bucket.
+    pub(crate) report: crate::dlq::DlqReport,
+    /// The `source_row` of each dead letter pushed while a capture is armed;
+    /// see [`Self::arm_capture`]. Holds only the ids of the dispatch call in
+    /// flight, and is empty between calls.
+    capture: Vec<crate::executor::stream_event::SourceRowId>,
+    /// How many captures are armed.
+    capture_depth: usize,
+}
+
+/// Wrap a sink I/O error as the run's dead-letter exhaustion failure: a
+/// [`PipelineError::Io`] of the same [`std::io::ErrorKind`] whose payload
+/// names the dead-letter files, the rows dead-lettered so far, and the
+/// stage and category most of them came from. Any other error is returned
+/// unchanged.
+fn dlq_write_failure(
+    error: PipelineError,
+    artifacts: Vec<std::path::PathBuf>,
+    dead_letters: u64,
+    report: &crate::dlq::DlqReport,
+) -> PipelineError {
+    let PipelineError::Io(source) = error else {
+        return error;
+    };
+    let (top_stage, top_category) = report
+        .top_stage_category()
+        .map_or((String::new(), None), |(stage, category, _)| {
+            (stage.to_owned(), Some(category))
+        });
+    PipelineError::Io(std::io::Error::new(
+        source.kind(),
+        crate::dlq::DlqWriteFailure {
+            artifacts,
+            dead_letters,
+            top_stage,
+            top_category,
+            source,
+        },
+    ))
+}
+
+/// An open capture of [`DlqWalkState::arm_capture`], closed by
+/// [`DlqWalkState::take_capture`].
+#[must_use = "an armed capture is closed by take_capture"]
+pub(crate) struct DlqCaptureMark(usize);
+
+/// Where the walk's writer is in its life.
+enum DlqWalkWriter {
+    /// The run has no layout, or its caller supplied no sink. Without a
+    /// layout no row has a destination; without a sink the first row that
+    /// has one fails the run (see [`DlqWalkState::write`]).
+    Absent,
+    Open(Box<dyn crate::dlq::DlqRowWriter>),
+    /// Closed at the end of the walk; no row may arrive after this.
+    Closed,
+}
+
+impl<'a> DlqWalkState<'a> {
+    /// Encode every bucket's header and open the walk's writer from `sink`
+    /// when the plan has a layout and the caller supplied a sink. Opens no
+    /// file: a bucket's file is staged by the sink on its first row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError`] when a header cannot be encoded or the sink
+    /// refuses a writer.
+    pub(crate) fn open(
+        layout: Option<&'a clinker_plan::plan::dlq_layout::DlqLayout>,
+        sink: Option<&dyn crate::dlq::DlqSink>,
+    ) -> Result<Self, PipelineError> {
+        let mut encoder = crate::dlq::DlqRowEncoder::new();
+        let headers = match layout {
+            Some(layout) => layout
+                .buckets()
+                .iter()
+                .map(|bucket| encoder.header(bucket).map(<[u8]>::to_vec))
+                .collect::<Result<Vec<_>, _>>()?,
+            None => Vec::new(),
+        };
+        let writer = match (layout, sink) {
+            (Some(_), Some(sink)) => DlqWalkWriter::Open(sink.open_walk_writer()?),
+            _ => DlqWalkWriter::Absent,
+        };
+        Ok(Self {
+            layout,
+            headers,
+            encoder,
+            writer,
+            report: crate::dlq::DlqReport::default(),
+            capture: Vec::new(),
+            capture_depth: 0,
+        })
+    }
+
+    /// The one implementation behind [`push_dlq`]: count `entry` in
+    /// `accounts` and the report, write its row, then check the rate
+    /// ceilings, in that order (see [`push_dlq`] for why). May block on the
+    /// sink's file I/O.
+    ///
+    /// # Errors
+    ///
+    /// As [`push_dlq`]: a write error, or [`PipelineError::DlqRateExceeded`].
+    pub(crate) fn push(
+        &mut self,
+        entry: DlqEntry,
+        accounts: &mut DlqAccounts<'_>,
+    ) -> Result<(), PipelineError> {
+        let source_name = Arc::clone(&entry.source_name);
+        accounts.counters.dlq_count += 1;
+        *accounts
+            .dlq_per_source
+            .entry(Arc::clone(&source_name))
+            .or_insert(0) += 1;
+        self.report.record(entry.stage.as_deref(), entry.category);
+        self.write(&entry, accounts.counters.dlq_count)?;
+        if self.capture_depth > 0 {
+            self.capture.push(entry.source_row);
+        }
+        check_dlq_rate(accounts, &source_name)
+    }
+
+    /// Encode `entry` under its bucket's header and write it, then count the
+    /// row against the bucket. An entry whose source has no bucket, or a run
+    /// whose plan has no dead-letter block, writes nothing. May block on the
+    /// sink's file I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError::Internal`] when the record carries a column
+    /// its bucket's compiled header does not admit, when the entry has a
+    /// bucket but the caller supplied no sink (the row would otherwise be
+    /// counted and dropped), or when a row arrives after [`Self::close`]. A sink I/O error is returned as
+    /// [`PipelineError::Io`] of the same kind carrying a
+    /// [`DlqWriteFailure`](crate::dlq::DlqWriteFailure) that names the bucket
+    /// and the run's `dead_letters` so far; any other sink error as is.
+    fn write(&mut self, entry: &DlqEntry, dead_letters: u64) -> Result<(), PipelineError> {
+        let Some(layout) = self.layout else {
+            return Ok(());
+        };
+        let Some(id) = layout.bucket_for_source(&entry.source_name) else {
+            return Ok(());
+        };
+        let writer = match &mut self.writer {
+            DlqWalkWriter::Absent => {
+                return Err(PipelineError::Internal {
+                    op: "dead-letter",
+                    node: layout.bucket(id).path().display().to_string(),
+                    detail: "a dead-lettered row has a destination but the caller supplied \
+                             no dead-letter sink"
+                        .to_string(),
+                });
+            }
+            DlqWalkWriter::Open(writer) => writer,
+            DlqWalkWriter::Closed => {
+                return Err(PipelineError::Internal {
+                    op: "dead-letter-write",
+                    node: entry.stage.clone().unwrap_or_default(),
+                    detail: "a dead-letter row arrived after the walk closed its writer"
+                        .to_string(),
+                });
+            }
+        };
+        let bucket = layout.bucket(id);
+        let row = self.encoder.row(layout, bucket, entry)?;
+        let target = crate::dlq::DlqBucketTarget {
+            id,
+            path: bucket.path(),
+            header: &self.headers[id.index()],
+        };
+        writer.write_row(&target, row).map_err(|error| {
+            dlq_write_failure(
+                error,
+                vec![bucket.path().to_path_buf()],
+                dead_letters,
+                &self.report,
+            )
+        })?;
+        self.report.record_bucket_row(id, bucket.path());
+        Ok(())
+    }
+
+    /// Start collecting the `source_row` of every dead letter pushed until
+    /// the matching [`Self::take_capture`]; the commit pass arms one around
+    /// each `dispatch_plan_node` call.
+    ///
+    /// Captures nest: a capture armed while another is open sees only its
+    /// own pushes, and the outer capture still sees them after the inner one
+    /// is taken, as the whole call it wraps produced them.
+    pub(crate) fn arm_capture(&mut self) -> DlqCaptureMark {
+        if self.capture_depth == 0 {
+            // A capture left open by a dispatch call that returned an error
+            // belongs to a run that is already failing; never let its ids
+            // reach the next call.
+            self.capture.clear();
+        }
+        self.capture_depth += 1;
+        DlqCaptureMark(self.capture.len())
+    }
+
+    /// End the capture `mark` opened and hand each `source_row` pushed since,
+    /// in push order, to `out`. After the outermost capture is taken the
+    /// capture is empty.
+    pub(crate) fn take_capture(
+        &mut self,
+        mark: DlqCaptureMark,
+        mut out: impl FnMut(crate::executor::stream_event::SourceRowId),
+    ) {
+        self.capture_depth = self.capture_depth.saturating_sub(1);
+        let start = mark.0.min(self.capture.len());
+        if self.capture_depth == 0 {
+            self.capture.drain(start..).for_each(out);
+        } else {
+            self.capture[start..].iter().copied().for_each(&mut out);
+        }
+    }
+
+    /// Flush and close the walk's writer, handing its bucket files back to
+    /// the sink. Called once, after the last dead letter of the walk; a later
+    /// row is refused. Blocks until every buffer is flushed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the sink's flush error, an I/O error wrapped as in
+    /// [`Self::write`] with every bucket written so far and the run's
+    /// `dead_letters`; the run then fails and nothing is published.
+    pub(crate) fn close(&mut self, dead_letters: u64) -> Result<(), PipelineError> {
+        if let DlqWalkWriter::Absent = self.writer {
+            return Ok(());
+        }
+        match std::mem::replace(&mut self.writer, DlqWalkWriter::Closed) {
+            DlqWalkWriter::Open(writer) => writer.close().map_err(|error| {
+                let artifacts = self
+                    .report
+                    .bucket_rows()
+                    .iter()
+                    .map(|(path, _)| path.clone())
+                    .collect();
+                dlq_write_failure(error, artifacts, dead_letters, &self.report)
+            }),
+            DlqWalkWriter::Absent | DlqWalkWriter::Closed => Ok(()),
+        }
+    }
 }
 
 /// One population shared by source-type strategy routing and its circuit
@@ -544,6 +852,7 @@ fn route_source_rejection(
                     source_name: event.source_name,
                     triggering_field: Some(Arc::from(event.triggering_field)),
                     triggering_value: Some(event.triggering_value),
+                    failed_at: event.failed_at,
                 };
                 push_dlq(ctx, entry)?;
             }
@@ -594,8 +903,8 @@ pub(crate) fn advance_cursor(
 /// fraction exceeds it. Per-source thresholds win against pipeline-wide
 /// when set. Both branches honor `min_records` to avoid 1/1 = 100%
 /// false positives on the very first failure.
-fn check_dlq_rate(ctx: &ExecutorContext<'_>, source: &Arc<str>) -> Result<(), PipelineError> {
-    let Some(dlq) = ctx.config.error_handling.dlq.as_ref() else {
+fn check_dlq_rate(accounts: &DlqAccounts<'_>, source: &Arc<str>) -> Result<(), PipelineError> {
+    let Some(dlq) = accounts.config else {
         return Ok(());
     };
     let pipeline_min = dlq
@@ -605,8 +914,8 @@ fn check_dlq_rate(ctx: &ExecutorContext<'_>, source: &Arc<str>) -> Result<(), Pi
     if let Some(per) = dlq.per_source.get(source.as_ref())
         && let Some(max) = per.max_rate
     {
-        let total = ctx.total_per_source.get(source).copied().unwrap_or(0);
-        let observed = ctx.dlq_per_source.get(source).copied().unwrap_or(0);
+        let total = accounts.total_per_source.get(source).copied().unwrap_or(0);
+        let observed = accounts.dlq_per_source.get(source).copied().unwrap_or(0);
         let min = per.min_records.unwrap_or(pipeline_min);
         if total >= min && total > 0 {
             let rate = observed as f64 / total as f64;
@@ -623,8 +932,8 @@ fn check_dlq_rate(ctx: &ExecutorContext<'_>, source: &Arc<str>) -> Result<(), Pi
     }
 
     if let Some(max) = dlq.max_rate {
-        let total: u64 = ctx.total_per_source.values().sum();
-        let observed = ctx.counters.dlq_count;
+        let total: u64 = accounts.total_per_source.values().sum();
+        let observed = accounts.counters.dlq_count;
         if total >= pipeline_min && total > 0 {
             let rate = observed as f64 / total as f64;
             if rate >= max {
@@ -726,12 +1035,14 @@ pub(crate) fn buffer_key_for_record(
 ///
 /// Returns `true` iff the buffer is active and the error has been
 /// parked under the record's group cell — the caller must NOT also
-/// push to `ctx.dlq_entries` / `counters.dlq_count`. Returns `false`
+/// call [`push_dlq`] for it. Returns `false`
 /// when the buffer is unconfigured, signaling the caller to take the
 /// per-record DLQ path. Buffer admission bumps `total_records`,
 /// tripping the overflow flag once `max_group_buffer` is exceeded.
 /// Null-keyed records get a row-number-disambiguated cell so each is
-/// its own group of one.
+/// its own group of one. `failed_at` is the stamp the caller took when it
+/// observed the failure; the parked error keeps it until the group commits.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_error_to_buffer_if_grouped(
     ctx: &mut ExecutorContext<'_>,
     record: &Record,
@@ -740,6 +1051,7 @@ pub(crate) fn record_error_to_buffer_if_grouped(
     error_message: String,
     stage: Option<String>,
     route: Option<String>,
+    failed_at: DlqFailureStamp,
 ) -> bool {
     if ctx.correlation_buffers.is_none() {
         return false;
@@ -763,6 +1075,7 @@ pub(crate) fn record_error_to_buffer_if_grouped(
         error_message,
         stage,
         route,
+        failed_at,
     });
     true
 }
@@ -799,6 +1112,7 @@ pub(crate) fn dispatch_transform_eval_error(
         }
         _ => clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
     };
+    let failed_at = DlqFailureStamp::now();
     let stage = Some(DlqEntry::stage_transform(&transform_name));
     let routed = record_error_to_buffer_if_grouped(
         ctx,
@@ -808,6 +1122,7 @@ pub(crate) fn dispatch_transform_eval_error(
         eval_err.to_string(),
         stage.clone(),
         None,
+        failed_at,
     );
     if routed {
         return Ok(());
@@ -828,6 +1143,7 @@ pub(crate) fn dispatch_transform_eval_error(
         None,
         triggering_field.clone(),
         triggering_value.clone(),
+        failed_at,
     );
     if marked {
         return Ok(());
@@ -846,6 +1162,7 @@ pub(crate) fn dispatch_transform_eval_error(
             source_name,
             triggering_field,
             triggering_value,
+            failed_at,
         },
     )
 }
@@ -871,10 +1188,11 @@ pub(crate) fn push_write_error(
 ///
 /// The entry names the offending column via `triggering_field` and the value
 /// via `triggering_value`, and stamps `stage: output:<name>` — the first DLQ
-/// category to originate at the sink-write stage. The sink dispatch arms build
-/// it while holding only a partial `ctx` borrow (the writer helpers) and drain
-/// it through [`push_dlq`] once the full `ctx` is free, so the DLQ rate ceiling
-/// (E315/E316) is still enforced.
+/// category to originate at the sink-write stage. The buffered Sink arm pushes
+/// it through a [`DlqFunnel`] borrowed beside the writer helpers' other `ctx`
+/// fields, at the record that collided; the streaming Sink thread hands it
+/// back to the walk, which pushes it through [`push_dlq`] at the join. Either
+/// way the DLQ rate ceiling (E315/E316) is enforced.
 pub(crate) fn sink_collision_dlq_entry(
     record: &Record,
     projected: &Record,
@@ -922,12 +1240,13 @@ pub(crate) fn sink_collision_dlq_entry(
         source_name: source_name_arc_of(record),
         triggering_field: Some(Arc::from(column)),
         triggering_value: Some(value),
+        failed_at: DlqFailureStamp::now(),
     })
 }
 
 use crate::executor::node_buffer::{NodeBuffer, TransientNodeBufferReservation};
 use crate::executor::schema_check::check_input_schema;
-use crate::executor::{DlqEntry, evaluate_single_transform, stage_metrics};
+use crate::executor::{DlqEntry, DlqFailureStamp, evaluate_single_transform, stage_metrics};
 use clinker_plan::BudgetCategory;
 use clinker_plan::plan::composition_body::CompositionBodies;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
@@ -1126,7 +1445,8 @@ impl NodeBufferReaderLedger {
 ///   `SourceIngestChannel`. The `$source.file` per-record stamp travels
 ///   on each record's engine-stamped column.
 /// * `writers` — output writer registry consumed lazily as Output arms fire.
-/// * `counters` / `dlq_entries` — pipeline-wide accounting.
+/// * `counters` / `dlq` — pipeline-wide accounting and the walk's
+///   dead-letter output.
 /// * `output_errors` — collected sink failures so siblings still attempt
 ///   their writes (DataFusion collection-pattern PR #14439).
 /// * `ok_source_rows` — distinct source rows that have reached at least
@@ -1352,7 +1672,8 @@ pub(crate) struct ExecutorContext<'a> {
     /// [`ExecutorContext::qualified_node_name`].
     pub(crate) composition_call_sites: Vec<String>,
     pub(crate) counters: PipelineCounters,
-    pub(crate) dlq_entries: Vec<DlqEntry>,
+    /// Dead-letter output and counters of the walk; see [`DlqWalkState`].
+    pub(crate) dlq: DlqWalkState<'a>,
     /// Per-source DLQ counters keyed by Source-node name. Incremented
     /// alongside `counters.dlq_count` at the [`push_dlq`] funnel so
     /// per-source `max_rate` thresholds can fire with attribution.
@@ -4553,7 +4874,7 @@ pub(crate) fn service_pending_node_buffer_spills(
 /// `PlanNode` variant. Each arm reads from and writes to `ctx.node_buffers`
 /// and updates the cumulative counters / timers. Errors short-circuit only for
 /// invariant violations and `ErrorStrategy::FailFast` runtime failures;
-/// per-record DLQ-able errors land in `ctx.dlq_entries` under `Continue`.
+/// per-record DLQ-able errors go through [`push_dlq`] under `Continue`.
 /// Output sink errors are collected into `ctx.output_errors` instead of
 /// short-circuiting so sibling outputs still get their chance to fail (and be
 /// reported) — the caller aggregates after the walk.
@@ -4814,6 +5135,115 @@ pub(crate) struct CorrelationErrorRecord {
     pub(crate) error_message: String,
     pub(crate) stage: Option<String>,
     pub(crate) route: Option<String>,
+    /// Taken when the failure was observed; the trigger entry the commit
+    /// emits for this row carries it.
+    pub(crate) failed_at: DlqFailureStamp,
+}
+
+#[cfg(test)]
+mod dlq_capture_tests {
+    use super::*;
+    use crate::executor::stream_event::SourceRowId;
+    use clinker_plan::plan::PlanNodeId;
+
+    fn row(ordinal: u64) -> SourceRowId {
+        SourceRowId::new(PlanNodeId::new(0), ordinal)
+    }
+
+    fn entry(ordinal: u64) -> DlqEntry {
+        let schema =
+            SharedStorage::from_arc(Arc::new(clinker_record::Schema::new(vec!["id".into()])));
+        DlqEntry {
+            source_row: row(ordinal),
+            category: clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
+            error_message: "bad".to_string(),
+            original_record: Record::new(schema, vec![Value::Integer(ordinal as i64)]),
+            stage: Some("transform:t".to_string()),
+            route: None,
+            trigger: true,
+            source_name: Arc::from("src"),
+            triggering_field: None,
+            triggering_value: None,
+            failed_at: DlqFailureStamp::now(),
+        }
+    }
+
+    /// The run-scoped state a push updates, owned by the test.
+    struct Accounts {
+        counters: PipelineCounters,
+        dlq_per_source: HashMap<Arc<str>, u64>,
+        total_per_source: HashMap<Arc<str>, u64>,
+    }
+
+    impl Accounts {
+        fn new() -> Self {
+            Self {
+                counters: PipelineCounters::default(),
+                dlq_per_source: HashMap::new(),
+                total_per_source: HashMap::new(),
+            }
+        }
+
+        fn push(&mut self, state: &mut DlqWalkState<'_>, ordinal: u64) {
+            let mut accounts = DlqAccounts {
+                counters: &mut self.counters,
+                dlq_per_source: &mut self.dlq_per_source,
+                total_per_source: &self.total_per_source,
+                config: None,
+            };
+            state
+                .push(entry(ordinal), &mut accounts)
+                .expect("a dead letter with no destination is counted");
+        }
+    }
+
+    fn take(state: &mut DlqWalkState<'_>, mark: DlqCaptureMark) -> Vec<SourceRowId> {
+        let mut rows = Vec::new();
+        state.take_capture(mark, |source_row| rows.push(source_row));
+        rows
+    }
+
+    #[test]
+    fn commit_capture_is_empty_between_dispatch_calls() {
+        let mut state = DlqWalkState::open(None, None).expect("no layout opens");
+        let mut accounts = Accounts::new();
+
+        // A push outside any dispatch call is counted and never captured.
+        accounts.push(&mut state, 1);
+        let mark = state.arm_capture();
+        accounts.push(&mut state, 2);
+        accounts.push(&mut state, 3);
+        assert_eq!(take(&mut state, mark), vec![row(2), row(3)]);
+
+        accounts.push(&mut state, 4);
+        let mark = state.arm_capture();
+        assert_eq!(
+            take(&mut state, mark),
+            Vec::<SourceRowId>::new(),
+            "the ids of one call never reach the next"
+        );
+        assert_eq!(accounts.counters.dlq_count, 4, "every push counts");
+    }
+
+    #[test]
+    fn nested_commit_capture_keeps_inner_rows_for_the_outer_call() {
+        let mut state = DlqWalkState::open(None, None).expect("no layout opens");
+        let mut accounts = Accounts::new();
+
+        let outer = state.arm_capture();
+        accounts.push(&mut state, 1);
+        let inner = state.arm_capture();
+        accounts.push(&mut state, 2);
+        assert_eq!(take(&mut state, inner), vec![row(2)]);
+        accounts.push(&mut state, 3);
+        assert_eq!(
+            take(&mut state, outer),
+            vec![row(1), row(2), row(3)],
+            "a call nested in a dispatch call still counts toward the outer call"
+        );
+        let mark = state.arm_capture();
+        assert_eq!(take(&mut state, mark), Vec::<SourceRowId>::new());
+    }
 }
 
 #[cfg(test)]

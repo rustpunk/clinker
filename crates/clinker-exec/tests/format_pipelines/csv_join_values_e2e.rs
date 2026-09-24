@@ -10,7 +10,7 @@
 //! error to the DLQ under `Continue`. Both the buffered arm (source → output)
 //! and the streaming fused arm (source → transform → output) are exercised.
 
-use crate::common;
+use crate::dlq_sink::{self, DlqRow};
 
 use std::collections::HashMap;
 
@@ -18,7 +18,6 @@ use clinker_bench_support::io::SharedBuffer;
 use clinker_core_types::dlq::DlqErrorCategory;
 use clinker_exec::executor::{ExecutionReport, PipelineRunParams, SourceReaders};
 use clinker_plan::error::PipelineError;
-use clinker_record::Value;
 
 fn params() -> PipelineRunParams {
     PipelineRunParams {
@@ -52,7 +51,10 @@ fn run_input(
     source: &str,
     filename: &str,
     input: &[u8],
-) -> (Result<ExecutionReport, PipelineError>, SharedBuffer) {
+) -> (
+    Result<(ExecutionReport, Vec<DlqRow>), PipelineError>,
+    SharedBuffer,
+) {
     let config = clinker_plan::config::parse_config(pipeline).expect("pipeline parses");
     let readers = HashMap::from([(
         source.to_string(),
@@ -67,7 +69,7 @@ fn run_input(
         Box::new(output.clone()) as Box<dyn std::io::Write + Send>,
     )]);
     (
-        common::run_config(&config, readers, writers, &params()),
+        dlq_sink::run_config_with_dlq(&config, readers, writers, &params()),
         output,
     )
 }
@@ -186,6 +188,8 @@ pipeline:
   name: csv_join_values_buffered
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: orders
@@ -216,7 +220,7 @@ nodes:
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report = common::run_config(&config, json_reader(), writers, &params())
+    let (report, rows) = dlq_sink::run_config_with_dlq(&config, json_reader(), writers, &params())
         .expect("run succeeds — the collision dead-letters, it does not abort");
 
     // Only the clean record reached the CSV; the colliding record did not.
@@ -226,7 +230,7 @@ nodes:
         "got: {output}"
     );
 
-    assert_join_collision_entry(&report.dlq_entries);
+    assert_join_collision_entry(&rows);
     assert_rejected_row_did_not_affect_mapping_advisories(&report.advisories);
     // The colliding record is counted once (as DLQ), not as both written and
     // dead-lettered: one row written/ok (row 2), one row dead-lettered (row 1).
@@ -245,6 +249,8 @@ pipeline:
   name: csv_join_values_streaming
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: orders
@@ -282,7 +288,7 @@ nodes:
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report = common::run_config(&config, json_reader(), writers, &params())
+    let (report, rows) = dlq_sink::run_config_with_dlq(&config, json_reader(), writers, &params())
         .expect("run succeeds — the streaming collision dead-letters, it does not abort");
 
     let output = String::from_utf8(buf.contents()).expect("utf-8 output");
@@ -291,7 +297,7 @@ nodes:
         "got: {output}"
     );
 
-    assert_join_collision_entry(&report.dlq_entries);
+    assert_join_collision_entry(&rows);
     assert_rejected_row_did_not_affect_mapping_advisories(&report.advisories);
     assert_eq!(report.counters.records_written, 1, "only row 2 was written");
     assert_eq!(report.counters.ok_count, 1, "only row 2 is ok");
@@ -312,39 +318,36 @@ fn assert_rejected_row_did_not_affect_mapping_advisories(advisories: &[String]) 
     );
 }
 
-/// Exactly one `MultiValueJoinCollision` entry, naming the `tags` field and the
+/// Exactly one `MultiValueJoinCollision` row, naming the `tags` field and the
 /// offending `a;b` value, stamped with the `output:out` sink stage.
-fn assert_join_collision_entry(entries: &[clinker_exec::executor::DlqEntry]) {
-    let collisions: Vec<_> = entries
+fn assert_join_collision_entry(rows: &[DlqRow]) {
+    let collisions: Vec<_> = rows
         .iter()
-        .filter(|e| e.category == DlqErrorCategory::MultiValueJoinCollision)
+        .filter(|row| row.category() == Some(DlqErrorCategory::MultiValueJoinCollision.as_str()))
         .collect();
     assert_eq!(
         collisions.len(),
         1,
         "one collision entry expected, got {:?}",
-        entries
-            .iter()
-            .map(|e| e.category.as_str())
-            .collect::<Vec<_>>()
+        rows.iter().map(DlqRow::category).collect::<Vec<_>>()
     );
     let entry = collisions[0];
     assert_eq!(
-        entry.triggering_field.as_deref(),
+        entry.triggering_field(),
         Some("tags"),
         "the entry names the offending field"
     );
     assert_eq!(
-        entry.triggering_value,
-        Some(Value::String("a;b".into())),
+        entry.triggering_value(),
+        Some("a;b"),
         "the entry carries the offending value"
     );
     assert_eq!(
-        entry.stage.as_deref(),
+        entry.stage(),
         Some("output:out"),
         "the entry is stamped with the sink-write stage"
     );
-    assert!(entry.trigger, "the failing record is its own trigger");
+    assert!(entry.trigger(), "the failing record is its own trigger");
 }
 
 #[test]
@@ -354,6 +357,8 @@ pipeline:
   name: csv_reordered_collision
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: orders
@@ -379,8 +384,8 @@ nodes:
         "in.json",
         br#"[{"order_id":"1","tags":["ok","a;b"]},{"order_id":"2","tags":["x","y"]}]"#,
     );
-    let report = result.unwrap();
-    assert_join_collision_entry(&report.dlq_entries);
+    let (report, rows) = result.unwrap();
+    assert_join_collision_entry(&rows);
     assert_eq!(output.as_string(), "tags,order_id\nx;y,2\n");
     assert_eq!(report.counters.records_written, 1);
     assert_eq!(report.counters.dlq_count, 1);

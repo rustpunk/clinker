@@ -23,7 +23,7 @@ struct CullOutputs {
     main: String,
     removed: String,
     cumulative_spill_bytes: u64,
-    dlq_count: usize,
+    dlq_count: u64,
 }
 
 /// Run a single-source → cull → (main output + audit output) pipeline over
@@ -88,7 +88,7 @@ fn run_cull_result(
         main: main_buf.as_string(),
         removed: removed_buf.as_string(),
         cumulative_spill_bytes: report.cumulative_spill_bytes,
-        dlq_count: report.dlq_entries.len(),
+        dlq_count: report.counters.dlq_count,
     })
 }
 
@@ -1037,7 +1037,7 @@ fn empty_string_and_null_partitions_are_distinct_deterministic_groups() {
     };
     let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
         .expect("empty/null partition cull run");
-    assert!(report.dlq_entries.is_empty(), "no DLQ entries");
+    assert_eq!(report.counters.dlq_count, 0, "no DLQ entries");
 
     let main = main_buf.as_string();
     let removed = removed_buf.as_string();
@@ -1136,7 +1136,7 @@ fn one_successor_drawing_both_ports_receives_the_union() {
     };
     let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
         .expect("both-ports merge run");
-    assert!(report.dlq_entries.is_empty(), "no DLQ entries");
+    assert_eq!(report.counters.dlq_count, 0, "no DLQ entries");
 
     let out = out_buf.as_string();
     let data: Vec<&str> = out.lines().skip(1).filter(|l| !l.is_empty()).collect();

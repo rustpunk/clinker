@@ -22,7 +22,9 @@ use crate::executor::dispatch::{
 };
 use crate::executor::preparation::is_explicit_cancellation;
 use crate::executor::structured_output_guard::StructuredOutputDocumentGuard;
-use crate::executor::{DlqEntry, OutputDeliveryId, build_format_writer, format_group_key};
+use crate::executor::{
+    DlqEntry, DlqFailureStamp, OutputDeliveryId, build_format_writer, format_group_key,
+};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, WriterBoundaryMode};
 
@@ -109,7 +111,10 @@ fn commit_one_group(
         // category=Correlated and trigger=false. Per-record original
         // records come from `records` (the projected buffer holds the
         // un-projected original alongside).
-        let mut emitted_trigger = false;
+        // The group is condemned here, at commit. The `group_size_exceeded`
+        // row is the overflow's trigger; every later row is condemned by it
+        // and carries its trigger id.
+        let mut overflow_stamp: Option<DlqFailureStamp> = None;
         let group_repr = format_group_key(group_key);
         let overflow_msg = PipelineError::CorrelationGroupOverflow {
             group_key: group_repr.clone(),
@@ -125,19 +130,23 @@ fn commit_one_group(
             if !seen_rows.insert(slot.row_num) {
                 continue;
             }
-            let (category, trigger, error_message) = if !emitted_trigger {
-                emitted_trigger = true;
-                (
-                    clinker_core_types::dlq::DlqErrorCategory::GroupSizeExceeded,
-                    true,
-                    overflow_msg.clone(),
-                )
-            } else {
-                (
+            let (category, trigger, error_message, failed_at) = match &overflow_stamp {
+                None => {
+                    let stamp = DlqFailureStamp::now();
+                    overflow_stamp = Some(stamp);
+                    (
+                        clinker_core_types::dlq::DlqErrorCategory::GroupSizeExceeded,
+                        true,
+                        overflow_msg.clone(),
+                        stamp,
+                    )
+                }
+                Some(cause) => (
                     clinker_core_types::dlq::DlqErrorCategory::Correlated,
                     false,
                     format!("correlated with failure in group: {overflow_msg}"),
-                )
+                    DlqFailureStamp::condemned_by(cause),
+                ),
             };
             push_dlq(
                 ctx,
@@ -152,6 +161,7 @@ fn commit_one_group(
                     source_name,
                     triggering_field: None,
                     triggering_value: None,
+                    failed_at,
                 },
             )?;
         }
@@ -198,10 +208,18 @@ fn commit_one_group(
     // distinct row_num touched by the group. Triggers come from
     // `error_messages`; collaterals come from `records` (rows that
     // succeeded their leg but get rolled back because the group failed).
-    let first_err_message = error_messages
-        .first()
-        .map(|e| e.error_message.clone())
-        .unwrap_or_else(|| "unknown".to_string());
+    // The group's first parked error is the failure its collaterals are
+    // attributed to: their detail quotes its message, and their trigger id
+    // is its trigger row's id. `group_dirty` guarantees it exists.
+    let Some(first_err) = error_messages.first() else {
+        return Err(PipelineError::Internal {
+            op: "correlation-commit",
+            node: format_group_key(group_key),
+            detail: "a dirty correlation group holds no parked error".to_string(),
+        });
+    };
+    let first_err_message = first_err.error_message.clone();
+    let first_err_stamp = first_err.failed_at;
 
     // Per-source narrowing: a collateral slot is spared whenever its
     // originating Source did not contribute any trigger error to this
@@ -240,10 +258,14 @@ fn commit_one_group(
                 original_record: err.original_record.clone(),
                 stage: err.stage.clone(),
                 route: err.route.clone(),
-                trigger: true,
+                // A parked error is its own failure's trigger unless it is a
+                // second row of another failure (a Combine build row keeps
+                // its driver's trigger id), which is never a trigger.
+                trigger: err.failed_at.trigger_id() == err.failed_at.id(),
                 source_name,
                 triggering_field: None,
                 triggering_value: None,
+                failed_at: err.failed_at,
             },
         )?;
     }
@@ -319,6 +341,9 @@ fn commit_one_group(
                 source_name: slot_source,
                 triggering_field: None,
                 triggering_value: None,
+                // Stamped as the dirty group is condemned, at commit, by
+                // the group's first error: the one the detail quotes.
+                failed_at: DlqFailureStamp::condemned_by(&first_err_stamp),
             },
         )?;
     }

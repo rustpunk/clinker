@@ -42,18 +42,20 @@
 //!   one partition's retract leaves the other partitions identical to
 //!   baseline.
 
-mod common;
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_exec::executor::{DlqEntry, PipelineRunParams};
+use clinker_exec::executor::PipelineRunParams;
 use clinker_plan::error::PipelineError;
 use clinker_record::PipelineCounters;
+use dlq_sink::DlqRow;
 use std::collections::HashMap;
 
 fn run_pipeline(
     yaml: &str,
     csv_input: &str,
-) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
+) -> Result<(PipelineCounters, Vec<DlqRow>, String), PipelineError> {
     let config = clinker_plan::config::parse_config(yaml).unwrap();
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
@@ -78,8 +80,8 @@ fn run_pipeline(
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report = common::run_config(&config, readers, writers, &params)?;
-    Ok((report.counters, report.dlq_entries, buf.as_string()))
+    let (report, rows) = dlq_sink::run_config_with_dlq(&config, readers, writers, &params)?;
+    Ok((report.counters, rows, buf.as_string()))
 }
 
 /// Stable sort of CSV body lines for diffing against a baseline. The
@@ -174,6 +176,8 @@ pipeline:
   name: window_retract
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src

@@ -11,11 +11,15 @@
 //! generic correlation-commit disposition, and that the failing group
 //! flushes atomically while clean groups still reach the writer.
 
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
+
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::PathBuf;
 
 use clinker_bench_support::io::SharedBuffer;
+use clinker_core_types::dlq::DlqErrorCategory;
 use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, SourceReaders};
 use clinker_exec::source::multi_file::FileSlot;
 use clinker_plan::config::{CompileContext, parse_config};
@@ -64,6 +68,8 @@ pipeline:
   name: grouped_combine_output_row
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: src_drv
@@ -131,66 +137,74 @@ nodes:
         HashMap::from([("out".to_string(), writer(&buf))]);
 
     let plan = config.compile(&CompileContext::default()).unwrap();
-    let report =
-        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .unwrap();
+    let sink = dlq_sink::CollectingDlqSink::new();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        dlq_sink::registry(writers, &sink),
+        &run_params(),
+    )
+    .unwrap();
+    let rows = sink.rows();
+    assert_eq!(
+        rows.len() as u64,
+        report.counters.dlq_count,
+        "every dead letter is written as a row"
+    );
 
     // (a) The parked failure surfaces through group-commit as
     // `combine_output_row` — category and stage preserved verbatim, not
     // rewritten to the generic correlation-commit disposition.
-    let combine_dlq: Vec<&clinker_exec::executor::DlqEntry> = report
-        .dlq_entries
+    let combine_dlq: Vec<&dlq_sink::DlqRow> = rows
         .iter()
-        .filter(|e| e.category == clinker_core_types::dlq::DlqErrorCategory::CombineOutputRow)
+        .filter(|row| row.category() == Some(DlqErrorCategory::CombineOutputRow.as_str()))
         .collect();
     assert_eq!(
         combine_dlq.len(),
         2,
         "the failing group parks the driver row and its matched build row, \
          both surfacing as combine_output_row through group-commit: {:?}",
-        report
-            .dlq_entries
-            .iter()
-            .map(|e| (e.source_name.as_ref(), e.category.as_str(), e.trigger))
+        rows.iter()
+            .map(|row| (row.source_name(), row.category(), row.trigger()))
             .collect::<Vec<_>>()
     );
 
     let driver_entry = combine_dlq
         .iter()
-        .find(|e| e.source_name.as_ref() == "src_drv")
+        .find(|row| row.source_name() == "src_drv")
         .expect("driver row of the failing group is attributed to src_drv");
     assert!(
-        driver_entry.trigger,
+        driver_entry.trigger(),
         "the driver row is the group's trigger after group-commit"
     );
     assert_eq!(
-        driver_entry.stage.as_deref(),
+        driver_entry.stage(),
         Some("combine:enriched"),
         "the parked Combine stage survives group-commit, not rewritten to \
          the generic correlation-commit stage"
     );
     assert_eq!(
-        driver_entry.source_row.ordinal(),
+        driver_entry.source_row(),
         2,
         "the failing driver source row is id=2's 1-based source row"
     );
 
     let build_entry = combine_dlq
         .iter()
-        .find(|e| e.source_name.as_ref() == "src_bld")
+        .find(|row| row.source_name() == "src_bld")
         .expect("matched build row is attributed to src_bld, not the merged source");
     assert_eq!(
-        build_entry.source_row.ordinal(),
+        build_entry.source_row(),
         3,
         "the matched build source row keeps id=2's independently ordered source ordinal"
     );
     assert_ne!(
-        build_entry.source_row.source(),
-        driver_entry.source_row.source(),
+        build_entry.source_name(),
+        driver_entry.source_name(),
         "driver and matched build entries retain distinct compiled Source scopes"
     );
     assert_eq!(
-        build_entry.stage.as_deref(),
+        build_entry.stage(),
         Some("combine:enriched"),
         "the parked build-side Combine stage also survives group-commit"
     );
@@ -199,16 +213,13 @@ nodes:
     // so no co-grouped survivor is collaterally DLQ'd: no `correlated`
     // entry is produced for id=2's group.
     assert!(
-        !report
-            .dlq_entries
+        !rows
             .iter()
-            .any(|e| e.category == clinker_core_types::dlq::DlqErrorCategory::Correlated),
+            .any(|row| row.category() == Some(DlqErrorCategory::Correlated.as_str())),
         "id=2 is the only member of its dirty group, so no collateral \
          (Correlated) entry is produced: {:?}",
-        report
-            .dlq_entries
-            .iter()
-            .map(|e| (e.source_name.as_ref(), e.category.as_str()))
+        rows.iter()
+            .map(|row| (row.source_name(), row.category()))
             .collect::<Vec<_>>()
     );
 

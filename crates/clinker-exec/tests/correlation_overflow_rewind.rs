@@ -17,14 +17,19 @@
 //! minima, not to a single pipeline-wide floor and not to the synthetic
 //! merged source.
 
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
+
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::PathBuf;
 
 use clinker_bench_support::io::SharedBuffer;
+use clinker_core_types::dlq::DlqErrorCategory;
 use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, SourceReaders};
 use clinker_exec::source::multi_file::FileSlot;
 use clinker_plan::config::{CompileContext, parse_config};
+use dlq_sink::CollectingDlqSink;
 
 fn slot(name: &str, csv: &str) -> FileSlot {
     FileSlot::new(
@@ -63,6 +68,8 @@ pipeline:
 error_handling:
   strategy: continue
   max_group_buffer: 3
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: src_a
@@ -121,43 +128,42 @@ nodes:
         HashMap::from([("out".to_string(), writer(&buf))]);
 
     let plan = config.compile(&CompileContext::default()).unwrap();
-    let report =
-        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .unwrap();
+    let sink = CollectingDlqSink::new();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        dlq_sink::registry(writers, &sink),
+        &run_params(),
+    )
+    .unwrap();
+    let rows = sink.rows();
 
     // Overflow disposition: exactly one root-cause GroupSizeExceeded
     // trigger; every other buffered row is a `correlated` collateral.
-    let trigger_count = report
-        .dlq_entries
+    let trigger_count = rows
         .iter()
-        .filter(|e| e.category == clinker_core_types::dlq::DlqErrorCategory::GroupSizeExceeded)
+        .filter(|r| r.category() == Some(DlqErrorCategory::GroupSizeExceeded.as_str()))
         .count();
     assert_eq!(
         trigger_count,
         1,
         "one GroupSizeExceeded root-cause trigger: {:?}",
-        report
-            .dlq_entries
-            .iter()
-            .map(|e| (e.source_name.as_ref(), e.category.as_str(), e.trigger))
+        rows.iter()
+            .map(|r| (r.source_name(), r.category(), r.trigger()))
             .collect::<Vec<_>>()
     );
     assert_eq!(
-        report.dlq_entries.len(),
+        rows.len(),
         4,
         "every buffered row of the overflowing group is DLQ'd (1 trigger + 3 collateral)"
     );
 
     // The trigger and collaterals are attributed to the real contributing
     // sources, never to the synthetic merged source.
-    let dlq_by_source: HashMap<&str, usize> =
-        report
-            .dlq_entries
-            .iter()
-            .fold(HashMap::new(), |mut acc, e| {
-                *acc.entry(e.source_name.as_ref()).or_insert(0) += 1;
-                acc
-            });
+    let dlq_by_source: HashMap<&str, usize> = rows.iter().fold(HashMap::new(), |mut acc, r| {
+        *acc.entry(r.source_name()).or_insert(0) += 1;
+        acc
+    });
     assert_eq!(
         dlq_by_source.get("<merged>").copied().unwrap_or(0),
         0,
@@ -213,6 +219,8 @@ pipeline:
 error_handling:
   strategy: continue
   max_group_buffer: 3
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: src_a
@@ -275,15 +283,20 @@ nodes:
         HashMap::from([("out".to_string(), writer(&buf))]);
 
     let plan = config.compile(&CompileContext::default()).unwrap();
-    let report =
-        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .unwrap();
+    let sink = CollectingDlqSink::new();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        dlq_sink::registry(writers, &sink),
+        &run_params(),
+    )
+    .unwrap();
+    let rows = sink.rows();
 
     // Only group id=7 overflows; group id=9 (a single src_b row) is clean.
-    let trigger_count = report
-        .dlq_entries
+    let trigger_count = rows
         .iter()
-        .filter(|e| e.category == clinker_core_types::dlq::DlqErrorCategory::GroupSizeExceeded)
+        .filter(|r| r.category() == Some(DlqErrorCategory::GroupSizeExceeded.as_str()))
         .count();
     assert_eq!(trigger_count, 1, "only group id=7 overflows");
 

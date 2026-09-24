@@ -2,7 +2,8 @@
 mod tests {
     use std::collections::HashMap;
 
-    use crate::executor::{DlqEntry, PipelineExecutor, PipelineRunParams};
+    use crate::executor::{PipelineExecutor, PipelineRunParams};
+    use crate::test_support::{CaptureDlqSink, CapturedDlqRow};
     use clinker_bench_support::io::SharedBuffer;
     use clinker_plan::config;
     use clinker_plan::error::PipelineError;
@@ -11,7 +12,14 @@ mod tests {
     fn run_pipeline(
         yaml: &str,
         csv_input: &str,
-    ) -> Result<(clinker_record::PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
+    ) -> Result<
+        (
+            clinker_record::PipelineCounters,
+            Vec<CapturedDlqRow>,
+            String,
+        ),
+        PipelineError,
+    > {
         let run = run_pipeline_reporting(yaml, csv_input)?;
         Ok((run.counters, run.dlq, run.output))
     }
@@ -19,7 +27,8 @@ mod tests {
     /// What one in-memory run produced.
     struct RunOutcome {
         counters: clinker_record::PipelineCounters,
-        dlq: Vec<DlqEntry>,
+        /// The dead-letter rows the run wrote, parsed.
+        dlq: Vec<CapturedDlqRow>,
         output: String,
         /// The run's advisory end-of-stream findings — the `mapping:` report.
         advisories: Vec<String>,
@@ -54,12 +63,17 @@ mod tests {
             ..Default::default()
         };
 
-        let report =
-            PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)?;
+        let sink = CaptureDlqSink::new();
+        let report = PipelineExecutor::run_with_readers_writers(
+            &config,
+            readers,
+            sink.registry(writers),
+            &params,
+        )?;
 
         Ok(RunOutcome {
             counters: report.counters,
-            dlq: report.dlq_entries,
+            dlq: sink.rows(),
             output: output_buf.as_string(),
             advisories: report.advisories,
         })
@@ -67,7 +81,14 @@ mod tests {
 
     /// Determine exit code from pipeline result (mirrors main.rs logic).
     fn exit_code(
-        result: &Result<(clinker_record::PipelineCounters, Vec<DlqEntry>, String), PipelineError>,
+        result: &Result<
+            (
+                clinker_record::PipelineCounters,
+                Vec<CapturedDlqRow>,
+                String,
+            ),
+            PipelineError,
+        >,
     ) -> u8 {
         match result {
             Ok((counters, _, _)) => {
@@ -1665,7 +1686,7 @@ nodes:
             report.counters.ok_count, 2,
             "both orders rows must enrich successfully against products"
         );
-        assert!(report.dlq_entries.is_empty(), "no DLQ entries expected");
+        assert_eq!(report.counters.dlq_count, 0, "no DLQ entries expected");
 
         let output = out_buf.as_string();
         assert!(

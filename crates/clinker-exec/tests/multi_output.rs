@@ -16,20 +16,33 @@ mod resource_fixtures;
 #[path = "common/dlq_encode.rs"]
 mod dlq_encode;
 
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
+
 use clinker_record::owned_storage::SharedStorage;
 use std::collections::HashMap;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_exec::executor::{DlqEntry, ExecutionReport, PipelineRunParams, SourceRowId};
+use clinker_exec::executor::{
+    DlqEntry, DlqFailureStamp, ExecutionReport, PipelineRunParams, SourceRowId,
+};
 use clinker_exec::pipeline::shutdown::ShutdownToken;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::{EntityRef, PlanNodeId};
 use clinker_record::{PipelineCounters, Value};
 
-/// Counters, DLQ entries, and per-output CSV bodies keyed by output name —
-/// the result of driving a multi-output pipeline to completion.
-type MultiOutputResult =
-    Result<(PipelineCounters, Vec<DlqEntry>, HashMap<String, String>), PipelineError>;
+/// Counters, the dead-letter rows written, and per-output CSV bodies keyed by
+/// output name — the result of driving a multi-output pipeline to completion.
+type MultiOutputResult = Result<
+    (
+        PipelineCounters,
+        Vec<dlq_sink::DlqRow>,
+        HashMap<String, String>,
+    ),
+    PipelineError,
+>;
+/// Counters and per-output CSV bodies keyed by output name.
+type MixedFanoutResult = Result<(PipelineCounters, HashMap<String, String>), PipelineError>;
 type MixedFanoutReportResult = Result<(ExecutionReport, HashMap<String, String>), PipelineError>;
 
 fn source_row(ordinal: u64) -> SourceRowId {
@@ -90,20 +103,20 @@ fn run_multi_output(yaml: &str, csv_input: &str) -> MultiOutputResult {
         })
         .collect();
 
-    let report = common::run_config(&config, readers, writers, &params)?;
+    let (report, dlq_rows) = dlq_sink::run_config_with_dlq(&config, readers, writers, &params)?;
 
     let outputs: HashMap<String, String> = buffers
         .iter()
         .map(|(name, buf)| (name.clone(), buf.as_string()))
         .collect();
 
-    Ok((report.counters, report.dlq_entries, outputs))
+    Ok((report.counters, dlq_rows, outputs))
 }
 
 /// Run a multi-source, multi-output fixture through the public executor path.
-fn run_mixed_fanout(yaml: &str, sources: &[(&str, &str)]) -> MultiOutputResult {
+fn run_mixed_fanout(yaml: &str, sources: &[(&str, &str)]) -> MixedFanoutResult {
     let (report, outputs) = run_mixed_fanout_report(yaml, sources, test_params())?;
-    Ok((report.counters, report.dlq_entries, outputs))
+    Ok((report.counters, outputs))
 }
 
 fn run_mixed_fanout_report(
@@ -188,7 +201,7 @@ nodes:
       path: merged.csv
 "#;
 
-    let (counters, dlq, outputs) = run_mixed_fanout(
+    let (counters, outputs) = run_mixed_fanout(
         yaml,
         &[
             ("shared", "id,value\ns1,10\ns2,20\n"),
@@ -197,7 +210,7 @@ nodes:
     )
     .expect("mixed Output plus Merge executes");
 
-    assert!(dlq.is_empty());
+    assert_eq!(counters.dlq_count, 0);
     assert_eq!(csv_data_rows(&outputs["direct"]), ["s1,10", "s2,20"]);
     assert_eq!(
         csv_data_rows(&outputs["merged"]),
@@ -263,7 +276,7 @@ nodes:
       path: combined.csv
 "#;
 
-    let (counters, dlq, outputs) = run_mixed_fanout(
+    let (counters, outputs) = run_mixed_fanout(
         yaml,
         &[
             ("shared", "id,value\ns1,10\ns2,20\n"),
@@ -272,7 +285,7 @@ nodes:
     )
     .expect("mixed Output plus Combine executes");
 
-    assert!(dlq.is_empty());
+    assert_eq!(counters.dlq_count, 0);
     assert_eq!(csv_data_rows(&outputs["direct"]), ["s1,10", "s2,20"]);
     assert_eq!(
         csv_data_rows(&outputs["combined"]),
@@ -1350,6 +1363,8 @@ pipeline:
   name: test_cancel
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src
@@ -1592,6 +1607,7 @@ fn test_dlq_stage_source() {
         source_name: std::sync::Arc::from("test_source"),
         triggering_field: None,
         triggering_value: None,
+        failed_at: DlqFailureStamp::now(),
     };
     assert_eq!(entry.stage, Some("source".to_string()));
     assert_eq!(entry.route, None);
@@ -1606,6 +1622,8 @@ pipeline:
   name: test_dlq_transform
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src
@@ -1656,12 +1674,13 @@ nodes:
     assert_eq!(counters.dlq_count, 1);
     assert_eq!(dlq.len(), 1);
     assert_eq!(
-        dlq[0].stage,
-        Some("transform:classify_emit".to_string()),
+        dlq[0].stage(),
+        Some("transform:classify_emit"),
         "stage should be transform:classify_emit"
     );
     assert_eq!(
-        dlq[0].route, None,
+        dlq[0].route(),
+        None,
         "pre-routing error should have null route"
     );
 }
@@ -1674,6 +1693,8 @@ pipeline:
   name: test_dlq_route_eval
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src
@@ -1729,11 +1750,11 @@ nodes:
     );
     assert_eq!(dlq.len(), 1);
     assert_eq!(
-        dlq[0].stage,
-        Some("route_eval".to_string()),
+        dlq[0].stage(),
+        Some("route_eval"),
         "stage should be route_eval"
     );
-    assert_eq!(dlq[0].route, None, "route eval error has null route");
+    assert_eq!(dlq[0].route(), None, "route eval error has null route");
 }
 
 #[test]
@@ -1755,6 +1776,7 @@ fn test_dlq_stage_output() {
         source_name: std::sync::Arc::from("test_source"),
         triggering_field: None,
         triggering_value: None,
+        failed_at: DlqFailureStamp::now(),
     };
     assert_eq!(entry.stage, Some("output:results".to_string()));
     assert_eq!(entry.route, Some("high_value".to_string()));
@@ -1768,6 +1790,8 @@ pipeline:
   name: test_dlq_pre_routing
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src
@@ -1816,10 +1840,15 @@ nodes:
     let (counters, dlq, _) = run_multi_output(yaml, csv).unwrap();
 
     assert_eq!(counters.dlq_count, 2);
+    assert_eq!(dlq.len(), 2, "both failures are written");
     for entry in &dlq {
-        assert_eq!(entry.route, None, "pre-routing errors must have null route");
+        assert_eq!(
+            entry.route(),
+            None,
+            "pre-routing errors must have null route"
+        );
         assert!(
-            entry.stage.as_ref().unwrap().starts_with("transform:"),
+            entry.stage().unwrap().starts_with("transform:"),
             "pre-routing errors should have transform stage"
         );
     }
@@ -1873,6 +1902,7 @@ nodes:
         source_name: std::sync::Arc::from("test_source"),
         triggering_field: None,
         triggering_value: None,
+        failed_at: DlqFailureStamp::now(),
     }];
 
     let output = dlq_encode::dlq_csv(&plan, &entries);
@@ -1941,24 +1971,19 @@ nodes:
     assert_eq!(dlq.len(), 1);
     // Single-output pipeline still populates stage
     assert!(
-        dlq[0].stage.is_some(),
+        dlq[0].stage().is_some(),
         "single-output DLQ should have stage field populated"
     );
     assert_eq!(
-        dlq[0].route, None,
+        dlq[0].route(),
+        None,
         "single-output DLQ should have null route"
     );
 
-    // Verify the DLQ CSV, written under the compiled header, includes
+    // The DLQ row was written under the compiled header, which includes
     // the new columns.
-    let plan = clinker_plan::config::parse_config(yaml)
-        .unwrap()
-        .compile(&clinker_plan::config::CompileContext::default())
-        .unwrap();
-    let output = dlq_encode::dlq_csv(&plan, &dlq);
-    let header = output.lines().next().unwrap();
-    assert!(header.contains("_cxl_dlq_stage"));
-    assert!(header.contains("_cxl_dlq_route"));
+    assert!(dlq[0].field("_cxl_dlq_stage").is_some());
+    assert!(dlq[0].field("_cxl_dlq_route").is_some());
 }
 
 #[test]

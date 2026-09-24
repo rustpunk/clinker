@@ -18,8 +18,10 @@ use clinker_exec::source::multi_file::FileSlot;
 use clinker_plan::config::{CompileContext, parse_config};
 use clinker_plan::error::PipelineError;
 
-#[path = "common/dlq_encode.rs"]
-mod dlq_encode;
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
+
+use dlq_sink::CollectingDlqSink;
 
 fn slot(name: &str, csv: &str) -> FileSlot {
     FileSlot::new(
@@ -111,56 +113,89 @@ fn five_each_readers() -> SourceReaders {
     ])
 }
 
-/// AC1 reinforcement: every DLQ entry carries the originating Source
-/// name through Merge. With `tfm` failing 100% of `src_b` records and
-/// no per-source override, every entry in the in-memory DLQ vector
-/// must report `source_name == "src_b"`. CSV column ordering is
-/// validated separately in `dlq.rs` unit tests; this asserts the
-/// in-memory plumbing through the full executor walk.
+/// The collecting sink holds exactly the rows the executor counted when every
+/// failure has a destination: one parsed row per dead letter, each under the
+/// header the compiled plan fixed for the bucket.
 #[test]
-fn dlq_entries_carry_source_b_attribution_under_merge() {
+fn collecting_sink_rows_match_counted_dead_letters() {
     let yaml = fail_src_b_yaml(
         r#"
 error_handling:
   strategy: continue
+  dlq:
+    path: dlq.csv
 "#,
     );
     let config = parse_config(&yaml).unwrap();
     let plan = config.compile(&CompileContext::default()).unwrap();
+    let layout = plan.dlq_layout().expect("a DLQ block yields a layout");
+    let bucket = layout.bucket_for_source("src_b").expect("src_b routes");
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
         HashMap::from([("out".to_string(), writer(&buf))]);
+    let sink = CollectingDlqSink::new();
 
     let report = PipelineExecutor::run_plan_with_readers_writers(
         &plan,
         five_each_readers(),
-        writers,
+        dlq_sink::registry(writers, &sink),
         &run_params(),
     )
     .expect("pipeline must complete under Continue strategy");
+
+    let rows = sink.rows();
     assert_eq!(report.counters.dlq_count, 5, "5 src_b rows fail");
+    assert_eq!(rows.len() as u64, report.counters.dlq_count);
+    assert_eq!(
+        sink.header_for("dlq.csv")
+            .expect("the bucket received rows"),
+        layout.bucket(bucket).header()
+    );
     assert!(
-        report
-            .dlq_entries
-            .iter()
-            .all(|e| e.source_name.as_ref() == "src_b"),
-        "every DLQ entry must attribute to src_b; got: {:?}",
-        report
-            .dlq_entries
-            .iter()
-            .map(|e| e.source_name.as_ref())
-            .collect::<Vec<_>>()
+        rows.iter()
+            .all(|row| row.bucket_path() == std::path::Path::new("dlq.csv")
+                && row.source_name() == "src_b")
+    );
+}
+
+/// AC1 reinforcement: every dead letter carries the originating Source
+/// name through Merge. With `tfm` failing 100% of `src_b` records and
+/// no per-source override, every row written to the dead-letter file
+/// must report `_cxl_dlq_source_name == "src_b"`. CSV column ordering is
+/// validated separately in `dlq.rs` unit tests; this asserts the
+/// attribution plumbing through the full executor walk.
+#[test]
+fn dead_letters_carry_source_b_attribution_under_merge() {
+    let yaml = fail_src_b_yaml(
+        r#"
+error_handling:
+  strategy: continue
+  dlq: { path: dlq.csv }
+"#,
+    );
+    let config = parse_config(&yaml).unwrap();
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
+        HashMap::from([("out".to_string(), writer(&buf))]);
+
+    let (report, rows) =
+        dlq_sink::run_config_with_dlq(&config, five_each_readers(), writers, &run_params())
+            .expect("pipeline must complete under Continue strategy");
+    assert_eq!(report.counters.dlq_count, 5, "5 src_b rows fail");
+    assert_eq!(rows.len(), 5, "every dead letter has a destination");
+    assert!(
+        rows.iter().all(|row| row.source_name() == "src_b"),
+        "every dead letter must attribute to src_b; got: {:?}",
+        rows.iter().map(|row| row.source_name()).collect::<Vec<_>>()
     );
     // The eval failed inside `emit ratio = ...`. The compiled emit node
     // attaches the target field name to `EvalError.triggering_field`,
-    // so every DLQ entry derived from an emit-statement subexpression
+    // so every dead letter derived from an emit-statement subexpression
     // names the offending column.
     assert!(
-        report
-            .dlq_entries
-            .iter()
-            .all(|e| e.triggering_field.as_deref() == Some("ratio")),
-        "every DLQ entry must name 'ratio' as the triggering field"
+        rows.iter()
+            .all(|row| row.triggering_field() == Some("ratio")),
+        "every dead letter must name 'ratio' as the triggering field"
     );
 }
 
@@ -193,7 +228,7 @@ error_handling:
     let err = PipelineExecutor::run_plan_with_readers_writers(
         &plan,
         five_each_readers(),
-        writers,
+        dlq_sink::discarding_registry(writers),
         &run_params(),
     )
     .expect_err("per-source threshold of 0.1 must halt the run on the first src_b failure");
@@ -238,7 +273,7 @@ error_handling:
     let err = PipelineExecutor::run_plan_with_readers_writers(
         &plan,
         five_each_readers(),
-        writers,
+        dlq_sink::discarding_registry(writers),
         &run_params(),
     )
     .expect_err("pipeline-wide max_rate 0.4 must halt the run once 5/10 records DLQ");
@@ -282,20 +317,157 @@ error_handling:
     let report = PipelineExecutor::run_plan_with_readers_writers(
         &plan,
         five_each_readers(),
-        writers,
+        dlq_sink::discarding_registry(writers),
         &run_params(),
     )
     .expect("min_records floor (100) is above this run's total (10); no halt expected");
     assert_eq!(report.counters.dlq_count, 5);
 }
 
+/// Whether the compiled plan streams `node`'s output into its consumer
+/// rather than materializing it in a node buffer. The runtime dispatcher
+/// reads the same verdict to pick the Sink's write arm.
+fn streams(plan: &clinker_plan::plan::CompiledPlan, node: &str) -> bool {
+    use clinker_plan::plan::execution::{StreamClass, classify_stream_nodes};
+    let dag = plan.dag();
+    let idx = dag
+        .graph
+        .node_indices()
+        .find(|&idx| dag.graph[idx].name() == node)
+        .unwrap_or_else(|| panic!("{node} is a plan node"));
+    classify_stream_nodes(dag, plan.config())[&idx] == StreamClass::Streaming
+}
+
+/// A dead letter the buffered Sink arm cannot place stops the run at that
+/// Sink, exactly as a refusal anywhere else in the walk does.
+///
+/// `orders -> widen -> out` sorts, so `out` writes on the buffered arm, and
+/// row 1's `tags` holds the CSV join delimiter: its collision dead letter is
+/// 1 of 2 records against `max_rate: 0.4`, so the funnel refuses it with
+/// E315. `ledger` is a second sorted Sink on `widen` that excludes `tags`,
+/// so it has nothing to collide on and would write both rows. It sits after
+/// `out` in the plan's topological order, which the scheduler follows when no
+/// volume estimate separates the two; the test asserts that premise. The
+/// breach is the run's error, and `ledger` never runs: its writer receives
+/// no byte.
+#[test]
+fn buffered_sink_rate_breach_stops_the_run() {
+    const PIPELINE: &str = r#"
+pipeline:
+  name: buffered_sink_rate_breach
+error_handling:
+  strategy: continue
+  dlq:
+    path: dlq.csv
+    min_records: 1
+    max_rate: 0.4
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: json
+      path: in.json
+      schema:
+        - { name: order_id, type: string }
+        - { name: tags, type: string, multiple: true }
+  - type: transform
+    name: widen
+    input: orders
+    config:
+      cxl: |
+        emit order_id = order_id
+        emit tags = tags
+  - type: sink
+    name: ledger
+    input: widen
+    config:
+      name: ledger
+      type: csv
+      path: ledger.csv
+      sort_order: [order_id]
+      exclude: [tags]
+  - type: sink
+    name: out
+    input: widen
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      sort_order: [order_id]
+"#;
+    const INPUT: &str =
+        r#"[{"order_id":"1","tags":["a;b","c"]},{"order_id":"2","tags":["x","y"]}]"#;
+
+    let plan = parse_config(PIPELINE)
+        .unwrap()
+        .compile(&CompileContext::default())
+        .unwrap();
+    assert!(
+        !streams(&plan, "widen"),
+        "both sorted Sinks take the buffered arm"
+    );
+    let topo_position = |node: &str| {
+        let dag = plan.dag();
+        dag.topo_order
+            .iter()
+            .position(|&idx| dag.graph[idx].name() == node)
+            .unwrap_or_else(|| panic!("{node} is in the topological order"))
+    };
+    assert!(
+        topo_position("out") < topo_position("ledger"),
+        "`ledger` is dispatched after `out`"
+    );
+
+    let readers: SourceReaders = HashMap::from([(
+        "orders".to_string(),
+        clinker_exec::executor::single_file_reader(
+            "in.json",
+            Box::new(Cursor::new(INPUT.as_bytes().to_vec())),
+        ),
+    )]);
+    let out = SharedBuffer::new();
+    let ledger = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([
+        ("out".to_string(), writer(&out)),
+        ("ledger".to_string(), writer(&ledger)),
+    ]);
+
+    let err = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        dlq_sink::discarding_registry(writers),
+        &run_params(),
+    )
+    .expect_err("the collision dead letter breaches max_rate 0.4 and halts the run");
+    match err {
+        PipelineError::DlqRateExceeded {
+            source,
+            max_rate,
+            observed_count,
+            total_count,
+            ..
+        } => {
+            assert!(source.is_none(), "E315 carries source: None");
+            assert_eq!(max_rate, 0.4);
+            assert_eq!((observed_count, total_count), (1, 2));
+        }
+        other => panic!("expected E315 DlqRateExceeded(pipeline-wide), got: {other:?}"),
+    }
+    assert!(
+        ledger.contents().is_empty(),
+        "no node runs after the breach; ledger received: {:?}",
+        String::from_utf8_lossy(&ledger.contents())
+    );
+}
+
 /// AC4: a per-source `path:` routes that Source's dead-lettered rows to a
 /// sidecar file of their own, while a Source without an override falls
 /// through to the pipeline-wide file. Routing is the compiled plan's
 /// dead-letter layout, the one rule the CLI publishes through; the run's
-/// real entries are encoded under the header that layout fixed.
+/// rows are written under the header that layout fixed.
 #[test]
-fn per_source_path_partitions_dlq_entries() {
+fn per_source_path_partitions_dead_letters() {
     let yaml = fail_src_b_yaml(
         r#"
 error_handling:
@@ -323,31 +495,27 @@ error_handling:
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
         HashMap::from([("out".to_string(), writer(&buf))]);
+    let sink = CollectingDlqSink::new();
     let report = PipelineExecutor::run_plan_with_readers_writers(
         &plan,
         five_each_readers(),
-        writers,
+        dlq_sink::registry(writers, &sink),
         &run_params(),
     )
     .expect("pipeline must complete under Continue strategy");
-    assert_eq!(report.dlq_entries.len(), 5, "5 src_b rows fail");
+    assert_eq!(report.counters.dlq_count, 5, "5 src_b rows fail");
 
     // Every failure is src_b's, so every row lands in src_b's own file and
     // none in the pipeline-wide one.
-    let csv = dlq_encode::dlq_csv(&plan, &report.dlq_entries);
-    let mut lines = csv.lines();
-    let header: Vec<&str> = lines.next().expect("header").split(',').collect();
-    assert_eq!(header, layout.bucket(own).header());
-    let name_col = header
-        .iter()
-        .position(|c| *c == "_cxl_dlq_source_name")
-        .expect("source-name column");
-    let rows: Vec<&str> = lines.collect();
-    assert_eq!(rows.len(), 5);
-    assert!(
-        rows.iter()
-            .all(|row| row.split(',').nth(name_col) == Some("src_b"))
+    assert!(sink.rows_for("dlq.csv").is_empty());
+    assert_eq!(
+        sink.header_for("dlq_b.csv")
+            .expect("src_b's file received rows"),
+        layout.bucket(own).header()
     );
+    let rows = sink.rows_for("dlq_b.csv");
+    assert_eq!(rows.len(), 5);
+    assert!(rows.iter().all(|row| row.source_name() == "src_b"));
 }
 
 /// E317: `per_source` map key that does not name a declared Source

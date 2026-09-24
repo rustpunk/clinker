@@ -4497,15 +4497,23 @@ fn default_strategy() -> ErrorStrategy {
 
 /// Dead-letter queue configuration.
 ///
-/// `max_rate` is a cumulative fraction in `[0.0, 1.0]`. When set, the
-/// pipeline halts once `dlq_count / total_count >= max_rate` AND
-/// `total_count >= min_records`. `min_records` defaults to 100 to avoid
-/// 1/1 = 100% false positives on the first failure.
+/// `max_rate` is a cumulative fraction in `(0.0, 1.0]` (E318 rejects zero
+/// and anything above one). When set, the pipeline halts once
+/// `dlq_count / rows_ingested >= max_rate` and
+/// `rows_ingested >= min_records`, where `rows_ingested` counts the rows
+/// read so far, not a total known ahead of the read. `min_records`
+/// defaults to 100 to avoid 1/1 = 100% false positives on the first
+/// failure.
 ///
-/// `per_source` overrides keyed by Source-node name win against the
-/// pipeline-wide `max_rate` / `min_records`. A per-source `path`, if
-/// set, reroutes that source's DLQ entries to a separate sidecar file —
-/// those entries do not appear in the pipeline-wide file.
+/// A `per_source` `max_rate`, keyed by Source-node name, adds a check; it
+/// does not replace the pipeline-wide one. After each dead letter the
+/// source's own `max_rate` is checked first, over that source's dead
+/// letters and rows (its `min_records` falls back to the pipeline-wide
+/// value), and then the pipeline-wide `max_rate` over every source. Either
+/// ceiling halts the run: E316 names the source, E315 is pipeline-wide, and
+/// a row that crosses both reports E316. A per-source `path`, if set,
+/// reroutes that source's dead-lettered rows to a separate file — those
+/// rows do not appear in the pipeline-wide file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DlqConfig {
@@ -4526,7 +4534,7 @@ pub struct DlqConfig {
 /// Per-source overrides for [`DlqConfig`].
 ///
 /// Operators consulting `path` should grep both the pipeline-wide DLQ
-/// file and every per-source sidecar — entries with a `per_source` path
+/// file and every per-source file — rows with a `per_source` path
 /// override do not duplicate into the pipeline-wide file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

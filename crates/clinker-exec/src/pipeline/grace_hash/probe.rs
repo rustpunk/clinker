@@ -139,6 +139,7 @@ pub(super) fn emit_for_probe<'a>(
                                 row: rn,
                                 matched_build: Some(cand.record.clone()),
                                 error: e,
+                                failed_at: crate::executor::DlqFailureStamp::now(),
                             });
                             continue;
                         }
@@ -213,6 +214,7 @@ pub(super) fn emit_for_probe<'a>(
                                     row: rn,
                                     matched_build: Some(cand.record.clone()),
                                     error: e,
+                                    failed_at: crate::executor::DlqFailureStamp::now(),
                                 });
                                 continue;
                             }
@@ -279,6 +281,7 @@ pub(super) fn emit_for_probe<'a>(
                                     row: rn,
                                     matched_build: None,
                                     error: e,
+                                    failed_at: crate::executor::DlqFailureStamp::now(),
                                 });
                             }
                         }
@@ -324,6 +327,7 @@ pub(super) fn emit_for_probe<'a>(
                                 row: rn,
                                 matched_build: Some(m.clone()),
                                 error: e,
+                                failed_at: crate::executor::DlqFailureStamp::now(),
                             });
                             continue;
                         }

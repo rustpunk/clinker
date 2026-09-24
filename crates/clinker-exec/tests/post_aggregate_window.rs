@@ -10,10 +10,11 @@
 //! "is Some" assertions) was the failure mode this rip exists to
 //! eliminate.
 
-mod common;
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_exec::executor::{DlqEntry, PipelineRunParams};
+use clinker_exec::executor::PipelineRunParams;
 use clinker_plan::error::PipelineError;
 use clinker_record::PipelineCounters;
 use std::collections::HashMap;
@@ -21,7 +22,7 @@ use std::collections::HashMap;
 fn run_pipeline(
     yaml: &str,
     csv_input: &str,
-) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
+) -> Result<(PipelineCounters, Vec<dlq_sink::DlqRow>, String), PipelineError> {
     let config = clinker_plan::config::parse_config(yaml).unwrap();
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
@@ -46,8 +47,8 @@ fn run_pipeline(
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report = common::run_config(&config, readers, writers, &params)?;
-    Ok((report.counters, report.dlq_entries, buf.as_string()))
+    let (report, rows) = dlq_sink::run_config_with_dlq(&config, readers, writers, &params)?;
+    Ok((report.counters, rows, buf.as_string()))
 }
 
 /// Parse a CSV string into (header, rows-keyed-by-first-column).
@@ -143,9 +144,8 @@ ENG,100
 ENG,200
 ENG,300
 ";
-    let (counters, dlq, output) = run_pipeline(SUM_PIPELINE, csv).expect("pipeline must execute");
+    let (counters, _, output) = run_pipeline(SUM_PIPELINE, csv).expect("pipeline must execute");
     assert_eq!(counters.dlq_count, 0, "no failure injected");
-    assert!(dlq.is_empty(), "no failure injected");
 
     let rows = csv_rows_by_key(&output, "department");
     let hr = rows.get("HR").expect("HR row must be present");
@@ -235,10 +235,9 @@ ENG,west,50
 ENG,north,7
 ENG,north,3
 ";
-    let (counters, dlq, output) =
+    let (counters, _, output) =
         run_pipeline(MULTI_ROW_PIPELINE, csv).expect("pipeline must execute");
     assert_eq!(counters.dlq_count, 0);
-    assert!(dlq.is_empty());
 
     // Map (department, region) → row.
     let mut by_key: HashMap<(String, String), HashMap<String, String>> = HashMap::new();
@@ -383,10 +382,8 @@ ENG,west,50
 ENG,north,7
 ENG,north,3
 ";
-    let (counters, dlq, output) =
-        run_pipeline(CUMSUM_PIPELINE, csv).expect("pipeline must execute");
+    let (counters, _, output) = run_pipeline(CUMSUM_PIPELINE, csv).expect("pipeline must execute");
     assert_eq!(counters.dlq_count, 0);
-    assert!(dlq.is_empty());
 
     // Map (department, region) → row.
     let mut by_key: HashMap<(String, String), HashMap<String, String>> = HashMap::new();
@@ -430,6 +427,8 @@ pipeline:
   name: post_agg_div_zero
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src
@@ -491,6 +490,11 @@ ENG,300
         "exactly one row (HR, total=60) must hit divide-by-zero"
     );
     assert_eq!(dlq.len(), 1, "DLQ must carry the failing row");
+    assert_eq!(
+        dlq[0].field("department"),
+        Some("HR"),
+        "the dead-lettered row is the HR group"
+    );
 
     // Surviving output: only ENG.
     let rows = csv_rows_by_key(&output, "department");

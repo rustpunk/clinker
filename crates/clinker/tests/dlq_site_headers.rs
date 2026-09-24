@@ -208,6 +208,12 @@ fn cell<'a>(row: &'a Row, column: &str) -> &'a str {
         .unwrap_or_else(|| panic!("{column} is a header column; row: {row:?}"))
 }
 
+/// The failure a row belongs to: the `_cxl_dlq_id` of that failure's
+/// trigger row.
+fn trigger_id(row: &Row) -> &str {
+    cell(row, "_cxl_dlq_trigger_id")
+}
+
 /// The one file of a single-bucket run, holding `rows` rows.
 fn only_file(files: &[DlqFile], rows: usize) -> &DlqFile {
     assert_eq!(files.len(), 1, "one dead-letter file is published");
@@ -483,6 +489,13 @@ nodes:
         "the row carries the Transform's own input schema"
     );
     assert_eq!(cell(row, "_cxl_dlq_source_record"), "");
+    for row in &dlq.rows {
+        assert_eq!(
+            trigger_id(row),
+            cell(row, "_cxl_dlq_id"),
+            "a failure that wrote one row carries its own id: {row:?}"
+        );
+    }
 }
 
 #[test]
@@ -1054,6 +1067,24 @@ nodes:
         "the build file admits no probe column: {}",
         build.header_line
     );
+
+    let driver_row = &probe.rows[0];
+    let build_row = &build.rows[0];
+    assert_eq!(
+        trigger_id(driver_row),
+        cell(driver_row, "_cxl_dlq_id"),
+        "the driver row is the failure's trigger: {driver_row:?}"
+    );
+    assert_eq!(
+        trigger_id(build_row),
+        cell(driver_row, "_cxl_dlq_id"),
+        "the build row pairs with the driver row of the same failure: {build_row:?}"
+    );
+    assert_ne!(
+        cell(build_row, "_cxl_dlq_id"),
+        cell(driver_row, "_cxl_dlq_id"),
+        "the build row has its own id"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1351,6 +1382,80 @@ fn sink_join_values_collision_streaming() {
     assert_join_values_collision(&files);
 }
 
+/// A rate-ceiling breach on the buffered arm stops the run at the Sink that
+/// breached. `widen` feeds two sorted Sinks, both of which collide on row 1;
+/// the first collision is 1 of 2 records against `max_rate: 0.4`. The run
+/// exits 3 with the one E315 diagnostic: the second Sink never runs, so its
+/// collision cannot breach again and fold both into a combined error.
+#[test]
+fn buffered_sink_rate_breach_exits_with_the_rate_ceiling() {
+    const PIPELINE: &str = r#"pipeline:
+  name: dlq_buffered_rate_breach
+error_handling:
+  strategy: continue
+  dlq:
+    path: '{dir}/rejects.csv'
+    min_records: 1
+    max_rate: 0.4
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    type: json
+    path: in.json
+    schema:
+      - { name: order_id, type: string }
+      - { name: tags, type: string, multiple: true }
+- type: transform
+  name: widen
+  input: orders
+  config:
+    cxl: |
+      emit order_id = order_id
+      emit tags = tags
+- type: sink
+  name: first
+  input: widen
+  config:
+    name: first
+    type: csv
+    path: first.csv
+    sort_order: [order_id]
+- type: sink
+  name: second
+  input: widen
+  config:
+    name: second
+    type: csv
+    path: second.csv
+    sort_order: [order_id]
+"#;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let yaml = render(PIPELINE, dir.path());
+    write_inputs(dir.path(), &[("in.json", JOIN_VALUES_INPUT)]);
+    let plan = compile(dir.path(), &yaml);
+    assert!(
+        !streams(&plan, "widen"),
+        "both sorted Sinks take the buffered arm"
+    );
+
+    let output = run_clinker(dir.path(), &yaml);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "a rate-ceiling breach exits 3.\n{}",
+        describe(&output)
+    );
+    assert_eq!(
+        stderr.matches("E315").count(),
+        1,
+        "the run reports the one breach that stopped it.\n{}",
+        describe(&output)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Correlation buffer (sites 5-7)
 // ---------------------------------------------------------------------------
@@ -1423,6 +1528,12 @@ nodes:
         "the trigger carries the failing Transform's input schema"
     );
 
+    assert_eq!(
+        trigger_id(trigger),
+        cell(trigger, "_cxl_dlq_id"),
+        "the trigger carries its own id: {trigger:?}"
+    );
+
     let collateral: Vec<&Row> = dlq
         .rows
         .iter()
@@ -1431,6 +1542,12 @@ nodes:
     assert_eq!(collateral.len(), 2, "{:?}", dlq.rows);
     for row in collateral {
         assert_eq!(cell(row, "_cxl_dlq_error_category"), "correlated");
+        assert_eq!(
+            trigger_id(row),
+            cell(trigger, "_cxl_dlq_id"),
+            "a collateral pairs with its group's first trigger: {row:?}"
+        );
+        assert_ne!(cell(row, "_cxl_dlq_id"), cell(trigger, "_cxl_dlq_id"));
         assert_eq!(cell(row, "emp_id"), "A");
         assert!(
             !cell(row, "val").is_empty(),
@@ -1504,10 +1621,30 @@ nodes:
         .filter(|row| cell(row, "_cxl_dlq_trigger") == "true")
         .collect();
     assert_eq!(triggers.len(), 1, "{:?}", dlq.rows);
+    let overflow = triggers[0];
     assert_eq!(
-        cell(triggers[0], "_cxl_dlq_error_category"),
+        cell(overflow, "_cxl_dlq_error_category"),
         "group_size_exceeded"
     );
+    assert_eq!(
+        trigger_id(overflow),
+        cell(overflow, "_cxl_dlq_id"),
+        "the overflow row carries its own id: {overflow:?}"
+    );
+    let collateral: Vec<&Row> = dlq
+        .rows
+        .iter()
+        .filter(|row| cell(row, "_cxl_dlq_trigger") != "true")
+        .collect();
+    assert_eq!(collateral.len(), 4, "{:?}", dlq.rows);
+    for row in collateral {
+        assert_eq!(cell(row, "_cxl_dlq_error_category"), "correlated");
+        assert_eq!(
+            trigger_id(row),
+            cell(overflow, "_cxl_dlq_id"),
+            "an overflowed row pairs with the group_size_exceeded row: {row:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1591,7 +1728,13 @@ nodes:
         .filter(|row| cell(row, "_cxl_dlq_trigger") == "true")
         .collect();
     assert_eq!(triggers.len(), 1, "{:?}", dlq.rows);
-    assert_eq!(cell(triggers[0], "id"), "2");
+    let trigger = triggers[0];
+    assert_eq!(cell(trigger, "id"), "2");
+    assert_eq!(
+        trigger_id(trigger),
+        cell(trigger, "_cxl_dlq_id"),
+        "the document trigger carries its own id: {trigger:?}"
+    );
     assert_eq!(
         cell(triggers[0], "marker"),
         "widened",
@@ -1605,6 +1748,12 @@ nodes:
         assert!(
             !cell(row, "val").is_empty(),
             "a collateral row carries the Sink's input schema: {row:?}"
+        );
+        assert_eq!(cell(row, "_cxl_dlq_error_category"), "document_rejected");
+        assert_eq!(
+            trigger_id(row),
+            cell(trigger, "_cxl_dlq_id"),
+            "a rejected document's other records pair with its trigger: {row:?}"
         );
     }
     assert!(

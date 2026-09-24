@@ -117,11 +117,13 @@ struct WarningCount {
     count: usize,
 }
 
-/// DLQ columns that legitimately differ between two runs of identical input:
-/// a per-entry UUID and a wall-clock stamp. They are blanked before comparison.
-/// Every other DLQ column — source row, triggering value, error category and
-/// the full original record — is compared verbatim.
-const VOLATILE_DLQ_COLUMNS: usize = 2;
+/// DLQ columns that legitimately differ between two runs of identical input,
+/// and lead every DLQ header: `_cxl_dlq_id` (a per-row UUID),
+/// `_cxl_dlq_trigger_id` (the UUID of the row's failure's trigger row) and
+/// `_cxl_dlq_timestamp` (a wall-clock stamp). They are blanked before
+/// comparison. Every other DLQ column — source row, triggering value, error
+/// category and the full original record — is compared verbatim.
+const VOLATILE_DLQ_COLUMNS: usize = 3;
 
 const GATES: &[Gate] = &[
     Gate {
@@ -214,7 +216,7 @@ fn updating() -> bool {
 
 /// Blank the leading `n` comma-separated columns of every data row.
 ///
-/// The volatile DLQ columns are a UUID and an RFC 3339 timestamp, neither of
+/// The volatile DLQ columns are two UUIDs and an RFC 3339 timestamp, none of
 /// which can contain a comma or a quote, so splitting on the first `n` commas is
 /// safe without a full CSV parse. Later columns — which may be quoted and may
 /// contain commas — are left untouched.

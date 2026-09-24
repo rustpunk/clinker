@@ -192,9 +192,10 @@ pub(crate) fn orchestrate(
         recompute_agg::recompute_aggregates(ctx, current_dag, &scope, &iteration_rows)?;
         // The deferred-region members route per-record errors into the
         // correlation buffer (carrying the synthetic-CK column the
-        // aggregator stamped) AND emit non-buffer-routed errors (e.g.
-        // aggregate-finalize) directly to `dlq_entries`, surfaced via
-        // the dispatcher's returned `DlqEvent` vector. Folding both
+        // aggregator stamped) AND push non-buffer-routed errors (e.g.
+        // aggregate-finalize) straight through `push_dlq` into the
+        // dead-letter sink; the capture armed around each dispatch call
+        // hands their source rows back as the returned `DlqEvent` vector. Folding both
         // through a single `expand_with_dlq_events` call widens the
         // next iteration's retract scope. Buffer-routed errors are
         // recovered by re-running detect against the live buffer:
@@ -276,6 +277,7 @@ fn archive_iteration_errors(
                     error_message: err.error_message.clone(),
                     stage: err.stage.clone(),
                     route: err.route.clone(),
+                    failed_at: err.failed_at,
                 });
             }
         }

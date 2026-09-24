@@ -19,7 +19,7 @@ use petgraph::graph::NodeIndex;
 
 use crate::executor::dispatch::{
     CorrelationRecordSlot, ExecutorContext, buffer_key_for_record, mapping_probe,
-    missing_node_buffer_input_error, push_dlq, push_write_error, require_node_buffer_input,
+    missing_node_buffer_input_error, push_write_error, require_node_buffer_input,
     single_input_node_buffer_key, sink_collision_dlq_entry, source_file_path_of,
 };
 use crate::executor::node_buffer::TransientNodeBufferReservation;
@@ -28,7 +28,7 @@ use crate::executor::schema_check::check_input_schema;
 use crate::executor::structured_output_guard::{
     StructuredOutputDocumentGuard, structured_output_format,
 };
-use crate::executor::{DlqEntry, OutputDeliveryId, build_format_writer, stage_metrics};
+use crate::executor::{OutputDeliveryId, build_format_writer, stage_metrics};
 use crate::projection::project_output_from_record;
 use clinker_plan::config::ErrorStrategy;
 use clinker_plan::error::PipelineError;
@@ -724,12 +724,12 @@ fn dispatch_sink_work(
     let had_writer = fan_out_writers.is_some() || single_writer.is_some();
     let strategy = ctx.strategy;
     // Collected inside the writer helpers (which hold only partial `ctx`
-    // borrows) and applied below once `ctx` is free again: `dlq_pending` drains
-    // through `push_dlq`, `written_rows` drives the ok/written/emitted counts.
-    let mut dlq_pending: Vec<DlqEntry> = Vec::new();
+    // borrows) and applied below once `ctx` is free again: `written_rows`
+    // drives the ok/written/emitted counts. Collision dead letters are not
+    // collected: the helpers push each through `fan_ctx.dlq` where it happens.
     let mut written_rows: Vec<crate::executor::stream_event::SourceRowId> = Vec::new();
     let output_staging = ctx.output_staging.clone();
-    {
+    let dlq_fatal = {
         let mut fan_ctx = FanOutContext {
             writer_resources: ctx.writer_resources.clone(),
             truncation_ledger: ctx.truncation_ledger.clone(),
@@ -742,7 +742,16 @@ fn dispatch_sink_work(
             projection_timer: &mut ctx.projection_timer,
             collector: &mut *ctx.collector,
             strategy,
-            dlq_pending: &mut dlq_pending,
+            dlq: crate::executor::dispatch::DlqFunnel {
+                state: &mut ctx.dlq,
+                accounts: crate::executor::dispatch::DlqAccounts {
+                    counters: &mut ctx.counters,
+                    dlq_per_source: &mut ctx.dlq_per_source,
+                    total_per_source: &ctx.total_per_source,
+                    config: ctx.config.error_handling.dlq.as_ref(),
+                },
+            },
+            dlq_fatal: None,
             written_rows: &mut written_rows,
             output_staging: &output_staging,
             sink_byte_counter: ctx.sink_byte_counter.clone(),
@@ -762,6 +771,14 @@ fn dispatch_sink_work(
         } else if let Some(raw_writer) = single_writer {
             emit_single_writer(&mut fan_ctx, raw_writer, &unbuffered, scan_timer);
         }
+        fan_ctx.dlq_fatal
+    };
+    // A collision dead letter the funnel refused (a rate breach or a
+    // dead-letter write failure) ends the walk here, as every other
+    // `push_dlq` site does, so the run reports that error itself rather than
+    // folding it into the collected Output errors.
+    if let Some(error) = dlq_fatal {
+        return Err(error);
     }
     // With a writer present, count ok / written / emitted from the records
     // actually written — one entry in `written_rows` per successful
@@ -795,12 +812,6 @@ fn dispatch_sink_work(
     ctx.counters.ok_count += newly_ok;
     ctx.counters.records_written += written_total;
     ctx.records_emitted += written_total;
-
-    // Drain the collected collision entries; `push_dlq` enforces the DLQ rate
-    // ceiling (E315/E316), which can still abort the run.
-    for entry in dlq_pending {
-        push_dlq(ctx, entry)?;
-    }
 
     // The duplicate records have completed their synchronous Output use.
     drop(input_materialization_reservation);
@@ -1393,7 +1404,7 @@ fn missing_sink_input_error(
 /// single-writer helpers below clippy's argument threshold and gives them
 /// one shared shape — a change to how a Sink write is attributed (e.g.
 /// a new metric guard) lands on the struct, not on two signatures.
-struct FanOutContext<'a> {
+struct FanOutContext<'a, 'l> {
     writer_resources: clinker_format::preparation::WriterResources,
     truncation_ledger: crate::executor::truncation_report::TruncationLedger,
     name: &'a str,
@@ -1411,10 +1422,15 @@ struct FanOutContext<'a> {
     /// collision dead-letters under `Continue` but still aborts under
     /// `FailFast` — the same disposition every other per-record failure gets.
     strategy: ErrorStrategy,
-    /// Collision DLQ entries gathered during the write. Drained through
-    /// [`push_dlq`] by the caller once the full `ctx` borrow is free (the
-    /// writer helpers hold only partial borrows of it).
-    dlq_pending: &'a mut Vec<DlqEntry>,
+    /// The walk's dead-letter funnel, borrowed apart from the other context
+    /// fields this struct holds, so a collision is counted, written and
+    /// rate-checked at the record that collided. A push error (a rate breach
+    /// or a dead-letter write failure) is fatal for the run: the helper
+    /// stores it in [`Self::dlq_fatal`] and stops writing.
+    dlq: crate::executor::dispatch::DlqFunnel<'a, 'l>,
+    /// The push error that stopped this Output, returned by the caller as the
+    /// walk's error once the helper's borrows end.
+    dlq_fatal: Option<PipelineError>,
     /// The source `row_num` of every record actually written, in write order —
     /// one entry per successful `write_record`, so a `combine match: all`
     /// fan-out that emits several output records for one driver row contributes
@@ -1434,7 +1450,7 @@ struct FanOutContext<'a> {
 /// error sink rather than short-circuiting, so sibling Outputs still get
 /// their chance to fail.
 fn emit_single_writer(
-    fan_ctx: &mut FanOutContext<'_>,
+    fan_ctx: &mut FanOutContext<'_, '_>,
     raw_writer: Box<dyn Write + Send>,
     unbuffered: &[(Record, crate::executor::stream_event::SourceRowId)],
     scan_timer: crate::executor::stage_metrics::StageTimer,
@@ -1483,7 +1499,11 @@ fn emit_single_writer(
                         && let Some(entry) =
                             sink_collision_dlq_entry(record, &projected, *rn, fan_ctx.name, &e)
                     {
-                        fan_ctx.dlq_pending.push(entry);
+                        if let Err(error) = fan_ctx.dlq.push(entry) {
+                            fan_ctx.dlq_fatal = Some(error);
+                            write_failed = true;
+                            break;
+                        }
                         continue;
                     }
                     push_write_error(fan_ctx.output_errors, e);
@@ -1521,7 +1541,7 @@ fn emit_single_writer(
 /// short-circuiting so sibling writers in the same Output still get
 /// their chance to flush or report.
 fn emit_fan_out(
-    fan_ctx: &mut FanOutContext<'_>,
+    fan_ctx: &mut FanOutContext<'_, '_>,
     unbuffered: &[(Record, crate::executor::stream_event::SourceRowId)],
     per_file: HashMap<Arc<str>, Box<dyn Write + Send>>,
     mut resolved_paths: HashMap<Arc<str>, String>,
@@ -1635,7 +1655,12 @@ fn emit_fan_out(
                 && let Some(entry) =
                     sink_collision_dlq_entry(record, &projected, *rn, fan_ctx.name, &e)
             {
-                fan_ctx.dlq_pending.push(entry);
+                if let Err(error) = fan_ctx.dlq.push(entry) {
+                    // Fatal for the run: no further record of this Output is
+                    // written, and the caller returns the error as the walk's.
+                    fan_ctx.dlq_fatal = Some(error);
+                    break;
+                }
                 continue;
             }
             push_write_error(fan_ctx.output_errors, e);

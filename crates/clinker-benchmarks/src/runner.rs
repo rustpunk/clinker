@@ -7,10 +7,14 @@
 use std::collections::HashMap;
 use std::io::{BufReader, Cursor};
 use std::path::Path;
+use std::sync::Arc;
 
 use clinker_bench_support::cache::{BenchDataCache, DataSpec, NestedWrapper};
 use clinker_bench_support::{FieldKind, Scale};
-use clinker_exec::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams};
+use clinker_exec::dlq::DiscardingDlqSink;
+use clinker_exec::executor::{
+    ExecutionReport, PipelineExecutor, PipelineRunParams, WriterRegistry,
+};
 use clinker_plan::config::pipeline_node::{PipelineNode, SourceBody};
 use clinker_plan::config::{CompileContext, InputFormat, load_config};
 use clinker_plan::error::PipelineError;
@@ -105,10 +109,18 @@ impl BenchPipelineRunner {
             }
         }
 
-        let mut writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::new();
+        let mut single: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::new();
         for output in config.sink_configs() {
-            writers.insert(output.name.clone(), Box::new(Cursor::new(Vec::new())) as _);
+            single.insert(output.name.clone(), Box::new(Cursor::new(Vec::new())) as _);
         }
+        // Dead-lettered rows go to a sink that keeps nothing: bench throughput
+        // measures the pipeline, not dead-letter file I/O, and the report still
+        // counts every dead letter.
+        let writers = WriterRegistry {
+            single,
+            dlq_sink: Some(Arc::new(DiscardingDlqSink)),
+            ..WriterRegistry::default()
+        };
 
         let plan = config
             .compile(&CompileContext::new(clinker_bench_support::workspace_root()))

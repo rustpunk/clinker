@@ -8,7 +8,8 @@ use chrono::{DateTime, Utc};
 use clinker_record::{PipelineCounters, Value};
 use indexmap::IndexMap;
 
-use super::{DlqEntry, stage_metrics};
+use super::stage_metrics;
+use crate::dlq::DlqReport;
 
 /// Whether an admitted run executes normally or reads a bounded preview.
 ///
@@ -134,15 +135,19 @@ pub struct PipelineRunParams {
 
 /// Summary returned after a pipeline execution completes (success or partial).
 ///
-/// Replaces the previous `(PipelineCounters, Vec<DlqEntry>)` tuple. Callers
-/// that previously destructured the tuple should access `report.counters` and
-/// `report.dlq_entries` instead.
+/// Holds counts and metrics only; it retains no record. Dead letters are
+/// counted in [`Self::counters`] (`dlq_count`), [`Self::per_source_dlq_counts`]
+/// and [`Self::dead_letters`]; the dead-lettered rows themselves were written
+/// through the caller's [`crate::dlq::DlqSink`] while the run executed.
 #[derive(Debug)]
 pub struct ExecutionReport {
     /// Record counts: total, ok, dlq.
     pub counters: PipelineCounters,
-    /// Records that were routed to the dead-letter queue.
-    pub dlq_entries: Vec<DlqEntry>,
+    /// Dead-letter counters: rows per stage and category, and rows written
+    /// per dead-letter file. Holds counts only, never rows; its size is
+    /// bounded by the plan. The rows themselves went to the caller's
+    /// [`crate::dlq::DlqSink`] while the run executed.
+    pub dead_letters: DlqReport,
     /// Human-readable execution summary (e.g., "Streaming", "TwoPass").
     pub execution_summary: String,
     /// Whether any transform required arena allocation (window functions).

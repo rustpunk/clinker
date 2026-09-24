@@ -25,7 +25,9 @@ use crate::executor::dispatch::{
     source_name_arc_of, stream_linear_producer_emit, tee_emit_to_region_input_buffers,
 };
 use crate::executor::schema_check::check_input_schema;
-use crate::executor::{DlqEntry, NullStorage, stage_metrics, widen_record_to_schema};
+use crate::executor::{
+    DlqEntry, DlqFailureStamp, NullStorage, stage_metrics, widen_record_to_schema,
+};
 use crate::pipeline::iejoin::RecordOrder;
 use clinker_plan::BudgetCategory;
 use clinker_plan::config::ErrorStrategy;
@@ -932,6 +934,7 @@ where
                         f.matched_build.as_ref().map(|record| (record, f.row)),
                         name,
                         f.error,
+                        f.failed_at,
                     )?;
                 }
                 let probe_records_out = output_records.len() as u64;
@@ -1307,6 +1310,7 @@ where
                                 .map(|matched| (&matched.record, matched.row)),
                             name,
                             f.error,
+                            f.failed_at,
                         )?;
                         // A deferred failure routes the whole driver row to the DLQ;
                         // no output rows survive for it.
@@ -1742,6 +1746,7 @@ fn run_streaming_combine_probe(
                 .map(|matched| (&matched.record, matched.row)),
             name,
             f.error,
+            f.failed_at,
         )?;
     }
 
@@ -1781,6 +1786,8 @@ struct ProbeFailure {
     rn: crate::executor::stream_event::SourceRowId,
     matched_build: Option<MatchedBuildFailure>,
     error: cxl::eval::EvalError,
+    /// Taken as the probe observed the failure, on whichever thread ran it.
+    failed_at: DlqFailureStamp,
 }
 
 /// Exact build-side contribution attached to an inline combine output-row
@@ -1912,6 +1919,7 @@ impl CombineProbeKernel<'_> {
                 rn,
                 matched_build: None,
                 error: e,
+                failed_at: DlqFailureStamp::now(),
             })));
         }
 
@@ -1954,6 +1962,7 @@ impl CombineProbeKernel<'_> {
                                         row: self.build_row_id(candidate.index)?,
                                     }),
                                     error: e,
+                                    failed_at: DlqFailureStamp::now(),
                                 })));
                             }
                         }
@@ -2045,6 +2054,7 @@ impl CombineProbeKernel<'_> {
                                             row: self.build_row_id(candidate.index)?,
                                         }),
                                         error: e,
+                                        failed_at: DlqFailureStamp::now(),
                                     })));
                                 }
                             }
@@ -2124,6 +2134,7 @@ impl CombineProbeKernel<'_> {
                                         rn,
                                         matched_build: None,
                                         error: e,
+                                        failed_at: DlqFailureStamp::now(),
                                     })))
                                 }
                             }
@@ -2180,6 +2191,7 @@ impl CombineProbeKernel<'_> {
                                     rn,
                                     matched_build: Some(matched.clone()),
                                     error: e,
+                                    failed_at: DlqFailureStamp::now(),
                                 })));
                             }
                         }
@@ -2250,6 +2262,7 @@ fn dispatch_combine_output_errors(
             f.matched_build.as_ref().map(|record| (record, f.row)),
             combine_name,
             f.error,
+            f.failed_at,
         )?;
     }
     Ok(())
@@ -2796,6 +2809,13 @@ fn adopt_spilled_runs_into_node_buffer(
     Ok(())
 }
 
+/// Route one combine output-row failure to the dead-letter path: rewind the
+/// contributing sources, then park or push the probe-side trigger and, when a
+/// build row contributed, a build-side entry. `failed_at` is the stamp taken
+/// where the failure was observed, which may be a probe thread or a kernel
+/// that returned long after; the build-side entry shares its time under its
+/// own id.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_combine_output_error(
     ctx: &mut ExecutorContext<'_>,
     node_idx: NodeIndex,
@@ -2804,6 +2824,7 @@ fn dispatch_combine_output_error(
     matched_build: Option<(&Record, crate::executor::stream_event::SourceRowId)>,
     combine_name: &str,
     eval_err: cxl::eval::EvalError,
+    failed_at: DlqFailureStamp,
 ) -> Result<(), PipelineError> {
     let category = clinker_core_types::dlq::DlqErrorCategory::CombineOutputRow;
     let stage = Some(DlqEntry::stage_combine(combine_name));
@@ -2854,6 +2875,7 @@ fn dispatch_combine_output_error(
         message.clone(),
         stage.clone(),
         None,
+        failed_at,
     );
     if !routed {
         push_dlq(
@@ -2869,6 +2891,7 @@ fn dispatch_combine_output_error(
                 source_name: Arc::clone(&probe_source),
                 triggering_field,
                 triggering_value,
+                failed_at,
             },
         )?;
     }
@@ -2878,6 +2901,10 @@ fn dispatch_combine_output_error(
     // its identity travel as one pair so attribution cannot silently mix a
     // build record with an unrelated row id.
     if let Some((build_record, build_row_num)) = matched_build {
+        // One failure, two dead letters: the build side keeps the failure's
+        // time and trigger id under its own id, so it pairs with the driver
+        // row wherever it is held.
+        let build_failed_at = failed_at.sibling();
         let build_routed = record_error_to_buffer_if_grouped(
             ctx,
             build_record,
@@ -2886,6 +2913,7 @@ fn dispatch_combine_output_error(
             message.clone(),
             stage.clone(),
             None,
+            build_failed_at,
         );
         if !build_routed {
             let build_source_name = build_source
@@ -2904,6 +2932,7 @@ fn dispatch_combine_output_error(
                     source_name: build_source_name,
                     triggering_field: None,
                     triggering_value: None,
+                    failed_at: build_failed_at,
                 },
             )?;
         }

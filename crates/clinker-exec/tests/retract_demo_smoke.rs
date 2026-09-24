@@ -39,6 +39,9 @@
 //!    per-group memory budget never breaches the orchestrator's
 //!    degrade threshold.
 
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
+
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Cursor, Write};
@@ -47,6 +50,7 @@ use std::sync::{Arc, Mutex};
 
 use clinker_exec::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams};
 use clinker_plan::config::{CompileContext, PipelineConfig, parse_config};
+use dlq_sink::{CollectingDlqSink, DlqRow};
 
 #[derive(Clone, Default)]
 struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
@@ -98,7 +102,7 @@ fn read_demo_csv(name: &str) -> String {
 /// Run the demo pipeline against the supplied orders/audit_events CSV
 /// payloads. Audit events stream is held constant; orders is the dial
 /// the test turns to flip between the full input and the baseline.
-fn run_demo(orders_csv: &str, audit_events_csv: &str) -> (ExecutionReport, String) {
+fn run_demo(orders_csv: &str, audit_events_csv: &str) -> (ExecutionReport, Vec<DlqRow>, String) {
     let yaml = read_demo_yaml();
     let config: PipelineConfig = parse_config(&yaml).expect("parse demo pipeline");
 
@@ -147,9 +151,15 @@ fn run_demo(orders_csv: &str, audit_events_csv: &str) -> (ExecutionReport, Strin
         ..Default::default()
     };
 
-    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
-        .expect("demo pipeline run");
-    (report, report_buf.as_string())
+    let sink = CollectingDlqSink::new();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        dlq_sink::registry(writers, &sink),
+        &params,
+    )
+    .expect("demo pipeline run");
+    (report, sink.rows(), report_buf.as_string())
 }
 
 /// Return `csv` with every row whose first column matches `excluded`
@@ -218,8 +228,8 @@ fn demo_retract_output_matches_baseline_rerun() {
 
     let baseline_orders = drop_orders(&orders, &["O08"]);
 
-    let (retract_report, retract_output) = run_demo(&orders, &audit_events);
-    let (baseline_report, baseline_output) = run_demo(&baseline_orders, &audit_events);
+    let (retract_report, _, retract_output) = run_demo(&orders, &audit_events);
+    let (baseline_report, _, baseline_output) = run_demo(&baseline_orders, &audit_events);
 
     // Baseline still surfaces the post-aggregate dept_validate
     // triggers because their predicate fires on every HR group whose
@@ -257,27 +267,21 @@ fn demo_dlq_contains_upstream_and_post_aggregate_triggers() {
     let orders = read_demo_csv("orders.csv");
     let audit_events = read_demo_csv("audit_events.csv");
 
-    let (report, _output) = run_demo(&orders, &audit_events);
+    let (_report, rows, _output) = run_demo(&orders, &audit_events);
 
-    let upstream_trigger = report.dlq_entries.iter().find(|e| {
-        e.trigger
-            && e.stage.as_deref() == Some("transform:validate")
-            && e.original_record
-                .values()
-                .iter()
-                .any(|v| matches!(v, clinker_record::Value::String(s) if s.as_str() == "O08"))
+    let upstream_trigger = rows.iter().find(|r| {
+        r.trigger() && r.stage() == Some("transform:validate") && r.field("order_id") == Some("O08")
     });
     assert!(
         upstream_trigger.is_some(),
         "expected one upstream sentinel trigger from transform:validate carrying order_id O08, \
          got: {:?}",
-        report.dlq_entries
+        rows
     );
 
-    let post_aggregate_triggers: Vec<_> = report
-        .dlq_entries
+    let post_aggregate_triggers: Vec<_> = rows
         .iter()
-        .filter(|e| e.trigger && e.stage.as_deref() == Some("transform:dept_validate"))
+        .filter(|r| r.trigger() && r.stage() == Some("transform:dept_validate"))
         .collect();
     assert_eq!(
         post_aggregate_triggers.len(),
@@ -286,11 +290,7 @@ fn demo_dlq_contains_upstream_and_post_aggregate_triggers() {
          total is below the predicate threshold); got: {post_aggregate_triggers:?}",
     );
     for entry in &post_aggregate_triggers {
-        let department_is_hr = entry
-            .original_record
-            .values()
-            .iter()
-            .any(|v| matches!(v, clinker_record::Value::String(s) if s.as_str() == "HR"));
+        let department_is_hr = entry.field("department") == Some("HR");
         assert!(
             department_is_hr,
             "every post-aggregate trigger row belongs to the HR department; got: {entry:?}",
@@ -308,7 +308,7 @@ fn demo_retraction_counters_fire_in_the_expected_direction() {
     let orders = read_demo_csv("orders.csv");
     let audit_events = read_demo_csv("audit_events.csv");
 
-    let (report, _output) = run_demo(&orders, &audit_events);
+    let (report, _, _output) = run_demo(&orders, &audit_events);
     let r = &report.counters.retraction;
 
     // Aggregate retract path: relaxed-CK aggregator's recompute phase

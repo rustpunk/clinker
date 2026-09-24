@@ -9,6 +9,9 @@
 //! `counters.dlq_count` — the inequality the report doc promises and the
 //! strict `assert_eq!` in `per_source_dlq_counts.rs` cannot express.
 
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
+
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -52,6 +55,8 @@ pipeline:
   name: per_source_merged_dlq
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: src_a
@@ -110,9 +115,15 @@ nodes:
         HashMap::from([("out".to_string(), writer(&buf))]);
 
     let plan = config.compile(&CompileContext::default()).unwrap();
-    let report =
-        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .unwrap();
+    let sink = dlq_sink::CollectingDlqSink::new();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        dlq_sink::registry(writers, &sink),
+        &run_params(),
+    )
+    .unwrap();
+    let rows = sink.rows();
 
     // Three DLQ entries total: one real-source (the z row at the pre-aggregate
     // Transform) plus one per clean group (x, y) at the post-aggregate divide.
@@ -157,13 +168,13 @@ nodes:
         "only the single declared-source failure is attributed in the map"
     );
 
-    // Cross-check against the raw DLQ entries: exactly two entries carry the
-    // synthetic '<merged>' source name, confirming the gap is the merged
-    // rollup and not a dropped entry.
-    let merged_entries = report
-        .dlq_entries
+    // Cross-check against the written DLQ rows: every entry has a row, and
+    // exactly two carry the synthetic '<merged>' source name, confirming the
+    // gap is the merged rollup and not a dropped entry.
+    assert_eq!(rows.len() as u64, report.counters.dlq_count);
+    let merged_entries = rows
         .iter()
-        .filter(|e| e.source_name.as_ref() == "<merged>")
+        .filter(|row| row.source_name() == "<merged>")
         .count();
     assert_eq!(
         merged_entries, 2,

@@ -27,6 +27,9 @@
 //! (asserting the fixture's documented matches against the oracle) and over a
 //! generated spilling workload. The other IEJoin fixtures are parse-checked by
 //! `test_iejoin_fixtures_exist`.
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
+
 use std::collections::HashSet;
 
 use clinker_plan::config::PipelineConfig;
@@ -220,6 +223,7 @@ mod pure_range {
     use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, SourceReaders};
     use clinker_plan::config::{BackpressureKnob, CompileContext, PipelineConfig};
 
+    use super::dlq_sink;
     use super::nested_loop_oracle;
 
     /// Tight budget: small enough that the block-band external-sort threshold
@@ -233,8 +237,8 @@ mod pure_range {
     const ROOMY_LIMIT: &str = "512M";
 
     /// Outcome of one pipeline run: the primary output CSV, the total committed
-    /// spill bytes, and the count of recoverable Combine output-row failures the
-    /// run dead-lettered.
+    /// spill bytes, and the count of recoverable Combine output-row dead-letter
+    /// rows the run wrote.
     struct RunResult {
         output: String,
         spill_bytes: u64,
@@ -327,13 +331,18 @@ mod pure_range {
             batch_id: "iejoin-prop-batch".to_string(),
             ..Default::default()
         };
-        let report =
-            PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
-                .expect("pure-range pipeline must execute");
-        let combine_dlq = report
-            .dlq_entries
+        let sink = dlq_sink::CollectingDlqSink::new();
+        let report = PipelineExecutor::run_plan_with_readers_writers(
+            &plan,
+            readers,
+            dlq_sink::registry(writers, &sink),
+            &params,
+        )
+        .expect("pure-range pipeline must execute");
+        let combine_dlq = sink
+            .rows()
             .iter()
-            .filter(|e| e.category == DlqErrorCategory::CombineOutputRow)
+            .filter(|row| row.category() == Some(DlqErrorCategory::CombineOutputRow.as_str()))
             .count();
         RunResult {
             output: buf.as_string(),
@@ -1181,6 +1190,8 @@ pipeline:
   memory: { limit: "__LIMIT__", backpressure: __POLICY__ }
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: drivers

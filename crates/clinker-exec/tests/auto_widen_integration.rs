@@ -16,8 +16,10 @@ use std::sync::{Arc, Mutex};
 use clinker_exec::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams};
 use clinker_plan::config::{CompileContext, PipelineConfig, parse_config};
 
-#[path = "common/dlq_encode.rs"]
-mod dlq_encode;
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
+
+use dlq_sink::CollectingDlqSink;
 
 #[derive(Clone, Default)]
 struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
@@ -82,6 +84,36 @@ fn run_single_in_context(
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
             .expect("pipeline run");
+    (report, buf.as_string())
+}
+
+/// Like [`run_single`], with dead-letter rows collected by `sink`.
+fn run_single_collecting(
+    yaml: &str,
+    csv_input: &str,
+    sink: &Arc<CollectingDlqSink>,
+) -> (ExecutionReport, String) {
+    let config = parse_config(yaml).expect("parse pipeline yaml");
+    let plan = PipelineConfig::compile(&config, &CompileContext::default()).expect("compile");
+    let readers = HashMap::from([(
+        config.source_configs().next().unwrap().name.clone(),
+        clinker_exec::executor::single_file_reader(
+            "test.csv",
+            Box::new(Cursor::new(csv_input.as_bytes().to_vec())),
+        ),
+    )]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+        config.sink_configs().next().unwrap().name.clone(),
+        Box::new(buf.clone()) as Box<dyn Write + Send>,
+    )]);
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        dlq_sink::registry(writers, sink),
+        &test_params(),
+    )
+    .expect("pipeline run");
     (report, buf.as_string())
 }
 
@@ -843,22 +875,18 @@ fn h6b_record_round_trips_through_sort_spill() {
     }
 }
 
-// ── H7: DLQ entry carries $widened in-record; DLQ CSV strips it ──
+// ── H7: DLQ output strips the $widened sidecar ──
 
 /// A source row that fails downstream coercion (e.g. `to_int()` on a
-/// non-numeric value) gets routed to DLQ. The DLQ entry's
-/// `original_record` retains the source's auto_widen schema — the
-/// `$widened` sidecar column is part of `Record::schema()`, and the
-/// in-flight payload survives end-to-end so the failure context is
-/// preserved. The on-disk DLQ CSV (the compiled header, encoded by
-/// `dlq::DlqRowEncoder`) does NOT include the literal `$widened` column: a `Value::Map` has no
-/// canonical scalar serialization and would silently JSON-encode into
-/// a single cell, hiding routing bugs the same way the regular
-/// non-JSON writer's silent map-degrade did before commit
-/// `f5ae145`. This test locks both the in-memory DLQ entry shape
-/// AND the on-disk DLQ CSV shape simultaneously.
+/// non-numeric value) gets routed to DLQ. The DLQ output (the compiled
+/// header, encoded by `dlq::DlqRowEncoder`) does NOT include the literal
+/// `$widened` column: a `Value::Map` has no canonical scalar serialization
+/// and would silently JSON-encode into a single cell, hiding routing bugs
+/// the same way the regular non-JSON writer's silent map-degrade did before
+/// commit `f5ae145`. The user-declared columns and the rejected row's
+/// values do reach the DLQ output.
 #[test]
-fn h7_dlq_entry_carries_record_with_widened_but_dlq_csv_strips_it() {
+fn h7_dlq_output_strips_widened_sidecar() {
     let yaml = r#"
 pipeline:
   name: h7_dlq
@@ -893,7 +921,8 @@ nodes:
     include_unmapped: false
 "#;
     let csv = "id,amount,note\n1,100,ok\n2,bad,broken\n";
-    let (report, _output) = run_single(yaml, csv);
+    let sink = CollectingDlqSink::new();
+    let (report, _output) = run_single_collecting(yaml, csv, &sink);
 
     assert_eq!(
         report.counters.dlq_count, 1,
@@ -905,50 +934,29 @@ nodes:
         "exactly one ok output expected (the good row); got {}",
         report.counters.ok_count
     );
-    assert_eq!(
-        report.dlq_entries.len(),
-        1,
-        "the report exposes the DLQ entry alongside the counter"
+
+    // The on-disk DLQ header DROPS `$widened` — see
+    // `dlq_layout::dlq_user_columns` — and keeps the user-declared columns.
+    let header = sink
+        .header_for("rejected.csv")
+        .expect("the dead-letter bucket received a row");
+    assert!(
+        !header.iter().any(|c| c == "$widened"),
+        "DLQ writer must filter `$widened` from output (single point of truth in `dlq_user_columns`); got header: {header:?}"
+    );
+    assert!(
+        header.iter().any(|c| c == "id"),
+        "DLQ writer retains user-declared columns; got header: {header:?}"
+    );
+    assert!(
+        header.iter().any(|c| c == "amount"),
+        "DLQ writer retains user-declared columns; got header: {header:?}"
     );
 
-    let entry = &report.dlq_entries[0];
-
-    // The DLQ entry CARRIES the original record. The record's
-    // schema retains the auto_widen `$widened` sidecar column,
-    // so a downstream consumer driving the entry through other
-    // pipelines (or post-mortem inspection) sees the full
-    // shape — same shape as on the wire before the failure.
-    let record_schema = entry.original_record.schema();
-    assert!(
-        record_schema.contains("$widened"),
-        "DLQ entry's original_record retains the auto_widen schema shape; columns: {:?}",
-        record_schema.columns()
-    );
-
-    // The on-disk DLQ CSV DROPS `$widened` — see
-    // `dlq_layout::dlq_user_columns`. Encode the entry under the
-    // compiled plan's header, as `clinker run` does, to verify the
-    // on-disk shape.
-    let plan = PipelineConfig::compile(
-        &parse_config(yaml).expect("parse pipeline yaml"),
-        &CompileContext::default(),
-    )
-    .expect("compile");
-    let dlq_csv = dlq_encode::dlq_csv(&plan, std::slice::from_ref(entry));
-    let header_line = dlq_csv.lines().next().expect("dlq csv has header");
-    assert!(
-        !header_line.split(',').any(|c| c.trim() == "$widened"),
-        "DLQ writer must filter `$widened` from output (single point of truth in `dlq_user_columns`); got header: {header_line}"
-    );
-    // The user-declared columns DO appear in the DLQ CSV.
-    assert!(
-        header_line.split(',').any(|c| c.trim() == "id"),
-        "DLQ writer retains user-declared columns; got header: {header_line}"
-    );
-    assert!(
-        header_line.split(',').any(|c| c.trim() == "amount"),
-        "DLQ writer retains user-declared columns; got header: {header_line}"
-    );
+    let rows = sink.rows_for("rejected.csv");
+    assert_eq!(rows.len(), 1, "the one DLQ entry is written as one row");
+    assert_eq!(rows[0].field("id"), Some("2"));
+    assert_eq!(rows[0].field("amount"), Some("bad"));
 }
 
 // ── H8: include_correlation_keys does not surface $widened end-to-end ─

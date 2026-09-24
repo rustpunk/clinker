@@ -21,6 +21,9 @@
 //! claim: a regression to source-blind lineage breaks it because one
 //! source's HR contribution survives the retract.
 
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
+
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -29,6 +32,7 @@ use clinker_bench_support::io::SharedBuffer;
 use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, SourceReaders};
 use clinker_exec::source::multi_file::FileSlot;
 use clinker_plan::config::{CompileContext, parse_config};
+use dlq_sink::{CollectingDlqSink, DlqRow};
 
 fn slot(name: &str, csv: &str) -> FileSlot {
     FileSlot::new(
@@ -63,6 +67,8 @@ pipeline:
   name: two_source_relaxed_retract
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: src_a
@@ -117,11 +123,11 @@ nodes:
       include_unmapped: true
 "#;
 
-/// Successful run: counters, DLQ entries, rendered writer output, and
-/// the per-source DLQ attribution map.
+/// Successful run: counters, dead-letter rows, rendered writer output,
+/// and the per-source DLQ attribution map.
 struct RunOutput {
     counters: clinker_record::counters::PipelineCounters,
-    dlq: Vec<clinker_exec::executor::DlqEntry>,
+    dlq: Vec<DlqRow>,
     output: String,
     per_source_dlq: std::collections::BTreeMap<String, u64>,
 }
@@ -142,12 +148,17 @@ fn run_two_source(src_a_csv: &str, src_b_csv: &str) -> RunOutput {
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
         HashMap::from([("out".to_string(), writer(&buf))]);
-    let report =
-        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .expect("two-source relaxed-retract pipeline must execute");
+    let sink = CollectingDlqSink::new();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        dlq_sink::registry(writers, &sink),
+        &run_params(),
+    )
+    .expect("two-source relaxed-retract pipeline must execute");
     RunOutput {
         counters: report.counters,
-        dlq: report.dlq_entries,
+        dlq: sink.rows(),
         output: buf.as_string(),
         per_source_dlq: report.per_source_dlq_counts,
     }
@@ -233,7 +244,7 @@ B4,ENG,300
         "the post-aggregate divide-by-zero must land at least one DLQ entry"
     );
     assert!(
-        run.dlq.iter().any(|d| d.trigger),
+        run.dlq.iter().any(|d| d.trigger()),
         "the divide-by-zero on the HR aggregate row is the trigger entry"
     );
     // ENG survives intact: its total never equals 60, so the post-check
@@ -288,7 +299,7 @@ fn two_source_retract_expands_colliding_row_ids_per_source() {
         run.dlq
     );
     assert!(
-        run.dlq[0].trigger,
+        run.dlq[0].trigger(),
         "the sole DLQ entry is the divide-by-zero trigger"
     );
     assert!(

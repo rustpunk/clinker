@@ -4,7 +4,8 @@
 //! executor preserves the first N rows and routes the complete original input
 //! through the ordinary source DLQ instead of truncating silently or aborting.
 
-mod common;
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -12,13 +13,13 @@ use std::io::Cursor;
 use clinker_bench_support::io::SharedBuffer;
 use clinker_core_types::dlq::DlqErrorCategory;
 use clinker_exec::executor::{PipelineRunParams, SourceReaders};
-use clinker_record::Value;
+use dlq_sink::DlqRow;
 
 fn run(
     pipeline: &str,
     input: &[u8],
     filename: &str,
-) -> (clinker_exec::executor::ExecutionReport, String) {
+) -> (clinker_exec::executor::ExecutionReport, String, Vec<DlqRow>) {
     let config = clinker_plan::config::parse_config(pipeline).expect("pipeline parses");
     let readers: SourceReaders = HashMap::from([(
         "src".to_string(),
@@ -29,7 +30,7 @@ fn run(
         "out".to_string(),
         Box::new(output.clone()) as Box<dyn std::io::Write + Send>,
     )]);
-    let report = common::run_config(
+    let (report, dlq) = dlq_sink::run_config_with_dlq(
         &config,
         readers,
         writers,
@@ -40,15 +41,18 @@ fn run(
         },
     )
     .expect("continue strategy routes the breach and finishes");
-    (report, output.as_string())
+    (report, output.as_string(), dlq)
 }
 
+/// `raw_source_record` is the exact `_cxl_dlq_source_record` cell: the
+/// encoder's JSON text of the original decoded input.
 fn assert_common_limit_result(
     report: &clinker_exec::executor::ExecutionReport,
     output: &str,
+    dlq: &[DlqRow],
     header: &str,
     triggering_field: &str,
-    raw_shape: fn(&Value) -> bool,
+    raw_source_record: &str,
 ) {
     assert_eq!(
         output.lines().collect::<Vec<_>>(),
@@ -56,18 +60,21 @@ fn assert_common_limit_result(
         "the ceiling emits exactly four stable-order rows"
     );
     assert_eq!(report.counters.dlq_count, 1);
-    assert_eq!(report.dlq_entries.len(), 1);
-    let entry = &report.dlq_entries[0];
-    assert_eq!(entry.category, DlqErrorCategory::ExpansionLimitExceeded);
-    assert_eq!(entry.triggering_field.as_deref(), Some(triggering_field));
-    assert_eq!(entry.triggering_value, Some(Value::String("5".into())));
-    assert!(entry.error_message.contains("max_output_rows_per_input: 4"));
-    assert!(entry.error_message.contains("attempted row 5"));
+    assert_eq!(dlq.len(), 1);
+    let entry = &dlq[0];
+    assert_eq!(
+        entry.category(),
+        Some(DlqErrorCategory::ExpansionLimitExceeded.as_str())
+    );
+    assert_eq!(entry.triggering_field(), Some(triggering_field));
+    assert_eq!(entry.triggering_value(), Some("5"));
+    let detail = entry.error_detail().expect("include_reason defaults on");
+    assert!(detail.contains("max_output_rows_per_input: 4"));
+    assert!(detail.contains("attempted row 5"));
     let raw = entry
-        .original_record
-        .get("_cxl_dlq_source_record")
+        .field("_cxl_dlq_source_record")
         .expect("source rejection retains the original decoded input");
-    assert!(raw_shape(raw), "unexpected original input shape: {raw:?}");
+    assert_eq!(raw, raw_source_record, "unexpected original input");
 }
 
 #[test]
@@ -103,13 +110,19 @@ nodes:
     const INPUT: &[u8] =
         br#"[{"id":7,"left":[{"l":0},{"l":1}],"right":[{"r":0},{"r":1},{"r":2}]}]"#;
 
-    let (report, output) = run(PIPELINE, INPUT, "input.json");
+    let (report, output, dlq) = run(PIPELINE, INPUT, "input.json");
     assert_common_limit_result(
         &report,
         &output,
+        &dlq,
         "id,l,r",
         "right",
-        |raw| matches!(raw, Value::Map(map) if map.get("id") == Some(&Value::Integer(7))),
+        concat!(
+            r#"{"id":{"Integer":7},"#,
+            r#""left":{"Array":[{"Map":[["l",{"Integer":0}]]},{"Map":[["l",{"Integer":1}]]}]},"#,
+            r#""right":{"Array":[{"Map":[["r",{"Integer":0}]]},{"Map":[["r",{"Integer":1}]]},"#,
+            r#"{"Map":[["r",{"Integer":2}]]}]}}"#,
+        ),
     );
 }
 
@@ -155,12 +168,20 @@ nodes:
     )
     .as_bytes();
 
-    let (report, output) = run(PIPELINE, INPUT, "input.xml");
+    let (report, output, dlq) = run(PIPELINE, INPUT, "input.xml");
     assert_common_limit_result(
         &report,
         &output,
+        &dlq,
         "id,A.a,B.b",
         "B",
-        |raw| matches!(raw, Value::Array(occurrences) if occurrences.len() >= 6),
+        concat!(
+            r#"[{"Map":[["field",{"String":"id"}],["value",{"String":"7"}]]},"#,
+            r#"{"Map":[["field",{"String":"A.a"}],["value",{"String":"0"}]]},"#,
+            r#"{"Map":[["field",{"String":"A.a"}],["value",{"String":"1"}]]},"#,
+            r#"{"Map":[["field",{"String":"B.b"}],["value",{"String":"0"}]]},"#,
+            r#"{"Map":[["field",{"String":"B.b"}],["value",{"String":"1"}]]},"#,
+            r#"{"Map":[["field",{"String":"B.b"}],["value",{"String":"2"}]]}]"#,
+        ),
     );
 }

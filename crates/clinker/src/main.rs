@@ -756,6 +756,9 @@ fn preview_writer_registry(
         fan_out_paths: std::collections::HashMap::new(),
         output_staging: Default::default(),
         auto_commit_staged: false,
+        // Preview publishes nothing, dead letters included; the exit code
+        // reads the report's counters.
+        dlq_sink: Some(std::sync::Arc::new(clinker_exec::dlq::DiscardingDlqSink)),
     })
 }
 
@@ -3498,7 +3501,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 compile_ctx.without_overlay_ops(),
             )?;
         source_stager.cleanup(true);
-        return Ok(if report.dlq_entries.is_empty() { 0 } else { 2 });
+        return Ok(if report.counters.dlq_count > 0 { 2 } else { 0 });
     }
 
     // Every output writes to a hidden destination-local leaf admitted through
@@ -3783,12 +3786,24 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         writers.insert(output.name.clone(), writer);
     }
 
+    // Dead-letter rows stream into staged bucket files during the run; the
+    // attempt publishes them with every other artifact once the run succeeds.
+    // Each staged bucket file is one dead-letter telemetry work unit; one the
+    // run abandons while the shutdown token is requested reports interrupted.
+    let dlq_sink = std::sync::Arc::new(
+        clinker_exec::output::dlq_sink::StagedDlqSink::new(
+            output_staging.clone(),
+            telemetry_producer.clone(),
+        )
+        .with_shutdown_token(shutdown_token.clone()),
+    );
     let registry = clinker_exec::executor::WriterRegistry {
         single: writers,
         fan_out: fan_out_writers,
         fan_out_paths,
         output_staging: output_staging.clone(),
         auto_commit_staged: false,
+        dlq_sink: Some(dlq_sink.clone()),
     };
     let run_params = clinker_exec::executor::PipelineRunParams {
         execution_id: execution_id.clone(),
@@ -3915,75 +3930,48 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
     }
 
     let counters = &report.counters;
-    let dlq_entries = &report.dlq_entries;
 
-    // Write DLQ if there are entries and at least one DLQ path is
-    // configured (pipeline-wide or per-source). Same atomic
-    // temp+rename discipline as primary outputs above — operators
-    // inspecting DLQ output should never see a truncated file.
-    // The compiled plan's dead-letter layout owns the bucket rule and each
-    // bucket's header: per-source `path:` overrides get their own file,
-    // sources without one fall through to the pipeline-wide file, and every
-    // file carries the header fixed at compile time whatever failed.
+    // The executor already streamed every dead-letter row into its bucket's
+    // staged file under the header the compiled plan fixed for it, and closed
+    // its writer before returning. `finish` releases those files; they are
+    // already registered with the attempt and publish with it. An interrupted
+    // run skips this and abandons the attempt, so no dead-letter file is
+    // promoted.
     let publication_preparation = (|| -> Result<(), PipelineError> {
         if report.interrupted {
             return Ok(());
         }
-        if !dlq_entries.is_empty()
-            && let Some(layout) = compiled_plan.dlq_layout()
-        {
-            // Route each entry through the compiled bucket rule, keeping
-            // arrival order within a bucket. An entry with no bucket has no
-            // destination and is not written.
-            let mut bucket_entries: Vec<Vec<&clinker_exec::executor::DlqEntry>> =
-                vec![Vec::new(); layout.buckets().len()];
-            for entry in dlq_entries {
-                if let Some(id) = layout.bucket_for_source(&entry.source_name) {
-                    bucket_entries[id.index()].push(entry);
-                }
-            }
-            use std::io::Write as _;
-            let mut encoder = clinker_exec::dlq::DlqRowEncoder::new();
-            for (bucket, entries) in layout.buckets().iter().zip(&bucket_entries) {
-                // No file for a bucket nothing failed into.
-                if entries.is_empty() {
-                    continue;
-                }
-                let bare = bucket.path().to_path_buf();
-                let (_final_path, dlq_handle) = output_staging.stage_attempt_output(
-                    clinker_exec::output::attempt::ArtifactKind::Dlq,
-                    "dead-letter output",
-                    clinker_plan::config::IfExistsPolicy::Overwrite,
-                    false,
-                    move |n| {
-                        debug_assert!(n.is_none());
-                        Ok(bare.clone())
-                    },
-                )?;
-                let mut file = std::io::BufWriter::with_capacity(64 * 1024, dlq_handle);
-                file.write_all(encoder.header(bucket)?)
-                    .map_err(PipelineError::Io)?;
-                for entry in entries {
-                    file.write_all(encoder.row(layout, bucket, entry)?)
-                        .map_err(PipelineError::Io)?;
-                }
-                file.flush().map_err(PipelineError::Io)?;
-            }
+        let artifacts = clinker_exec::dlq::DlqSink::finish(dlq_sink.as_ref())?;
+        let staged_rows = artifacts.iter().map(|artifact| artifact.rows);
+        let counted_rows = report
+            .dead_letters
+            .bucket_rows()
+            .iter()
+            .map(|(_, rows)| *rows);
+        if !staged_rows.eq(counted_rows) {
+            return Err(PipelineError::Internal {
+                op: "dead-letter-publication",
+                node: pipeline_config.pipeline.name.clone(),
+                detail: format!(
+                    "the staged dead-letter files hold {:?} rows, the run counted {:?}",
+                    artifacts
+                        .iter()
+                        .map(|artifact| (&artifact.final_path, artifact.rows))
+                        .collect::<Vec<_>>(),
+                    report.dead_letters.bucket_rows(),
+                ),
+            });
         }
         for output in pipeline_config.sink_configs() {
             if !output.write_meta {
                 continue;
             }
             let targets = output_staging.pending_paths(&output.name);
-            let mut dlq_counts: std::collections::BTreeMap<String, u64> =
-                std::collections::BTreeMap::new();
-            for entry in dlq_entries {
-                if entry.stage.as_deref() == Some(&format!("output:{}", output.name)) {
-                    *dlq_counts
-                        .entry(format!("{:?}", entry.category))
-                        .or_default() += 1;
-                }
-            }
+            let dlq_counts: std::collections::BTreeMap<String, u64> = report
+                .dead_letters
+                .for_stage(&format!("output:{}", output.name))
+                .map(|(category, rows)| (format!("{category:?}"), rows))
+                .collect();
             let elapsed_ms = (report.finished_at - report.started_at)
                 .num_milliseconds()
                 .max(0) as u64;

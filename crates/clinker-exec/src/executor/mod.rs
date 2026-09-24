@@ -51,7 +51,7 @@ use context::{SourceRuntimePolicy, build_stable_eval_context};
 #[cfg(feature = "test-utils")]
 #[doc(hidden)]
 pub use dispatch::DispatchFaultGuard;
-pub use dlq::DlqEntry;
+pub use dlq::{DlqEntry, DlqFailureStamp};
 pub(crate) use dlq::{SourceRejectionEvent, SourceRejectionKind};
 pub use ingest::build_source_format_reader;
 use ingest::{IngestTaskOutcome, ingest_source};
@@ -149,9 +149,9 @@ pub use crate::source::{RecordSource, SourceInput};
 pub(crate) struct DispatchOutcome {
     /// Aggregate pipeline counters: total / ok / dlq / records-written.
     pub(crate) counters: PipelineCounters,
-    /// Every DLQ entry produced across every dispatcher arm, in
-    /// observation order. Empty when the run had no failures.
-    pub(crate) dlq_entries: Vec<DlqEntry>,
+    /// Dead-letter counters by stage and category, and rows written per
+    /// bucket. Bounded by the plan.
+    pub(crate) dead_letters: crate::dlq::DlqReport,
     /// Peak process RSS observed across chunk boundaries. `None` on
     /// platforms where RSS measurement is unavailable.
     pub(crate) peak_rss_bytes: Option<u64>,
@@ -239,6 +239,9 @@ struct DagExecInputs<'a> {
     params: &'a PipelineRunParams,
     /// Resolved scheduler/preview policy for this run.
     run_policy: RunPolicy,
+    /// The compiled dead-letter layout: each bucket, its header, and the rule
+    /// routing a source's rows to one. `None` without a dead-letter block.
+    dlq_layout: Option<&'a clinker_plan::plan::dlq_layout::DlqLayout>,
 }
 
 struct RunExecutionContext<'a> {
@@ -758,6 +761,7 @@ impl PipelineExecutor {
         let started_at = Utc::now();
         let output_staging = writers.output_staging.clone();
         let auto_commit_staged = writers.auto_commit_staged;
+        let dlq_sink = writers.dlq_sink.clone();
 
         let source_configs: Vec<_> = config.source_configs().cloned().collect();
         let mut sink_configs: Vec<_> = config.sink_configs().cloned().collect();
@@ -1192,6 +1196,7 @@ impl PipelineExecutor {
                 statistics: validated_plan.statistics(),
                 params,
                 run_policy,
+                dlq_layout: validated_plan.dlq_layout(),
             },
             DagExecResources {
                 writer_resources,
@@ -1223,7 +1228,7 @@ impl PipelineExecutor {
 
         let DispatchOutcome {
             counters,
-            dlq_entries,
+            dead_letters,
             peak_rss_bytes,
             mut watermarks,
             per_source_rollback_cursors,
@@ -1270,6 +1275,14 @@ impl PipelineExecutor {
                     .is_some_and(|token| !token.try_begin_publication())
             {
                 interrupted = true;
+            }
+            // The walk closed its dead-letter writer before dispatch
+            // returned. With no outer publication owner, the executor
+            // finishes the sink itself, releasing each staged bucket file
+            // complete, before those files commit with the outputs. An
+            // interrupted run commits nothing, so it skips this too.
+            if !interrupted && let Some(sink) = dlq_sink.as_deref() {
+                sink.finish()?;
             }
             if let Some(outcome) = output_staging.commit_all_if_complete(interrupted)? {
                 use crate::output::staging::PublicationOutcome;
@@ -1330,7 +1343,7 @@ impl PipelineExecutor {
 
         Ok(ExecutionReport {
             counters,
-            dlq_entries,
+            dead_letters,
             execution_summary,
             required_arena,
             peak_rss_bytes,
@@ -1372,15 +1385,14 @@ impl PipelineExecutor {
     /// the receivers via `recv` and never touches a `FormatReader`
     /// directly.
     ///
-    /// Returns `(counters, dlq_entries, peak_rss_bytes)`.
+    /// Returns the run's [`DispatchOutcome`]: counters, dead-letter report,
+    /// peak RSS and the per-source bookkeeping the report folds in.
     fn execute_dag(
         inputs: &DagExecInputs<'_>,
         resources: DagExecResources,
         collector: &mut stage_metrics::StageCollector,
         mut counters: PipelineCounters,
     ) -> Result<DispatchOutcome, PipelineError> {
-        let mut dlq_entries: Vec<DlqEntry> = Vec::new();
-
         // No prologue drain or arena build. The dispatch Source arm
         // is the first consumer of every crossbeam `Receiver`:
         // - canonicalize per record onto the source's plan-time schema,
@@ -1401,14 +1413,7 @@ impl PipelineExecutor {
             &inputs.plan.indices_to_build,
         );
 
-        Self::execute_dag_branching(
-            inputs,
-            resources,
-            &mut counters,
-            &mut dlq_entries,
-            collector,
-            window_runtime,
-        )
+        Self::execute_dag_branching(inputs, resources, &mut counters, collector, window_runtime)
     }
 
     /// Execute a branching DAG by walking nodes in topological order.
@@ -1427,7 +1432,6 @@ impl PipelineExecutor {
         inputs: &DagExecInputs<'_>,
         resources: DagExecResources,
         counters: &mut PipelineCounters,
-        dlq_entries: &mut Vec<DlqEntry>,
         collector: &mut stage_metrics::StageCollector,
         window_runtime: crate::executor::window_runtime::WindowRuntimeRegistry,
     ) -> Result<DispatchOutcome, PipelineError> {
@@ -1439,6 +1443,7 @@ impl PipelineExecutor {
             statistics,
             params,
             run_policy,
+            dlq_layout,
         } = inputs;
         let DagExecResources {
             writer_resources,
@@ -1674,6 +1679,12 @@ impl PipelineExecutor {
         // same worker set rather than spinning up a pool per operator.
         let kernel_pool = build_kernel_pool(run_policy)?;
 
+        // The walk's dead-letter writer, opened before any thread is spawned
+        // so a refusal leaves nothing to join. Rows stream through it from the
+        // first dead letter; it is closed once the walk's last dead letter is
+        // pushed, and dropped unclosed on every error return.
+        let dlq = dispatch::DlqWalkState::open(dlq_layout, writers.dlq_sink.as_deref())?;
+
         // Streaming-Output setup (issue #72). For every fused
         // `Merge.interleave → single Output` chain that satisfies the
         // eligibility predicate, take the writer out of `writers.single`
@@ -1816,7 +1827,7 @@ impl PipelineExecutor {
             fan_out_paths: writers.fan_out_paths,
             output_staging: writers.output_staging,
             counters: std::mem::take(counters),
-            dlq_entries: std::mem::take(dlq_entries),
+            dlq,
             dlq_per_source: HashMap::new(),
             total_per_source,
             records_pending_publish: 0,
@@ -2106,7 +2117,6 @@ impl PipelineExecutor {
         let collector = ctx.collector;
         let total_records: u64 = ctx.total_per_source.values().sum();
         *counters = ctx.counters;
-        *dlq_entries = ctx.dlq_entries;
 
         collector.record(transform_timer.finish(
             stage_metrics::StageName::TransformEval,
@@ -2142,6 +2152,13 @@ impl PipelineExecutor {
             _ => return Err(PipelineError::Multiple(output_errors)),
         }
 
+        // Every dead letter of the walk has been pushed: the streaming Sink
+        // threads were joined and folded above, and the document terminal
+        // sweep has run. Close the walk's writer so its rows are flushed into
+        // the staged files before the caller can publish them. A flush error
+        // fails the run.
+        ctx.dlq.close(counters.dlq_count)?;
+
         // Clean-exit teardown of the spill directory. Dropping the guard here —
         // after every operator-side spill path has been drained and the metrics
         // flushed — releases the held `.lock` and then removes the directory, in
@@ -2174,7 +2191,7 @@ impl PipelineExecutor {
         advisories.extend(ctx.truncation_ledger.advisories(ctx.sink_configs));
         Ok(DispatchOutcome {
             counters: std::mem::take(counters),
-            dlq_entries: std::mem::take(dlq_entries),
+            dead_letters: ctx.dlq.report,
             peak_rss_bytes: rss_bytes(),
             watermarks: ctx.watermarks,
             per_source_rollback_cursors: rollback_cursors,
@@ -2421,6 +2438,501 @@ nodes:
         assert_eq!(advisories.len(), 2, "{advisories:?}");
         assert!(advisories[0].contains("z_out"), "{}", advisories[0]);
         assert!(advisories[1].contains("a_out"), "{}", advisories[1]);
+    }
+
+    /// A staging registry attached to a fresh run attempt whose only
+    /// destination root is `root`, the shape the CLI hands a real run.
+    fn dead_letter_attempt_staging(
+        root: &std::path::Path,
+    ) -> crate::output::staging::OutputStagingRegistry {
+        let policy = clinker_plan::config::ClinkerToml::parse(
+            "[storage.publication]\nfailed_retention_seconds = 300\nmax_attempt_bytes = \"1MB\"\n",
+        )
+        .expect("parse publication policy")
+        .storage
+        .publication
+        .resolve(root, 1_024, 8_000_000_000)
+        .expect("resolve publication policy");
+        let now: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_millis()
+            .try_into()
+            .expect("milliseconds fit u64");
+        let attempt = crate::output::attempt::RunAttemptPublication::create(
+            policy,
+            &uuid::Uuid::now_v7().to_string(),
+            now,
+            now + 300_000,
+            vec![
+                clinker_plan::security::validate_path(std::path::Path::new("."), root, false)
+                    .expect("destination root"),
+            ],
+        )
+        .expect("create run attempt");
+        crate::output::staging::OutputStagingRegistry::for_run_attempt(attempt)
+    }
+
+    /// `[src_a, src_b] → merge → tfm → out`, where `tfm` divides by zero on
+    /// every row, under the dead-letter block `dlq`.
+    fn every_row_fails_config(dlq: &str) -> PipelineConfig {
+        clinker_plan::config::parse_config(&format!(
+            r#"
+pipeline:
+  name: walk_dead_letters
+error_handling:
+  strategy: continue
+  dlq:
+{dlq}
+nodes:
+  - type: source
+    name: src_a
+    config:
+      name: src_a
+      type: csv
+      path: a.csv
+      schema:
+        - {{ name: id, type: int }}
+        - {{ name: amt, type: int }}
+  - type: source
+    name: src_b
+    config:
+      name: src_b
+      type: csv
+      path: b.csv
+      schema:
+        - {{ name: id, type: int }}
+        - {{ name: amt, type: int }}
+  - type: merge
+    name: m
+    inputs: [src_a, src_b]
+  - type: transform
+    name: tfm
+    input: m
+    config:
+      cxl: |
+        emit id = id
+        emit ratio = amt / (amt - amt)
+  - type: sink
+    name: out
+    input: tfm
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#
+        ))
+        .expect("pipeline parses")
+    }
+
+    /// Run `config` over three `src_a` rows and four `src_b` rows, writing
+    /// dead letters through `sink` and outputs through `staging`.
+    fn run_every_row_fails(
+        config: &PipelineConfig,
+        staging: &crate::output::staging::OutputStagingRegistry,
+        sink: Arc<dyn crate::dlq::DlqSink>,
+    ) -> ExecutionReport {
+        let slot = |name: &str, csv: &str| {
+            crate::source::multi_file::FileSlot::new(
+                std::path::PathBuf::from(format!("{name}.csv")),
+                Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+            )
+        };
+        let readers: SourceReaders = HashMap::from([
+            (
+                "src_a".to_string(),
+                SourceInput::Files(vec![slot("a", "id,amt\n1,10\n2,20\n3,30\n")]),
+            ),
+            (
+                "src_b".to_string(),
+                SourceInput::Files(vec![slot("b", "id,amt\n10,1\n11,2\n12,3\n13,4\n")]),
+            ),
+        ]);
+        let writers = WriterRegistry {
+            single: HashMap::from([(
+                "out".to_string(),
+                Box::new(std::io::sink()) as Box<dyn std::io::Write + Send>,
+            )]),
+            output_staging: staging.clone(),
+            auto_commit_staged: false,
+            dlq_sink: Some(sink),
+            ..WriterRegistry::default()
+        };
+        PipelineExecutor::run_with_readers_writers(
+            config,
+            readers,
+            writers,
+            &PipelineRunParams::default(),
+        )
+        .expect("a continue-strategy run dead-letters and completes")
+    }
+
+    /// The staged bytes of the artifact whose final path is `final_path`.
+    fn staged_dead_letters(
+        staging: &crate::output::staging::OutputStagingRegistry,
+        final_path: &std::path::Path,
+    ) -> String {
+        let partial = staging
+            .partials()
+            .into_iter()
+            .find(|partial| partial.final_path == final_path)
+            .expect("the dead-letter bucket was staged");
+        std::fs::read_to_string(&partial.partial_path).expect("read the staged bucket")
+    }
+
+    #[test]
+    fn walk_dead_letters_stream_into_the_staged_sink() {
+        use crate::dlq::DlqSink as _;
+
+        let root = tempfile::tempdir().expect("destination root");
+        let dlq_path = root.path().join("dlq.csv");
+        let config = every_row_fails_config(&format!("    path: {}", dlq_path.display()));
+        let compiled = config
+            .compile(&clinker_plan::config::CompileContext::default())
+            .expect("pipeline compiles");
+        let layout = compiled.dlq_layout().expect("a DLQ block yields a layout");
+        assert_eq!(layout.buckets().len(), 1, "one pipeline-wide bucket");
+        let header = layout.buckets()[0].header().join(",");
+
+        let staging = dead_letter_attempt_staging(root.path());
+        let sink = Arc::new(crate::output::dlq_sink::StagedDlqSink::new(
+            staging.clone(),
+            None,
+        ));
+        let report = run_every_row_fails(&config, &staging, sink.clone());
+
+        assert_eq!(report.counters.dlq_count, 7, "every row dead-letters");
+        // The executor has returned and nobody has called `finish`: the rows
+        // are already in the staged file, under the compiled header.
+        let staged = staged_dead_letters(&staging, &dlq_path);
+        let lines: Vec<&str> = staged.lines().collect();
+        assert_eq!(lines.first().copied(), Some(header.as_str()), "{staged}");
+        assert_eq!(
+            lines.len(),
+            8,
+            "the header plus one row per failure: {staged}"
+        );
+        assert_eq!(
+            report.dead_letters.bucket_rows(),
+            &[(dlq_path.clone(), 7)],
+            "the report counts the rows written to the bucket"
+        );
+
+        let artifacts = sink.finish().expect("the walk writer closed before return");
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].final_path, dlq_path);
+        assert_eq!(artifacts[0].rows, report.counters.dlq_count);
+        assert!(!dlq_path.exists(), "the executor never publishes");
+    }
+
+    #[test]
+    fn no_destination_dead_letters_count_without_rows() {
+        use crate::dlq::DlqSink as _;
+
+        let root = tempfile::tempdir().expect("destination root");
+        let a_path = root.path().join("a_rejects.csv");
+        // No pipeline-wide path, and only `src_a` has its own: `src_b`'s
+        // dead letters have no destination.
+        let config = every_row_fails_config(&format!(
+            "    per_source:\n      src_a:\n        path: {}",
+            a_path.display()
+        ));
+
+        let staging = dead_letter_attempt_staging(root.path());
+        let sink = Arc::new(crate::output::dlq_sink::StagedDlqSink::new(
+            staging.clone(),
+            None,
+        ));
+        let report = run_every_row_fails(&config, &staging, sink.clone());
+
+        assert_eq!(report.counters.dlq_count, 7, "every failure counts");
+        assert_eq!(
+            report.per_source_dlq_counts,
+            BTreeMap::from([("src_a".to_string(), 3), ("src_b".to_string(), 4)])
+        );
+        let at_tfm: Vec<(clinker_core_types::dlq::DlqErrorCategory, u64)> =
+            report.dead_letters.for_stage("transform:tfm").collect();
+        assert_eq!(at_tfm.len(), 1, "{at_tfm:?}");
+        assert_eq!(at_tfm[0].1, 7, "stage and category counts include src_b");
+        assert_eq!(
+            report.dead_letters.bucket_rows(),
+            &[(a_path.clone(), 3)],
+            "only src_a's rows are written"
+        );
+
+        let staged = staged_dead_letters(&staging, &a_path);
+        assert_eq!(
+            staged.lines().count(),
+            4,
+            "header plus src_a's rows: {staged}"
+        );
+        assert!(!staged.contains("src_b"), "{staged}");
+        let artifacts = sink.finish().expect("the walk writer closed before return");
+        assert_eq!(artifacts.len(), 1, "src_b has no file");
+        assert_eq!(artifacts[0].rows, 3);
+    }
+
+    /// `src → tfm → out` under a pipeline-wide dead-letter `path`, where
+    /// `tfm` divides by `d`: a row with `d = 0` dead-letters into the bucket.
+    /// Runs `csv` with no dead-letter sink supplied.
+    fn run_without_dlq_sink(
+        dlq_path: &std::path::Path,
+        csv: &str,
+    ) -> Result<ExecutionReport, PipelineError> {
+        let config = clinker_plan::config::parse_config(&format!(
+            r#"
+pipeline:
+  name: missing_dead_letter_sink
+error_handling:
+  strategy: continue
+  dlq:
+    path: {}
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: src.csv
+      schema:
+        - {{ name: id, type: int }}
+        - {{ name: amt, type: int }}
+        - {{ name: d, type: int }}
+  - type: transform
+    name: tfm
+    input: src
+    config:
+      cxl: |
+        emit id = id
+        emit ratio = amt / d
+  - type: sink
+    name: out
+    input: tfm
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#,
+            dlq_path.display()
+        ))
+        .expect("pipeline parses");
+        let readers: SourceReaders = HashMap::from([(
+            "src".to_string(),
+            SourceInput::Files(vec![crate::source::multi_file::FileSlot::new(
+                std::path::PathBuf::from("src.csv"),
+                Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+            )]),
+        )]);
+        let writers = WriterRegistry {
+            single: HashMap::from([(
+                "out".to_string(),
+                Box::new(std::io::sink()) as Box<dyn std::io::Write + Send>,
+            )]),
+            auto_commit_staged: false,
+            ..WriterRegistry::default()
+        };
+        assert!(writers.dlq_sink.is_none(), "the caller supplies no sink");
+        PipelineExecutor::run_with_readers_writers(
+            &config,
+            readers,
+            writers,
+            &PipelineRunParams::default(),
+        )
+    }
+
+    #[test]
+    fn missing_sink_with_a_bucketed_row_is_internal() {
+        let root = tempfile::tempdir().expect("destination root");
+        let dlq_path = root.path().join("rejects.csv");
+        let error = run_without_dlq_sink(&dlq_path, "id,amt,d\n1,10,2\n2,20,0\n3,30,3\n")
+            .expect_err("a dead letter with a destination and no sink fails the run");
+        let PipelineError::Internal { op, node, detail } = &error else {
+            panic!("expected PipelineError::Internal, got {error:?}");
+        };
+        assert_eq!(*op, "dead-letter", "{error}");
+        assert_eq!(node, &dlq_path.display().to_string(), "names the bucket");
+        assert!(detail.contains("no dead-letter sink"), "{detail}");
+        assert!(
+            error.to_string().contains(&dlq_path.display().to_string()),
+            "the rendered error names the bucket path: {error}"
+        );
+        assert!(!dlq_path.exists(), "nothing is written or published");
+    }
+
+    #[test]
+    fn missing_sink_without_dead_letters_runs_clean() {
+        let root = tempfile::tempdir().expect("destination root");
+        let dlq_path = root.path().join("rejects.csv");
+        let report = run_without_dlq_sink(&dlq_path, "id,amt,d\n1,10,2\n2,20,4\n3,30,3\n")
+            .expect("a run with no dead letters needs no sink");
+        assert_eq!(report.counters.total_count, 3);
+        assert_eq!(report.counters.ok_count, 3);
+        assert_eq!(report.counters.dlq_count, 0);
+        assert!(report.dead_letters.bucket_rows().is_empty());
+        assert!(!dlq_path.exists());
+    }
+
+    /// A JSON source feeding a CSV Sink directly, which dispatches on the
+    /// buffered Sink arm. Every row's `tags` value contains the join
+    /// delimiter, so every row is a `join_values` collision at the Sink.
+    fn every_row_collides_plan(dlq_path: &std::path::Path) -> clinker_plan::plan::CompiledPlan {
+        clinker_plan::config::parse_config(&format!(
+            r#"
+pipeline:
+  name: buffered_sink_collisions
+error_handling:
+  strategy: continue
+  dlq:
+    path: {}
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: json
+      path: ./in.json
+      schema:
+        - {{ name: order_id, type: string }}
+        - {{ name: tags, type: string, multiple: true }}
+  - type: sink
+    name: out
+    input: orders
+    config:
+      name: out
+      type: csv
+      path: ./out.csv
+      mapping:
+        - order_id
+        - tags
+"#,
+            dlq_path.display()
+        ))
+        .expect("pipeline parses")
+        .compile(&clinker_plan::config::CompileContext::default())
+        .expect("pipeline compiles")
+    }
+
+    /// `rows` JSON orders, each with a tag holding the CSV join delimiter.
+    fn colliding_orders(rows: usize) -> SourceReaders {
+        let mut json = String::from("[");
+        for id in 0..rows {
+            if id > 0 {
+                json.push(',');
+            }
+            json.push_str(&format!(r#"{{"order_id":"{id}","tags":["a;b","c"]}}"#));
+        }
+        json.push(']');
+        HashMap::from([(
+            "orders".to_string(),
+            single_file_reader("in.json", Box::new(std::io::Cursor::new(json.into_bytes()))),
+        )])
+    }
+
+    #[test]
+    fn buffered_sink_collisions_stream_without_pending_entries() {
+        use crate::dlq::DlqSink as _;
+
+        const COLLISIONS: usize = 10_000;
+        let root = tempfile::tempdir().expect("destination root");
+        let dlq_path = root.path().join("dlq.csv");
+        let plan = every_row_collides_plan(&dlq_path);
+        let staging = dead_letter_attempt_staging(root.path());
+        let sink = Arc::new(crate::output::dlq_sink::StagedDlqSink::new(
+            staging.clone(),
+            None,
+        ));
+        let writers = WriterRegistry {
+            single: HashMap::from([(
+                "out".to_string(),
+                Box::new(std::io::sink()) as Box<dyn std::io::Write + Send>,
+            )]),
+            output_staging: staging.clone(),
+            auto_commit_staged: false,
+            dlq_sink: Some(sink.clone()),
+            ..WriterRegistry::default()
+        };
+        let report = PipelineExecutor::run_plan_with_readers_writers(
+            &plan,
+            colliding_orders(COLLISIONS),
+            writers,
+            &PipelineRunParams::default(),
+        )
+        .expect("collisions dead-letter under continue");
+
+        assert_eq!(report.counters.dlq_count, COLLISIONS as u64);
+        assert_eq!(report.counters.records_written, 0, "no row was written");
+        let at_sink: Vec<_> = report.dead_letters.for_stage("output:out").collect();
+        assert_eq!(
+            at_sink,
+            vec![(
+                clinker_core_types::dlq::DlqErrorCategory::MultiValueJoinCollision,
+                COLLISIONS as u64
+            )]
+        );
+        let staged = staged_dead_letters(&staging, &dlq_path);
+        assert_eq!(
+            staged.lines().count(),
+            COLLISIONS + 1,
+            "the header plus one row per collision"
+        );
+        let artifacts = sink.finish().expect("the walk writer closed before return");
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].rows, COLLISIONS as u64);
+    }
+
+    #[test]
+    fn auto_commit_publishes_dlq_with_outputs() {
+        use crate::dlq::DlqSink as _;
+
+        let root = tempfile::tempdir().expect("destination root");
+        let dlq_path = root.path().join("dlq.csv");
+        let out_path = root.path().join("out.csv");
+        let plan = every_row_collides_plan(&dlq_path);
+        let staging = dead_letter_attempt_staging(root.path());
+        let staged_out = out_path.clone();
+        let (_, out_file) = staging
+            .stage_attempt_output(
+                crate::output::attempt::ArtifactKind::Primary,
+                "out",
+                clinker_plan::config::IfExistsPolicy::Overwrite,
+                false,
+                move |_| Ok(staged_out.clone()),
+            )
+            .expect("stage the primary output");
+        let sink = Arc::new(crate::output::dlq_sink::StagedDlqSink::new(
+            staging.clone(),
+            None,
+        ));
+        let writers = WriterRegistry {
+            single: HashMap::from([(
+                "out".to_string(),
+                Box::new(out_file) as Box<dyn std::io::Write + Send>,
+            )]),
+            output_staging: staging.clone(),
+            auto_commit_staged: true,
+            dlq_sink: Some(sink.clone()),
+            ..WriterRegistry::default()
+        };
+        let report = PipelineExecutor::run_plan_with_readers_writers(
+            &plan,
+            colliding_orders(3),
+            writers,
+            &PipelineRunParams::default(),
+        )
+        .expect("an auto-commit run publishes");
+
+        assert_eq!(report.counters.dlq_count, 3);
+        let published = std::fs::read_to_string(&dlq_path).expect("the DLQ file is published");
+        assert_eq!(published.lines().count(), 4, "header plus three rows");
+        assert!(out_path.exists(), "the primary output is published with it");
+        assert!(
+            staging.partials().is_empty(),
+            "nothing is left staged after an auto-commit"
+        );
+        assert!(
+            sink.finish().is_err(),
+            "the executor finished the sink before it committed, so the caller must not"
+        );
     }
 
     mod aggregation;

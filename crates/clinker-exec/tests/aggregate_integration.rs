@@ -149,7 +149,7 @@ nodes:
 "#;
     let csv = "dept,salary\neng,100\neng,200\nsales,50\n";
     let (report, output) = run_single(yaml, csv);
-    assert_eq!(report.dlq_entries.len(), 0);
+    assert_eq!(report.counters.dlq_count, 0);
     assert_eq!(report.counters.ok_count, 2, "two output groups");
     assert_eq!(
         sorted_body_lines(&output),
@@ -208,7 +208,7 @@ nodes:
 "#;
     let csv = "dept,salary\neng,100\neng,200\neng,300\nsales,50\nsales,150\n";
     let (report, output) = run_single(yaml, csv);
-    assert_eq!(report.dlq_entries.len(), 0);
+    assert_eq!(report.counters.dlq_count, 0);
     assert_eq!(report.counters.ok_count, 2);
     assert_eq!(
         sorted_body_lines(&output),
@@ -270,7 +270,7 @@ nodes:
 "#;
     let csv = "dept,name\neng,Alice\neng,Bob\nsales,Carol\n";
     let (report, output) = run_single(yaml, csv);
-    assert_eq!(report.dlq_entries.len(), 0);
+    assert_eq!(report.counters.dlq_count, 0);
     assert_eq!(report.counters.ok_count, 2);
     // The JSON array output writes one object per group on its own line, with
     // the collected names as a native JSON array.
@@ -343,7 +343,7 @@ nodes:
 "#;
     let csv = "dept,salary,hours\neng,100,40\neng,200,20\nsales,50,40\n";
     let (report, output) = run_single(yaml, csv);
-    assert_eq!(report.dlq_entries.len(), 0);
+    assert_eq!(report.counters.dlq_count, 0);
     assert_eq!(report.counters.ok_count, 2);
     let body = sorted_body_lines(&output);
     let eng = body
@@ -414,7 +414,7 @@ nodes:
 "#;
     let csv = "amount\n10\n20\n30\n40\n";
     let (report, output) = run_single(yaml, csv);
-    assert_eq!(report.dlq_entries.len(), 0);
+    assert_eq!(report.counters.dlq_count, 0);
     assert_eq!(report.counters.ok_count, 1, "one global-fold row");
     assert_eq!(sorted_body_lines(&output), vec!["100,4".to_string()]);
 }
@@ -475,7 +475,7 @@ nodes:
 "#;
     let csv = "dept,salary\neng,100\neng,\nsales,50\n";
     let (report, output) = run_single(yaml, csv);
-    assert_eq!(report.dlq_entries.len(), 0);
+    assert_eq!(report.counters.dlq_count, 0);
     assert_eq!(report.counters.ok_count, 2);
     assert_eq!(
         sorted_body_lines(&output),
@@ -543,7 +543,7 @@ nodes:
 "#;
     let csv = "dept,salary\neng,100\neng,200\nsales,50\n";
     let (report, output) = run_single(yaml, csv);
-    assert_eq!(report.dlq_entries.len(), 0);
+    assert_eq!(report.counters.dlq_count, 0);
     assert_eq!(report.counters.ok_count, 2);
     // (100+10) + (200+10) = 320 ; 50+10 = 60
     assert_eq!(
@@ -659,8 +659,8 @@ nodes:
 "#;
     let (hash_report, hash_out) = run_single(yaml_hash, csv);
     let (stream_report, stream_out) = run_single(yaml_streaming, csv);
-    assert_eq!(hash_report.dlq_entries.len(), 0);
-    assert_eq!(stream_report.dlq_entries.len(), 0);
+    assert_eq!(hash_report.counters.dlq_count, 0);
+    assert_eq!(stream_report.counters.dlq_count, 0);
     assert_eq!(hash_report.counters.ok_count, 2);
     assert_eq!(stream_report.counters.ok_count, 2);
     assert_eq!(sorted_body_lines(&hash_out), sorted_body_lines(&stream_out));
@@ -746,7 +746,7 @@ nodes:
         2,c,500\n";
 
     let (report, out) = run_single(yaml, csv);
-    assert_eq!(report.dlq_entries.len(), 0, "no DLQ entries expected");
+    assert_eq!(report.counters.dlq_count, 0, "no DLQ entries expected");
     assert!(
         !out.is_empty() && out.lines().count() >= 2,
         "aggregate output must be non-empty (header + ≥1 group): {out}"
@@ -908,7 +908,10 @@ nodes:
     // team zeta: Zoe → count 1 (>1 false), max 'Zoe' (> 'M', true).
     let csv = "team,name\nalpha,Alice\nalpha,Bob\nzeta,Zoe\n";
     let (report, output) = run_single(yaml, csv);
-    assert_eq!(report.dlq_entries.len(), 0, "no DLQ on comparison residual");
+    assert_eq!(
+        report.counters.dlq_count, 0,
+        "no DLQ on comparison residual"
+    );
     let lines = sorted_body_lines(&output);
     // alpha,true,false  and  zeta,false,true
     assert!(
@@ -977,7 +980,7 @@ nodes:
     // dept y: 0.10 + 0.20 = 0.30; avg = 0.15 (exact).
     let csv = "dept,amount\nx,1.00\nx,1.00\nx,2.00\ny,0.10\ny,0.20\n";
     let (report, output) = run_single(yaml, csv);
-    assert_eq!(report.dlq_entries.len(), 0, "no DLQ entries");
+    assert_eq!(report.counters.dlq_count, 0, "no DLQ entries");
     assert_eq!(report.counters.ok_count, 2, "two output groups");
     assert_eq!(
         sorted_body_lines(&output),
@@ -1037,7 +1040,7 @@ nodes:
 "#;
     let csv = "dept,amount\nx,1.00\nx,1.00\nx,2.00\ny,0.10\ny,0.20\n";
     let (report, output) = run_single(yaml, csv);
-    assert_eq!(report.dlq_entries.len(), 0, "no DLQ entries");
+    assert_eq!(report.counters.dlq_count, 0, "no DLQ entries");
     assert_eq!(report.counters.ok_count, 2, "two output groups");
     assert_eq!(
         sorted_body_lines(&output),
@@ -1092,7 +1095,7 @@ nodes:
 "#;
     let csv = "dept,amount\nx,1.00\nx,1.00\nx,2.00\ny,0.10\ny,0.20\n";
     let (report, output) = run_single(yaml, csv);
-    assert_eq!(report.dlq_entries.len(), 0, "no DLQ entries");
+    assert_eq!(report.counters.dlq_count, 0, "no DLQ entries");
     assert!(
         output.contains(r#""average":"1.33""#),
         "ndjson must carry the rounded avg for dept x: {output}"
@@ -1156,8 +1159,7 @@ nodes:
     let csv = "dept,amount\nx,1.00\nx,1.00\nx,2.00\n";
     let (report, output) = run_single(yaml, csv);
     assert_eq!(
-        report.dlq_entries.len(),
-        0,
+        report.counters.dlq_count, 0,
         "the rounded avg fits the field — no error/DLQ"
     );
     assert_eq!(report.counters.ok_count, 1, "one output group");
