@@ -47,7 +47,7 @@ use clinker_record::owned_storage::SharedStorage;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use clinker_record::{GroupByKey, Record, Schema, Value};
+use clinker_record::{FieldMetadata, GroupByKey, Record, Schema, Value};
 use cxl::eval::{EvalContext, EvalResult, ProgramEvaluator};
 use petgraph::graph::NodeIndex;
 
@@ -954,15 +954,12 @@ fn process_group(
             if let Some(synth) = rule.synth.as_mut() {
                 let mut new_row = match synth.copy_from {
                     CopyFrom::Trigger => clone_into_schema(record, output_schema),
-                    // Born sized to the full output schema (upstream cols +
-                    // the three `$meta.*` audit cols) so each override lands
-                    // in its schema-indexed slot. Binding guarantees a
-                    // `copy_from: none` rule overrides every user column, so
-                    // no `Null` survives below.
-                    CopyFrom::None => Record::new(
-                        output_schema.clone(),
-                        vec![Value::Null; output_schema.column_count()],
-                    ),
+                    // Only the user columns start null: binding guarantees a
+                    // `copy_from: none` rule overrides every one of them. The
+                    // row still derives from its trigger, so it keeps the
+                    // trigger's `$source.*` identity just as it borrows the
+                    // trigger's `SourceRowId` below.
+                    CopyFrom::None => project_into_schema(record, output_schema, is_source_stamp),
                 };
                 for (field, evaluator) in synth.overrides.iter_mut() {
                     let value = eval_scalar(evaluator, &eval_ctx, record, field)
@@ -1137,11 +1134,43 @@ fn sort_group(
 /// Re-key a record onto the (audit-widened) output schema, carrying every
 /// matching column value through and defaulting new columns to null.
 fn clone_into_schema(record: &Record, schema: &SharedStorage<clinker_record::Schema>) -> Record {
+    project_into_schema(record, schema, |_| true)
+}
+
+/// Re-key a record onto the (audit-widened) output schema, carrying through
+/// the value of each output column whose metadata `carry` admits and that the
+/// record also has. Every other column starts null. The one re-keying path
+/// for Reshape output rows, so an original, a `copy_from: trigger` row and a
+/// `copy_from: none` row cannot disagree on how a carried column is read.
+fn project_into_schema(
+    record: &Record,
+    schema: &SharedStorage<clinker_record::Schema>,
+    carry: impl Fn(Option<&FieldMetadata>) -> bool,
+) -> Record {
     let mut values = Vec::with_capacity(schema.column_count());
-    for col in schema.columns() {
-        values.push(record.get(col.as_ref()).cloned().unwrap_or(Value::Null));
+    for (idx, col) in schema.columns().iter().enumerate() {
+        let value = if carry(schema.field_metadata(idx)) {
+            record.get(col.as_ref()).cloned()
+        } else {
+            None
+        };
+        values.push(value.unwrap_or(Value::Null));
     }
     Record::new(schema.clone(), values)
+}
+
+/// The engine's per-record source identity stamps: `$source.file`,
+/// `$source.name` and `$source.event_time`. A synthesized row inherits these
+/// from its trigger whatever its `copy_from`, so it is attributed to the
+/// trigger's Source downstream (dead-letter routing, per-source counters and
+/// `$source.*` reads) rather than to the unstamped `<merged>` stand-in.
+fn is_source_stamp(meta: Option<&FieldMetadata>) -> bool {
+    matches!(
+        meta,
+        Some(
+            FieldMetadata::SourceFile | FieldMetadata::SourceName | FieldMetadata::SourceEventTime
+        )
+    )
 }
 
 /// Write the three `$meta.*` audit columns onto a row.

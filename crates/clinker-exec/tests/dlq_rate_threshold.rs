@@ -8,7 +8,6 @@
 //! attribution and the per-source threshold can be exercised in
 //! isolation against `src_b`'s denominator.
 
-use clinker_record::owned_storage::SharedStorage;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -18,6 +17,9 @@ use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, SourceReaders}
 use clinker_exec::source::multi_file::FileSlot;
 use clinker_plan::config::{CompileContext, parse_config};
 use clinker_plan::error::PipelineError;
+
+#[path = "common/dlq_encode.rs"]
+mod dlq_encode;
 
 fn slot(name: &str, csv: &str) -> FileSlot {
     FileSlot::new(
@@ -287,74 +289,65 @@ error_handling:
     assert_eq!(report.counters.dlq_count, 5);
 }
 
-/// AC4: per-source `path:` partitions DLQ entries into their own
-/// sidecar file. The `partition_dlq_entries` helper drives the CLI
-/// flush loop; this test exercises the partitioner directly so the
-/// routing semantics are pinned independent of the I/O layer.
+/// AC4: a per-source `path:` routes that Source's dead-lettered rows to a
+/// sidecar file of their own, while a Source without an override falls
+/// through to the pipeline-wide file. Routing is the compiled plan's
+/// dead-letter layout, the one rule the CLI publishes through; the run's
+/// real entries are encoded under the header that layout fixed.
 #[test]
 fn per_source_path_partitions_dlq_entries() {
-    use std::path::PathBuf;
-    use std::sync::Arc;
-
-    use clinker_core_types::dlq::DlqErrorCategory;
-    use clinker_exec::dlq::partition_dlq_entries;
-    use clinker_exec::executor::{DlqEntry, SourceRowId};
-    use clinker_plan::config::{DlqConfig, DlqPerSourceConfig};
-    use clinker_plan::plan::{EntityRef, PlanNodeId};
-    use clinker_record::{Record, Schema, Value};
-
-    let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into()])));
-    let mk = |src: &str| DlqEntry {
-        source_row: SourceRowId::new(PlanNodeId::new(0), 0),
-        category: DlqErrorCategory::TypeCoercionFailure,
-        error_message: String::new(),
-        original_record: Record::new(schema.clone(), vec![Value::Integer(0)]),
-        stage: None,
-        route: None,
-        trigger: true,
-        source_name: Arc::from(src),
-        triggering_field: None,
-        triggering_value: None,
-    };
-    let entries = vec![mk("src_a"), mk("src_b"), mk("src_a"), mk("src_b")];
-
-    let mut per_source = std::collections::BTreeMap::new();
-    per_source.insert(
-        "src_b".to_string(),
-        DlqPerSourceConfig {
-            path: Some("dlq_b.csv".to_string()),
-            max_rate: None,
-            min_records: None,
-        },
+    let yaml = fail_src_b_yaml(
+        r#"
+error_handling:
+  strategy: continue
+  dlq:
+    path: dlq.csv
+    per_source:
+      src_b:
+        path: dlq_b.csv
+"#,
     );
-    let cfg = DlqConfig {
-        path: Some("dlq.csv".to_string()),
-        include_reason: None,
-        include_source_row: None,
-        max_rate: None,
-        min_records: None,
-        per_source,
-    };
+    let config = parse_config(&yaml).unwrap();
+    let plan = config.compile(&CompileContext::default()).unwrap();
+    let layout = plan.dlq_layout().expect("a DLQ block yields a layout");
+    assert_eq!(layout.buckets().len(), 2);
 
-    let buckets = partition_dlq_entries(&entries, &cfg);
-    let dlq_bucket = buckets
+    let wide = layout.bucket_for_source("src_a").expect("src_a routes");
+    assert!(layout.is_fallback(wide));
+    assert_eq!(layout.bucket(wide).path(), PathBuf::from("dlq.csv"));
+    let own = layout.bucket_for_source("src_b").expect("src_b routes");
+    assert_ne!(own, wide);
+    assert_eq!(layout.bucket(own).path(), PathBuf::from("dlq_b.csv"));
+    assert_eq!(layout.sources_for(own).collect::<Vec<_>>(), ["src_b"]);
+
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
+        HashMap::from([("out".to_string(), writer(&buf))]);
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        five_each_readers(),
+        writers,
+        &run_params(),
+    )
+    .expect("pipeline must complete under Continue strategy");
+    assert_eq!(report.dlq_entries.len(), 5, "5 src_b rows fail");
+
+    // Every failure is src_b's, so every row lands in src_b's own file and
+    // none in the pipeline-wide one.
+    let csv = dlq_encode::dlq_csv(&plan, &report.dlq_entries);
+    let mut lines = csv.lines();
+    let header: Vec<&str> = lines.next().expect("header").split(',').collect();
+    assert_eq!(header, layout.bucket(own).header());
+    let name_col = header
         .iter()
-        .find(|(p, _)| p == &PathBuf::from("dlq.csv"))
-        .expect("default bucket must exist");
-    assert_eq!(dlq_bucket.1.len(), 2);
+        .position(|c| *c == "_cxl_dlq_source_name")
+        .expect("source-name column");
+    let rows: Vec<&str> = lines.collect();
+    assert_eq!(rows.len(), 5);
     assert!(
-        dlq_bucket
-            .1
-            .iter()
-            .all(|e| e.source_name.as_ref() == "src_a")
+        rows.iter()
+            .all(|row| row.split(',').nth(name_col) == Some("src_b"))
     );
-
-    let b_bucket = buckets
-        .iter()
-        .find(|(p, _)| p == &PathBuf::from("dlq_b.csv"))
-        .expect("per-source bucket must exist");
-    assert_eq!(b_bucket.1.len(), 2);
-    assert!(b_bucket.1.iter().all(|e| e.source_name.as_ref() == "src_b"));
 }
 
 /// E317: `per_source` map key that does not name a declared Source

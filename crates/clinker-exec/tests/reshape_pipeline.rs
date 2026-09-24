@@ -547,6 +547,96 @@ fn copy_from_none_synthesizes_fully_overridden_row() {
     assert_eq!(counters.ok_count, 2, "both source rows emit clean");
 }
 
+/// `copy_from: none` pipeline read back through a Transform that surfaces
+/// the engine's `$source.*` identity of every Reshape output row.
+const COPY_FROM_NONE_SOURCE_IDENTITY_PIPELINE: &str = r#"
+pipeline:
+  name: reshape_copy_from_none_source_identity
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: csv
+      path: test.csv
+      schema:
+        - { name: id, type: string }
+        - { name: amount, type: int }
+        - { name: label, type: string }
+  - type: reshape
+    name: emit_summary
+    input: rows
+    config:
+      partition_by: [id]
+      rules:
+        - name: summarize_big
+          when: "amount > 100"
+          synthesize:
+            copy_from: none
+            overrides:
+              id: "id"
+              amount: "amount * 2"
+              label: "'synthetic-summary'"
+  - type: transform
+    name: identify
+    input: emit_summary
+    config:
+      cxl: |
+        emit id = id
+        emit label = label
+        emit origin = $source.name
+        emit origin_file = $source.file
+  - type: sink
+    name: out
+    input: identify
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+
+#[test]
+fn copy_from_none_synthesized_row_carries_trigger_source_identity() {
+    // Only the user columns of a `copy_from: none` row come from `overrides`;
+    // the row still derives from its trigger, so it reports the trigger's
+    // Source and file rather than the `<merged>` stand-in an unstamped row
+    // resolves to.
+    let csv = "id,amount,label\n\
+               A,150,original\n\
+               B,50,original\n";
+    let (_, dlq, output) = run_reshape(COPY_FROM_NONE_SOURCE_IDENTITY_PIPELINE, csv).unwrap();
+    assert!(dlq.is_empty(), "no DLQ entries expected, got {dlq:?}");
+
+    let mut lines = output.lines();
+    let header: Vec<&str> = lines.next().expect("header line").split(',').collect();
+    let rows: Vec<HashMap<&str, &str>> = lines
+        .filter(|line| !line.is_empty())
+        .map(|line| header.iter().copied().zip(line.split(',')).collect())
+        .collect();
+    let row_for = |id: &str, label: &str| -> &HashMap<&str, &str> {
+        rows.iter()
+            .find(|row| row["id"] == id && row["label"] == label)
+            .unwrap_or_else(|| panic!("row {id}/{label} is emitted: {output}"))
+    };
+    let trigger = row_for("A", "original");
+    let synthesized = row_for("A", "synthetic-summary");
+
+    assert_eq!(
+        trigger["origin"], "rows",
+        "the trigger reports its Source: {output}"
+    );
+    assert_eq!(
+        synthesized["origin"], trigger["origin"],
+        "the synthesized row reports its trigger's `$source.name`: {output}"
+    );
+    assert_eq!(
+        synthesized["origin_file"], trigger["origin_file"],
+        "the synthesized row reports its trigger's `$source.file`: {output}"
+    );
+}
+
 /// SCD pipeline parameterized on the pipeline-level `memory.limit`, with the
 /// `spill` backpressure policy so a sub-baseline limit forces the disk path
 /// instead of being rejected as unsatisfiable (a producer-pausing policy

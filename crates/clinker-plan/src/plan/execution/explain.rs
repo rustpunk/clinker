@@ -14,6 +14,7 @@ use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Serialize, Serializer};
 
 use crate::config::{PipelineConfig, RouteMode};
+use crate::plan::dlq_layout::DlqLayout;
 
 /// Walk `config.nodes` in declaration order and yield each
 /// expression-bearing node's `(name, cxl_source)` pair for the
@@ -1967,6 +1968,11 @@ pub struct ExplainJson<'a> {
     /// `storage_summary` key is omitted entirely rather than emitted as
     /// `null`.
     storage_summary: Option<StorageSummaryJson>,
+    /// Every dead-letter file with its compiled header, at parity with the
+    /// text `=== Dead-Letter Output ===` section. `None` when the pipeline
+    /// has no `error_handling.dlq` block or the view was built without the
+    /// layout, in which case the `dead_letter` key is omitted.
+    dead_letter: Option<DeadLetterExplainJson>,
 }
 
 impl<'a> ExplainJson<'a> {
@@ -1979,7 +1985,16 @@ impl<'a> ExplainJson<'a> {
             dag,
             statistics,
             storage_summary: None,
+            dead_letter: None,
         }
+    }
+
+    /// Attach the compiled dead-letter layout so the JSON output lists each
+    /// dead-letter file, the sources routed to it and its header. `None`
+    /// (no DLQ block) leaves the `dead_letter` key out.
+    pub fn with_dead_letter_layout(mut self, layout: Option<&DlqLayout>) -> Self {
+        self.dead_letter = layout.map(DeadLetterExplainJson::from_layout);
+        self
     }
 
     /// Attach the storage observability summary so the JSON `--explain`
@@ -2135,13 +2150,82 @@ pub struct StagingFileJson {
     pub reuse: Option<String>,
 }
 
+/// Label the text section prints for the pipeline-wide dead-letter file in
+/// place of (or ahead of) `per_source` names.
+const DEAD_LETTER_FALLBACK_LABEL: &str = "(pipeline-wide fallback)";
+
+/// Render the `=== Dead-Letter Output ===` section of the text `--explain`:
+/// for each dead-letter file, in bucket order, its authored path, the
+/// sources routed to it and the CSV header the compiled plan fixed for it.
+///
+/// The pipeline-wide file is labelled `(pipeline-wide fallback)`: it takes
+/// every row whose Source has no `per_source.<name>.path` override and every
+/// row attributed to no Source. Plan-only; reads no data.
+pub fn dead_letter_explain_text(layout: &DlqLayout) -> String {
+    let mut out = String::from("=== Dead-Letter Output ===\n\n");
+    for (id, bucket) in layout.iter() {
+        let mut sources: Vec<&str> = Vec::new();
+        if layout.is_fallback(id) {
+            sources.push(DEAD_LETTER_FALLBACK_LABEL);
+        }
+        sources.extend(layout.sources_for(id));
+        out.push_str(&format!("  {}\n", bucket.path().display()));
+        out.push_str(&format!("    sources: {}\n", sources.join(", ")));
+        out.push_str(&format!("    columns: {}\n", bucket.header().join(", ")));
+    }
+    out.push('\n');
+    out
+}
+
+/// Dead-letter layout for the JSON `--explain` output, at parity with
+/// [`dead_letter_explain_text`].
+#[derive(Debug, Clone, Serialize)]
+pub struct DeadLetterExplainJson {
+    /// One entry per dead-letter file, in bucket order.
+    pub buckets: Vec<DeadLetterBucketJson>,
+}
+
+impl DeadLetterExplainJson {
+    /// Structured view of every bucket in `layout`.
+    pub fn from_layout(layout: &DlqLayout) -> Self {
+        let buckets = layout
+            .iter()
+            .map(|(id, bucket)| DeadLetterBucketJson {
+                path: bucket.path().to_string_lossy().into_owned(),
+                sources: layout.sources_for(id).map(String::from).collect(),
+                fallback: layout.is_fallback(id),
+                header: bucket.header().to_vec(),
+            })
+            .collect();
+        Self { buckets }
+    }
+}
+
+/// One dead-letter file in the JSON `--explain` output.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeadLetterBucketJson {
+    /// The authored path that names the file.
+    pub path: String,
+    /// The `per_source` names whose override routes here, sorted. Sources
+    /// that fall through to the pipeline-wide file are not listed.
+    pub sources: Vec<String>,
+    /// `true` for the pipeline-wide file: every Source without an override,
+    /// and every row attributed to no Source, lands here.
+    pub fallback: bool,
+    /// The complete CSV header fixed at compile time, `_cxl_dlq_*` engine
+    /// columns first.
+    pub header: Vec<String>,
+}
+
 impl<'a> Serialize for ExplainJson<'a> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         // schema_version + nodes + node_properties, plus storage_summary
-        // when the CLI threaded the storage context through.
+        // when the CLI threaded the storage context through and dead_letter
+        // when the pipeline has a DLQ block.
         let writer_boundaries = writer_boundary_explain_views(self.dag);
         let entry_count = 3
             + usize::from(self.storage_summary.is_some())
+            + usize::from(self.dead_letter.is_some())
             + usize::from(!writer_boundaries.is_empty());
         let mut map = serializer.serialize_map(Some(entry_count))?;
         map.serialize_entry("schema_version", "1")?;
@@ -2240,6 +2324,10 @@ impl<'a> Serialize for ExplainJson<'a> {
         // without storage context.
         if let Some(summary) = &self.storage_summary {
             map.serialize_entry("storage_summary", summary)?;
+        }
+        // Omitted (not `null`) when the pipeline has no DLQ block.
+        if let Some(dead_letter) = &self.dead_letter {
+            map.serialize_entry("dead_letter", dead_letter)?;
         }
         map.end()
     }

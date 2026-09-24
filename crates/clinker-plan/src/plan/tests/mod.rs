@@ -12,6 +12,7 @@ mod cull_validation;
 mod dag;
 mod dedup_node_rooted;
 mod deferred_region;
+mod dlq_layout;
 mod doc_paths;
 mod dup_body_node_name;
 mod envelope_synthesis;

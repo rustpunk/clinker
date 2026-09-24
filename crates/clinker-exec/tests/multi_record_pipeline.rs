@@ -17,6 +17,9 @@ use clinker_exec::executor::{PipelineExecutor, PipelineRunParams};
 use clinker_exec::source::multi_file::FileSlot;
 use clinker_plan::config::{CompileContext, parse_config};
 
+#[path = "common/dlq_encode.rs"]
+mod dlq_encode;
+
 /// A three-record-type fixed-width payment file: one `H` header (batch id), two
 /// `D` detail rows (id + amount), and a `T` trailer claiming 2 body records.
 const PAYMENTS_OK: &str = "HBATCH0001\nD00001 100\nD00002 200\nT00002    \n";
@@ -786,10 +789,8 @@ fn run_record_dlq(fixture: &str) -> (clinker_exec::executor::ExecutionReport, St
     let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
         .expect("record-grained E345 must reject one row and continue");
 
-    let mut dlq = Vec::new();
-    clinker_exec::dlq::write_dlq(&mut dlq, &report.dlq_entries, true, true)
-        .expect("serialize record-grained DLQ");
-    (report, out.as_string(), String::from_utf8(dlq).unwrap())
+    let dlq = dlq_encode::dlq_csv(&plan, &report.dlq_entries);
+    (report, out.as_string(), dlq)
 }
 
 #[test]

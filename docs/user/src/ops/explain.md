@@ -63,6 +63,39 @@ bounded spill path. `boundary_mode` names the physical write path.
 `per_source_file` is an independent order for each fan-out destination. The
 section is absent when no terminal order was authored.
 
+### Dead-letter output
+
+When the pipeline has an `error_handling.dlq` block, the text output ends with
+a `=== Dead-Letter Output ===` section. It lists every DLQ file the run can
+write, with the header the compiled plan fixed for it, so you can check the
+columns before any data is read:
+
+```text
+=== Dead-Letter Output ===
+
+  rejects.csv
+    sources: (pipeline-wide fallback)
+    columns: _cxl_dlq_id, _cxl_dlq_timestamp, _cxl_dlq_source_file, _cxl_dlq_source_name, _cxl_dlq_source_row, _cxl_dlq_triggering_field, _cxl_dlq_triggering_value, _cxl_dlq_error_category, _cxl_dlq_error_detail, _cxl_dlq_stage, _cxl_dlq_route, _cxl_dlq_trigger, order_id, order_total, _cxl_dlq_source_record
+  refunds_rejects.csv
+    sources: refunds
+    columns: _cxl_dlq_id, _cxl_dlq_timestamp, _cxl_dlq_source_file, _cxl_dlq_source_name, _cxl_dlq_source_row, _cxl_dlq_triggering_field, _cxl_dlq_triggering_value, _cxl_dlq_error_category, _cxl_dlq_error_detail, _cxl_dlq_stage, _cxl_dlq_route, _cxl_dlq_trigger, refund_id, refund_amount, reason, _cxl_dlq_source_record
+```
+
+Each entry gives:
+
+- **The path** that names the file, as written in the YAML.
+- **`sources`**: the Sources whose `per_source.<name>.path` routes to this
+  file. The pipeline-wide `path` is labelled `(pipeline-wide fallback)`: it
+  takes the rows of every Source without a `per_source` path, and rows that
+  carry no Source identity.
+- **`columns`**: the file's complete header, in order. A row that lacks one of
+  these columns writes an empty cell.
+
+The files are listed with the pipeline-wide file first, then each
+`per_source` file in Source-name order. The section is absent when the
+pipeline has no `dlq` block. How the columns are chosen is described in
+[Error Handling](../pipelines/error-handling.md#how-the-dlq-columns-are-chosen).
+
 ## JSON format
 
 ```bash
@@ -84,6 +117,34 @@ An authored Sink order adds a `writer_boundaries` array. Each entry carries the
 Sink name, structured `terminal_order` fields and directions, the
 `terminal_order_label`, `disposition`, optional `proven_by`, `boundary_mode`,
 and `partition_scope`. The key is omitted when no Sink declares an order.
+
+A pipeline with an `error_handling.dlq` block adds a `dead_letter` object with
+the same information as the text [dead-letter section](#dead-letter-output).
+Its `buckets` array has one entry per DLQ file, in the same order:
+
+```json
+"dead_letter": {
+  "buckets": [
+    {
+      "path": "rejects.csv",
+      "sources": [],
+      "fallback": true,
+      "header": ["_cxl_dlq_id", "_cxl_dlq_timestamp", "...", "order_id", "order_total", "_cxl_dlq_source_record"]
+    },
+    {
+      "path": "refunds_rejects.csv",
+      "sources": ["refunds"],
+      "fallback": false,
+      "header": ["_cxl_dlq_id", "_cxl_dlq_timestamp", "...", "refund_id", "refund_amount", "reason", "_cxl_dlq_source_record"]
+    }
+  ]
+}
+```
+
+`sources` lists the `per_source` names routed to the file. `fallback` is
+`true` for the pipeline-wide file. `header` is the complete header, including
+the `_cxl_dlq_*` columns (shortened to `"..."` above). The key is omitted when
+the pipeline has no `dlq` block.
 
 ```bash
 # Compare plans before and after a config change

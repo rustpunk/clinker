@@ -817,7 +817,8 @@ fn drive_record_source(
         // without fabricating a declared record layout. The source-order
         // barrier can therefore spill and merge every kind in one
         // ordinal-ordered stream.
-        let rejection_schema = build_source_rejection_schema(&reader_schema);
+        let rejection_schema =
+            clinker_plan::plan::dlq_layout::source_rejection_schema(&reader_schema);
 
         // Fallback `$source.file` for records whose reader exposes no
         // per-record file identity (`current_source_file() == None`):
@@ -1605,40 +1606,6 @@ fn close_open_levels(
         )?;
     }
     Ok(())
-}
-
-const SOURCE_RAW_RECORD_COLUMN: &str = "_cxl_dlq_source_record";
-
-/// Build the one source-rejection schema shared by declared-type, reader-
-/// classification, and fan-out-ceiling failures. Its fixed shape lets the
-/// ordered-source barrier spill a mixed rejection stream without assuming
-/// every rejected attempt had a declared record type.
-fn build_source_rejection_schema(
-    reader_schema: &SharedStorage<clinker_record::Schema>,
-) -> SharedStorage<clinker_record::Schema> {
-    let mut builder =
-        clinker_record::SchemaBuilder::with_capacity(reader_schema.column_count() + 4);
-    for (idx, column) in reader_schema.columns().iter().enumerate() {
-        builder = match reader_schema.field_metadata(idx) {
-            Some(metadata) => builder.with_field_meta(column.as_ref(), metadata.clone()),
-            None => builder.with_field(column.as_ref()),
-        };
-    }
-    builder
-        .with_field(SOURCE_RAW_RECORD_COLUMN)
-        .with_field_meta(
-            clinker_plan::config::pipeline_node::SOURCE_FILE_COLUMN,
-            clinker_record::FieldMetadata::source_file(),
-        )
-        .with_field_meta(
-            clinker_plan::config::pipeline_node::SOURCE_NAME_COLUMN,
-            clinker_record::FieldMetadata::source_name(),
-        )
-        .with_field_meta(
-            clinker_plan::config::pipeline_node::SOURCE_EVENT_TIME_COLUMN,
-            clinker_record::FieldMetadata::source_event_time(),
-        )
-        .build()
 }
 
 /// Stamp one rejected attempt onto the shared rejection schema. `body_values`
