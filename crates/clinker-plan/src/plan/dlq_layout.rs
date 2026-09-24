@@ -148,8 +148,10 @@ impl DlqLayout {
         bodies: &CompositionBodies,
         dlq: Option<&DlqConfig>,
         strategy: ErrorStrategy,
-    ) -> Option<DlqLayout> {
-        let dlq = dlq?;
+    ) -> Result<Option<DlqLayout>, String> {
+        let Some(dlq) = dlq else {
+            return Ok(None);
+        };
         let mut layout = bucket_rule(dlq);
         let engine = engine_columns(layout.include_reason);
         let mut union: Vec<ColumnUnion> = (0..layout.buckets.len())
@@ -178,7 +180,7 @@ impl DlqLayout {
             bucket.header = engine.clone();
             bucket.header.extend(bucket.user_columns.iter().cloned());
         }
-        Some(layout)
+        Ok(Some(layout))
     }
 }
 

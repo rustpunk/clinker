@@ -2502,7 +2502,17 @@ impl PipelineConfig {
             }
         }
 
-        let plan = CompiledPlan::from_compile(dag, runtime_config, bound_schemas, artifacts);
+        let plan = match CompiledPlan::from_compile(dag, runtime_config, bound_schemas, artifacts) {
+            Ok(plan) => plan,
+            Err(detail) => {
+                diags.push(Diagnostic::error(
+                    "E000",
+                    format!("internal error: {detail}"),
+                    LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                ));
+                return Err(diags);
+            }
+        };
         Ok((plan, diags))
     }
 

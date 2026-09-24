@@ -214,7 +214,7 @@ impl CompiledPlan {
         config: PipelineConfig,
         bound_schemas: IndexMap<String, SourceSchema>,
         artifacts: CompileArtifacts,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let pipeline_hash = config.source_hash;
         let CompileArtifacts {
             composition_bodies,
@@ -240,8 +240,8 @@ impl CompiledPlan {
             &composition_bodies,
             config.error_handling.dlq.as_ref(),
             config.error_handling.strategy,
-        );
-        Self {
+        )?;
+        Ok(Self {
             dag,
             config,
             composition_bodies,
@@ -254,7 +254,7 @@ impl CompiledPlan {
             output_rows,
             dlq_layout,
             cxl_modules,
-        }
+        })
     }
 
     pub fn dag(&self) -> &ExecutionPlanDag {
