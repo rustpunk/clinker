@@ -315,6 +315,8 @@ Registrations are scoped to the state they mirror, not to the run: each wrapper 
 
 Window-runtime arenas (the columnar backing store that analytic-window evaluation reads from) are attributed but not independently spillable: an arena is immutable once built and is freed only indirectly, when the operator that consumes its windows drains to disk. Its wrapper reports the arena's bytes so the arbitrator's attribution is complete, but ranks last among spill victims so a policy never elects an arena while any consumer that can actually pause or spill remains.
 
+Under `dlq_granularity: document` the run-scoped document state registers one consumer for the ledgers that record, per rejected document, which rows have been dead-lettered, so a row held by several Sinks is written once. A ledger is a compressed row set, one per Source and document, keyed by absolute row ordinal. It is exact dedup state, so it cannot spill and ranks last: each admission is charged its worst-case growth and preflighted against the hard limit, and growth past it fails the run with E310 (`Arena`). At the end of every rejection pass, and every 65,536 admissions within one, the ledger is compressed and its charge replaced by a bound on the compressed heap. The consumer is unregistered when the run's context drops.
+
 ### Per-operator arbitration parameters
 
 Each registered consumer carries two parameters the active policy reads: a **spill priority** (lower is spilled first under `Priority`) and a **back-pressure flag** (whether its producer can be paused instead). The defaults are:
@@ -335,6 +337,7 @@ Each registered consumer carries two parameters the active policy reads: a **spi
 | credential registry | last | false |
 | transient scan materialization | last | false |
 | window arena | last | false |
+| document dead-letter ledger | last | false |
 
 A consumer whose state cannot spill is listed as charged-only in `crates/clinker-exec/tests/memory_consumer_inventory.rs` with the approval that allows it.
 

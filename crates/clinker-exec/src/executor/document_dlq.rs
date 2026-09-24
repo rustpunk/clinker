@@ -205,9 +205,11 @@ const FAILED_DOCUMENT_BYTES: u64 = 3 * (std::mem::size_of::<(DocKey, FailedDocum
 /// Roaring splits the ordinals into 65,536-value containers and keeps each as
 /// a sorted array (2 bytes per value), a bitmap (8 KiB) or a list of runs,
 /// whichever is smaller once the treemap is optimized. A contiguous document
-/// settles to one run per container, a few dozen bytes; no shape costs more
-/// than about 2 bytes per recorded row plus a container header of a few dozen
-/// bytes per 65,536 rows of the document.
+/// settles to one run per container, a few dozen bytes. No settled container
+/// is charged more than about 16 KiB for its 65,536 ordinals (an array of
+/// 4,096 values with vector growth), which is under a quarter of a byte per
+/// row of the document, plus a header of a few dozen bytes; before a settle
+/// each admission is charged at most [`MAX_ADMISSION_BYTES`].
 ///
 /// The ledger is exact dedup state and does not spill. Its charge is an upper
 /// bound on its heap: each admission is charged its worst-case growth (at

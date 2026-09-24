@@ -50,7 +50,7 @@ Existing normal dependencies are intentional evidence:
 
 - Workspace/internal: `clinker-core-types`, `clinker-plan`, `clinker-record`, `clinker-format`, `cxl`.
 - Runtime/concurrency: `crossbeam-channel`, `rayon`, `arc-swap`, `fs4`, `ctrlc` on native targets.
-- Data/error/support: `serde`, `serde_json`, `serde-saphyr`, `indexmap`, `hashbrown`, `ahash`, `chrono`, `regex`, `thiserror`, `miette`, `tracing`.
+- Data/error/support: `serde`, `serde_json`, `serde-saphyr`, `indexmap`, `hashbrown`, `ahash`, `chrono`, `regex`, `thiserror`, `miette`, `tracing`, `roaring`.
 - Spill/storage/runtime utilities: `tempfile`, `lz4_flex`, `postcard`, `blake3`, `uuid`, `glob`, `walkdir`, `csv`, `petgraph`, `libc`, `windows-sys`.
 - Test/bench only or feature-gated: `criterion`, `insta`, `proptest`, `serial_test`, `clinker-channel`, and `clinker-bench-support`.
 

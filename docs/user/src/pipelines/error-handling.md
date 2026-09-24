@@ -189,7 +189,13 @@ DLQ files use does not grow with the number of failures.
   [`dlq_granularity: document`](#document-level-dlq), records are held until
   their group or document is decided. That is those features' own state,
   described in their sections, not DLQ output; the rows they dead-letter are
-  then written like any other.
+  then written like any other. Under `dlq_granularity: document` the engine
+  also keeps, for each rejected document, a compressed record of which rows
+  it has already written, so a row held by several Sinks is written once.
+  That record is charged to the memory budget. A rejected document whose
+  rows are contiguous costs about 2 KiB; no document costs more than that
+  plus about 2 bytes per row. It cannot spill: if it would pass the memory
+  limit, the run fails with E310.
 
 Disk bounds how much DLQ output a run can produce: the free space at the
 staging location, and the publication attempt's byte ceiling
@@ -570,11 +576,13 @@ Clean documents in the same run stream through untouched, and records from sibli
 
 **Sinks run last.** Every Sink runs after every other node, so a document's verdict is final before any Sink writes one of its records. `--explain` lists the Sinks last. Dead-letter rows that other nodes write directly come before the rows a Sink writes.
 
+**Several Sinks.** Each record of a rejected document appears in the DLQ once, however many Sinks it reached. The copy written is the one held by the first Sink, in run order, that held the record. A record that reached only a later Sink (a Route sent it there, say) is written by that Sink. Every collateral, whichever Sink writes it, names the document's root-cause entry in `_cxl_dlq_trigger_id`.
+
 This is the document-shaped analogue of [correlation keys](#correlation-key): use it when partial processing of a document (an EDI interchange, a batch file with a header/trailer) is worse than rejecting the whole document. Unlike correlation keys, which group across files by a key value, document-level DLQ scopes rejection to a single document's records.
 
 **Document grain.** The document is the **outermost** level — the source file. For a flat format (CSV, JSON, plain XML) each input file is one document. For a nested-envelope format (an X12 `ISA → GS → ST` interchange, an EDIFACT `UNB → UNG → UNH`) the document is the whole **interchange / file**, not an inner functional group or transaction set: a failure anywhere in the interchange rejects the entire interchange, including the transaction sets that validated cleanly. Reject the inner-level grain instead by partitioning the input so each interchange is its own file is not currently offered — the grain is fixed at the file.
 
-**DLQ rate.** Every emitted entry — the trigger and each collateral — counts toward the configured DLQ `max_rate`, matching the correlated-collateral precedent. A rejected 1000-record document contributes 1000 DLQ entries. It does **not** affect [`type_error_threshold`](#type-error-threshold), whose numerator contains only declared source-type failures.
+**DLQ rate.** Each dead-lettered record — the trigger and each collateral — counts once toward the configured DLQ `max_rate`, matching the correlated-collateral precedent, however many Sinks held it. `dlq_count` never counts a record that `ok_count` also counts: no Sink writes a record of a rejected document. A rejected 1000-record document contributes 1000 when every one of its records reaches a Sink. It does **not** affect [`type_error_threshold`](#type-error-threshold), whose numerator contains only declared source-type failures.
 
 **Memory.** The engine buffers each open document's records until its boundary, then flushes the document clean to the sink or rejects it and drops the buffer. Peak memory scales with the **concurrently-open** documents, not the total input; a single very large document spills its buffer to disk under the run's memory budget rather than holding everything in RAM. See [Streaming vs blocking](../ops/streaming-vs-blocking.md) for the spill model.
 
