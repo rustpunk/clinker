@@ -573,4 +573,28 @@ impl CapturedDlqRow {
         cell.parse()
             .unwrap_or_else(|_| panic!("_cxl_dlq_source_row must be an ordinal; got {cell:?}"))
     }
+
+    /// The header and the cells, with the cell of each column named in
+    /// `columns` replaced by a fixed token.
+    ///
+    /// For byte-identity comparisons that ignore generated columns: the
+    /// encoder writes a row as a pure function of its header and cells, so
+    /// two runs whose masked rows are equal wrote the same bytes outside the
+    /// masked columns. A name the header lacks masks nothing.
+    pub(crate) fn masked(&self, columns: &[&str]) -> (Vec<String>, Vec<String>) {
+        const MASK: &str = "<masked>";
+        let cells = self
+            .header
+            .iter()
+            .zip(&self.cells)
+            .map(|(name, cell)| {
+                if columns.contains(&name.as_str()) {
+                    MASK.to_owned()
+                } else {
+                    cell.clone()
+                }
+            })
+            .collect();
+        (self.header.to_vec(), cells)
+    }
 }

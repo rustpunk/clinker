@@ -1291,9 +1291,11 @@ fn block_band_dlq_order_is_identical_across_memory_limits() {
     // (driver order, driver_idx, BUILD input index) — must make the dead-letter
     // row order a pure function of the data, identical at both limits.
     //
-    // A driver's failures all share its source_row, so a source_row-only
-    // projection is blind to the third (build input index) sort component.
-    // Capture each build-side entry's band INPUT INDEX instead — the band side's
+    // A build-side entry reports its own band's source_row, not its driver's,
+    // so the build projection groups each build-side entry under the
+    // source_row of the trigger entry immediately before it — the driver whose
+    // failure wrote it. Within that group, capture each build-side entry's band
+    // INPUT INDEX (and assert its source_row is that index plus one) — the band side's
     // `lo` key is a non-monotonic permutation of that index (see
     // `dlq_bands_csv`), so the kernel emits a driver's builds in `lo`-key order,
     // which the block slicing keeps layout-invariant but which is NOT the input
@@ -1307,8 +1309,8 @@ fn block_band_dlq_order_is_identical_across_memory_limits() {
     // layout-dependent difference in trigger routing cannot hide behind a
     // collateral-only view, and the collateral (build-side) entries' band
     // input indices, which pin the third sort component.
-    // (source_row, trigger) for every CombineOutputRow entry; (source_row,
-    // band input index) for the collateral subset.
+    // (source_row, trigger) for every CombineOutputRow entry; (preceding
+    // trigger's source_row, band input index) for the collateral subset.
     type DlqSequences = (Vec<(u64, bool)>, Vec<(u64, u64)>);
     let dlq_sequences = |limit: u64| -> DlqSequences {
         let arb = no_op_arbitrator(limit);
@@ -1327,21 +1329,30 @@ fn block_band_dlq_order_is_identical_across_memory_limits() {
             })
             .collect();
         let full: Vec<(u64, bool)> = rows.iter().map(|e| (e.source_row(), e.trigger())).collect();
-        let builds: Vec<(u64, u64)> = rows
-            .iter()
-            .filter(|e| !e.trigger())
-            .map(|e| {
-                let band = match e.field("band_id") {
-                    Some(band) if !band.is_empty() => band.to_string(),
-                    other => panic!("a build-side DLQ entry must carry band_id; got {other:?}"),
-                };
-                let idx = band
-                    .strip_prefix('b')
-                    .and_then(|d| d.parse::<u64>().ok())
-                    .unwrap_or_else(|| panic!("band_id must be b<input-index>; got {band:?}"));
-                (e.source_row(), idx)
-            })
-            .collect();
+        let mut builds: Vec<(u64, u64)> = Vec::new();
+        let mut driver_row: Option<u64> = None;
+        for e in &rows {
+            if e.trigger() {
+                driver_row = Some(e.source_row());
+                continue;
+            }
+            let band = match e.field("band_id") {
+                Some(band) if !band.is_empty() => band.to_string(),
+                other => panic!("a build-side DLQ entry must carry band_id; got {other:?}"),
+            };
+            let idx = band
+                .strip_prefix('b')
+                .and_then(|d| d.parse::<u64>().ok())
+                .unwrap_or_else(|| panic!("band_id must be b<input-index>; got {band:?}"));
+            assert_eq!(
+                e.source_row(),
+                idx + 1,
+                "build-side entry {band} must report its own band's source_row, not its driver's"
+            );
+            let driver_row =
+                driver_row.expect("a build-side DLQ entry follows the trigger entry it pairs with");
+            builds.push((driver_row, idx));
+        }
         (full, builds)
     };
 

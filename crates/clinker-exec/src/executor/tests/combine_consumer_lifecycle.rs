@@ -85,7 +85,7 @@ fn run(
 /// Compile `yaml` and return the strategy the planner stamped on the
 /// combine node named `combine_name` — the guard that keeps each test
 /// honest about which branch it actually exercises.
-fn compiled_combine_strategy(yaml: &str, combine_name: &str) -> CombineStrategy {
+pub(super) fn compiled_combine_strategy(yaml: &str, combine_name: &str) -> CombineStrategy {
     let config = clinker_plan::config::parse_config(yaml).expect("parse pipeline YAML");
     let validated = config
         .compile(&clinker_plan::config::CompileContext::default())
