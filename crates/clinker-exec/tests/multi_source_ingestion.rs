@@ -29,8 +29,10 @@ use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, SourceReaders}
 use clinker_exec::source::multi_file::FileSlot;
 use clinker_plan::config::{CompileContext, parse_config};
 
-#[path = "common/dlq_encode.rs"]
-mod dlq_encode;
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
+
+use dlq_sink::CollectingDlqSink;
 
 fn slot(name: &str, csv: &str) -> FileSlot {
     FileSlot::new(
@@ -337,27 +339,32 @@ nodes:
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
         HashMap::from([("out".to_string(), writer(&buf))]);
 
-    let report =
-        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .expect("pipeline must complete under Continue strategy");
+    let sink = CollectingDlqSink::new();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        dlq_sink::registry(writers, &sink),
+        &run_params(),
+    )
+    .expect("pipeline must complete under Continue strategy");
     assert_eq!(report.counters.dlq_count, 3);
 
-    // Encode the DLQ vector under the compiled plan's header and read the
-    // header + body back to assert column-level attribution.
-    let csv = dlq_encode::dlq_csv(&plan, &report.dlq_entries);
-    let mut lines = csv.lines();
-    let header: Vec<&str> = lines.next().unwrap().split(',').collect();
-    let name_col = header
-        .iter()
-        .position(|c| *c == "_cxl_dlq_source_name")
-        .expect("DLQ header must carry _cxl_dlq_source_name");
-    let rows: Vec<&str> = lines.collect();
+    // Read the header and the rows the executor wrote to assert
+    // column-level attribution.
+    let header = sink
+        .header_for("rejected.csv")
+        .expect("the dead-letter bucket received rows");
+    assert!(
+        header.iter().any(|c| c == "_cxl_dlq_source_name"),
+        "DLQ header must carry _cxl_dlq_source_name"
+    );
+    let rows = sink.rows_for("rejected.csv");
     assert_eq!(rows.len(), 3);
     for row in rows {
-        let cells: Vec<&str> = row.split(',').collect();
         assert_eq!(
-            cells[name_col], "src_b",
-            "every DLQ row must attribute to src_b; got row: {row}"
+            row.source_name(),
+            "src_b",
+            "every DLQ row must attribute to src_b; got row: {row:?}"
         );
     }
 }

@@ -7,6 +7,11 @@
 #[path = "common/pipeline_resource_fixtures.rs"]
 mod resource_fixtures;
 
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
+
+use dlq_sink::{CollectingDlqSink, DlqRow};
+
 use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues, SharedStorage};
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -121,20 +126,25 @@ fn native_values() -> Vec<Value> {
     ]
 }
 
+/// Run to completion: the report, the Sink output, and the dead-letter rows.
 fn run(
     csv: &str,
     schema: &str,
     error_handling: &str,
-) -> Result<(ExecutionReport, String), PipelineError> {
-    let (result, output) = execute(csv, schema, error_handling);
-    result.map(|report| (report, output.as_string()))
+) -> Result<(ExecutionReport, String, Vec<DlqRow>), PipelineError> {
+    let (result, output, dlq) = execute(csv, schema, error_handling);
+    result.map(|report| (report, output.as_string(), dlq))
 }
 
 fn execute(
     csv: &str,
     schema: &str,
     error_handling: &str,
-) -> (Result<ExecutionReport, PipelineError>, SharedBuffer) {
+) -> (
+    Result<ExecutionReport, PipelineError>,
+    SharedBuffer,
+    Vec<DlqRow>,
+) {
     execute_with_source_options(csv, schema, error_handling, "")
 }
 
@@ -143,7 +153,11 @@ fn execute_with_source_options(
     schema: &str,
     error_handling: &str,
     source_options: &str,
-) -> (Result<ExecutionReport, PipelineError>, SharedBuffer) {
+) -> (
+    Result<ExecutionReport, PipelineError>,
+    SharedBuffer,
+    Vec<DlqRow>,
+) {
     let yaml = format!(
         r#"
 pipeline:
@@ -186,11 +200,17 @@ nodes:
     )
 }
 
+/// Run `yaml`, returning the run result, the Sink output, and every
+/// dead-letter row written, including the rows of a failed run.
 fn execute_yaml(
     yaml: &str,
     readers: SourceReaders,
     params: PipelineRunParams,
-) -> (Result<ExecutionReport, PipelineError>, SharedBuffer) {
+) -> (
+    Result<ExecutionReport, PipelineError>,
+    SharedBuffer,
+    Vec<DlqRow>,
+) {
     let config = parse_config(yaml).expect("fixture must parse");
     let plan = config
         .compile(&CompileContext::default())
@@ -198,8 +218,14 @@ fn execute_yaml(
     let output = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
         HashMap::from([("out".to_string(), Box::new(output.clone()) as _)]);
-    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params);
-    (report, output)
+    let sink = CollectingDlqSink::new();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        dlq_sink::registry(writers, &sink),
+        &params,
+    );
+    (report, output, sink.rows())
 }
 
 fn continuing() -> &'static str {
@@ -420,25 +446,23 @@ fn declared_type_edge_matrix() {
 
     let raw = format!("{}\n\tprivate-tail", "x".repeat(300));
     let csv = format!("id,quantity\nbad,\"{raw}\"\n");
-    let (report, _) = run(
+    let (_, _, dlq) = run(
         &csv,
         "        - { name: id, type: string }\n        - { name: quantity, type: int }",
         continuing(),
     )
     .expect("continuing strategy must retain the complete rejected payload");
-    let entry = &report.dlq_entries[0];
-    assert_eq!(
-        entry.original_record.get("quantity"),
-        Some(&Value::String(raw.clone().into()))
-    );
-    assert!(entry.error_message.contains("original_bytes=314"));
-    assert_eq!(entry.error_message.lines().count(), 1);
-    assert!(!entry.error_message.contains("private-tail"));
+    let entry = &dlq[0];
+    assert_eq!(entry.field("quantity"), Some(raw.as_str()));
+    let detail = entry.error_detail().expect("include_reason defaults on");
+    assert!(detail.contains("original_bytes=314"));
+    assert_eq!(detail.lines().count(), 1);
+    assert!(!detail.contains("private-tail"));
 }
 
 #[test]
 fn coercion_malformed_value_enters_one_error_population() {
-    let (report, output) = run(
+    let (report, output, dlq) = run(
         "id,quantity\nbad,not-an-int\ngood,42\n",
         "        - { name: id, type: string }\n        - { name: quantity, type: int }",
         continuing(),
@@ -446,7 +470,7 @@ fn coercion_malformed_value_enters_one_error_population() {
     .expect("continue must route the bad row and finish");
 
     assert_eq!(report.counters.dlq_count, 1);
-    assert_eq!(report.dlq_entries.len(), 1);
+    assert_eq!(dlq.len(), 1);
     assert!(output.contains("good,42"), "valid row missing: {output}");
     assert!(
         !output.contains("not-an-int"),
@@ -456,7 +480,7 @@ fn coercion_malformed_value_enters_one_error_population() {
 
 #[test]
 fn coercion_empty_values_follow_declared_nullability() {
-    let (report, output) = run(
+    let (report, output, _) = run(
         "id,text,optional_count,required_count\n1,,,3\n2,,,\n",
         concat!(
             "        - { name: id, type: int }\n",
@@ -478,7 +502,7 @@ fn coercion_empty_values_follow_declared_nullability() {
 
 #[test]
 fn coercion_precision_overflow_rounding_and_date_bounds_are_fail_closed() {
-    let (report, output) = run(
+    let (report, output, _) = run(
         concat!(
             "id,whole,amount,day\n",
             "min,-9223372036854775808,12.34,0001-01-01\n",
@@ -513,7 +537,7 @@ fn coercion_precision_overflow_rounding_and_date_bounds_are_fail_closed() {
 
 #[test]
 fn coercion_rfc3339_datetimes_normalize_offsets_and_reject_invalid_values() {
-    let (report, output) = run(
+    let (report, output, dlq) = run(
         concat!(
             "id,opened_at\n",
             "utc,2026-01-31T08:27:00Z\n",
@@ -532,7 +556,7 @@ fn coercion_rfc3339_datetimes_normalize_offsets_and_reject_invalid_values() {
     .expect("continue must retain valid RFC 3339 datetimes");
 
     assert_eq!(report.counters.dlq_count, 3);
-    assert_eq!(report.dlq_entries.len(), 3);
+    assert_eq!(dlq.len(), 3);
     assert!(
         output.lines().any(|line| line == "utc,2026-01-31T08:27:00"),
         "{output}",
@@ -561,7 +585,7 @@ fn threshold_allows_exact_ratio_and_aborts_just_above() {
   dlq:
     path: rejected.csv
   type_error_threshold: 0.5"#;
-    let (report, _) = run(
+    let (report, _, _) = run(
         "id,quantity\ngood,1\nbad,nope\n",
         "        - { name: id, type: string }\n        - { name: quantity, type: int }",
         at_boundary,
@@ -569,7 +593,7 @@ fn threshold_allows_exact_ratio_and_aborts_just_above() {
     .expect("an exact threshold ratio does not exceed the limit");
     assert_eq!(report.counters.dlq_count, 1);
 
-    let (report, _) = run(
+    let (report, _, _) = run(
         "id,quantity\ngood-a,1\ngood-b,2\nbad,nope\n",
         "        - { name: id, type: string }\n        - { name: quantity, type: int }",
         at_boundary,
@@ -609,7 +633,7 @@ fn threshold_allows_exact_ratio_and_aborts_just_above() {
   dlq:
     path: rejected.csv
   type_error_threshold: 1.0"#;
-    let (report, _) = run(
+    let (report, _, _) = run(
         "id,quantity\nbad-a,nope\nbad-b,still-nope\n",
         "        - { name: id, type: string }\n        - { name: quantity, type: int }",
         one,
@@ -633,27 +657,21 @@ fn ordered_attempt_staging_preserves_complete_population_identity_and_payload() 
   dlq:
     path: rejected.csv
   type_error_threshold: 0.5"#;
-    let (result, output) = execute_with_source_options(
+    let (result, output, dlq) = execute_with_source_options(
         "id,quantity\nb,2\nbad,not-an-int\na,1\n",
         "        - { name: id, type: string }\n        - { name: quantity, type: int }",
         handling,
         "      sort_order: [id]",
     );
 
-    let report = result.expect(
+    result.expect(
         "the ordered file's complete 1/3 rejected population must be admitted before effects",
     );
-    assert_eq!(report.dlq_entries.len(), 1);
-    let rejected = &report.dlq_entries[0];
-    assert_eq!(rejected.source_row.ordinal(), 2);
-    assert_eq!(
-        rejected.original_record.get("id"),
-        Some(&Value::String("bad".into()))
-    );
-    assert_eq!(
-        rejected.original_record.get("quantity"),
-        Some(&Value::String("not-an-int".into()))
-    );
+    assert_eq!(dlq.len(), 1);
+    let rejected = &dlq[0];
+    assert_eq!(rejected.source_row(), 2);
+    assert_eq!(rejected.field("id"), Some("bad"));
+    assert_eq!(rejected.field("quantity"), Some("not-an-int"));
 
     let output = output.as_string();
     let rows = output.lines().skip(1).collect::<Vec<_>>();
@@ -683,7 +701,7 @@ fn ten_attempt_csv(rejected: usize) -> String {
 #[test]
 fn ordered_threshold_uses_complete_attempt_population() {
     let schema = "        - { name: id, type: string }\n        - { name: quantity, type: int }";
-    let (at_boundary, output) = execute_with_source_options(
+    let (at_boundary, output, _) = execute_with_source_options(
         &ten_attempt_csv(1),
         schema,
         ordered_threshold_handling(),
@@ -694,7 +712,7 @@ fn ordered_threshold_uses_complete_attempt_population() {
     assert_eq!(report.counters.dlq_count, 1);
     assert_eq!(output.as_string().lines().skip(1).count(), 9);
 
-    let (just_over, output) = execute_with_source_options(
+    let (just_over, output, _) = execute_with_source_options(
         &ten_attempt_csv(2),
         schema,
         ordered_threshold_handling(),
@@ -753,7 +771,7 @@ nodes:
             Box::new(Cursor::new(ten_attempt_csv(1).into_bytes())),
         )]),
     )]);
-    let (transform, output) = execute_yaml(
+    let (transform, output, _) = execute_yaml(
         &transform_yaml,
         transform_readers,
         PipelineRunParams::default(),
@@ -820,7 +838,7 @@ nodes:
             )]),
         ),
     ]);
-    let (merge, output) = execute_yaml(&merge_yaml, merge_readers, PipelineRunParams::default());
+    let (merge, output, _) = execute_yaml(&merge_yaml, merge_readers, PipelineRunParams::default());
     let merge = merge.expect("fused Merge must apply each ordered population exactly once");
     assert_eq!(merge.per_source_record_counts.get("src_a"), Some(&10));
     assert_eq!(merge.per_source_record_counts.get("src_b"), Some(&1));
@@ -881,7 +899,7 @@ nodes:
                 Box::new(Cursor::new(csv.into_bytes())),
             )]),
         )]);
-        let (report, output) = execute_yaml(&yaml, readers, PipelineRunParams::default());
+        let (report, output, _) = execute_yaml(&yaml, readers, PipelineRunParams::default());
         (
             report.expect("ordered attempt spill run"),
             output.as_string(),
@@ -1020,7 +1038,7 @@ nodes:
     };
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
-        let (report, output) = execute_yaml(yaml, readers, params);
+        let (report, output, _) = execute_yaml(yaml, readers, params);
         let _ = done_tx.send((report, output.as_string()));
     });
 
@@ -1094,30 +1112,25 @@ fn strategies_fail_closed_and_continue_keeps_full_dlq_evidence() {
     let schema = "        - { name: id, type: string }\n        - { name: quantity, type: int }";
     let csv = "id,quantity\nbad,not-an-int\ngood,42\n";
 
-    let (failed, fail_fast_output) = execute(csv, schema, "");
+    let (failed, fail_fast_output, _) = execute(csv, schema, "");
     let message = failed
         .expect_err("fail_fast must abort on the first declared-type error")
         .to_string();
     assert!(message.contains("E126"), "{message}");
     assert!(!fail_fast_output.as_string().contains("not-an-int"));
 
-    let (report, output) = run(csv, schema, continuing()).expect("continue strategy finishes");
-    assert_eq!(report.dlq_entries.len(), 1);
-    let entry = &report.dlq_entries[0];
-    assert_eq!(
-        entry.original_record.get("quantity"),
-        Some(&clinker_record::Value::String("not-an-int".into()))
-    );
-    assert_eq!(
-        entry.triggering_value,
-        Some(clinker_record::Value::String("not-an-int".into()))
-    );
-    assert!(entry.error_message.contains("source=\"src\""));
-    assert!(entry.error_message.contains("file=\"input.csv\""));
-    assert!(entry.error_message.contains("row=1"));
-    assert!(entry.error_message.contains("column=2"));
-    assert!(entry.error_message.contains("field=\"quantity\""));
-    assert!(entry.error_message.contains("declared_type=Int"));
+    let (_, output, dlq) = run(csv, schema, continuing()).expect("continue strategy finishes");
+    assert_eq!(dlq.len(), 1);
+    let entry = &dlq[0];
+    assert_eq!(entry.field("quantity"), Some("not-an-int"));
+    assert_eq!(entry.triggering_value(), Some("not-an-int"));
+    let detail = entry.error_detail().expect("include_reason defaults on");
+    assert!(detail.contains("source=\"src\""));
+    assert!(detail.contains("file=\"input.csv\""));
+    assert!(detail.contains("row=1"));
+    assert!(detail.contains("column=2"));
+    assert!(detail.contains("field=\"quantity\""));
+    assert!(detail.contains("declared_type=Int"));
     assert!(!output.contains("not-an-int"), "{output}");
     assert!(output.contains("good,42"), "{output}");
 }
@@ -1128,8 +1141,8 @@ fn diagnostic_preview_respects_255_256_257_byte_boundaries_without_raw_tail() {
     for length in [255usize, 256] {
         let value = "x".repeat(length);
         let csv = format!("quantity\n{value}\n");
-        let (report, _) = run(&csv, schema, continuing()).expect("continue routes error");
-        let diagnostic = &report.dlq_entries[0].error_message;
+        let (_, _, dlq) = run(&csv, schema, continuing()).expect("continue routes error");
+        let diagnostic = dlq[0].error_detail().expect("include_reason defaults on");
         assert!(
             diagnostic.contains(&format!("preview=\"{value}\" original_bytes={length}")),
             "{diagnostic}"
@@ -1138,8 +1151,8 @@ fn diagnostic_preview_respects_255_256_257_byte_boundaries_without_raw_tail() {
 
     let value = "x".repeat(257);
     let csv = format!("quantity\n{value}\n");
-    let (report, _) = run(&csv, schema, continuing()).expect("continue routes error");
-    let diagnostic = &report.dlq_entries[0].error_message;
+    let (_, _, dlq) = run(&csv, schema, continuing()).expect("continue routes error");
+    let diagnostic = dlq[0].error_detail().expect("include_reason defaults on");
     let expected = format!("preview=\"{}…\" original_bytes=257", "x".repeat(253));
     assert!(diagnostic.contains(&expected), "{diagnostic}");
     assert!(
@@ -1152,13 +1165,13 @@ fn diagnostic_preview_respects_255_256_257_byte_boundaries_without_raw_tail() {
 fn diagnostic_preview_is_single_line_and_escapes_control_and_delimiter_tokens() {
     let value = "bad\r\n\t\\[]{}<>|\u{0085}\u{202e}";
     let csv = format!("quantity\n\"{value}\"\n");
-    let (report, _) = run(
+    let (_, _, dlq) = run(
         &csv,
         "        - { name: quantity, type: int }",
         continuing(),
     )
     .expect("continue routes error");
-    let diagnostic = &report.dlq_entries[0].error_message;
+    let diagnostic = dlq[0].error_detail().expect("include_reason defaults on");
 
     assert_eq!(diagnostic.lines().count(), 1, "{diagnostic:?}");
     for token in [
@@ -1186,7 +1199,7 @@ fn diagnostic_preview_is_single_line_and_escapes_control_and_delimiter_tokens() 
 
 #[test]
 fn strategy_fail_fast_aborts_without_emitting_a_replacement() {
-    let (result, output) = execute(
+    let (result, output, _) = execute(
         "id,quantity\nbad,not-an-int\ngood,42\n",
         "        - { name: id, type: string }\n        - { name: quantity, type: int }",
         "",
@@ -1207,7 +1220,7 @@ fn strategy_continue_preserves_full_dlq_evidence_only() {
     let strategy = "continue";
     let error_handling =
         format!("error_handling:\n  strategy: {strategy}\n  dlq:\n    path: rejected.csv");
-    let (report, output) = run(
+    let (report, output, dlq) = run(
         "id,quantity,context\nbad,not-an-int,full evidence\ngood,42,ok\n",
         concat!(
             "        - { name: id, type: string }\n",
@@ -1219,18 +1232,12 @@ fn strategy_continue_preserves_full_dlq_evidence_only() {
     .unwrap_or_else(|error| panic!("{strategy} must finish through the DLQ: {error}"));
 
     assert_eq!(report.counters.dlq_count, 1, "{strategy}");
-    let entry = &report.dlq_entries[0];
-    assert_eq!(entry.source_row.ordinal(), 1, "{strategy}");
-    assert_eq!(entry.source_name.as_ref(), "src", "{strategy}");
-    assert_eq!(entry.triggering_field.as_deref(), Some("quantity"));
-    assert_eq!(
-        entry.original_record.get("quantity"),
-        Some(&clinker_record::Value::String("not-an-int".into()))
-    );
-    assert_eq!(
-        entry.original_record.get("context"),
-        Some(&clinker_record::Value::String("full evidence".into()))
-    );
+    let entry = &dlq[0];
+    assert_eq!(entry.source_row(), 1, "{strategy}");
+    assert_eq!(entry.source_name(), "src", "{strategy}");
+    assert_eq!(entry.triggering_field(), Some("quantity"));
+    assert_eq!(entry.field("quantity"), Some("not-an-int"));
+    assert_eq!(entry.field("context"), Some("full evidence"));
     assert!(!output.contains("not-an-int"), "{strategy}: {output}");
     assert!(output.contains("good,42,ok"), "{strategy}: {output}");
 }
@@ -1250,21 +1257,19 @@ fn strategy_continuing_type_error_requires_an_explicit_dlq() {
 fn preview_is_bounded_without_leaking_the_raw_coercion_message() {
     let raw = "x".repeat(400);
     let csv = format!("id,quantity\nbad,{raw}\n");
-    let (report, _) = run(
+    let (_, _, dlq) = run(
         &csv,
         "        - { name: id, type: string }\n        - { name: quantity, type: int }",
         continuing(),
     )
     .expect("continue must retain full evidence only in the DLQ record");
-    let entry = &report.dlq_entries[0];
-    assert_eq!(
-        entry.original_record.get("quantity"),
-        Some(&clinker_record::Value::String(raw.clone().into()))
-    );
-    assert!(entry.error_message.contains("original_bytes=400"));
-    assert!(entry.error_message.contains('…'));
+    let entry = &dlq[0];
+    assert_eq!(entry.field("quantity"), Some(raw.as_str()));
+    let detail = entry.error_detail().expect("include_reason defaults on");
+    assert!(detail.contains("original_bytes=400"));
+    assert!(detail.contains('…'));
     assert!(
-        !entry.error_message.contains(&raw),
+        !detail.contains(&raw),
         "the unbounded raw input leaked outside the DLQ record"
     );
 }
@@ -1273,13 +1278,13 @@ fn preview_is_bounded_without_leaking_the_raw_coercion_message() {
 fn preview_escapes_controls_bidi_delimiters_and_backslashes() {
     let raw = "a\t\u{0085}\u{202e}[x]\\z";
     let csv = format!("id,quantity\nbad,\"{raw}\"\n");
-    let (report, _) = run(
+    let (_, _, dlq) = run(
         &csv,
         "        - { name: id, type: string }\n        - { name: quantity, type: int }",
         continuing(),
     )
     .expect("continue must route the escaped diagnostic");
-    let message = &report.dlq_entries[0].error_message;
+    let message = dlq[0].error_detail().expect("include_reason defaults on");
     assert!(message.contains("\\t"), "{message}");
     assert!(message.contains("\\u{0085}"), "{message}");
     assert!(message.contains("\\u{202E}"), "{message}");
