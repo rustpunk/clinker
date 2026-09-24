@@ -347,7 +347,13 @@ impl PauseSignal {
     /// Flip to resumed and wake every parked waiter. Producers
     /// re-check the flag inside the `wait` loop so a spurious wake
     /// stays a no-op.
+    ///
+    /// The flag is cleared while holding the mutex that
+    /// `wait_while_paused` checks it under. A waiter that has read
+    /// `paused` but not yet parked still holds that mutex, so this
+    /// resume cannot land in the gap and lose its notification.
     pub fn resume(&self) {
+        let _guard = self.mu.lock().unwrap();
         self.paused.store(false, Ordering::Release);
         self.cv.notify_all();
     }
@@ -1764,6 +1770,45 @@ mod tests {
         signal.resume();
         // Producer should wake within reasonable time and finish.
         handle.join().expect("producer thread should join cleanly");
+        assert!(!signal.is_paused());
+    }
+
+    #[test]
+    fn pause_signal_resume_between_check_and_park_still_wakes_the_waiter() {
+        // Hold the waiter's window open: the flag has been read as paused
+        // under the mutex, but the waiter has not yet parked on the
+        // condvar. A resume that lands in this window must still wake it.
+        let signal = Arc::new(PauseSignal::new());
+        signal.pause();
+        let guard = signal.mu.lock().unwrap();
+        assert!(signal.is_paused());
+
+        let (resumed_tx, resumed_rx) = std::sync::mpsc::channel();
+        let resumer = {
+            let signal = signal.clone();
+            std::thread::spawn(move || {
+                signal.resume();
+                let _ = resumed_tx.send(());
+            })
+        };
+        // A resume that bypasses the mutex returns while this thread still
+        // holds it, so its notification has fired before the park below.
+        // A resume that takes the mutex cannot return yet; the timeout
+        // lets this thread go on to park and release it.
+        let _ = resumed_rx.recv_timeout(std::time::Duration::from_secs(1));
+
+        // Park without re-checking the flag first, exactly as the waiter
+        // does once it has seen `paused`.
+        let (guard, wait) = signal
+            .cv
+            .wait_timeout(guard, std::time::Duration::from_secs(2))
+            .unwrap();
+        assert!(
+            !wait.timed_out(),
+            "a resume between the waiter's check and its park was lost"
+        );
+        drop(guard);
+        resumer.join().expect("resumer thread should join cleanly");
         assert!(!signal.is_paused());
     }
 
