@@ -89,8 +89,8 @@ The DLQ is always written as CSV, regardless of the pipeline's input/output form
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `path` | No | -- | File path for DLQ output. If omitted, DLQ records are logged but not written to file. The `dlq:` block itself is required to continue past a declared source-type failure. |
-| `include_reason` | No | -- | Include `_cxl_dlq_error_category` and `_cxl_dlq_error_detail` columns. |
-| `include_source_row` | No | -- | Include the stable alphabetical union of user source fields across all DLQ records. A field absent from one record is an empty cell. |
+| `include_reason` | No | `true` | Include `_cxl_dlq_error_category` and `_cxl_dlq_error_detail` columns. |
+| `include_source_row` | No | `true` | Include the failing record's columns after the `_cxl_dlq_*` columns. Which record columns each DLQ file carries is fixed when the pipeline compiles; see [How the DLQ columns are chosen](#how-the-dlq-columns-are-chosen). With `false`, only the `_cxl_dlq_*` columns are written. |
 
 ## DLQ columns
 
@@ -101,11 +101,14 @@ Every DLQ record includes these metadata columns:
 | `_cxl_dlq_id` | UUID v7 (time-ordered unique identifier) |
 | `_cxl_dlq_timestamp` | RFC 3339 timestamp of when the error occurred |
 | `_cxl_dlq_source_file` | Input filename carried by that failing record's `$source.file` provenance (or `<merged>` when no source-file provenance exists) |
+| `_cxl_dlq_source_name` | Name of the Source the failing record came from (or `<merged>` when the record carries no Source identity) |
 | `_cxl_dlq_source_row` | 1-based row number in the source file |
+| `_cxl_dlq_triggering_field` | The field whose evaluation failed, when the failure names one; empty for collateral rejections |
+| `_cxl_dlq_triggering_value` | The value the failure reported, when it carries one (for example the text that failed to convert) |
 | `_cxl_dlq_stage` | Name of the transform or aggregate node where the error occurred |
 | `_cxl_dlq_route` | Route branch name (if the error occurred after routing) |
 | `_cxl_dlq_trigger` | Validation rule name that triggered the rejection |
-| `_cxl_dlq_source_record` | Present in the optional source-row columns for a record-grained E345 rejection. Contains the fixed-width line text or a JSON array of decoded CSV cells, preserving the physical row without assigning it a declared record shape. |
+| `_cxl_dlq_source_record` | One of the record columns rather than a metadata column: present in any file a Source rejection can reach under `strategy: continue`, and filled only for a record-grained E345 rejection. Contains the fixed-width line text or a JSON array of decoded CSV cells, preserving the physical row without assigning it a declared record shape. |
 
 When `include_reason: true` is set, two additional columns appear:
 
@@ -114,11 +117,95 @@ When `include_reason: true` is set, two additional columns appear:
 | `_cxl_dlq_error_category` | Machine-readable error classification |
 | `_cxl_dlq_error_detail` | Human-readable error description |
 
-DLQ batches may contain records from different source schemas. Clinker derives
-the optional source-row columns from every record in the batch, filters
-engine-only sidecars, and writes their alphabetical union so the CSV shape does
-not depend on which schema arrived first. Source-file provenance is likewise
-read per record; one file's path is never reused for a later heterogeneous row.
+### How the DLQ columns are chosen
+
+Each DLQ file's header is fixed when the pipeline compiles, before any record
+is read. It does not depend on which records failed, or on which stages they
+failed in: every time a pipeline writes a given DLQ file, that file has the
+same columns in the same order.
+
+A header starts with the `_cxl_dlq_*` metadata columns, always in this order:
+`_cxl_dlq_id`, `_cxl_dlq_timestamp`, `_cxl_dlq_source_file`,
+`_cxl_dlq_source_name`, `_cxl_dlq_source_row`, `_cxl_dlq_triggering_field`,
+`_cxl_dlq_triggering_value`, then `_cxl_dlq_error_category` and
+`_cxl_dlq_error_detail` when `include_reason` is on, then `_cxl_dlq_stage`,
+`_cxl_dlq_route` and `_cxl_dlq_trigger`.
+
+With `include_source_row` on, the record columns follow. They come from every
+record shape that can reach that file:
+
+- the declared columns of each Source, and `_cxl_dlq_source_record`, when
+  Source rejections are dead-lettered (`strategy: continue`);
+- the shape of the records entering each Transform, Route, Reshape, Aggregate,
+  Combine and Sink that can dead-letter a record under the pipeline's
+  strategy (stages inside a composition count at the composition's place in
+  the pipeline);
+- the output columns of an Aggregate without `group_by` under
+  `strategy: continue`, which go to the pipeline-wide file.
+
+A shape is added to the file of each Source whose records can carry it: that
+Source's `per_source.<name>.path` when it has one, otherwise the pipeline-wide
+`path`. A shape that carries no Source identity, such as the output of a
+Combine using `match: first` or `match: all`, is added to the pipeline-wide
+file.
+
+The shapes then combine as follows:
+
+- **One shape** keeps its natural column order.
+- **Several shapes** give their first-seen union in plan order: each column
+  appears once, at the position where it was first seen. Plan order is the
+  node order `--explain` prints, which need not match the order the nodes are
+  written in the YAML.
+- **A column a record does not carry** is an empty cell in that record's row.
+- **Engine-only sidecar columns** (`$widened` and the `$source.*` stamps) are
+  never written. Correlation-key columns (`$ck.*`) are.
+
+For example, this pipeline has two Sources with different columns, one
+pipeline-wide DLQ file, and a Transform on each Source that can fail:
+
+```yaml
+error_handling:
+  strategy: continue
+  dlq:
+    path: rejects.csv
+nodes:
+- type: source
+  name: orders
+  config:
+    schema:
+      - { name: order_id, type: int }
+      - { name: amount, type: int }
+    # ...
+- type: source
+  name: refunds
+  config:
+    schema:
+      - { name: refund_id, type: int }
+      - { name: order_id, type: int }
+      - { name: amount, type: int }
+    # ...
+# one Transform on each Source, then a Sink on each Transform
+```
+
+In this plan `refunds` comes before `orders`, so the record columns of
+`rejects.csv` are:
+
+```text
+refund_id,order_id,amount,_cxl_dlq_source_record
+```
+
+An `orders` row writes an empty `refund_id` cell. `order_id` and `amount`
+appear once, although both Sources declare them. `_cxl_dlq_source_record` is
+in the header because a Source rejection can reach the file under `continue`.
+It is empty for these rows.
+
+To see every DLQ file's columns before a run, use
+`clinker run pipeline.yaml --explain`: its `=== Dead-Letter Output ===`
+section lists each file, the Sources routed to it and its full header (see
+[Explain Plans](../ops/explain.md#dead-letter-output)).
+
+Source-file provenance (`_cxl_dlq_source_file`) is read from each record, so
+one file's path is never reused for a later row.
 
 ## Error categories
 
