@@ -1572,6 +1572,7 @@ impl PipelineExecutor {
                 .collect();
             Some(crate::executor::document_dlq::DocumentDlqState::new(
                 doc_sources,
+                Arc::clone(&memory_budget),
             ))
         } else {
             None
