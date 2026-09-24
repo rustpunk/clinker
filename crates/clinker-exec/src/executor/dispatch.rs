@@ -5124,7 +5124,15 @@ impl CorrelationGroupBuffer {
     /// Fold another view of this group's overflow into this one, keeping
     /// the earlier crossing. Ids come from one process-wide UUIDv7
     /// generator, so the smaller id is the stamp taken first.
-    pub(crate) fn note_overflow(&mut self, other: Option<DlqFailureStamp>) {
+    ///
+    /// An overflowing view also carries its held-entry count, and the larger
+    /// count is kept, so a group whose overflow came from another view (an
+    /// earlier retraction iteration) never reports a count at or under the
+    /// cap it crossed.
+    pub(crate) fn note_overflow(&mut self, other: Option<DlqFailureStamp>, other_held: u64) {
+        if other.is_some() {
+            self.held_entries = self.held_entries.max(other_held);
+        }
         self.overflowed_at = match (self.overflowed_at, other) {
             (Some(ours), Some(theirs)) if theirs.id() < ours.id() => Some(theirs),
             (None, theirs) => theirs,
@@ -5305,16 +5313,23 @@ mod correlation_group_overflow_tests {
         let later = DlqFailureStamp::now();
 
         let mut group = CorrelationGroupBuffer::default();
-        group.note_overflow(None);
+        group.note_overflow(None, 7);
         assert!(group.overflowed_at.is_none());
-        group.note_overflow(Some(later));
+        assert_eq!(
+            group.held_entries, 0,
+            "a view that did not overflow adds no count"
+        );
+        group.note_overflow(Some(later), 3);
         assert_eq!(group.overflowed_at, Some(later));
-        group.note_overflow(Some(earlier));
+        assert_eq!(group.held_entries, 3);
+        group.note_overflow(Some(earlier), 2);
         assert_eq!(group.overflowed_at, Some(earlier));
-        group.note_overflow(Some(later));
+        assert_eq!(group.held_entries, 3, "the larger count is kept");
+        group.note_overflow(Some(later), 1);
         assert_eq!(group.overflowed_at, Some(earlier));
-        group.note_overflow(None);
+        group.note_overflow(None, 9);
         assert_eq!(group.overflowed_at, Some(earlier));
+        assert_eq!(group.held_entries, 3);
     }
 }
 

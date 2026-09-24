@@ -284,7 +284,7 @@ fn archive_iteration_errors(
         for &row in &group.error_rows {
             entry.error_rows.insert(row);
         }
-        entry.note_overflow(group.overflowed_at);
+        entry.note_overflow(group.overflowed_at, group.held_entries);
     }
 }
 
@@ -312,7 +312,7 @@ fn merge_archive_into_live(
         for row in archived.error_rows {
             entry.error_rows.insert(row);
         }
-        entry.note_overflow(archived.overflowed_at);
+        entry.note_overflow(archived.overflowed_at, archived.held_entries);
     }
 }
 

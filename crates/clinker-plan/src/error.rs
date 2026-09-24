@@ -186,7 +186,9 @@ pub enum PipelineError {
     /// emits — this variant is rendered into the `group_size_exceeded`
     /// entry's `error_message` and never propagated up the call stack.
     /// `held_entries` counts every Sink slot and parked failure the group
-    /// held at commit, not distinct source rows.
+    /// held, not distinct source rows: at commit, or, when a relaxed-key
+    /// retry merged earlier passes, the largest count of any pass that
+    /// overflowed.
     CorrelationGroupOverflow {
         group_key: String,
         max_group_buffer: u64,
