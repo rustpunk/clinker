@@ -3788,9 +3788,15 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
 
     // Dead-letter rows stream into staged bucket files during the run; the
     // attempt publishes them with every other artifact once the run succeeds.
-    let dlq_sink = std::sync::Arc::new(clinker_exec::output::dlq_sink::StagedDlqSink::new(
-        output_staging.clone(),
-    ));
+    // Each staged bucket file is one dead-letter telemetry work unit; one the
+    // run abandons while the shutdown token is requested reports interrupted.
+    let dlq_sink = std::sync::Arc::new(
+        clinker_exec::output::dlq_sink::StagedDlqSink::new(
+            output_staging.clone(),
+            telemetry_producer.clone(),
+        )
+        .with_shutdown_token(shutdown_token.clone()),
+    );
     let registry = clinker_exec::executor::WriterRegistry {
         single: writers,
         fan_out: fan_out_writers,

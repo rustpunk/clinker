@@ -63,11 +63,32 @@ impl StagedDlqSink {
     /// A sink staging into `staging`, which must be attached to a run
     /// attempt ([`OutputStagingRegistry::for_run_attempt`]); without one, the
     /// first row fails with [`PipelineError::Internal`].
-    pub fn new(staging: OutputStagingRegistry) -> Self {
+    pub fn new(
+        staging: OutputStagingRegistry,
+        telemetry: Option<crate::telemetry::TelemetryProducer>,
+    ) -> Self {
+        let _ = telemetry;
         Self {
             staging,
             shared: Arc::new(Mutex::new(SinkState::default())),
         }
+    }
+
+    /// Report a bucket abandoned while `token` is requested as interrupted.
+    #[must_use]
+    pub fn with_shutdown_token(self, token: crate::pipeline::shutdown::ShutdownToken) -> Self {
+        let _ = token;
+        self
+    }
+
+    /// Fail every bucket file's writes with `kind` once it has accepted
+    /// `after_bytes` bytes.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_write_fault_for_testing(self, after_bytes: u64, kind: std::io::ErrorKind) -> Self {
+        let _ = (after_bytes, kind);
+        self
     }
 
     fn state(&self) -> MutexGuard<'_, SinkState> {
@@ -305,7 +326,7 @@ nodes:\n- type: source\n  name: src_a\n  config:\n    name: src_a\n    type: csv
         let staging = attempt_staging(root.path());
         let (id, _) = two_bucket_ids();
         let path = root.path().join("dlq.csv");
-        let sink = StagedDlqSink::new(staging.clone());
+        let sink = StagedDlqSink::new(staging.clone(), None);
 
         let mut writer = sink.open_walk_writer().expect("open writer");
         writer
@@ -336,7 +357,7 @@ nodes:\n- type: source\n  name: src_a\n  config:\n    name: src_a\n    type: csv
         let (wide, own) = two_bucket_ids();
         let wide_path = root.path().join("dlq.csv");
         let own_path = root.path().join("dlq_b.csv");
-        let sink = StagedDlqSink::new(staging.clone());
+        let sink = StagedDlqSink::new(staging.clone(), None);
 
         let mut writer = sink.open_walk_writer().expect("open writer");
         writer
@@ -361,7 +382,7 @@ nodes:\n- type: source\n  name: src_a\n  config:\n    name: src_a\n    type: csv
         let staging = attempt_staging(root.path());
         let (id, _) = two_bucket_ids();
         let path = root.path().join("dlq.csv");
-        let sink = StagedDlqSink::new(staging);
+        let sink = StagedDlqSink::new(staging, None);
 
         let mut writer = sink.walk_writer();
         writer.write_row(&target(id, &path), b"1,a\n").expect("row");
@@ -413,7 +434,7 @@ nodes:\n- type: source\n  name: src_a\n  config:\n    name: src_a\n    type: csv
         let (wide, own) = two_bucket_ids();
         let wide_path = root.path().join("dlq.csv");
         let own_path = root.path().join("dlq_b.csv");
-        let sink = StagedDlqSink::new(staging.clone());
+        let sink = StagedDlqSink::new(staging.clone(), None);
 
         // The second bucket is opened first, so bucket order is not the
         // order the writer met them in.

@@ -70,6 +70,7 @@ fn span_family(span: SpanName) -> (&'static str, &'static [&'static str]) {
         ),
         SpanName::WriterSpill => ("clinker.writer.spill", TERMINALS),
         SpanName::WriterCleanup => ("clinker.writer.cleanup", TERMINALS),
+        SpanName::DeadLetter => ("clinker.dead_letter", TERMINALS),
     }
 }
 
