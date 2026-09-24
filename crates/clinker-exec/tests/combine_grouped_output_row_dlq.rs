@@ -54,13 +54,14 @@ fn run_params() -> PipelineRunParams {
 /// one `$ck` group cell per id. The matched-body `d.amt / b.factor` eval
 /// divides by zero on `id=2` (build factor=0), so that group's cell goes
 /// dirty; ids 1 and 3 land in their own clean cells. At group-commit the
-/// dirty cell re-emits its parked failures as `combine_output_row`
-/// triggers (category and `combine:enriched` stage copied verbatim from
-/// the parked records — NOT rewritten to the generic correlation-commit
-/// disposition), while the two clean cells flush their surviving rows to
-/// the writer. The failing group is a self-contained single-member group,
-/// so no clean survivor is co-grouped with the failure and DLQ'd as
-/// collateral.
+/// dirty cell re-emits its parked failures as `combine_output_row` rows
+/// (category and `combine:enriched` stage copied verbatim from the parked
+/// records — NOT rewritten to the generic correlation-commit disposition):
+/// the driver row as the group's trigger, and the matched build row as a
+/// collateral held with the driver's group. The two clean cells flush
+/// their surviving rows to the writer. The failing group is a
+/// self-contained single-member group, so no clean survivor is co-grouped
+/// with the failure and DLQ'd as collateral.
 #[test]
 fn grouped_combine_output_row_parks_under_group_cell_and_flushes_atomically() {
     let yaml = r#"
@@ -207,6 +208,11 @@ nodes:
         build_entry.stage(),
         Some("combine:enriched"),
         "the parked build-side Combine stage also survives group-commit"
+    );
+    assert!(
+        !build_entry.trigger(),
+        "the matched build row is held with the failing driver's group as a \
+         collateral, not as a trigger"
     );
 
     // (b) The failing group is a self-contained single-member dirty cell,
