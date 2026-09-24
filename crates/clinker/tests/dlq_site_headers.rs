@@ -615,6 +615,84 @@ nodes:
     );
 }
 
+/// A `copy_from: none` Reshape row dead-lettered downstream is attributed to
+/// its trigger's Source. Every stamp Source here has a `per_source` file, so
+/// the pipeline-wide header admits no Source columns: a row that lost its
+/// trigger's `$source.name` would fall to that file and be refused.
+#[test]
+fn synthesized_row_dead_letters_under_trigger_source() {
+    const PIPELINE: &str = r#"pipeline:
+  name: dlq_site_reshape_synthesized
+error_handling:
+  strategy: continue
+  dlq:
+    path: '{dir}/rejects.csv'
+    per_source:
+      rows:
+        path: '{dir}/row_rejects.csv'
+nodes:
+- type: source
+  name: rows
+  config:
+    name: rows
+    type: csv
+    path: input.csv
+    schema:
+      - { name: id, type: string }
+      - { name: amount, type: int }
+      - { name: divisor, type: int }
+- type: reshape
+  name: summarize
+  input: rows
+  config:
+    partition_by: [id]
+    rules:
+      - name: big
+        when: "amount > 100"
+        synthesize:
+          copy_from: none
+          overrides:
+            id: "id"
+            amount: "amount"
+            divisor: "0"
+- type: transform
+  name: ratio
+  input: summarize
+  config:
+    cxl: |
+      emit id = id
+      emit ratio = amount / divisor
+- type: sink
+  name: out
+  input: ratio
+  config:
+    name: out
+    type: csv
+    path: out.csv
+"#;
+    let files = run_and_compare(
+        PIPELINE,
+        &[("input.csv", "id,amount,divisor\nA,150,1\nB,50,1\n")],
+    );
+
+    // Only the synthesized row (the one with a zero divisor) fails `ratio`.
+    let rows = file(&files, "row_rejects.csv");
+    assert_eq!(rows.rows.len(), 1, "one row dead-lettered: {:?}", rows.rows);
+    let row = &rows.rows[0];
+    assert_eq!(cell(row, "_cxl_dlq_source_name"), "rows");
+    assert_eq!(cell(row, "_cxl_dlq_stage"), "transform:ratio");
+    assert_eq!(cell(row, "id"), "A");
+    assert_eq!(cell(row, "amount"), "150");
+    assert_eq!(cell(row, "divisor"), "0");
+    assert!(
+        files
+            .iter()
+            .filter(|f| f.name != "row_rejects.csv")
+            .all(|f| f.rows.is_empty()),
+        "nothing reaches the pipeline-wide file"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Aggregates (sites 8-11)
 // ---------------------------------------------------------------------------
