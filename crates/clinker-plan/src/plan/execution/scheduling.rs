@@ -93,6 +93,92 @@ pub(crate) fn stable_topological_order(
     Err(cycle)
 }
 
+/// Re-sequence [`ExecutionPlanDag::topo_order`] so every Sink follows every
+/// other node.
+///
+/// Under `dlq_granularity: document` a document's verdict must be final
+/// before any Sink writes one of its records. Every place that condemns a
+/// document is a non-Sink node: a Source rejecting a record against its
+/// declared types or a structural rule, a Transform evaluation failure
+/// (fused or not), and a Route evaluation failure. A Sink write error is
+/// an output error and never condemns a document. So once every non-Sink
+/// node has run, no verdict can change, and a Sink that runs after that
+/// point never publishes a record of a document that is later rejected.
+///
+/// The result is a topological order computed with Kahn's algorithm whose
+/// ready set is ordered by (is a Sink, position in the current order): it
+/// keeps the relative order of the non-Sinks and of the Sinks, and puts
+/// every Sink after every non-Sink because Sinks have no successors.
+///
+/// This fixes the compiled order only. The executor's scheduler may still
+/// reorder a pass by its volume estimates, so it applies the same rule as a
+/// hard constraint whenever document dead-lettering is active. A Sink
+/// inside a composition body runs inside its composition's dispatch, where
+/// no top-level order can hold it back; document granularity therefore
+/// refuses composition bodies that declare a Sink (E378).
+///
+/// The error is a node the walk never reached, which only a cycle can
+/// cause; `topo_order` is left unchanged then.
+pub(crate) fn order_sinks_after_operators(dag: &mut ExecutionPlanDag) -> Result<(), NodeIndex> {
+    let graph = &dag.graph;
+    let position: HashMap<NodeIndex, usize> = dag
+        .topo_order
+        .iter()
+        .enumerate()
+        .map(|(position, &idx)| (idx, position))
+        .collect();
+    let key = |idx: NodeIndex| -> (bool, usize, usize) {
+        (
+            matches!(graph[idx], PlanNode::Sink { .. }),
+            position.get(&idx).copied().unwrap_or(usize::MAX),
+            idx.index(),
+        )
+    };
+    let mut indegree: HashMap<NodeIndex, usize> = graph
+        .node_indices()
+        .map(|idx| {
+            (
+                idx,
+                graph
+                    .edges_directed(idx, petgraph::Direction::Incoming)
+                    .count(),
+            )
+        })
+        .collect();
+    let mut ready: BTreeSet<(bool, usize, usize)> = indegree
+        .iter()
+        .filter_map(|(&idx, &degree)| (degree == 0).then(|| key(idx)))
+        .collect();
+    let mut ordered = Vec::with_capacity(graph.node_count());
+
+    while let Some(first) = ready.pop_first() {
+        let idx = NodeIndex::new(first.2);
+        ordered.push(idx);
+        for edge in graph.edges_directed(idx, petgraph::Direction::Outgoing) {
+            let target = edge.target();
+            let Some(remaining) = indegree.get_mut(&target) else {
+                continue;
+            };
+            *remaining -= 1;
+            if *remaining == 0 {
+                ready.insert(key(target));
+            }
+        }
+    }
+
+    if ordered.len() != graph.node_count() {
+        let unreached = indegree
+            .into_iter()
+            .filter(|(_, degree)| *degree > 0)
+            .map(|(idx, _)| idx)
+            .min()
+            .unwrap_or_else(|| NodeIndex::new(0));
+        return Err(unreached);
+    }
+    dag.topo_order = ordered;
+    Ok(())
+}
+
 /// Prove the Source fusion groups already implemented by the compiled graph.
 ///
 /// Only caller-identified external Sources participate; composition input-port

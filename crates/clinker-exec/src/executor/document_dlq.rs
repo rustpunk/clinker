@@ -95,10 +95,24 @@ struct DocTrigger {
     failed_at: DlqFailureStamp,
 }
 
+/// A document's run-wide failed verdict. Once a document is marked failed it
+/// stays failed until the run ends: every Sink holding any of its records
+/// rejects it, however many Sinks read them.
+struct FailedDocument {
+    /// The stamp of the document's first failure. Every collateral of the
+    /// document, at any Sink and at any time, is condemned by it.
+    cause: DlqFailureStamp,
+    /// The first failure, until its trigger entry is written. The first
+    /// rejection takes it; a document still holding it at the end of the
+    /// run never reached a Sink and is rejected by the end sweep.
+    trigger: Option<DocTrigger>,
+}
+
 /// Run-scoped document-DLQ state: which sources opt into the policy, the
-/// failed-document set with each document's captured root-cause trigger,
-/// and the run-scoped dedup set that keeps a duplicate close from
-/// re-emitting a document's reject entries.
+/// run-wide failed verdict of each document with its captured root-cause
+/// trigger, and the run-scoped dedup set that keeps a duplicate close, or a
+/// second Sink reading the same document, from re-emitting a document's
+/// reject entries.
 ///
 /// `Some(..)` on [`ExecutorContext::document_dlq`] iff at least one source
 /// declares `dlq_granularity: document`; `None` otherwise (the dominant
@@ -116,8 +130,10 @@ pub(crate) struct DocumentDlqState {
     /// Documents marked failed, keyed by source file, with the root-cause
     /// trigger captured at the FIRST failure. Run-scoped so an upstream
     /// failure (Transform / Route, before any Output) is visible to every
-    /// Output at the document's close.
-    failed: HashMap<DocKey, DocTrigger>,
+    /// Output at the document's close, and never cleared: a document's
+    /// first rejection takes its trigger but leaves the verdict, so every
+    /// later Sink holding the document rejects it too.
+    failed: HashMap<DocKey, FailedDocument>,
     /// Records of a failed document that ALSO failed (the 2nd, 3rd, … failure
     /// in the same document), keyed by source file. Only the first failure
     /// becomes the trigger; a later failing record never reaches an Output
@@ -127,8 +143,9 @@ pub(crate) struct DocumentDlqState {
     /// rejected N-record document contributes exactly one DLQ entry.
     extra_collaterals: HashMap<DocKey, Vec<(Record, SourceRowId)>>,
     /// Documents whose reject DLQ entries have already been emitted. A
-    /// duplicate close (fan-in dedup escapee, malformed input) finds the key
-    /// here and emits nothing more.
+    /// duplicate close (fan-in dedup escapee, malformed input) or a second
+    /// Sink reading the same document finds the key here and emits nothing
+    /// more.
     rejected: HashSet<DocKey>,
 }
 
@@ -313,7 +330,10 @@ fn mark_document_failed(ctx: &mut ExecutorContext<'_>, key: DocKey, trigger: Doc
     };
     match state.failed.entry(key.clone()) {
         std::collections::hash_map::Entry::Vacant(v) => {
-            v.insert(trigger);
+            v.insert(FailedDocument {
+                cause: trigger.failed_at,
+                trigger: Some(trigger),
+            });
         }
         std::collections::hash_map::Entry::Occupied(_) => {
             state
@@ -723,7 +743,7 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
                 .document_dlq
                 .as_ref()
                 .and_then(|s| s.failed.get(&key))
-                .map(|trigger| trigger.failed_at);
+                .map(|failed| failed.cause);
             match cause {
                 Some(cause) => push_document_collateral(ctx, &key, record, source_row, &cause)?,
                 None => self.write_through(ctx, record, source_row)?,
@@ -844,9 +864,9 @@ pub(crate) fn reject_unclosed_failed_documents(
     };
     let mut pending: Vec<DocKey> = state
         .failed
-        .keys()
-        .filter(|k| !state.rejected.contains(*k))
-        .cloned()
+        .iter()
+        .filter(|(_, failed)| failed.trigger.is_some())
+        .map(|(key, _)| Arc::clone(key))
         .collect();
     pending.sort_unstable();
     for key in pending {
@@ -1046,7 +1066,12 @@ fn take_document_rejection(
         }
         return Ok(None);
     }
-    let trigger = state.failed.remove(key);
+    // The verdict stays for the run; only the trigger is taken, so it is
+    // written once.
+    let trigger = state
+        .failed
+        .get_mut(key)
+        .and_then(|failed| failed.trigger.take());
     let extra_collaterals = state.extra_collaterals.remove(key).unwrap_or_default();
 
     // Collect this document's collateral rows out of the bucket before any
@@ -1238,19 +1263,23 @@ mod tests {
         let collateral_row = SourceRowId::from(2);
 
         let mut state = DocumentDlqState::new(HashSet::from([Arc::clone(&source_name)]));
+        let failed_at = DlqFailureStamp::now();
         state.failed.insert(
             Arc::clone(&key),
-            DocTrigger {
-                source_row: trigger_row,
-                category: clinker_core_types::dlq::DlqErrorCategory::ValidationFailure,
-                error_message: "document validation failed".to_string(),
-                original_record: trigger_record.clone(),
-                stage: Some("validate".to_string()),
-                route: None,
-                source_name,
-                triggering_field: None,
-                triggering_value: None,
-                failed_at: DlqFailureStamp::now(),
+            FailedDocument {
+                cause: failed_at,
+                trigger: Some(DocTrigger {
+                    source_row: trigger_row,
+                    category: clinker_core_types::dlq::DlqErrorCategory::ValidationFailure,
+                    error_message: "document validation failed".to_string(),
+                    original_record: trigger_record.clone(),
+                    stage: Some("validate".to_string()),
+                    route: None,
+                    source_name,
+                    triggering_field: None,
+                    triggering_value: None,
+                    failed_at,
+                }),
             },
         );
 
@@ -1302,6 +1331,13 @@ mod tests {
             }
         }
 
+        assert!(
+            state
+                .failed
+                .get(&key)
+                .is_some_and(|failed| failed.trigger.is_none()),
+            "the rejection takes the trigger and keeps the run-wide verdict"
+        );
         assert_eq!(decided, HashSet::from([key]));
         assert_eq!(rejections.len(), 1, "a duplicate close cannot reject twice");
         assert!(rejections[0].trigger.is_some(), "one root-cause entry");

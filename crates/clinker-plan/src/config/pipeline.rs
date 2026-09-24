@@ -2343,6 +2343,24 @@ impl PipelineConfig {
             dag.rebuild_id_index();
         }
 
+        // Under `dlq_granularity: document` every Sink runs after every other
+        // node, so each document's verdict is final before any Sink writes.
+        // This follows the last structural mutation, so the order contract
+        // and the Source activation seal below see the final order. The
+        // executor activates its document state from the same predicate, so
+        // the plan and the run read one fact.
+        if self.any_source_has_document_dlq()
+            && let Err(unreached) = crate::plan::execution::order_sinks_after_operators(&mut dag)
+        {
+            let cycle_path = crate::plan::execution::extract_cycle_path(&dag.graph, unreached);
+            diags.push(Diagnostic::error(
+                "E003",
+                format!("cycle detected while ordering Sinks after operators: {cycle_path}"),
+                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            ));
+            return Err(diags);
+        }
+
         // E152 — every PlanNode::Composition's incoming edges must carry
         // a `PlanEdge.port` tag. Compile-time guard for the dispatcher's
         // collect_port_records invariant: a planner pass that splices an
