@@ -26,12 +26,19 @@
 //! single `#[serde(deny_unknown_fields)]` struct with flat `Option<_>`
 //! attributes and a `type` field carrying the externally-tagged
 //! `cxl::typecheck::Type` value, so saphyr source spans survive on every leaf.
+//!
+//! Serialization mirrors the same shapes through a manual `Serialize`: a
+//! sequence, a `discriminator`/`records`/`structure` or `generated` map, or a
+//! bare string. A derived `Serialize` would emit the externally-tagged
+//! variant name (`Columns: [...]`), which the visitor rejects, so a
+//! serialized config would not parse back.
 
 use clinker_record::schema_def::{Justify, TruncationPolicy};
 use cxl::typecheck::Type;
 use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Separator a multi-value field is parsed from (read) and encoded with
 /// (write) when the author declares none. Semicolon rather than comma: it is
@@ -311,7 +318,7 @@ pub struct GeneratedSchema {}
 
 /// A source's unified schema — a sum over record cardinality plus the external
 /// file form. See the module docs for the YAML shapes and the serde discipline.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SourceSchema {
     /// Single-record column list.
     Columns(Vec<Column>),
@@ -401,6 +408,37 @@ pub fn multi_record_superset(record_types: &[RecordType]) -> Vec<Column> {
         }
     }
     columns
+}
+
+impl Serialize for SourceSchema {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            SourceSchema::Columns(columns) => columns.serialize(serializer),
+            SourceSchema::MultiRecord {
+                discriminator,
+                record_types,
+                structure,
+            } => {
+                let len = 2 + usize::from(structure.is_some());
+                let mut map = serializer.serialize_map(Some(len))?;
+                map.serialize_entry("discriminator", discriminator)?;
+                map.serialize_entry("records", record_types)?;
+                if let Some(structure) = structure {
+                    map.serialize_entry("structure", structure)?;
+                }
+                map.end()
+            }
+            SourceSchema::Generated(generated) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("generated", generated)?;
+                map.end()
+            }
+            SourceSchema::File(path) => serializer.serialize_str(path),
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for SourceSchema {
@@ -521,6 +559,67 @@ mod tests {
 
     fn from_json<T: for<'de> serde::Deserialize<'de>>(j: &str) -> T {
         serde_json::from_str(j).expect("parse")
+    }
+
+    /// Serialize a schema and parse the output back. Every shape must come back
+    /// unchanged, so a config written out by a tool reads back as the config it
+    /// wrote.
+    fn round_trip(schema: &SourceSchema) -> serde_json::Value {
+        let json = serde_json::to_value(schema).expect("serialize");
+        let back: SourceSchema = serde_json::from_value(json.clone()).expect("re-parse");
+        assert_eq!(&back, schema, "round trip changed the schema: {json}");
+        json
+    }
+
+    #[test]
+    fn columns_serialize_as_a_bare_sequence() {
+        let schema: SourceSchema = from_json(
+            r#"[{"name":"id","type":"int"},{"name":"name","type":"string","long_unique":true}]"#,
+        );
+        let json = round_trip(&schema);
+        assert!(json.is_array(), "no variant tag around the columns: {json}");
+    }
+
+    #[test]
+    fn multi_record_serializes_as_its_map_form() {
+        let schema: SourceSchema = from_json(
+            r#"{"discriminator":{"field":"kind"},
+                "records":[
+                  {"id":"header","tag":"H","columns":[{"name":"batch","type":"string"}]},
+                  {"id":"detail","tag":"D","columns":[{"name":"amount","type":"float"}]}
+                ],
+                "structure":[{"record":"header","count":"1"}]}"#,
+        );
+        let json = round_trip(&schema);
+        let keys: Vec<&str> = json
+            .as_object()
+            .expect("map form")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["discriminator", "records", "structure"]);
+    }
+
+    #[test]
+    fn multi_record_without_structure_omits_the_key() {
+        let schema: SourceSchema = from_json(
+            r#"{"discriminator":{"field":"kind"},
+                "records":[{"id":"detail","tag":"D","columns":[{"name":"amount","type":"float"}]}]}"#,
+        );
+        let json = round_trip(&schema);
+        assert!(json.get("structure").is_none(), "{json}");
+    }
+
+    #[test]
+    fn generated_serializes_as_a_generated_map() {
+        let json = round_trip(&SourceSchema::Generated(GeneratedSchema {}));
+        assert_eq!(json, serde_json::json!({ "generated": {} }));
+    }
+
+    #[test]
+    fn file_serializes_as_a_bare_string() {
+        let json = round_trip(&SourceSchema::File("schemas/orders.schema.yaml".into()));
+        assert_eq!(json, serde_json::json!("schemas/orders.schema.yaml"));
     }
 
     #[test]
