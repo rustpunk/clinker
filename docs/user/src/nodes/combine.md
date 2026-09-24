@@ -292,7 +292,7 @@ Semantics:
 - **Independent of the memory budget.** This is a result-*size* guard, not memory pressure. A runaway join can be perfectly bounded in memory (its output spills to disk) yet still produce far more rows than intended; `max_output_rows` caps the row count regardless of bytes.
 - **Covers the whole output, on every strategy.** The cap counts every emitted **output row** across all match modes and any `on_miss` rows, and is enforced identically whichever join strategy the planner picks (hash build-probe, grace-hash, sort-merge, or the IEJoin block-band).
 - **`collect` counts driver rows.** Under `match: collect` a combine emits **one output row per driver row** (each carrying an array of up to 10 000 collected matches), so `max_output_rows` bounds the driver-row count, not the number of collected array elements.
-- **Dead-lettered rows are not counted.** A driver whose `cxl:` body or residual raises a *recoverable* eval failure is routed to the DLQ, not the output, so it does not count toward the cap.
+- **Dead-lettered rows are not counted.** A driver whose `cxl:` body or residual raises a *recoverable* eval failure is routed to the DLQ, not the output, so it does not count toward the cap. The driver row and the matched build row are dead-lettered, each with its own Source and row number.
 - **N-ary combines cap the final output.** A combine whose `where:` spans three or more inputs is decomposed into a chain of binary steps; `max_output_rows` guards the **final** combined output, not the intermediate chain steps.
 
 If the large result is expected, raise the cap (or omit the field). If it is not, tighten the `where:` predicate. Run `clinker explain --code E325` for the full remediation guide.

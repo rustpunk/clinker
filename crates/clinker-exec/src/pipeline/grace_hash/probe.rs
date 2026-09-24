@@ -23,12 +23,46 @@ use clinker_plan::plan::combine::DecomposedPredicate;
 /// every code path truncates at the same threshold.
 const COLLECT_PER_GROUP_CAP: usize = 10_000;
 
-/// Outcome of [`super::GraceHashExecutor::probe_record`]. Either an
-/// in-memory probe iterator (caller walks matches inline) or a marker
-/// that the record was written to a probe-side spill file.
+/// Outcome of [`super::GraceHashExecutor::probe_record`]. Either the
+/// in-memory matches (caller walks them inline) or a marker that the
+/// record was written to a probe-side spill file.
 pub(crate) enum ProbeOutcome<'a> {
-    InMemory(ProbeIter<'a>),
+    InMemory(ProbeMatches<'a>),
     Spilled,
+}
+
+/// One probe's candidates against a built hash table, with the build row
+/// ids that table was built from.
+///
+/// Invariant: `build_rows[i]` is the row id of the build record the table
+/// reports at `ProbeCandidate.index == i`. The table keeps insertion order
+/// and both are built from the same `(record, row)` pairs in the same
+/// order, so every candidate's index has a row. A candidate without one is
+/// an engine invariant violation, reported as `PipelineError::Internal`.
+pub(crate) struct ProbeMatches<'a> {
+    pub(crate) candidates: ProbeIter<'a>,
+    pub(crate) build_rows: &'a [RecordOrder],
+}
+
+/// The build row id of the candidate at `index`, or the invariant
+/// violation [`ProbeMatches`] documents.
+fn candidate_row(
+    build_rows: &[RecordOrder],
+    index: usize,
+    name: &str,
+) -> Result<RecordOrder, PipelineError> {
+    build_rows
+        .get(index)
+        .copied()
+        .ok_or_else(|| PipelineError::Internal {
+            op: "grace_hash probe",
+            node: name.to_string(),
+            detail: format!(
+                "hash table candidate index {index} has no build row id; the partition holds {} \
+                 build row ids",
+                build_rows.len()
+            ),
+        })
 }
 
 /// Mutable emission targets threaded through every grace-hash emit path
@@ -94,7 +128,7 @@ pub(super) fn emit_for_probe<'a>(
     args: &EmitArgs<'_>,
     probe_record: &Record,
     rn: RecordOrder,
-    probe_iter: ProbeIter<'a>,
+    matches: ProbeMatches<'a>,
     body_evaluator: Option<&mut ProgramEvaluator>,
     ctx: &EvalContext<'_>,
     sink: &mut GraceEmitSink<'_>,
@@ -110,12 +144,17 @@ pub(super) fn emit_for_probe<'a>(
         propagate_ck,
         strategy,
     } = *args;
+    let ProbeMatches {
+        candidates: probe_iter,
+        build_rows,
+    } = matches;
     match match_mode {
         MatchMode::Collect => {
             let mut arr: Vec<Value> = Vec::new();
             let mut first_build: Option<Record> = None;
             let mut truncated = false;
             for cand in probe_iter {
+                let row = candidate_row(build_rows, cand.index, name)?;
                 if let Some(residual) = decomposed.residual.as_ref() {
                     let resolver =
                         CombineResolver::new(resolver_mapping, probe_record, Some(cand.record));
@@ -137,7 +176,7 @@ pub(super) fn emit_for_probe<'a>(
                             sink.failures.push(CombineOutputEvalFailure {
                                 probe_record: probe_record.clone(),
                                 row: rn,
-                                matched_build: Some((cand.record.clone(), rn)),
+                                matched_build: Some((cand.record.clone(), row)),
                                 error: e,
                                 failed_at: crate::executor::DlqFailureStamp::now(),
                             });
@@ -188,9 +227,10 @@ pub(super) fn emit_for_probe<'a>(
             sink.push_row(rec, rn)?;
         }
         MatchMode::First | MatchMode::All => {
-            let matched: Vec<Record> = {
-                let mut acc: Vec<Record> = Vec::new();
+            let matched: Vec<(Record, RecordOrder)> = {
+                let mut acc: Vec<(Record, RecordOrder)> = Vec::new();
                 for cand in probe_iter {
+                    let row = candidate_row(build_rows, cand.index, name)?;
                     if let Some(residual) = decomposed.residual.as_ref() {
                         let resolver =
                             CombineResolver::new(resolver_mapping, probe_record, Some(cand.record));
@@ -212,7 +252,7 @@ pub(super) fn emit_for_probe<'a>(
                                 sink.failures.push(CombineOutputEvalFailure {
                                     probe_record: probe_record.clone(),
                                     row: rn,
-                                    matched_build: Some((cand.record.clone(), rn)),
+                                    matched_build: Some((cand.record.clone(), row)),
                                     error: e,
                                     failed_at: crate::executor::DlqFailureStamp::now(),
                                 });
@@ -220,7 +260,7 @@ pub(super) fn emit_for_probe<'a>(
                             }
                         }
                     }
-                    acc.push(cand.record.clone());
+                    acc.push((cand.record.clone(), row));
                     if matches!(match_mode, MatchMode::First) {
                         break;
                     }
@@ -288,7 +328,7 @@ pub(super) fn emit_for_probe<'a>(
                     }
                 }
             } else if let Some(evaluator) = body_evaluator {
-                for m in &matched {
+                for (m, build_row) in &matched {
                     let resolver = CombineResolver::new(resolver_mapping, probe_record, Some(m));
                     match evaluator.eval_record::<NullStorage>(ctx, &resolver, None) {
                         Ok(EvalResult::Emit {
@@ -325,7 +365,7 @@ pub(super) fn emit_for_probe<'a>(
                             sink.failures.push(CombineOutputEvalFailure {
                                 probe_record: probe_record.clone(),
                                 row: rn,
-                                matched_build: Some((m.clone(), rn)),
+                                matched_build: Some((m.clone(), *build_row)),
                                 error: e,
                                 failed_at: crate::executor::DlqFailureStamp::now(),
                             });
@@ -342,7 +382,7 @@ pub(super) fn emit_for_probe<'a>(
                     node: name.to_string(),
                     detail: "synthetic grace hash step has no output schema".to_string(),
                 })?;
-                for m in &matched {
+                for (m, _) in &matched {
                     let mut values: Vec<Value> = Vec::with_capacity(target_schema.column_count());
                     values.extend(probe_record.values().iter().cloned());
                     values.extend(m.values().iter().cloned());

@@ -6,6 +6,8 @@
 
 use clinker_record::Record;
 
+use super::RecordOrder;
+
 use crate::sketch::Hll;
 
 /// Maximum partition bit width. 12 bits = 4096 partitions; beyond this,
@@ -96,23 +98,32 @@ pub(super) fn estimated_record_bytes(record: &Record) -> usize {
     record.estimated_heap_size() + std::mem::size_of::<Record>()
 }
 
-/// Iterator over a build-record buffer that yields chunks bounded by
-/// estimated heap bytes. Emits at least one record per non-empty
-/// remainder so a chunk budget smaller than a single record's footprint
-/// still terminates rather than spinning. Records are moved out of the
-/// underlying Vec; the iterator drains its source.
+/// Estimate one build entry's footprint: the record, per
+/// [`estimated_record_bytes`], plus the build row id held beside it. The
+/// unit every build-side charge and chunk size uses, so a partition's
+/// admitted charge and the bytes its spill releases stay symmetric.
+pub(super) fn estimated_build_entry_bytes(record: &Record) -> usize {
+    estimated_record_bytes(record) + std::mem::size_of::<RecordOrder>()
+}
+
+/// Iterator over a build buffer of `(record, build row id)` pairs that
+/// yields chunks bounded by [`estimated_build_entry_bytes`]. Emits at least
+/// one entry per non-empty remainder so a chunk budget smaller than a
+/// single entry's footprint still terminates rather than spinning.
+/// Entries are moved out of the underlying Vec; the iterator drains its
+/// source.
 pub(crate) struct BuildChunkIter {
-    source: std::vec::IntoIter<Record>,
-    pending: Option<Record>,
+    source: std::vec::IntoIter<(Record, RecordOrder)>,
+    pending: Option<(Record, RecordOrder)>,
     byte_budget: usize,
 }
 
 impl BuildChunkIter {
     /// Construct an iterator over `records`. `byte_budget` is the
-    /// maximum estimated heap footprint per emitted chunk. The
+    /// maximum estimated footprint per emitted chunk. The
     /// constructor enforces a `byte_budget >= 1` floor so the iterator
     /// always makes forward progress.
-    pub(crate) fn new(records: Vec<Record>, byte_budget: usize) -> Self {
+    pub(crate) fn new(records: Vec<(Record, RecordOrder)>, byte_budget: usize) -> Self {
         Self {
             source: records.into_iter(),
             pending: None,
@@ -122,17 +133,17 @@ impl BuildChunkIter {
 }
 
 impl Iterator for BuildChunkIter {
-    type Item = Vec<Record>;
+    type Item = Vec<(Record, RecordOrder)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut out: Vec<Record> = Vec::new();
+        let mut out: Vec<(Record, RecordOrder)> = Vec::new();
         let mut accumulated: usize = 0;
         if let Some(r) = self.pending.take() {
-            accumulated += estimated_record_bytes(&r);
+            accumulated += estimated_build_entry_bytes(&r.0);
             out.push(r);
         }
         for r in self.source.by_ref() {
-            let cost = estimated_record_bytes(&r);
+            let cost = estimated_build_entry_bytes(&r.0);
             if !out.is_empty() && accumulated + cost > self.byte_budget {
                 // Stash this record for the next chunk so the size cap
                 // bites. The single-record-per-chunk degenerate case is

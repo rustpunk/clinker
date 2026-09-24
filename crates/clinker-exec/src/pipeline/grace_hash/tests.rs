@@ -11,6 +11,16 @@ use super::spill::{
 };
 use super::*;
 use crate::pipeline::grace_spill::GraceSpillReader;
+
+/// The row id `crate::test_support::with_build_row_ids` gives the build
+/// fixture record at `index`, for fixtures that add or spill build records
+/// one at a time.
+fn build_row(index: usize) -> RecordOrder {
+    RecordOrder::new(
+        <clinker_plan::plan::PlanNodeId as clinker_plan::plan::EntityRef>::new(1),
+        index as u64 + 1,
+    )
+}
 use clinker_record::SchemaBuilder;
 use clinker_record::owned_storage::SharedStorage;
 use cxl::ast::Statement;
@@ -154,7 +164,8 @@ fn pipeline_temp_dir_owns_spill_files_on_drop() {
     // Deposit a record and force a spill so a file actually exists.
     let rec = record_for(&schema, vec![Value::Integer(7)]);
     let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
-    exec.add_build_record(rec, 0, &budget).unwrap();
+    exec.add_build_record(rec, build_row(0), 0, &budget)
+        .unwrap();
     exec.spill_partition(0, &budget).unwrap();
     let spilled_inside = std::fs::read_dir(&pipeline_path).unwrap().count();
     assert!(spilled_inside >= 1, "spill_partition must commit a file");
@@ -192,7 +203,8 @@ fn pipeline_temp_dir_cleans_on_panic_unwind() {
         let schema = schema_with(&["k"]);
         let rec = record_for(&schema, vec![Value::Integer(99)]);
         let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
-        exec.add_build_record(rec, 0, &budget).unwrap();
+        exec.add_build_record(rec, build_row(0), 0, &budget)
+            .unwrap();
         exec.spill_partition(0, &budget).unwrap();
         panic!("simulated mid-spill panic");
     }));
@@ -228,7 +240,8 @@ fn spill_activates_under_tiny_budget() {
         );
         // Synthetic hash: distribute uniformly across 16 partitions.
         let hash = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        exec.add_build_record(rec, hash, &budget).unwrap();
+        exec.add_build_record(rec, build_row(0), hash, &budget)
+            .unwrap();
     }
     let on_disk = exec
         .partitions
@@ -284,7 +297,8 @@ fn spill_activates_on_charged_bytes_without_rss() {
         &schema,
         vec![Value::Integer(0), Value::String("row-0".into())],
     );
-    exec.add_build_record(rec, 0, &budget).unwrap();
+    exec.add_build_record(rec, build_row(0), 0, &budget)
+        .unwrap();
 
     let on_disk = exec
         .partitions
@@ -322,7 +336,7 @@ fn lazy_probe_spill_routes_to_partition_file() {
     let probe_partition_hash: u64 = 0x0000_0000_0000_1234;
     for i in 0..64i64 {
         let rec = record_for(&schema, vec![Value::Integer(i)]);
-        exec.add_build_record(rec, probe_partition_hash, &budget)
+        exec.add_build_record(rec, build_row(0), probe_partition_hash, &budget)
             .unwrap();
     }
     // Force spill of partition 0.
@@ -1069,7 +1083,7 @@ fn build_eviction_spill_commit_trips_disk_cap_mid_stream() {
             ],
         );
         let hash = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        match exec.add_build_record(rec, hash, &budget) {
+        match exec.add_build_record(rec, build_row(0), hash, &budget) {
             Ok(()) => fed += 1,
             Err(e) => {
                 hit = Some(e);
@@ -1174,6 +1188,7 @@ fn build_ondisk_immediate_write_commit_trips_disk_cap() {
             &schema,
             vec![Value::Integer(0), Value::String("seed".into())],
         ),
+        build_row(0),
         hash_p0,
         &budget,
     )
@@ -1199,7 +1214,7 @@ fn build_ondisk_immediate_write_commit_trips_disk_cap() {
             &schema,
             vec![Value::Integer(i), Value::String(format!("row-{i}").into())],
         );
-        match exec.add_build_record(rec, hash_p0, &budget) {
+        match exec.add_build_record(rec, build_row(0), hash_p0, &budget) {
             Ok(()) => fed += 1,
             Err(e) => {
                 hit = Some(e);
@@ -1283,12 +1298,14 @@ fn probe_finalize_spill_commit_trips_disk_cap_per_partition() {
     // Drive partitions 0 and 1 OnDisk by hand (cap unlimited during build).
     exec.add_build_record(
         record_for(&schema, vec![Value::Integer(0)]),
+        build_row(0),
         hash_p0,
         &budget,
     )
     .unwrap();
     exec.add_build_record(
         record_for(&schema, vec![Value::Integer(1)]),
+        build_row(1),
         hash_p1,
         &budget,
     )
@@ -1430,14 +1447,15 @@ fn build_spill_reload_records_match() {
         })
         .collect();
     for (i, r) in originals.iter().enumerate() {
-        exec.add_build_record(r.clone(), i as u64, &budget).unwrap();
+        exec.add_build_record(r.clone(), build_row(i), i as u64, &budget)
+            .unwrap();
     }
     // Force-spill every partition.
     for idx in 0..exec.partitions.len() {
         let _ = exec.spill_partition(idx, &budget);
     }
     let spilled = exec.drain_spilled();
-    let mut reloaded: Vec<Record> = Vec::new();
+    let mut reloaded: Vec<(Record, RecordOrder)> = Vec::new();
     for sp in spilled {
         for path in &sp.build_files {
             let reader = GraceSpillReader::open(path, schema.clone()).unwrap();
@@ -1446,10 +1464,11 @@ fn build_spill_reload_records_match() {
             }
         }
     }
-    // Sort both by k to compare independent of partition ordering.
-    let mut by_k: Vec<(i64, String)> = reloaded
+    // Sort both by k to compare independent of partition ordering. Each
+    // record comes back with the build row id it was added with.
+    let mut by_k: Vec<(i64, String, RecordOrder)> = reloaded
         .iter()
-        .map(|r| {
+        .map(|(r, row)| {
             let k = match r.get("k") {
                 Some(Value::Integer(i)) => *i,
                 _ => panic!("missing k"),
@@ -1458,11 +1477,13 @@ fn build_spill_reload_records_match() {
                 Some(Value::String(s)) => s.to_string(),
                 _ => panic!("missing v"),
             };
-            (k, v)
+            (k, v, *row)
         })
         .collect();
-    by_k.sort_by_key(|(k, _)| *k);
-    let expected: Vec<(i64, String)> = (0..16).map(|i| (i, format!("v-{i}"))).collect();
+    by_k.sort_by_key(|(k, _, _)| *k);
+    let expected: Vec<(i64, String, RecordOrder)> = (0..16)
+        .map(|i| (i, format!("v-{i}"), build_row(i as usize)))
+        .collect();
     assert_eq!(by_k, expected);
 }
 
@@ -1676,8 +1697,8 @@ fn spill_for_bnl(
 ) -> SpilledPartition {
     let mut bw = GraceSpillWriter::new(h.spill_dir.path(), hash_bits, partition_id, true).unwrap();
     let mut sketch = GraceHll::new();
-    for r in build_records {
-        bw.write_record(r).unwrap();
+    for (index, r) in build_records.iter().enumerate() {
+        bw.write_record(r, build_row(index)).unwrap();
         // Feed the HLL via the build-side hash of the join key.
         let stable = cxl::eval::StableEvalContext::test_default();
         let source_file: Arc<str> = Arc::from("test.csv");
@@ -1786,7 +1807,7 @@ fn test_skew_detection_triggers_bnl() {
         bnl_fallback(
             rc,
             &sp,
-            builds,
+            crate::test_support::with_build_row_ids(builds),
             &mut body_eval,
             &budget,
             &mut GraceEmitSink {
@@ -1846,7 +1867,7 @@ fn test_bnl_fallback_correct_output() {
         bnl_fallback(
             rc,
             &sp,
-            builds,
+            crate::test_support::with_build_row_ids(builds),
             &mut body_eval,
             &budget,
             &mut GraceEmitSink {
@@ -1937,7 +1958,7 @@ fn test_bnl_bounded_memory() {
         bnl_fallback(
             rc,
             &sp,
-            builds,
+            crate::test_support::with_build_row_ids(builds),
             &mut body_eval,
             &budget,
             &mut GraceEmitSink {
@@ -2007,7 +2028,7 @@ fn test_bnl_bounded_memory() {
         bnl_fallback(
             rc,
             &sp2,
-            builds2,
+            crate::test_support::with_build_row_ids(builds2),
             &mut body_eval2,
             &big_budget,
             &mut GraceEmitSink {
@@ -2074,7 +2095,7 @@ fn test_bnl_result_batching() {
         bnl_fallback(
             rc,
             &sp,
-            builds,
+            crate::test_support::with_build_row_ids(builds),
             &mut body_eval,
             &budget,
             &mut GraceEmitSink {
@@ -2141,7 +2162,7 @@ fn test_e310_hard_limit_abort() {
         bnl_fallback(
             rc,
             &sp,
-            builds,
+            crate::test_support::with_build_row_ids(builds),
             &mut body_eval,
             &budget,
             &mut GraceEmitSink {

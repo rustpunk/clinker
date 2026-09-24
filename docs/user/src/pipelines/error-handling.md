@@ -261,7 +261,9 @@ When `include_reason: true` is set, two additional columns appear:
 
 One failure can dead-letter several rows:
 
-- a Combine body that fails writes the driver row and its matched build row;
+- a Combine body that fails writes the driver row and its matched build row,
+  each under its own Source's `_cxl_dlq_source_name` and `_cxl_dlq_source_row`,
+  whichever join strategy ran;
 - a failing row in a correlation group takes the rest of its group with it as
   `correlated` rows;
 - a group larger than `max_group_buffer` writes a `group_size_exceeded` row
@@ -408,7 +410,7 @@ The `_cxl_dlq_error_category` column contains one of these values:
 | `document_rejected` | A non-failing record was DLQ'd as collateral because another record in its document failed under a source's `dlq_granularity: document` policy |
 | `late_record` | A record arrived at a time-windowed aggregate after its event-time window had already closed |
 | `expansion_limit_exceeded` | Per-input fan-out exceeded its authored ceiling. Transform `max_expansion` rejects before body rows emit; Source `max_output_rows_per_input` emits exactly its ceiling, then DLQs the original input on the first attempted row above it. Neither is silent truncation. |
-| `combine_output_row` | A Combine output-stage eval failed for one driver row (probe-key, residual, or matched / `on_miss: null_fields` body); the entry carries the contributing-build lineage and rewinds both the driver and matched build source's rollback cursor. Routed to the DLQ under `continue` across every Combine join mode; `fail_fast` propagates the eval error |
+| `combine_output_row` | A Combine output-stage eval failed for one driver row (probe-key, residual, or matched / `on_miss: null_fields` body); the entry carries the contributing-build lineage and rewinds both the driver and matched build source's rollback cursor. The driver row and the matched build row each report their own Source in `_cxl_dlq_source_name` and their own row in `_cxl_dlq_source_row`, whichever join strategy ran. Routed to the DLQ under `continue` across every Combine join mode; `fail_fast` propagates the eval error |
 | `structural_validation` | A structural source rule failed: an envelope trailer's declared count did not match its streamed body, a multi-record body appeared after its closing trailer, or a record type discriminator was unknown. Under `dlq_granularity: document`, the root cause has `trigger: true` and every already-streamed record of that file is `document_rejected` collateral. Under record-grained `continue`, E345 instead emits only the unknown row with `_cxl_dlq_source_record`. |
 
 ## Advanced options

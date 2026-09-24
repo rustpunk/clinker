@@ -7,7 +7,8 @@
 //! [body: a stream of frames, each prefixed by a 4-byte LE length covering a
 //!        1-byte discriminator plus the frame body; raw when the tag is 0x00,
 //!        inside an LZ4 frame when 0x01:
-//!          0x00 record pair  — postcard `RecordPayload`
+//!          0x00 record pair  — postcard `(RecordPayload, SourceRowId)`: the
+//!                              build record and the row id its Source minted
 //!          0x01 context intern — postcard `DocumentContext`]
 //! [footer: magic u32 LE | version u16 LE | hash_bits u8 |
 //!          partition_id u16 LE | record_count u64 LE]
@@ -55,6 +56,7 @@ use std::sync::Arc;
 
 use lz4_flex::frame::{FrameDecoder, FrameEncoder};
 
+use crate::executor::stream_event::SourceRowId;
 use crate::pipeline::spill::SPILL_MAX_FRAME_BYTES;
 use clinker_plan::SpillError;
 use clinker_plan::error::PipelineError;
@@ -246,11 +248,12 @@ pub(crate) fn grace_spill_error(e: GraceSpillError, node: &str, detail: &str) ->
 /// no string handling.
 pub(crate) const GRACE_SPILL_MAGIC: u32 = 0x434C_4B47;
 
-/// Format revision. Bump when the on-disk layout changes incompatibly. The
-/// body now carries discriminator-tagged frames (record pair vs context
-/// intern) and per-document context interning, which the prior format did
-/// not, so a reader must reject the older layout outright.
-pub(crate) const GRACE_SPILL_VERSION: u16 = 2;
+/// Format revision. Bump when the on-disk layout changes incompatibly, so a
+/// reader rejects an older layout outright instead of misreading a frame.
+/// Version 2 introduced discriminator-tagged frames (record pair vs context
+/// intern) and per-document context interning; version 3 adds the build
+/// row id to every record-pair frame.
+pub(crate) const GRACE_SPILL_VERSION: u16 = 3;
 
 /// Footer byte size: 4 (magic) + 2 (version) + 1 (hash_bits) +
 /// 2 (partition_id) + 8 (record_count) = 17 bytes.
@@ -402,13 +405,18 @@ impl GraceSpillWriter {
         Ok(())
     }
 
-    /// Append one record to the partition body.
+    /// Append one build record and the row id its Source minted to the
+    /// partition body, as one record-pair frame.
     ///
     /// Emits the record's document context as a one-time intern frame the
     /// first time its non-synthetic [`DocumentId`] is seen, before the
     /// record frame, so the reader's table is populated before the record
     /// references it. The synthetic document is never interned.
-    pub(crate) fn write_record(&mut self, record: &Record) -> Result<(), GraceSpillError> {
+    pub(crate) fn write_record(
+        &mut self,
+        record: &Record,
+        row: SourceRowId,
+    ) -> Result<(), GraceSpillError> {
         let doc_ctx = record.doc_ctx();
         let doc_id = doc_ctx.id();
         if doc_id != DocumentId::SYNTHETIC && self.seen_docs.insert(doc_id) {
@@ -418,8 +426,8 @@ impl GraceSpillWriter {
         }
 
         let payload = RecordPayload::from_record(record);
-        let bytes =
-            postcard::to_stdvec(&payload).map_err(|e| std::io::Error::other(e.to_string()))?;
+        let bytes = postcard::to_stdvec(&(&payload, row))
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         self.write_frame(FRAME_RECORD_PAIR, &bytes)?;
         self.record_count += 1;
         Ok(())
@@ -606,7 +614,8 @@ impl GraceSpillReader {
 }
 
 impl Iterator for GraceSpillReader {
-    type Item = std::io::Result<Record>;
+    /// Each build record with the row id its Source minted.
+    type Item = std::io::Result<(Record, SourceRowId)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.records_read >= self.header.record_count {
@@ -653,16 +662,17 @@ impl Iterator for GraceSpillReader {
                     // Loop to the next frame.
                 }
                 FRAME_RECORD_PAIR => {
-                    let payload: RecordPayload = match postcard::from_bytes(body) {
-                        Ok(p) => p,
-                        Err(e) => return Some(Err(std::io::Error::other(e.to_string()))),
-                    };
+                    let (payload, row): (RecordPayload, SourceRowId) =
+                        match postcard::from_bytes(body) {
+                            Ok(p) => p,
+                            Err(e) => return Some(Err(std::io::Error::other(e.to_string()))),
+                        };
                     let doc_ctx = match self.doc_ctx_for(payload.doc_id) {
                         Ok(c) => c,
                         Err(e) => return Some(Err(e)),
                     };
                     self.records_read += 1;
-                    return Some(Ok(payload.into_record(self.schema.clone(), doc_ctx)));
+                    return Some(Ok((payload.into_record(self.schema.clone(), doc_ctx), row)));
                 }
                 other => {
                     return Some(Err(std::io::Error::other(format!(
@@ -719,6 +729,15 @@ mod tests {
         Record::new(s.clone(), vec![Value::Integer(id), Value::String(v.into())])
     }
 
+    /// A build row id under Source node 3, so a round trip that dropped or
+    /// defaulted the Source scope would not compare equal.
+    fn build_row(ordinal: u64) -> SourceRowId {
+        SourceRowId::new(
+            <clinker_plan::plan::PlanNodeId as clinker_plan::plan::EntityRef>::new(3),
+            ordinal,
+        )
+    }
+
     /// Build a `DocumentContext` with a single `Head` section carrying a
     /// nested `Value::Map`, exercising the recursive `Value` path through
     /// the interned context frame.
@@ -750,7 +769,8 @@ mod tests {
             let s = schema();
             let mut w = GraceSpillWriter::new(dir.path(), 4, 7, compress).unwrap();
             for i in 0..50 {
-                w.write_record(&record(&s, i, &format!("row-{i}"))).unwrap();
+                w.write_record(&record(&s, i, &format!("row-{i}")), build_row(i as u64 + 1))
+                    .unwrap();
             }
             let (path, bytes) = w.finish().unwrap();
             let on_disk = std::fs::metadata(&*path).unwrap().len();
@@ -763,11 +783,47 @@ mod tests {
             assert_eq!(reader.header().record_count, 50);
             assert_eq!(reader.header().hash_bits, 4);
             assert_eq!(reader.header().partition_id, 7);
-            let recs: Vec<Record> = reader.map(|r| r.unwrap()).collect();
+            let recs: Vec<Record> = reader.map(|r| r.unwrap().0).collect();
             assert_eq!(recs.len(), 50, "compress={compress}");
             for (i, r) in recs.iter().enumerate() {
                 assert_eq!(r.get("id"), Some(&Value::Integer(i as i64)));
                 assert_eq!(r.get("v"), Some(&Value::String(format!("row-{i}").into())));
+            }
+        }
+    }
+
+    #[test]
+    fn build_frames_round_trip_row_identity() {
+        // Every record frame carries the build row id its Source minted; the
+        // reader hands back the same record and the same id, Source scope
+        // included, under both body formats.
+        for compress in [true, false] {
+            let dir = TempDir::new().unwrap();
+            let s = schema();
+            let written: Vec<(Record, SourceRowId)> = (0..20)
+                .map(|i| {
+                    (
+                        record(&s, i, &format!("b-{i}")),
+                        build_row(100 + i as u64 * 7),
+                    )
+                })
+                .collect();
+            let mut w = GraceSpillWriter::new(dir.path(), 4, 2, compress).unwrap();
+            for (rec, row) in &written {
+                w.write_record(rec, *row).unwrap();
+            }
+            let (path, _) = w.finish().unwrap();
+
+            let reader = GraceSpillReader::open(&path, s.clone()).unwrap();
+            assert_eq!(reader.header().version, 3, "compress={compress}");
+            assert_eq!(reader.header().record_count, written.len() as u64);
+            let read: Vec<(Record, SourceRowId)> = reader.map(|r| r.unwrap()).collect();
+            assert_eq!(read.len(), written.len(), "compress={compress}");
+            for ((rec, row), (got_rec, got_row)) in written.iter().zip(&read) {
+                assert_eq!(got_rec.values(), rec.values(), "compress={compress}");
+                assert_eq!(got_row, row, "compress={compress}");
+                assert_eq!(got_row.source(), row.source(), "compress={compress}");
+                assert_eq!(got_row.ordinal(), row.ordinal(), "compress={compress}");
             }
         }
     }
@@ -784,7 +840,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let s = schema();
         let mut w = GraceSpillWriter::new(dir.path(), 4, 0, false).unwrap();
-        w.write_record(&record(&s, 1, "row")).unwrap();
+        w.write_record(&record(&s, 1, "row"), build_row(1)).unwrap();
         let (path, _) = w.finish().unwrap();
         let mode = std::fs::metadata(&*path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "grace spill file must be owner-only");
@@ -803,7 +859,8 @@ mod tests {
         for (compress, expected_tag) in [(true, FORMAT_TAG_LZ4), (false, FORMAT_TAG_UNCOMPRESSED)] {
             let mut w = GraceSpillWriter::new(dir.path(), 4, 3, compress).unwrap();
             for i in 0..8 {
-                w.write_record(&record(&s, i, "x")).unwrap();
+                w.write_record(&record(&s, i, "x"), build_row(i as u64 + 1))
+                    .unwrap();
             }
             let (path, _bytes) = w.finish().unwrap();
             let raw = std::fs::read(&*path).unwrap();
@@ -849,7 +906,8 @@ mod tests {
         let s = schema();
         let mut w = GraceSpillWriter::new(dir.path(), 4, 1, true).unwrap();
         for i in 0..10 {
-            w.write_record(&record(&s, i, "x")).unwrap();
+            w.write_record(&record(&s, i, "x"), build_row(i as u64 + 1))
+                .unwrap();
         }
         let (path, _bytes) = w.finish().unwrap();
 
@@ -891,7 +949,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let s = schema();
         let mut w = GraceSpillWriter::new(dir.path(), 4, 0, true).unwrap();
-        w.write_record(&record(&s, 1, "a")).unwrap();
+        w.write_record(&record(&s, 1, "a"), build_row(1)).unwrap();
         let (path, _bytes) = w.finish().unwrap();
 
         // Overwrite magic bytes with garbage.
@@ -965,7 +1023,7 @@ mod tests {
             let mut w = GraceSpillWriter::new(dir.path(), 4, 0, compress).unwrap();
             let mut rec = record(&s, 1, "a");
             rec.set_doc_ctx(doc.clone());
-            w.write_record(&rec).unwrap();
+            w.write_record(&rec, build_row(1)).unwrap();
             let (path, _) = w.finish().unwrap();
 
             let reader = GraceSpillReader::open(&path, s.clone()).unwrap();
@@ -974,7 +1032,7 @@ mod tests {
                 1,
                 "footer record_count counts record frames only (compress={compress})"
             );
-            let recs: Vec<Record> = reader.map(|r| r.unwrap()).collect();
+            let recs: Vec<Record> = reader.map(|r| r.unwrap().0).collect();
             assert_eq!(recs.len(), 1, "compress={compress}");
             let ctx = recs[0].doc_ctx();
             assert_eq!(ctx.id(), doc.id(), "compress={compress}");
@@ -998,11 +1056,11 @@ mod tests {
         for i in 0..3 {
             let mut rec = record(&s, i, "x");
             rec.set_doc_ctx(doc.clone());
-            w.write_record(&rec).unwrap();
+            w.write_record(&rec, build_row(1)).unwrap();
         }
         let (path, _) = w.finish().unwrap();
         let reader = GraceSpillReader::open(&path, s.clone()).unwrap();
-        let recs: Vec<Record> = reader.map(|r| r.unwrap()).collect();
+        let recs: Vec<Record> = reader.map(|r| r.unwrap().0).collect();
         assert_eq!(recs.len(), 3);
         let first = recs[0].doc_ctx();
         for r in &recs[1..] {
@@ -1021,10 +1079,10 @@ mod tests {
         let s = schema();
         let mut w = GraceSpillWriter::new(dir.path(), 4, 0, true).unwrap();
         // record() leaves the default synthetic context attached.
-        w.write_record(&record(&s, 1, "syn")).unwrap();
+        w.write_record(&record(&s, 1, "syn"), build_row(1)).unwrap();
         let (path, _) = w.finish().unwrap();
         let reader = GraceSpillReader::open(&path, s.clone()).unwrap();
-        let recs: Vec<Record> = reader.map(|r| r.unwrap()).collect();
+        let recs: Vec<Record> = reader.map(|r| r.unwrap().0).collect();
         assert_eq!(recs.len(), 1);
         assert!(
             SharedStorage::ptr_eq(recs[0].doc_ctx(), &synthetic_document_context()),
@@ -1050,7 +1108,7 @@ mod tests {
             for i in 0..RECS_PER_DOC {
                 let mut rec = record(&s, i as i64, "r");
                 rec.set_doc_ctx(doc.clone());
-                w.write_record(&rec).unwrap();
+                w.write_record(&rec, build_row(1)).unwrap();
             }
         }
         let (path, _) = w.finish().unwrap();
@@ -1060,7 +1118,7 @@ mod tests {
             reader.header().record_count as usize,
             DOCS as usize * RECS_PER_DOC,
         );
-        let recs: Vec<Record> = reader.map(|r| r.unwrap()).collect();
+        let recs: Vec<Record> = reader.map(|r| r.unwrap().0).collect();
         assert_eq!(recs.len(), DOCS as usize * RECS_PER_DOC);
         let doc_a = recs[0].doc_ctx();
         let doc_b = recs[RECS_PER_DOC].doc_ctx();
