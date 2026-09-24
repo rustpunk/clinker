@@ -351,6 +351,12 @@ pub(crate) struct DlqWalkState<'a> {
     writer: DlqWalkWriter,
     /// Rows per stage and category, and rows written per bucket.
     pub(crate) report: crate::dlq::DlqReport,
+    /// The `source_row` of each dead letter pushed while a capture is armed;
+    /// see [`Self::arm_capture`]. Holds only the ids of the dispatch call in
+    /// flight, and is empty between calls.
+    capture: Vec<crate::executor::stream_event::SourceRowId>,
+    /// How many captures are armed.
+    capture_depth: usize,
 }
 
 /// An open capture of [`DlqWalkState::arm_capture`], closed by
@@ -400,6 +406,8 @@ impl<'a> DlqWalkState<'a> {
             encoder,
             writer,
             report: crate::dlq::DlqReport::default(),
+            capture: Vec::new(),
+            capture_depth: 0,
         })
     }
 
@@ -424,6 +432,9 @@ impl<'a> DlqWalkState<'a> {
             .or_insert(0) += 1;
         self.report.record(entry.stage.as_deref(), entry.category);
         self.write(&entry)?;
+        if self.capture_depth > 0 {
+            self.capture.push(entry.source_row);
+        }
         accounts.entries.push(entry); // Removed when the executor test suite reads the DLQ sink.
         check_dlq_rate(accounts, &source_name)
     }
@@ -469,19 +480,38 @@ impl<'a> DlqWalkState<'a> {
     }
 
     /// Start collecting the `source_row` of every dead letter pushed until
-    /// the matching [`Self::take_capture`].
+    /// the matching [`Self::take_capture`]; the commit pass arms one around
+    /// each `dispatch_plan_node` call.
+    ///
+    /// Captures nest: a capture armed while another is open sees only its
+    /// own pushes, and the outer capture still sees them after the inner one
+    /// is taken, as the whole call it wraps produced them.
     pub(crate) fn arm_capture(&mut self) -> DlqCaptureMark {
-        DlqCaptureMark(0)
+        if self.capture_depth == 0 {
+            // A capture left open by a dispatch call that returned an error
+            // belongs to a run that is already failing; never let its ids
+            // reach the next call.
+            self.capture.clear();
+        }
+        self.capture_depth += 1;
+        DlqCaptureMark(self.capture.len())
     }
 
-    /// End the capture `mark` opened and hand each captured `source_row` to
-    /// `out`, in push order.
+    /// End the capture `mark` opened and hand each `source_row` pushed since,
+    /// in push order, to `out`. After the outermost capture is taken the
+    /// capture is empty.
     pub(crate) fn take_capture(
         &mut self,
         mark: DlqCaptureMark,
-        out: impl FnMut(crate::executor::stream_event::SourceRowId),
+        mut out: impl FnMut(crate::executor::stream_event::SourceRowId),
     ) {
-        let _ = (mark, out);
+        self.capture_depth = self.capture_depth.saturating_sub(1);
+        let start = mark.0.min(self.capture.len());
+        if self.capture_depth == 0 {
+            self.capture.drain(start..).for_each(out);
+        } else {
+            self.capture[start..].iter().copied().for_each(&mut out);
+        }
     }
 
     /// Flush and close the walk's writer, handing its bucket files back to
@@ -1091,10 +1121,11 @@ pub(crate) fn push_write_error(
 ///
 /// The entry names the offending column via `triggering_field` and the value
 /// via `triggering_value`, and stamps `stage: output:<name>` — the first DLQ
-/// category to originate at the sink-write stage. The sink dispatch arms build
-/// it while holding only a partial `ctx` borrow (the writer helpers) and drain
-/// it through [`push_dlq`] once the full `ctx` is free, so the DLQ rate ceiling
-/// (E315/E316) is still enforced.
+/// category to originate at the sink-write stage. The buffered Sink arm pushes
+/// it through a [`DlqFunnel`] borrowed beside the writer helpers' other `ctx`
+/// fields, at the record that collided; the streaming Sink thread hands it
+/// back to the walk, which pushes it through [`push_dlq`] at the join. Either
+/// way the DLQ rate ceiling (E315/E316) is enforced.
 pub(crate) fn sink_collision_dlq_entry(
     record: &Record,
     projected: &Record,
@@ -5049,9 +5080,8 @@ mod dlq_capture_tests {
     }
 
     fn entry(ordinal: u64) -> DlqEntry {
-        let schema = SharedStorage::from_arc(Arc::new(clinker_record::Schema::new(vec![
-            "id".into(),
-        ])));
+        let schema =
+            SharedStorage::from_arc(Arc::new(clinker_record::Schema::new(vec!["id".into()])));
         DlqEntry {
             source_row: row(ordinal),
             category: clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,

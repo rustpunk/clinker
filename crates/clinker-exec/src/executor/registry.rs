@@ -61,7 +61,9 @@ pub struct WriterRegistry {
     ///
     /// The walk thread opens one writer from it at run start and closes that
     /// writer before the executor returns `Ok`, so the caller may call
-    /// [`DlqSink::finish`] once the run has returned. A run whose plan has a
+    /// [`DlqSink::finish`] once the run has returned. With
+    /// [`Self::auto_commit_staged`] the executor calls `finish` itself, before
+    /// it commits the staged files, and the caller must not. A run whose plan has a
     /// dead-letter bucket needs a sink to write rows; with `None` the run
     /// still counts every dead letter in its report and writes none.
     pub dlq_sink: Option<Arc<dyn DlqSink>>,

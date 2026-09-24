@@ -764,6 +764,7 @@ impl PipelineExecutor {
         let started_at = Utc::now();
         let output_staging = writers.output_staging.clone();
         let auto_commit_staged = writers.auto_commit_staged;
+        let dlq_sink = writers.dlq_sink.clone();
 
         let source_configs: Vec<_> = config.source_configs().cloned().collect();
         let mut sink_configs: Vec<_> = config.sink_configs().cloned().collect();
@@ -1278,6 +1279,14 @@ impl PipelineExecutor {
                     .is_some_and(|token| !token.try_begin_publication())
             {
                 interrupted = true;
+            }
+            // The walk closed its dead-letter writer before dispatch
+            // returned. With no outer publication owner, the executor
+            // finishes the sink itself, releasing each staged bucket file
+            // complete, before those files commit with the outputs. An
+            // interrupted run commits nothing, so it skips this too.
+            if !interrupted && let Some(sink) = dlq_sink.as_deref() {
+                sink.finish()?;
             }
             if let Some(outcome) = output_staging.commit_all_if_complete(interrupted)? {
                 use crate::output::staging::PublicationOutcome;
