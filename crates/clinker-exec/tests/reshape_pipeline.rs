@@ -6,7 +6,8 @@
 //! contract, and mutation-conflict routing to the dead-letter queue with a
 //! whole-group rollback.
 
-mod common;
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
 #[path = "common/pipeline_resource_fixtures.rs"]
 mod resource_fixtures;
 
@@ -14,7 +15,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_exec::executor::{DlqEntry, PipelineExecutor, PipelineRunParams};
+use clinker_exec::executor::{PipelineExecutor, PipelineRunParams};
 use clinker_plan::config::{CompileContext, parse_config};
 use clinker_plan::error::PipelineError;
 use clinker_record::PipelineCounters;
@@ -81,22 +82,23 @@ fn pressure_padding(yaml: &str, group_rows: usize) -> String {
 }
 
 /// Run a single-source → reshape → single-output pipeline over `csv_input`,
-/// returning the run counters, DLQ entries, and the CSV output string.
+/// returning the run counters, the dead-letter rows written, and the CSV
+/// output string.
 fn run_reshape(
     yaml: &str,
     csv_input: &str,
-) -> Result<(PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
+) -> Result<(PipelineCounters, Vec<dlq_sink::DlqRow>, String), PipelineError> {
     let report = run_reshape_report(yaml, csv_input)?;
-    Ok((report.counters, report.dlq_entries, report.output))
+    Ok((report.counters, report.dlq_rows, report.output))
 }
 
-/// The full observable surface of a Reshape run: counters, DLQ entries, the
+/// The full observable surface of a Reshape run: counters, dead-letter rows, the
 /// rendered CSV output, and the run's cumulative on-disk spill volume. Spill
 /// tests assert `cumulative_spill_bytes > 0` to prove the disk path fired.
 #[derive(Debug)]
 struct ReshapeReport {
     counters: PipelineCounters,
-    dlq_entries: Vec<DlqEntry>,
+    dlq_rows: Vec<dlq_sink::DlqRow>,
     output: String,
     cumulative_spill_bytes: u64,
 }
@@ -127,10 +129,10 @@ fn run_reshape_report(yaml: &str, csv_input: &str) -> Result<ReshapeReport, Pipe
         Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let report = common::run_config(&config, readers, writers, &params)?;
+    let (report, dlq_rows) = dlq_sink::run_config_with_dlq(&config, readers, writers, &params)?;
     Ok(ReshapeReport {
         counters: report.counters,
-        dlq_entries: report.dlq_entries,
+        dlq_rows,
         output: buf.as_string(),
         cumulative_spill_bytes: report.cumulative_spill_bytes,
     })
@@ -240,9 +242,9 @@ fn empty_partition_by_groups_the_whole_input() {
                a,50,plain\n\
                c,200,plain\n\
                a,10,plain\n";
-    let (counters, dlq, output) = run_reshape(WHOLE_INPUT_PIPELINE, csv).unwrap();
+    let (counters, _, output) = run_reshape(WHOLE_INPUT_PIPELINE, csv).unwrap();
 
-    assert!(dlq.is_empty(), "no DLQ entries expected, got {dlq:?}");
+    assert_eq!(counters.dlq_count, 0, "no DLQ entries expected");
     assert_eq!(counters.ok_count, 4, "all 4 source rows emit clean");
 
     let data: Vec<&str> = output.lines().skip(1).filter(|l| !l.is_empty()).collect();
@@ -261,9 +263,9 @@ fn scd_type2_mutates_trigger_and_synthesizes_row() {
                A,100,90,baseline\n\
                A,1000,100,baseline\n\
                B,200,150,baseline\n";
-    let (counters, dlq, output) = run_reshape(SCD_PIPELINE, csv).unwrap();
+    let (counters, _, output) = run_reshape(SCD_PIPELINE, csv).unwrap();
 
-    assert!(dlq.is_empty(), "no DLQ entries expected, got {dlq:?}");
+    assert_eq!(counters.dlq_count, 0, "no DLQ entries expected");
     // `ok_count` counts distinct SOURCE rows reaching output; the
     // synthesized row borrows its trigger's identity, so all 3 source
     // rows count clean.
@@ -307,8 +309,8 @@ fn scd_idempotent_rerun_is_stable() {
                          A,100,90,baseline\n\
                          A,1000,1000,baseline\n\
                          A,1000,1000,synthesized\n";
-    let (_, dlq, output) = run_reshape(SCD_PIPELINE, already_fixed).unwrap();
-    assert!(dlq.is_empty());
+    let (counters, _, output) = run_reshape(SCD_PIPELINE, already_fixed).unwrap();
+    assert_eq!(counters.dlq_count, 0);
     // No new synthesized row beyond the one already present.
     let synth_count = output.lines().filter(|l| l.contains("synthesized")).count();
     assert_eq!(
@@ -325,6 +327,8 @@ pipeline:
   name: reshape_conflict
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: rows
@@ -372,13 +376,17 @@ fn mutation_conflict_dlqs_whole_group() {
                Y,60,base\n";
     let (counters, dlq, output) = run_reshape(CONFLICT_PIPELINE, csv).unwrap();
 
-    assert_eq!(dlq.len(), 1, "exactly one MutationConflict DLQ entry");
     assert_eq!(
-        dlq[0].category,
-        clinker_core_types::dlq::DlqErrorCategory::MutationConflict
+        counters.dlq_count, 1,
+        "exactly one MutationConflict DLQ entry"
+    );
+    assert_eq!(dlq.len(), 1, "exactly one MutationConflict DLQ row written");
+    assert_eq!(
+        dlq[0].category(),
+        Some(clinker_core_types::dlq::DlqErrorCategory::MutationConflict.as_str())
     );
     assert_eq!(
-        dlq[0].stage.as_deref(),
+        dlq[0].stage(),
         Some("reshape:classify:bump_high+bump_big"),
         "stage label names the colliding rule pair"
     );
@@ -443,8 +451,8 @@ nodes:
       path: out.csv
 "#;
     let csv = "gid,amount,tier,note\nX,100,base,\n";
-    let (_, dlq, output) = run_reshape(yaml, csv).unwrap();
-    assert!(dlq.is_empty(), "different fields → no conflict: {dlq:?}");
+    let (counters, _, output) = run_reshape(yaml, csv).unwrap();
+    assert_eq!(counters.dlq_count, 0, "different fields → no conflict");
     // Both rules fired against the original snapshot: tier=high AND
     // note=was_base on the same row.
     assert!(
@@ -509,9 +517,9 @@ fn copy_from_none_synthesizes_fully_overridden_row() {
     let csv = "id,amount,label\n\
                A,150,original\n\
                B,50,original\n";
-    let (counters, dlq, output) = run_reshape(COPY_FROM_NONE_PIPELINE, csv).unwrap();
+    let (counters, _, output) = run_reshape(COPY_FROM_NONE_PIPELINE, csv).unwrap();
 
-    assert!(dlq.is_empty(), "no DLQ entries expected, got {dlq:?}");
+    assert_eq!(counters.dlq_count, 0, "no DLQ entries expected");
 
     let lines: Vec<&str> = output.lines().collect();
     // The two originals pass through plus exactly one synthesized row.
@@ -606,8 +614,8 @@ fn copy_from_none_synthesized_row_carries_trigger_source_identity() {
     let csv = "id,amount,label\n\
                A,150,original\n\
                B,50,original\n";
-    let (_, dlq, output) = run_reshape(COPY_FROM_NONE_SOURCE_IDENTITY_PIPELINE, csv).unwrap();
-    assert!(dlq.is_empty(), "no DLQ entries expected, got {dlq:?}");
+    let (counters, _, output) = run_reshape(COPY_FROM_NONE_SOURCE_IDENTITY_PIPELINE, csv).unwrap();
+    assert_eq!(counters.dlq_count, 0, "no DLQ entries expected");
 
     let mut lines = output.lines();
     let header: Vec<&str> = lines.next().expect("header line").split(',').collect();
@@ -780,9 +788,9 @@ fn reshape_spills_under_memory_pressure() {
     let in_memory = run_reshape_report(&scd_spill_pipeline("512M"), &csv).unwrap();
 
     assert!(
-        spilled.dlq_entries.is_empty(),
-        "spilling run produces no DLQ entries: {:?}",
-        spilled.dlq_entries
+        spilled.counters.dlq_count == 0,
+        "spilling run produces no DLQ entries: {}",
+        spilled.counters.dlq_count
     );
     assert!(
         spilled.cumulative_spill_bytes > 0,
@@ -850,7 +858,7 @@ fn reshape_spill_preserves_within_group_arrival_order() {
     let spilled = run_reshape_report(&scd_spill_pipeline_no_order(&limit), &csv).unwrap();
     let in_memory = run_reshape_report(&scd_spill_pipeline_no_order("512M"), &csv).unwrap();
 
-    assert!(spilled.dlq_entries.is_empty(), "no DLQ entries under spill");
+    assert_eq!(spilled.counters.dlq_count, 0, "no DLQ entries under spill");
     assert!(
         spilled.cumulative_spill_bytes > 0,
         "the single group must partition-spill under the layout-sized budget"
@@ -1021,9 +1029,9 @@ fn reshape_spill_preserves_arrival_order_across_merge() {
         run_merge_reshape(&merge_reshape_pipeline("512M"), &csv_a, &csv_b);
 
     assert!(
-        spilled_report.dlq_entries.is_empty(),
-        "no DLQ entries under spill: {:?}",
-        spilled_report.dlq_entries
+        spilled_report.counters.dlq_count == 0,
+        "no DLQ entries under spill: {}",
+        spilled_report.counters.dlq_count
     );
     assert!(
         spilled_report.cumulative_spill_bytes > 0,
@@ -1074,7 +1082,7 @@ fn reshape_skew_single_giant_group() {
         &payload,
     );
     let report = run_reshape_report(&scd_spill_pipeline(&limit), &csv).unwrap();
-    assert!(report.dlq_entries.is_empty(), "no DLQ entries under skew");
+    assert_eq!(report.counters.dlq_count, 0, "no DLQ entries under skew");
 
     // The giant group went to disk: spill fired and evicted real volume. A
     // single group that fits finalize can only spill its overflow above the
@@ -1279,9 +1287,9 @@ fn scd_type2_e2e_with_spill() {
     let output = buf.as_string();
 
     assert!(
-        report.dlq_entries.is_empty(),
-        "example run produces no DLQ entries: {:?}",
-        report.dlq_entries
+        report.counters.dlq_count == 0,
+        "example run produces no DLQ entries: {}",
+        report.counters.dlq_count
     );
     assert!(
         report.cumulative_spill_bytes > 0,

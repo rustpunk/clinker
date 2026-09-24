@@ -21,13 +21,16 @@
 //! the driver's independent Transform-fed floor is untouched by the
 //! build-side rewind.
 
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
+
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::PathBuf;
 
 use clinker_bench_support::io::SharedBuffer;
 use clinker_core_types::dlq::DlqErrorCategory;
-use clinker_exec::executor::{DlqEntry, PipelineExecutor, PipelineRunParams, SourceReaders};
+use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, SourceReaders};
 use clinker_exec::source::multi_file::FileSlot;
 use clinker_plan::config::{CompileContext, parse_config};
 
@@ -77,6 +80,8 @@ pipeline:
   name: build_direct_combine_rollback
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: src_drv
@@ -142,41 +147,44 @@ nodes:
         HashMap::from([("out".to_string(), writer(&buf))]);
 
     let plan = config.compile(&CompileContext::default()).unwrap();
-    let report =
-        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .unwrap();
+    let sink = dlq_sink::CollectingDlqSink::new();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        dlq_sink::registry(writers, &sink),
+        &run_params(),
+    )
+    .unwrap();
+    let rows = sink.rows();
 
     // The build-value-dependent failure produces a `combine_output_row`
     // DLQ pair: a trigger attributed to the driver source plus a
     // non-trigger entry attributed to the *real* build source. Neither
     // falls back to the synthetic `<merged>` source.
-    let combine_dlq: Vec<&DlqEntry> = report
-        .dlq_entries
+    let combine_dlq: Vec<&dlq_sink::DlqRow> = rows
         .iter()
-        .filter(|e| e.category == DlqErrorCategory::CombineOutputRow)
+        .filter(|row| row.category() == Some(DlqErrorCategory::CombineOutputRow.as_str()))
         .collect();
     assert_eq!(
         combine_dlq.len(),
         2,
         "one trigger (driver) + one build-side entry for the failing row: {:?}",
-        report
-            .dlq_entries
-            .iter()
-            .map(|e| (e.source_name.as_ref(), e.category.as_str(), e.trigger))
+        rows.iter()
+            .map(|row| (row.source_name(), row.category(), row.trigger()))
             .collect::<Vec<_>>()
     );
     assert!(
         combine_dlq
             .iter()
-            .any(|e| e.source_name.as_ref() == "src_drv" && e.trigger),
+            .any(|row| row.source_name() == "src_drv" && row.trigger()),
         "driver row is the attributed trigger on src_drv"
     );
     let build_entry = combine_dlq
         .iter()
-        .find(|e| !e.trigger)
+        .find(|row| !row.trigger())
         .expect("a non-trigger build-side entry is emitted for the matched build row");
     assert_eq!(
-        build_entry.source_name.as_ref(),
+        build_entry.source_name(),
         "src_bld",
         "the build-side entry names the real build source, never the synthetic <merged> source"
     );

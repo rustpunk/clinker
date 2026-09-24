@@ -15,14 +15,20 @@
 //! pipeline has exactly one Source. The narrowing is a no-op there
 //! because every co-grouped slot shares the failing source.
 
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
+
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::PathBuf;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, SourceReaders};
+use clinker_core_types::dlq::DlqErrorCategory;
+use clinker_exec::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams, SourceReaders};
 use clinker_exec::source::multi_file::FileSlot;
 use clinker_plan::config::{CompileContext, parse_config};
+use clinker_plan::plan::CompiledPlan;
+use dlq_sink::{CollectingDlqSink, DlqRow};
 
 fn slot(name: &str, csv: &str) -> FileSlot {
     FileSlot::new(
@@ -45,6 +51,24 @@ fn run_params() -> PipelineRunParams {
     }
 }
 
+/// Run `plan` to completion, returning the report and every dead-letter row
+/// the executor wrote.
+fn run_collecting(
+    plan: &CompiledPlan,
+    readers: SourceReaders,
+    writers: HashMap<String, Box<dyn std::io::Write + Send>>,
+) -> (ExecutionReport, Vec<DlqRow>) {
+    let sink = CollectingDlqSink::new();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        plan,
+        readers,
+        dlq_sink::registry(writers, &sink),
+        &run_params(),
+    )
+    .unwrap();
+    (report, sink.rows())
+}
+
 /// AC2 regression: src_b's mid-window failure must NOT collaterally
 /// DLQ src_a's co-grouped records. Two sources share the `id`
 /// correlation key. `tfm` rewrites a column using a CXL conditional
@@ -60,6 +84,8 @@ pipeline:
   name: ac2_collateral_narrowing
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: src_a
@@ -115,18 +141,13 @@ nodes:
         HashMap::from([("out".to_string(), writer(&buf))]);
 
     let plan = config.compile(&CompileContext::default()).unwrap();
-    let report =
-        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .unwrap();
+    let (report, rows) = run_collecting(&plan, readers, writers);
 
-    let dlq_by_source: HashMap<&str, usize> =
-        report
-            .dlq_entries
-            .iter()
-            .fold(HashMap::new(), |mut acc, e| {
-                *acc.entry(e.source_name.as_ref()).or_insert(0) += 1;
-                acc
-            });
+    assert_eq!(rows.len() as u64, report.counters.dlq_count);
+    let dlq_by_source: HashMap<&str, usize> = rows.iter().fold(HashMap::new(), |mut acc, row| {
+        *acc.entry(row.source_name()).or_insert(0) += 1;
+        acc
+    });
 
     assert_eq!(
         dlq_by_source.get("src_b").copied().unwrap_or(0),
@@ -169,6 +190,8 @@ pipeline:
   name: ac4_single_source
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: src
@@ -210,12 +233,11 @@ nodes:
         HashMap::from([("out".to_string(), writer(&buf))]);
 
     let plan = config.compile(&CompileContext::default()).unwrap();
-    let report =
-        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .unwrap();
+    let (report, rows) = run_collecting(&plan, readers, writers);
 
-    let triggers = report.dlq_entries.iter().filter(|e| e.trigger).count();
-    let collaterals = report.dlq_entries.iter().filter(|e| !e.trigger).count();
+    assert_eq!(rows.len() as u64, report.counters.dlq_count);
+    let triggers = rows.iter().filter(|row| row.trigger()).count();
+    let collaterals = rows.iter().filter(|row| !row.trigger()).count();
     assert_eq!(triggers, 1, "the bad row is the single trigger");
     assert_eq!(
         collaterals, 1,
@@ -323,12 +345,10 @@ nodes:
         HashMap::from([("out".to_string(), writer(&buf))]);
 
     let plan = config.compile(&CompileContext::default()).unwrap();
-    let report =
-        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .unwrap();
+    let (report, _) = run_collecting(&plan, readers, writers);
 
-    assert!(
-        report.dlq_entries.is_empty(),
+    assert_eq!(
+        report.counters.dlq_count, 0,
         "clean Combine run produces no DLQ entries"
     );
     let output = buf.as_string();
@@ -386,6 +406,8 @@ pipeline:
   name: ac3_combine_output_row_recoverable
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: src_drv
@@ -444,39 +466,34 @@ nodes:
         HashMap::from([("out".to_string(), writer(&buf))]);
 
     let plan = config.compile(&CompileContext::default()).unwrap();
-    let report =
-        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .unwrap();
+    let (report, rows) = run_collecting(&plan, readers, writers);
 
     // The failing output row produces a `combine_output_row` DLQ entry
     // scoped to the contributing sources — a trigger on the driver and a
     // non-trigger entry on the matched build. Neither falls back to the
     // synthetic merged source.
-    let combine_dlq: Vec<&clinker_exec::executor::DlqEntry> = report
-        .dlq_entries
+    let combine_dlq: Vec<&DlqRow> = rows
         .iter()
-        .filter(|e| e.category == clinker_core_types::dlq::DlqErrorCategory::CombineOutputRow)
+        .filter(|row| row.category() == Some(DlqErrorCategory::CombineOutputRow.as_str()))
         .collect();
     assert_eq!(
         combine_dlq.len(),
         2,
         "one trigger (driver) + one build-side entry for the failing row: {:?}",
-        report
-            .dlq_entries
-            .iter()
-            .map(|e| (e.source_name.as_ref(), e.category.as_str(), e.trigger))
+        rows.iter()
+            .map(|row| (row.source_name(), row.category(), row.trigger()))
             .collect::<Vec<_>>()
     );
     assert!(
         combine_dlq
             .iter()
-            .any(|e| e.source_name.as_ref() == "src_drv" && e.trigger),
+            .any(|row| row.source_name() == "src_drv" && row.trigger()),
         "driver row is the attributed trigger on src_drv"
     );
     assert!(
         combine_dlq
             .iter()
-            .any(|e| e.source_name.as_ref() == "src_bld" && !e.trigger),
+            .any(|row| row.source_name() == "src_bld" && !row.trigger()),
         "matched build row is attributed to src_bld, not the merged source"
     );
 
@@ -514,38 +531,36 @@ nodes:
 /// the contributing sources, both contributing sources rewound to their
 /// pre-fold floor of 0, and exactly the clean `id=1` row at the output.
 fn assert_combine_output_row_recovered(
-    report: &clinker_exec::executor::ExecutionReport,
+    report: &ExecutionReport,
+    rows: &[DlqRow],
     buf: &SharedBuffer,
 ) {
-    let combine_dlq: Vec<&clinker_exec::executor::DlqEntry> = report
-        .dlq_entries
+    let combine_dlq: Vec<&DlqRow> = rows
         .iter()
-        .filter(|e| e.category == clinker_core_types::dlq::DlqErrorCategory::CombineOutputRow)
+        .filter(|row| row.category() == Some(DlqErrorCategory::CombineOutputRow.as_str()))
         .collect();
     assert_eq!(
         combine_dlq.len(),
         2,
         "one trigger (driver) + one build-side entry for the failing row: {:?}",
-        report
-            .dlq_entries
-            .iter()
-            .map(|e| (e.source_name.as_ref(), e.category.as_str(), e.trigger))
+        rows.iter()
+            .map(|row| (row.source_name(), row.category(), row.trigger()))
             .collect::<Vec<_>>()
     );
     assert!(
         combine_dlq
             .iter()
-            .any(|e| e.source_name.as_ref() == "src_drv" && e.trigger),
+            .any(|row| row.source_name() == "src_drv" && row.trigger()),
         "driver row is the attributed trigger on src_drv: {:?}",
         combine_dlq
             .iter()
-            .map(|e| (e.source_name.as_ref(), e.trigger))
+            .map(|row| (row.source_name(), row.trigger()))
             .collect::<Vec<_>>()
     );
     assert!(
         combine_dlq
             .iter()
-            .any(|e| e.source_name.as_ref() == "src_bld" && !e.trigger),
+            .any(|row| row.source_name() == "src_bld" && !row.trigger()),
         "matched build row is attributed to src_bld, not the merged source"
     );
 
@@ -591,6 +606,8 @@ pipeline:
   name: iejoin_combine_output_row_recoverable
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: src_drv
@@ -654,11 +671,9 @@ nodes:
         HashMap::from([("out".to_string(), writer(&buf))]);
 
     let plan = config.compile(&CompileContext::default()).unwrap();
-    let report =
-        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .unwrap();
+    let (report, rows) = run_collecting(&plan, readers, writers);
 
-    assert_combine_output_row_recovered(&report, &buf);
+    assert_combine_output_row_recovered(&report, &rows, &buf);
     // The surviving IEJoin row carries the matched build x=1.
     assert!(
         buf.as_string()
@@ -686,6 +701,8 @@ pipeline:
   name: grace_hash_combine_output_row_recoverable
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: src_drv
@@ -745,11 +762,9 @@ nodes:
         HashMap::from([("out".to_string(), writer(&buf))]);
 
     let plan = config.compile(&CompileContext::default()).unwrap();
-    let report =
-        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .unwrap();
+    let (report, rows) = run_collecting(&plan, readers, writers);
 
-    assert_combine_output_row_recovered(&report, &buf);
+    assert_combine_output_row_recovered(&report, &rows, &buf);
 }
 
 /// A recoverable Combine output-row eval failure recovers the same way
@@ -767,6 +782,8 @@ pipeline:
   name: sort_merge_combine_output_row_recoverable
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: src_drv
@@ -831,37 +848,32 @@ nodes:
         HashMap::from([("out".to_string(), writer(&buf))]);
 
     let plan = config.compile(&CompileContext::default()).unwrap();
-    let report =
-        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .unwrap();
+    let (_, rows) = run_collecting(&plan, readers, writers);
 
     // The clean driver row k=1 reaches the output; the failing k=6 row is
     // routed to the DLQ with both contributing sources rewound.
-    let combine_dlq: Vec<&clinker_exec::executor::DlqEntry> = report
-        .dlq_entries
+    let combine_dlq: Vec<&DlqRow> = rows
         .iter()
-        .filter(|e| e.category == clinker_core_types::dlq::DlqErrorCategory::CombineOutputRow)
+        .filter(|row| row.category() == Some(DlqErrorCategory::CombineOutputRow.as_str()))
         .collect();
     assert_eq!(
         combine_dlq.len(),
         2,
         "one trigger (driver) + one build-side entry for the failing row: {:?}",
-        report
-            .dlq_entries
-            .iter()
-            .map(|e| (e.source_name.as_ref(), e.category.as_str(), e.trigger))
+        rows.iter()
+            .map(|row| (row.source_name(), row.category(), row.trigger()))
             .collect::<Vec<_>>()
     );
     assert!(
         combine_dlq
             .iter()
-            .any(|e| e.source_name.as_ref() == "src_drv" && e.trigger),
+            .any(|row| row.source_name() == "src_drv" && row.trigger()),
         "driver row is the attributed trigger on src_drv"
     );
     assert!(
         combine_dlq
             .iter()
-            .any(|e| e.source_name.as_ref() == "src_bld" && !e.trigger),
+            .any(|row| row.source_name() == "src_bld" && !row.trigger()),
         "matched build row is attributed to src_bld, not the merged source"
     );
     let output = buf.as_string();
