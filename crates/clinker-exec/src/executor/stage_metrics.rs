@@ -379,18 +379,27 @@ mod tests {
 
     #[test]
     fn stage_timer_cpu_delta_nonzero_after_busy_work() {
-        let timer = StageTimer::new(StageName::TransformEval);
-        let start = std::time::Instant::now();
-        let mut x: u64 = 0;
-        while start.elapsed() < std::time::Duration::from_millis(50) {
-            x = x.wrapping_add(1);
-            std::hint::black_box(&x);
+        // CPU time is accounted in scheduler ticks (about 15.6 ms on
+        // Windows), and a loaded machine can deschedule this thread for most
+        // of a short wall-clock window, so a single 50 ms spin can record a
+        // zero delta. Repeat bounded spins until the timer reports user CPU
+        // time; broken accounting still fails once the bound is reached.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut observed: u64 = 0;
+        while observed == 0 && std::time::Instant::now() < deadline {
+            let timer = StageTimer::new(StageName::TransformEval);
+            let start = std::time::Instant::now();
+            let mut x: u64 = 0;
+            while start.elapsed() < std::time::Duration::from_millis(50) {
+                x = x.wrapping_add(1);
+                std::hint::black_box(&x);
+            }
+            observed = timer.finish(0, 0).cpu_user_delta_ns.unwrap_or(0);
         }
-        let metrics = timer.finish(0, 0);
         #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         assert!(
-            metrics.cpu_user_delta_ns.unwrap_or(0) > 0,
-            "expected nonzero cpu_user_delta_ns after spin"
+            observed > 0,
+            "expected nonzero cpu_user_delta_ns after up to 2 s of busy work"
         );
     }
 
