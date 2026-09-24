@@ -199,6 +199,13 @@ manifest and liveness metadata last, and removes the now-empty attempt root.
 A crash or refusal before that sequence finishes remains explicit cleanup debt
 for a bounded retry.
 
+An attempt can also hold short-lived scratch files named `scratch-` followed
+by eight hexadecimal digits. A run must remove each one before it publishes,
+so only a retained attempt whose run ended before that removal can hold one.
+The manifest records each scratch file before it is created, so inspection
+counts its size in the attempt's retained bytes and cleanup removes it with
+the attempt. A file the manifest does not name still keeps the whole attempt.
+
 Use the non-mutating operator surface to inspect or preview retained state:
 
 ```bash

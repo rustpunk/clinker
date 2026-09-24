@@ -997,7 +997,14 @@ mod tests {
     const SCRATCH_EXECUTION: &str = "018f47a2-9a41-7a27-b4d6-4f7137e3c159";
 
     fn scratch_run(root: &std::path::Path) -> (RunAttemptPublication, OutputStagingRegistry) {
-        let policy = clinker_plan::config::ClinkerToml::parse("")
+        scratch_run_with("", root)
+    }
+
+    fn scratch_run_with(
+        publication_config: &str,
+        root: &std::path::Path,
+    ) -> (RunAttemptPublication, OutputStagingRegistry) {
+        let policy = clinker_plan::config::ClinkerToml::parse(publication_config)
             .expect("parse publication fixture")
             .storage
             .publication
@@ -1089,6 +1096,45 @@ mod tests {
             !root.path().join("rejects.csv").exists(),
             "the destination itself is untouched"
         );
+    }
+
+    /// Under `local_then_publish` an artifact stages in the local spool, so
+    /// the scratch file whose bytes it will receive lives there too.
+    #[test]
+    fn local_then_publish_scratch_lives_in_the_spool_root() {
+        let root = tempfile::tempdir().expect("destination root");
+        let spool = tempfile::tempdir().expect("local spool");
+        let config = format!(
+            "[storage.publication]\nmode = \"local_then_publish\"\nlocal_spool_dir = \"{}\"\n",
+            spool.path().display().to_string().replace('\\', "\\\\")
+        );
+        let (_attempt, registry) = scratch_run_with(&config, root.path());
+        let scratch = registry
+            .create_attempt_scratch(&root.path().join("rejects.csv"), "rejects")
+            .expect("create recorded scratch file");
+        let id = scratch.id.as_str();
+        assert!(
+            spool
+                .path()
+                .join(".clinker-attempts")
+                .join(SCRATCH_EXECUTION)
+                .join(id)
+                .is_file(),
+            "the scratch file is beside the staged artifacts in the spool"
+        );
+        assert!(!scratch_attempt_dir(root.path()).join(id).exists());
+        let manifest = persisted_manifest(root.path());
+        assert_eq!(
+            manifest.scratch()[0].root_identifier(),
+            owned_root_identifier(spool.path()),
+            "every root's manifest copy names the spool as the file's root"
+        );
+        let id = scratch.id.clone();
+        drop(scratch);
+        registry
+            .retire_attempt_scratch(&id)
+            .expect("retire the scratch file");
+        assert!(persisted_manifest(root.path()).scratch().is_empty());
     }
 
     #[test]

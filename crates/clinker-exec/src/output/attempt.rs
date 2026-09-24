@@ -743,6 +743,20 @@ pub struct ScratchManifest {
 }
 
 impl ScratchManifest {
+    fn new(scratch_id: String, root_identifier: String) -> Result<Self, AttemptError> {
+        let entry = Self {
+            scratch_id,
+            root_identifier,
+        };
+        entry.validate()?;
+        Ok(entry)
+    }
+
+    fn validate(&self) -> Result<(), AttemptError> {
+        validate_scratch_id(&self.scratch_id)?;
+        validate_root_identifier(&self.root_identifier)
+    }
+
     /// The file's leaf inside its attempt root: `scratch-` and eight
     /// lowercase hexadecimal characters.
     pub fn scratch_id(&self) -> &str {
@@ -886,6 +900,16 @@ impl AttemptManifest {
         &self.scratch
     }
 
+    /// Leaves of the scratch files recorded in the attempt root of
+    /// `root_identifier`, in id order. A scratch file recorded for another
+    /// root never legitimises a same-named child here.
+    fn scratch_leaves_in<'a>(&'a self, root_identifier: &'a str) -> impl Iterator<Item = &'a str> {
+        self.scratch
+            .iter()
+            .filter(move |entry| entry.root_identifier == root_identifier)
+            .map(|entry| entry.scratch_id.as_str())
+    }
+
     fn with_admitted_bytes(mut self, admitted_bytes: u64) -> Result<Self, AttemptError> {
         self.admitted_bytes = admitted_bytes;
         self.validate(None)?;
@@ -940,6 +964,29 @@ impl AttemptManifest {
         if total_bytes != self.total_bytes {
             return Err(AttemptError::InvalidManifest(
                 "artifact byte total does not match entries",
+            ));
+        }
+        // Scratch files share the artifacts' bound, so the per-root child
+        // inventories sized from `MANIFEST_MAX_ARTIFACTS` still see every
+        // owned child.
+        if self.artifacts.len().saturating_add(self.scratch.len()) > MANIFEST_MAX_ARTIFACTS {
+            return Err(AttemptError::InvalidManifest(
+                "artifact and scratch count exceeds its bound",
+            ));
+        }
+        let mut previous = None;
+        for scratch in &self.scratch {
+            scratch.validate()?;
+            if previous.is_some_and(|id: &str| id >= scratch.scratch_id.as_str()) {
+                return Err(AttemptError::InvalidManifest(
+                    "scratch files must be strictly ordered by scratch_id",
+                ));
+            }
+            previous = Some(scratch.scratch_id.as_str());
+        }
+        if self.state == AttemptState::Complete && !self.scratch.is_empty() {
+            return Err(AttemptError::InvalidManifest(
+                "complete attempt still records a scratch file",
             ));
         }
         if let Some(receipt) = &self.root_receipt {
@@ -2429,10 +2476,22 @@ impl AttemptQuery {
                 return Ok(report);
             }
         };
-        let expected = manifest
+        // Owned leaves in removal order: artifacts, then this root's scratch
+        // files. Every `artifact-` id sorts before every `scratch-` id, so
+        // one cursor over the sequence resumes an interrupted purge.
+        let owned_leaves = manifest
             .artifacts
             .iter()
-            .map(|artifact| artifact.artifact_id.as_str())
+            .map(|artifact| (artifact.artifact_id.as_str(), true))
+            .chain(
+                manifest
+                    .scratch_leaves_in(&request.root_identifier)
+                    .map(|leaf| (leaf, false)),
+            )
+            .collect::<Vec<_>>();
+        let expected = owned_leaves
+            .iter()
+            .map(|(leaf, _)| *leaf)
             .chain(["live.lock", "manifest.json"])
             .collect::<std::collections::BTreeSet<_>>();
         let refusal = if manifest.execution_id != execution_id {
@@ -2480,10 +2539,10 @@ impl AttemptQuery {
         }
 
         let mut last_removed = cursor;
-        for artifact in &manifest.artifacts {
+        for &(leaf, is_artifact) in &owned_leaves {
             if last_removed
                 .as_ref()
-                .is_some_and(|cursor| artifact.artifact_id <= *cursor)
+                .is_some_and(|cursor| leaf <= cursor.as_str())
             {
                 continue;
             }
@@ -2520,16 +2579,16 @@ impl AttemptQuery {
                 report.bounds = budget.bounds();
                 return Ok(report);
             }
-            if observed.contains_key(&artifact.artifact_id) {
-                if attempt_root
-                    .directory
-                    .remove_file(&artifact.artifact_id)
-                    .is_err()
-                {
+            if observed.contains_key(leaf) {
+                if attempt_root.directory.remove_file(leaf).is_err() {
                     report.disposition = PurgeDisposition::Partial;
                     report.cleanup_debt.push(CleanupDebt::new(
                         CleanupDebtKind::Operational,
-                        "owned artifact removal failed with owner metadata retained",
+                        if is_artifact {
+                            "owned artifact removal failed with owner metadata retained"
+                        } else {
+                            "owned scratch file removal failed with owner metadata retained"
+                        },
                     ));
                     report.continuation = Some(self.continuation(
                         &request.root_identifier,
@@ -2541,9 +2600,11 @@ impl AttemptQuery {
                     report.bounds = budget.bounds();
                     return Ok(report);
                 }
-                report.removed_artifact_count += 1;
+                if is_artifact {
+                    report.removed_artifact_count += 1;
+                }
             }
-            last_removed = Some(artifact.artifact_id.clone());
+            last_removed = Some(leaf.to_owned());
         }
         if shutdown.is_requested() {
             report.disposition = PurgeDisposition::Partial;
@@ -3270,6 +3331,7 @@ fn inspect_owned_attempt(
                 artifact.artifact_id.as_str()
             }
         })
+        .chain(manifest.scratch_leaves_in(&root.identifier))
         .chain(["live.lock", "manifest.json"])
         .collect::<std::collections::BTreeSet<_>>();
     if observed
@@ -3291,60 +3353,21 @@ fn inspect_owned_attempt(
             } else {
                 artifact.artifact_id.as_str()
             };
-        match observed.get(quarantine_leaf) {
-            Some((ContainedEntryKind::File, size_bytes)) => {
+        if let Some(entry) = observed.get(quarantine_leaf) {
+            if entry.0 == ContainedEntryKind::File {
                 inspection.artifact_ids.push(artifact.artifact_id.clone());
-                match attempt_root.directory.open_file(quarantine_leaf) {
-                    Ok(_) => match size_bytes {
-                        Some(size_bytes) => {
-                            if let Some(total) = retained_bytes {
-                                retained_bytes = total.checked_add(*size_bytes);
-                                if retained_bytes.is_none() {
-                                    inspection.cleanup_debt.push(CleanupDebt::new(
-                                        CleanupDebtKind::Operational,
-                                        "owned artifact byte accounting overflowed",
-                                    ));
-                                }
-                            }
-                            if artifact.state != ArtifactState::Promoting {
-                                match usize::try_from(*size_bytes) {
-                                    Ok(size) => {
-                                        if let Err(debt) = budget.consume_bytes(size) {
-                                            inspection.cleanup_debt.push(debt);
-                                        }
-                                    }
-                                    Err(_) => {
-                                        inspection.cleanup_debt.push(CleanupDebt::new(
-                                            CleanupDebtKind::ByteBudget,
-                                            "owned artifact exceeds the addressable byte budget",
-                                        ));
-                                        retained_bytes = None;
-                                    }
-                                }
-                            }
-                        }
-                        None => {
-                            retained_bytes = None;
-                            inspection.cleanup_debt.push(CleanupDebt::new(
-                                CleanupDebtKind::Operational,
-                                "owned artifact size could not be established handle-relatively",
-                            ));
-                        }
-                    },
-                    Err(_) => {
-                        retained_bytes = None;
-                        inspection.cleanup_debt.push(CleanupDebt::new(
-                            CleanupDebtKind::Operational,
-                            "owned artifact could not be opened through its retained handle",
-                        ));
-                    }
-                }
             }
-            None => {}
-            Some(_) => inspection.cleanup_debt.push(CleanupDebt::new(
-                CleanupDebtKind::UnsafeEntry,
-                "manifest-owned artifact is not a regular file",
-            )),
+            account_owned_file(
+                &attempt_root,
+                quarantine_leaf,
+                *entry,
+                OwnedFileKind::Artifact {
+                    promoting: artifact.state == ArtifactState::Promoting,
+                },
+                &mut retained_bytes,
+                budget,
+                &mut inspection.cleanup_debt,
+            );
         }
         let reconciled = match reconcile_promoting_artifact(root, &attempt_root, artifact, budget) {
             Ok(state) => state,
@@ -3356,6 +3379,19 @@ fn inspect_owned_attempt(
         inspection
             .artifact_states
             .push((artifact.artifact_id.clone(), reconciled));
+    }
+    for leaf in manifest.scratch_leaves_in(&root.identifier) {
+        if let Some(entry) = observed.get(leaf) {
+            account_owned_file(
+                &attempt_root,
+                leaf,
+                *entry,
+                OwnedFileKind::Scratch,
+                &mut retained_bytes,
+                budget,
+                &mut inspection.cleanup_debt,
+            );
+        }
     }
     inspection.retained_bytes = retained_bytes;
 
@@ -3395,6 +3431,100 @@ fn inspect_owned_attempt(
     });
     inspection.bounds = budget.bounds();
     inspection
+}
+
+/// Which manifest record owns a file being inventoried.
+#[derive(Clone, Copy)]
+enum OwnedFileKind {
+    /// A promoting artifact's bytes are charged by promotion reconciliation,
+    /// not here.
+    Artifact {
+        promoting: bool,
+    },
+    Scratch,
+}
+
+/// Count one manifest-owned child's observed size toward `retained_bytes`,
+/// after proving the file opens through the attempt's contained handle, and
+/// charge it to the query byte budget. Any size that cannot be established
+/// makes the total unknown rather than smaller.
+fn account_owned_file(
+    attempt_root: &AttemptRoot,
+    leaf: &str,
+    observed: (ContainedEntryKind, Option<u64>),
+    kind: OwnedFileKind,
+    retained_bytes: &mut Option<u64>,
+    budget: &mut QueryBudget,
+    cleanup_debt: &mut Vec<CleanupDebt>,
+) {
+    let scratch = matches!(kind, OwnedFileKind::Scratch);
+    let detail = |artifact: &'static str, scratch_detail: &'static str| {
+        if scratch { scratch_detail } else { artifact }
+    };
+    let (ContainedEntryKind::File, size_bytes) = observed else {
+        cleanup_debt.push(CleanupDebt::new(
+            CleanupDebtKind::UnsafeEntry,
+            detail(
+                "manifest-owned artifact is not a regular file",
+                "manifest-owned scratch file is not a regular file",
+            ),
+        ));
+        return;
+    };
+    if attempt_root.directory.open_file(leaf).is_err() {
+        *retained_bytes = None;
+        cleanup_debt.push(CleanupDebt::new(
+            CleanupDebtKind::Operational,
+            detail(
+                "owned artifact could not be opened through its retained handle",
+                "owned scratch file could not be opened through its retained handle",
+            ),
+        ));
+        return;
+    }
+    let Some(size_bytes) = size_bytes else {
+        *retained_bytes = None;
+        cleanup_debt.push(CleanupDebt::new(
+            CleanupDebtKind::Operational,
+            detail(
+                "owned artifact size could not be established handle-relatively",
+                "owned scratch file size could not be established handle-relatively",
+            ),
+        ));
+        return;
+    };
+    if let Some(total) = *retained_bytes {
+        *retained_bytes = total.checked_add(size_bytes);
+        if retained_bytes.is_none() {
+            cleanup_debt.push(CleanupDebt::new(
+                CleanupDebtKind::Operational,
+                detail(
+                    "owned artifact byte accounting overflowed",
+                    "owned scratch file byte accounting overflowed",
+                ),
+            ));
+        }
+    }
+    if matches!(kind, OwnedFileKind::Artifact { promoting: true }) {
+        return;
+    }
+    match usize::try_from(size_bytes) {
+        Ok(size) => {
+            if let Err(debt) = budget.consume_bytes(size) {
+                cleanup_debt.push(debt);
+            }
+        }
+        Err(_) => {
+            cleanup_debt.push(CleanupDebt::new(
+                CleanupDebtKind::ByteBudget,
+                detail(
+                    "owned artifact exceeds the addressable byte budget",
+                    "owned scratch file exceeds the addressable byte budget",
+                ),
+            ));
+            *retained_bytes = None;
+        }
+    }
 }
 
 fn reconcile_promoting_artifact(
@@ -3663,9 +3793,12 @@ fn continuation_binding(
 }
 
 pub(super) fn owned_root_identifier(path: &Path) -> String {
-    blake3::hash(destination_root_key(path).as_bytes())
-        .to_hex()
-        .to_string()
+    root_identifier_for_key(&destination_root_key(path))
+}
+
+/// Path-free identifier of the root whose [`destination_root_key`] is `key`.
+fn root_identifier_for_key(key: &str) -> String {
+    blake3::hash(key.as_bytes()).to_hex().to_string()
 }
 
 fn legacy_inspection(execution_id: &str, disposition: CleanupDisposition) -> AttemptInspection {
@@ -3805,6 +3938,12 @@ pub struct AttemptPublication {
     lock_file: Option<File>,
     manifest: AttemptManifest,
     artifacts: Vec<ArtifactRuntime>,
+    /// Root key holding each live scratch file, by scratch id.
+    scratch_roots: BTreeMap<String, String>,
+    /// Serial of the last scratch id handed out. Ids are never reused within
+    /// an attempt, so a record left by a failed retirement cannot collide
+    /// with a later file.
+    scratch_serial: u32,
     policy: Option<ResolvedPublicationPolicy>,
     terminal: bool,
     fault: Option<AttemptFault>,
@@ -4122,6 +4261,8 @@ impl AttemptPublication {
             destination_root_keys: vec![owner_root_key],
             manifest,
             artifacts: Vec::new(),
+            scratch_roots: BTreeMap::new(),
+            scratch_serial: 0,
             policy: None,
             terminal: false,
             fault: None,
@@ -4581,21 +4722,109 @@ impl AttemptPublication {
         })
     }
 
+    /// Record, then create, one scratch file in the attempt root that stages
+    /// an artifact for `destination`: the destination's own root when output
+    /// streams directly into destination quarantine, the local spool root
+    /// under `local_then_publish`. That is the root holding the staged file
+    /// the scratch bytes are later copied into.
     fn create_scratch(
         &mut self,
         destination: &ValidatedPath,
     ) -> Result<(String, File), AttemptError> {
-        let _ = destination;
-        Err(AttemptError::InvalidTransition(
-            "attempt scratch files are not supported",
-        ))
+        if self.terminal || self.manifest.state != AttemptState::Staging {
+            return Err(AttemptError::InvalidTransition(
+                "attempt no longer accepts scratch files",
+            ));
+        }
+        let mode = self
+            .policy
+            .as_ref()
+            .ok_or(AttemptError::InvalidTransition(
+                "run attempt has no resolved publication policy",
+            ))?
+            .mode();
+        let destination_root = destination_parent(destination)?;
+        let destination_root_key = destination_root_key(destination_root.as_path());
+        if self
+            .destination_root_keys
+            .binary_search(&destination_root_key)
+            .is_err()
+        {
+            return Err(AttemptError::InvalidManifest(
+                "scratch destination is outside the compiled run roots",
+            ));
+        }
+        let root_key = match mode {
+            PublicationMode::Direct => destination_root_key,
+            PublicationMode::LocalThenPublish => self.owner_root_key.clone(),
+        };
+        let serial = self
+            .scratch_serial
+            .checked_add(1)
+            .ok_or(AttemptError::InvalidManifest(
+                "scratch identifier space is exhausted",
+            ))?;
+        let scratch_id = format!("scratch-{serial:08x}");
+        let entry = ScratchManifest::new(scratch_id.clone(), root_identifier_for_key(&root_key))?;
+        let previous = self.manifest.clone();
+        let mut next = previous.clone();
+        next.scratch.push(entry);
+        self.persist_replacement(next, false)?;
+        self.scratch_serial = serial;
+        match self.create_artifact_in_root(&root_key, &scratch_id) {
+            Ok(file) => {
+                self.scratch_roots.insert(scratch_id.clone(), root_key);
+                Ok((scratch_id, file))
+            }
+            Err(error) => {
+                // No file exists under this record. Withdraw it; if that write
+                // fails too, the record stays, which cleanup tolerates as it
+                // does an artifact record without its file.
+                let _ = self.persist_replacement(previous, false);
+                Err(error)
+            }
+        }
     }
 
+    /// Remove one scratch file through its contained root, synchronize the
+    /// root, then drop the record. A failure before the record is dropped
+    /// leaves it in place, so a file that may still exist stays owned.
     fn retire_scratch(&mut self, scratch_id: &str) -> Result<(), AttemptError> {
-        let _ = scratch_id;
-        Err(AttemptError::InvalidTransition(
-            "attempt scratch files are not supported",
-        ))
+        let root_key =
+            self.scratch_roots
+                .get(scratch_id)
+                .cloned()
+                .ok_or(AttemptError::InvalidTransition(
+                    "scratch file is not recorded by this attempt",
+                ))?;
+        self.remove_artifact_in_root(&root_key, scratch_id)?;
+        self.sync_root(&root_key)?;
+        let mut next = self.manifest.clone();
+        next.scratch.retain(|entry| entry.scratch_id != scratch_id);
+        self.persist_replacement(next, false)?;
+        self.scratch_roots.remove(scratch_id);
+        Ok(())
+    }
+
+    fn sync_root(&self, root_key: &str) -> Result<(), AttemptError> {
+        if root_key == self.owner_root_key {
+            return self
+                .attempt_root
+                .as_ref()
+                .ok_or(AttemptError::InvalidTransition("attempt root was removed"))?
+                .directory
+                .sync()
+                .map_err(AttemptError::from);
+        }
+        self.additional_roots
+            .get(root_key)
+            .ok_or(AttemptError::InvalidTransition(
+                "destination attempt root is missing",
+            ))?
+            .root
+            .directory
+            .sync()
+            .map_err(AttemptError::from)
     }
 
     fn create_artifact_in_root(&self, root_key: &str, leaf: &str) -> Result<File, AttemptError> {
@@ -4960,6 +5189,13 @@ impl AttemptPublication {
                 "attempt is not eligible for publication",
             ));
         }
+        // Every scratch file is copied where it belongs and retired before
+        // publication; one still recorded here means bytes were never placed.
+        if !self.manifest.scratch.is_empty() {
+            return Err(AttemptError::InvalidTransition(
+                "attempt still records a scratch file at publication",
+            ));
+        }
         if !shutdown.try_begin_publication() {
             let mut abandoned = self.manifest.clone();
             abandoned.state = AttemptState::Abandoned;
@@ -5243,10 +5479,16 @@ impl AttemptPublication {
         {
             return Ok(kept());
         }
-        let expected = manifest
+        let root_identifier = owned_root_identifier(destination_root.as_path());
+        let owned_leaves = manifest
             .artifacts
             .iter()
             .map(|artifact| artifact.artifact_id.as_str())
+            .chain(manifest.scratch_leaves_in(&root_identifier))
+            .collect::<Vec<_>>();
+        let expected = owned_leaves
+            .iter()
+            .copied()
             .chain(["live.lock", "manifest.json"])
             .collect::<std::collections::BTreeSet<_>>();
         if observed
@@ -5255,14 +5497,10 @@ impl AttemptPublication {
         {
             return Ok(kept());
         }
-        for artifact in &manifest.artifacts {
-            match observed.get(&artifact.artifact_id) {
+        for &leaf in &owned_leaves {
+            match observed.get(leaf) {
                 Some(ContainedEntryKind::File) => {
-                    if attempt_root
-                        .directory
-                        .open_file(&artifact.artifact_id)
-                        .is_err()
-                    {
+                    if attempt_root.directory.open_file(leaf).is_err() {
                         return Ok(kept());
                     }
                 }
@@ -5271,13 +5509,8 @@ impl AttemptPublication {
             }
         }
 
-        for artifact in &manifest.artifacts {
-            if observed.contains_key(&artifact.artifact_id)
-                && attempt_root
-                    .directory
-                    .remove_file(&artifact.artifact_id)
-                    .is_err()
-            {
+        for &leaf in &owned_leaves {
+            if observed.contains_key(leaf) && attempt_root.directory.remove_file(leaf).is_err() {
                 return Ok(kept());
             }
         }
@@ -5637,6 +5870,20 @@ fn validate_artifact_id(artifact_id: &str) -> Result<(), AttemptError> {
     {
         return Err(AttemptError::InvalidManifest(
             "artifact_id must be artifact- followed by eight lowercase hexadecimal characters",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_scratch_id(scratch_id: &str) -> Result<(), AttemptError> {
+    if scratch_id.len() != 16
+        || !scratch_id.starts_with("scratch-")
+        || !scratch_id[8..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(AttemptError::InvalidManifest(
+            "scratch_id must be scratch- followed by eight lowercase hexadecimal characters",
         ));
     }
     Ok(())

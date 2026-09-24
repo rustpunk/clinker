@@ -139,6 +139,18 @@ at least one per-execution reservation until every artifact size is exact;
 simultaneous local-spool and destination quarantine copies still count
 physically. Missing or uninspectable ownership evidence is conservative debt,
 never a zero-byte assumption.
+The manifest also records scratch files (`scratch-<8 hex>`), each by its id
+and the path-free identifier of the root that holds it. A scratch file sits in
+the attempt root that stages artifacts for its destination: the destination's
+own root in `destination` mode, and the local spool in `local_then_publish`
+mode. Its record is persisted in every root's copy of the manifest before the
+file is created through the contained handle. Retiring a scratch file removes
+it, synchronizes the directory, and then drops the record. A record without
+its file is tolerated, as it is for an artifact. Scratch records share the
+artifact count bound. Inventory and purge treat a recorded scratch file in its
+own root as an owned child whose observed size counts toward retained bytes,
+and a complete attempt never records one: publication refuses to start while
+one is recorded.
 Namespace enumeration is bounded by the publication policy's fixed maximum,
 not the current desired retained count. A configuration downgrade therefore
 still returns physical attempts through advancing continuation tokens while
