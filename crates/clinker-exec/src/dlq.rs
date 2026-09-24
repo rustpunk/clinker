@@ -445,10 +445,28 @@ pub struct DlqReport {
 impl DlqReport {
     /// Count one dead-lettered row at `stage` (`None` when the failure has
     /// no stage) with `category`.
-    pub fn record(&mut self, _stage: Option<&str>, _category: DlqErrorCategory) {}
+    ///
+    /// Allocates only the first time a stage is seen.
+    pub fn record(&mut self, stage: Option<&str>, category: DlqErrorCategory) {
+        let stage = stage.unwrap_or("");
+        let categories = match self.by_stage_category.get_mut(stage) {
+            Some(categories) => categories,
+            None => self.by_stage_category.entry(stage.to_owned()).or_default(),
+        };
+        *categories.entry(category).or_default() += 1;
+    }
 
-    /// Count one row written to bucket `id`, whose file is `path`.
-    pub fn record_bucket_row(&mut self, _id: DlqBucketId, _path: &Path) {}
+    /// Count one row written to bucket `id`, whose file is `path`. The path
+    /// is kept from the bucket's first row.
+    pub fn record_bucket_row(&mut self, id: DlqBucketId, path: &Path) {
+        match self.bucket_ids.binary_search(&id) {
+            Ok(slot) => self.bucket_rows[slot].1 += 1,
+            Err(slot) => {
+                self.bucket_ids.insert(slot, id);
+                self.bucket_rows.insert(slot, (path.to_path_buf(), 1));
+            }
+        }
+    }
 
     /// The categories counted at `stage` and their counts, in category
     /// order. The empty string names rows with no stage.
@@ -463,7 +481,15 @@ impl DlqReport {
     /// goes to the pair first in stage-then-category order; the empty stage
     /// names rows with no stage.
     pub fn top_stage_category(&self) -> Option<(&str, DlqErrorCategory, u64)> {
-        None
+        let mut top: Option<(&str, DlqErrorCategory, u64)> = None;
+        for (stage, categories) in &self.by_stage_category {
+            for (category, count) in categories {
+                if top.is_none_or(|(_, _, best)| *count > best) {
+                    top = Some((stage, *category, *count));
+                }
+            }
+        }
+        top
     }
 
     /// Rows per bucket file, in bucket order.
@@ -1030,7 +1056,9 @@ nodes:\n- type: source\n  name: src_a\n  config:\n    name: src_a\n    type: csv
 - type: sink\n  name: out\n  input: m\n  config:\n    name: out\n    type: csv\n    path: out.csv\n",
         );
         let wide = layout.bucket_for_source("src_a").expect("pipeline bucket");
-        let own = layout.bucket_for_source("src_b").expect("per-source bucket");
+        let own = layout
+            .bucket_for_source("src_b")
+            .expect("per-source bucket");
         let (first, second) = if wide < own { (wide, own) } else { (own, wide) };
 
         let mut report = DlqReport::default();
