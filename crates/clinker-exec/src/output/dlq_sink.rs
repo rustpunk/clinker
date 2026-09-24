@@ -167,7 +167,16 @@ fn open_bucket(
 
 impl DlqRowWriter for StagedDlqRowWriter {
     fn write_row(&mut self, target: &DlqBucketTarget<'_>, row: &[u8]) -> Result<(), PipelineError> {
-        let _ = (target, row, open_bucket);
+        let index = target.id.index();
+        if self.buckets.len() <= index {
+            self.buckets.resize_with(index + 1, || None);
+        }
+        let bucket = match &mut self.buckets[index] {
+            Some(open) => open,
+            slot @ None => slot.insert(open_bucket(&self.staging, target)?),
+        };
+        bucket.out.write_all(row).map_err(PipelineError::Io)?;
+        bucket.rows += 1;
         Ok(())
     }
 
@@ -355,9 +364,7 @@ nodes:\n- type: source\n  name: src_a\n  config:\n    name: src_a\n    type: csv
         let sink = StagedDlqSink::new(staging);
 
         let mut writer = sink.walk_writer();
-        writer
-            .write_row(&target(id, &path), b"1,a\n")
-            .expect("row");
+        writer.write_row(&target(id, &path), b"1,a\n").expect("row");
         let capacity = writer
             .buckets
             .get(id.index())
