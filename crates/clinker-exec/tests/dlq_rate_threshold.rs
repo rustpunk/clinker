@@ -174,20 +174,13 @@ error_handling:
 "#,
     );
     let config = parse_config(&yaml).unwrap();
-    let plan = config.compile(&CompileContext::default()).unwrap();
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
         HashMap::from([("out".to_string(), writer(&buf))]);
-    let sink = CollectingDlqSink::new();
 
-    let report = PipelineExecutor::run_plan_with_readers_writers(
-        &plan,
-        five_each_readers(),
-        dlq_sink::registry(writers, &sink),
-        &run_params(),
-    )
-    .expect("pipeline must complete under Continue strategy");
-    let rows = sink.rows();
+    let (report, rows) =
+        dlq_sink::run_config_with_dlq(&config, five_each_readers(), writers, &run_params())
+            .expect("pipeline must complete under Continue strategy");
     assert_eq!(report.counters.dlq_count, 5, "5 src_b rows fail");
     assert_eq!(rows.len(), 5, "every dead letter has a destination");
     assert!(
