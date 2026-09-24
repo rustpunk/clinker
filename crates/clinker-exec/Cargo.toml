@@ -36,6 +36,7 @@ uuid = { version = "1", features = ["v7"] }
 num_cpus = "1"
 fs4 = { workspace = true }
 petgraph = { workspace = true }
+roaring = { workspace = true }
 libc = "0.2"
 walkdir = "2"
 fastrand = { workspace = true }
