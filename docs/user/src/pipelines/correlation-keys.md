@@ -72,7 +72,17 @@ error_handling:
   max_group_buffer: 100000     # Default: 100,000
 ```
 
-Groups that exceed the cap are DLQ'd entirely with a `group_size_exceeded` trigger plus a collateral entry per buffered record. This is a backpressure boundary, not a hard error.
+A group that goes over the cap is dead-lettered whole when the run commits it. It is not a hard error: the run continues.
+
+- Each row of the group that failed on its own is written as its own trigger, with its own category and `_cxl_dlq_id`.
+- The group's other rows are written under one `group_size_exceeded` trigger, the first of them; the rest are `correlated` rows that carry its id as their `_cxl_dlq_trigger_id`.
+- A group whose rows all failed writes only those failures, with no `group_size_exceeded` row.
+
+Every row is written once and counts toward `dlq_count` and the DLQ rate limits. The `group_size_exceeded` row's `_cxl_dlq_timestamp` is when the group went over the cap, and its error detail states the cap and how many entries the group held.
+
+The cap counts the entries a group holds, not its distinct rows: a row counts once for each Sink it reaches, and each failure counts once. A row that an inclusive Route sends to two Sinks counts twice, and so does a row that fails on one branch and reaches a Sink on another.
+
+Going over the cap does not stop a group from buffering. The group keeps buffering its rows until the run commits it, so today the cap decides how a large group is dead-lettered but does not bound the memory it uses.
 
 ## Per-operator interactions
 

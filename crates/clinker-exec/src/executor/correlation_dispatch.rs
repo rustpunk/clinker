@@ -17,8 +17,8 @@ use std::sync::Arc;
 use clinker_record::GroupByKey;
 
 use crate::executor::dispatch::{
-    CorrelationGroupBuffer, CorrelationRecordSlot, ExecutorContext, MERGED_SOURCE_NAME, push_dlq,
-    push_write_error, source_name_arc_of,
+    CorrelationErrorRecord, CorrelationGroupBuffer, CorrelationRecordSlot, ExecutorContext,
+    MERGED_SOURCE_NAME, push_dlq, push_write_error, source_name_arc_of,
 };
 use crate::executor::preparation::is_explicit_cancellation;
 use crate::executor::structured_output_guard::StructuredOutputDocumentGuard;
@@ -42,7 +42,8 @@ pub(crate) fn dispatch_correlation_commit(
 
 /// Walk every correlation buffer and emit the per-group commit:
 /// flush-to-writer for clean groups, DLQ-with-trigger for dirty groups,
-/// overflow-aware DLQ for groups that tripped `max_group_buffer`.
+/// and for groups that crossed `max_group_buffer` their held failures plus
+/// a `group_size_exceeded` trigger over the rest.
 ///
 /// Two-phase: phase 1 walks every group once, accumulating clean
 /// records into a per-output queue and emitting DLQ entries for
@@ -100,95 +101,19 @@ fn commit_one_group(
         records,
         error_rows,
         error_messages,
-        total_records,
-        overflowed,
+        held_entries,
+        overflowed_at,
     } = group;
 
-    if overflowed {
-        // Overflow disposition: one root-cause DLQ entry with
-        // category=GroupSizeExceeded and trigger=true; every other
-        // buffered record of the group becomes a collateral with
-        // category=Correlated and trigger=false. Per-record original
-        // records come from `records` (the projected buffer holds the
-        // un-projected original alongside).
-        // The group is condemned here, at commit. The `group_size_exceeded`
-        // row is the overflow's trigger; every later row is condemned by it
-        // and carries its trigger id.
-        let mut overflow_stamp: Option<DlqFailureStamp> = None;
-        let group_repr = format_group_key(group_key);
-        let overflow_msg = PipelineError::CorrelationGroupOverflow {
-            group_key: group_repr.clone(),
-            count: total_records,
-        }
-        .to_string();
-        // SourceRowId already carries the compiled Source scope. Dedup it
-        // directly so Route fan-out emits one entry per source row without
-        // reconstructing identity from a diagnostic source name.
-        let mut seen_rows: HashSet<crate::executor::stream_event::SourceRowId> = HashSet::new();
-        for slot in &records {
-            let source_name = source_name_arc_of(&slot.original_record);
-            if !seen_rows.insert(slot.row_num) {
-                continue;
-            }
-            let (category, trigger, error_message, failed_at) = match &overflow_stamp {
-                None => {
-                    let stamp = DlqFailureStamp::now();
-                    overflow_stamp = Some(stamp);
-                    (
-                        clinker_core_types::dlq::DlqErrorCategory::GroupSizeExceeded,
-                        true,
-                        overflow_msg.clone(),
-                        stamp,
-                    )
-                }
-                Some(cause) => (
-                    clinker_core_types::dlq::DlqErrorCategory::Correlated,
-                    false,
-                    format!("correlated with failure in group: {overflow_msg}"),
-                    DlqFailureStamp::condemned_by(cause),
-                ),
-            };
-            push_dlq(
-                ctx,
-                DlqEntry {
-                    source_row: slot.row_num,
-                    category,
-                    error_message,
-                    original_record: slot.original_record.clone(),
-                    stage: Some("correlation_commit".to_string()),
-                    route: None,
-                    trigger,
-                    source_name,
-                    triggering_field: None,
-                    triggering_value: None,
-                    failed_at,
-                },
-            )?;
-        }
-        // Per-source rollback rewind: each contributing source rewinds
-        // its `rollback_cursors` entry to the lowest `row_num` of any
-        // group member from that source. The cursor narrows the replay
-        // anchor so a downstream resume reprocesses every record that
-        // contributed to the overflowing group, including those whose
-        // forward operators had already advanced the cursor past them.
-        // No causal-source attribution is required for an overflow —
-        // every contributing source shared blame proportionally — so
-        // every source contributing a slot rewinds independently.
-        let mut per_source_min: HashMap<Arc<str>, u64> = HashMap::new();
-        for slot in &records {
-            let sn = source_name_arc_of(&slot.original_record);
-            per_source_min
-                .entry(sn)
-                .and_modify(|m| *m = (*m).min(slot.row_num.ordinal()))
-                .or_insert(slot.row_num.ordinal());
-        }
-        for (sn, min_rn) in per_source_min {
-            ctx.rollback_cursors
-                .entry(sn)
-                .and_modify(|c| *c = (*c).min(min_rn))
-                .or_insert(min_rn);
-        }
-        return Ok(());
+    if let Some(overflow_stamp) = overflowed_at {
+        return commit_overflowed_group(
+            ctx,
+            group_key,
+            &records,
+            &error_messages,
+            held_entries,
+            overflow_stamp,
+        );
     }
 
     let group_dirty = !error_rows.is_empty();
@@ -241,34 +166,7 @@ fn commit_one_group(
     // directly so Route fan-out emits one entry per source row without
     // reconstructing identity from a diagnostic source name.
     let mut seen_rows: HashSet<crate::executor::stream_event::SourceRowId> = HashSet::new();
-    // Trigger entries: one per distinct erroring row. Multiple errors
-    // per row (different branches failing) collapse to a single trigger
-    // entry carrying the first error.
-    for err in &error_messages {
-        let source_name = source_name_arc_of(&err.original_record);
-        if !seen_rows.insert(err.row_num) {
-            continue;
-        }
-        push_dlq(
-            ctx,
-            DlqEntry {
-                source_row: err.row_num,
-                category: err.category,
-                error_message: err.error_message.clone(),
-                original_record: err.original_record.clone(),
-                stage: err.stage.clone(),
-                route: err.route.clone(),
-                // A parked error is its own failure's trigger unless it is a
-                // second row of another failure (a Combine build row keeps
-                // its driver's trigger id), which is never a trigger.
-                trigger: err.failed_at.trigger_id() == err.failed_at.id(),
-                source_name,
-                triggering_field: None,
-                triggering_value: None,
-                failed_at: err.failed_at,
-            },
-        )?;
-    }
+    write_held_failures(ctx, &error_messages, &mut seen_rows)?;
     // Collateral entries: every other distinct row that flowed through
     // the group's Output buffers but didn't itself error. Two sparing
     // axes apply, in order:
@@ -348,6 +246,149 @@ fn commit_one_group(
         )?;
     }
 
+    Ok(())
+}
+
+/// Commit a group that crossed `max_group_buffer`.
+///
+/// Every held failure is written first, as the dirty path writes it: its own
+/// trigger, category and stamp. The buffered rows not already written follow
+/// under one `group_size_exceeded` trigger, the first such row, stamped with
+/// `overflow_stamp` (taken when the group crossed the cap); the rest are
+/// `correlated` rows condemned by it now. Overflow spares nothing: per-source
+/// narrowing and the fan-out policy do not apply. A group holding only
+/// failures writes no `group_size_exceeded` row, because the overflow
+/// condemned nothing that had not already failed on its own.
+///
+/// Each contributing Source then rewinds its rollback cursor to the lowest
+/// row it contributed, buffered or failed.
+fn commit_overflowed_group(
+    ctx: &mut ExecutorContext<'_>,
+    group_key: &[GroupByKey],
+    records: &[CorrelationRecordSlot],
+    error_messages: &[CorrelationErrorRecord],
+    held_entries: u64,
+    overflow_stamp: DlqFailureStamp,
+) -> Result<(), PipelineError> {
+    if let Some(producer) = &ctx.telemetry_producer {
+        producer.record_metric(crate::telemetry::MetricKey::CorrelationGroupOverflows, 1);
+    }
+
+    let mut seen_rows: HashSet<crate::executor::stream_event::SourceRowId> = HashSet::new();
+    write_held_failures(ctx, error_messages, &mut seen_rows)?;
+
+    let overflow_msg = PipelineError::CorrelationGroupOverflow {
+        group_key: format_group_key(group_key),
+        max_group_buffer: ctx.correlation_max_group_buffer,
+        held_entries,
+    }
+    .to_string();
+    let mut overflow_written = false;
+    for slot in records {
+        if !seen_rows.insert(slot.row_num) {
+            continue;
+        }
+        let (category, trigger, error_message, failed_at) = if overflow_written {
+            (
+                clinker_core_types::dlq::DlqErrorCategory::Correlated,
+                false,
+                format!("correlated with failure in group: {overflow_msg}"),
+                DlqFailureStamp::condemned_by(&overflow_stamp),
+            )
+        } else {
+            overflow_written = true;
+            (
+                clinker_core_types::dlq::DlqErrorCategory::GroupSizeExceeded,
+                true,
+                overflow_msg.clone(),
+                overflow_stamp,
+            )
+        };
+        push_dlq(
+            ctx,
+            DlqEntry {
+                source_row: slot.row_num,
+                category,
+                error_message,
+                original_record: slot.original_record.clone(),
+                stage: Some("correlation_commit".to_string()),
+                route: None,
+                trigger,
+                source_name: source_name_arc_of(&slot.original_record),
+                triggering_field: None,
+                triggering_value: None,
+                failed_at,
+            },
+        )?;
+    }
+
+    // Per-source rollback rewind: each contributing source rewinds its
+    // `rollback_cursors` entry to the lowest `row_num` of any group member
+    // from that source, buffered or failed, so a downstream resume
+    // reprocesses every record that contributed to the overflowing group,
+    // including those whose forward operators had already advanced the
+    // cursor past them. No causal-source attribution is required for an
+    // overflow — every contributing source shared blame proportionally.
+    let members = records
+        .iter()
+        .map(|slot| (&slot.original_record, slot.row_num))
+        .chain(
+            error_messages
+                .iter()
+                .map(|err| (&err.original_record, err.row_num)),
+        );
+    let mut per_source_min: HashMap<Arc<str>, u64> = HashMap::new();
+    for (record, row_num) in members {
+        per_source_min
+            .entry(source_name_arc_of(record))
+            .and_modify(|m| *m = (*m).min(row_num.ordinal()))
+            .or_insert(row_num.ordinal());
+    }
+    for (sn, min_rn) in per_source_min {
+        ctx.rollback_cursors
+            .entry(sn)
+            .and_modify(|c| *c = (*c).min(min_rn))
+            .or_insert(min_rn);
+    }
+    Ok(())
+}
+
+/// Write a group's held failures in parking order, one row per source row
+/// (the first failure parked for a row wins), recording each written row in
+/// `seen_rows`.
+///
+/// Each row keeps the failure's own category, message, stage, route and
+/// stamp. A held failure is a trigger unless its stamp pairs it with another
+/// failure's trigger (a second row of that failure), in which case it keeps
+/// that trigger's id and is written as collateral. The dirty and the
+/// overflowed commit both write held failures here, so the two cannot
+/// diverge.
+fn write_held_failures(
+    ctx: &mut ExecutorContext<'_>,
+    error_messages: &[CorrelationErrorRecord],
+    seen_rows: &mut HashSet<crate::executor::stream_event::SourceRowId>,
+) -> Result<(), PipelineError> {
+    for err in error_messages {
+        if !seen_rows.insert(err.row_num) {
+            continue;
+        }
+        push_dlq(
+            ctx,
+            DlqEntry {
+                source_row: err.row_num,
+                category: err.category,
+                error_message: err.error_message.clone(),
+                original_record: err.original_record.clone(),
+                stage: err.stage.clone(),
+                route: err.route.clone(),
+                trigger: err.failed_at.trigger_id() == err.failed_at.id(),
+                source_name: source_name_arc_of(&err.original_record),
+                triggering_field: None,
+                triggering_value: None,
+                failed_at: err.failed_at,
+            },
+        )?;
+    }
     Ok(())
 }
 

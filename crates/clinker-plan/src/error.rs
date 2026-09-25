@@ -183,11 +183,16 @@ pub enum PipelineError {
     /// Diagnostic carrier for a correlation-key group that exceeded
     /// `error_handling.max_group_buffer`. The actual flow-control
     /// signal lives in the DLQ entries the `CorrelationCommit` arm
-    /// emits — this variant is rendered into the trigger entry's
-    /// `error_message` and never propagated up the call stack.
+    /// emits — this variant is rendered into the `group_size_exceeded`
+    /// entry's `error_message` and never propagated up the call stack.
+    /// `held_entries` counts every Sink slot and parked failure the group
+    /// held, not distinct source rows: at commit, or, when a relaxed-key
+    /// retry merged earlier passes, the largest count of any pass that
+    /// overflowed.
     CorrelationGroupOverflow {
         group_key: String,
-        count: u64,
+        max_group_buffer: u64,
+        held_entries: u64,
     },
     /// E310 — a memory-budget surface (arena state, `node_buffers`,
     /// or accumulated disk-spill bytes) exceeded the configured RSS
@@ -609,11 +614,16 @@ impl fmt::Display for PipelineError {
                 composition_name,
                 inner,
             } => write!(f, "in composition '{composition_name}': {inner}"),
-            Self::CorrelationGroupOverflow { group_key, count } => write!(
+            Self::CorrelationGroupOverflow {
+                group_key,
+                max_group_buffer,
+                held_entries,
+            } => write!(
                 f,
-                "correlation-key group {group_key:?} exceeded max_group_buffer \
-                 after {count} records — remaining records of the group are \
-                 DLQ'd as collateral"
+                "correlation-key group {group_key:?} held {held_entries} entries, \
+                 over max_group_buffer ({max_group_buffer}), so the whole group is \
+                 dead-lettered; to commit a group this size, set \
+                 error_handling.max_group_buffer: {held_entries} or higher"
             ),
             Self::MemoryBudgetExceeded {
                 node,

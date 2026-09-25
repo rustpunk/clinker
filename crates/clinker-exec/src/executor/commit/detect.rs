@@ -64,7 +64,7 @@ pub(crate) fn detect_retract_scope(
     // emission.
     let mut trigger_keys: Vec<Vec<GroupByKey>> = buffers
         .iter()
-        .filter(|(_, g)| !g.error_rows.is_empty() || g.overflowed)
+        .filter(|(_, g)| !g.error_rows.is_empty() || g.overflowed_at.is_some())
         .map(|(k, _)| k.clone())
         .collect();
     trigger_keys.sort_by_key(|k| format_group_key(k));

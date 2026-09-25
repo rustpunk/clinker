@@ -631,12 +631,11 @@ fn dispatch_sink_work(
     // transition (Invariant 3).
     let scan_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::SchemaScan);
     // Buffer non-null-key records. Project once, push slot.
-    // Overflow check fires the moment a group's record count
-    // exceeds the configured cap; subsequent records of the
+    // The group's overflow is stamped the moment its held-entry
+    // count exceeds the configured cap; subsequent records of the
     // same group are still admitted so they can become
     // collateral entries when `CorrelationCommit` drains the
-    // group, but admission flips the overflow flag so the
-    // commit arm emits a `GroupSizeExceeded` trigger.
+    // group under its `GroupSizeExceeded` trigger.
     if !buffered.is_empty() {
         let max_buf = ctx.correlation_max_group_buffer;
         let buffers = ctx
@@ -651,10 +650,7 @@ fn dispatch_sink_work(
             let projected =
                 crate::projection::project_output_from_record(record, out_cfg, cxl_emit_names_opt);
             let entry = buffers.entry(group_key.clone()).or_default();
-            entry.total_records += 1;
-            if max_buf > 0 && entry.total_records > max_buf {
-                entry.overflowed = true;
-            }
+            entry.admit_entry(max_buf);
             entry.records.push(CorrelationRecordSlot {
                 row_num: *rn,
                 consumer: output_id,
