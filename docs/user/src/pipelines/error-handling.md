@@ -293,7 +293,9 @@ repeats across the rows of one failure.
 When a correlation group holds several failing rows, each failing row is a
 trigger and keeps its own id as its trigger id. The group's `correlated` rows
 carry the trigger id of the group's first failing row, the one whose error
-their `_cxl_dlq_error_detail` quotes.
+their `_cxl_dlq_error_detail` quotes. A rejected document has one trigger, its
+first failing record; its other records, including any that failed after it,
+carry that trigger's id.
 
 A group larger than `max_group_buffer` can hold failing rows too. Each of
 them is still written as its own trigger, with its own category and id, and
@@ -302,9 +304,7 @@ before the rest of the group. The group's other rows follow under one
 `correlated` rows carrying its id. A row is written once: a row that failed
 on one Route branch and reached a Sink on another is written as its own
 failure. A group whose rows all failed writes no `group_size_exceeded` row,
-because the overflow took nothing with it that had not already failed. A rejected document has one trigger, its
-first failing record; its other records, including any that failed after it,
-carry that trigger's id.
+because the overflow took nothing with it that had not already failed.
 
 The rows of one failure can land in different DLQ files: with
 `per_source` paths, a Combine build row goes to its own Source's file while
