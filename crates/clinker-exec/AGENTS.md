@@ -68,6 +68,8 @@ Existing normal dependencies are intentional evidence:
 - Runtime remains finite-batch and synchronous; `RecordSource::next_record` is finite by contract.
 - Source transports feed the same ingest path through `SourceInput`; dispatcher logic should not branch on file vs non-file transport.
 - One run-scoped `MemoryArbitrator` governs spill, pause, abort, and memory attribution decisions.
+- Retained state that grows with input follows the Memory budget checklist in `docs/ai/32_NODE_OBLIGATIONS.md`. Read it, the per-operator arbitration-parameters table in `docs/engine/src/memory-arbitration.md`, and the `MemoryConsumer` docs in `src/pipeline/memory.rs` before designing such state.
+- Copy a spillable consumer, not a charged-only one: `NodeBufferConsumer` (`src/executor/node_buffer.rs`) is the reference. The `i32::MAX` and free-nothing consumers listed as charged-only in `tests/memory_consumer_inventory.rs` are approved exceptions, not templates.
 - Spill directory lifetime and `.lock` handling are load-bearing; `SpillDir` must release the lock before removing the directory.
 - Crash purge runs only for configured spill roots, not arbitrary OS temp dirs.
 - Document-boundary punctuations flow inline with records and must not be dropped or sent on side channels.
@@ -82,6 +84,8 @@ Existing normal dependencies are intentional evidence:
 - Moving config parsing, YAML validation, or schema binding into `clinker-exec`.
 - Adding async/Tokio code to the core execution path.
 - Creating independent memory limits or spill decisions outside `MemoryArbitrator`.
+- Holding charged state that cannot spill without the maintainer's recorded approval.
+- Shrinking a test's input, raising its limit or relaxing its assertion so a memory test passes.
 - Buffering unbounded source data or whole documents in streaming paths.
 - Dropping `StreamEvent` punctuations in transform/route/merge/output paths.
 - Special-casing REST or future transports in operator dispatch.

@@ -523,6 +523,21 @@ impl ConsumerHandle {
 /// Memory-consuming operator that the arbitrator can interrogate and,
 /// when a policy elects it, ask to give up memory.
 ///
+/// Contract for a new consumer (the full checklist is the Memory budget
+/// section of `docs/ai/32_NODE_OBLIGATIONS.md`): register through
+/// `MemoryArbitrator::register_consumer` on entry and unregister on every
+/// exit path, including error, cancellation and drop; report true resident
+/// bytes, collection overhead included; spill only on arbitrator signals
+/// (the consumer's spill request, the arbitrator's soft-threshold poll at a
+/// batch boundary, or a reclaim when growth falls short), never on a byte,
+/// row or count threshold of its own; take `spill_priority` and
+/// `can_back_pressure` from the per-operator arbitration-parameters table in
+/// `docs/engine/src/memory-arbitration.md`, adding a row there when none
+/// fits. A consumer whose `try_spill` frees nothing needs the maintainer's
+/// recorded approval and is listed as charged-only in
+/// `crates/clinker-exec/tests/memory_consumer_inventory.rs`; the existing
+/// charged-only consumers are approved exceptions, not templates.
+///
 /// Implementations live with their operator (Aggregate, sort,
 /// grace-hash, sort-merge join, IEJoin, inter-stage buffers). The
 /// arbitrator holds them as `Arc<dyn MemoryConsumer>` in a copy-on-write
@@ -548,10 +563,9 @@ pub trait MemoryConsumer: Send + Sync {
     fn current_usage(&self) -> u64;
 
     /// Relative spill cost. Lower = spill first. The arbitrator's
-    /// policy uses this when comparing victims of similar size.
-    /// Convention: `0` for cheap-to-spill consumers
-    /// (`ctx.node_buffers`), `10` for grace-hash, `20` for sort,
-    /// `30` for Aggregate.
+    /// policy uses this when comparing victims of similar size. Each
+    /// consumer takes its value from its row of the per-operator
+    /// arbitration-parameters table in `docs/engine/src/memory-arbitration.md`.
     fn spill_priority(&self) -> i32;
 
     /// Best-effort attempt to release `target_bytes` of live state to
@@ -695,10 +709,9 @@ impl ArbitrationPolicy for LargestFirst {
 /// consumers still produce deterministic, headroom-maximizing
 /// selection.
 ///
-/// Suits the cheapest-to-spill-first heuristic: `node_buffers` (0)
-/// before `grace-hash` (10) before sort (20) before Aggregate (30).
-/// Per-consumer priorities are set in each operator's
-/// `MemoryConsumer` impl (lands in 117c).
+/// Suits the cheapest-to-spill-first heuristic. Each operator's
+/// `MemoryConsumer` impl sets its priority from the per-operator
+/// arbitration-parameters table in `docs/engine/src/memory-arbitration.md`.
 pub struct Priority;
 
 impl ArbitrationPolicy for Priority {
@@ -841,8 +854,8 @@ pub struct MemoryArbitrator {
     resume_threshold_pct: f64,
     /// Peak RSS observed across all `observe()` / `should_spill()`
     /// calls. Sentinel `0` = never observed; the `peak_rss()` getter
-    /// maps `0` back to `None` to preserve the pre-117c "platform
-    /// without RSS support" branch. RSS is never legitimately 0 on
+    /// maps `0` back to `None` so a platform without RSS support reads
+    /// as no sample. RSS is never legitimately 0 on
     /// Linux / macOS / Windows for a live process so the sentinel is
     /// unambiguous.
     peak_rss: AtomicU64,
