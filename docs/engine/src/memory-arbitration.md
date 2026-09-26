@@ -306,16 +306,21 @@ Each registered consumer carries two parameters the active policy reads: a **spi
 | Operator class | `spill_priority` | `can_back_pressure` |
 |----------------|------------------|---------------------|
 | `node_buffers` slot (inter-stage buffer) | 0 | false |
+| output staging (writer resources) | 0 | false |
 | grace-hash Combine | 10 | false |
 | Reshape | 15 | false |
+| Cull | 15 | false |
 | sort buffer / IEJoin build | 20 | false |
 | sort-merge Combine | 25 | false |
 | hash Aggregate | 30 | false |
 | inline-hash Combine | 30 | false |
 | Source ingest | N/A | true |
 | streaming Aggregate | N/A | false |
+| credential registry | last | false |
 | transient scan materialization | last | false |
 | window arena | last | false |
+
+A consumer whose state cannot spill is listed as charged-only in `crates/clinker-exec/tests/memory_consumer_inventory.rs` with the approval that allows it.
 
 Lower priority is spilled first, so `node_buffers` slots (priority 0) are the cheapest victim class — spilling an inter-stage buffer to disk costs one LZ4 + postcard round-trip and frees the most reclaimable bytes per call. The blocking operators climb from there: a grace-hash Combine (10) is preferred over Reshape (15), which is preferred over a sort buffer (20), which is preferred over a hash Aggregate or inline-hash Combine (30). Reshape sits between grace-hash and sort because its spill round-trip re-runs synthesis on reload — costlier to evict than grace partitions, cheaper than an external-sort merge — and it spills the raw per-group input records rather than post-processed output.
 
