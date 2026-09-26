@@ -577,19 +577,30 @@ impl ConsumerHandle {
 /// when a policy elects it, ask to give up memory.
 ///
 /// Contract for a new consumer (the full checklist is the Memory budget
-/// section of `docs/ai/32_NODE_OBLIGATIONS.md`): register through
-/// `MemoryArbitrator::register_consumer` on entry and unregister on every
-/// exit path, including error, cancellation and drop; report true resident
-/// bytes, collection overhead included; spill only on arbitrator signals
-/// (the consumer's spill request, the arbitrator's soft-threshold poll at a
-/// batch boundary, or a reclaim when growth falls short), never on a byte,
-/// row or count threshold of its own; take `spill_priority` and
-/// `can_back_pressure` from the per-operator arbitration-parameters table in
-/// `docs/engine/src/memory-arbitration.md`, adding a row there when none
-/// fits. A consumer whose `try_spill` frees nothing needs the maintainer's
-/// recorded approval and is listed as charged-only in
-/// `crates/clinker-exec/tests/memory_consumer_inventory.rs`; the existing
-/// charged-only consumers are approved exceptions, not templates.
+/// section of `docs/ai/32_NODE_OBLIGATIONS.md`): register node-owned state
+/// through `MemoryArbitrator::register_node_consumer` under the node's name
+/// (run-scoped state through `MemoryArbitrator::register_consumer`) and
+/// unregister on every exit path, including error, cancellation and drop;
+/// report true resident bytes, collection overhead included, charging
+/// growth through the consumer's [`ConsumerHandle`] no later than the batch
+/// boundary where the operator next polls the arbitrator; spill only when
+/// the arbitrator asks, which today means the spill request `try_spill`
+/// posts (read with [`ConsumerHandle::take_spill_request`] at a batch
+/// boundary; [`MemoryArbitrator::spill_reclaimable`] posts the same request
+/// before a paused Source resumes) or `should_spill` / `should_spill_self`
+/// reporting the soft threshold crossed at a batch boundary, never on a
+/// byte, row or count threshold or an RSS reading of its own; refuse growth
+/// only through the arbitrator's limit checks (`should_abort`,
+/// `should_abort_local`), never on its own RSS reading or a limit of its
+/// own; take `spill_priority` and `can_back_pressure` from the per-operator
+/// arbitration-parameters table in `docs/engine/src/memory-arbitration.md`,
+/// adding a row there when none fits. The arbitrator does not yet ask
+/// spillable state to reclaim before a refusal. A consumer whose `try_spill`
+/// frees nothing needs the maintainer's recorded approval and is listed as
+/// charged-only in `crates/clinker-exec/tests/memory_consumer_inventory.rs`;
+/// the existing charged-only consumers are approved exceptions, not
+/// templates, and existing consumers that spill on a threshold of their own
+/// are not templates either.
 ///
 /// Implementations live with their operator (Aggregate, sort,
 /// grace-hash, sort-merge join, IEJoin, inter-stage buffers). The
@@ -1831,8 +1842,9 @@ impl MemoryArbitrator {
     }
 
     /// Best-effort spill of reclaimable (non-back-pressureable) consumers in
-    /// `Priority` order (node-buffer 0 < grace-hash 10 < sort 20 <
-    /// aggregate 30), shedding up to `target_bytes` of downstream state.
+    /// ascending `spill_priority` order, the order of the per-operator
+    /// arbitration-parameters table in `docs/engine/src/memory-arbitration.md`,
+    /// shedding up to `target_bytes` of downstream state.
     ///
     /// Called at a drain arm's progress boundary, just before a Source that
     /// a prior round paused under pressure is resumed, so the resumed
