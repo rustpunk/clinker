@@ -16,7 +16,7 @@ Three mechanisms make an omission invisible today, which is why these are writte
 
 - The `clinker-lineage` builder dispatches over plan nodes through catch-all arms, so a new `PlanNode` variant compiles clean and silently produces no lineage.
 - `MetricKey` and `SpanName` in `clinker_exec::telemetry` name only `Transform` work, so every other node type is telemetry-blind by construction.
-- Registering with `MemoryArbitrator` is a call a consumer makes, not an obligation the compiler enforces, so an operator that accumulates without registering builds and passes its tests.
+- Registering with `MemoryArbitrator` is a call a consumer makes, not an obligation the compiler enforces. `crates/clinker-exec/tests/memory_consumer_inventory.rs` fails for a `MemoryConsumer` implementation that is not listed with its spill class and engine-table row, but an operator that accumulates without implementing the trait at all still builds and passes its tests.
 
 ## Lineage
 
@@ -41,9 +41,21 @@ Trigger: the change introduces execution work with a lifecycle, or an outcome wo
 
 ## Memory budget
 
-Trigger: the change retains anything whose size grows with input — buffered records, hash tables, group state, sort runs, join build sides, spill indexes, retained tails.
+Trigger: the change retains anything whose size grows with input — buffered records, hash tables, group state, sort runs, join build sides, spill indexes, retained tails, held or deferred rows, per-document or per-key sets.
 
-- That state implements `MemoryConsumer`, registers through `register_consumer` on entry and unregisters on every exit path including error and cancellation, reports true bytes through its `ConsumerHandle`, and honors both `take_spill_request` and `wait_while_paused`.
-- Exempt: allocation bounded by a constant independent of input size, or state an ancestor consumer already accounts for — name that consumer.
-- Small inputs in practice, a passing test, and short-lived state are not bounds. The question is whether a bound exists that holds however much data arrives.
-- Growing a buffer never answers a dropped telemetry signal. The observability arena is fixed and sheds load deliberately, so enlarging it to retain signals converts a reporting gap into a memory-bound violation.
+A plan or PR that meets the trigger states each item below for every new or changed consumer:
+
+1. Consumer: the type implementing `MemoryConsumer`, where it registers, and how every exit path (success, error, cancellation, drop) unregisters it. Node-owned state registers through `register_node_consumer` under the node's name, the name its spill is recorded under, so the run report attributes its charged peak and spill to that node; `register_consumer` is for run-scoped state no node owns. A consumer backed by a `ConsumerHandle` returns the handle's `peak_bytes` from `peak_charged_bytes`.
+2. Bytes: what `current_usage` reports and why it is the true resident size, including collection overhead.
+3. `spill_priority` and `can_back_pressure`: the value and the row of the per-operator table in [docs/engine/src/memory-arbitration.md](../engine/src/memory-arbitration.md) it follows; a new row goes into that table in the same change, and the consumer goes into `crates/clinker-exec/tests/memory_consumer_inventory.rs`. A consumer that returns `true` from `can_back_pressure` parks its producer through `wait_while_paused`.
+4. Spill: only when the arbitrator asks. Today that is the spill request `try_spill` posts, read with `ConsumerHandle::take_spill_request` at a batch boundary (`spill_reclaimable` posts the same request before a paused Source resumes), or `should_spill` / `should_spill_self` reporting the soft threshold crossed when polled at a batch boundary. Never on a byte, row or count threshold or an RSS reading of the consumer's own. A fixed I/O write buffer is not a spill decision; a size that triggers a flush is. Some existing consumers still spill on a threshold of their own; they are not templates.
+5. Admission: charge growth through the consumer's `ConsumerHandle` (`add_bytes` / `set_bytes`) as it becomes resident, and no later than the batch boundary where the operator next polls the arbitrator. State collected into memory in one step is reserved before it is collected, with the charged-pressure preflight `reserve_node_buffer_materialization` uses. Refuse growth only through the arbitrator: `should_abort`, `should_abort_local` for bytes not yet charged, or that preflight. Refusing or aborting on the consumer's own RSS reading, or on a limit of its own, is forbidden. The arbitrator does not yet ask spillable state to reclaim before a refusal; its only reclaim is `spill_reclaimable`, run before a paused Source resumes.
+6. Tests: one proves the state spills and completes under a limit smaller than the state, with output identical to ample memory; one proves nothing reaches disk and the bytes are charged when memory is ample. Use the helper in `crates/clinker-exec/tests/common/memory_pressure.rs`. Neither may be made to pass by shrinking its input, raising its limit or relaxing an assertion — that is a stop, not a deviation.
+
+Exempt: allocation bounded by a constant independent of input size, or state an ancestor consumer already accounts for — name that consumer.
+
+Charged state that cannot spill (`try_spill` frees nothing) is not an exemption an agent may claim: it needs the maintainer's recorded approval, named in the change and in the inventory test. Existing charged-only consumers are not precedent for a new one.
+
+Small inputs in practice, a passing test, and short-lived state are not bounds. The question is whether a bound exists that holds however much data arrives.
+
+Growing a buffer never answers a dropped telemetry signal. The observability arena is fixed and sheds load deliberately, so enlarging it to retain signals converts a reporting gap into a memory-bound violation.

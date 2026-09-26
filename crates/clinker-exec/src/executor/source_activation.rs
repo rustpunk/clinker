@@ -144,8 +144,10 @@ impl SourceActivationController {
             );
             #[cfg(test)]
             stream.assert_allocation_domain(allocation_resources);
-            let consumer_id =
-                memory.register_consumer(Arc::new(SourceConsumer::new(Arc::clone(&handle))));
+            let consumer_id = memory.register_node_consumer(
+                &source_name,
+                Arc::new(SourceConsumer::new(Arc::clone(&handle))),
+            );
             activated.receivers.push((source_name.clone(), receiver));
             activated
                 .consumers

@@ -134,6 +134,10 @@ impl MemoryConsumer for ReshapeConsumer {
         self.handle.bytes()
     }
 
+    fn peak_charged_bytes(&self) -> Option<u64> {
+        Some(self.handle.peak_bytes())
+    }
+
     fn spill_priority(&self) -> i32 {
         RESHAPE_SPILL_PRIORITY
     }
@@ -283,7 +287,7 @@ where
     let handle = ConsumerHandle::new();
     let consumer_id = ctx
         .memory_budget
-        .register_consumer(Arc::new(ReshapeConsumer::new(handle.clone())));
+        .register_node_consumer(name, Arc::new(ReshapeConsumer::new(handle.clone())));
 
     // Every exit path past this point must deregister `consumer_id`, so the
     // grouping/finalize work runs inside a closure whose result is matched

@@ -667,9 +667,12 @@ where
             // `should_abort_local` gate is a genuine last resort for a
             // single block-pair plus kernel aux that still cannot fit.
             let ie_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
-            let ie_consumer_id = ctx.memory_budget.register_consumer(Arc::new(
-                crate::pipeline::sort_buffer::SortConsumer::new(ie_consumer_handle.clone()),
-            ));
+            let ie_consumer_id = ctx.memory_budget.register_node_consumer(
+                name,
+                Arc::new(crate::pipeline::sort_buffer::SortConsumer::new(
+                    ie_consumer_handle.clone(),
+                )),
+            );
             // Every exit past this registration must unregister the
             // consumer, so the kernel-install-through-admit body runs
             // inside a closure whose Result is captured: the clean return
@@ -834,9 +837,12 @@ where
             // sum into the handle's counter on every admit /
             // spill_partition transition.
             let grace_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
-            let grace_consumer_id = ctx.memory_budget.register_consumer(Arc::new(
-                crate::pipeline::grace_hash::GraceHashConsumer::new(grace_consumer_handle.clone()),
-            ));
+            let grace_consumer_id = ctx.memory_budget.register_node_consumer(
+                name,
+                Arc::new(crate::pipeline::grace_hash::GraceHashConsumer::new(
+                    grace_consumer_handle.clone(),
+                )),
+            );
             // Every exit past this registration must unregister the
             // consumer, so the kernel-install-through-admit body runs
             // inside a closure whose Result is captured: the clean return
@@ -969,11 +975,12 @@ where
             // matching-run accumulator size into the handle's
             // counter at every push / spill transition.
             let sm_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
-            let sm_consumer_id = ctx.memory_budget.register_consumer(Arc::new(
-                crate::pipeline::sort_merge_join::SortMergeConsumer::new(
+            let sm_consumer_id = ctx.memory_budget.register_node_consumer(
+                name,
+                Arc::new(crate::pipeline::sort_merge_join::SortMergeConsumer::new(
                     sm_consumer_handle.clone(),
-                ),
-            ));
+                )),
+            );
             // Every exit past this registration must unregister the
             // consumer, so the kernel-install-through-admit body runs
             // inside a closure whose Result is captured: the clean return
@@ -1115,9 +1122,12 @@ where
     // ConsumerId is unregistered at arm exit so the
     // arbitrator's registry tracks live tables only.
     let inline_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
-    let inline_consumer_id = ctx.memory_budget.register_consumer(Arc::new(
-        crate::pipeline::combine::CombineHashConsumer::new(inline_consumer_handle.clone()),
-    ));
+    let inline_consumer_id = ctx.memory_budget.register_node_consumer(
+        name,
+        Arc::new(crate::pipeline::combine::CombineHashConsumer::new(
+            inline_consumer_handle.clone(),
+        )),
+    );
     // Every exit past this registration must unregister the
     // consumer, so the hash-build-through-admit body runs inside a
     // closure whose Result is captured: the clean return, the
@@ -1491,7 +1501,7 @@ fn run_streaming_combine_probe(
     // producer-side change. The probe thread's per-record `sub_bytes`
     // discharge nets the producer's per-batch charge to zero.
     let (rx, charge_handle, charge_consumer_id) =
-        ctx.install_streaming_ingest_channel(producer_idx);
+        ctx.install_streaming_ingest_channel(producer_idx, current_dag.graph[producer_idx].name());
 
     // Copy the stable-context references out of `ctx` before the scope so
     // the probe thread borrows `&'a StableEvalContext` directly (shared,
@@ -2774,9 +2784,10 @@ fn adopt_spilled_runs_into_node_buffer(
     // later drain unregisters through the same path `admit_node_buffer` sets up.
     let handle = crate::pipeline::memory::ConsumerHandle::new();
     handle.set_bytes(0);
-    let consumer_id = ctx
-        .memory_budget
-        .register_consumer(Arc::new(NodeBufferConsumer::new(handle.clone())));
+    let consumer_id = ctx.memory_budget.register_node_consumer(
+        combine_name,
+        Arc::new(NodeBufferConsumer::new(handle.clone())),
+    );
     ctx.node_buffer_consumer_ids
         .insert(node_idx.into(), (consumer_id, handle));
     ctx.memory_budget.sample_peak_consumer_usage();

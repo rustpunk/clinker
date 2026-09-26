@@ -60,6 +60,20 @@ sampling at dispatch close would report those already-released bytes as live.
 The total and per-stage spill fields include committed charges minus releases,
 not every byte ever written to temporary storage.
 
+Two further report figures answer per-node questions those totals cannot.
+`per_stage_spill_bytes_written` adds every spill charge a stage records and is
+never lowered by a release, so a sort whose runs were merged and unlinked
+before the run ended still shows the bytes it wrote while its on-disk entry is
+back at zero. `per_node_peak_charged_bytes` gives, for each node whose state is
+registered under the node's name (`register_node_consumer`), the highest
+charge any one of its consumers reached. Every `ConsumerHandle` charge raises
+that consumer's mark, so the figure is exact per consumer rather than sampled,
+and another node's state never raises it. A node with several consumers
+reports the largest single consumer's mark. Run-scoped state that no node owns
+(writer output staging, the credential registry) registers through
+`register_consumer` and has no entry. The run-wide `peak_consumer_usage_bytes`
+remains a sum sampled at streaming charges.
+
 `WriterResourceConsumer` reports the ledger's exact live grant total through its
 `ConsumerHandle`. It is admission-managed and never backpressureable: parking
 the synchronous writer would prevent its own release progress. Spill requests
@@ -306,18 +320,23 @@ Each registered consumer carries two parameters the active policy reads: a **spi
 | Operator class | `spill_priority` | `can_back_pressure` |
 |----------------|------------------|---------------------|
 | `node_buffers` slot (inter-stage buffer) | 0 | false |
+| output staging (writer resources) | 0 | false |
 | grace-hash Combine | 10 | false |
 | Reshape | 15 | false |
+| Cull | 15 | false |
 | sort buffer / IEJoin build | 20 | false |
 | sort-merge Combine | 25 | false |
 | hash Aggregate | 30 | false |
 | inline-hash Combine | 30 | false |
 | Source ingest | N/A | true |
 | streaming Aggregate | N/A | false |
+| credential registry | last | false |
 | transient scan materialization | last | false |
 | window arena | last | false |
 
-Lower priority is spilled first, so `node_buffers` slots (priority 0) are the cheapest victim class — spilling an inter-stage buffer to disk costs one LZ4 + postcard round-trip and frees the most reclaimable bytes per call. The blocking operators climb from there: a grace-hash Combine (10) is preferred over Reshape (15), which is preferred over a sort buffer (20), which is preferred over a hash Aggregate or inline-hash Combine (30). Reshape sits between grace-hash and sort because its spill round-trip re-runs synthesis on reload — costlier to evict than grace partitions, cheaper than an external-sort merge — and it spills the raw per-group input records rather than post-processed output.
+A consumer whose state cannot spill is listed as charged-only in `crates/clinker-exec/tests/memory_consumer_inventory.rs` with the approval that allows it.
+
+Lower priority is spilled first. Among the spillable consumers, `node_buffers` slots (priority 0) are the cheapest victim class — spilling an inter-stage buffer to disk costs one LZ4 + postcard round-trip and frees the most reclaimable bytes per call. Output staging (writer resources) also sits at 0, but it is charged-only: its `try_spill` posts a spill request, frees nothing on the call, and the writer can then move only its fixed staging tails to disk, so electing it relieves little. The blocking operators climb from there: a grace-hash Combine (10) is preferred over Reshape and Cull (both 15), which are preferred over a sort buffer (20), which is preferred over a sort-merge Combine (25), which is preferred over a hash Aggregate or inline-hash Combine (30). Reshape sits between grace-hash and sort because its spill round-trip re-runs synthesis on reload — costlier to evict than grace partitions, cheaper than an external-sort merge — and it spills the raw per-group input records rather than post-processed output. Cull shares Reshape's priority for a similar reason: its grouped record buffer is costlier to evict than grace partitions, because reload re-splits the group, but cheaper than an external-sort merge.
 
 A **Source** and a **streaming Aggregate** show `spill_priority=N/A` because neither *operator* holds spillable accumulated state. A Source's `try_spill` always frees zero bytes — its only real lever is the pause its `can_back_pressure=true` advertises. A streaming Aggregate emits each group as it completes and never accumulates a spillable group table. The `N/A` here is about the operator's own state, not its downstream handoff: when a streaming stage's output rides a per-batch streaming handoff to a single consumer, that handoff registers a priority-0 consumer just like a `node_buffers` slot does, and its in-flight batches are spilled to disk one batch at a time if RSS crosses the soft threshold while they are in flight. So a streaming Aggregate's *group table* is never a spill victim, but the batches it hands downstream can be.
 

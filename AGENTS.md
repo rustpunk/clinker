@@ -91,6 +91,7 @@ Recurring ground truths. Each has been got wrong more than once; treat a design 
 ## Observability And Memory Obligations
 
 OpenLineage lineage, OTLP telemetry, and the memory budget are part of a node's contract, not instrumentation fitted afterwards. Every new node, new feature, and refactor answers three trigger tests — lineage (a column's value, or whether, where, and in what order a row travels), telemetry (execution work with a lifecycle, or an outcome worth counting), and memory budget (state that grows with input) — and meets each obligation or states its exemption in the PR. Backfill covers only the node types whose contract the change alters; an unmet obligation on another node becomes a follow-up issue. The full triggers, obligations, and exemptions are in [docs/ai/32_NODE_OBLIGATIONS.md](docs/ai/32_NODE_OBLIGATIONS.md): read it before changing plan nodes, operators, dataset boundaries, or retained state.
+A change that retains state reads the Memory budget checklist there and [docs/engine/src/memory-arbitration.md](docs/engine/src/memory-arbitration.md), and answers the checklist for each consumer.
 
 ## Verification
 
