@@ -914,9 +914,10 @@ pub(crate) fn reserve_node_buffer_materialization(
 
     let handle = crate::pipeline::memory::ConsumerHandle::new();
     handle.set_bytes(reserved_bytes);
-    let consumer_id = budget.register_consumer(std::sync::Arc::new(
-        TransientNodeBufferConsumer::new(handle.clone()),
-    ));
+    let consumer_id = budget.register_node_consumer(
+        node,
+        std::sync::Arc::new(TransientNodeBufferConsumer::new(handle.clone())),
+    );
     budget.sample_peak_consumer_usage();
     let reservation = TransientNodeBufferReservation {
         budget: std::sync::Arc::clone(budget),
@@ -946,6 +947,10 @@ impl TransientNodeBufferConsumer {
 impl crate::pipeline::memory::MemoryConsumer for TransientNodeBufferConsumer {
     fn current_usage(&self) -> u64 {
         self.handle.bytes()
+    }
+
+    fn peak_charged_bytes(&self) -> Option<u64> {
+        Some(self.handle.peak_bytes())
     }
 
     fn spill_priority(&self) -> i32 {
@@ -1188,6 +1193,10 @@ impl NodeBufferConsumer {
 impl crate::pipeline::memory::MemoryConsumer for NodeBufferConsumer {
     fn current_usage(&self) -> u64 {
         self.handle.bytes()
+    }
+
+    fn peak_charged_bytes(&self) -> Option<u64> {
+        Some(self.handle.peak_bytes())
     }
 
     fn spill_priority(&self) -> i32 {

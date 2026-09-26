@@ -242,6 +242,15 @@ pub struct ExecutionReport {
     /// `cumulative_spill_bytes`, which is the single pipeline-wide total.
     /// Both are sampled after all Source workers have joined.
     pub per_stage_spill_bytes: BTreeMap<String, u64>,
+    /// Bytes each stage wrote to spill files over the whole run, keyed by the
+    /// spilling node's name. Never lowered when a run is unlinked, so a sort
+    /// whose runs were merged and deleted before the run ended still shows the
+    /// bytes it wrote here while its [`Self::per_stage_spill_bytes`] entry is
+    /// back at zero. This is the figure that answers "did this stage spill";
+    /// the on-disk figures answer "how much disk is still held". Stages that
+    /// never spilled have no entry. Sampled with the on-disk figures, after
+    /// all Source workers have joined.
+    pub per_stage_spill_bytes_written: BTreeMap<String, u64>,
     /// High-water mark of the arbitrator's summed pull-mode charged bytes
     /// observed across streaming per-batch charges. For a streaming stage
     /// this stays bounded to one in-flight batch (plus the bounded
@@ -249,6 +258,18 @@ pub struct ExecutionReport {
     /// observable that proves the per-batch admit/discharge model. `0`
     /// when no streaming charge fired (a fully materialized pipeline).
     pub peak_consumer_usage_bytes: u64,
+    /// For each node whose retained state is registered with the arbitrator
+    /// under the node's name, the highest number of bytes any one of that
+    /// node's memory consumers held charged. Each consumer's mark is raised
+    /// on every charge, not sampled, and belongs to that consumer alone, so
+    /// another node's state never raises this node's figure. A node with
+    /// several consumers reports the largest single consumer's mark, not
+    /// their sum. Run-scoped state that no node owns (writer output staging,
+    /// the credential registry) has no entry. Unlike
+    /// [`Self::peak_consumer_usage_bytes`], which is a run-wide sum sampled
+    /// at streaming charges, this is the figure that says how much one
+    /// node's state held. Sampled after all Source workers have joined.
+    pub per_node_peak_charged_bytes: BTreeMap<String, u64>,
     /// `true` when the run unwound early because a shutdown signal
     /// (SIGINT/SIGTERM, or a programmatic request) tripped the run's
     /// [`crate::pipeline::shutdown::ShutdownToken`]. The CLI maps this to

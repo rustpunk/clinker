@@ -448,17 +448,23 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
 
     /// Borrow (building on first sight) the bucket for file `key`. The
     /// arbitrator is passed in so the caller's other `&self` fields stay
-    /// free of the `&mut self.buckets` borrow this returns.
+    /// free of the `&mut self.buckets` borrow this returns. A new bucket's
+    /// consumer is registered under `output_name`, the name its spill is
+    /// recorded under.
     fn bucket_for<'a>(
         buckets: &'a mut HashMap<DocKey, DocBucket>,
         arbitrator: &crate::pipeline::memory::MemoryArbitrator,
+        output_name: &str,
         key: &DocKey,
     ) -> &'a mut DocBucket {
         buckets.entry(Arc::clone(key)).or_insert_with(|| {
             let handle = crate::pipeline::memory::ConsumerHandle::new();
-            let consumer_id = arbitrator.register_consumer(Arc::new(
-                crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone()),
-            ));
+            let consumer_id = arbitrator.register_node_consumer(
+                output_name,
+                Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                    handle.clone(),
+                )),
+            );
             DocBucket {
                 buffer: NodeBuffer::Memory(Vec::new()),
                 consumer_id,
@@ -482,7 +488,7 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
         source_row: SourceRowId,
     ) -> Result<(), PipelineError> {
         let column_count = record.schema().column_count();
-        let bucket = Self::bucket_for(&mut self.buckets, &self.arbitrator, key);
+        let bucket = Self::bucket_for(&mut self.buckets, &self.arbitrator, &self.output_name, key);
         bucket.buffer.push(record, source_row);
         bucket.handle.set_bytes(
             bucket
@@ -777,7 +783,13 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
                             // the file. A bucket may not exist yet for a
                             // header-only file that has emitted no record;
                             // create it so the open/close balance is counted.
-                            Self::bucket_for(&mut self.buckets, &self.arbitrator, &file).depth += 1;
+                            Self::bucket_for(
+                                &mut self.buckets,
+                                &self.arbitrator,
+                                &self.output_name,
+                                &file,
+                            )
+                            .depth += 1;
                         }
                         PunctuationKind::DocumentClose => {
                             if let Some(key) = closing_document_key(&mut self.buckets, &file) {

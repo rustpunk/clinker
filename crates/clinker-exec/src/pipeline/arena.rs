@@ -234,6 +234,10 @@ impl MemoryConsumer for ArenaConsumer {
         self.handle.bytes()
     }
 
+    fn peak_charged_bytes(&self) -> Option<u64> {
+        Some(self.handle.peak_bytes())
+    }
+
     fn spill_priority(&self) -> i32 {
         // A consumer that can neither pause nor free is never a useful
         // victim; rank it last among everything so `Priority` reaches

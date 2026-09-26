@@ -45,7 +45,7 @@ Trigger: the change retains anything whose size grows with input — buffered re
 
 A plan or PR that meets the trigger states each item below for every new or changed consumer:
 
-1. Consumer: the type implementing `MemoryConsumer`, where it registers through `register_consumer`, and how every exit path (success, error, cancellation, drop) unregisters it.
+1. Consumer: the type implementing `MemoryConsumer`, where it registers, and how every exit path (success, error, cancellation, drop) unregisters it. Node-owned state registers through `register_node_consumer` under the node's name, the name its spill is recorded under, so the run report attributes its charged peak and spill to that node; `register_consumer` is for run-scoped state no node owns. A consumer backed by a `ConsumerHandle` returns the handle's `peak_bytes` from `peak_charged_bytes`.
 2. Bytes: what `current_usage` reports and why it is the true resident size, including collection overhead.
 3. `spill_priority` and `can_back_pressure`: the value and the row of the per-operator table in [docs/engine/src/memory-arbitration.md](../engine/src/memory-arbitration.md) it follows; a new row goes into that table in the same change, and the consumer goes into `crates/clinker-exec/tests/memory_consumer_inventory.rs`. A consumer that returns `true` from `can_back_pressure` parks its producer through `wait_while_paused`.
 4. Spill: only on arbitrator signals — its spill request (`take_spill_request`), the arbitrator's soft-threshold poll at a batch boundary, or a reclaim when growth falls short; never on a byte, row or count threshold of its own. A fixed I/O write buffer is not a spill decision; a size that triggers a flush is.

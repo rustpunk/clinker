@@ -955,6 +955,10 @@ impl crate::pipeline::memory::MemoryConsumer for CombineHashConsumer {
         self.handle.bytes()
     }
 
+    fn peak_charged_bytes(&self) -> Option<u64> {
+        Some(self.handle.peak_bytes())
+    }
+
     fn spill_priority(&self) -> i32 {
         30
     }

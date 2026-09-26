@@ -195,7 +195,9 @@ struct SourceCompletion {
     outcomes: Vec<ingest::IngestTaskOutcome>,
     cumulative_spill_bytes: u64,
     per_stage_spill_bytes: BTreeMap<String, u64>,
+    per_stage_spill_bytes_written: BTreeMap<String, u64>,
     peak_consumer_usage_bytes: u64,
+    per_node_peak_charged_bytes: BTreeMap<String, u64>,
 }
 
 impl SourceCompletion {
@@ -208,7 +210,9 @@ impl SourceCompletion {
             outcomes,
             cumulative_spill_bytes: memory.cumulative_spill_bytes(),
             per_stage_spill_bytes: memory.per_stage_spill_bytes(),
+            per_stage_spill_bytes_written: memory.per_stage_spill_bytes_written(),
             peak_consumer_usage_bytes: memory.peak_consumer_usage(),
+            per_node_peak_charged_bytes: memory.per_node_peak_charged_bytes(),
         })
     }
 }
@@ -1128,11 +1132,12 @@ impl PipelineExecutor {
                         allocation_resources.clone(),
                     ),
                 };
-                let source_consumer_id = memory_budget.register_consumer(Arc::new(
-                    crate::executor::source_stream::SourceConsumer::new(Arc::clone(
-                        &source_consumer_handle,
+                let source_consumer_id = memory_budget.register_node_consumer(
+                    &src_cfg.name,
+                    Arc::new(crate::executor::source_stream::SourceConsumer::new(
+                        Arc::clone(&source_consumer_handle),
                     )),
-                ));
+                );
                 source_records.insert(src_cfg.name.clone(), rx);
                 source_consumers.insert(
                     src_cfg.name.clone(),
@@ -1255,7 +1260,9 @@ impl PipelineExecutor {
             outcomes,
             cumulative_spill_bytes,
             per_stage_spill_bytes,
+            per_stage_spill_bytes_written,
             peak_consumer_usage_bytes,
+            per_node_peak_charged_bytes,
         } = SourceCompletion::join(&memory_budget, || {
             ingest::join_source_workers(ingest_handles, "source-ingest-thread")
         })?;
@@ -1362,7 +1369,9 @@ impl PipelineExecutor {
             per_source_dlq_counts,
             cumulative_spill_bytes,
             per_stage_spill_bytes,
+            per_stage_spill_bytes_written,
             peak_consumer_usage_bytes,
+            per_node_peak_charged_bytes,
             interrupted,
             advisories,
         })
@@ -1756,9 +1765,12 @@ impl PipelineExecutor {
             // would arrive with the streaming generalization tracked in
             // #301. Matches `admit_node_buffer`'s posture.
             let charge_handle = crate::pipeline::memory::ConsumerHandle::new();
-            let charge_consumer_id = memory_budget.register_consumer(Arc::new(
-                crate::executor::node_buffer::NodeBufferConsumer::new(charge_handle.clone()),
-            ));
+            let charge_consumer_id = memory_budget.register_node_consumer(
+                &spec.producer_name,
+                Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                    charge_handle.clone(),
+                )),
+            );
             let writer_charge_handle = charge_handle.clone();
             let telemetry_producer = params.telemetry_producer.clone();
             let sink_shutdown_token = params.shutdown_token.clone();

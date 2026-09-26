@@ -464,7 +464,9 @@ mod tests {
             per_source_dlq_counts: Default::default(),
             cumulative_spill_bytes: 0,
             per_stage_spill_bytes: Default::default(),
+            per_stage_spill_bytes_written: Default::default(),
             peak_consumer_usage_bytes: 0,
+            per_node_peak_charged_bytes: Default::default(),
             interrupted: false,
             advisories: Vec::new(),
         };
@@ -549,7 +551,9 @@ mod tests {
             per_source_dlq_counts: Default::default(),
             cumulative_spill_bytes: 0,
             per_stage_spill_bytes: Default::default(),
+            per_stage_spill_bytes_written: Default::default(),
             peak_consumer_usage_bytes: 0,
+            per_node_peak_charged_bytes: Default::default(),
             interrupted: false,
             advisories: Vec::new(),
         };

@@ -60,6 +60,20 @@ sampling at dispatch close would report those already-released bytes as live.
 The total and per-stage spill fields include committed charges minus releases,
 not every byte ever written to temporary storage.
 
+Two further report figures answer per-node questions those totals cannot.
+`per_stage_spill_bytes_written` adds every spill charge a stage records and is
+never lowered by a release, so a sort whose runs were merged and unlinked
+before the run ended still shows the bytes it wrote while its on-disk entry is
+back at zero. `per_node_peak_charged_bytes` gives, for each node whose state is
+registered under the node's name (`register_node_consumer`), the highest
+charge any one of its consumers reached. Every `ConsumerHandle` charge raises
+that consumer's mark, so the figure is exact per consumer rather than sampled,
+and another node's state never raises it. A node with several consumers
+reports the largest single consumer's mark. Run-scoped state that no node owns
+(writer output staging, the credential registry) registers through
+`register_consumer` and has no entry. The run-wide `peak_consumer_usage_bytes`
+remains a sum sampled at streaming charges.
+
 `WriterResourceConsumer` reports the ledger's exact live grant total through its
 `ConsumerHandle`. It is admission-managed and never backpressureable: parking
 the synchronous writer would prevent its own release progress. Spill requests

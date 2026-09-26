@@ -401,6 +401,10 @@ impl crate::pipeline::memory::MemoryConsumer for SourceConsumer {
         self.handle.bytes()
     }
 
+    fn peak_charged_bytes(&self) -> Option<u64> {
+        Some(self.handle.peak_bytes())
+    }
+
     fn spill_priority(&self) -> i32 {
         i32::MAX
     }

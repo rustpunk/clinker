@@ -124,6 +124,10 @@ impl MemoryConsumer for CullConsumer {
         self.handle.bytes()
     }
 
+    fn peak_charged_bytes(&self) -> Option<u64> {
+        Some(self.handle.peak_bytes())
+    }
+
     fn spill_priority(&self) -> i32 {
         CULL_SPILL_PRIORITY
     }
@@ -260,7 +264,7 @@ where
     let handle = ConsumerHandle::new();
     let consumer_id = ctx
         .memory_budget
-        .register_consumer(Arc::new(CullConsumer::new(handle.clone())));
+        .register_node_consumer(name, Arc::new(CullConsumer::new(handle.clone())));
 
     // Every exit path past this point must deregister `consumer_id`, so the
     // grouping/finalize work runs inside a helper whose result is matched

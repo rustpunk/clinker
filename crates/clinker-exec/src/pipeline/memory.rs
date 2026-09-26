@@ -269,6 +269,32 @@ pub fn reject_unsatisfiable_budget(
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct ConsumerId(u32);
 
+/// Node attribution for [`MemoryArbitrator::per_node_peak_charged_bytes`]:
+/// the owning node of every live node consumer, and the largest mark each
+/// node's already-unregistered consumers reached.
+#[derive(Default)]
+struct ConsumerOwners {
+    /// Owning node name of each registered node consumer.
+    live: std::collections::HashMap<ConsumerId, String>,
+    /// Per node, the largest [`MemoryConsumer::peak_charged_bytes`] among its
+    /// consumers that were unregistered or replaced.
+    retired_peaks: std::collections::BTreeMap<String, u64>,
+}
+
+impl ConsumerOwners {
+    /// Fold `consumer`'s mark into its node's retired peak when `id` is a
+    /// node consumer. The attribution itself stays; the caller removes it on
+    /// unregister.
+    fn retain_peak(&mut self, id: ConsumerId, consumer: &dyn MemoryConsumer) {
+        if let Some(node) = self.live.get(&id)
+            && let Some(peak) = consumer.peak_charged_bytes()
+        {
+            let entry = self.retired_peaks.entry(node.clone()).or_insert(0);
+            *entry = (*entry).max(peak);
+        }
+    }
+}
+
 /// Reason a `MemoryConsumer::try_spill` call could not free the
 /// requested number of bytes.
 ///
@@ -404,6 +430,11 @@ impl Default for PauseSignal {
 /// (not paused) is lock-free.
 pub struct ConsumerHandle {
     bytes: AtomicU64,
+    /// Highest value `bytes` has held since the handle was built. Raised by
+    /// every [`Self::set_bytes`] and [`Self::add_bytes`], never lowered, so
+    /// it is the consumer's exact charged high-water mark rather than a
+    /// sample taken at some boundaries.
+    peak: AtomicU64,
     spill_requested: AtomicBool,
     pause_signal: PauseSignal,
     /// Set while the walk thread is actively draining this consumer's
@@ -422,6 +453,7 @@ impl ConsumerHandle {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             bytes: AtomicU64::new(0),
+            peak: AtomicU64::new(0),
             spill_requested: AtomicBool::new(false),
             pause_signal: PauseSignal::new(),
             active: AtomicBool::new(false),
@@ -433,21 +465,42 @@ impl ConsumerHandle {
         self.bytes.load(Ordering::Relaxed)
     }
 
-    /// Absolute set: replaces the counter with `n`. Use when the
-    /// operator already maintains a `usize` byte tally and just
-    /// mirrors it into the atomic at batch boundaries.
-    pub fn set_bytes(&self, n: u64) {
-        self.bytes.store(n, Ordering::Relaxed);
+    /// Highest live-byte count this handle has held: the consumer's charged
+    /// high-water mark. Every [`Self::set_bytes`] and [`Self::add_bytes`]
+    /// raises it; a discharge never lowers it. Lock-free read.
+    pub fn peak_bytes(&self) -> u64 {
+        self.peak.load(Ordering::Relaxed)
     }
 
-    /// Saturating add. Use on per-record admissions when the operator
-    /// tracks deltas instead of an absolute total.
+    /// Raise the high-water mark to `n` when `n` exceeds it. The plain load
+    /// first keeps a charge below the mark to one uncontended read.
+    fn raise_peak(&self, n: u64) {
+        if n > self.peak.load(Ordering::Relaxed) {
+            self.peak.fetch_max(n, Ordering::Relaxed);
+        }
+    }
+
+    /// Absolute set: replaces the counter with `n` and raises the
+    /// high-water mark to it. Use when the operator already maintains a
+    /// `usize` byte tally and just mirrors it into the atomic at batch
+    /// boundaries.
+    pub fn set_bytes(&self, n: u64) {
+        self.bytes.store(n, Ordering::Relaxed);
+        self.raise_peak(n);
+    }
+
+    /// Saturating add; raises the high-water mark to the new total. Use on
+    /// per-record admissions when the operator tracks deltas instead of an
+    /// absolute total.
     pub fn add_bytes(&self, n: u64) {
-        let _ = self
+        if let Ok(previous) = self
             .bytes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                 Some(cur.saturating_add(n))
-            });
+            })
+        {
+            self.raise_peak(previous.saturating_add(n));
+        }
     }
 
     /// Saturating subtract. Use on consumer drains to keep the
@@ -561,6 +614,16 @@ pub trait MemoryConsumer: Send + Sync {
     /// Live bytes the consumer currently holds against the arbitrator's
     /// `limit` envelope. Read every arbitration round; must be cheap.
     fn current_usage(&self) -> u64;
+
+    /// The highest `current_usage` this consumer has reached, when it keeps
+    /// an exact high-water mark. A consumer backed by a [`ConsumerHandle`]
+    /// returns [`ConsumerHandle::peak_bytes`], which every charge raises.
+    /// The default `None` means the consumer keeps no mark; the arbitrator
+    /// then reports no peak for it rather than a guessed one. Read when the
+    /// consumer is unregistered and when the run's report is assembled.
+    fn peak_charged_bytes(&self) -> Option<u64> {
+        None
+    }
 
     /// Relative spill cost. Lower = spill first. The arbitrator's
     /// policy uses this when comparing victims of similar size. Each
@@ -874,6 +937,14 @@ pub struct MemoryArbitrator {
     /// trips the memory budget), so a `Mutex<BTreeMap>` here costs nothing
     /// observable while keeping the breakdown allocation-stable and ordered.
     per_stage_spill_bytes: Mutex<std::collections::BTreeMap<String, u64>>,
+    /// Bytes each stage has written to spill files over the whole run, keyed
+    /// by the spilling node's name. Every [`Self::record_spill_bytes`] charge
+    /// adds to it and nothing subtracts from it, so unlinking a run (a merged
+    /// sort input, a dropped merger, a drained order barrier) leaves it
+    /// unchanged. [`Self::per_stage_spill_bytes`] is the on-disk figure, which
+    /// falls back as runs are unlinked; this is the figure that says whether a
+    /// stage spilled at all. Updated under the same lock as the on-disk map.
+    per_stage_spill_bytes_written: Mutex<std::collections::BTreeMap<String, u64>>,
     /// High-water mark of `sum_consumer_usage()` sampled whenever a
     /// streaming charge handle admits a batch. Lets a test prove the
     /// charged-bytes peak of a streaming stage stays bounded to one
@@ -882,6 +953,12 @@ pub struct MemoryArbitrator {
     /// lock-free via `fetch_max`. Surfaced on the `ExecutionReport` as
     /// `peak_consumer_usage_bytes` for callers that assert the bound.
     peak_consumer_usage: AtomicU64,
+    /// Which node owns each consumer registered through
+    /// [`Self::register_node_consumer`], and the high-water marks of the
+    /// node consumers already unregistered. Read by
+    /// [`Self::per_node_peak_charged_bytes`]. Touched only on register,
+    /// unregister, replace and report assembly, never on a charge.
+    consumer_owners: Mutex<ConsumerOwners>,
     /// Registry of operator wrappers the arbitrator polls for
     /// per-operator `current_usage()` and routes `pause` / `resume` /
     /// `try_spill` callbacks to. A copy-on-write snapshot: hot read
@@ -949,7 +1026,9 @@ impl MemoryArbitrator {
             max_spill_bytes: AtomicU64::new(u64::MAX),
             cumulative_spill_bytes: AtomicU64::new(0),
             per_stage_spill_bytes: Mutex::new(std::collections::BTreeMap::new()),
+            per_stage_spill_bytes_written: Mutex::new(std::collections::BTreeMap::new()),
             peak_consumer_usage: AtomicU64::new(0),
+            consumer_owners: Mutex::new(ConsumerOwners::default()),
             consumers: ArcSwap::from_pointee(Vec::new()),
             next_consumer_id: AtomicU32::new(0),
             policy,
@@ -1205,9 +1284,10 @@ impl MemoryArbitrator {
     /// Bytes currently on disk across every spill operator polling this
     /// arbitrator: the sum of every [`Self::record_spill_bytes`] charge minus
     /// every [`Self::release_spill_bytes`] release. Equals the sum of every
-    /// entry in [`Self::per_stage_spill_bytes`]. For spill paths that never
-    /// unlink a run before the run ends (all but the cascaded k-way merge) no
-    /// release fires, so this is exactly the monotonic total those paths wrote.
+    /// entry in [`Self::per_stage_spill_bytes`]. It falls as runs are
+    /// unlinked (merged sort inputs, dropped mergers, drained order barriers),
+    /// so a run can end at zero after spilling; whether a stage spilled at all
+    /// is [`Self::per_stage_spill_bytes_written`].
     pub fn cumulative_spill_bytes(&self) -> u64 {
         self.cumulative_spill_bytes.load(Ordering::Relaxed)
     }
@@ -1222,6 +1302,21 @@ impl MemoryArbitrator {
         self.per_stage_spill_bytes
             .lock()
             .expect("per_stage_spill_bytes mutex poisoned")
+            .clone()
+    }
+
+    /// Snapshot of the bytes each stage has written to spill files over the
+    /// run so far, keyed by the spilling node's name. Unlike
+    /// [`Self::per_stage_spill_bytes`], a release never lowers an entry: a
+    /// stage whose runs were all merged and unlinked before the run ended
+    /// still reads as having written them. A stage that never charged a spill
+    /// has no entry. Copies the map under its lock; read once at run
+    /// completion to populate
+    /// [`crate::executor::ExecutionReport::per_stage_spill_bytes_written`].
+    pub fn per_stage_spill_bytes_written(&self) -> std::collections::BTreeMap<String, u64> {
+        self.per_stage_spill_bytes_written
+            .lock()
+            .expect("per_stage_spill_bytes_written mutex poisoned")
             .clone()
     }
 
@@ -1241,7 +1336,8 @@ impl MemoryArbitrator {
     /// bytes with [`Self::release_spill_bytes`]; the counter then tracks current
     /// on-disk usage. Cascaded merges release consumed inputs, and authored
     /// sorts release their surviving runs when the eager merger or lazy stream
-    /// drops.
+    /// drops. The same `n` is added to the stage's written total
+    /// ([`Self::per_stage_spill_bytes_written`]), which no release lowers.
     pub fn record_spill_bytes(&self, node: &str, n: u64) -> bool {
         let ledger = self
             .admission
@@ -1261,6 +1357,14 @@ impl MemoryArbitrator {
             let entry = per_stage.entry(node.to_string()).or_insert(0);
             *entry = entry.saturating_add(n);
         }
+        {
+            let mut written = self
+                .per_stage_spill_bytes_written
+                .lock()
+                .expect("per_stage_spill_bytes_written mutex poisoned");
+            let entry = written.entry(node.to_string()).or_insert(0);
+            *entry = entry.saturating_add(n);
+        }
         self.cumulative_spill_bytes
             .load(Ordering::Relaxed)
             .saturating_add(ledger.usage.disk)
@@ -1271,7 +1375,8 @@ impl MemoryArbitrator {
     /// `node`, because a run that held those bytes was unlinked from disk. The
     /// pipeline-wide cumulative total and the stage's entry both drop by `n`, so
     /// the disk-cap counter reflects the bytes still on disk rather than every
-    /// byte ever written.
+    /// byte ever written. The stage's written total
+    /// ([`Self::per_stage_spill_bytes_written`]) is left unchanged.
     ///
     /// Cascaded k-way spill merges call this when they unlink consumed inputs;
     /// authored-sort charge guards call it when the final eager merger or lazy
@@ -1311,17 +1416,58 @@ impl MemoryArbitrator {
                 });
     }
 
-    /// Register a consumer with the arbitrator. Returns a fresh
-    /// `ConsumerId` the operator records for later
-    /// `unregister_consumer` calls. The only path that adds a
-    /// contributor to the arbitrator's policy registry.
+    /// Register a consumer that no single node owns with the arbitrator.
+    /// Returns a fresh `ConsumerId` the operator records for later
+    /// `unregister_consumer` calls. Together with
+    /// [`Self::register_node_consumer`], the only path that adds a
+    /// contributor to the arbitrator's policy registry. A consumer registered
+    /// here is arbitrated like any other but has no entry in
+    /// [`Self::per_node_peak_charged_bytes`]; node-owned state registers
+    /// through [`Self::register_node_consumer`].
     ///
     /// Clones the current snapshot Vec, appends the new entry, and
     /// atomically swaps it in. `O(N)` in the registry size, but
     /// registration is a once-per-operator-lifetime event, so the cost
     /// is off the per-batch hot path readers traverse.
     pub fn register_consumer(&self, consumer: Arc<dyn MemoryConsumer>) -> ConsumerId {
+        self.register_owned_consumer(None, consumer)
+    }
+
+    /// Register a consumer that holds the retained state of the node named
+    /// `node`, so the run's report can say how much that node held charged.
+    ///
+    /// Behaves exactly like [`Self::register_consumer`] for arbitration; in
+    /// addition, [`Self::per_node_peak_charged_bytes`] reports the consumer's
+    /// [`MemoryConsumer::peak_charged_bytes`] under `node`, while it is
+    /// registered and after it is unregistered. `node` is the same name the
+    /// node's spill is recorded under in [`Self::record_spill_bytes`]. Use
+    /// [`Self::register_consumer`] only for state no single node owns (writer
+    /// output staging, the credential registry).
+    pub fn register_node_consumer(
+        &self,
+        node: &str,
+        consumer: Arc<dyn MemoryConsumer>,
+    ) -> ConsumerId {
+        self.register_owned_consumer(Some(node), consumer)
+    }
+
+    /// Shared body of [`Self::register_consumer`] and
+    /// [`Self::register_node_consumer`]. The owner is recorded before the
+    /// consumer enters the snapshot, so a report assembled concurrently never
+    /// sees a registered node consumer without its node.
+    fn register_owned_consumer(
+        &self,
+        node: Option<&str>,
+        consumer: Arc<dyn MemoryConsumer>,
+    ) -> ConsumerId {
         let id = ConsumerId(self.next_consumer_id.fetch_add(1, Ordering::Relaxed));
+        if let Some(node) = node {
+            self.consumer_owners
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .live
+                .insert(id, node.to_string());
+        }
         self.consumers.rcu(|current| {
             let mut next = Vec::with_capacity(current.len() + 1);
             next.extend(current.iter().cloned());
@@ -1360,6 +1506,12 @@ impl MemoryArbitrator {
             }
             next
         });
+        if let Some(previous) = &replaced {
+            self.consumer_owners
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain_peak(id, previous.as_ref());
+        }
         replaced
     }
 
@@ -1386,6 +1538,14 @@ impl MemoryArbitrator {
                 .cloned()
                 .collect::<Vec<_>>()
         });
+        if let Some(consumer) = &removed {
+            let mut owners = self
+                .consumer_owners
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            owners.retain_peak(id, consumer.as_ref());
+            owners.live.remove(&id);
+        }
         removed
     }
 
@@ -1441,6 +1601,37 @@ impl MemoryArbitrator {
     /// the whole stage at once.
     pub fn peak_consumer_usage(&self) -> u64 {
         self.peak_consumer_usage.load(Ordering::Relaxed)
+    }
+
+    /// For each node that registered state through
+    /// [`Self::register_node_consumer`], the highest number of bytes any one
+    /// of its consumers held charged, keyed by node name.
+    ///
+    /// Each consumer's mark is exact (every charge raises it; see
+    /// [`ConsumerHandle::peak_bytes`]) and belongs to that consumer alone, so
+    /// another node's charges never raise this node's figure. A node with
+    /// several consumers, at once or one after another, reports the largest
+    /// single consumer's mark, not their sum. Consumers registered through
+    /// [`Self::register_consumer`], and consumers whose
+    /// [`MemoryConsumer::peak_charged_bytes`] is `None`, contribute nothing.
+    /// Covers consumers still registered and those already unregistered;
+    /// copies a small map under a lock. Read once at run completion to
+    /// populate [`crate::executor::ExecutionReport::per_node_peak_charged_bytes`].
+    pub fn per_node_peak_charged_bytes(&self) -> std::collections::BTreeMap<String, u64> {
+        let owners = self
+            .consumer_owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut peaks = owners.retired_peaks.clone();
+        for (id, consumer) in self.consumers.load().iter() {
+            if let Some(node) = owners.live.get(id)
+                && let Some(peak) = consumer.peak_charged_bytes()
+            {
+                let entry = peaks.entry(node.clone()).or_insert(0);
+                *entry = (*entry).max(peak);
+            }
+        }
+        peaks
     }
 
     /// Choose which of several currently-runnable nodes to dispatch next,
@@ -2443,6 +2634,134 @@ mod tests {
             Some(&400),
             "the stage entry drops with the pipeline-wide total"
         );
+    }
+
+    #[test]
+    fn spill_bytes_written_is_not_lowered_by_a_release() {
+        // A sort writes two runs, merges them and unlinks both inputs: the
+        // on-disk figures fall back to zero, but the written figures keep every
+        // byte each stage wrote, so a finished run still shows it spilled.
+        let arbitrator =
+            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
+        arbitrator.record_spill_bytes("sort_by_amount", 1000);
+        arbitrator.record_spill_bytes("sort_by_amount", 400);
+        arbitrator.record_spill_bytes("dept_totals", 64);
+        arbitrator.release_spill_bytes("sort_by_amount", 1400);
+        arbitrator.release_spill_bytes("dept_totals", 64);
+        assert_eq!(arbitrator.cumulative_spill_bytes(), 0);
+        assert_eq!(
+            arbitrator.per_stage_spill_bytes().get("sort_by_amount"),
+            Some(&0)
+        );
+        let written = arbitrator.per_stage_spill_bytes_written();
+        assert_eq!(written.get("sort_by_amount"), Some(&1400));
+        assert_eq!(written.get("dept_totals"), Some(&64));
+        assert_eq!(written.len(), 2, "only stages that wrote appear");
+        // A release for a stage that never wrote adds no entry.
+        arbitrator.release_spill_bytes("never_spilled", 10);
+        assert!(
+            !arbitrator
+                .per_stage_spill_bytes_written()
+                .contains_key("never_spilled")
+        );
+    }
+
+    #[test]
+    fn consumer_handle_peak_rises_on_every_charge_and_survives_a_discharge() {
+        let handle = ConsumerHandle::new();
+        assert_eq!(handle.peak_bytes(), 0);
+        handle.set_bytes(10);
+        handle.add_bytes(30);
+        assert_eq!(handle.peak_bytes(), 40);
+        handle.sub_bytes(35);
+        handle.set_bytes(5);
+        assert_eq!(handle.bytes(), 5);
+        assert_eq!(
+            handle.peak_bytes(),
+            40,
+            "a discharge or a lower absolute set never lowers the mark"
+        );
+        handle.add_bytes(50);
+        assert_eq!(handle.peak_bytes(), 55);
+    }
+
+    #[test]
+    fn node_peak_is_each_nodes_own_high_water_mark() {
+        use crate::pipeline::arena::ArenaConsumer;
+        let arbitrator =
+            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
+
+        // Two nodes hold state at the same time; each node's mark is its own
+        // consumer's, never the sum across nodes.
+        let small = ConsumerHandle::new();
+        let large = ConsumerHandle::new();
+        let small_id = arbitrator.register_node_consumer(
+            "sort_by_amount",
+            Arc::new(ArenaConsumer::new(small.clone())),
+        );
+        let large_id = arbitrator
+            .register_node_consumer("dept_totals", Arc::new(ArenaConsumer::new(large.clone())));
+        small.set_bytes(100);
+        large.set_bytes(900);
+        small.set_bytes(20);
+
+        // A consumer no node owns is charged but attributed to no node.
+        let run_scoped = ConsumerHandle::new();
+        run_scoped.set_bytes(5_000);
+        let run_scoped_id =
+            arbitrator.register_consumer(Arc::new(ArenaConsumer::new(run_scoped.clone())));
+
+        let peaks = arbitrator.per_node_peak_charged_bytes();
+        assert_eq!(peaks.get("sort_by_amount"), Some(&100));
+        assert_eq!(peaks.get("dept_totals"), Some(&900));
+        assert_eq!(peaks.len(), 2, "the run-scoped consumer has no node entry");
+
+        // Unregistering keeps the mark: a node that already finished still
+        // reports what it held.
+        large.set_bytes(0);
+        arbitrator.unregister_consumer(large_id);
+        assert_eq!(
+            arbitrator.per_node_peak_charged_bytes().get("dept_totals"),
+            Some(&900)
+        );
+
+        // A node that registers again later reports the larger of its two
+        // consumers' marks, not their sum.
+        let again = ConsumerHandle::new();
+        let again_id = arbitrator
+            .register_node_consumer("dept_totals", Arc::new(ArenaConsumer::new(again.clone())));
+        again.set_bytes(300);
+        assert_eq!(
+            arbitrator.per_node_peak_charged_bytes().get("dept_totals"),
+            Some(&900)
+        );
+        again.set_bytes(1_200);
+        assert_eq!(
+            arbitrator.per_node_peak_charged_bytes().get("dept_totals"),
+            Some(&1_200)
+        );
+
+        // Replacing a node's wrapper keeps its attribution.
+        let replacement = ConsumerHandle::new();
+        replacement.set_bytes(150);
+        assert!(
+            arbitrator
+                .replace_consumer(small_id, Arc::new(ArenaConsumer::new(replacement)))
+                .is_some()
+        );
+        assert_eq!(
+            arbitrator
+                .per_node_peak_charged_bytes()
+                .get("sort_by_amount"),
+            Some(&150)
+        );
+        arbitrator.unregister_consumer(small_id);
+        arbitrator.unregister_consumer(again_id);
+        arbitrator.unregister_consumer(run_scoped_id);
+        let peaks = arbitrator.per_node_peak_charged_bytes();
+        assert_eq!(peaks.get("sort_by_amount"), Some(&150));
+        assert_eq!(peaks.get("dept_totals"), Some(&1_200));
+        assert_eq!(peaks.len(), 2);
     }
 
     #[test]

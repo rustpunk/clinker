@@ -2235,10 +2235,13 @@ impl<'a> ExecutorContext<'a> {
     /// consumer thread drains. The 256-event bound mirrors the Source
     /// ingest channel so back-pressure paces both ends, and the per-batch
     /// `add_bytes` the producer charges on flush is netted to zero by the
-    /// consumer's per-record `sub_bytes` discharge.
+    /// consumer's per-record `sub_bytes` discharge. The charge consumer is
+    /// registered under `producer_name`, the name the producer's streaming
+    /// spill is recorded under.
     pub(crate) fn install_streaming_ingest_channel(
         &mut self,
         producer_idx: NodeIndex,
+        producer_name: &str,
     ) -> (
         crossbeam_channel::Receiver<crate::executor::stream_event::StreamEvent>,
         Arc<crate::pipeline::memory::ConsumerHandle>,
@@ -2247,9 +2250,12 @@ impl<'a> ExecutorContext<'a> {
         let (tx, rx) =
             crossbeam_channel::bounded::<crate::executor::stream_event::StreamEvent>(256);
         let charge_handle = crate::pipeline::memory::ConsumerHandle::new();
-        let charge_consumer_id = self.memory_budget.register_consumer(Arc::new(
-            crate::executor::node_buffer::NodeBufferConsumer::new(charge_handle.clone()),
-        ));
+        let charge_consumer_id = self.memory_budget.register_node_consumer(
+            producer_name,
+            Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                charge_handle.clone(),
+            )),
+        );
         self.streaming_output_senders.insert(producer_idx, tx);
         self.streaming_charge_consumers
             .insert(producer_idx, (charge_consumer_id, charge_handle.clone()));
@@ -3404,9 +3410,12 @@ fn admit_node_buffer_inner(
         }
         let handle = crate::pipeline::memory::ConsumerHandle::new();
         handle.set_bytes(bytes);
-        let consumer_id = ctx.memory_budget.register_consumer(Arc::new(
-            crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone()),
-        ));
+        let consumer_id = ctx.memory_budget.register_node_consumer(
+            node_name,
+            Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                handle.clone(),
+            )),
+        );
         (consumer_id, handle)
     };
     ctx.node_buffer_consumer_ids
@@ -3770,9 +3779,12 @@ pub(crate) fn finalize_node_rooted_windows(
         }
         let arena_handle = crate::pipeline::memory::ConsumerHandle::new();
         arena_handle.set_bytes(arena.estimated_bytes() as u64);
-        let arena_consumer_id = ctx.memory_budget.register_consumer(Arc::new(
-            crate::pipeline::arena::ArenaConsumer::new(arena_handle.clone()),
-        ));
+        let arena_consumer_id = ctx.memory_budget.register_node_consumer(
+            current_dag.graph[upstream_idx].name(),
+            Arc::new(crate::pipeline::arena::ArenaConsumer::new(
+                arena_handle.clone(),
+            )),
+        );
         ctx.window_arena_consumer_ids
             .insert(idx, (arena_consumer_id, arena_handle));
 

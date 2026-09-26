@@ -315,9 +315,12 @@ where
             .spill_compress
             .resolve_for_schema(output_schema.column_count(), ctx.batch_size as u64);
         let agg_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
-        let agg_consumer_id = ctx.memory_budget.register_consumer(Arc::new(
-            crate::aggregation::AggregateConsumer::new(agg_consumer_handle.clone()),
-        ));
+        let agg_consumer_id = ctx.memory_budget.register_node_consumer(
+            name,
+            Arc::new(crate::aggregation::AggregateConsumer::new(
+                agg_consumer_handle.clone(),
+            )),
+        );
         let mut stream = crate::aggregation::AggregateStream::for_node(
             agg_strategy,
             crate::aggregation::AggregatorConfig {
@@ -691,9 +694,10 @@ impl DocAggregatorFactory {
                 arbitrator: Arc::clone(&self.arbitrator),
             },
         )?;
-        let consumer_id = self
-            .arbitrator
-            .register_consumer(Arc::new(crate::aggregation::AggregateConsumer::new(handle)));
+        let consumer_id = self.arbitrator.register_node_consumer(
+            &self.transform_name,
+            Arc::new(crate::aggregation::AggregateConsumer::new(handle)),
+        );
         Ok((stream, consumer_id))
     }
 }
@@ -1212,7 +1216,7 @@ fn run_streaming_aggregate_ingest(
     // change. The scoped thread's per-record `sub_bytes` discharge below
     // nets the producer's per-batch charge to zero.
     let (rx, charge_handle, charge_consumer_id) =
-        ctx.install_streaming_ingest_channel(producer_idx);
+        ctx.install_streaming_ingest_channel(producer_idx, &upstream_name);
 
     // Copy the stable-context reference out of `ctx` *before* the scope so
     // the scoped thread borrows `&'a StableEvalContext` directly (shared,
@@ -1530,9 +1534,12 @@ impl WindowedAggContext<'_> {
             cxl::eval::DEFAULT_MAX_EXPANSION,
         );
         let agg_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
-        let agg_consumer_id = ctx.memory_budget.register_consumer(Arc::new(
-            crate::aggregation::AggregateConsumer::new(agg_consumer_handle.clone()),
-        ));
+        let agg_consumer_id = ctx.memory_budget.register_node_consumer(
+            self.name,
+            Arc::new(crate::aggregation::AggregateConsumer::new(
+                agg_consumer_handle.clone(),
+            )),
+        );
         // Resolve the spill compression mode against this aggregate's
         // output-schema width and the run's batch size, matching the
         // `--explain` projection for the Aggregation node so each window's
