@@ -277,7 +277,8 @@ impl MemoryArbitrator {
 }
 
 impl ReservationState {
-    pub(crate) fn release_writer_memory(&self, bytes: usize) {
+    pub(crate) fn release_writer_memory(&self, bytes: usize, attribution: Option<ConsumerId>) {
+        let _ = attribution;
         let mut ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
         ledger.usage.memory -= bytes as u64;
         if let Some(handle) = &ledger.handle {

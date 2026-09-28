@@ -307,7 +307,7 @@ impl AllocationAuthority for ReleaseAuthority {
         Err(ResourceError::new(ResourceErrorKind::Authority, 0, 0))
     }
     fn release(&self, _: OwnerId, bytes: usize) {
-        self.state.release_writer_memory(bytes);
+        self.state.release_writer_memory(bytes, None);
     }
     fn check_cancelled(&self) -> Result<(), ResourceError> {
         self.state.check_open()
@@ -491,7 +491,7 @@ impl AllocationAuthority for AdmissionAuthority {
         result
     }
     fn release(&self, _: OwnerId, bytes: usize) {
-        self.release.state.release_writer_memory(bytes);
+        self.release.state.release_writer_memory(bytes, None);
     }
     fn check_cancelled(&self) -> Result<(), ResourceError> {
         self.release.state.check_open()?;

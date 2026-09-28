@@ -5,7 +5,8 @@
 //! execution engine's disk-spill and memory-budget subsystems, but they are
 //! defined here, alongside the error type that names them, so the planning
 //! layer can own the unified `PipelineError` without depending upward on the
-//! executor.
+//! executor. [`MemorySurface`] and [`ConsumerLabel`] name the holders of
+//! charged memory in author vocabulary for the same reason.
 
 /// Disk-spill I/O or decode failure.
 ///
@@ -159,6 +160,89 @@ impl std::fmt::Display for BudgetCategory {
             Self::NodeBuffer => f.write_str("node_buffer"),
         }
     }
+}
+
+/// What a piece of charged memory holds, named in the words a pipeline author
+/// uses for their own pipeline.
+///
+/// Memory diagnostics name the holder of every charged byte by its node and
+/// one of these surfaces, so the rendered text never exposes the engine's own
+/// machinery. Closed: a new kind of retained state adds a variant here together
+/// with its author-facing wording.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub enum MemorySurface {
+    /// Records a Source has read and not yet handed on.
+    RowsRead,
+    /// Rows waiting between two nodes, named by their author-given names.
+    BufferedRows { from: String, to: String },
+    /// Per-group accumulators of an Aggregate.
+    GroupState,
+    /// Rows collected for sorting.
+    SortBuffer,
+    /// The build side a join holds while it matches the probe side.
+    JoinBuildSide,
+    /// Other state a join holds between records.
+    JoinState,
+    /// The failing rows of a failed document, held until the document is
+    /// dead-lettered.
+    HeldFailingRows,
+    /// The run's record of rows already dead-lettered, kept so a row several
+    /// Sinks hold is dead-lettered once.
+    DeadLetteredRowSet,
+    /// State a routing or filtering decision keeps between records.
+    DecisionState,
+    /// Rows held while Reshape groups complete.
+    ReshapeGroups,
+    /// The index a window reads its neighbouring rows through.
+    WindowIndex,
+    /// Rows collected so a node can scan all of them.
+    ScanMaterialization,
+    /// Output bytes staged before they are written.
+    OutputStaging,
+    /// Credentials resolved for the run.
+    CredentialRegistry,
+    /// Rows held until their correlation group commits.
+    CorrelationGroups,
+    /// Rows parked between two regions of the pipeline until they commit.
+    ParkedCrossRegionRows { from: String, to: String },
+}
+
+impl std::fmt::Display for MemorySurface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RowsRead => f.write_str("rows read from the source"),
+            Self::BufferedRows { from, to } => {
+                write!(f, "rows buffered between {from} and {to}")
+            }
+            Self::GroupState => f.write_str("group state"),
+            Self::SortBuffer => f.write_str("sort buffer"),
+            Self::JoinBuildSide => f.write_str("join build side"),
+            Self::JoinState => f.write_str("join state"),
+            Self::HeldFailingRows => f.write_str("held failing rows of a failed document"),
+            Self::DeadLetteredRowSet => f.write_str("set of rows already dead-lettered"),
+            Self::DecisionState => f.write_str("decision state"),
+            Self::ReshapeGroups => f.write_str("rows held for Reshape groups"),
+            Self::WindowIndex => f.write_str("window index"),
+            Self::ScanMaterialization => f.write_str("rows collected for a full scan"),
+            Self::OutputStaging => f.write_str("output staging"),
+            Self::CredentialRegistry => f.write_str("credential registry"),
+            Self::CorrelationGroups => f.write_str("rows held for correlation groups"),
+            Self::ParkedCrossRegionRows { from, to } => {
+                write!(f, "rows held between {from} and {to} for commit")
+            }
+        }
+    }
+}
+
+/// Who holds a piece of charged memory: the author-given name of the node that
+/// owns it and what it is.
+///
+/// Run-scoped state that no single node owns carries the run-level surface it
+/// serves (output staging, the credential registry).
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct ConsumerLabel {
+    pub node: String,
+    pub surface: MemorySurface,
 }
 
 #[cfg(test)]
