@@ -15,17 +15,20 @@
 //! signed-zero, infinite and NaN floats (random sign and payload), decimals of
 //! every scale 0..=28 including maximum-precision mantissas, strings with NUL
 //! and non-ASCII characters, dates, datetimes including leap seconds, and
-//! arrays and maps up to depth 2 with null elements. Half of the pairs are
-//! drawn as a value and one of its relatives (the same number in another
-//! domain, an adjacent float, a rescaled decimal, a leap second and the instant
-//! it ties), so ties and near-ties across domains are frequent rather than
-//! accidental.
+//! arrays and maps up to depth 2 with null elements. Half of the pairs and
+//! triples are numbers only, and half are drawn as a value and its relatives
+//! (the same number in another domain, an adjacent float, a rescaled decimal, a
+//! leap second and the instant it ties), so ties and near-ties across domains
+//! are frequent rather than accidental.
+//!
+//! Case counts: 1,024 per pair property and 512 for the triple property.
 
 use std::cmp::Ordering;
+use std::hash::{DefaultHasher, Hasher};
 
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use clinker_record::Value;
-use clinker_record::order::{compare, encode};
+use clinker_record::order::{NumericTieClass, compare, encode, hash_tie_class, ties};
 use clinker_record::owned_storage::OwnedValues;
 use proptest::prelude::*;
 use rust_decimal::Decimal;
@@ -136,12 +139,13 @@ fn edge_decimal() -> impl Strategy<Value = Decimal> {
     ]
 }
 
-fn number() -> impl Strategy<Value = Value> {
+fn number() -> BoxedStrategy<Value> {
     prop_oneof![
         edge_i64().prop_map(Value::Integer),
         edge_f64().prop_map(Value::Float),
         edge_decimal().prop_map(Value::Decimal),
     ]
+    .boxed()
 }
 
 fn text() -> impl Strategy<Value = String> {
@@ -185,7 +189,7 @@ fn datetime() -> impl Strategy<Value = NaiveDateTime> {
     ]
 }
 
-fn scalar() -> impl Strategy<Value = Value> {
+fn scalar() -> BoxedStrategy<Value> {
     prop_oneof![
         6 => number(),
         1 => any::<bool>().prop_map(Value::Bool),
@@ -193,6 +197,7 @@ fn scalar() -> impl Strategy<Value = Value> {
         1 => date().prop_map(Value::Date),
         2 => datetime().prop_map(Value::DateTime),
     ]
+    .boxed()
 }
 
 fn element() -> impl Strategy<Value = Value> {
@@ -212,7 +217,7 @@ fn map_of(inner: impl Strategy<Value = Value>) -> impl Strategy<Value = Value> {
 }
 
 /// A value of any domain; arrays and maps nest to depth 2.
-fn value() -> impl Strategy<Value = Value> {
+fn value() -> BoxedStrategy<Value> {
     let nested = || {
         prop_oneof![
             4 => element(),
@@ -226,6 +231,26 @@ fn value() -> impl Strategy<Value = Value> {
         1 => array_of(nested()),
         1 => map_of(nested()),
     ]
+    .boxed()
+}
+
+/// The decimal equal to `f`, when `f` is a dyadic rational a decimal can hold:
+/// `f · 2^n` is an integer `k` for some `n ≤ 28`, and `k · 5^n` fits the
+/// 96-bit mantissa at scale `n`.
+fn exact_decimal(f: f64) -> Option<Decimal> {
+    if !f.is_finite() || f.abs() >= 7.9e28 {
+        return None;
+    }
+    (0u32..=28).find_map(|n| {
+        // Scaling by a power of two is exact.
+        let scaled = f * f64::from(1u32 << n);
+        if scaled.fract() != 0.0 || scaled.abs() >= 1.7e38 {
+            return None;
+        }
+        (scaled as i128)
+            .checked_mul(5i128.pow(n))
+            .and_then(|mantissa| Decimal::try_from_i128_with_scale(mantissa, n).ok())
+    })
 }
 
 /// Values that tie `v` or sit next to it in the order, in other domains and
@@ -265,9 +290,13 @@ fn relatives(v: &Value) -> Vec<Value> {
                 let i = *f as i64;
                 out.extend([Value::Integer(i), Value::Decimal(Decimal::from(i))]);
             }
+            out.extend(exact_decimal(*f).map(Value::Decimal));
         }
         Value::Decimal(d) => {
-            let approx = d.mantissa() as f64 / 10f64.powi(d.scale() as i32);
+            // From the normalized form, so a short dyadic such as 2.50 lands
+            // on its float exactly.
+            let normal = d.normalize();
+            let approx = normal.mantissa() as f64 / 10f64.powi(normal.scale() as i32);
             out.extend([
                 Value::Float(approx),
                 Value::Float(approx.next_up()),
@@ -340,23 +369,161 @@ fn relatives(v: &Value) -> Vec<Value> {
     out
 }
 
-/// Half independent pairs, half a value and one of its relatives.
-fn pair() -> impl Strategy<Value = (Value, Value)> {
-    prop_oneof![
-        (value(), value()),
-        value().prop_flat_map(|a| {
-            let related = relatives(&a);
-            (Just(a), prop::sample::select(related))
-        }),
-    ]
+fn related_pair(base: impl Strategy<Value = Value>) -> impl Strategy<Value = (Value, Value)> {
+    base.prop_flat_map(|a| {
+        let related = relatives(&a);
+        (Just(a), prop::sample::select(related))
+    })
 }
 
+fn related_triple(
+    base: impl Strategy<Value = Value>,
+) -> impl Strategy<Value = (Value, Value, Value)> {
+    base.prop_flat_map(|a| {
+        let related = relatives(&a);
+        (
+            Just(a),
+            prop::sample::select(related.clone()),
+            prop::sample::select(related),
+        )
+    })
+}
+
+/// Pairs of any domain and pairs of numbers, each drawn half independently and
+/// half as a value and one of its relatives. Numbers get half the weight
+/// because the numeric domain is where three representations share one order.
+fn pair() -> BoxedStrategy<(Value, Value)> {
+    prop_oneof![
+        (value(), value()),
+        related_pair(value()),
+        (number(), number()),
+        related_pair(number()),
+    ]
+    .boxed()
+}
+
+fn triple() -> BoxedStrategy<(Value, Value, Value)> {
+    prop_oneof![
+        (value(), value(), value()),
+        related_triple(value()),
+        (number(), number(), number()),
+        related_triple(number()),
+    ]
+    .boxed()
+}
+
+fn non_nan_number() -> impl Strategy<Value = Value> {
+    number().prop_filter(
+        "a NaN is not a non-NaN number",
+        |v| !matches!(v, Value::Float(f) if f.is_nan()),
+    )
+}
+
+fn tie_hash(v: &Value) -> u64 {
+    let mut state = DefaultHasher::new();
+    hash_tie_class(v, &mut state);
+    state.finish()
+}
+
+fn tie_class(v: &Value) -> Option<NumericTieClass> {
+    match v {
+        Value::Integer(i) => Some(NumericTieClass::from_i64(*i)),
+        Value::Float(f) => Some(NumericTieClass::from_f64(*f)),
+        Value::Decimal(d) => Some(NumericTieClass::from_decimal(*d)),
+        _ => None,
+    }
+}
+
+/// `x ≤ y ≤ z` implies `x ≤ z`, strictly when either step is strict.
+fn check_transitive(x: &Value, y: &Value, z: &Value) -> Result<(), TestCaseError> {
+    let (xy, yz, xz) = (compare(x, y), compare(y, z), compare(x, z));
+    if xy != Ordering::Greater && yz != Ordering::Greater {
+        let expected = if xy == Ordering::Equal && yz == Ordering::Equal {
+            Ordering::Equal
+        } else {
+            Ordering::Less
+        };
+        prop_assert_eq!(xz, expected, "{:?} / {:?} / {:?}", x, y, z);
+    }
+    Ok(())
+}
+
+// Case counts: 1,024 per pair property, 512 per triple property. The whole
+// file runs in well under a second in a debug build.
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(1024))]
 
     #[test]
     fn encoder_agrees_with_comparator((a, b) in pair()) {
         prop_assert_eq!(key(&a).cmp(&key(&b)), compare(&a, &b), "{:?} vs {:?}", a, b);
+    }
+
+    #[test]
+    fn equal_bytes_iff_tie((a, b) in pair()) {
+        prop_assert_eq!(key(&a) == key(&b), ties(&a, &b), "{:?} vs {:?}", a, b);
+    }
+
+    #[test]
+    fn encoding_is_prefix_free((a, b) in pair()) {
+        let (ka, kb) = (key(&a), key(&b));
+        if ka != kb {
+            prop_assert!(!ka.starts_with(&kb), "{:?} vs {:?}", a, b);
+            prop_assert!(!kb.starts_with(&ka), "{:?} vs {:?}", a, b);
+        }
+    }
+
+    #[test]
+    fn ties_hash_equally((a, b) in pair()) {
+        if ties(&a, &b) {
+            prop_assert_eq!(tie_hash(&a), tie_hash(&b), "{:?} vs {:?}", a, b);
+        }
+        // Group keys lean on the numeric class being exactly the tie, in
+        // both directions, not only on equal hashes.
+        if let (Some(ca), Some(cb)) = (tie_class(&a), tie_class(&b)) {
+            prop_assert_eq!(ca == cb, ties(&a, &b), "{:?} vs {:?}", a, b);
+        }
+    }
+
+    #[test]
+    fn every_nan_ties_and_sorts_above_infinity(
+        first in nan(),
+        second in nan(),
+        other in non_nan_number(),
+    ) {
+        let (first, second) = (Value::Float(first), Value::Float(second));
+        prop_assert!(ties(&first, &second), "{:?} vs {:?}", first, second);
+        prop_assert_eq!(key(&first), key(&second));
+        prop_assert_eq!(compare(&first, &other), Ordering::Greater, "{:?}", other);
+        prop_assert_eq!(compare(&other, &first), Ordering::Less, "{:?}", other);
+        prop_assert!(key(&first) > key(&other), "{:?}", other);
+        prop_assert_eq!(
+            compare(&first, &Value::Float(f64::INFINITY)),
+            Ordering::Greater
+        );
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    #[test]
+    fn value_order_is_a_total_order((a, b, c) in triple()) {
+        for v in [&a, &b, &c] {
+            prop_assert_eq!(compare(v, v), Ordering::Equal, "{:?}", v);
+        }
+        for (x, y) in [(&a, &b), (&b, &c), (&a, &c)] {
+            prop_assert_eq!(compare(x, y), compare(y, x).reverse(), "{:?} vs {:?}", x, y);
+        }
+        for (x, y, z) in [
+            (&a, &b, &c),
+            (&a, &c, &b),
+            (&b, &a, &c),
+            (&b, &c, &a),
+            (&c, &a, &b),
+            (&c, &b, &a),
+        ] {
+            check_transitive(x, y, z)?;
+        }
     }
 }
 

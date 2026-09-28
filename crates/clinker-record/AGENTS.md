@@ -44,6 +44,7 @@ storage/resolver traits.
 - `schema_def`: schema-file and inline schema structures.
 - `storage`, `record_view`, `resolver`: zero-copy storage and field/window resolution contracts.
 - `document_context`: `$doc` envelope records, document ids/grains, synthetic context, and spill codec.
+- `order`: the one value order — `compare`, the memcomparable `encode` and per-domain `encode_*`, `ties`, `NumericTieClass` and `hash_tie_class`; pure functions, no retained state.
 - `provenance`, `group_key`, `accumulator`, `counters`, `coercion`, `minimal`: focused data-model helpers.
 
 ## Dependency rules
