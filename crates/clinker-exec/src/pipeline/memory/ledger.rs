@@ -260,6 +260,10 @@ impl MemoryArbitrator {
     /// for this call.
     pub fn reserve(&self, bytes: u64, requester: Requester) -> Result<Grant, Shortfall> {
         let mut ledger = self.admission.ledger.lock();
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(forced) = take_forced_shortfall(&mut ledger, bytes, requester) {
+            return Err(forced);
+        }
         if let Err(refusal) = ledger.try_charge(bytes, requester.consumer.map(|id| id.0)) {
             return Err(shortfall(&ledger, bytes, requester.consumer, refusal));
         }

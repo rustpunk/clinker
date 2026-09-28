@@ -19,19 +19,24 @@
 //! node's charged high-water mark (`per_node_peak_charged_bytes`, never the
 //! run-wide sampled sum) and the bytes the node wrote to spill files
 //! (`per_stage_spill_bytes_written`, which unlinking a run does not lower),
-//! and refuses a limit that differs from the one the compiled plan runs
-//! under.
+//! and refuses a limit that differs from the one the run's arbitrator
+//! enforced (`memory_limit_bytes`: `memory.limit`, or the test capacity the
+//! run was held to).
+//!
+//! A spill-forcing test that runs on a test ledger capacity also calls
+//! [`assert_spill_engaged`] on its low run and
+//! [`assert_capacity_below_ample_peak`] on its capacity and ample run.
 //!
 //! Include it with `#[path = "common/memory_pressure.rs"] mod memory_pressure;`.
 
 use clinker_exec::executor::ExecutionReport;
-use clinker_plan::plan::CompiledPlan;
 
 /// The figures [`assert_arbitrated`] compares from one run of a pressure
 /// test.
 #[derive(Debug, Clone)]
 pub struct PressureRun {
-    /// The memory limit the run was given, in bytes.
+    /// The memory limit the run's arbitrator enforced, in bytes, as its
+    /// report states it.
     pub limit_bytes: u64,
     /// The highest number of bytes any one of the node's own memory
     /// consumers held charged, or `None` when the run attributes no charged
@@ -49,41 +54,31 @@ pub struct PressureRun {
     pub output: Vec<u8>,
 }
 
-/// The memory limit `plan` runs under, in bytes: its `memory.limit` read by
-/// the same parser the executor uses to size the run's arbitrator.
-#[allow(dead_code)] // Read only through `PressureRun::from_report`, which a target may not call.
-pub fn effective_limit_bytes(plan: &CompiledPlan) -> u64 {
-    clinker_plan::config::utils::parse_memory_limit_bytes(
-        plan.config().pipeline.memory.limit.as_deref(),
-    )
-    .expect("a compiled plan's memory.limit parses")
-}
-
 impl PressureRun {
-    /// Read the figures of a finished run of `plan` from its report.
+    /// Read the figures of a finished run from its report.
     ///
     /// `node` is the name of the node whose state is under test; its spill
     /// bytes are `0` when the report attributes no spill to it, and its peak
     /// is `None` when the report attributes no charged state to it.
     /// `limit_bytes` is the limit the caller believes the run was given; it
-    /// must equal the plan's effective limit, so a test cannot claim one
-    /// limit while running another. `output` is the run's masked output.
+    /// must equal the limit the run's arbitrator enforced, so a test cannot
+    /// claim one limit while running another. `output` is the run's masked
+    /// output.
     ///
-    /// Panics when `limit_bytes` differs from the plan's effective limit.
+    /// Panics when `limit_bytes` differs from the report's enforced limit.
     #[allow(dead_code)] // A target that builds its runs by hand does not read a report.
     pub fn from_report(
         report: &ExecutionReport,
-        plan: &CompiledPlan,
         node: &str,
         limit_bytes: u64,
         output: Vec<u8>,
     ) -> Self {
-        let effective = effective_limit_bytes(plan);
+        let enforced = report.memory_limit_bytes;
         assert_eq!(
-            limit_bytes, effective,
-            "`{node}`: the caller's limit ({limit_bytes} bytes) disagrees with the plan's \
-             effective limit ({effective} bytes); state the limit the pipeline's memory.limit \
-             sets"
+            limit_bytes, enforced,
+            "`{node}`: the caller's limit ({limit_bytes} bytes) is not the limit the run \
+             enforced ({enforced} bytes); state the ledger capacity or memory.limit the run \
+             was given"
         );
         Self {
             limit_bytes,
@@ -153,5 +148,36 @@ pub fn assert_arbitrated(node: &str, low: &PressureRun, ample: &PressureRun) {
          ample memory)",
         low.output.len(),
         ample.output.len()
+    );
+}
+
+/// Assert that a low run spilled: some stage wrote spill bytes over the run.
+///
+/// Reads the bytes written (`per_stage_spill_bytes_written`), never the net
+/// on-disk figures, which fall back to zero once spilled runs are merged and
+/// deleted.
+#[allow(dead_code)] // Only spill-forcing targets call it.
+pub fn assert_spill_engaged(report: &ExecutionReport) {
+    let written: u64 = report.per_stage_spill_bytes_written.values().sum();
+    assert!(
+        written > 0,
+        "the low run spilled nothing: {:?}; a capacity that cannot force a spill proves \
+         nothing about spilling",
+        report.per_stage_spill_bytes_written
+    );
+}
+
+/// Assert that `capacity` is below what the ample run held charged at its
+/// peak, so the low run could not have held the whole state.
+///
+/// Reads the run-wide charged peak (`peak_consumer_usage_bytes`); this is the
+/// helper's one read of that field.
+#[allow(dead_code)] // Only spill-forcing targets call it.
+pub fn assert_capacity_below_ample_peak(capacity: u64, ample: &ExecutionReport) {
+    let ample_peak = ample.peak_consumer_usage_bytes;
+    assert!(
+        ample_peak > capacity,
+        "the ample run's charged peak ({ample_peak} bytes) is not above the capacity \
+         ({capacity} bytes); a capacity the ample run fits under cannot force a spill"
     );
 }
