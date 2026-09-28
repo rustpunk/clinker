@@ -1,41 +1,45 @@
 //! Soft-spill end-to-end coverage for `node_buffers` admission.
 //!
-//! Drives a Source → Route(a, b, c) → 3 Outputs pipeline under a
-//! 1 MiB memory limit. The Source admits its full output buffer to
-//! its own `node_buffers` slot; the Source has a single outgoing
-//! edge (port=None) so the slot qualifies for producer-side spill.
-//! The 80 % soft threshold (≈819 KiB) is crossed by the test
-//! process's own RSS — the spill predicate is RSS-based, not
-//! counter-based, so the admit's spill arm fires on every supported
-//! platform. Counter-based hard limit (1 MiB) stays above the
-//! admit's charge so the run completes.
+//! Drives a Source → Route(a, b, c) → 3 Outputs pipeline under an ample
+//! `memory.limit` with the run held to a small ledger capacity
+//! ([`LOW_CAPACITY`]). The Source admits its full output buffer to its own
+//! `node_buffers` slot; the Source has a single outgoing edge (port=None)
+//! so the slot qualifies for producer-side spill. With ample memory the run
+//! charges more than the capacity at its peak (the slot plus the Route's
+//! materialization), so under the capacity the slot spills while the run
+//! completes.
 //!
 //! Per-row admission cost is the `estimate_node_buffer_bytes`
 //! formula in `executor/dispatch.rs`: `size_of::<Value>() * cols +
 //! size_of::<(Record, u64)>()`. For the 5-column schema below this
-//! resolves to ~216 B/row, so 2 000 rows charge ~432 KiB — under the
-//! 1 MiB hard limit but well above the 819 KiB soft floor against
-//! which the RSS check is compared.
+//! resolves to ~216 B/row, so 2 000 rows charge ~432 KiB.
 //!
 //! Asserts:
 //! - the run completes with the expected per-branch row counts,
 //! - `ExecutionReport.cumulative_spill_bytes > 0` so the budget
-//!   recorded at least one spill commit.
-//!
-//! Skipped silently when `rss_bytes()` is unavailable — the spill
-//! predicate gates on RSS, so without it the path stays in memory
-//! and the test would assert against a counter that never moves.
+//!   recorded at least one spill commit,
+//! - the low run wrote spill bytes and the capacity lies below the charged
+//!   peak of the same input with ample memory, so the pair cannot pass with
+//!   the whole slot resident.
+
+#![cfg(feature = "test-utils")]
+
+#[path = "common/memory_pressure.rs"]
+mod memory_pressure;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_exec::executor::{PipelineExecutor, PipelineRunParams};
+use clinker_exec::executor::{
+    ExecutionReport, MemoryTestOverrides, PipelineExecutor, PipelineRunParams,
+};
 use clinker_plan::config::{CompileContext, PipelineConfig};
+use memory_pressure::{assert_capacity_below_ample_peak, assert_spill_engaged};
 use std::collections::HashMap;
 use std::io::Write;
 
 const PIPELINE_YAML: &str = r#"
 pipeline:
   name: route_fanout_soft_spill
-  memory: { limit: "1M", backpressure: spill }
+  memory: { limit: "512M", backpressure: spill }
 nodes:
   - type: source
     name: events
@@ -86,6 +90,15 @@ const ROWS_B: usize = 300;
 const ROWS_C: usize = 200;
 const TOTAL_ROWS: usize = ROWS_A + ROWS_B + ROWS_C;
 
+/// The ledger capacity the low run is held to: 1 MiB, the limit this test
+/// ran under before capacity existed, kept because it lies where a pressure
+/// capacity must. It is above what cannot spill: the Route's node-buffer
+/// materialization projects 736,600 bytes (600 charged plus 736,000
+/// temporary), and a capacity below that fails with E310 naming
+/// `by_region` instead of completing. It is below the charged peak of the
+/// same input with ample memory, 1,472,600 bytes.
+const LOW_CAPACITY: u64 = 1024 * 1024;
+
 fn build_events_csv() -> String {
     let mut s = String::with_capacity(TOTAL_ROWS * 48);
     s.push_str("id,region,payload,value,ts\n");
@@ -106,14 +119,17 @@ fn count_data_rows(csv_bytes: &str) -> usize {
     csv_bytes.lines().skip(1).filter(|l| !l.is_empty()).count()
 }
 
-#[test]
-fn route_fanout_emits_spill_under_one_megabyte_budget() {
-    // RSS-based spill predicate: no RSS reading, no spill firing — skip
-    // rather than assert a false-negative.
-    if clinker_exec::pipeline::memory::rss_bytes().is_none() {
-        return;
-    }
+/// One run of the fixture: its report and the three branch outputs.
+struct FanoutRun {
+    report: ExecutionReport,
+    out_a: String,
+    out_b: String,
+    out_c: String,
+}
 
+/// Run the fixture at its ample `memory.limit`, held to `capacity` bytes of
+/// ledger when one is given.
+fn run_fanout(capacity: Option<u64>) -> FanoutRun {
     let csv = build_events_csv();
     let config: PipelineConfig =
         clinker_plan::yaml::from_str(PIPELINE_YAML).expect("parse pipeline YAML");
@@ -148,16 +164,40 @@ fn route_fanout_emits_spill_under_one_megabyte_budget() {
         ),
     ]);
 
+    let memory_test = match capacity {
+        Some(bytes) => MemoryTestOverrides::default().with_ledger_capacity(bytes),
+        None => MemoryTestOverrides::default(),
+    };
     let params = PipelineRunParams {
         execution_id: "route-fanout-soft-spill".to_string(),
         batch_id: "batch-0".to_string(),
         pipeline_vars: indexmap::IndexMap::new(),
         shutdown_token: None,
+        memory_test,
         ..Default::default()
     };
 
     let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
         .expect("soft-spill run must complete");
+    FanoutRun {
+        report,
+        out_a: out_a.as_string(),
+        out_b: out_b.as_string(),
+        out_c: out_c.as_string(),
+    }
+}
+
+#[test]
+fn route_fanout_emits_spill_under_a_low_ledger_capacity() {
+    let FanoutRun {
+        report,
+        out_a,
+        out_b,
+        out_c,
+    } = run_fanout(Some(LOW_CAPACITY));
+    let ample = run_fanout(None);
+    assert_spill_engaged(&report);
+    assert_capacity_below_ample_peak(LOW_CAPACITY, &ample.report);
 
     assert_eq!(
         report.counters.total_count as usize, TOTAL_ROWS,
@@ -165,7 +205,7 @@ fn route_fanout_emits_spill_under_one_megabyte_budget() {
     );
     assert!(
         report.cumulative_spill_bytes > 0,
-        "node_buffers admission must have spilled at least once under 1 MiB budget; \
+        "node_buffers admission must have spilled at least once under the low capacity; \
          report.cumulative_spill_bytes = {}",
         report.cumulative_spill_bytes,
     );
@@ -187,17 +227,17 @@ fn route_fanout_emits_spill_under_one_megabyte_budget() {
     );
 
     assert_eq!(
-        count_data_rows(&out_a.as_string()),
+        count_data_rows(&out_a),
         ROWS_A,
         "branch `a` output row count mismatch",
     );
     assert_eq!(
-        count_data_rows(&out_b.as_string()),
+        count_data_rows(&out_b),
         ROWS_B,
         "branch `b` output row count mismatch",
     );
     assert_eq!(
-        count_data_rows(&out_c.as_string()),
+        count_data_rows(&out_c),
         ROWS_C,
         "branch `c` output row count mismatch",
     );
