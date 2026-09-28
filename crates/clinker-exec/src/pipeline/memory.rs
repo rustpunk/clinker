@@ -817,12 +817,10 @@ impl ConsumerHandle {
 /// without compromising the existing pipeline-context concurrency
 /// posture.
 pub trait MemoryConsumer: Send + Sync {
-    /// True only when the synchronized grant ledger already includes this usage.
-    fn is_admission_managed(&self) -> bool {
-        false
-    }
-    /// Live bytes the consumer currently holds against the arbitrator's
-    /// `limit` envelope. Read every arbitration round; must be cheap.
+    /// Live bytes the consumer currently holds, as the victim policies rank
+    /// it. Read every arbitration round; must be cheap. The charged total the
+    /// limit is checked against is the ledger's, which a handle-backed
+    /// consumer's handle charges; this figure is not summed into it.
     fn current_usage(&self) -> u64;
 
     /// The most bytes this consumer has held charged, when it keeps an exact

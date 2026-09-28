@@ -101,7 +101,7 @@ when a streaming batch is charged.
 `WriterResourceConsumer`'s `ConsumerHandle` charges nothing: its staging chunks
 are governed allocations the ledger already holds, so a handle charge would
 count every staged byte twice. It stays registered for its inventory row. It
-is admission-managed and never backpressureable: parking
+is never backpressureable: parking
 the synchronous writer would prevent its own release progress. Spill requests
 are consumed at chunk boundaries, and cancellation is checked before consulting
 pause state. Grants and cleanup debt keep the admission owner registered after
@@ -121,7 +121,11 @@ Named fixed startup allowances are the standalone Arc/mutex control block and
 the executor authority, admission, consumer and storage control blocks. The
 environment-derived current-directory lookup is a temporary startup allowance;
 retained authored paths, path-construction envelopes and descriptor inventories
-are admitted separately. CSV's raw parser buffers and the full intermediate
+are admitted separately. Each Source channel's slot array
+(`SourceIngestChannel::DEFAULT_CAPACITY` slots, allocated once when the channel
+is built) is a fixed allowance, constant in input size: a queued attempt's
+fixed shell lives in a slot, so only the heap the attempt holds outside the
+ledger is charged to its Source. CSV's raw parser buffers and the full intermediate
 JSON tree used for JSON-encoded cells remain explicit parser allowances.
 Unchanged readers and legacy operators retain their existing owners; a later
 deep copy or spill reload is a distinct allocation, not an extension of the
@@ -252,8 +256,10 @@ admission uses `unaccounted_heap_size` with the executing run's live allocation
 resources. It excludes a backing allocation only when its lease belongs to that
 same ledger, then classifies each child independently. A custom library source
 can supply governed storage from a different provider; that foreign allocation
-still contributes its physical estimate to this run. The comparison reuses the
-existing authority identity and never transfers or releases a grant.
+contributes its size to the Source's charge for as long as it is queued in the
+Source's channel, and the operator that keeps it downstream charges it under
+its own rule. The comparison reuses the existing authority identity and never
+transfers or releases a grant.
 
 The separate legacy-only traversal describes storage representation and does
 not establish which run owns a charge. Neither traversal subtracts a global
@@ -333,7 +339,7 @@ dataset boundary. Raw temporary bytes are internal storage, not a new dataset.
 
 ### Existing consumer attribution
 
-Clinker tracks memory in two layers. RSS (resident set size) is sampled at chunk boundaries and supplies the primary spill / abort signal. Alongside RSS, every memory-touching operator (Source ingest channels, Aggregate hash maps, sort buffers, grace-hash partitions, sort-merge accumulators, IEJoin arrays, inline-Combine hash tables, the Reshape per-group input buffer, `node_buffers` slots and their transient scan materializations, and window-runtime arenas) registers a `MemoryConsumer` wrapper with the pipeline-scoped arbitrator. Each operator owns its live byte counter and updates it on every admit / spill transition; the arbitrator queries `current_usage()` per consumer at every policy poll. This pull-mode attribution lets the policy distinguish *reclaimable* bytes (what an operator can give up right now) from currently-held bytes — a grace-hash with on-disk partitions, for instance, reports only its in-memory portion, and the Reshape buffer reports the live bytes of the groups still resident in memory.
+Clinker tracks memory in two layers. RSS (resident set size) is sampled at chunk boundaries and supplies the primary spill / abort signal. Alongside RSS, every memory-touching operator (Source ingest channels, Aggregate hash maps, sort buffers, grace-hash partitions, sort-merge accumulators, IEJoin arrays, inline-Combine hash tables, the Reshape per-group input buffer, `node_buffers` slots and their transient scan materializations, and window-runtime arenas) registers a `MemoryConsumer` wrapper with the pipeline-scoped arbitrator. Each operator owns its live byte counter and updates it on every admit / spill transition; that counter is the consumer handle's charge on the run's one ledger, and the arbitrator queries `current_usage()` per consumer at every policy poll to rank victims. A Source ingest channel's handle charges exactly the heap its queued attempts hold outside the run's ledger (foreign-provider or legacy storage, and a rejection's box): each attempt carries that charge from just before it is sent until the walk takes it off the channel, or until it is dropped unconsumed. Its records' admitted bytes are charged when they are allocated, in the Source's name, so no byte is counted twice. This pull-mode attribution lets the policy distinguish *reclaimable* bytes (what an operator can give up right now) from currently-held bytes — a grace-hash with on-disk partitions, for instance, reports only its in-memory portion, and the Reshape buffer reports the live bytes of the groups still resident in memory.
 
 Registrations are scoped to the state they mirror, not to the run: each wrapper is unregistered when the state it attributes drains. A Source's ingest-channel consumer is released the moment its receiver disconnects (whichever arm consumed it — the Source arm, a fused `Merge.interleave`, or a fused Transform); a Combine branch's consumer is released when the branch exits — the IEJoin, grace-hash, and sort-merge branches route their clean return and every internal `?` early-return through a single unregister, and the inline-hash branch unregisters at its clean exit; and a `node_buffers` slot's consumer leaves the registry after its final planned reader. A consumer that collects a sequential scan into a resident vector carries an RAII materialization reservation for its complete synchronous use, so normal completion and every error return unregister it. Composition input seeding transfers that same registration into the body-local node-buffer registry without an unregister/register gap or a second charge. While the body Source canonicalizes its seed, the same byte handle first reserves the prospective output in addition to the still-live seed, then drops back to the output estimate when the seed allocation is gone; admission atomically swaps the wrapper under the existing consumer id. Later stages therefore never see charged bytes from state that has already moved downstream, and the registry the policy polls contains live contributors only.
 
@@ -378,11 +384,15 @@ pause-only Source shape: it inserts a verification barrier around each physical
 file before the ingest channel releases that file downstream. The barrier reuses
 the Source consumer's live-byte counter. While a file is staged, that counter is
 the shared `SortBuffer`'s resident bytes plus one adjacent record retained for
-inversion detection, plus any verified records from the preceding file still
-queued downstream. During resident release, ownership moves from the sorter to
-an explicitly charged release total and then to the bounded-channel estimate;
-the transition subtracts a record only after the send succeeds, so the same row
-is neither omitted nor charged twice. Document punctuation does not grow with
+inversion detection, plus the charges of any verified records from the
+preceding file still queued downstream. During resident release, ownership
+moves from the sorter to an explicitly charged release total and then to the
+queued record's own charge, the same exact per-attempt charge an unordered
+Source's attempts carry. That last hand-off is one step on the counter, taken
+before the send, so the same row is neither omitted nor charged twice; a failed
+send drops the record together with its charge. The barrier moves the counter
+only by the change in its own figure, so it never overwrites the charges its
+queued records carry. Document punctuation does not grow with
 row count: admission allows only a flat file or one matching inner frame, so the
 barrier holds a statically bounded set of open/close events. Different physical
 files and different Sources never share a barrier or an authored-key comparison.

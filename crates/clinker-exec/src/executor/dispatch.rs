@@ -826,7 +826,15 @@ pub(crate) fn consume_source_event(
         crate::executor::source_stream::SourceStreamEvent::Punctuation(punctuation) => {
             Ok(ConsumedSourceEvent::Punctuation(punctuation))
         }
-        crate::executor::source_stream::SourceStreamEvent::Attempt { event, population } => {
+        crate::executor::source_stream::SourceStreamEvent::Attempt {
+            event,
+            population,
+            queued,
+        } => {
+            // The attempt has left the Source's channel: its queue charge
+            // ends here, before the record goes downstream, and whatever
+            // keeps the record charges it under its own rule.
+            drop(queued);
             let source_row = event.source_row();
             if let Some(population) = population {
                 if source_row.source() != population.source {
@@ -1491,6 +1499,9 @@ pub(crate) struct ExecutorContext<'a> {
     pub(crate) writer_resources: clinker_format::preparation::WriterResources,
     /// Allocation admission borrows the run weakly, independently of writer staging.
     pub(crate) allocation_resources: clinker_record::owned_storage::AllocationResources,
+    /// Builds the allocation view each activated body Source reads through,
+    /// charged in that Source's name.
+    pub(crate) allocation_attribution: crate::executor::preparation::AllocationAttribution,
     // Borrowed plan-time state.
     pub(crate) config: &'a PipelineConfig,
     /// Bound composition bodies the dispatcher re-enters at runtime. The
@@ -2406,15 +2417,16 @@ impl<'a> ExecutorContext<'a> {
     }
 
     /// Release the arbitrator registration for `source_name`'s ingest
-    /// channel once its receiver has disconnected. The producer mirrors
-    /// `queue depth × per-record bytes` into the shared handle on every
-    /// push and never zeroes it, so without this release the last push's
-    /// estimate stays summed into `sum_consumer_usage` for the rest of the
-    /// run — memory that has already moved downstream keeps influencing
-    /// spill victim selection and abort checks. Call only after `recv`
-    /// reports disconnect: the producer has dropped its sender by then, so
-    /// zeroing cannot race a concurrent `set_bytes`. The `remove` makes the
-    /// release single-shot; a repeat call for the same source is a no-op.
+    /// channel once its receiver has disconnected. Every queued attempt
+    /// released its own charge when it left the channel, but an ordered
+    /// Source's barrier never zeroes the figure it last charged to the shared
+    /// handle, so without this release that figure stays in the run's
+    /// charged total — memory that has already moved downstream keeps
+    /// influencing spill victim selection and abort checks. Call only after
+    /// `recv` reports disconnect: the producer has dropped its sender by
+    /// then, so zeroing cannot race a concurrent charge. The `remove` makes
+    /// the release single-shot; a repeat call for the same source is a
+    /// no-op.
     pub(crate) fn release_source_consumer(&mut self, source_name: &str) {
         if let Some((id, handle)) = self.source_consumers.remove(source_name) {
             // Resume before unregister: a prior arbitration round may have

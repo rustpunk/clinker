@@ -1,11 +1,11 @@
 //! Source ingest-channel consumer lifecycle across every drain arm.
 //!
 //! Each declared Source registers a `SourceConsumer` with the
-//! pipeline-scoped arbitrator whose shared handle mirrors the ingest
-//! channel's `queue depth × per-record bytes` on every producer push.
-//! The producer never zeroes the estimate, so the arm that drains the
-//! receiver must release the registration at disconnect — otherwise the
-//! last push's charge stays summed into `sum_consumer_usage()` for the
+//! pipeline-scoped arbitrator whose shared handle carries the ingest
+//! channel's queued attempts' charges and, for an ordered Source, its
+//! barrier's figure. The barrier never zeroes its figure, so the arm that
+//! drains the receiver must release the registration at disconnect —
+//! otherwise that charge stays summed into `sum_consumer_usage()` for the
 //! rest of the run and downstream stages spill / abort against memory
 //! that already moved on.
 //!

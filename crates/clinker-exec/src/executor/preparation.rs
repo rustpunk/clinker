@@ -250,7 +250,10 @@ fn write_temporary(file: &mut File, bytes: &[u8]) -> io::Result<usize> {
     file.write(bytes)
 }
 use crate::pipeline::{
-    memory::{ConsumerHandle, ConsumerId, ConsumerSpillError, MemoryArbitrator, MemoryConsumer},
+    memory::{
+        ConsumerHandle, ConsumerId, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
+        ledger::Requester,
+    },
     shutdown::ShutdownToken,
 };
 use clinker_format::{
@@ -321,6 +324,88 @@ impl Drop for ReleaseAuthority {
     }
 }
 
+/// The release side of an attributed allocation view: a lease admitted in a
+/// consumer's name returns its bytes in that consumer's name, on whatever
+/// thread it drops, so the consumer's charged figure falls with it. Holds
+/// only the ledger's synchronized state, never the run.
+struct AttributedRelease {
+    state: Arc<crate::pipeline::memory::reservation::ReservationState>,
+    attribution: Option<ConsumerId>,
+}
+impl AllocationAuthority for AttributedRelease {
+    fn identity(&self) -> usize {
+        Arc::as_ptr(&self.state) as usize
+    }
+    fn try_reserve(
+        self: Arc<Self>,
+        _: OwnerId,
+        _: Layout,
+    ) -> Result<AllocationLease, ResourceError> {
+        // Only live admission providers can create new reservations.
+        Err(ResourceError::new(ResourceErrorKind::Authority, 0, 0))
+    }
+    fn release(&self, _: OwnerId, bytes: usize) {
+        self.state.release_writer_memory(bytes, self.attribution);
+    }
+    fn check_cancelled(&self) -> Result<(), ResourceError> {
+        self.state.check_open()
+    }
+}
+
+/// An allocation view over the run's admission that charges every
+/// allocation in one requester's name. It is the run's ledger: its identity
+/// is the run admission's, so a lease it issues is accounted by the run's
+/// resources exactly as a lease the shared view issues.
+struct AttributedAdmission {
+    admission: Arc<AdmissionAuthority>,
+    requester: Requester,
+    release: Arc<AttributedRelease>,
+}
+impl AllocationAuthority for AttributedAdmission {
+    fn identity(&self) -> usize {
+        self.admission.identity()
+    }
+    fn try_reserve(
+        self: Arc<Self>,
+        owner: OwnerId,
+        layout: Layout,
+    ) -> Result<AllocationLease, ResourceError> {
+        self.admission
+            .admit(owner, layout, self.requester, self.release.clone())
+    }
+    fn release(&self, owner: OwnerId, bytes: usize) {
+        self.release.release(owner, bytes);
+    }
+    fn check_cancelled(&self) -> Result<(), ResourceError> {
+        self.admission.check_cancelled()
+    }
+}
+
+/// Builds allocation views over the run's admission that charge in one
+/// consumer's name. Cloning shares the run's admission; a view holds the
+/// run only weakly, like the shared view.
+#[derive(Clone)]
+pub(crate) struct AllocationAttribution(Arc<AdmissionAuthority>);
+impl AllocationAttribution {
+    /// The run's shared view, attributing nothing.
+    pub(crate) fn shared(&self) -> AllocationResources {
+        AllocationResources::new(self.0.clone())
+    }
+    /// A view whose allocations are charged in `requester`'s name and whose
+    /// leases release in that name.
+    pub(crate) fn attributed_allocation(&self, requester: Requester) -> AllocationResources {
+        let release = Arc::new(AttributedRelease {
+            state: self.0.release.state.clone(),
+            attribution: requester.consumer(),
+        });
+        AllocationResources::new(Arc::new(AttributedAdmission {
+            admission: self.0.clone(),
+            requester,
+            release,
+        }))
+    }
+}
+
 // Debt owners may be retained by the arbitrator itself. Their grant release
 // links are weak to avoid a run -> debt -> grant -> run reference cycle.
 struct AdmissionLink(std::sync::Weak<MemoryArbitrator>);
@@ -330,8 +415,8 @@ impl AdmissionLink {
             .upgrade()
             .ok_or_else(|| ResourceError::new(ResourceErrorKind::Authority, 0, 0))
     }
-    fn admit_writer_memory(&self, bytes: usize) -> Result<(), ResourceError> {
-        self.live()?.admit_writer_memory(bytes)
+    fn admit_writer_memory(&self, bytes: usize, requester: Requester) -> Result<(), ResourceError> {
+        self.live()?.admit_writer_memory(bytes, requester)
     }
     fn admit_writer_disk(&self, bytes: u64) -> Result<(), ResourceError> {
         self.live()?.admit_writer_disk(bytes)
@@ -357,9 +442,6 @@ struct WriterResourceConsumer {
 }
 
 impl MemoryConsumer for WriterResourceConsumer {
-    fn is_admission_managed(&self) -> bool {
-        true
-    }
     fn current_usage(&self) -> u64 {
         self.handle.bytes()
     }
@@ -459,15 +541,19 @@ impl ExecutorResources {
     /// Allocation-only capability with a weak run link. Returned leases retain
     /// only release state, never staging, telemetry or the executor itself.
     pub fn allocation(&self) -> AllocationResources {
-        AllocationResources::new(self.authority.admission.clone())
+        self.attribution().shared()
     }
-    /// An allocation view over the run's admission that charges in
-    /// `requester`'s name.
-    pub fn attributed_allocation(
-        &self,
-        _requester: crate::pipeline::memory::ledger::Requester,
-    ) -> AllocationResources {
-        self.allocation()
+    /// An allocation view over the run's admission whose allocations are
+    /// charged in `requester`'s name, raising that consumer's charged figure
+    /// and mark, and whose leases release in that name on whatever thread
+    /// they drop. Same ledger identity as [`Self::allocation`], so its leases
+    /// are accounted by the run's resources. Holds the run weakly.
+    pub fn attributed_allocation(&self, requester: Requester) -> AllocationResources {
+        self.attribution().attributed_allocation(requester)
+    }
+    /// The builder of attributed views, for code that holds no provider.
+    pub(crate) fn attribution(&self) -> AllocationAttribution {
+        AllocationAttribution(self.authority.admission.clone())
     }
     /// Retry each debt slot once; filesystem calls run outside admission locks.
     pub fn cleanup(&self) {
@@ -488,6 +574,28 @@ impl ExecutorResources {
         })
     }
 }
+impl AdmissionAuthority {
+    /// Admit `layout` for `requester` and issue a lease that releases through
+    /// `release`.
+    fn admit(
+        &self,
+        owner: OwnerId,
+        layout: Layout,
+        requester: Requester,
+        release: Arc<dyn AllocationAuthority>,
+    ) -> Result<AllocationLease, ResourceError> {
+        let mut signal = ResourceSignal::new(self.telemetry.clone(), ResourceWork::Admission);
+        let result = self
+            .check_cancelled()
+            .and_then(|()| {
+                self.arbitrator
+                    .admit_writer_memory(layout.size(), requester)
+            })
+            .and_then(|()| AllocationLease::admitted(release, owner, layout.size()));
+        signal.finish(result.as_ref().map(|_| ()).map_err(|error| *error));
+        result
+    }
+}
 impl AllocationAuthority for AdmissionAuthority {
     fn identity(&self) -> usize {
         self.release.identity()
@@ -497,13 +605,7 @@ impl AllocationAuthority for AdmissionAuthority {
         owner: OwnerId,
         layout: Layout,
     ) -> Result<AllocationLease, ResourceError> {
-        let mut signal = ResourceSignal::new(self.telemetry.clone(), ResourceWork::Admission);
-        let result = self
-            .check_cancelled()
-            .and_then(|()| self.arbitrator.admit_writer_memory(layout.size()))
-            .and_then(|()| AllocationLease::admitted(self.release.clone(), owner, layout.size()));
-        signal.finish(result.as_ref().map(|_| ()).map_err(|error| *error));
-        result
+        self.admit(owner, layout, Requester::governed(), self.release.clone())
     }
     fn release(&self, _: OwnerId, bytes: usize) {
         self.release.state.release_writer_memory(bytes, None);

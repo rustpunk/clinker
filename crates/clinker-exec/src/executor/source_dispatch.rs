@@ -127,7 +127,7 @@ where
             &ctx.memory_budget,
             ctx.shutdown_token.clone(),
             ctx.telemetry_producer.as_ref(),
-            &ctx.allocation_resources,
+            &ctx.allocation_attribution,
         );
         ctx.source_activation = Some(controller);
         if let Some(activated) = activated? {

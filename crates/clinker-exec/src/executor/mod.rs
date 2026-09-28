@@ -271,6 +271,9 @@ struct RunExecutionContext<'a> {
 struct DagExecResources {
     writer_resources: clinker_format::preparation::WriterResources,
     allocation_resources: clinker_record::owned_storage::AllocationResources,
+    /// Builds the allocation view each activated body Source reads through,
+    /// charged in that Source's name.
+    allocation_attribution: preparation::AllocationAttribution,
     /// Executor-owned sealed Source capabilities for body activation.
     source_activation: Option<source_activation::SourceActivationController>,
     /// One live crossbeam `Receiver` per declared Source, drained by
@@ -1074,14 +1077,12 @@ impl PipelineExecutor {
                 })?;
                 // Single ConsumerHandle shared between the SourceConsumer
                 // wrapper (BackPressurePreferred / Priority pause target)
-                // and the SourceIngestChannel that mirrors the channel queue
-                // depth × per-record bytes into the handle's counter on
-                // every `push`. The registration travels with the receiver:
-                // whichever dispatch arm drains this source's channel releases
-                // the wrapper at receiver disconnect, so a drained source
-                // stops contributing its last queue estimate to
-                // `sum_consumer_usage` — downstream spill / abort decisions
-                // would otherwise keep seeing bytes that already moved on.
+                // and the SourceIngestChannel, whose queued attempts each
+                // carry their unadmitted heap as a charge on it until they
+                // leave the channel. The registration travels with the
+                // receiver: whichever dispatch arm drains this source's
+                // channel releases the wrapper at receiver disconnect, so a
+                // drained source leaves the registry the policies poll.
                 let source_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
                 let source_body = validated_plan
                     .config()
@@ -1119,6 +1120,21 @@ impl PipelineExecutor {
                     .pipeline
                     .batch_size
                     .unwrap_or(crate::executor::batch_handoff::DEFAULT_BATCH_SIZE);
+                // Registered before its stream exists so every record the
+                // stream allocates is charged in this Source's name.
+                let source_consumer_id = memory_budget.register_node_consumer(
+                    Arc::new(crate::executor::source_stream::SourceConsumer::new(
+                        Arc::clone(&source_consumer_handle),
+                    )),
+                    Arc::clone(&source_consumer_handle),
+                    clinker_plan::runtime_error::ConsumerLabel {
+                        node: src_cfg.name.clone(),
+                        surface: clinker_plan::runtime_error::MemorySurface::RowsRead,
+                    },
+                );
+                let source_allocation = writer_provider.attributed_allocation(
+                    crate::pipeline::memory::ledger::Requester::for_consumer(source_consumer_id),
+                );
                 let (stream, rx) = match order_config {
                     Some(order_config) => {
                         crate::executor::source_stream::SourceIngestChannel::new_ordered(
@@ -1131,26 +1147,18 @@ impl PipelineExecutor {
                             params
                                 .spill_compress
                                 .resolve_for_schema(source_column_count, source_batch_size as u64),
-                            allocation_resources.clone(),
+                            source_allocation,
                         )
                     }
                     None => crate::executor::source_stream::SourceIngestChannel::new(
                         crate::executor::source_stream::SourceIngestChannel::DEFAULT_CAPACITY,
                         source_consumer_handle.clone(),
                         source_id,
-                        allocation_resources.clone(),
+                        source_allocation,
                     ),
                 };
-                let source_consumer_id = memory_budget.register_node_consumer(
-                    Arc::new(crate::executor::source_stream::SourceConsumer::new(
-                        Arc::clone(&source_consumer_handle),
-                    )),
-                    Arc::clone(&source_consumer_handle),
-                    clinker_plan::runtime_error::ConsumerLabel {
-                        node: src_cfg.name.clone(),
-                        surface: clinker_plan::runtime_error::MemorySurface::RowsRead,
-                    },
-                );
+                #[cfg(test)]
+                stream.assert_allocation_domain(&allocation_resources);
                 source_records.insert(src_cfg.name.clone(), rx);
                 source_consumers.insert(
                     src_cfg.name.clone(),
@@ -1219,6 +1227,7 @@ impl PipelineExecutor {
             DagExecResources {
                 writer_resources,
                 allocation_resources,
+                allocation_attribution: writer_provider.attribution(),
                 source_activation,
                 source_records,
                 source_consumers,
@@ -1470,6 +1479,7 @@ impl PipelineExecutor {
         let DagExecResources {
             writer_resources,
             allocation_resources,
+            allocation_attribution,
             source_activation,
             source_records,
             source_consumers,
@@ -1835,6 +1845,7 @@ impl PipelineExecutor {
         let mut ctx = dispatch::ExecutorContext {
             writer_resources,
             allocation_resources,
+            allocation_attribution,
             config,
             composition_bodies,
             sink_configs: &sink_configs,

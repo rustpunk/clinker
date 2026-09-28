@@ -21,8 +21,8 @@ use clinker_record::{DocumentContext, Record, Value};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::executor::source_stream::{
-    AttemptPopulationDelta, AttemptPopulationId, SourceAttemptEvent, SourceStreamError,
-    SourceStreamEvent,
+    AttemptPopulationDelta, AttemptPopulationId, QueuedCharge, SourceAttemptEvent,
+    SourceStreamError, SourceStreamEvent,
 };
 use crate::executor::stream_event::{Punctuation, PunctuationKind, SourceRowId};
 use crate::pipeline::memory::{ConsumerHandle, MemoryArbitrator};
@@ -324,15 +324,21 @@ pub(crate) struct SourceFileOrderBarrier {
     spill_compress: bool,
     record_stage: String,
     error_stage: String,
-    queued_bytes_ewma: u64,
     /// Full physical record/payload estimate for independent spill decoding.
     reload_bytes_ewma: u64,
     /// Resident records being transferred from an in-memory sorted spool into
-    /// the bounded channel. Decrements only after ownership moves to `tx`.
+    /// the bounded channel. Decrements as each record's ownership passes to
+    /// the channel queue, in the same ledger step that charges its
+    /// [`QueuedCharge`].
     releasing_memory_bytes: u64,
     /// Fixed bounded buffers held by spill readers/merge cursors/writers while
     /// a spilled file is validated and released.
     fixed_memory_bytes: u64,
+    /// The barrier's own figure (staged + releasing + fixed) as last charged
+    /// to `consumer_handle`. The handle also carries the queued attempts'
+    /// charges, so the barrier moves it only by the change in its own figure
+    /// and never restates the handle's whole charge.
+    charged_bytes: std::cell::Cell<u64>,
     #[cfg(test)]
     emitted_warnings: u64,
 }
@@ -365,10 +371,10 @@ impl SourceFileOrderBarrier {
             spill_compress,
             record_stage,
             error_stage,
-            queued_bytes_ewma: 0,
             reload_bytes_ewma: 0,
             releasing_memory_bytes: 0,
             fixed_memory_bytes: 0,
+            charged_bytes: std::cell::Cell::new(0),
             #[cfg(test)]
             emitted_warnings: 0,
         }
@@ -423,10 +429,6 @@ impl SourceFileOrderBarrier {
         }
         let record_bytes = record_pair_bytes(&record);
         self.reload_bytes_ewma = ewma_step(self.reload_bytes_ewma, record_bytes);
-        self.queued_bytes_ewma = ewma_step(
-            self.queued_bytes_ewma,
-            unaccounted_record_pair_bytes(&record, &self.allocation_resources),
-        );
         let Some(state) = self.state.as_mut() else {
             return Err(self.shape_error_for_file(
                 "<unknown>",
@@ -530,10 +532,6 @@ impl SourceFileOrderBarrier {
         let (record, payload) = StagedSourceRejection::from_event(event);
         let record_bytes = rejection_pair_bytes(&record, &payload);
         self.reload_bytes_ewma = ewma_step(self.reload_bytes_ewma, record_bytes);
-        self.queued_bytes_ewma = ewma_step(
-            self.queued_bytes_ewma,
-            unaccounted_rejection_pair_bytes(&record, &payload, &self.allocation_resources),
-        );
         let Some(state) = self.state.as_mut() else {
             return Err(self.shape_error_for_file(
                 "<unknown>",
@@ -1048,18 +1046,12 @@ impl SourceFileOrderBarrier {
         population: AttemptPopulationId,
         released_bytes: u64,
     ) -> Result<(), SourceStreamError> {
-        let sample = unaccounted_record_pair_bytes(&record, &self.allocation_resources);
-        self.queued_bytes_ewma = ewma_step(self.queued_bytes_ewma, sample);
         self.reload_bytes_ewma = ewma_step(self.reload_bytes_ewma, record_pair_bytes(&record));
-        self.tx
-            .send(SourceStreamEvent::Attempt {
-                event: SourceAttemptEvent::Record(record, row_id),
-                population: Some(population),
-            })
-            .map_err(|_| SourceStreamError::Closed)?;
-        self.release_resident_bytes(released_bytes)?;
-        self.update_runtime_charge();
-        Ok(())
+        self.send_attempt(
+            SourceAttemptEvent::Record(record, row_id),
+            population,
+            released_bytes,
+        )
     }
 
     fn emit_rejection(
@@ -1068,18 +1060,41 @@ impl SourceFileOrderBarrier {
         population: AttemptPopulationId,
         released_bytes: u64,
     ) -> Result<(), SourceStreamError> {
-        let sample = unaccounted_rejection_event_bytes(&event, &self.allocation_resources);
-        self.queued_bytes_ewma = ewma_step(self.queued_bytes_ewma, sample);
         self.reload_bytes_ewma = ewma_step(self.reload_bytes_ewma, rejection_event_bytes(&event));
+        self.send_attempt(
+            SourceAttemptEvent::Rejection(Box::new(event)),
+            population,
+            released_bytes,
+        )
+    }
+
+    /// Hand one released attempt to the channel queue. `released_bytes` is
+    /// what the resident spool charged for it (0 for a spill reload, whose
+    /// record is newly decoded): the barrier's figure drops by it and the
+    /// attempt's queue charge is taken in the same ledger step, before the
+    /// send, so the attempt is charged exactly once at every instant. A failed
+    /// send returns the attempt, whose drop releases its charge.
+    fn send_attempt(
+        &mut self,
+        event: SourceAttemptEvent,
+        population: AttemptPopulationId,
+        released_bytes: u64,
+    ) -> Result<(), SourceStreamError> {
+        self.release_resident_bytes(released_bytes)?;
+        let released = self.settle_released_figure();
+        let queued = QueuedCharge::take_releasing(
+            &self.consumer_handle,
+            &event,
+            &self.allocation_resources,
+            released,
+        );
         self.tx
             .send(SourceStreamEvent::Attempt {
-                event: SourceAttemptEvent::Rejection(Box::new(event)),
+                event,
                 population: Some(population),
+                queued,
             })
-            .map_err(|_| SourceStreamError::Closed)?;
-        self.release_resident_bytes(released_bytes)?;
-        self.update_runtime_charge();
-        Ok(())
+            .map_err(|_| SourceStreamError::Closed)
     }
 
     fn release_resident_bytes(&mut self, bytes: u64) -> Result<(), SourceStreamError> {
@@ -1113,14 +1128,40 @@ impl SourceFileOrderBarrier {
         self.update_accounted_charge();
     }
 
+    /// The barrier's own figure: staged rows, rows being released, and
+    /// spill readers' fixed buffers. Queued attempts are not part of it:
+    /// each carries its own charge.
+    fn accounted_figure(&self) -> u64 {
+        self.staged_bytes()
+            .saturating_add(self.releasing_memory_bytes)
+            .saturating_add(self.fixed_memory_bytes)
+    }
+
+    /// Move the handle by the change in the barrier's own figure since it was
+    /// last charged, leaving the queued attempts' charges on the same handle
+    /// untouched.
     fn update_accounted_charge(&self) {
-        let queued = (self.tx.len() as u64).saturating_mul(self.queued_bytes_ewma);
-        self.consumer_handle.set_bytes(
-            self.staged_bytes()
-                .saturating_add(self.releasing_memory_bytes)
-                .saturating_add(self.fixed_memory_bytes)
-                .saturating_add(queued),
-        );
+        let figure = self.accounted_figure();
+        let previous = self.charged_bytes.replace(figure);
+        if figure > previous {
+            self.consumer_handle.add_bytes(figure - previous);
+        } else if previous > figure {
+            self.consumer_handle.sub_bytes(previous - figure);
+        }
+    }
+
+    /// Record a fall in the barrier's own figure without releasing it,
+    /// returning the bytes the caller must release in its own ledger step. A
+    /// rise is charged at once, and then nothing is left to release.
+    fn settle_released_figure(&self) -> u64 {
+        let figure = self.accounted_figure();
+        let previous = self.charged_bytes.get();
+        if figure > previous {
+            self.update_accounted_charge();
+            return 0;
+        }
+        self.charged_bytes.set(figure);
+        previous - figure
     }
 
     fn cleanup_after_failure(&mut self) {
@@ -1407,7 +1448,9 @@ fn rejection_event_bytes(event: &crate::executor::SourceRejectionEvent) -> u64 {
         as u64
 }
 
-fn unaccounted_rejection_event_bytes(
+/// A rejection's queued size: the `Box` it travels in plus its heap no
+/// allocation of this run admitted.
+pub(crate) fn unaccounted_rejection_event_bytes(
     event: &crate::executor::SourceRejectionEvent,
     resources: &AllocationResources,
 ) -> u64 {
@@ -1551,7 +1594,6 @@ mod tests {
         assert_eq!(barrier.staged_bytes(), relative + previous_relative);
         assert_eq!(barrier.consumer_handle.bytes(), barrier.staged_bytes());
         assert_eq!(barrier.reload_bytes_ewma, physical);
-        assert_eq!(barrier.queued_bytes_ewma, relative);
         assert!(barrier.physical_staged_bytes() > barrier.staged_bytes());
         assert_eq!(
             spill_reader_bytes(barrier.reload_bytes_ewma),
@@ -1607,7 +1649,6 @@ mod tests {
                         .unwrap();
                 }
             }
-            assert!(barrier.reload_bytes_ewma > barrier.queued_bytes_ewma);
             assert_eq!(barrier.consumer_handle.bytes(), barrier.staged_bytes());
             let forced = limit < 1024 * 1024;
             if forced {
@@ -1627,13 +1668,20 @@ mod tests {
             assert_eq!(outcome.spilled, forced);
             assert_eq!(barrier.releasing_memory_bytes, 0);
             assert_eq!(barrier.fixed_memory_bytes, 0);
+            let events = rx.try_iter().collect::<Vec<_>>();
             assert_eq!(
                 barrier.consumer_handle.bytes(),
-                rx.len() as u64 * barrier.queued_bytes_ewma
+                events
+                    .iter()
+                    .map(|event| match event {
+                        SourceStreamEvent::Attempt { queued, .. } => queued.bytes(),
+                        _ => 0,
+                    })
+                    .sum::<u64>()
             );
             assert_eq!(memory.cumulative_spill_bytes(), 0);
             let mut result = Vec::new();
-            for event in rx.try_iter() {
+            for event in events {
                 match event {
                     SourceStreamEvent::Attempt { event, .. } => {
                         let (record, row, prefix) = match event {
@@ -1717,7 +1765,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(barrier.releasing_memory_bytes, 777);
-        assert_eq!(barrier.queued_bytes_ewma, queued);
         assert_eq!(barrier.consumer_handle.bytes(), 777 + queued);
         drop(rx.recv().unwrap());
         barrier.abort_file_barrier();

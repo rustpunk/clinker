@@ -136,12 +136,16 @@ impl MemoryArbitrator {
         self.admission.usage()
     }
 
-    /// Admit one governed allocation of `bytes` through [`Self::reserve`],
-    /// attributed to no consumer. The caller's `AllocationLease` owns the
-    /// charge from here and returns it through
-    /// [`ReservationState::release_writer_memory`] with no attribution.
-    pub(crate) fn admit_writer_memory(&self, bytes: usize) -> Result<(), ResourceError> {
-        match self.reserve(bytes as u64, Requester::governed()) {
+    /// Admit one governed allocation of `bytes` through [`Self::reserve`] for
+    /// `requester`. The caller's `AllocationLease` owns the charge from here
+    /// and returns it through [`ReservationState::release_writer_memory`]
+    /// with the same attribution.
+    pub(crate) fn admit_writer_memory(
+        &self,
+        bytes: usize,
+        requester: Requester,
+    ) -> Result<(), ResourceError> {
+        match self.reserve(bytes as u64, requester) {
             Ok(grant) => {
                 grant.detach();
                 Ok(())

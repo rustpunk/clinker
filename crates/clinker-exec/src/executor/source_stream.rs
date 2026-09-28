@@ -58,14 +58,111 @@ pub(crate) struct AttemptPopulationDelta {
 /// consumed) or name the already-applied ordered-file population that covers
 /// them. Rejections are consumed before downstream [`StreamEvent`] buffers are
 /// built.
-#[derive(Debug, Clone)]
+///
+/// Not `Clone`: an attempt carries its own charge on the Source's handle,
+/// which exactly one event may release.
+#[derive(Debug)]
 pub(crate) enum SourceStreamEvent {
     Population(AttemptPopulationDelta),
     Attempt {
         event: SourceAttemptEvent,
         population: Option<AttemptPopulationId>,
+        /// The attempt's charge on its Source's handle while it is queued.
+        queued: QueuedCharge,
     },
     Punctuation(Punctuation),
+}
+
+/// The heap a queued attempt holds outside the run's ledger: the part of a
+/// record's storage no allocation of this run admitted (foreign-provider or
+/// legacy heap), and for a rejection also the `Box` it travels in. The
+/// record's fixed shell is not counted: it lives in the channel's
+/// preallocated slot array, which is constant in input size. The one rule
+/// for every Source channel, ordered or not.
+pub(crate) fn queued_charge_bytes(
+    event: &SourceAttemptEvent,
+    resources: &clinker_record::owned_storage::AllocationResources,
+) -> u64 {
+    match event {
+        SourceAttemptEvent::Record(record, _) => record.unaccounted_heap_size(resources) as u64,
+        SourceAttemptEvent::Rejection(event) => {
+            crate::source::order_barrier::unaccounted_rejection_event_bytes(event, resources)
+        }
+    }
+}
+
+/// One queued attempt's charge on its Source's handle, taken before the
+/// attempt is sent and released exactly once: when the walk takes the
+/// attempt off the channel, or when the attempt is dropped unconsumed (a
+/// failed send, cancellation, the channel destroyed with it still queued).
+/// Charged unchecked. A zero-byte charge holds no handle and takes no lock,
+/// so a fully admitted record costs nothing here. When the Source's consumer
+/// has already unregistered, the release touches only the handle's own
+/// counter: unregistration returned the handle's charge to the ledger.
+pub(crate) struct QueuedCharge {
+    charge: Option<(Arc<crate::pipeline::memory::ConsumerHandle>, u64)>,
+}
+
+impl QueuedCharge {
+    /// A charge of nothing, for attempts that hold no unadmitted heap and for
+    /// events built outside a Source channel.
+    pub(crate) fn none() -> Self {
+        Self { charge: None }
+    }
+
+    /// Charge `event`'s queued size to `handle`.
+    pub(crate) fn take(
+        handle: &Arc<crate::pipeline::memory::ConsumerHandle>,
+        event: &SourceAttemptEvent,
+        resources: &clinker_record::owned_storage::AllocationResources,
+    ) -> Self {
+        Self::take_releasing(handle, event, resources, 0)
+    }
+
+    /// Charge `event`'s queued size to `handle` and release `released` of the
+    /// handle's other charge in the same ledger step: the hand-off of a
+    /// record the Source already charged elsewhere (a resident ordered
+    /// spool) to the queue, so its bytes are never charged twice or to
+    /// nothing at any instant.
+    pub(crate) fn take_releasing(
+        handle: &Arc<crate::pipeline::memory::ConsumerHandle>,
+        event: &SourceAttemptEvent,
+        resources: &clinker_record::owned_storage::AllocationResources,
+        released: u64,
+    ) -> Self {
+        let bytes = queued_charge_bytes(event, resources);
+        if bytes == 0 && released == 0 {
+            return Self::none();
+        }
+        handle.take_over(handle, released, bytes);
+        if bytes == 0 {
+            return Self::none();
+        }
+        Self {
+            charge: Some((Arc::clone(handle), bytes)),
+        }
+    }
+
+    /// The bytes this charge holds.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.charge.as_ref().map_or(0, |(_, bytes)| *bytes)
+    }
+}
+
+impl Drop for QueuedCharge {
+    fn drop(&mut self) {
+        if let Some((handle, bytes)) = self.charge.take() {
+            handle.sub_bytes(bytes);
+        }
+    }
+}
+
+impl std::fmt::Debug for QueuedCharge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueuedCharge")
+            .field("bytes", &self.bytes())
+            .finish()
+    }
 }
 
 /// Error surface for [`SourceIngestChannel`] sends.
@@ -103,26 +200,15 @@ impl std::error::Error for SourceStreamError {}
 /// loop's Source arm.
 pub(crate) struct SourceIngestChannel {
     tx: crossbeam_channel::Sender<SourceStreamEvent>,
-    /// Shared with the registered `SourceConsumer` wrapper. Each
-    /// `push` updates `handle.bytes` from the current channel queue
-    /// depth times a smoothed per-record byte estimate (see
-    /// `record_bytes_ewma`), so the arbitrator's pull-mode
-    /// `current_usage` reads the channel's in-flight memory at every
-    /// policy poll. Punctuation sends carry no record bytes and leave
-    /// the handle untouched.
+    /// Shared with the registered `SourceConsumer` wrapper. It charges
+    /// exactly the heap the queued attempts hold outside the run's ledger:
+    /// each attempt carries a [`QueuedCharge`] on it from just before its send
+    /// until it leaves the channel. The records' admitted bytes are charged
+    /// when they are allocated, in the Source consumer's name through
+    /// `allocation_resources`, so none is charged twice. Punctuations carry
+    /// no charge. An ordered Source's barrier also charges its staged rows
+    /// here.
     consumer_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
-    /// Exponentially weighted moving average (alpha = 1/8) of recent
-    /// per-record bytes not independently charged by this run, in bytes. Updated on each body push and
-    /// multiplied by the post-send queue depth to mirror the channel's
-    /// in-flight footprint into `consumer_handle`. Smoothing the
-    /// per-record cost across recent samples keeps the mirrored estimate
-    /// stable when record sizes drift (variable-width strings, optional
-    /// payload columns, mixed `Value` variants), which sharpens
-    /// pause-victim ranking and sampled legacy attribution. This remains an
-    /// estimate, separate from exact allocation grants and physical pressure. `0` means
-    /// "unseeded": the first push adopts its own sample as the baseline
-    /// rather than climbing from zero over several records.
-    record_bytes_ewma: u64,
     /// Source-scoped identity to mint for the next successfully sent record.
     /// `None` means the preceding send used `u64::MAX`; another body record
     /// must fail the attempt instead of wrapping to zero.
@@ -133,30 +219,9 @@ pub(crate) struct SourceIngestChannel {
     order_barrier: Option<crate::source::order_barrier::SourceFileOrderBarrier>,
 }
 
-/// Folds one per-record byte `sample` into an exponentially weighted
-/// moving average with alpha = 1/8.
-///
-/// `prev == 0` is the unseeded sentinel: the first sample becomes the
-/// baseline directly (a real record can never be zero bytes because
-/// `size_of::<Record>()` is a nonzero constant), avoiding the warm-up
-/// where the estimate would otherwise spend several records climbing
-/// from zero. Otherwise the average moves toward `sample` by one eighth
-/// of the gap. The `/ 8` decay is a bit shift and the subtraction is
-/// ordered to stay non-negative, so the update is allocation-free,
-/// float-free, and underflow-safe — appropriate for the hot send path.
-const fn ewma_step(prev: u64, sample: u64) -> u64 {
-    if prev == 0 {
-        sample
-    } else if sample >= prev {
-        prev + (sample - prev) / 8
-    } else {
-        prev - (prev - sample) / 8
-    }
-}
-
 impl SourceIngestChannel {
     /// Borrow the same run authority used to exclude admitted row storage from
-    /// legacy queue estimates. Decoder allocations keep their own grants.
+    /// queued-attempt charges. Decoder allocations keep their own grants.
     pub(super) fn allocation_resources(
         &self,
     ) -> &clinker_record::owned_storage::AllocationResources {
@@ -202,7 +267,6 @@ impl SourceIngestChannel {
             Self {
                 tx,
                 consumer_handle,
-                record_bytes_ewma: 0,
                 next_row_id: Some(SourceRowId::first(source)),
                 source,
                 allocation_resources,
@@ -240,7 +304,6 @@ impl SourceIngestChannel {
             Self {
                 tx,
                 consumer_handle,
-                record_bytes_ewma: 0,
                 next_row_id: Some(SourceRowId::first(source)),
                 source,
                 allocation_resources,
@@ -265,40 +328,37 @@ impl SourceIngestChannel {
         // pause/resume from the arbitrator side and the producer-
         // side wait participate in the same primitive.
         self.consumer_handle.wait_while_paused();
-        // Sample this record's target-relative heap size before moving it
-        // into the channel, then fold it into a per-stream EWMA. The
-        // smoothed value (not the raw last sample) multiplies the
-        // post-send queue depth, so the mirrored estimate stays stable
-        // when record sizes drift instead of swinging with whichever
-        // record was pushed most recently — sharpening pause-victim
-        // ranking. The accumulator is plain per-task state: `&mut self`
-        // means no synchronization is needed. This sampled legacy contribution
-        // excludes only allocations already charged to this run's ledger.
-        let sample = (std::mem::size_of::<Record>()
-            + record.unaccounted_heap_size(&self.allocation_resources)) as u64;
-        self.record_bytes_ewma = ewma_step(self.record_bytes_ewma, sample);
         let row_id = self
             .next_row_id
             .ok_or(SourceStreamError::OrdinalExhausted {
                 source: self.source,
             })?;
+        self.send_attempt(SourceAttemptEvent::Record(record, row_id))?;
+        self.next_row_id = row_id.checked_next();
+        Ok(row_id)
+    }
+
+    /// Send one attempt, or stage it in the order barrier. An unordered
+    /// attempt is charged to the Source's handle before the send, so it is
+    /// never queued uncharged; a failed send returns the attempt, whose drop
+    /// releases the charge at once. The barrier charges the attempts it
+    /// releases under the same rule.
+    fn send_attempt(&mut self, event: SourceAttemptEvent) -> Result<(), SourceStreamError> {
         if let Some(barrier) = self.order_barrier.as_mut() {
-            barrier.observe_attempt(SourceAttemptEvent::Record(record, row_id))?;
+            barrier.observe_attempt(event)?;
         } else {
+            let queued =
+                QueuedCharge::take(&self.consumer_handle, &event, &self.allocation_resources);
             self.tx
                 .send(SourceStreamEvent::Attempt {
-                    event: SourceAttemptEvent::Record(record, row_id),
+                    event,
                     population: None,
+                    queued,
                 })
                 .map_err(|_| SourceStreamError::Closed)?;
         }
-        self.next_row_id = row_id.checked_next();
-        // `Sender::len()` is the number of events sitting in the channel
-        // buffer waiting for the consumer — the in-flight queue depth. The
-        // product approximates the channel's in-flight memory footprint
-        // and is what the arbitrator's `current_usage` reports.
         self.update_usage();
-        Ok(row_id)
+        Ok(())
     }
 
     /// Reserve the next source-scoped identity for a rejected input attempt.
@@ -320,36 +380,21 @@ impl SourceIngestChannel {
 
     /// Push a source rejection at its exact source-stream position.
     /// The full original record is bounded by the same channel capacity and
-    /// accounted with the same per-record queue estimate as successful rows.
+    /// charged under the same queued-attempt rule as successful rows.
     pub(crate) fn push_rejection(
         &mut self,
         event: crate::executor::dlq::SourceRejectionEvent,
     ) -> Result<(), SourceStreamError> {
         self.consumer_handle.wait_while_paused();
-        let sample = (std::mem::size_of::<crate::executor::dlq::SourceRejectionEvent>()
-            + event.unaccounted_heap_size(&self.allocation_resources)) as u64;
-        self.record_bytes_ewma = ewma_step(self.record_bytes_ewma, sample);
-        let event = SourceAttemptEvent::Rejection(Box::new(event));
-        if let Some(barrier) = self.order_barrier.as_mut() {
-            barrier.observe_attempt(event)?;
-        } else {
-            self.tx
-                .send(SourceStreamEvent::Attempt {
-                    event,
-                    population: None,
-                })
-                .map_err(|_| SourceStreamError::Closed)?;
-        }
-        self.update_usage();
-        Ok(())
+        self.send_attempt(SourceAttemptEvent::Rejection(Box::new(event)))
     }
 
     /// Push a document-boundary punctuation. One `DocumentOpen` and
     /// one `DocumentClose` per file; the executor's dispatch loop
     /// forwards them through downstream stages with operator-specific
     /// behavior (Aggregate / Output flush; Merge dedupes; Transform /
-    /// Route pass through). Punctuations carry no record bytes, so the
-    /// `ConsumerHandle` byte estimate is left untouched.
+    /// Route pass through). Punctuations carry no record bytes, so they
+    /// carry no charge on the `ConsumerHandle`.
     pub(crate) fn push_punctuation(&mut self, punct: Punctuation) -> Result<(), SourceStreamError> {
         if let Some(barrier) = self.order_barrier.as_mut() {
             barrier.observe_punctuation(punct).map(|_| ())
@@ -360,23 +405,25 @@ impl SourceIngestChannel {
         }
     }
 
+    /// Bring an ordered Source's barrier figure (staged rows, rows being
+    /// released, spill readers) up to date on the handle. The queued
+    /// attempts' charges travel with the attempts and need no refresh, so an
+    /// unordered Source has nothing to do here.
     fn update_usage(&self) {
         if let Some(barrier) = &self.order_barrier {
-            // The barrier owns staging, readers and the actual released-row
-            // samples. A spill reload can have a different allocation owner
-            // from the original row sampled by this channel.
             barrier.refresh_accounted_charge();
-            return;
         }
-        let queued = (self.tx.len() as u64).saturating_mul(self.record_bytes_ewma);
-        self.consumer_handle.set_bytes(queued);
     }
 }
 
 /// `MemoryConsumer` wrapper for a `SourceIngestChannel`.
-/// Holds an `Arc<ConsumerHandle>` shared with the source ingest thread:
-/// the thread updates `handle.bytes` from the bounded-channel queue
-/// depth × estimated per-record bytes at each batch boundary.
+/// Holds an `Arc<ConsumerHandle>` shared with the source ingest thread. The
+/// handle charges exactly the heap the Source's queued attempts hold outside
+/// the run's ledger, each attempt's [`QueuedCharge`] from just before its
+/// send until it leaves the channel, plus an ordered Source's barrier
+/// figure. The records' admitted bytes are charged when allocated, in this
+/// consumer's name, so its `peak_charged_bytes` (the ledger's mark) covers
+/// both, and `current_usage` is the one charged figure the policies rank by.
 ///
 /// Sources do not spill: `try_spill` returns `Ok(0)` and the
 /// arbitrator's policy is expected to choose `pause` instead via
@@ -508,15 +555,12 @@ mod tests {
         let handle = ConsumerHandle::new();
         let (mut channel, rx) =
             SourceIngestChannel::new(4, handle.clone(), PlanNodeId::new(7), resources.clone());
-        let mut average = 0;
+        let mut charges = Vec::new();
         for (i, record) in rows.into_iter().enumerate() {
-            let sample =
-                (std::mem::size_of::<Record>() + record.unaccounted_heap_size(&resources)) as u64;
-            average = ewma_step(average, sample);
+            charges.push(record.unaccounted_heap_size(&resources) as u64);
             let row = channel.push(record).unwrap();
             assert_eq!(row.ordinal(), i as u64 + 1);
-            assert_eq!(channel.record_bytes_ewma, average);
-            assert_eq!(handle.bytes(), average * (i as u64 + 1));
+            assert_eq!(handle.bytes(), charges.iter().sum::<u64>());
         }
         let event = crate::executor::dlq::SourceRejectionEvent {
             source_row: channel.reserve_rejected_row_id().unwrap(),
@@ -538,12 +582,19 @@ mod tests {
             event.unaccounted_heap_size(&resources),
             diagnostic + foreign_text.heap_size()
         );
-        let sample =
-            (std::mem::size_of_val(&event) + event.unaccounted_heap_size(&resources)) as u64;
-        average = ewma_step(average, sample);
+        charges
+            .push((std::mem::size_of_val(&event) + event.unaccounted_heap_size(&resources)) as u64);
         channel.push_rejection(event).unwrap();
-        assert_eq!(handle.bytes(), average * 4);
+        assert_eq!(handle.bytes(), charges.iter().sum::<u64>());
         assert_eq!(rx.len(), 4);
+        // Each dequeue releases exactly that attempt's charge.
+        let first = rx.recv().unwrap();
+        let second = rx.recv().unwrap();
+        drop(first);
+        assert_eq!(handle.bytes(), charges[1..].iter().sum::<u64>());
+        drop(second);
+        assert_eq!(handle.bytes(), charges[2..].iter().sum::<u64>());
+        assert!(charges[1] > 0, "the foreign leaf is charged while queued");
         assert!(observer.usage().memory > escaped_local_bytes);
         assert!(foreign.used() > escaped_foreign_bytes);
         let queued_local = observer.usage().memory;
@@ -661,7 +712,6 @@ nodes:
             .push_punctuation(Punctuation::document_close(doc.clone()))
             .unwrap();
         let decoded_queue = handle.bytes();
-        assert!(decoded_queue > rx.len() as u64 * channel.record_bytes_ewma);
         channel.update_usage();
         assert_eq!(
             handle.bytes(),
@@ -748,11 +798,6 @@ nodes:
             "the Source's governed record bytes are charged in its name"
         );
         assert_eq!(handle.bytes(), 0, "the Source's handle charges nothing");
-        let peak = consumer.peak_charged_bytes().unwrap();
-        assert!(
-            peak >= 64 * KIB,
-            "the Source's peak covers its record allocations: {peak}"
-        );
         let lease = view
             .scope()
             .unwrap()
@@ -763,6 +808,11 @@ nodes:
             "a lease from the Source's view is the run's"
         );
         drop(lease);
+        let peak = consumer.peak_charged_bytes().unwrap();
+        assert!(
+            peak >= 64 * KIB,
+            "the Source's peak covers its record allocations: {peak}"
+        );
 
         drop(channel);
         drop(rx);
@@ -780,6 +830,154 @@ nodes:
         );
         arb.unregister_consumer(id);
         assert_eq!(arb.per_node_peak_charged_bytes().get("events"), Some(&peak));
+    }
+
+    /// A run with admission, a foreign provider, and a Source handle bound to
+    /// the run's ledger.
+    fn charged_source_channel() -> (
+        Arc<crate::pipeline::memory::MemoryArbitrator>,
+        crate::executor::preparation::ExecutorResources,
+        clinker_format::preparation::MemoryOnlyResources,
+        Arc<ConsumerHandle>,
+        crate::pipeline::memory::ConsumerId,
+    ) {
+        use crate::executor::preparation::ExecutorResources;
+        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
+        use crate::pipeline::shutdown::ShutdownToken;
+        use clinker_format::preparation::MemoryOnlyResources;
+        use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface};
+        use std::num::NonZeroUsize;
+        let arb = Arc::new(MemoryArbitrator::with_policy(
+            1024 * 1024,
+            0.8,
+            0.7,
+            Box::new(NoOpPolicy),
+        ));
+        let provider = ExecutorResources::new(
+            arb.clone(),
+            ShutdownToken::detached(),
+            None,
+            NonZeroUsize::MIN,
+            None,
+        )
+        .unwrap();
+        let foreign = MemoryOnlyResources::new(NonZeroUsize::new(1024 * 1024).unwrap());
+        let handle = ConsumerHandle::new();
+        let id = arb.register_node_consumer(
+            Arc::new(SourceConsumer::new(handle.clone())),
+            handle.clone(),
+            ConsumerLabel {
+                node: "rows".to_string(),
+                surface: MemorySurface::RowsRead,
+            },
+        );
+        (arb, provider, foreign, handle, id)
+    }
+
+    #[test]
+    fn queued_charge_is_released_when_the_event_leaves_the_channel() {
+        use clinker_record::{FieldStr, Value};
+        let (arb, provider, foreign, handle, id) = charged_source_channel();
+        let resources = provider.allocation();
+        let foreign_resources = foreign.resources().allocation().clone();
+        let (mut channel, rx) =
+            SourceIngestChannel::new(8, handle.clone(), PlanNodeId::new(7), resources.clone());
+        let local_text =
+            FieldStr::try_new(&"local".repeat(100), &resources.scope().unwrap()).unwrap();
+        let foreign_text =
+            FieldStr::try_new(&"foreign".repeat(100), &foreign_resources.scope().unwrap()).unwrap();
+
+        // A fully admitted record holds nothing outside the ledger.
+        channel
+            .push(admitted_record(
+                &resources,
+                Value::String(local_text.clone()),
+            ))
+            .unwrap();
+        assert_eq!(handle.bytes(), 0);
+        let mut charges = vec![0];
+        for record in [
+            admitted_record(&resources, Value::String(foreign_text.clone())),
+            admitted_record(&foreign_resources, Value::String(local_text.clone())),
+        ] {
+            let charge = record.unaccounted_heap_size(&resources) as u64;
+            assert!(charge > 0, "the fixture queues unadmitted heap");
+            charges.push(charge);
+            channel.push(record).unwrap();
+            assert_eq!(handle.bytes(), charges.iter().sum::<u64>());
+        }
+
+        // The walk's path: the charge comes off the attempt while the record
+        // is still held, before it is routed on.
+        for charge in &charges {
+            let SourceStreamEvent::Attempt {
+                event: SourceAttemptEvent::Record(record, _),
+                queued,
+                ..
+            } = rx.recv().unwrap()
+            else {
+                panic!("a queued record");
+            };
+            assert_eq!(queued.bytes(), *charge);
+            let (held, charged) = (handle.bytes(), arb.charged_bytes());
+            drop(queued);
+            assert_eq!(handle.bytes(), held - charge);
+            assert_eq!(
+                arb.charged_bytes(),
+                charged - charge,
+                "the ledger releases exactly that attempt's charge"
+            );
+            drop(record);
+        }
+        assert_eq!(handle.bytes(), 0);
+        drop(channel);
+        drop(rx);
+        arb.unregister_consumer(id);
+    }
+
+    #[test]
+    fn queued_charge_is_released_when_an_unconsumed_channel_is_destroyed() {
+        use clinker_record::{FieldStr, Value};
+        let (arb, provider, foreign, handle, id) = charged_source_channel();
+        let resources = provider.allocation();
+        let foreign_resources = foreign.resources().allocation().clone();
+        let (mut channel, rx) =
+            SourceIngestChannel::new(8, handle.clone(), PlanNodeId::new(7), resources.clone());
+        let foreign_text =
+            FieldStr::try_new(&"foreign".repeat(100), &foreign_resources.scope().unwrap()).unwrap();
+        let mut queued = 0;
+        for _ in 0..3 {
+            let record = admitted_record(&resources, Value::String(foreign_text.clone()));
+            queued += record.unaccounted_heap_size(&resources) as u64;
+            channel.push(record).unwrap();
+        }
+        assert!(queued > 0, "the fixture queues unadmitted heap");
+        assert_eq!(handle.bytes(), queued);
+        let charged = arb.charged_bytes();
+
+        // Disconnect alone destroys nothing: the attempts stay in the channel
+        // until its last endpoint drops, and so do their charges.
+        drop(rx);
+        assert_eq!(handle.bytes(), queued);
+        assert_eq!(arb.charged_bytes(), charged);
+
+        // A failed send returns its attempt, whose charge is released at once.
+        let record = admitted_record(&resources, Value::String(foreign_text.clone()));
+        assert!(record.unaccounted_heap_size(&resources) > 0);
+        assert!(matches!(
+            channel.push(record),
+            Err(SourceStreamError::Closed)
+        ));
+        assert_eq!(handle.bytes(), queued);
+        assert_eq!(arb.charged_bytes(), charged);
+
+        drop(channel);
+        assert_eq!(handle.bytes(), 0);
+        assert!(
+            arb.charged_bytes() <= charged - queued,
+            "destroying the channel releases every queued attempt's charge"
+        );
+        arb.unregister_consumer(id);
     }
 
     #[test]
@@ -808,50 +1006,6 @@ nodes:
         assert!(!handle.is_paused());
     }
 
-    #[test]
-    fn ewma_step_seeds_on_first_sample() {
-        // Unseeded (prev == 0) adopts the sample directly so the
-        // estimate does not climb from zero over the first several
-        // pushes.
-        assert_eq!(ewma_step(0, 4096), 4096);
-    }
-
-    #[test]
-    fn ewma_step_converges_toward_steady_sample() {
-        // Repeated identical samples drive the average to that value
-        // and hold it there.
-        let mut ewma = ewma_step(0, 1000);
-        for _ in 0..64 {
-            ewma = ewma_step(ewma, 1000);
-        }
-        assert_eq!(ewma, 1000);
-    }
-
-    #[test]
-    fn ewma_step_damps_a_single_spike() {
-        // A 10x spike over an established baseline moves the estimate
-        // by ~1/8 of the gap, not the full gap: 1000 + (10000-1000)/8.
-        let seeded = ewma_step(0, 1000);
-        assert_eq!(seeded, 1000);
-        let after_spike = ewma_step(seeded, 10_000);
-        assert_eq!(after_spike, 1000 + (10_000 - 1000) / 8);
-        assert!(after_spike < 10_000);
-    }
-
-    #[test]
-    fn ewma_step_is_underflow_safe_when_sample_shrinks() {
-        // A sample far below the baseline decays downward by 1/8 of the
-        // gap without underflowing the unsigned subtraction.
-        let after = ewma_step(8000, 0);
-        assert_eq!(after, 8000 - 8000 / 8);
-        // Drive it down repeatedly: it approaches but never wraps past
-        // zero.
-        let mut ewma = 8000u64;
-        for _ in 0..256 {
-            ewma = ewma_step(ewma, 1);
-        }
-        assert!(ewma >= 1);
-    }
     #[test]
     fn source_channels_preserve_allocation_domain_and_release_run_ownership() {
         use crate::executor::preparation::ExecutorResources;

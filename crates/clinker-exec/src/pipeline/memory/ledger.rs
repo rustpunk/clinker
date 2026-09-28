@@ -37,6 +37,11 @@ impl Requester {
     pub fn governed() -> Self {
         Self { consumer: None }
     }
+
+    /// The consumer the request is made for, if any.
+    pub(crate) fn consumer(&self) -> Option<ConsumerId> {
+        self.consumer
+    }
 }
 
 /// Bytes charged to the ledger and not yet released.
@@ -744,7 +749,7 @@ mod tests {
         // A governed release through the lease path names no consumer, so it
         // lowers only the run total.
         arbitrator
-            .admit_writer_memory(2 * KIB as usize)
+            .admit_writer_memory(2 * KIB as usize, governed())
             .expect("the admission path charges through the same ledger");
         assert_eq!(arbitrator.charged_bytes(), 11 * KIB);
         arbitrator
