@@ -244,22 +244,26 @@ fn peak_rss_bytes_impl() -> Option<u64> {
 /// fast and makes forward progress — that path is a legitimate way to
 /// force aggressive spilling and is left alone.
 ///
-/// Skipped when `rss_bytes()` is unavailable: with no baseline to compare
-/// against, the budget cannot be judged unsatisfiable, and the run
-/// proceeds to surface any overflow through the normal runtime path.
+/// `baseline_rss` is the process's baseline resident memory: the run start
+/// passes an injected figure when a test supplies one, else a fresh
+/// `rss_bytes()` reading. `None` (no reading on this platform) skips the
+/// check: with no baseline to compare against, the budget cannot be judged
+/// unsatisfiable, and the run proceeds to surface any overflow through the
+/// normal runtime path.
 ///
 /// # Errors
 ///
 /// Returns [`PipelineError::UnsatisfiableMemoryBudget`] when the policy
-/// pauses producers and `limit` is below the measured baseline RSS.
+/// pauses producers and `limit` is below the baseline.
 pub fn reject_unsatisfiable_budget(
     limit: u64,
     knob: clinker_plan::config::BackpressureKnob,
+    baseline_rss: Option<u64>,
 ) -> Result<(), clinker_plan::error::PipelineError> {
     if !knob.pauses_producers() {
         return Ok(());
     }
-    let Some(baseline_rss) = rss_bytes() else {
+    let Some(baseline_rss) = baseline_rss else {
         return Ok(());
     };
     if limit < baseline_rss {
@@ -2478,8 +2482,8 @@ mod tests {
     }
 
     /// This test samples `rss_bytes()` as `baseline`, then
-    /// `reject_unsatisfiable_budget` internally samples current RSS again as
-    /// `baseline_rss` and the test asserts `baseline_rss >= baseline`. Both
+    /// each `reject_unsatisfiable_budget` call is handed a fresh `rss_bytes()`
+    /// reading as `baseline_rss` and the test asserts `baseline_rss >= baseline`. Both
     /// reads are of the process-global *current* RSS, so a sibling test
     /// thread freeing memory between them lowers RSS and trips the
     /// assertion under the multi-threaded harness — the same churn that
@@ -2498,7 +2502,10 @@ mod tests {
 
                 // No baseline to compare against → cannot judge; never rejects.
                 let Some(baseline) = rss_bytes() else {
-                    assert!(reject_unsatisfiable_budget(1, BackpressureKnob::Pause).is_ok());
+                    assert!(
+                        reject_unsatisfiable_budget(1, BackpressureKnob::Pause, rss_bytes())
+                            .is_ok()
+                    );
                     return;
                 };
 
@@ -2506,7 +2513,7 @@ mod tests {
                 // policies (pause/both) it would deadlock, so it is rejected at
                 // startup with the configured limit and the measured baseline.
                 for knob in [BackpressureKnob::Pause, BackpressureKnob::Both] {
-                    match reject_unsatisfiable_budget(1, knob) {
+                    match reject_unsatisfiable_budget(1, knob, rss_bytes()) {
                         Err(PipelineError::UnsatisfiableMemoryBudget {
                             limit,
                             baseline_rss,
@@ -2525,7 +2532,7 @@ mod tests {
                 // Under spill the same sub-baseline budget never pauses, so it is
                 // NOT rejected — it spills/aborts via the runtime admission path.
                 assert!(
-                    reject_unsatisfiable_budget(1, BackpressureKnob::Spill).is_ok(),
+                    reject_unsatisfiable_budget(1, BackpressureKnob::Spill, rss_bytes()).is_ok(),
                     "spill policy must not reject a sub-baseline budget at startup"
                 );
 
@@ -2537,7 +2544,7 @@ mod tests {
                     BackpressureKnob::Spill,
                 ] {
                     assert!(
-                        reject_unsatisfiable_budget(generous, knob).is_ok(),
+                        reject_unsatisfiable_budget(generous, knob, rss_bytes()).is_ok(),
                         "a budget above baseline must be satisfiable under {knob:?}"
                     );
                 }
@@ -2558,8 +2565,8 @@ mod tests {
     /// than looped here.
     ///
     /// Runs in a child process via [`run_isolated`] so no sibling test thread
-    /// churns process-global RSS between the reads. The gate re-samples
-    /// `rss_bytes()` internally as its baseline, so the probe is built to
+    /// churns process-global RSS between the reads. Each gate call is handed a
+    /// fresh `rss_bytes()` reading as its baseline, so the probe is built to
     /// survive that re-read rather than assume it equals an earlier sample:
     ///
     /// - The budget is derived from a baseline sampled immediately before each
@@ -2591,7 +2598,7 @@ mod tests {
                 // `/proc/self/statm` into a fresh String, and the first such
                 // reads can fault in allocator pages that nudge process RSS
                 // upward. Exercising the path up front pages that machinery in,
-                // so the gate's internal re-read faults nothing new relative to
+                // so the gate call's re-read faults nothing new relative to
                 // the sample each probe is built from. `None` → the gate is
                 // skipped on this platform; there is no band to pin.
                 for _ in 0..256 {
@@ -2606,7 +2613,7 @@ mod tests {
                 // `[b, ceil(b / DEFAULT_SPILL_THRESHOLD))`: at or above baseline
                 // (so the hard gate accepts it) yet under the ceiling (so a
                 // soft-limit comparison — the rejected direction this guards
-                // against — would reject it). Because the gate re-samples RSS
+                // against — would reject it). Because each gate call re-samples RSS
                 // itself, the budget is derived from a baseline read immediately
                 // before each call and placed at the middle of the band, with a
                 // bounded retry to re-sample if RSS still crept past it. Every
@@ -2628,7 +2635,7 @@ mod tests {
                             "mid-band probe must sit strictly inside \
                              [{baseline}, {band_ceiling}): mid={mid_band}"
                         );
-                        if reject_unsatisfiable_budget(mid_band, knob).is_ok() {
+                        if reject_unsatisfiable_budget(mid_band, knob, rss_bytes()).is_ok() {
                             accepted = true;
                             break;
                         }

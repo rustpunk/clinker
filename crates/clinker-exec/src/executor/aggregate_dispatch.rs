@@ -24,7 +24,7 @@ use crate::executor::dispatch::{
     stream_linear_producer_emit, tee_emit_to_region_input_buffers,
 };
 use crate::executor::schema_check::check_input_schema;
-use crate::executor::{DlqEntry, DlqFailureStamp, parse_memory_limit, stage_metrics};
+use crate::executor::{DlqEntry, DlqFailureStamp, operator_memory_limit, stage_metrics};
 use clinker_plan::config::ErrorStrategy;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
@@ -253,7 +253,7 @@ where
         // strict path below never reaches here, so the spill schema is built
         // only on this windowed branch — never built-then-dropped.
         let spill_schema = aggregate_spill_schema(compiled);
-        let mem_limit = parse_memory_limit(ctx.config);
+        let mem_limit = operator_memory_limit(&ctx.memory_budget);
         let win_ctx = WindowedAggContext {
             name,
             compiled,
@@ -302,7 +302,7 @@ where
             cxl::eval::DEFAULT_MAX_EXPANSION,
         );
         let spill_schema = aggregate_spill_schema(compiled);
-        let mem_limit = parse_memory_limit(ctx.config);
+        let mem_limit = operator_memory_limit(&ctx.memory_budget);
         // Resolve the spill compression mode against this aggregate's
         // output-schema width and the run's batch size, so spilled group
         // state matches what `--explain` projects for the operator: the
@@ -643,7 +643,7 @@ impl DocAggregatorFactory {
             max_expansion: cxl::eval::DEFAULT_MAX_EXPANSION,
             output_schema: spec.output_schema.clone(),
             spill_schema,
-            mem_limit: parse_memory_limit(ctx.config),
+            mem_limit: operator_memory_limit(&ctx.memory_budget),
             spill_dir: ctx.spill_root_path.to_path_buf(),
             spill_compress,
             transform_name: spec.name.to_string(),

@@ -343,39 +343,20 @@ pub(crate) fn record_with_emitted_fields(
     widen_record_to_schema(input, &widened)
 }
 
-/// Resolve the pipeline `memory.limit` into a byte count for the
-/// spill-threshold sizing the aggregate and sort arms perform.
+/// Build the run's `MemoryArbitrator` from the pipeline-level `memory:`
+/// block. Resolves `memory.limit` through `parse_memory_limit_bytes`
+/// (defaults to 512 MiB when omitted) and chooses the active policy by
+/// mapping the `memory.backpressure` knob through `build_policy`.
 ///
-/// Delegates to the authoritative [`clinker_plan::config::utils::parse_memory_limit_bytes`]
-/// so the spill-threshold budget honors the same `K`/`M`/`G` binary
-/// suffixes as the arbitrator ceiling. A second local parser previously
-/// lived here and silently dropped the `K` suffix, so a `limit: "256K"`
-/// sized a 256 KiB arbitrator but a 512 MiB aggregate spill budget; that
-/// divergence is gone — there is exactly one limit parser. Narrowed from
-/// the parser's `u64` to `usize` for the operator-facing budget fields;
-/// on a 32-bit host a limit above `usize::MAX` saturates rather than
-/// wrapping.
-pub(crate) fn parse_memory_limit(config: &PipelineConfig) -> usize {
-    // Reached only from inside a run, after the startup boundary
-    // (`run_with_readers_writers_in_context`) has already rejected an
-    // overflowing `memory.limit`. The default-on-error fallback is therefore
-    // unreachable on the run path; it only keeps this helper panic-free.
-    let bytes = clinker_plan::config::utils::parse_memory_limit_bytes(
-        config.pipeline.memory.limit.as_deref(),
-    )
-    .unwrap_or(clinker_plan::config::utils::DEFAULT_MEMORY_LIMIT_BYTES);
-    usize::try_from(bytes).unwrap_or(usize::MAX)
-}
-
-/// Build a `MemoryArbitrator` from the pipeline-level `memory:` block.
-/// Resolves `memory.limit` through `parse_memory_limit_bytes` (defaults
-/// to 512 MiB when omitted) and chooses the active policy by mapping the
-/// `memory.backpressure` knob through `build_policy`. Used by both the
-/// pipeline-scoped arbitrator and every per-arm budget the dispatch path
-/// constructs.
+/// A test ledger capacity in `overrides` holds the runtime limit to the
+/// smaller of it and `memory.limit`; the arbitrator keeps `memory.limit` as
+/// its configured limit. The arbitrator is the run's one limit reader:
+/// operator budgets and spill thresholds take the runtime limit from it, so
+/// a capacity reaches every runtime decision.
 pub(crate) fn build_arbitrator_from_config(
     config: &PipelineConfig,
-) -> crate::pipeline::memory::MemoryArbitrator {
+    overrides: &super::MemoryTestOverrides,
+) -> Result<crate::pipeline::memory::MemoryArbitrator, PipelineError> {
     let mem = &config.pipeline.memory;
     // Called only after the run boundary validated `memory.limit`, so the
     // default-on-error fallback never fires here on the run path; it keeps the
@@ -389,12 +370,34 @@ pub(crate) fn build_arbitrator_from_config(
     let resume_threshold = mem
         .resume_threshold
         .unwrap_or(clinker_plan::config::utils::DEFAULT_RESUME_THRESHOLD);
-    crate::pipeline::memory::MemoryArbitrator::with_policy(
+    let arbitrator = crate::pipeline::memory::MemoryArbitrator::with_policy(
         limit,
         clinker_plan::config::utils::DEFAULT_SPILL_THRESHOLD,
         resume_threshold,
         crate::pipeline::memory::build_policy(mem.backpressure),
-    )
+    );
+    if let Some(capacity) = overrides.ledger_capacity() {
+        // Nothing is charged to a fresh arbitrator, so no capacity is below
+        // its charged total; a refusal here is a broken invariant.
+        arbitrator
+            .cap_runtime_limit(capacity)
+            .map_err(|error| PipelineError::Internal {
+                op: "memory-arbitrator",
+                node: "pipeline".to_string(),
+                detail: format!("a fresh ledger refused capacity {capacity}: {error}"),
+            })?;
+    }
+    Ok(arbitrator)
+}
+
+/// The runtime memory limit as an operator budget in bytes: the run
+/// arbitrator's limit, so a test capacity reaches the operators too.
+/// Narrowed from `u64` to `usize`; on a 32-bit host a limit above
+/// `usize::MAX` saturates rather than wrapping.
+pub(crate) fn operator_memory_limit(
+    arbitrator: &crate::pipeline::memory::MemoryArbitrator,
+) -> usize {
+    usize::try_from(arbitrator.limit()).unwrap_or(usize::MAX)
 }
 
 /// Render a group key as a bare bracketed value list: `["A-1", 3]`.
@@ -748,7 +751,8 @@ pub(crate) fn giant_group_error(
 
 #[cfg(test)]
 mod tests {
-    use super::{DIAGNOSTIC_GROUP_TOTAL_BYTES, format_partition_group, parse_memory_limit};
+    use super::{DIAGNOSTIC_GROUP_TOTAL_BYTES, format_partition_group, operator_memory_limit};
+    use crate::executor::MemoryTestOverrides;
     use clinker_record::GroupByKey;
 
     const MINIMAL_PIPELINE: &str = r#"
@@ -773,10 +777,15 @@ nodes:
       path: out.csv
 "#;
 
+    /// The operator budget a run of the minimal pipeline at `limit` sizes
+    /// from: the limit of the arbitrator production builds for it.
     fn budget_for(limit: &str) -> usize {
         let yaml = MINIMAL_PIPELINE.replace("__LIMIT__", limit);
         let config = clinker_plan::config::parse_config(&yaml).expect("minimal pipeline parses");
-        parse_memory_limit(&config)
+        let arbitrator =
+            super::build_arbitrator_from_config(&config, &MemoryTestOverrides::process())
+                .expect("a fresh arbitrator");
+        operator_memory_limit(&arbitrator)
     }
 
     /// Build a pipeline-scoped arbitrator from a `memory:` inline block,
@@ -784,7 +793,8 @@ nodes:
     fn arbitrator_for_memory(memory_inline: &str) -> crate::pipeline::memory::MemoryArbitrator {
         let yaml = MINIMAL_PIPELINE.replace(r#"memory: { limit: "__LIMIT__" }"#, memory_inline);
         let config = clinker_plan::config::parse_config(&yaml).expect("pipeline parses");
-        super::build_arbitrator_from_config(&config)
+        super::build_arbitrator_from_config(&config, &MemoryTestOverrides::process())
+            .expect("a fresh arbitrator")
     }
 
     #[test]
@@ -821,10 +831,10 @@ nodes:
 
     #[test]
     fn aggregate_spill_budget_matches_arbitrator_parser() {
-        // The budget the aggregate arm sizes from and the arbitrator
-        // ceiling come from one parser, so a suffixed limit yields the same
-        // byte count on both paths — no divergence between the arbitrator
-        // limit and the aggregate spill budget.
+        // The budget the aggregate arm sizes from is the arbitrator's own
+        // limit, which the one `memory.limit` parser sets, so a suffixed
+        // limit yields the same byte count on both paths — no divergence
+        // between the arbitrator limit and the aggregate spill budget.
         for limit in ["256K", "4M", "2G", "1024"] {
             let yaml = MINIMAL_PIPELINE.replace("__LIMIT__", limit);
             let config = clinker_plan::config::parse_config(&yaml).expect("parses");
@@ -833,7 +843,7 @@ nodes:
             )
             .unwrap_or(clinker_plan::config::utils::DEFAULT_MEMORY_LIMIT_BYTES);
             assert_eq!(
-                parse_memory_limit(&config) as u64,
+                budget_for(limit) as u64,
                 arbitrator_ceiling,
                 "aggregate spill budget for {limit:?} must equal the arbitrator ceiling"
             );

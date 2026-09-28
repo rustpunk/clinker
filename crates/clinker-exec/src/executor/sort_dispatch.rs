@@ -16,7 +16,7 @@ use crate::executor::dispatch::{
     ExecutorContext, admit_node_buffer, node_buffer_spill_allowed,
     require_single_input_node_buffer_slot, tee_emit_to_region_input_buffers,
 };
-use crate::executor::{parse_memory_limit, stage_metrics};
+use crate::executor::{operator_memory_limit, stage_metrics};
 use crate::pipeline::spill_merge::merge_sorted_runs;
 use clinker_core_types::QuoteName;
 use clinker_plan::error::PipelineError;
@@ -227,7 +227,7 @@ pub(super) fn sort_records_by_authored_fields(
         return Ok(input_records);
     }
     let schema = input_records[0].0.schema().clone();
-    let mem_limit = parse_memory_limit(ctx.config);
+    let mem_limit = operator_memory_limit(&ctx.memory_budget);
     let spill_compress = ctx
         .spill_compress
         .resolve_for_schema(schema.column_count(), ctx.batch_size as u64);
@@ -287,7 +287,7 @@ where
     use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
     use crate::pipeline::spill_merge::{MergeBudget, SortedRunMerger, SpillChargeGuard};
 
-    let mem_limit = parse_memory_limit(ctx.config);
+    let mem_limit = operator_memory_limit(&ctx.memory_budget);
     let mut buffer: Option<SortBuffer<crate::executor::stream_event::SourceRowId>> = None;
     let mut spill_compress = false;
     let mut sort_count = 0u64;
