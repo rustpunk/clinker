@@ -306,7 +306,14 @@ fn spill_activates_on_charged_bytes_without_rss() {
     // its charged bytes flow into `sum_consumer_usage`.
     let budget =
         MemoryArbitrator::with_policy(1024 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
-    budget.register_consumer(Arc::new(GraceHashConsumer::new(consumer_handle.clone())));
+    budget.register_consumer(
+        Arc::new(GraceHashConsumer::new(consumer_handle.clone())),
+        consumer_handle.clone(),
+        clinker_plan::runtime_error::ConsumerLabel {
+            node: "grace_test".to_string(),
+            surface: clinker_plan::runtime_error::MemorySurface::JoinBuildSide,
+        },
+    );
     let soft = budget.soft_limit();
     assert!(
         budget.peak_rss().is_none_or(|rss| rss < soft),

@@ -145,8 +145,12 @@ impl SourceActivationController {
             #[cfg(test)]
             stream.assert_allocation_domain(allocation_resources);
             let consumer_id = memory.register_node_consumer(
-                &source_name,
                 Arc::new(SourceConsumer::new(Arc::clone(&handle))),
+                Arc::clone(&handle),
+                clinker_plan::runtime_error::ConsumerLabel {
+                    node: source_name.clone(),
+                    surface: clinker_plan::runtime_error::MemorySurface::RowsRead,
+                },
             );
             activated.receivers.push((source_name.clone(), receiver));
             activated

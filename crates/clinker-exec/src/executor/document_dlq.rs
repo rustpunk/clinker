@@ -82,6 +82,7 @@ use clinker_core_types::dlq::DlqErrorCategory;
 use clinker_plan::config::{CompressMode, SinkConfig};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::PlanNodeId;
+use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface};
 use roaring::RoaringTreemap;
 
 /// Identity of one document the policy operates on: its source file (the
@@ -1404,10 +1405,14 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
         buckets.entry(Arc::clone(key)).or_insert_with(|| {
             let handle = crate::pipeline::memory::ConsumerHandle::new();
             let consumer_id = arbitrator.register_node_consumer(
-                output_name,
                 Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
                     handle.clone(),
                 )),
+                handle.clone(),
+                ConsumerLabel {
+                    node: output_name.to_string(),
+                    surface: MemorySurface::HeldFailingRows,
+                },
             );
             DocBucket {
                 buffer: NodeBuffer::Memory(Vec::new()),
@@ -2128,6 +2133,13 @@ fn replay_held(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_label(node: &str) -> clinker_plan::runtime_error::ConsumerLabel {
+        clinker_plan::runtime_error::ConsumerLabel {
+            node: node.to_string(),
+            surface: clinker_plan::runtime_error::MemorySurface::HeldFailingRows,
+        }
+    }
     use clinker_record::owned_storage::SharedStorage;
     use clinker_record::{
         DocumentContext, DocumentId, EnvelopeRecord, FieldMetadata, Schema, SchemaBuilder, Value,
@@ -2211,9 +2223,13 @@ mod tests {
         );
 
         let handle = ConsumerHandle::new();
-        let consumer_id = arbitrator.register_consumer(Arc::new(
-            crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone()),
-        ));
+        let consumer_id = arbitrator.register_consumer(
+            Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                handle.clone(),
+            )),
+            handle.clone(),
+            test_label("out"),
+        );
         let mut buffer = NodeBuffer::Memory(Vec::new());
         buffer.push(trigger_record, trigger_row);
         buffer.push(collateral_record, collateral_row);
@@ -2669,9 +2685,13 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
 
         let handle = crate::pipeline::memory::ConsumerHandle::new();
-        let consumer_id = arbitrator.register_consumer(Arc::new(
-            crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone()),
-        ));
+        let consumer_id = arbitrator.register_consumer(
+            Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                handle.clone(),
+            )),
+            handle.clone(),
+            test_label("out"),
+        );
         let mut bucket = DocBucket {
             buffer: NodeBuffer::Memory(Vec::new()),
             consumer_id,
@@ -2753,9 +2773,13 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
 
         let handle = crate::pipeline::memory::ConsumerHandle::new();
-        let consumer_id = arbitrator.register_consumer(Arc::new(
-            crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone()),
-        ));
+        let consumer_id = arbitrator.register_consumer(
+            Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                handle.clone(),
+            )),
+            handle.clone(),
+            test_label("out"),
+        );
         let mut bucket = DocBucket {
             buffer: NodeBuffer::Memory(Vec::new()),
             consumer_id,
@@ -2801,9 +2825,13 @@ mod tests {
         ));
         let tmp = tempfile::tempdir().expect("tempdir");
         let handle = crate::pipeline::memory::ConsumerHandle::new();
-        let consumer_id = arbitrator.register_consumer(Arc::new(
-            crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone()),
-        ));
+        let consumer_id = arbitrator.register_consumer(
+            Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                handle.clone(),
+            )),
+            handle.clone(),
+            test_label("out"),
+        );
         let mut bucket = DocBucket {
             buffer: NodeBuffer::Memory(Vec::new()),
             consumer_id,

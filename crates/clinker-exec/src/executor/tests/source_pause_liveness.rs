@@ -73,9 +73,18 @@ fn pinned_arbitrator() -> Arc<crate::pipeline::memory::MemoryArbitrator> {
         RESUME_FRAC,
         crate::pipeline::memory::MemoryArbitrator::default_policy(),
     ));
-    arb.register_consumer(Arc::new(PinnedPressure {
-        bytes: PINNED_BYTES,
-    }));
+    let handle = crate::pipeline::memory::ConsumerHandle::new();
+    handle.set_bytes(PINNED_BYTES);
+    arb.register_consumer(
+        Arc::new(PinnedPressure {
+            bytes: PINNED_BYTES,
+        }),
+        handle,
+        clinker_plan::runtime_error::ConsumerLabel {
+            node: "pinned".to_string(),
+            surface: clinker_plan::runtime_error::MemorySurface::JoinState,
+        },
+    );
     arb
 }
 

@@ -40,6 +40,7 @@ pub(crate) mod sync {
 }
 use clinker_format::preparation::{ResourceError, ResourceErrorKind};
 use clinker_plan::plan::scheduling_hint::SchedulingHint;
+use clinker_plan::runtime_error::ConsumerLabel;
 use petgraph::graph::NodeIndex;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -288,6 +289,8 @@ struct ConsumerOwners {
     /// Per node, the largest [`MemoryConsumer::peak_charged_bytes`] among its
     /// consumers that were unregistered or replaced.
     retired_peaks: std::collections::BTreeMap<String, u64>,
+    /// The handle each registered consumer charges through.
+    handles: std::collections::HashMap<ConsumerId, Arc<ConsumerHandle>>,
 }
 
 impl ConsumerOwners {
@@ -520,6 +523,24 @@ impl ConsumerHandle {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                 Some(cur.saturating_sub(n))
             });
+    }
+
+    /// Grow this handle's charge by `n` bytes if they fit, raising its mark.
+    pub fn try_grow(&self, n: u64) -> Result<(), ledger::Shortfall> {
+        self.add_bytes(n);
+        Ok(())
+    }
+
+    /// Grow or shrink this handle's charge to exactly `total` bytes.
+    pub fn try_resize(&self, total: u64) -> Result<(), ledger::Shortfall> {
+        self.set_bytes(total);
+        Ok(())
+    }
+
+    /// Release `n` of this handle's charged bytes (all of them when `n`
+    /// exceeds the charge). Never lowers the mark.
+    pub fn shrink(&self, n: u64) {
+        self.sub_bytes(n);
     }
 
     /// Flip the spill-request flag to `true`. Called by the consumer
@@ -1430,26 +1451,34 @@ impl MemoryArbitrator {
     /// atomically swaps it in. `O(N)` in the registry size, but
     /// registration is a once-per-operator-lifetime event, so the cost
     /// is off the per-batch hot path readers traverse.
-    pub fn register_consumer(&self, consumer: Arc<dyn MemoryConsumer>) -> ConsumerId {
-        self.register_owned_consumer(None, consumer)
+    pub fn register_consumer(
+        &self,
+        consumer: Arc<dyn MemoryConsumer>,
+        handle: Arc<ConsumerHandle>,
+        label: ConsumerLabel,
+    ) -> ConsumerId {
+        self.register_owned_consumer(false, consumer, handle, label)
     }
 
     /// Register a consumer that holds the retained state of the node named
-    /// `node`, so the run's report can say how much that node held charged.
+    /// `label.node`, so the run's report can say how much that node held
+    /// charged.
     ///
     /// Behaves exactly like [`Self::register_consumer`] for arbitration; in
     /// addition, [`Self::per_node_peak_charged_bytes`] reports the consumer's
-    /// [`MemoryConsumer::peak_charged_bytes`] under `node`, while it is
-    /// registered and after it is unregistered. `node` is the same name the
-    /// node's spill is recorded under in [`Self::record_spill_bytes`]. Use
+    /// [`MemoryConsumer::peak_charged_bytes`] under `label.node`, while it is
+    /// registered and after it is unregistered. `label.node` is the same name
+    /// the node's spill is recorded under in [`Self::record_spill_bytes`]. Use
     /// [`Self::register_consumer`] only for state no single node owns (writer
-    /// output staging, the credential registry).
+    /// output staging, the credential registry, the document dead-letter
+    /// state).
     pub fn register_node_consumer(
         &self,
-        node: &str,
         consumer: Arc<dyn MemoryConsumer>,
+        handle: Arc<ConsumerHandle>,
+        label: ConsumerLabel,
     ) -> ConsumerId {
-        self.register_owned_consumer(Some(node), consumer)
+        self.register_owned_consumer(true, consumer, handle, label)
     }
 
     /// Shared body of [`Self::register_consumer`] and
@@ -1458,16 +1487,21 @@ impl MemoryArbitrator {
     /// sees a registered node consumer without its node.
     fn register_owned_consumer(
         &self,
-        node: Option<&str>,
+        node_owned: bool,
         consumer: Arc<dyn MemoryConsumer>,
+        handle: Arc<ConsumerHandle>,
+        label: ConsumerLabel,
     ) -> ConsumerId {
         let id = ConsumerId(self.next_consumer_id.fetch_add(1, Ordering::Relaxed));
-        if let Some(node) = node {
-            self.consumer_owners
+        {
+            let mut owners = self
+                .consumer_owners
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .live
-                .insert(id, node.to_string());
+                .unwrap_or_else(|e| e.into_inner());
+            if node_owned {
+                owners.live.insert(id, label.node.clone());
+            }
+            owners.handles.insert(id, handle);
         }
         self.consumers.rcu(|current| {
             let mut next = Vec::with_capacity(current.len() + 1);
@@ -1546,6 +1580,7 @@ impl MemoryArbitrator {
                 .unwrap_or_else(|e| e.into_inner());
             owners.retain_peak(id, consumer.as_ref());
             owners.live.remove(&id);
+            owners.handles.remove(&id);
         }
         removed
     }
@@ -2419,7 +2454,7 @@ mod tests {
             arbitrator.peak_rss().is_none_or(|rss| rss < soft),
             "test invariant: real RSS must stay under the soft limit so the RSS arm is inert"
         );
-        arbitrator.register_consumer(Arc::new(MockConsumer::new(soft + 1, 0, 0)));
+        register_charged(&arbitrator, Arc::new(MockConsumer::new(soft + 1, 0, 0)));
         assert!(
             arbitrator.should_spill(),
             "charged bytes over the soft limit must trip should_spill via the RSS-independent arm"
@@ -2443,7 +2478,7 @@ mod tests {
             arbitrator.peak_rss().is_none_or(|rss| rss < hard),
             "test invariant: real RSS must stay under the hard limit so the RSS arm is inert"
         );
-        arbitrator.register_consumer(Arc::new(MockConsumer::new(hard + 1, 0, 0)));
+        register_charged(&arbitrator, Arc::new(MockConsumer::new(hard + 1, 0, 0)));
         assert!(
             arbitrator.should_abort(),
             "charged bytes over the hard limit must trip should_abort via the RSS-independent arm"
@@ -2493,7 +2528,7 @@ mod tests {
             arbitrator.peak_rss().is_none_or(|rss| rss < soft),
             "test invariant: real RSS must stay under the soft limit so the RSS arm is inert"
         );
-        arbitrator.register_consumer(Arc::new(MockConsumer::new(soft + 1, 0, 0)));
+        register_charged(&arbitrator, Arc::new(MockConsumer::new(soft + 1, 0, 0)));
         assert!(arbitrator.should_spill_self());
     }
 
@@ -2698,11 +2733,15 @@ mod tests {
         let small = ConsumerHandle::new();
         let large = ConsumerHandle::new();
         let small_id = arbitrator.register_node_consumer(
-            "sort_by_amount",
             Arc::new(ArenaConsumer::new(small.clone())),
+            small.clone(),
+            test_label("sort_by_amount"),
         );
-        let large_id = arbitrator
-            .register_node_consumer("dept_totals", Arc::new(ArenaConsumer::new(large.clone())));
+        let large_id = arbitrator.register_node_consumer(
+            Arc::new(ArenaConsumer::new(large.clone())),
+            large.clone(),
+            test_label("dept_totals"),
+        );
         small.set_bytes(100);
         large.set_bytes(900);
         small.set_bytes(20);
@@ -2710,8 +2749,11 @@ mod tests {
         // A consumer no node owns is charged but attributed to no node.
         let run_scoped = ConsumerHandle::new();
         run_scoped.set_bytes(5_000);
-        let run_scoped_id =
-            arbitrator.register_consumer(Arc::new(ArenaConsumer::new(run_scoped.clone())));
+        let run_scoped_id = arbitrator.register_consumer(
+            Arc::new(ArenaConsumer::new(run_scoped.clone())),
+            run_scoped.clone(),
+            test_label("run"),
+        );
 
         let peaks = arbitrator.per_node_peak_charged_bytes();
         assert_eq!(peaks.get("sort_by_amount"), Some(&100));
@@ -2730,8 +2772,11 @@ mod tests {
         // A node that registers again later reports the larger of its two
         // consumers' marks, not their sum.
         let again = ConsumerHandle::new();
-        let again_id = arbitrator
-            .register_node_consumer("dept_totals", Arc::new(ArenaConsumer::new(again.clone())));
+        let again_id = arbitrator.register_node_consumer(
+            Arc::new(ArenaConsumer::new(again.clone())),
+            again.clone(),
+            test_label("dept_totals"),
+        );
         again.set_bytes(300);
         assert_eq!(
             arbitrator.per_node_peak_charged_bytes().get("dept_totals"),
@@ -2792,6 +2837,26 @@ mod tests {
     fn test_budget_category_display_shape() {
         assert_eq!(BudgetCategory::Arena.to_string(), "arena");
         assert_eq!(BudgetCategory::NodeBuffer.to_string(), "node_buffer");
+    }
+
+    /// A label for a test registration, naming `node`.
+    fn test_label(node: &str) -> ConsumerLabel {
+        ConsumerLabel {
+            node: node.to_string(),
+            surface: clinker_plan::runtime_error::MemorySurface::GroupState,
+        }
+    }
+
+    /// Register `consumer` run-scoped through a fresh handle already charged
+    /// with the bytes the consumer reports, so the charge it applies is the
+    /// figure it reports.
+    fn register_charged(
+        arbitrator: &MemoryArbitrator,
+        consumer: Arc<dyn MemoryConsumer>,
+    ) -> ConsumerId {
+        let handle = ConsumerHandle::new();
+        handle.set_bytes(consumer.current_usage());
+        arbitrator.register_consumer(consumer, handle, test_label("test"))
     }
 
     /// Minimal `MemoryConsumer` used to exercise the trait surface
@@ -2943,9 +3008,9 @@ mod tests {
     #[test]
     fn test_register_consumer_assigns_monotonic_ids() {
         let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
-        let id_a = arbitrator.register_consumer(Arc::new(MockConsumer::new(10, 0, 0)));
-        let id_b = arbitrator.register_consumer(Arc::new(MockConsumer::new(20, 0, 0)));
-        let id_c = arbitrator.register_consumer(Arc::new(MockConsumer::new(30, 0, 0)));
+        let id_a = register_charged(&arbitrator, Arc::new(MockConsumer::new(10, 0, 0)));
+        let id_b = register_charged(&arbitrator, Arc::new(MockConsumer::new(20, 0, 0)));
+        let id_c = register_charged(&arbitrator, Arc::new(MockConsumer::new(30, 0, 0)));
         assert_ne!(id_a, id_b);
         assert_ne!(id_b, id_c);
         assert_ne!(id_a, id_c);
@@ -2955,7 +3020,7 @@ mod tests {
     #[test]
     fn test_unregister_consumer_returns_removed() {
         let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
-        let id = arbitrator.register_consumer(Arc::new(MockConsumer::new(100, 0, 0)));
+        let id = register_charged(&arbitrator, Arc::new(MockConsumer::new(100, 0, 0)));
         assert_eq!(arbitrator.consumer_count(), 1);
         let removed = arbitrator.unregister_consumer(id);
         assert!(removed.is_some());
@@ -2968,11 +3033,18 @@ mod tests {
     #[test]
     fn replace_consumer_preserves_registry_cardinality_and_updates_usage() {
         let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
-        let id = arbitrator.register_consumer(Arc::new(MockConsumer::new(100, 40, 0)));
+        let handle = ConsumerHandle::new();
+        handle.set_bytes(100);
+        let id = arbitrator.register_consumer(
+            Arc::new(MockConsumer::new(100, 40, 0)),
+            handle.clone(),
+            test_label("test"),
+        );
         assert_eq!(arbitrator.consumer_count(), 1);
         assert_eq!(arbitrator.sum_consumer_usage(), 100);
 
         let replaced = arbitrator.replace_consumer(id, Arc::new(MockConsumer::new(250, 0, 0)));
+        handle.set_bytes(250);
         assert!(replaced.is_some());
         assert_eq!(arbitrator.consumer_count(), 1);
         assert_eq!(arbitrator.sum_consumer_usage(), 250);
@@ -2983,7 +3055,7 @@ mod tests {
     #[test]
     fn replace_consumer_missing_id_leaves_registry_unchanged() {
         let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
-        let id = arbitrator.register_consumer(Arc::new(MockConsumer::new(100, 40, 0)));
+        let id = register_charged(&arbitrator, Arc::new(MockConsumer::new(100, 40, 0)));
         let missing = ConsumerId(id.0 + 1);
 
         assert!(
@@ -2999,9 +3071,9 @@ mod tests {
     fn test_sum_consumer_usage_aggregates_registered() {
         let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
         assert_eq!(arbitrator.sum_consumer_usage(), 0);
-        arbitrator.register_consumer(Arc::new(MockConsumer::new(1024, 0, 0)));
-        arbitrator.register_consumer(Arc::new(MockConsumer::new(4096, 0, 0)));
-        arbitrator.register_consumer(Arc::new(MockConsumer::new(100, 0, 0)));
+        register_charged(&arbitrator, Arc::new(MockConsumer::new(1024, 0, 0)));
+        register_charged(&arbitrator, Arc::new(MockConsumer::new(4096, 0, 0)));
+        register_charged(&arbitrator, Arc::new(MockConsumer::new(100, 0, 0)));
         assert_eq!(arbitrator.sum_consumer_usage(), 1024 + 4096 + 100);
     }
 
@@ -3036,7 +3108,11 @@ mod tests {
         // does: a fresh handle seeded to the arena's measured bytes.
         let handle = ConsumerHandle::new();
         handle.set_bytes(ARENA_BYTES);
-        let id = arbitrator.register_consumer(Arc::new(ArenaConsumer::new(handle.clone())));
+        let id = arbitrator.register_consumer(
+            Arc::new(ArenaConsumer::new(handle.clone())),
+            handle.clone(),
+            test_label("rolling"),
+        );
 
         // Attribution: the arena's bytes now flow through pull-mode.
         assert_eq!(arbitrator.sum_consumer_usage(), ARENA_BYTES);
@@ -3081,9 +3157,13 @@ mod tests {
         arena_handle.set_bytes(512 * 1024 * 1024);
         // The arena is far larger than the spillable; only the priority
         // ordering keeps it from being elected, which is the point.
-        arbitrator.register_consumer(Arc::new(ArenaConsumer::new(arena_handle)));
+        arbitrator.register_consumer(
+            Arc::new(ArenaConsumer::new(arena_handle.clone())),
+            arena_handle,
+            test_label("rolling"),
+        );
         let spillable = Arc::new(ReclaimableMock::new(1024, 10));
-        arbitrator.register_consumer(spillable.clone());
+        register_charged(&arbitrator, spillable.clone());
 
         arbitrator.set_peak_rss_for_test(75 * 1024 * 1024 * 1024);
         assert!(arbitrator.should_spill());
@@ -3096,9 +3176,9 @@ mod tests {
     #[test]
     fn test_consumer_ids_are_never_reused_after_unregister() {
         let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
-        let id_a = arbitrator.register_consumer(Arc::new(MockConsumer::new(1, 0, 0)));
+        let id_a = register_charged(&arbitrator, Arc::new(MockConsumer::new(1, 0, 0)));
         arbitrator.unregister_consumer(id_a);
-        let id_b = arbitrator.register_consumer(Arc::new(MockConsumer::new(1, 0, 0)));
+        let id_b = register_charged(&arbitrator, Arc::new(MockConsumer::new(1, 0, 0)));
         // Monotonic allocator: even after unregister, the next id is
         // strictly above the previous one — stale ConsumerId references
         // cannot collide with a later registration.
@@ -3108,7 +3188,7 @@ mod tests {
     #[test]
     fn test_register_then_unregister_leaves_empty_snapshot() {
         let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
-        let id = arbitrator.register_consumer(Arc::new(MockConsumer::new(512, 0, 0)));
+        let id = register_charged(&arbitrator, Arc::new(MockConsumer::new(512, 0, 0)));
         assert_eq!(arbitrator.consumer_count(), 1);
         assert_eq!(arbitrator.sum_consumer_usage(), 512);
         let removed = arbitrator.unregister_consumer(id);
@@ -3161,7 +3241,7 @@ mod tests {
             thread::spawn(move || {
                 start.wait();
                 for _ in 0..WRITES {
-                    arbitrator.register_consumer(Arc::new(MockConsumer::new(PER_CONSUMER, 0, 0)));
+                    register_charged(&arbitrator, Arc::new(MockConsumer::new(PER_CONSUMER, 0, 0)));
                 }
             })
         };
@@ -3463,7 +3543,7 @@ mod tests {
         let arb = MemoryArbitrator::with_policy(limit, 0.80, 0.70, Box::new(NoOpPolicy));
         assert_eq!(arb.soft_limit(), soft, "soft limit setup");
         if used > 0 {
-            arb.register_consumer(Arc::new(MockConsumer::new(used, 0, 0)));
+            register_charged(&arb, Arc::new(MockConsumer::new(used, 0, 0)));
         }
         assert_eq!(arb.sum_consumer_usage(), used, "usage setup");
         arb
@@ -3624,7 +3704,11 @@ mod tests {
             Box::new(BackPressurePreferred::wrapping(Priority)),
         );
         let handle = ConsumerHandle::new();
-        arb.register_consumer(Arc::new(SourceConsumer::new(handle.clone())));
+        arb.register_consumer(
+            Arc::new(SourceConsumer::new(handle.clone())),
+            handle.clone(),
+            test_label("orders"),
+        );
 
         // Above soft: pause. Repeated polls stay paused (single victim,
         // idempotent) — no per-poll thrash.
@@ -3676,7 +3760,11 @@ mod tests {
             Box::new(BackPressurePreferred::wrapping(Priority)),
         );
         let handle = ConsumerHandle::new();
-        arb.register_consumer(Arc::new(SourceConsumer::new(handle.clone())));
+        arb.register_consumer(
+            Arc::new(SourceConsumer::new(handle.clone())),
+            handle.clone(),
+            test_label("orders"),
+        );
 
         handle.set_active();
         handle.set_bytes(60 * gib); // above soft
@@ -3706,9 +3794,13 @@ mod tests {
         let gib = 1024u64 * 1024 * 1024;
         let arb = MemoryArbitrator::with_policy(100 * gib, 0.50, 0.40, Box::new(Priority));
         let source_handle = ConsumerHandle::new();
-        arb.register_consumer(Arc::new(SourceConsumer::new(source_handle.clone())));
+        arb.register_consumer(
+            Arc::new(SourceConsumer::new(source_handle.clone())),
+            source_handle.clone(),
+            test_label("orders"),
+        );
         let reclaimable = Arc::new(ReclaimableMock::new(60 * gib, 0));
-        arb.register_consumer(reclaimable.clone());
+        register_charged(&arb, reclaimable.clone());
 
         arb.set_peak_rss_for_test(60 * gib); // trip the peak-based spill arm
         arb.poll_arbitration();
@@ -3735,9 +3827,13 @@ mod tests {
             Box::new(BackPressurePreferred::wrapping(Priority)),
         );
         let source_handle = ConsumerHandle::new();
-        arb.register_consumer(Arc::new(SourceConsumer::new(source_handle.clone())));
+        arb.register_consumer(
+            Arc::new(SourceConsumer::new(source_handle.clone())),
+            source_handle.clone(),
+            test_label("orders"),
+        );
         let reclaimable = Arc::new(ReclaimableMock::new(4096, 0));
-        arb.register_consumer(reclaimable.clone());
+        register_charged(&arb, reclaimable.clone());
 
         arb.spill_reclaimable(0);
         assert!(!reclaimable.was_spilled(), "a zero target must be a no-op");

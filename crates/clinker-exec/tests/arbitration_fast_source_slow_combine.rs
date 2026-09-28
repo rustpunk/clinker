@@ -17,7 +17,15 @@ use clinker_exec::pipeline::memory::{
     BackPressurePreferred, ConsumerHandle, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
     Priority,
 };
+use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface};
 use std::sync::Arc;
+
+fn label(node: &str, surface: MemorySurface) -> ConsumerLabel {
+    ConsumerLabel {
+        node: node.to_string(),
+        surface,
+    }
+}
 
 /// Aggregate-shaped consumer for the test — non-back-pressureable, reports a
 /// fixed in-memory footprint via its handle. Records whether the arbitrator
@@ -57,7 +65,11 @@ fn source_pauses_on_current_pressure_and_resumes_below_the_resume_watermark() {
 
     let source_handle = ConsumerHandle::new();
     source_handle.set_bytes(64 * 1024);
-    arbitrator.register_consumer(Arc::new(SourceConsumer::new(source_handle.clone())));
+    arbitrator.register_consumer(
+        Arc::new(SourceConsumer::new(source_handle.clone())),
+        source_handle.clone(),
+        label("orders", MemorySurface::RowsRead),
+    );
 
     // Aggregate charged above the soft limit so `sum_consumer_usage` — and
     // therefore `current_pressure()` — sits over the 50 GiB soft threshold.
@@ -66,7 +78,11 @@ fn source_pauses_on_current_pressure_and_resumes_below_the_resume_watermark() {
     let aggregate = Arc::new(AggregateLike {
         handle: aggregate_handle.clone(),
     });
-    arbitrator.register_consumer(aggregate.clone());
+    arbitrator.register_consumer(
+        aggregate.clone(),
+        aggregate_handle.clone(),
+        label("totals", MemorySurface::GroupState),
+    );
 
     // A seeded peak keeps `should_spill` tripped for the whole test (peak is
     // monotonic), so its arbitration round always runs; the pause/resume
@@ -112,13 +128,21 @@ fn an_actively_drained_source_is_exempt_from_pause() {
     );
 
     let source_handle = ConsumerHandle::new();
-    arbitrator.register_consumer(Arc::new(SourceConsumer::new(source_handle.clone())));
+    arbitrator.register_consumer(
+        Arc::new(SourceConsumer::new(source_handle.clone())),
+        source_handle.clone(),
+        label("orders", MemorySurface::RowsRead),
+    );
 
     let aggregate_handle = ConsumerHandle::new();
     aggregate_handle.set_bytes(60 * GIB); // current pressure over soft
-    arbitrator.register_consumer(Arc::new(AggregateLike {
-        handle: aggregate_handle.clone(),
-    }));
+    arbitrator.register_consumer(
+        Arc::new(AggregateLike {
+            handle: aggregate_handle.clone(),
+        }),
+        aggregate_handle.clone(),
+        label("totals", MemorySurface::GroupState),
+    );
 
     arbitrator.set_peak_rss_for_test(75 * GIB);
 

@@ -1142,10 +1142,14 @@ impl PipelineExecutor {
                     ),
                 };
                 let source_consumer_id = memory_budget.register_node_consumer(
-                    &src_cfg.name,
                     Arc::new(crate::executor::source_stream::SourceConsumer::new(
                         Arc::clone(&source_consumer_handle),
                     )),
+                    Arc::clone(&source_consumer_handle),
+                    clinker_plan::runtime_error::ConsumerLabel {
+                        node: src_cfg.name.clone(),
+                        surface: clinker_plan::runtime_error::MemorySurface::RowsRead,
+                    },
                 );
                 source_records.insert(src_cfg.name.clone(), rx);
                 source_consumers.insert(
@@ -1784,10 +1788,17 @@ impl PipelineExecutor {
             // #301. Matches `admit_node_buffer`'s posture.
             let charge_handle = crate::pipeline::memory::ConsumerHandle::new();
             let charge_consumer_id = memory_budget.register_node_consumer(
-                &spec.producer_name,
                 Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
                     charge_handle.clone(),
                 )),
+                charge_handle.clone(),
+                clinker_plan::runtime_error::ConsumerLabel {
+                    node: spec.producer_name.clone(),
+                    surface: clinker_plan::runtime_error::MemorySurface::BufferedRows {
+                        from: spec.producer_name.clone(),
+                        to: spec.output_name.clone(),
+                    },
+                },
             );
             let writer_charge_handle = charge_handle.clone();
             let telemetry_producer = params.telemetry_producer.clone();

@@ -83,6 +83,7 @@ use clinker_plan::config::pipeline_node::CullBody;
 use clinker_plan::config::{SortField, SortOrder};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode, single_predecessor};
+use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface};
 
 /// Spill priority for the Cull group buffer: between grace-hash (`10`) and
 /// external sort (`20`), matching Reshape. A grouped record buffer is
@@ -262,9 +263,14 @@ where
     // Register the group buffer with the arbitrator only after the
     // empty-input guard, so the no-work path never leaks a consumer.
     let handle = ConsumerHandle::new();
-    let consumer_id = ctx
-        .memory_budget
-        .register_node_consumer(name, Arc::new(CullConsumer::new(handle.clone())));
+    let consumer_id = ctx.memory_budget.register_node_consumer(
+        Arc::new(CullConsumer::new(handle.clone())),
+        handle.clone(),
+        ConsumerLabel {
+            node: name.to_string(),
+            surface: MemorySurface::DecisionState,
+        },
+    );
 
     // Every exit path past this point must deregister `consumer_id`, so the
     // grouping/finalize work runs inside a helper whose result is matched

@@ -43,6 +43,24 @@ impl crate::pipeline::memory::MemoryConsumer for PinnedUsage {
     }
 }
 
+/// Register a [`PinnedUsage`] of `bytes`, charged through its handle at
+/// registration.
+fn register_pinned(
+    arbitrator: &crate::pipeline::memory::MemoryArbitrator,
+    bytes: u64,
+) -> crate::pipeline::memory::ConsumerId {
+    let handle = crate::pipeline::memory::ConsumerHandle::new();
+    handle.set_bytes(bytes);
+    arbitrator.register_consumer(
+        Arc::new(PinnedUsage(bytes)),
+        handle,
+        clinker_plan::runtime_error::ConsumerLabel {
+            node: "pinned".to_string(),
+            surface: clinker_plan::runtime_error::MemorySurface::GroupState,
+        },
+    )
+}
+
 fn quiet_arbitrator() -> Arc<crate::pipeline::memory::MemoryArbitrator> {
     Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
         HARD_LIMIT,
@@ -67,7 +85,7 @@ fn materialization_rejection_arbitrator(
     // The sole nonempty source's admitted document survives in punctuation
     // owners even after its body rows spill. Leave exactly that measured charge.
     let pinned_bytes = HARD_LIMIT - row_bytes + 1 - document_bytes;
-    let id = arbitrator.register_consumer(Arc::new(PinnedUsage(pinned_bytes)));
+    let id = register_pinned(&arbitrator, pinned_bytes);
     (arbitrator, id, pinned_bytes)
 }
 
@@ -80,7 +98,7 @@ fn canonicalization_overlap_rejection_arbitrator(
 ) {
     let arbitrator = quiet_arbitrator();
     let pinned_bytes = HARD_LIMIT - 2 * batch_bytes + 1;
-    let id = arbitrator.register_consumer(Arc::new(PinnedUsage(pinned_bytes)));
+    let id = register_pinned(&arbitrator, pinned_bytes);
     (arbitrator, id, pinned_bytes)
 }
 

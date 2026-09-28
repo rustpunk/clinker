@@ -348,7 +348,7 @@ impl MemoryArbitrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::memory::NoOpPolicy;
+    use crate::pipeline::memory::{ConsumerHandle, ConsumerSpillError, MemoryConsumer, NoOpPolicy};
     use clinker_plan::runtime_error::MemorySurface;
     use std::sync::Barrier;
 
@@ -881,6 +881,171 @@ mod tests {
         assert_holders_cover_charged(&snapshot);
         drop(b_grant);
         drop(run);
+    }
+
+    /// A consumer whose charge is its handle's, as every production consumer's
+    /// is.
+    struct HandleConsumer(Arc<ConsumerHandle>);
+
+    impl MemoryConsumer for HandleConsumer {
+        fn current_usage(&self) -> u64 {
+            self.0.bytes()
+        }
+        fn peak_charged_bytes(&self) -> Option<u64> {
+            Some(self.0.peak_bytes())
+        }
+        fn spill_priority(&self) -> i32 {
+            0
+        }
+        fn try_spill(&self, _: u64) -> Result<u64, ConsumerSpillError> {
+            Ok(0)
+        }
+        fn can_back_pressure(&self) -> bool {
+            false
+        }
+    }
+
+    /// Register a node consumer charging through a fresh handle.
+    fn register_node(
+        arbitrator: &MemoryArbitrator,
+        node: &str,
+    ) -> (Arc<ConsumerHandle>, ConsumerId) {
+        let handle = ConsumerHandle::new();
+        let id = arbitrator.register_node_consumer(
+            Arc::new(HandleConsumer(Arc::clone(&handle))),
+            Arc::clone(&handle),
+            label(node, MemorySurface::GroupState),
+        );
+        (handle, id)
+    }
+
+    #[test]
+    fn handle_and_governed_charges_share_one_limit() {
+        let limit = MIB;
+        let arbitrator = arbitrator(limit);
+        let (handle, id) = register_node(&arbitrator, "totals");
+        for iteration in 0..1_000 {
+            for (bytes, expected) in [(limit / 2 + 1, 1), (limit / 2, 2)] {
+                let barrier = Barrier::new(2);
+                let (grown, granted) = std::thread::scope(|scope| {
+                    let grower = scope.spawn(|| {
+                        barrier.wait();
+                        handle.try_grow(bytes).is_ok()
+                    });
+                    let requester = scope.spawn(|| {
+                        barrier.wait();
+                        arbitrator.reserve(bytes, governed())
+                    });
+                    (
+                        grower.join().expect("grower thread"),
+                        requester.join().expect("requester thread"),
+                    )
+                });
+                let succeeded = usize::from(grown) + usize::from(granted.is_ok());
+                assert_eq!(
+                    succeeded, expected,
+                    "iteration {iteration}: a handle growth and a governed request of {bytes} \
+                     bytes each under a {limit}-byte limit"
+                );
+                assert_eq!(
+                    arbitrator.charged_bytes(),
+                    succeeded as u64 * bytes,
+                    "the ledger charges exactly what was granted"
+                );
+                if grown {
+                    handle.shrink(bytes);
+                }
+                drop(granted);
+                assert_eq!(arbitrator.charged_bytes(), 0);
+            }
+        }
+        arbitrator.unregister_consumer(id);
+    }
+
+    #[test]
+    fn unregister_releases_its_charge() {
+        let arbitrator = arbitrator(MIB);
+        let run = arbitrator.reserve(KIB, governed()).expect("fits");
+        let before = arbitrator.charged_bytes();
+        let (handle, id) = register_node(&arbitrator, "totals");
+        handle.try_grow(8 * KIB).expect("fits");
+        assert_eq!(arbitrator.charged_bytes(), before + 8 * KIB);
+        let epoch = arbitrator.release_epoch();
+        assert!(arbitrator.unregister_consumer(id).is_some());
+        assert_eq!(
+            arbitrator.charged_bytes(),
+            before,
+            "unregistering returns its handle's charge"
+        );
+        assert_eq!(
+            arbitrator.release_epoch(),
+            epoch + 1,
+            "returning the charge is one release"
+        );
+        drop(run);
+        assert_eq!(arbitrator.charged_bytes(), 0);
+    }
+
+    #[test]
+    fn bound_handle_peak_rises_on_try_grow_and_try_resize() {
+        let arbitrator = arbitrator(MIB);
+
+        let (sorted, sorted_id) = register_node(&arbitrator, "dept_totals");
+        sorted.try_grow(4 * KIB).expect("fits");
+        sorted.try_resize(12 * KIB).expect("fits");
+        assert_eq!(sorted.peak_bytes(), 12 * KIB);
+        sorted.shrink(8 * KIB);
+        assert_eq!(sorted.bytes(), 4 * KIB);
+        assert_eq!(
+            sorted.peak_bytes(),
+            12 * KIB,
+            "a shrink never lowers the mark"
+        );
+        arbitrator.unregister_consumer(sorted_id);
+        assert_eq!(
+            sorted.peak_bytes(),
+            12 * KIB,
+            "unregistration never lowers the mark"
+        );
+        assert_eq!(
+            arbitrator.per_node_peak_charged_bytes().get("dept_totals"),
+            Some(&(12 * KIB)),
+            "the node reports its consumer's mark under its label's node"
+        );
+
+        // The mark covers the handle's charge and the grants made in the
+        // consumer's name at one instant.
+        let (reader, reader_id) = register_node(&arbitrator, "by_region");
+        reader.try_resize(12 * KIB).expect("fits");
+        reader.shrink(8 * KIB);
+        let mut grant = arbitrator
+            .reserve(6 * KIB, Requester::for_consumer(reader_id))
+            .expect("fits");
+        assert_eq!(
+            reader.peak_bytes(),
+            12 * KIB,
+            "4 KiB held plus 6 KiB granted stays under the 12 KiB mark"
+        );
+        grant.try_grow(2 * KIB).expect("fits");
+        assert_eq!(
+            reader.peak_bytes(),
+            12 * KIB,
+            "reaching the mark is not passing it"
+        );
+        grant.try_grow(2 * KIB).expect("fits");
+        assert_eq!(
+            reader.peak_bytes(),
+            14 * KIB,
+            "4 KiB held plus 10 KiB granted passes the mark"
+        );
+        drop(grant);
+        arbitrator.unregister_consumer(reader_id);
+        assert_eq!(reader.peak_bytes(), 14 * KIB);
+        assert_eq!(
+            arbitrator.per_node_peak_charged_bytes().get("by_region"),
+            Some(&(14 * KIB))
+        );
+        assert_eq!(arbitrator.charged_bytes(), 0);
     }
 
     #[test]

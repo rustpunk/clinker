@@ -14,6 +14,7 @@
 use clinker_exec::pipeline::memory::{
     ConsumerHandle, ConsumerSpillError, MemoryArbitrator, MemoryConsumer, Priority,
 };
+use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface};
 use std::sync::Arc;
 
 struct StuckAggregate {
@@ -41,6 +42,13 @@ impl MemoryConsumer for StuckAggregate {
     }
 }
 
+fn label(node: &str) -> ConsumerLabel {
+    ConsumerLabel {
+        node: node.to_string(),
+        surface: MemorySurface::GroupState,
+    }
+}
+
 // Tests use limits in the hundreds of GiB so the real process RSS
 // (which `observe()` reads via `rss_bytes()` and folds into
 // `peak_rss` via `fetch_max`) cannot push the counter above our
@@ -55,9 +63,13 @@ fn should_abort_trips_when_rss_exceeds_hard_limit() {
 
     let handle = ConsumerHandle::new();
     handle.set_bytes(64 * 1024);
-    arbitrator.register_consumer(Arc::new(StuckAggregate {
-        handle: handle.clone(),
-    }));
+    arbitrator.register_consumer(
+        Arc::new(StuckAggregate {
+            handle: handle.clone(),
+        }),
+        handle.clone(),
+        label("stuck_totals"),
+    );
 
     // Push peak RSS just over the hard limit.
     arbitrator.set_peak_rss_for_test(HARD_LIMIT + 1024);
@@ -76,9 +88,13 @@ fn soft_limit_arbitration_runs_before_hard_limit_aborts() {
 
     let handle = ConsumerHandle::new();
     handle.set_bytes(64 * 1024);
-    arbitrator.register_consumer(Arc::new(StuckAggregate {
-        handle: handle.clone(),
-    }));
+    arbitrator.register_consumer(
+        Arc::new(StuckAggregate {
+            handle: handle.clone(),
+        }),
+        handle.clone(),
+        label("stuck_totals"),
+    );
 
     // Peak RSS above soft limit (50 GiB) but below hard limit (100 GiB).
     arbitrator.set_peak_rss_for_test(75 * 1024 * 1024 * 1024);

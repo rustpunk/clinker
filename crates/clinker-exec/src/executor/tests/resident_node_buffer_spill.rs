@@ -47,7 +47,17 @@ fn memory_slot(s: &SharedStorage<Schema>, rows: &[(i64, &str, u64)]) -> NodeBuff
 /// Register a `NodeBufferConsumer` sharing `handle` and return its id, so
 /// the sweep's `consumer_ids` map mirrors the production registration shape.
 fn register(arb: &MemoryArbitrator, handle: &Arc<ConsumerHandle>) -> ConsumerId {
-    arb.register_consumer(Arc::new(NodeBufferConsumer::new(handle.clone())))
+    arb.register_consumer(
+        Arc::new(NodeBufferConsumer::new(handle.clone())),
+        handle.clone(),
+        clinker_plan::runtime_error::ConsumerLabel {
+            node: "producer".to_string(),
+            surface: clinker_plan::runtime_error::MemorySurface::BufferedRows {
+                from: "producer".to_string(),
+                to: "reader".to_string(),
+            },
+        },
+    )
 }
 
 #[test]

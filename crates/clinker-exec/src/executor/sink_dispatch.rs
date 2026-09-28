@@ -1876,7 +1876,16 @@ mod tests {
             0.70,
             Box::new(crate::pipeline::memory::NoOpPolicy),
         ));
-        let baseline_id = budget.register_consumer(Arc::new(FixedUsage(baseline_usage)));
+        let baseline_handle = crate::pipeline::memory::ConsumerHandle::new();
+        baseline_handle.set_bytes(baseline_usage);
+        let baseline_id = budget.register_consumer(
+            Arc::new(FixedUsage(baseline_usage)),
+            baseline_handle,
+            clinker_plan::runtime_error::ConsumerLabel {
+                node: "baseline".to_string(),
+                surface: clinker_plan::runtime_error::MemorySurface::GroupState,
+            },
+        );
 
         match reserve_node_buffer_materialization(clone_bytes, &budget, "ordinary_out") {
             Err(PipelineError::MemoryBudgetExceeded {

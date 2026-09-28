@@ -18,6 +18,7 @@
 use clinker_exec::pipeline::memory::{
     ConsumerHandle, ConsumerSpillError, MemoryArbitrator, MemoryConsumer, NoOpPolicy,
 };
+use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface};
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use std::sync::Arc;
 
@@ -56,7 +57,16 @@ fn build_arbitrator(n: usize) -> MemoryArbitrator {
     let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
     for i in 0..n {
         let priority = (i % 4) as i32 * 10;
-        arbitrator.register_consumer(Arc::new(FakeConsumer::new(priority)));
+        let consumer = Arc::new(FakeConsumer::new(priority));
+        let handle = Arc::clone(&consumer.handle);
+        arbitrator.register_consumer(
+            consumer,
+            handle,
+            ConsumerLabel {
+                node: format!("node_{i}"),
+                surface: MemorySurface::GroupState,
+            },
+        );
     }
     arbitrator
 }

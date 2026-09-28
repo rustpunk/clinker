@@ -1133,7 +1133,14 @@ mod memory_consumer_contract_tests {
         let consumer = Arc::new(CredentialRegistryConsumer::new(Arc::clone(&handle)));
         let arbitrator =
             MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, MemoryArbitrator::default_policy());
-        let consumer_id = arbitrator.register_consumer(consumer.clone());
+        let consumer_id = arbitrator.register_consumer(
+            consumer.clone(),
+            Arc::clone(&handle),
+            clinker_plan::runtime_error::ConsumerLabel {
+                node: "credentials".to_string(),
+                surface: clinker_plan::runtime_error::MemorySurface::CredentialRegistry,
+            },
+        );
 
         let result = consumer.try_spill(2_048);
 
@@ -1235,7 +1242,14 @@ where
         let memory_handle = ConsumerHandle::new();
         memory_handle.set_bytes(table_bytes);
         let consumer = Arc::new(CredentialRegistryConsumer::new(Arc::clone(&memory_handle)));
-        let consumer_id = arbitrator.register_consumer(consumer.clone());
+        let consumer_id = arbitrator.register_consumer(
+            consumer.clone(),
+            Arc::clone(&memory_handle),
+            clinker_plan::runtime_error::ConsumerLabel {
+                node: "credentials".to_string(),
+                surface: clinker_plan::runtime_error::MemorySurface::CredentialRegistry,
+            },
+        );
         Ok(Self {
             arbitrator,
             catalog,

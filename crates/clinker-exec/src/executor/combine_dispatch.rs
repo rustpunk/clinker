@@ -39,6 +39,7 @@ use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{
     ExecutionPlanDag, OutputOrderPromise, PlanNode, assert_order_contract, matches_upstream_name,
 };
+use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface};
 
 /// Cap on matches collected per driver row under `match: collect` before
 /// truncation. 10K mirrors the module constants in `pipeline/combine.rs`
@@ -672,10 +673,14 @@ where
             // single block-pair plus kernel aux that still cannot fit.
             let ie_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
             let ie_consumer_id = ctx.memory_budget.register_node_consumer(
-                name,
                 Arc::new(crate::pipeline::sort_buffer::SortConsumer::new(
                     ie_consumer_handle.clone(),
                 )),
+                ie_consumer_handle.clone(),
+                ConsumerLabel {
+                    node: name.to_string(),
+                    surface: MemorySurface::JoinState,
+                },
             );
             // Every exit past this registration must unregister the
             // consumer, so the kernel-install-through-admit body runs
@@ -841,10 +846,14 @@ where
             // spill_partition transition.
             let grace_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
             let grace_consumer_id = ctx.memory_budget.register_node_consumer(
-                name,
                 Arc::new(crate::pipeline::grace_hash::GraceHashConsumer::new(
                     grace_consumer_handle.clone(),
                 )),
+                grace_consumer_handle.clone(),
+                ConsumerLabel {
+                    node: name.to_string(),
+                    surface: MemorySurface::JoinBuildSide,
+                },
             );
             // Every exit past this registration must unregister the
             // consumer, so the kernel-install-through-admit body runs
@@ -978,10 +987,14 @@ where
             // counter at every push / spill transition.
             let sm_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
             let sm_consumer_id = ctx.memory_budget.register_node_consumer(
-                name,
                 Arc::new(crate::pipeline::sort_merge_join::SortMergeConsumer::new(
                     sm_consumer_handle.clone(),
                 )),
+                sm_consumer_handle.clone(),
+                ConsumerLabel {
+                    node: name.to_string(),
+                    surface: MemorySurface::JoinState,
+                },
             );
             // Every exit past this registration must unregister the
             // consumer, so the kernel-install-through-admit body runs
@@ -1124,10 +1137,14 @@ where
     // arbitrator's registry tracks live tables only.
     let inline_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
     let inline_consumer_id = ctx.memory_budget.register_node_consumer(
-        name,
         Arc::new(crate::pipeline::combine::CombineHashConsumer::new(
             inline_consumer_handle.clone(),
         )),
+        inline_consumer_handle.clone(),
+        ConsumerLabel {
+            node: name.to_string(),
+            surface: MemorySurface::JoinBuildSide,
+        },
     );
     // Every exit past this registration must unregister the
     // consumer, so the hash-build-through-admit body runs inside a
@@ -1565,8 +1582,11 @@ fn run_streaming_combine_probe(
     // producer's index, so its dispatch arm streams into it with no
     // producer-side change. The probe thread's per-record `sub_bytes`
     // discharge nets the producer's per-batch charge to zero.
-    let (rx, charge_handle, charge_consumer_id) =
-        ctx.install_streaming_ingest_channel(producer_idx, current_dag.graph[producer_idx].name());
+    let (rx, charge_handle, charge_consumer_id) = ctx.install_streaming_ingest_channel(
+        producer_idx,
+        current_dag.graph[producer_idx].name(),
+        name,
+    );
 
     // Copy the stable-context references out of `ctx` before the scope so
     // the probe thread borrows `&'a StableEvalContext` directly (shared,
@@ -2920,9 +2940,15 @@ fn adopt_spilled_runs_into_node_buffer(
     // later drain unregisters through the same path `admit_node_buffer` sets up.
     let handle = crate::pipeline::memory::ConsumerHandle::new();
     handle.set_bytes(0);
-    let consumer_id = ctx.memory_budget.register_node_consumer(
+    let label = ctx.planned_node_buffer_readers.slot_label(
         combine_name,
+        &node_idx.into(),
+        &ctx.composition_call_sites,
+    );
+    let consumer_id = ctx.memory_budget.register_node_consumer(
         Arc::new(NodeBufferConsumer::new(handle.clone())),
+        handle.clone(),
+        label,
     );
     ctx.node_buffer_consumer_ids
         .insert(node_idx.into(), (consumer_id, handle));

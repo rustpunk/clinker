@@ -915,8 +915,12 @@ pub(crate) fn reserve_node_buffer_materialization(
     let handle = crate::pipeline::memory::ConsumerHandle::new();
     handle.set_bytes(reserved_bytes);
     let consumer_id = budget.register_node_consumer(
-        node,
         std::sync::Arc::new(TransientNodeBufferConsumer::new(handle.clone())),
+        handle.clone(),
+        clinker_plan::runtime_error::ConsumerLabel {
+            node: node.to_string(),
+            surface: clinker_plan::runtime_error::MemorySurface::ScanMaterialization,
+        },
     );
     budget.sample_peak_consumer_usage();
     let reservation = TransientNodeBufferReservation {
@@ -1824,7 +1828,7 @@ mod tests {
         ));
         // A fixed registered footprint makes the charged-pressure projection
         // exact. The requested materialization crosses the limit by one byte.
-        let baseline_id = budget.register_consumer(Arc::new(FixedUsageConsumer(baseline_usage)));
+        let baseline_id = register_fixed(&budget, baseline_usage);
 
         match reserve_node_buffer_materialization(reserved_bytes, &budget, "clone_site") {
             Err(PipelineError::MemoryBudgetExceeded {
@@ -1996,7 +2000,7 @@ mod tests {
             "plain_memory",
         )
         .expect("initial slot charge fits");
-        let baseline = budget.register_consumer(Arc::new(FixedUsageConsumer(hard)));
+        let baseline = register_fixed(&budget, hard);
 
         reservation
             .reserve_additional(0, "plain_memory")
@@ -2168,6 +2172,24 @@ mod tests {
     /// test can stage `sum_consumer_usage()` at a chosen value without
     /// standing up a real spilling operator.
     struct FixedUsageConsumer(u64);
+
+    /// Register a [`FixedUsageConsumer`] of `bytes`, charged through its
+    /// handle at registration.
+    fn register_fixed(
+        budget: &crate::pipeline::memory::MemoryArbitrator,
+        bytes: u64,
+    ) -> crate::pipeline::memory::ConsumerId {
+        let handle = crate::pipeline::memory::ConsumerHandle::new();
+        handle.set_bytes(bytes);
+        budget.register_consumer(
+            Arc::new(FixedUsageConsumer(bytes)),
+            handle,
+            clinker_plan::runtime_error::ConsumerLabel {
+                node: "baseline".to_string(),
+                surface: clinker_plan::runtime_error::MemorySurface::GroupState,
+            },
+        )
+    }
 
     impl crate::pipeline::memory::MemoryConsumer for FixedUsageConsumer {
         fn current_usage(&self) -> u64 {

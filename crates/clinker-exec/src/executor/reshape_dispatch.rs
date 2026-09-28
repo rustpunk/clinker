@@ -72,6 +72,7 @@ use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{
     CompiledReshapeRule, ExecutionPlanDag, PlanNode, single_predecessor,
 };
+use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface};
 
 use crate::executor::NullStorage;
 
@@ -285,9 +286,14 @@ where
     // handle's byte counter tracks live resident-group bytes; the wrapper
     // reads it on every arbitration round.
     let handle = ConsumerHandle::new();
-    let consumer_id = ctx
-        .memory_budget
-        .register_node_consumer(name, Arc::new(ReshapeConsumer::new(handle.clone())));
+    let consumer_id = ctx.memory_budget.register_node_consumer(
+        Arc::new(ReshapeConsumer::new(handle.clone())),
+        handle.clone(),
+        ConsumerLabel {
+            node: name.to_string(),
+            surface: MemorySurface::ReshapeGroups,
+        },
+    );
 
     // Every exit path past this point must deregister `consumer_id`, so the
     // grouping/finalize work runs inside a closure whose result is matched

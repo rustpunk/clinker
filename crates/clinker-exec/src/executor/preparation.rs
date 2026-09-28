@@ -411,9 +411,16 @@ impl ExecutorResources {
     ) -> Result<Self, ResourceError> {
         let handle = ConsumerHandle::new();
         arbitrator.attach_writer_handle(handle.clone())?;
-        let id = arbitrator.register_consumer(Arc::new(WriterResourceConsumer {
-            handle: handle.clone(),
-        }));
+        let id = arbitrator.register_consumer(
+            Arc::new(WriterResourceConsumer {
+                handle: handle.clone(),
+            }),
+            handle.clone(),
+            clinker_plan::runtime_error::ConsumerLabel {
+                node: "output".to_string(),
+                surface: clinker_plan::runtime_error::MemorySurface::OutputStaging,
+            },
+        );
         arbitrator.bind_writer_consumer(id)?;
         let release = Arc::new(ReleaseAuthority {
             state: arbitrator.writer_reservation_state(),
