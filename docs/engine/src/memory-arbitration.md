@@ -47,11 +47,23 @@ their heap allocations. The handles expose neither a detachable box nor its
 lease. Tests observe the charge at allocator deallocation, including unwinding,
 rather than treating payload destruction or a final zero balance as proof.
 
-The executor admission ledger serializes reservations and limit changes. It
-subtracts sampled legacy consumer usage and outstanding writer grants before
-admitting another layout. Legacy samples remain estimates, not atomic grants.
-`writer_resource_usage()` derives current memory, peak memory, disk and
-descriptor usage from this ledger. `set_limit` refuses a limit below outstanding
+The executor admission ledger serializes reservations and limit changes.
+Governed allocations charge it through `MemoryArbitrator::reserve`, which
+checks and charges under the ledger's one lock and returns a `Grant` or a
+`Shortfall`; concurrent requesters therefore can never together pass the
+limit. Until every consumer handle charges the same ledger, `reserve` also
+subtracts the usage the other registered consumers report, sampled before the
+lock because reading it calls into them; those samples remain estimates, not
+atomic grants. A `Shortfall` charges nothing and carries a snapshot taken
+under the same lock: the limit, the charged total, each labelled holder's
+current bytes under its node name and an author-vocabulary surface, and the
+bytes no labelled holder owns, so
+the holders and that remainder add up to the charged total. A reserve made for
+a consumer is attributed to it for the life of the grant, and the ledger keeps
+each consumer's high-water mark over its handle bytes plus its attributed
+bytes; attribution never changes what is admitted. Every release advances a
+release epoch. `writer_resource_usage()` derives current memory, peak memory,
+disk and descriptor usage from this ledger. `set_limit` refuses a limit below outstanding
 writer grants and leaves the previous limit unchanged; the disk setter likewise
 refuses a quota below the sum of outstanding writer disk and legacy spill bytes.
 

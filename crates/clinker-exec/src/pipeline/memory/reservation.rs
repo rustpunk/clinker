@@ -1,8 +1,16 @@
-//! Single synchronized ledger for writer allocation, disk and descriptor grants.
-//! Legacy consumer observations are sampled outside this lock and remain estimates.
+//! Writer admission on the one memory ledger: governed allocation grants,
+//! writer disk quota and descriptors, and writer cleanup.
+//!
+//! Memory, disk and descriptors share the ledger's one lock
+//! ([`super::protocol`]); memory is admitted through
+//! [`MemoryArbitrator::reserve`]. Usage reported by consumers the ledger does
+//! not yet hold is sampled outside the lock and remains an estimate.
 
+use super::ledger::Requester;
+use super::protocol::{LedgerCore, LedgerState};
 use super::*;
 use clinker_format::preparation::{ResourceError, ResourceErrorKind};
+use clinker_plan::runtime_error::ConsumerLabel;
 
 /// Bounded run cleanup capability. Implementations retain paths and quota
 /// ownership; callbacks run without the admission or registry lock held.
@@ -21,38 +29,61 @@ pub struct WriterResourceUsage {
     pub descriptors: usize,
 }
 
+/// State kept under the ledger lock beside the charges: the managed writer
+/// consumer's handle and id. The handle mirrors the charged total, set under
+/// the same lock as every charge and release so its reported usage never
+/// lags or overtakes the ledger.
 #[derive(Default)]
-pub(super) struct ReservationLedger {
-    pub usage: WriterResourceUsage,
+pub(super) struct WriterBinding {
     pub handle: Option<Arc<ConsumerHandle>>,
     pub consumer_id: Option<ConsumerId>,
-    pub closed: bool,
 }
+
+/// The ledger as this crate instantiates it.
+pub(super) type LedgerCell = LedgerCore<ConsumerLabel, WriterBinding>;
+/// The locked ledger as this crate instantiates it.
+pub(super) type LockedLedger = LedgerState<ConsumerLabel, WriterBinding>;
 
 /// Fixed release state. It holds counters and a managed handle, never a run,
 /// telemetry arena, storage callback or retained input value.
 pub(crate) struct ReservationState {
-    pub(super) ledger: Mutex<ReservationLedger>,
+    pub(super) ledger: LedgerCell,
 }
 impl ReservationState {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(limit: u64) -> Self {
         let state = Self {
-            ledger: Mutex::new(ReservationLedger::default()),
+            ledger: LedgerCore::new(limit, WriterBinding::default()),
         };
         // Establish platform-native mutex storage at run startup.
-        drop(state.ledger.lock().unwrap_or_else(|e| e.into_inner()));
+        drop(state.ledger.lock());
         state
     }
     pub(crate) fn check_open(&self) -> Result<(), ResourceError> {
-        let ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
-        Self::require_open(&ledger)
+        Self::require_open(&self.ledger.lock())
     }
-    fn require_open(ledger: &ReservationLedger) -> Result<(), ResourceError> {
+    fn require_open(ledger: &LockedLedger) -> Result<(), ResourceError> {
         if ledger.closed {
             Err(ResourceError::new(ResourceErrorKind::Finalized, 0, 0))
         } else {
             Ok(())
         }
+    }
+    fn usage(&self) -> WriterResourceUsage {
+        let ledger = self.ledger.lock();
+        WriterResourceUsage {
+            memory: ledger.charged(),
+            peak_memory: ledger.peak_charged(),
+            disk: ledger.disk,
+            descriptors: ledger.descriptors,
+        }
+    }
+}
+
+/// Copy the charged total into the managed writer handle. Called with the
+/// ledger locked after every change to the charged total.
+pub(super) fn mirror_writer_handle(ledger: &LockedLedger) {
+    if let Some(handle) = &ledger.attachment.handle {
+        handle.set_bytes(ledger.charged());
     }
 }
 
@@ -62,26 +93,13 @@ impl ReservationState {
 pub struct WriterResourceObserver(Arc<ReservationState>);
 impl WriterResourceObserver {
     pub fn usage(&self) -> WriterResourceUsage {
-        self.0
-            .ledger
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .usage
+        self.0.usage()
     }
     pub fn is_closed(&self) -> bool {
-        self.0
-            .ledger
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .closed
+        self.0.ledger.lock().closed
     }
     pub fn has_managed_handle(&self) -> bool {
-        self.0
-            .ledger
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .handle
-            .is_some()
+        self.0.ledger.lock().attachment.handle.is_some()
     }
 }
 
@@ -120,62 +138,37 @@ impl MemoryArbitrator {
     }
 
     pub fn writer_resource_usage(&self) -> WriterResourceUsage {
-        self.admission
-            .ledger
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .usage
+        self.admission.usage()
     }
 
+    /// Admit one governed allocation of `bytes` through [`Self::reserve`],
+    /// attributed to no consumer. The caller's `AllocationLease` owns the
+    /// charge from here and returns it through
+    /// [`ReservationState::release_writer_memory`] with no attribution.
     pub(crate) fn admit_writer_memory(&self, bytes: usize) -> Result<(), ResourceError> {
-        // Consumer callbacks run before the lock. Managed consumers are omitted
-        // from this legacy sample: their grants are already in the ledger.
-        let legacy = self
-            .consumers
-            .load()
-            .iter()
-            .filter(|(_, c)| !c.is_admission_managed())
-            .fold(0u64, |sum, (_, c)| sum.saturating_add(c.current_usage()));
-        let mut ledger = self
-            .admission
-            .ledger
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        ReservationState::require_open(&ledger)?;
-        let available = self
-            .limit()
-            .saturating_sub(legacy)
-            .saturating_sub(ledger.usage.memory);
-        if bytes as u64 > available {
-            return Err(ResourceError::new(
+        match self.reserve(bytes as u64, Requester::governed()) {
+            Ok(grant) => {
+                grant.detach();
+                Ok(())
+            }
+            Err(shortfall) if shortfall.is_closed() => {
+                Err(ResourceError::new(ResourceErrorKind::Finalized, 0, 0))
+            }
+            Err(shortfall) => Err(ResourceError::new(
                 ResourceErrorKind::Budget,
                 bytes,
-                available.min(usize::MAX as u64) as usize,
-            ));
+                shortfall.available.min(usize::MAX as u64) as usize,
+            )),
         }
-        ledger.usage.memory += bytes as u64;
-        ledger.usage.peak_memory = ledger.usage.peak_memory.max(ledger.usage.memory);
-        if let Some(handle) = &ledger.handle {
-            handle.set_bytes(ledger.usage.memory);
-        }
-        self.peak_consumer_usage.fetch_max(
-            legacy.saturating_add(ledger.usage.memory),
-            Ordering::Relaxed,
-        );
-        Ok(())
     }
 
     pub(crate) fn admit_writer_disk(&self, bytes: u64) -> Result<(), ResourceError> {
-        let mut ledger = self
-            .admission
-            .ledger
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut ledger = self.admission.ledger.lock();
         ReservationState::require_open(&ledger)?;
         let available = self
             .max_spill_bytes()
             .saturating_sub(self.cumulative_spill_bytes())
-            .saturating_sub(ledger.usage.disk);
+            .saturating_sub(ledger.disk);
         if bytes > available {
             return Err(ResourceError::new(
                 ResourceErrorKind::DiskQuota,
@@ -183,21 +176,17 @@ impl MemoryArbitrator {
                 available.min(usize::MAX as u64) as usize,
             ));
         }
-        ledger.usage.disk += bytes;
+        ledger.disk += bytes;
         Ok(())
     }
 
     pub(crate) fn admit_writer_descriptor(&self, limit: usize) -> Result<(), ResourceError> {
-        let mut ledger = self
-            .admission
-            .ledger
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut ledger = self.admission.ledger.lock();
         ReservationState::require_open(&ledger)?;
-        if ledger.usage.descriptors >= limit {
+        if ledger.descriptors >= limit {
             return Err(ResourceError::new(ResourceErrorKind::DescriptorQuota, 1, 0));
         }
-        ledger.usage.descriptors += 1;
+        ledger.descriptors += 1;
         Ok(())
     }
 
@@ -205,42 +194,30 @@ impl MemoryArbitrator {
         &self,
         handle: Arc<ConsumerHandle>,
     ) -> Result<(), ResourceError> {
-        let mut ledger = self
-            .admission
-            .ledger
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut ledger = self.admission.ledger.lock();
         ReservationState::require_open(&ledger)?;
-        if ledger.handle.is_some() {
+        if ledger.attachment.handle.is_some() {
             return Err(ResourceError::new(ResourceErrorKind::Authority, 1, 0));
         }
-        ledger.handle = Some(handle);
+        ledger.attachment.handle = Some(handle);
         Ok(())
     }
     pub(crate) fn bind_writer_consumer(&self, id: ConsumerId) -> Result<(), ResourceError> {
-        let mut ledger = self
-            .admission
-            .ledger
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut ledger = self.admission.ledger.lock();
         if let Err(error) = ReservationState::require_open(&ledger) {
             drop(ledger);
             self.unregister_consumer(id);
             return Err(error);
         }
-        ledger.consumer_id = Some(id);
+        ledger.attachment.consumer_id = Some(id);
         Ok(())
     }
     pub(crate) fn detach_writer_handle(&self, id: ConsumerId) {
         let detached = {
-            let mut ledger = self
-                .admission
-                .ledger
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if ledger.consumer_id == Some(id) {
-                ledger.consumer_id = None;
-                ledger.handle = None;
+            let mut ledger = self.admission.ledger.lock();
+            if ledger.attachment.consumer_id == Some(id) {
+                ledger.attachment.consumer_id = None;
+                ledger.attachment.handle = None;
                 true
             } else {
                 false
@@ -254,14 +231,10 @@ impl MemoryArbitrator {
     /// charges remain observable and releasable; cleanup runs outside the lock.
     pub fn close_writer_resources(&self) {
         let id = {
-            let mut ledger = self
-                .admission
-                .ledger
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut ledger = self.admission.ledger.lock();
             ledger.closed = true;
-            ledger.handle = None;
-            ledger.consumer_id.take()
+            ledger.attachment.handle = None;
+            ledger.attachment.consumer_id.take()
         };
         if let Some(id) = id {
             self.unregister_consumer(id);
@@ -277,26 +250,22 @@ impl MemoryArbitrator {
 }
 
 impl ReservationState {
+    /// Release `bytes` of governed allocation charged with `attribution`,
+    /// the consumer the charge was made for (`None` for a run-scoped charge).
+    /// Advances the release epoch. Releasing in the name of a consumer whose
+    /// ledger entry is already gone lowers only the charged total.
     pub(crate) fn release_writer_memory(&self, bytes: usize, attribution: Option<ConsumerId>) {
-        let _ = attribution;
-        let mut ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
-        ledger.usage.memory -= bytes as u64;
-        if let Some(handle) = &ledger.handle {
-            handle.set_bytes(ledger.usage.memory);
-        }
+        self.release_memory(bytes as u64, attribution);
+    }
+    pub(super) fn release_memory(&self, bytes: u64, attribution: Option<ConsumerId>) {
+        let mut ledger = self.ledger.lock();
+        ledger.release(bytes, attribution.map(|id| id.0));
+        mirror_writer_handle(&ledger);
     }
     pub(crate) fn release_writer_disk(&self, bytes: u64) {
-        self.ledger
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .usage
-            .disk -= bytes;
+        self.ledger.lock().disk -= bytes;
     }
     pub(crate) fn release_writer_descriptor(&self) {
-        self.ledger
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .usage
-            .descriptors -= 1;
+        self.ledger.lock().descriptors -= 1;
     }
 }

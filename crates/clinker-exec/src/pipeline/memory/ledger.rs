@@ -4,12 +4,16 @@
 //! The ledger holds charged byte counts, a release epoch and, per consumer,
 //! the bytes charged in its name and their high-water mark. It never holds
 //! records, RSS readings or cleanup callbacks, and nothing that performs I/O
-//! runs under its lock.
+//! runs under its lock. Its synchronized state is [`super::protocol`]; this
+//! module turns raw consumer ids into [`ConsumerId`]s and refusals into
+//! [`Shortfall`]s.
 
-use super::reservation::ReservationState;
+use super::protocol::Refusal;
+use super::reservation::{LockedLedger, ReservationState, mirror_writer_handle};
 use super::{ConsumerId, MemoryArbitrator};
 use clinker_plan::runtime_error::ConsumerLabel;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 /// Whose request a [`MemoryArbitrator::reserve`] is.
 ///
@@ -38,10 +42,11 @@ impl Requester {
 
 /// Bytes charged to the ledger and not yet released.
 ///
-/// Dropping the grant releases its bytes, lowers the charged figure of the
-/// consumer it was attributed to and advances the ledger's release epoch. The
-/// grant holds only the ledger's synchronized state, never the arbitrator, so
-/// a grant that outlives the run still settles the ledger when it drops.
+/// The grant keeps the attribution it was made with: growing, shrinking and
+/// dropping it adjust the same consumer's figures whatever requester is
+/// current. Dropping it releases its bytes and advances the ledger's release
+/// epoch. It holds only the ledger's synchronized state, never the
+/// arbitrator, so a grant that outlives the run still settles the ledger.
 pub struct Grant {
     state: Arc<ReservationState>,
     bytes: u64,
@@ -59,16 +64,45 @@ impl Grant {
     /// Check and charge are one step under the ledger lock: on a shortfall
     /// neither the grant nor the ledger changes. Until every consumer's
     /// handle charges the ledger, a grow is checked against the ledger's own
-    /// charges only.
+    /// charges only, not against usage consumers report outside it.
     pub fn try_grow(&mut self, n: u64) -> Result<(), Shortfall> {
-        let _ = n;
+        let mut ledger = self.state.ledger.lock();
+        if let Err(refusal) = ledger.try_charge(n, 0, self.attribution.map(|id| id.0)) {
+            return Err(shortfall(&ledger, n, self.attribution, refusal));
+        }
+        mirror_writer_handle(&ledger);
+        drop(ledger);
+        // The ledger's total covers this grant's bytes and just admitted `n`
+        // more without overflowing, so their sum fits too.
+        self.bytes += n;
         Ok(())
     }
 
     /// Release `n` of this grant's bytes (all of them when `n` exceeds what it
-    /// holds), keeping the rest charged.
+    /// holds), keeping the rest charged. A nonzero release advances the
+    /// ledger's release epoch.
     pub fn shrink(&mut self, n: u64) {
-        let _ = n;
+        let n = n.min(self.bytes);
+        if n == 0 {
+            return;
+        }
+        self.state.release_memory(n, self.attribution);
+        self.bytes -= n;
+    }
+
+    /// Hand this grant's bytes to a caller that releases them itself, through
+    /// [`ReservationState::release_writer_memory`] with the same attribution.
+    /// The grant then releases nothing when it drops.
+    pub(crate) fn detach(mut self) -> u64 {
+        std::mem::take(&mut self.bytes)
+    }
+}
+
+impl Drop for Grant {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            self.state.release_memory(self.bytes, self.attribution);
+        }
     }
 }
 
@@ -167,6 +201,53 @@ pub struct HolderSnapshot {
     pub charged: u64,
 }
 
+/// Read `ledger` into a snapshot for a request of `requested` bytes by
+/// `requester`. Called with the ledger locked; copies the holders' labels.
+fn snapshot(
+    ledger: &LockedLedger,
+    requested: u64,
+    requester: Option<ConsumerId>,
+) -> LedgerSnapshot {
+    let (holders, unattributed) = ledger.holders();
+    LedgerSnapshot {
+        limit: ledger.limit(),
+        charged: ledger.charged(),
+        requested,
+        requester,
+        holders: holders
+            .into_iter()
+            .map(|(id, label, charged)| HolderSnapshot {
+                consumer: ConsumerId(id),
+                label: label.clone(),
+                charged,
+            })
+            .collect(),
+        unattributed,
+    }
+}
+
+fn shortfall(
+    ledger: &LockedLedger,
+    requested: u64,
+    requester: Option<ConsumerId>,
+    refusal: Refusal,
+) -> Shortfall {
+    let (available, oversized, closed) = match refusal {
+        Refusal::Closed => (0, false, true),
+        Refusal::Short {
+            available,
+            oversized,
+        } => (available, oversized, false),
+    };
+    Shortfall {
+        requested,
+        available,
+        oversized,
+        snapshot: snapshot(ledger, requested, requester),
+        closed,
+    }
+}
+
 impl MemoryArbitrator {
     /// Charge `bytes` to the ledger for `requester`, or refuse without
     /// charging anything.
@@ -176,44 +257,62 @@ impl MemoryArbitrator {
     /// granted empty and never falls short. A request larger than the limit
     /// is refused as oversized. The call never blocks on anything but the
     /// ledger lock and never spills; a refusal is final for this call.
+    ///
+    /// Consumers that still report their usage outside the ledger count
+    /// against the same limit: their reports are summed before the lock is
+    /// taken, because reading them calls into the consumers.
     pub fn reserve(&self, bytes: u64, requester: Requester) -> Result<Grant, Shortfall> {
-        let _ = bytes;
+        let outside = self.usage_outside_ledger();
+        let mut ledger = self.admission.ledger.lock();
+        if let Err(refusal) = ledger.try_charge(bytes, outside, requester.consumer.map(|id| id.0)) {
+            return Err(shortfall(&ledger, bytes, requester.consumer, refusal));
+        }
+        mirror_writer_handle(&ledger);
+        let charged = ledger.charged();
+        drop(ledger);
+        self.peak_consumer_usage
+            .fetch_max(outside.saturating_add(charged), Ordering::Relaxed);
         Ok(Grant {
-            state: self.writer_reservation_state(),
-            bytes: 0,
+            state: Arc::clone(&self.admission),
+            bytes,
             attribution: requester.consumer,
         })
     }
 
+    /// Usage reported by the registered consumers whose bytes the ledger
+    /// does not hold: every consumer except the admission-managed writer
+    /// consumer, whose handle mirrors the ledger itself.
+    fn usage_outside_ledger(&self) -> u64 {
+        self.consumers
+            .load()
+            .iter()
+            .filter(|(_, consumer)| !consumer.is_admission_managed())
+            .fold(0u64, |sum, (_, consumer)| {
+                sum.saturating_add(consumer.current_usage())
+            })
+    }
+
     /// Bytes charged to the ledger now.
     pub fn charged_bytes(&self) -> u64 {
-        0
+        self.admission.ledger.lock().charged()
     }
 
     /// Highest [`Self::charged_bytes`] the ledger has held this run.
     pub fn peak_charged_bytes(&self) -> u64 {
-        0
+        self.admission.ledger.lock().peak_charged()
     }
 
     /// Read the ledger's charges under its lock, as a shortfall for a request
     /// of `requested` bytes by `requester` would report them.
     pub fn ledger_snapshot(&self, requested: u64, requester: Requester) -> LedgerSnapshot {
-        LedgerSnapshot {
-            limit: self.limit(),
-            charged: 0,
-            requested,
-            requester: requester.consumer,
-            holders: Vec::new(),
-            unattributed: 0,
-        }
+        snapshot(&self.admission.ledger.lock(), requested, requester.consumer)
     }
 
     /// High-water mark of `id`'s handle bytes plus the bytes granted in its
     /// name, raised by every charge to it and never lowered by a release.
     /// `None` when the ledger holds no entry for `id`.
     pub fn consumer_peak_charged_bytes(&self, id: ConsumerId) -> Option<u64> {
-        let _ = id;
-        None
+        self.admission.ledger.lock().consumer_mark(id.0)
     }
 }
 
@@ -223,23 +322,26 @@ impl MemoryArbitrator {
 impl MemoryArbitrator {
     /// Charge `bytes` to `id`'s handle and record its label, unchecked.
     pub(crate) fn charge_labelled_handle(&self, id: ConsumerId, label: ConsumerLabel, bytes: u64) {
-        let _ = (id, label, bytes);
+        let mut ledger = self.admission.ledger.lock();
+        ledger.charge_handle(id.0, label, bytes);
+        mirror_writer_handle(&ledger);
     }
 
     /// Release `bytes` of `id`'s handle charge.
     pub(crate) fn release_labelled_handle(&self, id: ConsumerId, bytes: u64) {
-        let _ = (id, bytes);
+        let mut ledger = self.admission.ledger.lock();
+        ledger.release_handle(id.0, bytes);
+        mirror_writer_handle(&ledger);
     }
 
     /// Remove `id`'s entry as unregistration does, returning its mark.
     pub(crate) fn forget_consumer_entry(&self, id: ConsumerId) -> Option<u64> {
-        let _ = id;
-        None
+        self.admission.ledger.lock().remove_consumer(id.0)
     }
 
     /// Number of releases the ledger has seen.
     pub(crate) fn release_epoch(&self) -> u64 {
-        0
+        self.admission.ledger.lock().release_epoch()
     }
 }
 

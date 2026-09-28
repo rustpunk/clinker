@@ -3388,7 +3388,11 @@ mod tests {
         );
 
         assert_eq!(state.held.resident_bytes(), 0, "nothing is left to flush");
-        arbitrator.set_limit(1).expect("limit");
+        // The tightest limit the ledger will take is what it already holds
+        // charged, so the next admission's growth is what overruns it.
+        arbitrator
+            .set_limit(arbitrator.charged_bytes())
+            .expect("limit");
         match state.admit_emitted(key, row(1, 99), node) {
             Err(PipelineError::MemoryBudgetExceeded { node, detail, .. }) => {
                 assert_eq!(node, "route_x");

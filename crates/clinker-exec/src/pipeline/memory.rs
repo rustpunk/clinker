@@ -29,7 +29,15 @@
 
 use arc_swap::ArcSwap;
 pub mod ledger;
+pub(crate) mod protocol;
 pub mod reservation;
+
+/// The synchronization primitives the ledger core locks through, kept behind
+/// one path so the core can be compiled against a model checker's primitives
+/// instead.
+pub(crate) mod sync {
+    pub(crate) use std::sync::{Mutex, MutexGuard};
+}
 use clinker_format::preparation::{ResourceError, ResourceErrorKind};
 use clinker_plan::plan::scheduling_hint::SchedulingHint;
 use petgraph::graph::NodeIndex;
@@ -1030,7 +1038,7 @@ impl MemoryArbitrator {
         drop(writer_cleanup.lock().unwrap_or_else(|e| e.into_inner()));
         Self {
             limit: AtomicU64::new(limit),
-            admission: Arc::new(reservation::ReservationState::new()),
+            admission: Arc::new(reservation::ReservationState::new(limit)),
             writer_cleanup,
             spill_threshold_pct,
             resume_threshold_pct,
@@ -1159,15 +1167,11 @@ impl MemoryArbitrator {
     /// overflow scenarios without spawning processes of the requested
     /// RSS size.
     pub fn set_limit(&self, n: u64) -> Result<(), ResourceError> {
-        let ledger = self
-            .admission
-            .ledger
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if n < ledger.usage.memory {
+        let mut ledger = self.admission.ledger.lock();
+        if let Err(charged) = ledger.set_limit(n) {
             return Err(ResourceError::new(
                 ResourceErrorKind::Budget,
-                ledger.usage.memory as usize,
+                charged as usize,
                 n as usize,
             ));
         }
@@ -1273,15 +1277,8 @@ impl MemoryArbitrator {
     /// construction; integration tests use it to drive E310
     /// overshoot scenarios.
     pub fn set_max_spill_bytes(&self, n: u64) -> Result<(), ResourceError> {
-        let ledger = self
-            .admission
-            .ledger
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let occupied = ledger
-            .usage
-            .disk
-            .saturating_add(self.cumulative_spill_bytes());
+        let ledger = self.admission.ledger.lock();
+        let occupied = ledger.disk.saturating_add(self.cumulative_spill_bytes());
         if n < occupied {
             return Err(ResourceError::new(
                 ResourceErrorKind::DiskQuota,
@@ -1351,11 +1348,7 @@ impl MemoryArbitrator {
     /// drops. The same `n` is added to the stage's written total
     /// ([`Self::per_stage_spill_bytes_written`]), which no release lowers.
     pub fn record_spill_bytes(&self, node: &str, n: u64) -> bool {
-        let ledger = self
-            .admission
-            .ledger
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let ledger = self.admission.ledger.lock();
         let _ =
             self.cumulative_spill_bytes
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
@@ -1379,7 +1372,7 @@ impl MemoryArbitrator {
         }
         self.cumulative_spill_bytes
             .load(Ordering::Relaxed)
-            .saturating_add(ledger.usage.disk)
+            .saturating_add(ledger.disk)
             > self.max_spill_bytes.load(Ordering::Relaxed)
     }
 
@@ -1398,11 +1391,7 @@ impl MemoryArbitrator {
     /// never charged to this node) cannot wrap the counter below other stages'
     /// live charges.
     pub fn release_spill_bytes(&self, node: &str, n: u64) {
-        let _ledger = self
-            .admission
-            .ledger
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _ledger = self.admission.ledger.lock();
         if n == 0 {
             return;
         }
