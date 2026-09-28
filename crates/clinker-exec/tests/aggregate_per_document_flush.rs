@@ -36,12 +36,18 @@
 #[path = "common/pipeline_resource_fixtures.rs"]
 mod resource_fixtures;
 
+#[cfg(feature = "test-utils")]
+#[path = "common/memory_pressure.rs"]
+mod memory_pressure;
+
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::PathBuf;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_exec::executor::{PipelineExecutor, PipelineRunParams};
+use clinker_exec::executor::{
+    ExecutionReport, MemoryTestOverrides, PipelineExecutor, PipelineRunParams,
+};
 use clinker_exec::source::multi_file::FileSlot;
 use clinker_plan::config::{CompileContext, parse_config};
 
@@ -104,6 +110,7 @@ nodes:
 /// per-group `min(payload)` state deterministically crosses Aggregate's value-
 /// heap threshold without requiring an impossible sub-materialization hard
 /// limit; the terminal projection removes the helper column again.
+#[cfg(feature = "test-utils")]
 fn count_by_category_spill_yaml(memory_limit: &str) -> String {
     // A plain literal is shared by compiled evaluation. concat constructs a
     // fresh 1 KiB value per row so Aggregate really retains per-group payloads.
@@ -167,6 +174,24 @@ fn run_multi_file_yaml(
     files: &[(&str, &str)],
     predecoded: bool,
 ) -> (Vec<String>, u64, u64, u64) {
+    let (body, report) =
+        run_multi_file_yaml_with(yaml, files, predecoded, MemoryTestOverrides::default());
+    (
+        body,
+        report.counters.ok_count,
+        report.counters.dlq_count,
+        report.cumulative_spill_bytes,
+    )
+}
+
+/// Run `yaml` over `files` with the given test memory figures, returning
+/// the sorted body lines and the run's report.
+fn run_multi_file_yaml_with(
+    yaml: &str,
+    files: &[(&str, &str)],
+    predecoded: bool,
+    memory_test: MemoryTestOverrides,
+) -> (Vec<String>, ExecutionReport) {
     let config = parse_config(yaml).expect("parse per-document aggregate pipeline");
     let plan = config
         .compile(&CompileContext::default())
@@ -205,6 +230,7 @@ fn run_multi_file_yaml(
         batch_id: "b".to_string(),
         pipeline_vars: indexmap::IndexMap::new(),
         shutdown_token: None,
+        memory_test,
         ..Default::default()
     };
 
@@ -214,12 +240,7 @@ fn run_multi_file_yaml(
     let output = buf.as_string();
     let mut body: Vec<String> = output.lines().skip(1).map(|s| s.to_string()).collect();
     body.sort();
-    (
-        body,
-        report.counters.ok_count,
-        report.counters.dlq_count,
-        report.cumulative_spill_bytes,
-    )
+    (body, report)
 }
 
 #[test]
@@ -286,12 +307,23 @@ fn single_document_emits_one_aggregate_unchanged() {
     assert_eq!(ok, 2, "single document emits one aggregate per group");
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn spilling_strategy_flushes_per_document_across_boundary() {
+    use memory_pressure::{assert_capacity_below_ample_peak, assert_spill_engaged};
+
     // Build payloads in the fused Transform so the source queue holds only
-    // categories when it admits the next file's document context. The original
-    // 96 KiB budget still faces 100 independently retained 1 KiB min(payload)
-    // values per document, forcing real Aggregate spills.
+    // categories when it admits the next file's document context. The
+    // 96 KiB budget still faces 100 independently retained 1 KiB
+    // min(payload) values per document, forcing real Aggregate spills.
+    //
+    // The budget is the run's ledger capacity under an ample `memory.limit`,
+    // kept from the limit the test ran under before capacity existed because
+    // it lies where a pressure capacity must: above what cannot spill (below
+    // 85,360 bytes the CSV decoder's 16,384-byte admission falls short and
+    // the run fails) and below the 110,000 bytes the same input charges at
+    // its peak with ample memory.
+    const CAPACITY: u64 = 96 * 1024;
     let mut doc_a = String::from("category\n");
     for i in 0..200 {
         doc_a.push_str(&format!("a{}\n", i % 100));
@@ -300,11 +332,21 @@ fn spilling_strategy_flushes_per_document_across_boundary() {
     for i in 0..200 {
         doc_b.push_str(&format!("b{}\n", i % 100));
     }
-    let yaml = count_by_category_spill_yaml("96K");
-    let (body, ok, dlq, spill_bytes) = run_multi_file_yaml(
+    let yaml = count_by_category_spill_yaml("512M");
+    let files = [("a.csv", doc_a.as_str()), ("b.csv", doc_b.as_str())];
+    let (body, report) = run_multi_file_yaml_with(
         &yaml,
-        &[("a.csv", doc_a.as_str()), ("b.csv", doc_b.as_str())],
+        &files,
         true,
+        MemoryTestOverrides::default().with_ledger_capacity(CAPACITY),
+    );
+    let (_, ample) = run_multi_file_yaml_with(&yaml, &files, true, MemoryTestOverrides::default());
+    assert_spill_engaged(&report);
+    assert_capacity_below_ample_peak(CAPACITY, &ample);
+    let (ok, dlq, spill_bytes) = (
+        report.counters.ok_count,
+        report.counters.dlq_count,
+        report.cumulative_spill_bytes,
     );
     assert_eq!(dlq, 0, "spilling run produces no DLQ entries");
     assert!(
@@ -328,20 +370,32 @@ fn spilling_strategy_flushes_per_document_across_boundary() {
     }
 }
 
+/// The ledger capacity the upstream-spill run is held to: 512 KiB.
+///
+/// The test ran under `memory.limit: 1M` before capacity existed, which is
+/// above what the same input charges with ample memory (606,000 bytes at
+/// its peak), so that figure could not force a spill on its own. 512 KiB
+/// lies below that peak and above what cannot spill: the Route's node-buffer
+/// materialization projects up to 246,000 bytes, and a capacity below that
+/// fails with E310 naming `split` instead of completing.
+#[cfg(feature = "test-utils")]
+const UPSTREAM_SPILL_CAPACITY: u64 = 512 * 1024;
+
 /// Per-document identity must survive an UPSTREAM record spill, not just the
 /// Aggregate's own accumulator spill. A multi-document CSV source fans out
 /// through a Route whose materialized branch `node_buffers` spill records to
-/// disk under a 1 MiB budget (the RSS-soft predicate from
-/// `route_fanout_soft_spill.rs`), then those re-hydrated records feed a
-/// per-document `count(*)` Aggregate. If the document context were lost on
-/// the record-half spill round-trip, every post-spill record would re-hydrate
-/// to the SYNTHETIC document and the per-document flush would fold all
-/// documents into a single cross-document group set. The per-document counts
-/// holding across the spill is the end-to-end proof that `doc_ctx` survived.
+/// disk under a small ledger capacity ([`UPSTREAM_SPILL_CAPACITY`]), then
+/// those re-hydrated records feed a per-document `count(*)` Aggregate. If
+/// the document context were lost on the record-half spill round-trip, every
+/// post-spill record would re-hydrate to the SYNTHETIC document and the
+/// per-document flush would fold all documents into a single cross-document
+/// group set. The per-document counts holding across the spill is the
+/// end-to-end proof that `doc_ctx` survived.
+#[cfg(feature = "test-utils")]
 const UPSTREAM_SPILL_YAML: &str = r#"
 pipeline:
   name: per_doc_upstream_spill
-  memory: { limit: "1M", backpressure: spill }
+  memory: { limit: "512M", backpressure: spill }
 nodes:
   - type: source
     name: events
@@ -381,19 +435,15 @@ nodes:
       include_unmapped: true
 "#;
 
-#[test]
-fn per_document_identity_survives_upstream_record_spill() {
-    // RSS-based spill predicate: with no RSS reading the upstream node_buffer
-    // never spills, so the record-half round-trip under test never fires.
-    // Skip rather than assert a false negative.
-    if clinker_exec::pipeline::memory::rss_bytes().is_none() {
-        return;
-    }
-
+/// Run the upstream-spill pipeline with the given test memory figures,
+/// returning its report and output.
+#[cfg(feature = "test-utils")]
+fn run_upstream_spill(memory_test: MemoryTestOverrides) -> (ExecutionReport, String) {
     // Two documents (one CSV file each). Document A: category x×400, y×200.
     // Document B: category x×300. A wide `payload` column inflates per-row
-    // node_buffer charge so the Route branch slot crosses the RSS soft floor
-    // and spills its records through the inter-stage SpillWriter.
+    // node_buffer charge so the run outgrows its ledger capacity and the
+    // Route branch slot spills its records through the inter-stage
+    // SpillWriter.
     let wide = "p".repeat(64);
     let mut doc_a = String::from("category,payload\n");
     for _ in 0..400 {
@@ -436,11 +486,26 @@ fn per_document_identity_survives_upstream_record_spill() {
         batch_id: "b".to_string(),
         pipeline_vars: indexmap::IndexMap::new(),
         shutdown_token: None,
+        memory_test,
         ..Default::default()
     };
 
     let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
         .expect("run upstream-spill pipeline");
+    (report, buf.as_string())
+}
+
+#[cfg(feature = "test-utils")]
+#[test]
+fn per_document_identity_survives_upstream_record_spill() {
+    use memory_pressure::{assert_capacity_below_ample_peak, assert_spill_engaged};
+
+    let (report, output) = run_upstream_spill(
+        MemoryTestOverrides::default().with_ledger_capacity(UPSTREAM_SPILL_CAPACITY),
+    );
+    let (ample, _) = run_upstream_spill(MemoryTestOverrides::default());
+    assert_spill_engaged(&report);
+    assert_capacity_below_ample_peak(UPSTREAM_SPILL_CAPACITY, &ample);
     assert_eq!(report.counters.dlq_count, 0, "no DLQ entries expected");
 
     // Fail loudly if the run stopped spilling — the test's whole point is to
@@ -448,12 +513,11 @@ fn per_document_identity_survives_upstream_record_spill() {
     // assertion below would pass vacuously.
     assert!(
         report.cumulative_spill_bytes > 0,
-        "upstream node_buffer must have spilled records under the 1 MiB budget; \
+        "upstream node_buffer must have spilled records under the low capacity; \
          cumulative_spill_bytes = {}",
         report.cumulative_spill_bytes,
     );
 
-    let output = buf.as_string();
     let mut body: Vec<String> = output.lines().skip(1).map(|s| s.to_string()).collect();
     body.sort();
     // Per-document flush: document A keeps x=400, y=200; document B keeps a

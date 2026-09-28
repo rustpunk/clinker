@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(feature = "test-utils")]
 use std::time::Duration;
 
 use clinker_bench_support::io::SharedBuffer;
@@ -24,6 +25,7 @@ use clinker_exec::executor::{
     ExecutionReport, PipelineExecutor, PipelineRunParams, SourceInput, SourceReaders,
 };
 use clinker_exec::pipeline::schema_coerce::CoercingReader;
+#[cfg(feature = "test-utils")]
 use clinker_exec::pipeline::shutdown::ShutdownToken;
 use clinker_exec::source::multi_file::FileSlot;
 use clinker_format::Column;
@@ -920,6 +922,7 @@ nodes:
     assert_eq!(resident.1, spilled.1);
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn ordered_attempt_interrupt_cleanup() {
     struct PausedRecords {
@@ -982,7 +985,7 @@ fn ordered_attempt_interrupt_cleanup() {
     let yaml = r#"
 pipeline:
   name: ordered_attempt_interrupt
-  memory: { limit: "1K", backpressure: spill }
+  memory: { limit: "512M", backpressure: spill }
 nodes:
   - type: source
     name: src
@@ -1006,7 +1009,8 @@ nodes:
     for ordinal in (1..=400).rev() {
         csv.push_str(&format!("{ordinal},{}\n", "x".repeat(256)));
     }
-    // Keep the 1K ordered-staging budget; decoding is fixture setup. Pause
+    // Keep the 1K ordered-staging budget, as ledger capacity under an ample
+    // `memory.limit`; decoding is fixture setup. Pause
     // after real staging so cancellation must clean an existing spill.
     let config = parse_config(yaml).expect("interrupt fixture parses");
     let mut readers = resource_fixtures::predecoded_csv_readers(
@@ -1034,6 +1038,8 @@ nodes:
     let params = PipelineRunParams {
         shutdown_token: Some(token.clone()),
         spill_root_dir: Some(spill_root.path().to_path_buf()),
+        memory_test: clinker_exec::executor::MemoryTestOverrides::default()
+            .with_ledger_capacity(1024),
         ..Default::default()
     };
     let (done_tx, done_rx) = std::sync::mpsc::channel();

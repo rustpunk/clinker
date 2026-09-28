@@ -13,9 +13,9 @@
 # input records to disk under pressure and re-running synthesis on reload.
 pipeline:
   name: scd_type2_backfill
-  # Include headroom for complete row groups and the prepared CSV writer.
-  # The spill policy permits disk-backed execution when memory is pressured.
-  memory: { limit: "128K", backpressure: spill }
+  # A realistic budget for this backfill. Reshape still spills its buffered
+  # groups to disk if memory runs short; the test suite forces that path.
+  memory: { limit: "64M", backpressure: spill }
 
 nodes:
   - type: source

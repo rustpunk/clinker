@@ -5,25 +5,36 @@
 //! predicate, the kept/removed split across the main and `removed_to`
 //! producer-side ports, the unchanged (unwidened) schema on both ports,
 //! bounded-memory spill under pressure, and idempotent re-run byte-equality.
+//!
+//! The memory-pressure tests hold their runs to a small ledger capacity under
+//! an ample `memory.limit`, so the startup check judges a realistic limit.
+
+#![cfg(feature = "test-utils")]
 
 #[path = "common/pipeline_resource_fixtures.rs"]
 mod resource_fixtures;
 
+#[path = "common/memory_pressure.rs"]
+mod memory_pressure;
+
 use std::collections::HashMap;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_exec::executor::{PipelineExecutor, PipelineRunParams};
+use clinker_exec::executor::{
+    ExecutionReport, MemoryTestOverrides, PipelineExecutor, PipelineRunParams,
+};
 use clinker_plan::config::{CompileContext, parse_config};
 
 /// The two rendered output streams of a Cull run: the main port (`main`) and
 /// the `removed_to` side-output port (`removed`), plus the run's cumulative
-/// on-disk spill volume.
+/// on-disk spill volume and its whole report.
 #[derive(Debug)]
 struct CullOutputs {
     main: String,
     removed: String,
     cumulative_spill_bytes: u64,
     dlq_count: u64,
+    report: ExecutionReport,
 }
 
 /// Run a single-source → cull → (main output + audit output) pipeline over
@@ -41,6 +52,16 @@ fn run_cull_result(
     yaml: &str,
     csv_input: &str,
     predecoded: bool,
+) -> Result<CullOutputs, clinker_plan::error::PipelineError> {
+    run_cull_with(yaml, csv_input, predecoded, MemoryTestOverrides::default())
+}
+
+/// [`run_cull_result`] with the given test memory figures.
+fn run_cull_with(
+    yaml: &str,
+    csv_input: &str,
+    predecoded: bool,
+    memory_test: MemoryTestOverrides,
 ) -> Result<CullOutputs, clinker_plan::error::PipelineError> {
     let config = parse_config(yaml).expect("fixture pipeline must parse");
     let plan = config
@@ -81,6 +102,7 @@ fn run_cull_result(
         batch_id: "cull-test".to_string(),
         pipeline_vars: indexmap::IndexMap::new(),
         shutdown_token: None,
+        memory_test,
         ..Default::default()
     };
     let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)?;
@@ -89,6 +111,7 @@ fn run_cull_result(
         removed: removed_buf.as_string(),
         cumulative_spill_bytes: report.cumulative_spill_bytes,
         dlq_count: report.counters.dlq_count,
+        report,
     })
 }
 
@@ -481,8 +504,9 @@ fn multi_rule_one_commented_or_combines() {
 }
 
 /// Count-threshold cull parameterized on the memory limit, with the `spill`
-/// backpressure policy so a sub-baseline limit forces the disk path. A group
-/// is removed when it holds more than 100 rows.
+/// backpressure policy; a pressure run holds it to a small ledger capacity so
+/// it takes the disk path. A group is removed when it holds more than 100
+/// rows.
 fn count_cull_pipeline(memory_limit: &str) -> String {
     format!(
         r#"
@@ -545,10 +569,22 @@ fn count_input(small_groups: usize, big_rows: usize) -> String {
     csv
 }
 
+/// The ledger capacity the Cull pressure run is held to: 448 KiB.
+///
+/// The test ran under `memory.limit: 512K` (524,288 bytes) before capacity
+/// existed, which is above what the same input charges with ample memory
+/// (462,600 bytes at its peak), so that figure could not force a spill on
+/// its own. 448 KiB lies below that peak and above what cannot spill: the
+/// 306,000-byte input scan plus the drop-decision state, which fails with
+/// E310 naming the decision state at 295,000 bytes and fits at 300,000.
+const CULL_PRESSURE_CAPACITY: u64 = 448 * 1024;
+
 #[test]
 fn cull_spills_under_memory_pressure() {
+    use memory_pressure::{assert_capacity_below_ample_peak, assert_spill_engaged};
+
     // Many small groups plus one big group (150 rows) that trips the
-    // `count(*) > 100` removal predicate. A 512 KiB budget admits the exact
+    // `count(*) > 100` removal predicate. The capacity admits the exact
     // 306,000-byte spill-backed input scan while leaving little enough
     // headroom that the cross-group resident peak evicts small groups to disk.
     // Every single group — including the big one — still fits the finalize
@@ -558,8 +594,16 @@ fn cull_spills_under_memory_pressure() {
     // transform) AND the run must report on-disk spill volume.
     let csv = count_input(200, 150);
 
-    let spilled = run_cull(&count_cull_pipeline("512K"), &csv);
+    let spilled = run_cull_with(
+        &count_cull_pipeline("512M"),
+        &csv,
+        false,
+        MemoryTestOverrides::default().with_ledger_capacity(CULL_PRESSURE_CAPACITY),
+    )
+    .expect("cull run");
     let in_memory = run_cull(&count_cull_pipeline("512M"), &csv);
+    assert_spill_engaged(&spilled.report);
+    assert_capacity_below_ample_peak(CULL_PRESSURE_CAPACITY, &in_memory.report);
 
     assert_eq!(spilled.dlq_count, 0, "spilling run produces no DLQ entries");
     assert!(
@@ -615,7 +659,7 @@ fn cull_spills_under_memory_pressure() {
 
 /// Build `groups` single-row partition groups: a huge partition cardinality
 /// over tiny raw records. The raw-record buffer stays small per group (one row
-/// each) and spills freely under a sub-baseline `spill` budget, isolating the
+/// each) and spills freely under a small budget, isolating the
 /// O(groups) drop-decision aggregate as the state under test.
 fn distinct_group_input(groups: usize) -> String {
     let mut csv = String::from("account\n");
@@ -673,7 +717,8 @@ nodes:
 
 #[test]
 fn cull_decision_state_fails_loud_when_group_cardinality_exceeds_budget() {
-    // 20_000 single-row groups. A 5 MiB limit admits the input's exact
+    // 20_000 single-row groups. The run is held to 5 MiB of ledger capacity
+    // under an ample `memory.limit`. 5 MiB admits the input's exact
     // 4,320,000-byte scan materialization, but not that input plus the
     // additional O(distinct groups) drop-decision aggregate. The decision
     // state runs in-memory and can neither spill nor back-pressure, so the
@@ -681,8 +726,13 @@ fn cull_decision_state_fails_loud_when_group_cardinality_exceeds_budget() {
     // state — not an OOM crash or truncated result. (`count(*) > 100` never
     // fires for one-row groups.)
     let csv = distinct_group_input(20_000);
-    let err = run_cull_result(&decision_state_cull_pipeline("5M"), &csv, true)
-        .expect_err("an O(groups) decision state above the budget must fail loud");
+    let err = run_cull_with(
+        &decision_state_cull_pipeline("512M"),
+        &csv,
+        true,
+        MemoryTestOverrides::default().with_ledger_capacity(5 * 1024 * 1024),
+    )
+    .expect_err("an O(groups) decision state above the budget must fail loud");
     match &err {
         clinker_plan::error::PipelineError::MemoryBudgetExceeded {
             node,
@@ -733,11 +783,17 @@ fn cull_giant_group_exceeds_budget_fails_loud() {
     // reload gate. An internal error would misreport an ordinary configured-
     // limit overrun as an engine invariant violation.
     let csv = single_giant_group_input(2_000);
-    // 1 MiB admits the input's exact 816,000-byte fixed-width scan, but the
-    // Cull buffer's heap-aware accounting includes the repeated 1 KiB payload
-    // and rejects the complete group on reload.
-    let err = run_cull_result(&count_cull_pipeline("1M"), &csv, true)
-        .expect_err("a single group larger than the budget must fail loud, not OOM");
+    // 1 MiB of ledger capacity, under an ample `memory.limit`, admits the
+    // input's exact 816,000-byte fixed-width scan, but the Cull buffer's
+    // heap-aware accounting includes the repeated 1 KiB payload and rejects
+    // the complete group on reload.
+    let err = run_cull_with(
+        &count_cull_pipeline("512M"),
+        &csv,
+        true,
+        MemoryTestOverrides::default().with_ledger_capacity(1024 * 1024),
+    )
+    .expect_err("a single group larger than the budget must fail loud, not OOM");
 
     match &err {
         clinker_plan::error::PipelineError::MemoryBudgetExceeded {

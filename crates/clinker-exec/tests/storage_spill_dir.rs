@@ -8,13 +8,24 @@
 //! start (unconditionally — before any spill admission decision) and
 //! recursively removed at run end, so a watcher thread polls the configured
 //! root for a `clinker-spill-*` entry while the run is in flight. The
-//! redirect therefore holds on every platform regardless of whether a real
-//! RSS-driven spill ever fires, so this test runs and asserts the same
-//! invariant on Linux, Windows, and macOS.
+//! redirect therefore holds on every platform, so this test runs and
+//! asserts the same invariant on Linux, Windows, and macOS.
+//!
+//! The run is held to a small ledger capacity ([`SPILL_CAPACITY`]) under an
+//! ample `memory.limit`, so it also writes real spill files into that
+//! directory.
+
+#![cfg(feature = "test-utils")]
+
+#[path = "common/memory_pressure.rs"]
+mod memory_pressure;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_exec::executor::{PipelineExecutor, PipelineRunParams};
+use clinker_exec::executor::{
+    ExecutionReport, MemoryTestOverrides, PipelineExecutor, PipelineRunParams,
+};
 use clinker_plan::config::{CompileContext, PipelineConfig};
+use memory_pressure::{assert_capacity_below_ample_peak, assert_spill_engaged};
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
@@ -23,7 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 const PIPELINE_YAML: &str = r#"
 pipeline:
   name: storage_spill_dir
-  memory: { limit: "1M", backpressure: spill }
+  memory: { limit: "512M", backpressure: spill }
 nodes:
   - type: source
     name: events
@@ -63,6 +74,63 @@ nodes:
 
 const ROWS: usize = 2_000;
 
+/// The ledger capacity every run here is held to: 1 MiB, the limit these
+/// tests ran under before capacity existed, kept because it lies where a
+/// pressure capacity must. It is above what cannot spill: the Route's
+/// node-buffer materialization projects 736,874 bytes for this 2,000-row
+/// input, and a capacity below that fails with E310 naming `by_region`. It
+/// is below the charged peak of the same input with ample memory,
+/// 1,472,600 bytes.
+const SPILL_CAPACITY: u64 = 1024 * 1024;
+
+/// Compile the pipeline, its reader and two writers whose output is not
+/// inspected.
+fn compiled() -> (
+    clinker_plan::plan::compiled::CompiledPlan,
+    clinker_exec::executor::SourceReaders,
+    HashMap<String, Box<dyn Write + Send>>,
+) {
+    let csv = build_events_csv();
+    let config: PipelineConfig =
+        clinker_plan::yaml::from_str(PIPELINE_YAML).expect("parse pipeline YAML");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("compile pipeline");
+
+    let mut readers: clinker_exec::executor::SourceReaders = HashMap::new();
+    readers.insert(
+        "events".to_string(),
+        clinker_exec::executor::single_file_reader(
+            "events.csv",
+            Box::new(std::io::Cursor::new(csv.into_bytes())),
+        ),
+    );
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([
+        (
+            "out_a".to_string(),
+            Box::new(SharedBuffer::new()) as Box<dyn Write + Send>,
+        ),
+        (
+            "out_b".to_string(),
+            Box::new(SharedBuffer::new()) as Box<dyn Write + Send>,
+        ),
+    ]);
+    (plan, readers, writers)
+}
+
+/// The same input with ample memory, whose charged peak the capacity must
+/// lie below.
+fn ample_report() -> ExecutionReport {
+    let (plan, readers, writers) = compiled();
+    let params = PipelineRunParams {
+        execution_id: "storage-spill-dir-ample".to_string(),
+        batch_id: "batch-0".to_string(),
+        ..Default::default()
+    };
+    PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+        .expect("ample run must complete")
+}
+
 fn build_events_csv() -> String {
     let mut s = String::with_capacity(ROWS * 48);
     s.push_str("id,region,payload,value,ts\n");
@@ -91,41 +159,13 @@ fn spill_subdir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
 
 #[test]
 fn spill_dir_setting_redirects_per_run_spill_directory() {
-    // No RSS gate: the per-run spill root is created unconditionally at run
-    // start, before any spill-admission decision, so the redirect is
-    // observable on every platform — including those without RSS readings,
-    // where the admission predicate never trips and no real spill fires.
+    // The per-run spill root is created unconditionally at run start, before
+    // any spill-admission decision, so the redirect is observable on every
+    // platform.
     let spill_root = tempfile::tempdir().expect("create custom spill root");
     let spill_root_path = spill_root.path().to_path_buf();
 
-    let csv = build_events_csv();
-    let config: PipelineConfig =
-        clinker_plan::yaml::from_str(PIPELINE_YAML).expect("parse pipeline YAML");
-    let plan = config
-        .compile(&CompileContext::default())
-        .expect("compile pipeline");
-
-    let mut readers: clinker_exec::executor::SourceReaders = HashMap::new();
-    readers.insert(
-        "events".to_string(),
-        clinker_exec::executor::single_file_reader(
-            "events.csv",
-            Box::new(std::io::Cursor::new(csv.into_bytes())),
-        ),
-    );
-
-    let out_a = SharedBuffer::new();
-    let out_b = SharedBuffer::new();
-    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([
-        (
-            "out_a".to_string(),
-            Box::new(out_a.clone()) as Box<dyn Write + Send>,
-        ),
-        (
-            "out_b".to_string(),
-            Box::new(out_b.clone()) as Box<dyn Write + Send>,
-        ),
-    ]);
+    let (plan, readers, writers) = compiled();
 
     // Watcher thread: polls the configured spill root for a
     // `clinker-spill-*` directory while the run is in flight. The per-run
@@ -171,6 +211,7 @@ fn spill_dir_setting_redirects_per_run_spill_directory() {
         execution_id: "storage-spill-dir".to_string(),
         batch_id: "batch-0".to_string(),
         spill_root_dir: Some(spill_root_path.clone()),
+        memory_test: MemoryTestOverrides::default().with_ledger_capacity(SPILL_CAPACITY),
         ..Default::default()
     };
 
@@ -179,6 +220,10 @@ fn spill_dir_setting_redirects_per_run_spill_directory() {
 
     done.store(true, Ordering::Relaxed);
     watcher.join().expect("watcher thread must join");
+
+    let ample = ample_report();
+    assert_spill_engaged(&report);
+    assert_capacity_below_ample_peak(SPILL_CAPACITY, &ample);
 
     assert_eq!(
         report.counters.total_count as usize, ROWS,
@@ -272,6 +317,7 @@ fn error_path_run_cleans_up_its_spill_directory_immediately() {
         execution_id: "spill-error-path".to_string(),
         batch_id: "batch-0".to_string(),
         spill_root_dir: Some(spill_root_path.clone()),
+        memory_test: MemoryTestOverrides::default().with_ledger_capacity(SPILL_CAPACITY),
         ..Default::default()
     };
 
@@ -365,6 +411,7 @@ fn startup_purges_an_orphaned_spill_dir_from_a_crashed_prior_run() {
         execution_id: "spill-crash-purge".to_string(),
         batch_id: "batch-0".to_string(),
         spill_root_dir: Some(spill_root_path.clone()),
+        memory_test: MemoryTestOverrides::default().with_ledger_capacity(SPILL_CAPACITY),
         ..Default::default()
     };
 

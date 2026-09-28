@@ -3,12 +3,18 @@
 #[path = "common/pipeline_resource_fixtures.rs"]
 mod resource_fixtures;
 
+#[cfg(feature = "test-utils")]
+#[path = "common/memory_pressure.rs"]
+mod memory_pressure;
+
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::PathBuf;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, SourceInput, SourceReaders};
+use clinker_exec::executor::{
+    MemoryTestOverrides, PipelineExecutor, PipelineRunParams, SourceInput, SourceReaders,
+};
 use clinker_exec::source::multi_file::FileSlot;
 use clinker_plan::config::{
     CompileContext, NullOrder, OnUnsorted, PipelineConfig, SortOrder, SortableEventShape,
@@ -65,6 +71,51 @@ fn run_csv_with_settings(
     Result<clinker_exec::executor::ExecutionReport, clinker_plan::error::PipelineError>,
     String,
 ) {
+    run_order_config(
+        &order_config(on_unsorted, memory_limit, worker_threads),
+        files,
+        MemoryTestOverrides::default(),
+    )
+}
+
+/// The `memory.limit` of a run whose budget is applied as ledger capacity.
+#[cfg(feature = "test-utils")]
+const AMPLE_LIMIT: &str = "512M";
+
+/// The ledger capacity the ordered-repair pressure runs are held to: 88 KiB.
+///
+/// The test ran under `memory.limit: 40K` plus the measured CSV workspace
+/// before capacity existed, 106,496 bytes, which is above what the same
+/// input charges with ample memory (99,568 bytes at its peak), so that
+/// figure could not force a spill on its own. 88 KiB lies below that peak
+/// and above what cannot spill: under 77,976 bytes the CSV decoder's
+/// 16,384-byte admission falls short and the run fails instead of
+/// completing.
+#[cfg(feature = "test-utils")]
+const ORDER_REPAIR_CAPACITY: u64 = 88 * 1024;
+
+/// Run at [`AMPLE_LIMIT`] (plus the CSV workspace), held to `capacity` bytes
+/// of ledger.
+#[cfg(feature = "test-utils")]
+fn run_csv_at_capacity(
+    files: &[(&str, &str)],
+    on_unsorted: &str,
+    capacity: u64,
+    worker_threads: usize,
+) -> (
+    Result<clinker_exec::executor::ExecutionReport, clinker_plan::error::PipelineError>,
+    String,
+) {
+    run_order_config(
+        &order_config(on_unsorted, AMPLE_LIMIT, worker_threads),
+        files,
+        MemoryTestOverrides::default().with_ledger_capacity(capacity),
+    )
+}
+
+/// The source-order fixture at `memory_limit`, with the measured CSV
+/// workspace added to its limit.
+fn order_config(on_unsorted: &str, memory_limit: &str, worker_threads: usize) -> PipelineConfig {
     let yaml = format!(
         r#"
 pipeline:
@@ -94,7 +145,18 @@ nodes:
     );
     let mut config = parse(&yaml);
     resource_fixtures::add_csv_workspace(&mut config, &CompileContext::default());
-    let plan = PipelineConfig::compile(&config, &CompileContext::default()).expect("compile");
+    config
+}
+
+fn run_order_config(
+    config: &PipelineConfig,
+    files: &[(&str, &str)],
+    memory_test: MemoryTestOverrides,
+) -> (
+    Result<clinker_exec::executor::ExecutionReport, clinker_plan::error::PipelineError>,
+    String,
+) {
+    let plan = PipelineConfig::compile(config, &CompileContext::default()).expect("compile");
     let slots = files
         .iter()
         .map(|(name, csv)| {
@@ -111,6 +173,7 @@ nodes:
     let params = PipelineRunParams {
         execution_id: "source-order-test".into(),
         batch_id: "batch".into(),
+        memory_test,
         ..Default::default()
     };
     let result = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params);
@@ -295,17 +358,35 @@ fn runtime_uses_compiled_source_order() {
     );
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn compiled_source_order_worker_spill_parity() {
+    use memory_pressure::{assert_capacity_below_ample_peak, assert_spill_engaged};
+
+    let old_limit = clinker_plan::config::utils::parse_memory_limit_bytes(
+        order_config("warn", "40K", 4)
+            .pipeline
+            .memory
+            .limit
+            .as_deref(),
+    )
+    .expect("parse the old limit");
+    assert!(
+        ORDER_REPAIR_CAPACITY <= old_limit,
+        "the capacity never exceeds the limit the test ran under before capacity existed"
+    );
     let mut unsorted = String::from("key,payload\n");
     for key in (0..128).rev() {
         unsorted.push_str(&format!("{key},row-{key:03}-{}\n", "x".repeat(96)));
     }
     let resident_warn = run_csv_with_settings(&[("rows.csv", &unsorted)], "warn", "64M", 1);
-    let spilled_warn = run_csv_with_settings(&[("rows.csv", &unsorted)], "warn", "40K", 4);
+    let spilled_warn =
+        run_csv_at_capacity(&[("rows.csv", &unsorted)], "warn", ORDER_REPAIR_CAPACITY, 4);
 
-    resident_warn.0.expect("resident repair");
+    let resident_report = resident_warn.0.expect("resident repair");
     let spilled_report = spilled_warn.0.expect("spilled repair");
+    assert_spill_engaged(&spilled_report);
+    assert_capacity_below_ample_peak(ORDER_REPAIR_CAPACITY, &resident_report);
     assert!(
         spilled_report.cumulative_spill_bytes > 0,
         "ordered repair must spill"
@@ -317,13 +398,21 @@ fn compiled_source_order_worker_spill_parity() {
         sorted.push_str(&format!("{key},row-{key:03}-{}\n", "x".repeat(96)));
     }
     let resident_sorted = run_csv_with_settings(&[("rows.csv", &sorted)], "error", "64M", 1);
-    let spilled_sorted = run_csv_with_settings(&[("rows.csv", &sorted)], "error", "40K", 4);
-    resident_sorted.0.expect("resident sorted input");
-    spilled_sorted.0.expect("spilled sorted input");
+    let spilled_sorted =
+        run_csv_at_capacity(&[("rows.csv", &sorted)], "error", ORDER_REPAIR_CAPACITY, 4);
+    let resident_sorted_report = resident_sorted.0.expect("resident sorted input");
+    let spilled_sorted_report = spilled_sorted.0.expect("spilled sorted input");
+    assert_spill_engaged(&spilled_sorted_report);
+    assert_capacity_below_ample_peak(ORDER_REPAIR_CAPACITY, &resident_sorted_report);
     assert_eq!(resident_sorted.1, spilled_sorted.1);
 
     let resident_error = run_csv_with_settings(&[("rows.csv", &unsorted)], "error", "64M", 1);
-    let spilled_error = run_csv_with_settings(&[("rows.csv", &unsorted)], "error", "40K", 4);
+    let spilled_error = run_csv_at_capacity(
+        &[("rows.csv", &unsorted)],
+        "error",
+        ORDER_REPAIR_CAPACITY,
+        4,
+    );
     assert_eq!(
         resident_error
             .0

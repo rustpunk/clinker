@@ -15,7 +15,9 @@ mod dlq_sink;
 #[path = "common/pipeline_resource_fixtures.rs"]
 mod resource_fixtures;
 
-use std::collections::{BTreeSet, HashMap};
+#[cfg(feature = "test-utils")]
+use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::io::Write;
 
 use clinker_bench_support::io::SharedBuffer;
@@ -180,19 +182,22 @@ o3,ENG,100
 /// E310 admission failure shape that the windowed-Transform's buffer-
 /// recompute path uses, so callers see a uniform error mode regardless
 /// of which deferred-region path tripped the overflow.
+///
+/// The 1 KiB budget is the run's ledger capacity under an ample
+/// `memory.limit`, so the startup check judges a realistic limit while the
+/// first record still meets the same admission charge.
+#[cfg(feature = "test-utils")]
 #[test]
 fn memory_budget_overflow_on_deferred_buffer_raises_e310() {
     // Force the per-arena budget to a very small value so the deferred
     // region producer's narrow projection trips memory accounting on
     // the first record. `backpressure: spill` keeps the bare `Priority`
-    // policy: the 1 KiB budget is below the process baseline RSS, which
-    // the default `pause` policy would reject at startup (E312), but the
-    // spill policy never pauses a producer and so reaches the per-record
+    // policy, which never pauses a producer and so reaches the per-record
     // admission charge that this test asserts trips on the first record.
     let yaml = r#"
 pipeline:
   name: deferred_budget_overflow
-  memory: { limit: "1K", backpressure: spill }
+  memory: { limit: "512M", backpressure: spill }
 error_handling:
   strategy: continue
 nodes:
@@ -258,6 +263,8 @@ nodes:
         batch_id: "test-batch".to_string(),
         pipeline_vars: Default::default(),
         shutdown_token: None,
+        memory_test: clinker_exec::executor::MemoryTestOverrides::default()
+            .with_ledger_capacity(1024),
         ..Default::default()
     };
     let result = common::run_config(&config, readers, writers, &params);

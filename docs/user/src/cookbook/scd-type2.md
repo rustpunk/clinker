@@ -35,10 +35,9 @@ E005,500,450,baseline
 ```yaml
 pipeline:
   name: scd_type2_backfill
-  # A small budget forces the spill path even on this tiny fixture, so the
-  # example also demonstrates bounded-memory Reshape. Raise or remove it for
-  # production volumes.
-  memory: { limit: "16K", backpressure: spill }
+  # A realistic budget for this backfill. Reshape still spills its buffered
+  # groups to disk if memory runs short; the test suite forces that path.
+  memory: { limit: "64M", backpressure: spill }
 
 nodes:
   - type: source
@@ -132,7 +131,7 @@ Reshape stamps `$meta.synthetic`, `$meta.synthesized_by`, and `$meta.mutated_by`
 
 ### Bounded memory and spill
 
-The example's `memory.limit: "16K"` with `backpressure: spill` is deliberately tiny so the run exercises Reshape's disk-spill path on a small fixture. Reshape buffers each employee's group, and when the budget trips it spills the raw input records to disk and re-runs synthesis on reload — the output is identical whether a group stayed in memory or round-tripped through disk. The per-stage spill volume appears in `clinker run --explain` and in the post-run spill summary. For real workloads, drop the artificial limit (the default budget is 512 MB) and Reshape stays in memory until it genuinely needs to spill.
+The example runs at a realistic `memory.limit: "64M"` with `backpressure: spill`, so on this small fixture every group stays in memory. Reshape buffers each employee's group, and when memory runs short it spills the raw input records to disk and re-runs synthesis on reload — the output is identical whether a group stayed in memory or round-tripped through disk. The test suite runs this pipeline with a budget small enough to force that spill path and checks that the output does not change. The per-stage spill volume appears in `clinker run --explain` and in the post-run spill summary.
 
 Two limits apply: a *single* correlation group must still fit the memory budget at finalize (the no-cascade contract reloads the whole group to apply its rules — a group larger than the budget fails loud rather than crashing), and Reshape rules cannot reference `$doc` document context while spill is in play (such a pipeline is rejected at compile time). Each employee's group in this example is tiny, so neither limit is reached here. See [Reshape's memory model](../nodes/reshape.md#memory-model) and [Memory & Spill](../ops/memory.md) for the full picture.
 

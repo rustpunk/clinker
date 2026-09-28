@@ -5,9 +5,17 @@
 //! trigger-row mutation, the `$meta.*` audit stamps, the no-cascade
 //! contract, and mutation-conflict routing to the dead-letter queue with a
 //! whole-group rollback.
+//!
+//! The memory-pressure tests hold their runs to a small ledger capacity
+//! under an ample `memory.limit`, so the startup check judges a realistic
+//! limit while the Reshape still spills and reloads its groups.
+
+#![cfg(feature = "test-utils")]
 
 #[path = "common/dlq_sink.rs"]
 mod dlq_sink;
+#[path = "common/memory_pressure.rs"]
+mod memory_pressure;
 #[path = "common/pipeline_resource_fixtures.rs"]
 mod resource_fixtures;
 
@@ -15,10 +23,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_exec::executor::{PipelineExecutor, PipelineRunParams};
+use clinker_exec::executor::{
+    ExecutionReport, MemoryTestOverrides, PipelineExecutor, PipelineRunParams,
+};
 use clinker_plan::config::{CompileContext, parse_config};
 use clinker_plan::error::PipelineError;
 use clinker_record::PipelineCounters;
+use memory_pressure::{assert_capacity_below_ample_peak, assert_spill_engaged};
 
 fn reshape_fixture_records(yaml: &str) -> (clinker_record::Record, clinker_record::Record) {
     let config = parse_config(yaml).unwrap();
@@ -41,17 +52,26 @@ fn reshape_fixture_records(yaml: &str) -> (clinker_record::Record, clinker_recor
     )
 }
 
-// The hard limit admits the actual input/output carriers plus CSV workspace.
-// A large group uses 90% of the limit: above the 80% spill threshold, below the
-// whole-group reload ceiling. No authored-width assumption omits hidden fields.
-fn reshape_fixture_limit(
+/// The ledger capacity a Reshape pressure fixture is held to, computed from
+/// the compiled schema: the capacity admits the actual input/output carriers
+/// plus CSV workspace, and a large group uses 90% of it, below the
+/// whole-group reload ceiling. No authored-width assumption omits hidden
+/// fields.
+///
+/// These tests ran with this figure as their `memory.limit` before capacity
+/// existed. A test keeps it as its capacity when it lies above what cannot
+/// spill (the group reloaded whole at finalize, beside what is resident
+/// then) and below the same input's charged peak with ample memory; a test
+/// whose figure lies above that peak states a smaller capacity and checks it
+/// against this one.
+fn reshape_fixture_capacity(
     yaml: &str,
     input_rows: usize,
     output_rows: usize,
     group_rows: usize,
     text_field: &str,
     longest_text: &str,
-) -> String {
+) -> u64 {
     let (mut input, mut output) = reshape_fixture_records(yaml);
     input.set(text_field, clinker_record::Value::from(longest_text));
     output.set(text_field, clinker_record::Value::from(longest_text));
@@ -69,7 +89,7 @@ fn reshape_fixture_limit(
                 clinker_exec::executor::SourceRowId,
             )>());
     let writer = resource_fixtures::csv_workspace_headroom(&output) as usize;
-    (scan + writer).max((group * 10).div_ceil(9)).to_string()
+    (scan + writer).max((group * 10).div_ceil(9)) as u64
 }
 
 fn pressure_padding(yaml: &str, group_rows: usize) -> String {
@@ -88,7 +108,7 @@ fn run_reshape(
     yaml: &str,
     csv_input: &str,
 ) -> Result<(PipelineCounters, Vec<dlq_sink::DlqRow>, String), PipelineError> {
-    let report = run_reshape_report(yaml, csv_input)?;
+    let report = run_reshape_report(yaml, csv_input, MemoryTestOverrides::default())?;
     Ok((report.counters, report.dlq_rows, report.output))
 }
 
@@ -101,17 +121,24 @@ struct ReshapeReport {
     dlq_rows: Vec<dlq_sink::DlqRow>,
     output: String,
     cumulative_spill_bytes: u64,
+    report: ExecutionReport,
 }
 
-/// Run a Reshape pipeline and surface the full [`ReshapeReport`], including
-/// the cumulative spill volume the memory-pressure tests gate on.
-fn run_reshape_report(yaml: &str, csv_input: &str) -> Result<ReshapeReport, PipelineError> {
+/// Run a Reshape pipeline with the given test memory figures and surface the
+/// full [`ReshapeReport`], including the cumulative spill volume the
+/// memory-pressure tests gate on.
+fn run_reshape_report(
+    yaml: &str,
+    csv_input: &str,
+    memory_test: MemoryTestOverrides,
+) -> Result<ReshapeReport, PipelineError> {
     let config = clinker_plan::config::parse_config(yaml).expect("fixture pipeline must parse");
     let params = PipelineRunParams {
         execution_id: "test-exec".to_string(),
         batch_id: "test-batch".to_string(),
         pipeline_vars: indexmap::IndexMap::new(),
         shutdown_token: None,
+        memory_test,
         ..Default::default()
     };
 
@@ -131,10 +158,11 @@ fn run_reshape_report(yaml: &str, csv_input: &str) -> Result<ReshapeReport, Pipe
 
     let (report, dlq_rows) = dlq_sink::run_config_with_dlq(&config, readers, writers, &params)?;
     Ok(ReshapeReport {
-        counters: report.counters,
+        counters: report.counters.clone(),
         dlq_rows,
         output: buf.as_string(),
         cumulative_spill_bytes: report.cumulative_spill_bytes,
+        report,
     })
 }
 
@@ -646,9 +674,8 @@ fn copy_from_none_synthesized_row_carries_trigger_source_identity() {
 }
 
 /// SCD pipeline parameterized on the pipeline-level `memory.limit`, with the
-/// `spill` backpressure policy so a sub-baseline limit forces the disk path
-/// instead of being rejected as unsatisfiable (a producer-pausing policy
-/// rejects a limit below baseline RSS up front). The rule both mutates the
+/// `spill` backpressure policy; a pressure run holds it to a small ledger
+/// capacity so it takes the disk path. The rule both mutates the
 /// trigger row and synthesizes a `copy_from: none` row, so the spill
 /// round-trip exercises the synthesized-row schema-width path at runtime.
 fn scd_spill_pipeline(memory_limit: &str) -> String {
@@ -776,7 +803,11 @@ fn reshape_spills_under_memory_pressure() {
     // parity below establish that the pressure fixture still exercises disk.
     let (csv, trigger_groups) = scd_input(200, 8);
 
-    let limit = reshape_fixture_limit(
+    // The computed capacity (843,136 bytes) is kept: the run completes at it,
+    // failing below 778,200 bytes where the Output's materialization does
+    // not fit, and the same input charges 1,315,800 bytes at its peak with
+    // ample memory.
+    let capacity = reshape_fixture_capacity(
         &scd_spill_pipeline("512M"),
         1600,
         1600 + trigger_groups,
@@ -784,8 +815,20 @@ fn reshape_spills_under_memory_pressure() {
         "status",
         "baseline-7",
     );
-    let spilled = run_reshape_report(&scd_spill_pipeline(&limit), &csv).unwrap();
-    let in_memory = run_reshape_report(&scd_spill_pipeline("512M"), &csv).unwrap();
+    let spilled = run_reshape_report(
+        &scd_spill_pipeline("512M"),
+        &csv,
+        MemoryTestOverrides::default().with_ledger_capacity(capacity),
+    )
+    .unwrap();
+    let in_memory = run_reshape_report(
+        &scd_spill_pipeline("512M"),
+        &csv,
+        MemoryTestOverrides::default(),
+    )
+    .unwrap();
+    assert_spill_engaged(&spilled.report);
+    assert_capacity_below_ample_peak(capacity, &in_memory.report);
 
     assert!(
         spilled.counters.dlq_count == 0,
@@ -847,16 +890,38 @@ fn reshape_spill_preserves_within_group_arrival_order() {
         csv.push_str(&format!("E,{},{},{padding}seq-{r:04}\n", r * 10, r * 10));
     }
 
-    let limit = reshape_fixture_limit(
-        &scd_spill_pipeline_no_order("512M"),
-        50,
-        50,
-        50,
-        "status",
-        &format!("{padding}seq-0049"),
+    // The computed capacity (310,834 bytes) lies above what the same input
+    // charges with ample memory (297,150 bytes at its peak), so the test is
+    // held to 284 KiB instead: below that peak, and above the 279,750 bytes
+    // the single group needs when it is reloaded whole at finalize (a smaller
+    // capacity fails with E310 naming the group).
+    const CAPACITY: u64 = 284 * 1024;
+    assert!(
+        CAPACITY
+            <= reshape_fixture_capacity(
+                &scd_spill_pipeline_no_order("512M"),
+                50,
+                50,
+                50,
+                "status",
+                &format!("{padding}seq-0049"),
+            ),
+        "the capacity never exceeds the figure the test ran under before capacity existed"
     );
-    let spilled = run_reshape_report(&scd_spill_pipeline_no_order(&limit), &csv).unwrap();
-    let in_memory = run_reshape_report(&scd_spill_pipeline_no_order("512M"), &csv).unwrap();
+    let spilled = run_reshape_report(
+        &scd_spill_pipeline_no_order("512M"),
+        &csv,
+        MemoryTestOverrides::default().with_ledger_capacity(CAPACITY),
+    )
+    .unwrap();
+    let in_memory = run_reshape_report(
+        &scd_spill_pipeline_no_order("512M"),
+        &csv,
+        MemoryTestOverrides::default(),
+    )
+    .unwrap();
+    assert_spill_engaged(&spilled.report);
+    assert_capacity_below_ample_peak(CAPACITY, &in_memory.report);
 
     assert_eq!(spilled.counters.dlq_count, 0, "no DLQ entries under spill");
     assert!(
@@ -954,6 +1019,7 @@ fn run_merge_reshape(
     yaml: &str,
     csv_a: &str,
     csv_b: &str,
+    memory_test: MemoryTestOverrides,
 ) -> (clinker_exec::executor::ExecutionReport, String) {
     let config = parse_config(yaml).expect("merge-reshape pipeline must parse");
     let plan = config
@@ -986,6 +1052,7 @@ fn run_merge_reshape(
         batch_id: "merge-reshape".to_string(),
         pipeline_vars: indexmap::IndexMap::new(),
         shutdown_token: None,
+        memory_test,
         ..Default::default()
     };
     let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
@@ -1015,7 +1082,11 @@ fn reshape_spill_preserves_arrival_order_across_merge() {
         csv_b.push_str(&format!("X,{padding}b{r:03}\n"));
     }
 
-    let limit = reshape_fixture_limit(
+    // The computed capacity (329,200 bytes) is kept: the run completes at it
+    // and at 300,000 bytes, failing at 280,000 where the merged group
+    // (286,404 bytes) cannot be reloaded whole, and the same input charges
+    // 608,160 bytes at its peak with ample memory.
+    let capacity = reshape_fixture_capacity(
         &merge_reshape_pipeline("512M"),
         120,
         120,
@@ -1023,10 +1094,20 @@ fn reshape_spill_preserves_arrival_order_across_merge() {
         "tag",
         &format!("{padding}a059"),
     );
-    let (spilled_report, spilled) =
-        run_merge_reshape(&merge_reshape_pipeline(&limit), &csv_a, &csv_b);
-    let (memory_report, in_memory) =
-        run_merge_reshape(&merge_reshape_pipeline("512M"), &csv_a, &csv_b);
+    let (spilled_report, spilled) = run_merge_reshape(
+        &merge_reshape_pipeline("512M"),
+        &csv_a,
+        &csv_b,
+        MemoryTestOverrides::default().with_ledger_capacity(capacity),
+    );
+    let (memory_report, in_memory) = run_merge_reshape(
+        &merge_reshape_pipeline("512M"),
+        &csv_a,
+        &csv_b,
+        MemoryTestOverrides::default(),
+    );
+    assert_spill_engaged(&spilled_report);
+    assert_capacity_below_ample_peak(capacity, &memory_report);
 
     assert!(
         spilled_report.counters.dlq_count == 0,
@@ -1073,7 +1154,11 @@ fn reshape_skew_single_giant_group() {
         csv.push_str(&format!("employee-{g:05},20,20,base\n"));
     }
 
-    let limit = reshape_fixture_limit(
+    // The computed capacity (520,667 bytes) is kept: it lies above the
+    // 468,600 bytes the giant group needs when it is reloaded whole (a
+    // smaller capacity fails with E310 naming the group) and below the
+    // 738,800 bytes the same input charges at its peak with ample memory.
+    let capacity = reshape_fixture_capacity(
         &scd_spill_pipeline("512M"),
         700,
         701,
@@ -1081,7 +1166,20 @@ fn reshape_skew_single_giant_group() {
         "status",
         &payload,
     );
-    let report = run_reshape_report(&scd_spill_pipeline(&limit), &csv).unwrap();
+    let report = run_reshape_report(
+        &scd_spill_pipeline("512M"),
+        &csv,
+        MemoryTestOverrides::default().with_ledger_capacity(capacity),
+    )
+    .unwrap();
+    let ample = run_reshape_report(
+        &scd_spill_pipeline("512M"),
+        &csv,
+        MemoryTestOverrides::default(),
+    )
+    .unwrap();
+    assert_spill_engaged(&report.report);
+    assert_capacity_below_ample_peak(capacity, &ample.report);
     assert_eq!(report.counters.dlq_count, 0, "no DLQ entries under skew");
 
     // The giant group went to disk: spill fired and evicted real volume. A
@@ -1155,9 +1253,14 @@ fn reshape_giant_group_exceeds_budget_fails_loud() {
 
     // Admit the fixed-width input scan while keeping the complete 1 KiB-per-row
     // group's heap far above the limit; the expected failure remains finalize.
-    let limit = reshape_fixture_limit(&scd_spill_pipeline("512M"), 400, 0, 0, "status", &payload);
-    let err = run_reshape_report(&scd_spill_pipeline(&limit), &csv)
-        .expect_err("a single group larger than the budget must fail loud, not OOM");
+    let capacity =
+        reshape_fixture_capacity(&scd_spill_pipeline("512M"), 400, 0, 0, "status", &payload);
+    let err = run_reshape_report(
+        &scd_spill_pipeline("512M"),
+        &csv,
+        MemoryTestOverrides::default().with_ledger_capacity(capacity),
+    )
+    .expect_err("a single group larger than the budget must fail loud, not OOM");
 
     match &err {
         PipelineError::MemoryBudgetExceeded {
@@ -1243,13 +1346,27 @@ fn examples_dir() -> PathBuf {
         .join("pipelines")
 }
 
+/// The ledger capacity the example's spill proof is held to: 128 KiB, the
+/// `memory.limit` the example carried before it moved to a realistic
+/// figure.
+///
+/// No capacity both forces a spill and lets the run complete today: the
+/// example's input charges at most 48,064 bytes with ample memory, and any
+/// capacity below that fails when the CSV reader's next 88-byte admission
+/// falls short, so what cannot spill equals the peak. The figure is kept,
+/// and the spill it proves comes from the soft spill threshold, not from a
+/// shortfall; once that threshold is gone, the test needs a single forced
+/// shortfall on the Reshape group growth that must spill.
+const SCD_EXAMPLE_CAPACITY: u64 = 128 * 1024;
+
 #[test]
 fn scd_type2_e2e_with_spill() {
-    // Run the runnable `examples/pipelines/scd_type2.yaml` end-to-end. Its
-    // pipeline-level `memory.limit: 128K` with the `spill` policy forces the
-    // disk path on this small fixture, so the example doubles as the
-    // bounded-memory smoke test: the mutate+synthesize output must be correct
-    // AND the run must report on-disk spill volume.
+    // Run the runnable `examples/pipelines/scd_type2.yaml` end-to-end. The
+    // example runs at a realistic `memory.limit`; this test holds the run to
+    // a small ledger capacity so it takes the disk path on this small
+    // fixture, and the example doubles as the bounded-memory smoke test: the
+    // mutate+synthesize output must be correct AND the run must report
+    // on-disk spill volume.
     let yaml = std::fs::read_to_string(examples_dir().join("scd_type2.yaml"))
         .expect("read scd_type2.yaml example");
     let csv = std::fs::read_to_string(examples_dir().join("data").join("scd_plans.csv"))
@@ -1279,12 +1396,14 @@ fn scd_type2_e2e_with_spill() {
         batch_id: "scd-e2e".to_string(),
         pipeline_vars: indexmap::IndexMap::new(),
         shutdown_token: None,
+        memory_test: MemoryTestOverrides::default().with_ledger_capacity(SCD_EXAMPLE_CAPACITY),
         ..Default::default()
     };
 
     let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
         .expect("example pipeline run");
     let output = buf.as_string();
+    assert_spill_engaged(&report);
 
     assert!(
         report.counters.dlq_count == 0,
@@ -1293,7 +1412,7 @@ fn scd_type2_e2e_with_spill() {
     );
     assert!(
         report.cumulative_spill_bytes > 0,
-        "the example's 128K budget forces the disk spill path"
+        "the 128 KiB capacity forces the disk spill path"
     );
 
     // Three employees have over-long windows (E001, E002, E004), so three

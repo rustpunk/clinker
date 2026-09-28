@@ -22,7 +22,7 @@
 mod dlq_sink;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_exec::executor::PipelineRunParams;
+use clinker_exec::executor::{MemoryTestOverrides, PipelineRunParams};
 use clinker_plan::error::PipelineError;
 use clinker_record::PipelineCounters;
 use dlq_sink::DlqRow;
@@ -32,12 +32,21 @@ use std::collections::HashMap;
 type RunOutput = (PipelineCounters, Vec<DlqRow>, String);
 
 fn run_pipeline(yaml: &str, csv_input: &str) -> Result<RunOutput, PipelineError> {
+    run_pipeline_with(yaml, csv_input, MemoryTestOverrides::default())
+}
+
+fn run_pipeline_with(
+    yaml: &str,
+    csv_input: &str,
+    memory_test: MemoryTestOverrides,
+) -> Result<RunOutput, PipelineError> {
     let config = clinker_plan::config::parse_config(yaml).unwrap();
     let params = PipelineRunParams {
         execution_id: "test-exec-id".to_string(),
         batch_id: "test-batch-id".to_string(),
         pipeline_vars: indexmap::IndexMap::new(),
         shutdown_token: None,
+        memory_test,
         ..Default::default()
     };
 
@@ -322,17 +331,20 @@ o9,ENG,300
 /// strict-collateral DLQ. The protocol must NOT panic and MUST NOT
 /// produce a spurious retract — output is either valid (no-spill)
 /// or the failure is surfaced through DLQ accounting.
+///
+/// The 1-byte budget is the run's ledger capacity under an ample
+/// `memory.limit`, so the startup check judges a realistic limit while the
+/// run still meets the same starvation.
+#[cfg(feature = "test-utils")]
 #[test]
 fn aggregator_state_degraded_falls_back_without_panic() {
-    // `backpressure: spill` keeps the bare `Priority` policy: the 1-byte
-    // budget is below the process baseline RSS, which the default `pause`
-    // policy rejects at startup (E312), but this test needs the run to
-    // reach the aggregator degrade path, which only the non-pausing spill
-    // policy does under a sub-baseline budget.
+    // `backpressure: spill` keeps the bare `Priority` policy: this test
+    // needs the run to reach the aggregator degrade path, which only the
+    // non-pausing spill policy does under a starvation budget.
     let yaml = r#"
 pipeline:
   name: degraded_post_aggregate
-  memory: { limit: "1", backpressure: spill }
+  memory: { limit: "512M", backpressure: spill }
 error_handling:
   strategy: continue
 nodes:
@@ -386,7 +398,13 @@ nodes:
     // Run on a dedicated OS thread so a panic inside the degrade path
     // surfaces as the `Err` arm of the join (the unwound panic payload),
     // letting the assertions below distinguish a clean error from a crash.
-    let join_handle = std::thread::spawn(move || run_pipeline(&yaml_owned, &csv_owned));
+    let join_handle = std::thread::spawn(move || {
+        run_pipeline_with(
+            &yaml_owned,
+            &csv_owned,
+            MemoryTestOverrides::default().with_ledger_capacity(1),
+        )
+    });
     let outcome: Result<Result<RunOutput, PipelineError>, Box<dyn std::any::Any + Send>> =
         join_handle.join();
     match outcome {

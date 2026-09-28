@@ -30,7 +30,7 @@ mod dlq_sink;
 mod resource_fixtures;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_exec::executor::PipelineRunParams;
+use clinker_exec::executor::{MemoryTestOverrides, PipelineRunParams};
 use clinker_plan::error::PipelineError;
 use clinker_record::PipelineCounters;
 use dlq_sink::DlqRow;
@@ -40,13 +40,14 @@ use std::collections::HashMap;
 type RunOutput = (PipelineCounters, Vec<DlqRow>, String);
 
 fn run_pipeline(yaml: &str, csv_input: &str) -> Result<RunOutput, PipelineError> {
-    run_pipeline_input(yaml, csv_input, false)
+    run_pipeline_input(yaml, csv_input, false, MemoryTestOverrides::default())
 }
 
 fn run_pipeline_input(
     yaml: &str,
     csv_input: &str,
     predecoded: bool,
+    memory_test: MemoryTestOverrides,
 ) -> Result<RunOutput, PipelineError> {
     let config = clinker_plan::config::parse_config(yaml).unwrap();
     let params = PipelineRunParams {
@@ -54,6 +55,7 @@ fn run_pipeline_input(
         batch_id: "test-batch-id".to_string(),
         pipeline_vars: indexmap::IndexMap::new(),
         shutdown_token: None,
+        memory_test,
         ..Default::default()
     };
 
@@ -1239,17 +1241,20 @@ O5,ENG,200
 /// would fail the test outright. It accepts either a clean run whose output
 /// or DLQ reflects the pressure, or a typed error; both are the
 /// architecturally-correct shapes, and neither is a crash.
+///
+/// The 1 KiB budget is the run's ledger capacity under an ample
+/// `memory.limit`, so the startup check judges a realistic limit while the
+/// row still meets the same admission guard.
+#[cfg(feature = "test-utils")]
 #[test]
 fn oversized_buffer_row_surfaces_typed_error_or_dlq_never_panics() {
     // One row keeps correlation sorting's fixed-width scan within 1 KiB;
     // a second would fail there before reaching the Aggregate guard. The
     // single 2 KiB payload still exceeds Aggregate's per-row admission limit.
-    // `backpressure: spill` keeps the non-pausing policy so a sub-baseline
-    // test budget reaches that guard.
     let yaml = r#"
 pipeline:
   name: degrade_fallback
-  memory: { limit: "1K", backpressure: spill }
+  memory: { limit: "512M", backpressure: spill }
 error_handling:
   strategy: continue
 nodes:
@@ -1289,7 +1294,12 @@ nodes:
 
     // Direct call: a panic in the admission path would unwind through this
     // frame and fail the test, which is exactly the regression this guards.
-    match run_pipeline_input(yaml, &csv, true) {
+    match run_pipeline_input(
+        yaml,
+        &csv,
+        true,
+        MemoryTestOverrides::default().with_ledger_capacity(1024),
+    ) {
         Ok((counters, _dlq, output)) => {
             // Clean run. Under `continue` the oversized rows route to the
             // DLQ; a run that instead absorbed the pressure (spill) still
@@ -1318,6 +1328,10 @@ nodes:
 /// stage that overran — not the empty node the `OversizedRow → E310` mapping
 /// leaves for the dispatch arm to fill. This pins the "names the aggregate
 /// stage" promise the memory docs make against the rendered diagnostic.
+///
+/// The 1 KiB budget is the run's ledger capacity under an ample
+/// `memory.limit`.
+#[cfg(feature = "test-utils")]
 #[test]
 fn oversized_buffer_row_failfast_names_the_aggregate_stage() {
     // A single row keeps correlation sorting's fixed-width materialization
@@ -1328,7 +1342,7 @@ fn oversized_buffer_row_failfast_names_the_aggregate_stage() {
     let yaml = r#"
 pipeline:
   name: oversized_failfast
-  memory: { limit: "1K", backpressure: spill }
+  memory: { limit: "512M", backpressure: spill }
 nodes:
 - type: source
   name: src
@@ -1364,7 +1378,12 @@ nodes:
     let large = "x".repeat(2048);
     let csv = format!("order_id,department,amount,payload\nO1,HR,10,{large}\n");
 
-    match run_pipeline_input(yaml, &csv, true) {
+    match run_pipeline_input(
+        yaml,
+        &csv,
+        true,
+        MemoryTestOverrides::default().with_ledger_capacity(1024),
+    ) {
         Err(PipelineError::MemoryBudgetExceeded { node, .. }) => {
             assert_eq!(
                 node, "dept_stats",

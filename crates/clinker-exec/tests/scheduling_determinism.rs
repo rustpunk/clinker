@@ -28,12 +28,22 @@
 //! dispatch order. That orthogonal nondeterminism is not what this test
 //! pins; sorting isolates the scheduling variable (the set of emitted
 //! group rows and their values) from the aggregate's emission order.
+//!
+//! The pressure runs are held to a small ledger capacity under an ample
+//! `memory.limit`, so the same output must also survive spilling.
+
+#![cfg(feature = "test-utils")]
+
+#[path = "common/memory_pressure.rs"]
+mod memory_pressure;
 
 use clinker_bench_support::io::SharedBuffer;
 use clinker_exec::executor::{
-    PipelineExecutor, PipelineRunParams, SourceReaders, single_file_reader,
+    ExecutionReport, MemoryTestOverrides, PipelineExecutor, PipelineRunParams, SourceReaders,
+    single_file_reader,
 };
 use clinker_plan::config::{CompileContext, parse_config};
+use memory_pressure::{assert_capacity_below_ample_peak, assert_spill_engaged};
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
 use std::path::Path;
@@ -113,14 +123,41 @@ fn large_csv() -> String {
     s
 }
 
-fn run_params() -> PipelineRunParams {
+fn run_params(memory_test: MemoryTestOverrides) -> PipelineRunParams {
     PipelineRunParams {
         execution_id: "sched-determinism".to_string(),
         batch_id: "batch-0".to_string(),
         pipeline_vars: indexmap::IndexMap::new(),
         shutdown_token: None,
+        memory_test,
         ..Default::default()
     }
+}
+
+/// The `memory.limit` of a pressure run; its pressure is ledger capacity.
+const AMPLE_LIMIT: &str = "512M";
+
+/// The ledger capacity the pressure runs are held to: 118,000 bytes.
+///
+/// The test ran under `memory.limit: 128K` (131,072 bytes) before capacity
+/// existed, which is above what the same input charges with ample memory
+/// (118,384 bytes at its peak), so that figure could not force a spill on
+/// its own. 118,000 bytes lies below that peak and above what cannot spill:
+/// `agg_large`'s input materialization projects 117,680 bytes (8,880
+/// charged plus 108,800 temporary), and a capacity below that fails with
+/// E310 naming `agg_large` instead of completing.
+const PRESSURE_CAPACITY: u64 = 118_000;
+
+// The capacity never exceeds the limit the test ran under before capacity
+// existed.
+const _: () = assert!(PRESSURE_CAPACITY <= 128 * 1024);
+
+/// How a run is budgeted: at a `memory.limit` alone, or at
+/// [`AMPLE_LIMIT`] held to a ledger capacity.
+#[derive(Clone, Copy)]
+enum Budget<'a> {
+    Limit(&'a str),
+    Capacity(u64),
 }
 
 fn readers() -> SourceReaders {
@@ -152,6 +189,24 @@ fn controlled_yaml(memory_limit: &str, worker_threads: usize) -> String {
 }
 
 fn run_at(anchor: &Path, memory_limit: &str, worker_threads: usize) -> (String, String, u64) {
+    let (small, large, report) = run_budgeted(anchor, Budget::Limit(memory_limit), worker_threads);
+    (small, large, report.counters.total_count)
+}
+
+/// Run the pipeline once under `budget`, returning both outputs and the
+/// run's report.
+fn run_budgeted(
+    anchor: &Path,
+    budget: Budget<'_>,
+    worker_threads: usize,
+) -> (String, String, ExecutionReport) {
+    let (memory_limit, memory_test) = match budget {
+        Budget::Limit(limit) => (limit, MemoryTestOverrides::default()),
+        Budget::Capacity(bytes) => (
+            AMPLE_LIMIT,
+            MemoryTestOverrides::default().with_ledger_capacity(bytes),
+        ),
+    };
     let yaml = controlled_yaml(memory_limit, worker_threads);
     let config = parse_config(&yaml).expect("parse");
     let plan = config
@@ -175,16 +230,12 @@ fn run_at(anchor: &Path, memory_limit: &str, worker_threads: usize) -> (String, 
         &plan,
         readers(),
         writers,
-        &run_params(),
+        &run_params(memory_test),
         CompileContext::with_pipeline_dir(anchor, ""),
     )
     .expect("run");
 
-    (
-        out_small.as_string(),
-        out_large.as_string(),
-        report.counters.total_count,
-    )
+    (out_small.as_string(), out_large.as_string(), report)
 }
 
 /// Output and counters are byte-identical whether the scheduler has volume
@@ -233,7 +284,8 @@ fn scheduling_reorder_does_not_change_output() {
         "empty anchor must seed zero (scheduler falls back to topo order)"
     );
 
-    let (small_a, large_a, total_a) = run_at(sized.path(), "64M", 1);
+    let (small_a, large_a, ample) = run_budgeted(sized.path(), Budget::Limit("64M"), 1);
+    let total_a = ample.counters.total_count;
     let (small_b, large_b, total_b) = run_at(empty.path(), "64M", 1);
 
     // Sorted multiset of rows: insensitive to the hash Aggregate's
@@ -261,13 +313,18 @@ fn scheduling_reorder_does_not_change_output() {
     );
     assert_eq!(total_a, 40 + 400, "all rows from both chains ingested");
 
-    for (anchor, memory_limit, worker_threads) in [
-        (sized.path(), "64M", 4),
-        (sized.path(), "128K", 1),
-        (empty.path(), "128K", 4),
-        (empty.path(), "128K", 4),
+    assert_capacity_below_ample_peak(PRESSURE_CAPACITY, &ample);
+    for (anchor, budget, worker_threads) in [
+        (sized.path(), Budget::Limit("64M"), 4),
+        (sized.path(), Budget::Capacity(PRESSURE_CAPACITY), 1),
+        (empty.path(), Budget::Capacity(PRESSURE_CAPACITY), 4),
+        (empty.path(), Budget::Capacity(PRESSURE_CAPACITY), 4),
     ] {
-        let (small, large, total) = run_at(anchor, memory_limit, worker_threads);
+        let (small, large, report) = run_budgeted(anchor, budget, worker_threads);
+        if let Budget::Capacity(_) = budget {
+            assert_spill_engaged(&report);
+        }
+        let total = report.counters.total_count;
         assert_eq!(
             rows(&small),
             rows(&small_a),
