@@ -11,14 +11,20 @@
 
 use std::collections::HashMap;
 use std::io::Write;
+use std::sync::Arc;
 
 use clinker_bench_support::io::SharedBuffer;
 use clinker_exec::executor::{
     ExecutionReport, IN_PROCESS_BASELINE_BYTES, MemoryTestOverrides, PipelineExecutor,
     PipelineRunParams, SourceReaders, single_file_reader,
 };
+use clinker_exec::pipeline::memory::ledger::{Requester, Shortfall};
+use clinker_exec::pipeline::memory::{
+    ConsumerHandle, ConsumerId, ConsumerSpillError, MemoryArbitrator, MemoryConsumer, NoOpPolicy,
+};
 use clinker_plan::config::{CompileContext, PipelineConfig};
 use clinker_plan::error::PipelineError;
+use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface};
 
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * KIB;
@@ -320,4 +326,77 @@ fn in_process_default_injects_the_baseline() {
         "opting into process memory measures the baseline"
     );
     assert_eq!(MemoryTestOverrides::process().injected_baseline_rss(), None);
+}
+
+/// A consumer whose charge is its handle's.
+struct HandleConsumer(Arc<ConsumerHandle>);
+
+impl MemoryConsumer for HandleConsumer {
+    fn current_usage(&self) -> u64 {
+        self.0.bytes()
+    }
+    fn spill_priority(&self) -> i32 {
+        0
+    }
+    fn try_spill(&self, _: u64) -> Result<u64, ConsumerSpillError> {
+        Ok(0)
+    }
+    fn can_back_pressure(&self) -> bool {
+        false
+    }
+}
+
+fn register(arbitrator: &MemoryArbitrator, node: &str) -> ConsumerId {
+    let handle = ConsumerHandle::new();
+    arbitrator.register_node_consumer(
+        Arc::new(HandleConsumer(Arc::clone(&handle))),
+        handle,
+        ConsumerLabel {
+            node: node.to_string(),
+            surface: MemorySurface::GroupState,
+        },
+    )
+}
+
+/// The forced refusal is the one a real shortage gives, with nothing
+/// reported available and a snapshot of the ledger at the refusal.
+fn assert_forced(result: Result<impl std::fmt::Debug, Shortfall>, bytes: u64, charged: u64) {
+    let shortfall = result.expect_err("the armed reserve falls short");
+    assert!(!shortfall.oversized, "a forced shortfall is not oversized");
+    assert_eq!(shortfall.requested, bytes);
+    assert_eq!(shortfall.available, 0, "nothing is reported available");
+    assert_eq!(shortfall.snapshot.requested, bytes);
+    assert_eq!(shortfall.snapshot.charged, charged, "nothing was charged");
+}
+
+#[test]
+fn forced_shortfall_fires_once_for_the_matching_requester() {
+    let arbitrator = MemoryArbitrator::with_policy(512 * MIB, 0.80, 0.70, Box::new(NoOpPolicy));
+    let r = Requester::for_consumer(register(&arbitrator, "r"));
+    let other = Requester::for_consumer(register(&arbitrator, "other"));
+    arbitrator.force_shortfall_once(|label| label.node == "r", 2);
+
+    let first = arbitrator
+        .reserve(KIB, r)
+        .expect("the first match is granted");
+    let unmatched = arbitrator
+        .reserve(KIB, other)
+        .expect("another consumer's reserve is granted and not counted");
+    let governed = arbitrator
+        .reserve(KIB, Requester::governed())
+        .expect("a governed reserve is never counted");
+    assert_forced(arbitrator.reserve(KIB, r), KIB, 3 * KIB);
+    let third = arbitrator
+        .reserve(KIB, r)
+        .expect("the retry after the forced shortfall takes the real path");
+    assert_eq!(arbitrator.charged_bytes(), 4 * KIB);
+
+    // `nth = 1` is the next matching reserve.
+    arbitrator.force_shortfall_once(|label| label.node == "r", 1);
+    assert_forced(arbitrator.reserve(KIB, r), KIB, 4 * KIB);
+    let after = arbitrator
+        .reserve(KIB, r)
+        .expect("the arm fires once and is gone");
+    drop((first, unmatched, governed, third, after));
+    assert_eq!(arbitrator.charged_bytes(), 0);
 }

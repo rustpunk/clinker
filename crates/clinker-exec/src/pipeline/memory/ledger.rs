@@ -303,6 +303,91 @@ impl MemoryArbitrator {
     }
 }
 
+/// A [`crate::executor::ForcedShortfall`] armed on the ledger, with the
+/// matching requests it has counted so far. Held under the ledger lock, so
+/// counting and firing are one step with the reserve they decide.
+#[cfg(any(test, feature = "test-utils"))]
+pub(super) struct ArmedShortfall {
+    shortfall: crate::executor::ForcedShortfall,
+    seen: u32,
+}
+
+/// Count `requester`'s reserve against the armed forced shortfall and fire it
+/// when this is the nth match: the refusal a real shortage would give, with
+/// the snapshot taken under the same lock and nothing reported available, so
+/// the caller's pass targets the whole request. Firing disarms it; nothing is
+/// charged.
+///
+/// Only a reserve that could otherwise be granted counts: a closed ledger, a
+/// zero-byte request and an oversized one take the real path. A governed
+/// request, or one for a consumer the ledger holds no label for, never
+/// matches. The matcher runs under the ledger lock, so it must be a pure
+/// predicate on the label.
+#[cfg(any(test, feature = "test-utils"))]
+fn take_forced_shortfall(
+    ledger: &mut LockedLedger,
+    bytes: u64,
+    requester: Requester,
+) -> Option<Shortfall> {
+    if ledger.closed || bytes == 0 || bytes > ledger.limit() {
+        return None;
+    }
+    let consumer = requester.consumer?;
+    let accepts = match (
+        &ledger.attachment.forced_shortfall,
+        ledger.label(consumer.0),
+    ) {
+        (Some(armed), Some(label)) => armed.shortfall.accepts(label),
+        _ => false,
+    };
+    if !accepts {
+        return None;
+    }
+    let armed = ledger.attachment.forced_shortfall.as_mut()?;
+    armed.seen += 1;
+    if armed.seen < armed.shortfall.nth() {
+        return None;
+    }
+    ledger.attachment.forced_shortfall = None;
+    Some(Shortfall {
+        requested: bytes,
+        available: 0,
+        oversized: false,
+        snapshot: snapshot(ledger, bytes, Some(consumer)),
+        closed: false,
+    })
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl MemoryArbitrator {
+    /// Make the `nth` (from 1) [`Self::reserve`] whose requester's label
+    /// `matcher` accepts fall short once, as if nothing were available;
+    /// every reserve after it, including the caller's retry, takes the real
+    /// path. Arming again replaces an arm that has not fired.
+    ///
+    /// Used only by tests that spill a whole unit and then reload it, where
+    /// no capacity both forces the spill and admits the reload; each use
+    /// records that reason in its test's doc comment. `matcher` runs under
+    /// the ledger lock and must not call back into the arbitrator.
+    ///
+    /// # Panics
+    ///
+    /// When `nth` is 0.
+    pub fn force_shortfall_once(
+        &self,
+        matcher: impl Fn(&ConsumerLabel) -> bool + Send + Sync + 'static,
+        nth: u32,
+    ) {
+        self.arm_forced_shortfall(crate::executor::ForcedShortfall::at(matcher, nth));
+    }
+
+    /// Arm `shortfall` on the ledger, replacing any arm that has not fired.
+    pub(crate) fn arm_forced_shortfall(&self, shortfall: crate::executor::ForcedShortfall) {
+        self.admission.ledger.lock().attachment.forced_shortfall =
+            Some(ArmedShortfall { shortfall, seen: 0 });
+    }
+}
+
 /// Labelled holders placed directly on the ledger, beside governed grants,
 /// without registering a consumer.
 #[cfg(test)]

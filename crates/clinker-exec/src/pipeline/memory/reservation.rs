@@ -36,10 +36,15 @@ pub struct WriterResourceUsage {
 /// lets exactly one writer consumer attach, and lets closing the run take its
 /// id to unregister. The handle charges nothing: the writer's staged bytes
 /// are governed allocations the ledger already holds.
+///
+/// Test builds also keep an armed forced shortfall here, because `reserve`
+/// must count and fire it in the same step as its own check.
 #[derive(Default)]
 pub(super) struct WriterBinding {
     pub handle: Option<Arc<ConsumerHandle>>,
     pub consumer_id: Option<ConsumerId>,
+    #[cfg(any(test, feature = "test-utils"))]
+    pub forced_shortfall: Option<super::ledger::ArmedShortfall>,
 }
 
 /// The ledger as this crate instantiates it.

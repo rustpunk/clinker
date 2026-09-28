@@ -387,6 +387,10 @@ pub(crate) fn build_arbitrator_from_config(
                 detail: format!("a fresh ledger refused capacity {capacity}: {error}"),
             })?;
     }
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(shortfall) = overrides.forced_shortfall() {
+        arbitrator.arm_forced_shortfall(shortfall.clone());
+    }
     Ok(arbitrator)
 }
 
