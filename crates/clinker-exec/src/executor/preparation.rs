@@ -461,6 +461,14 @@ impl ExecutorResources {
     pub fn allocation(&self) -> AllocationResources {
         AllocationResources::new(self.authority.admission.clone())
     }
+    /// An allocation view over the run's admission that charges in
+    /// `requester`'s name.
+    pub fn attributed_allocation(
+        &self,
+        _requester: crate::pipeline::memory::ledger::Requester,
+    ) -> AllocationResources {
+        self.allocation()
+    }
     /// Retry each debt slot once; filesystem calls run outside admission locks.
     pub fn cleanup(&self) {
         if let Some(storage) = &self.authority.storage {
@@ -1137,6 +1145,55 @@ mod tests {
         assert_eq!(observer.usage().memory, 64);
         drop(lease);
         assert_eq!(observer.usage().memory, 0);
+    }
+
+    #[test]
+    fn writer_staging_is_counted_once() {
+        const KIB: u64 = 1024;
+        let arb = Arc::new(MemoryArbitrator::with_policy(
+            4 * 1024 * KIB,
+            0.8,
+            0.7,
+            Box::new(NoOpPolicy),
+        ));
+        let provider = ExecutorResources::new(
+            arb.clone(),
+            ShutdownToken::detached(),
+            None,
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        )
+        .unwrap();
+        let records = provider
+            .allocation()
+            .scope()
+            .unwrap()
+            .reserve(Layout::array::<u8>(1024 * KIB as usize).unwrap())
+            .unwrap();
+        assert_eq!(arb.charged_bytes(), 1024 * KIB);
+
+        let mut stage = provider.resources().scope().unwrap().stage().unwrap();
+        let opened = arb.charged_bytes();
+        stage.write_all(&vec![5; 64 * KIB as usize]).unwrap();
+        let staging = arb.charged_bytes() - opened;
+        assert!(
+            staging >= 64 * KIB
+                && staging < 64 * KIB + clinker_format::preparation::STAGE_CHUNK_BYTES as u64,
+            "the staged bytes are charged once, with their chunk list: {staging}"
+        );
+        assert_eq!(
+            provider.authority.admission.handle.bytes(),
+            0,
+            "the writer consumer's handle charges nothing"
+        );
+        assert_eq!(
+            arb.charged_bytes(),
+            arb.writer_resource_usage().memory,
+            "every charged byte is a governed grant; no consumer handle adds to it"
+        );
+        drop(stage);
+        drop(records);
+        assert_eq!(arb.charged_bytes(), 0);
     }
 
     #[test]

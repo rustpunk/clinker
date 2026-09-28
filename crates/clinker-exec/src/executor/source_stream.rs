@@ -690,6 +690,99 @@ nodes:
     }
 
     #[test]
+    fn source_peak_reads_its_attributed_record_allocations() {
+        use crate::executor::preparation::ExecutorResources;
+        use crate::pipeline::memory::ledger::Requester;
+        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
+        use crate::pipeline::shutdown::ShutdownToken;
+        use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface};
+        use clinker_record::{FieldStr, Value};
+        use std::alloc::Layout;
+        use std::num::NonZeroUsize;
+
+        const KIB: u64 = 1024;
+        let arb = Arc::new(MemoryArbitrator::with_policy(
+            4 * 1024 * KIB,
+            0.8,
+            0.7,
+            Box::new(NoOpPolicy),
+        ));
+        let provider = ExecutorResources::new(
+            arb.clone(),
+            ShutdownToken::detached(),
+            None,
+            NonZeroUsize::MIN,
+            None,
+        )
+        .unwrap();
+        let run = provider.allocation();
+        let handle = ConsumerHandle::new();
+        let consumer = Arc::new(SourceConsumer::new(handle.clone()));
+        let id = arb.register_node_consumer(
+            consumer.clone(),
+            handle.clone(),
+            ConsumerLabel {
+                node: "events".to_string(),
+                surface: MemorySurface::RowsRead,
+            },
+        );
+        let view = provider.attributed_allocation(Requester::for_consumer(id));
+        assert_eq!(view.identity(), run.identity());
+        let (mut channel, rx) =
+            SourceIngestChannel::new(4, handle.clone(), PlanNodeId::new(7), view.clone());
+
+        let text =
+            FieldStr::try_new(&"x".repeat(64 * KIB as usize), &view.scope().unwrap()).unwrap();
+        channel
+            .push(admitted_record(&view, Value::String(text.clone())))
+            .unwrap();
+        let held = |arb: &MemoryArbitrator| {
+            arb.ledger_snapshot(0, Requester::governed())
+                .holders
+                .iter()
+                .find(|holder| holder.consumer == id)
+                .map_or(0, |holder| holder.charged)
+        };
+        assert!(
+            held(&arb) >= 64 * KIB,
+            "the Source's governed record bytes are charged in its name"
+        );
+        assert_eq!(handle.bytes(), 0, "the Source's handle charges nothing");
+        let peak = consumer.peak_charged_bytes().unwrap();
+        assert!(
+            peak >= 64 * KIB,
+            "the Source's peak covers its record allocations: {peak}"
+        );
+        let lease = view
+            .scope()
+            .unwrap()
+            .reserve(Layout::new::<[u8; 64]>())
+            .unwrap();
+        assert!(
+            lease.is_accounted_by(&run),
+            "a lease from the Source's view is the run's"
+        );
+        drop(lease);
+
+        drop(channel);
+        drop(rx);
+        drop(text);
+        assert_eq!(held(&arb), 0, "the dropped records return their bytes");
+        assert_eq!(
+            consumer.peak_charged_bytes(),
+            Some(peak),
+            "a release never lowers the mark"
+        );
+        assert_eq!(
+            arb.per_node_peak_charged_bytes().get("events"),
+            Some(&peak),
+            "the node reports its Source's mark"
+        );
+        arb.unregister_consumer(id);
+        assert_eq!(arb.per_node_peak_charged_bytes().get("events"), Some(&peak));
+    }
+
+    #[test]
     fn source_consumer_reports_handle_bytes_and_never_spills() {
         let handle = ConsumerHandle::new();
         handle.set_bytes(16 * 1024);
