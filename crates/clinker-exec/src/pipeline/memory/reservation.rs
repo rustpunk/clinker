@@ -3,8 +3,8 @@
 //!
 //! Memory, disk and descriptors share the ledger's one lock
 //! ([`super::protocol`]); memory is admitted through
-//! [`MemoryArbitrator::reserve`]. Usage reported by consumers the ledger does
-//! not yet hold is sampled outside the lock and remains an estimate.
+//! [`MemoryArbitrator::reserve`], against the same total every registered
+//! consumer's handle charges.
 
 use super::ledger::Requester;
 use super::protocol::{LedgerCore, LedgerState};
@@ -21,6 +21,8 @@ pub(crate) trait WriterCleanup: Send + Sync {
 }
 
 /// Live admitted resources and their memory high-water mark; excludes RSS.
+/// `memory` is what governed allocation grants hold on the ledger, not the
+/// consumer handle charges beside them.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WriterResourceUsage {
     pub memory: u64,
@@ -30,9 +32,10 @@ pub struct WriterResourceUsage {
 }
 
 /// State kept under the ledger lock beside the charges: the managed writer
-/// consumer's handle and id. The handle mirrors the charged total, set under
-/// the same lock as every charge and release so its reported usage never
-/// lags or overtakes the ledger.
+/// consumer's handle and id. Holding them under the lock that closes the run
+/// lets exactly one writer consumer attach, and lets closing the run take its
+/// id to unregister. The handle charges nothing: the writer's staged bytes
+/// are governed allocations the ledger already holds.
 #[derive(Default)]
 pub(super) struct WriterBinding {
     pub handle: Option<Arc<ConsumerHandle>>,
@@ -71,19 +74,11 @@ impl ReservationState {
     fn usage(&self) -> WriterResourceUsage {
         let ledger = self.ledger.lock();
         WriterResourceUsage {
-            memory: ledger.charged(),
-            peak_memory: ledger.peak_charged(),
+            memory: ledger.granted(),
+            peak_memory: ledger.peak_granted(),
             disk: ledger.disk,
             descriptors: ledger.descriptors,
         }
-    }
-}
-
-/// Copy the charged total into the managed writer handle. Called with the
-/// ledger locked after every change to the charged total.
-pub(super) fn mirror_writer_handle(ledger: &LockedLedger) {
-    if let Some(handle) = &ledger.attachment.handle {
-        handle.set_bytes(ledger.charged());
     }
 }
 
@@ -258,9 +253,9 @@ impl ReservationState {
         self.release_memory(bytes as u64, attribution);
     }
     pub(super) fn release_memory(&self, bytes: u64, attribution: Option<ConsumerId>) {
-        let mut ledger = self.ledger.lock();
-        ledger.release(bytes, attribution.map(|id| id.0));
-        mirror_writer_handle(&ledger);
+        self.ledger
+            .lock()
+            .release(bytes, attribution.map(|id| id.0));
     }
     pub(crate) fn release_writer_disk(&self, bytes: u64) {
         self.ledger.lock().disk -= bytes;

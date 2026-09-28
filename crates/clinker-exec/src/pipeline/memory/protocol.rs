@@ -30,6 +30,8 @@ impl<L, A> LedgerCore<L, A> {
                 limit,
                 charged: 0,
                 peak_charged: 0,
+                granted: 0,
+                peak_granted: 0,
                 release_epoch: 0,
                 consumers: BTreeMap::new(),
                 closed: false,
@@ -94,6 +96,10 @@ pub(crate) struct LedgerState<L, A> {
     limit: u64,
     charged: u64,
     peak_charged: u64,
+    /// The part of `charged` that grants hold (governed allocations, in a
+    /// consumer's name or none), as opposed to consumer handles.
+    granted: u64,
+    peak_granted: u64,
     /// Advanced by every release of a nonzero byte count and by nothing
     /// else, so an unchanged epoch across a span proves no byte was released
     /// in it.
@@ -133,11 +139,20 @@ impl<L, A> LedgerState<L, A> {
         self.peak_charged
     }
 
-    /// Bytes a request could be granted beside `outside` bytes the ledger
-    /// does not hold but that count against the same limit.
-    pub(crate) fn available(&self, outside: u64) -> u64 {
-        self.limit
-            .saturating_sub(self.charged.saturating_add(outside))
+    /// Bytes grants hold now: the charged total less every consumer handle's
+    /// charge.
+    pub(crate) fn granted(&self) -> u64 {
+        self.granted
+    }
+
+    /// Highest [`Self::granted`] so far; a release never lowers it.
+    pub(crate) fn peak_granted(&self) -> u64 {
+        self.peak_granted
+    }
+
+    /// Bytes a request could be granted now.
+    pub(crate) fn available(&self) -> u64 {
+        self.limit.saturating_sub(self.charged)
     }
 
     /// Check and charge `bytes` in one step, attributed to consumer
@@ -151,16 +166,48 @@ impl<L, A> LedgerState<L, A> {
     pub(crate) fn try_charge(
         &mut self,
         bytes: u64,
-        outside: u64,
         attribution: Option<u32>,
     ) -> Result<(), Refusal> {
+        self.admit(bytes)?;
+        self.granted = self.granted.saturating_add(bytes);
+        self.peak_granted = self.peak_granted.max(self.granted);
+        if let Some(id) = attribution
+            && bytes > 0
+        {
+            let entry = self
+                .consumers
+                .entry(id)
+                .or_insert_with(ConsumerEntry::empty);
+            entry.attributed = entry.attributed.saturating_add(bytes);
+            entry.raise_mark();
+        }
+        Ok(())
+    }
+
+    /// Check and charge `bytes` to consumer `id`'s handle in one step, with
+    /// [`Self::try_charge`]'s refusals. A grant raises the peak and the
+    /// consumer's mark.
+    pub(crate) fn try_charge_handle(&mut self, id: u32, bytes: u64) -> Result<(), Refusal> {
+        self.admit(bytes)?;
+        let entry = self
+            .consumers
+            .entry(id)
+            .or_insert_with(ConsumerEntry::empty);
+        entry.handle = entry.handle.saturating_add(bytes);
+        entry.raise_mark();
+        Ok(())
+    }
+
+    /// The check both charge kinds share: refuse, or add `bytes` to the
+    /// charged total and raise the peak.
+    fn admit(&mut self, bytes: u64) -> Result<(), Refusal> {
         if self.closed {
             return Err(Refusal::Closed);
         }
         if bytes == 0 {
             return Ok(());
         }
-        let available = self.available(outside);
+        let available = self.available();
         if bytes > self.limit {
             return Err(Refusal::Short {
                 available,
@@ -181,14 +228,6 @@ impl<L, A> LedgerState<L, A> {
         };
         self.charged = charged;
         self.peak_charged = self.peak_charged.max(charged);
-        if let Some(id) = attribution {
-            let entry = self
-                .consumers
-                .entry(id)
-                .or_insert_with(ConsumerEntry::empty);
-            entry.attributed = entry.attributed.saturating_add(bytes);
-            entry.raise_mark();
-        }
         Ok(())
     }
 
@@ -204,6 +243,7 @@ impl<L, A> LedgerState<L, A> {
             return;
         }
         self.discharge(bytes);
+        self.granted = self.granted.saturating_sub(bytes);
         if let Some(id) = attribution
             && let Some(entry) = self.consumers.get_mut(&id)
         {
@@ -219,6 +259,94 @@ impl<L, A> LedgerState<L, A> {
         );
         self.charged = self.charged.saturating_sub(bytes);
         self.release_epoch = self.release_epoch.wrapping_add(1);
+    }
+
+    /// Number of nonzero releases so far. An unchanged epoch across a span
+    /// proves nothing was released in it.
+    pub(crate) fn release_epoch(&self) -> u64 {
+        self.release_epoch
+    }
+
+    /// Record consumer `id` under `label` and charge the `bytes` its handle
+    /// already holds, unchecked: those bytes are resident before the
+    /// consumer registers, so refusing them would not free them.
+    pub(crate) fn bind_handle(&mut self, id: u32, label: L, bytes: u64) {
+        self.charged = self.charged.saturating_add(bytes);
+        self.peak_charged = self.peak_charged.max(self.charged);
+        let entry = self
+            .consumers
+            .entry(id)
+            .or_insert_with(ConsumerEntry::empty);
+        entry.label = Some(label);
+        entry.handle = entry.handle.saturating_add(bytes);
+        entry.raise_mark();
+    }
+
+    /// Set consumer `id`'s handle charge to `bytes`, unchecked, and return the
+    /// charge it replaced. A rise raises the peak and the mark; a fall is a
+    /// release.
+    pub(crate) fn set_handle(&mut self, id: u32, bytes: u64) -> u64 {
+        let entry = self
+            .consumers
+            .entry(id)
+            .or_insert_with(ConsumerEntry::empty);
+        let previous = entry.handle;
+        entry.handle = bytes;
+        entry.raise_mark();
+        if bytes >= previous {
+            self.charged = self.charged.saturating_add(bytes - previous);
+            self.peak_charged = self.peak_charged.max(self.charged);
+        } else {
+            self.discharge(previous - bytes);
+        }
+        previous
+    }
+
+    /// Set consumer `from`'s handle charge to `from_bytes` and consumer
+    /// `to`'s to `to_bytes` in one step, unchecked, so bytes changing owner
+    /// are never charged twice or to nobody. The charged total moves only by
+    /// the net difference: a rise raises the peak, a fall is a release.
+    pub(crate) fn move_handle_charge(
+        &mut self,
+        from: u32,
+        from_bytes: u64,
+        to: u32,
+        to_bytes: u64,
+    ) {
+        let before = self
+            .handle_bytes(from)
+            .saturating_add(self.handle_bytes(to));
+        for (id, bytes) in [(from, from_bytes), (to, to_bytes)] {
+            let entry = self
+                .consumers
+                .entry(id)
+                .or_insert_with(ConsumerEntry::empty);
+            entry.handle = bytes;
+            entry.raise_mark();
+        }
+        let after = from_bytes.saturating_add(to_bytes);
+        if after >= before {
+            self.charged = self.charged.saturating_add(after - before);
+            self.peak_charged = self.peak_charged.max(self.charged);
+        } else {
+            self.discharge(before - after);
+        }
+    }
+
+    /// Consumer `id`'s handle charge now.
+    pub(crate) fn handle_bytes(&self, id: u32) -> u64 {
+        self.consumers.get(&id).map_or(0, |entry| entry.handle)
+    }
+
+    /// Remove consumer `id`'s entry, releasing its remaining handle charge,
+    /// and return its mark. Bytes still granted in its name stay charged and
+    /// are unattributed from here on.
+    pub(crate) fn remove_consumer(&mut self, id: u32) -> Option<u64> {
+        let entry = self.consumers.remove(&id)?;
+        if entry.handle > 0 {
+            self.discharge(entry.handle);
+        }
+        Some(entry.mark)
     }
 
     /// `id`'s high-water mark of handle plus attributed bytes, or `None`
@@ -251,43 +379,5 @@ impl<L, A> LedgerState<L, A> {
             .iter()
             .fold(0u64, |sum, holder| sum.saturating_add(holder.2));
         (holders, self.charged.saturating_sub(held))
-    }
-}
-
-/// Handle charges and entry removal as a registered consumer's binding will
-/// make them, and the release epoch a reclaim pass will read.
-#[cfg(test)]
-impl<L, A> LedgerState<L, A> {
-    pub(crate) fn release_epoch(&self) -> u64 {
-        self.release_epoch
-    }
-
-    /// Charge `bytes` to `id`'s handle, unchecked, and record its label.
-    pub(crate) fn charge_handle(&mut self, id: u32, label: L, bytes: u64) {
-        self.charged = self.charged.saturating_add(bytes);
-        self.peak_charged = self.peak_charged.max(self.charged);
-        let entry = self
-            .consumers
-            .entry(id)
-            .or_insert_with(ConsumerEntry::empty);
-        entry.label = Some(label);
-        entry.handle = entry.handle.saturating_add(bytes);
-        entry.raise_mark();
-    }
-
-    /// Release `bytes` of `id`'s handle charge.
-    pub(crate) fn release_handle(&mut self, id: u32, bytes: u64) {
-        if bytes == 0 {
-            return;
-        }
-        self.discharge(bytes);
-        if let Some(entry) = self.consumers.get_mut(&id) {
-            entry.handle = entry.handle.saturating_sub(bytes);
-        }
-    }
-
-    /// Remove `id`'s entry, returning its mark.
-    pub(crate) fn remove_consumer(&mut self, id: u32) -> Option<u64> {
-        self.consumers.remove(&id).map(|entry| entry.mark)
     }
 }

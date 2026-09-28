@@ -466,10 +466,17 @@ impl DocumentDlqState {
     ) -> Self {
         let handle = ConsumerHandle::new();
         let log = ExtentLog::new(held.spill_root, held.compress, Arc::clone(&handle));
-        let consumer_id = arbitrator.register_consumer(Arc::new(DocumentDlqConsumer::new(
+        let consumer_id = arbitrator.register_consumer(
+            Arc::new(DocumentDlqConsumer::new(
+                Arc::clone(&handle),
+                log.resident_gauge(),
+            )),
             Arc::clone(&handle),
-            log.resident_gauge(),
-        )));
+            ConsumerLabel {
+                node: "dead letters".to_string(),
+                surface: MemorySurface::HeldFailingRows,
+            },
+        );
         Self {
             doc_sources,
             failed: HashMap::new(),
@@ -578,7 +585,6 @@ impl DocumentDlqState {
         if failed.emitted.unsettled >= SETTLE_EVERY_ADMISSIONS {
             settle_ledger(&self.handle, &mut failed.emitted);
         }
-        self.arbitrator.sample_peak_consumer_usage();
         Ok(true)
     }
 
@@ -588,7 +594,6 @@ impl DocumentDlqState {
         if let Some(failed) = self.failed.get_mut(key) {
             settle_ledger(&self.handle, &mut failed.emitted);
         }
-        self.arbitrator.sample_peak_consumer_usage();
     }
 
     /// Settle every ledger that took admissions since its last settle. A
@@ -600,7 +605,6 @@ impl DocumentDlqState {
                 settle_ledger(&self.handle, &mut failed.emitted);
             }
         }
-        self.arbitrator.sample_peak_consumer_usage();
     }
 
     /// The failed documents whose held rows no rejection has taken, in key
@@ -696,7 +700,6 @@ impl DocumentDlqState {
             self.handle.bytes() >= self.held.resident_bytes() + self.held.index_bytes(),
             "the state's charge covers its held rows"
         );
-        self.arbitrator.sample_peak_consumer_usage();
         self.appends += 1;
         Ok(())
     }
@@ -1444,7 +1447,6 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
                 .buffer
                 .unaccounted_memory_bytes(&self.allocation_resources),
         );
-        self.arbitrator.sample_peak_consumer_usage();
         if self.arbitrator.should_spill() {
             spill_bucket_in_place(
                 bucket,
@@ -2140,6 +2142,19 @@ mod tests {
             surface: clinker_plan::runtime_error::MemorySurface::HeldFailingRows,
         }
     }
+
+    /// A registered consumer whose only purpose is to own a `ConsumerId` a
+    /// victim-selection snapshot can name.
+    fn register_fresh(arbitrator: &MemoryArbitrator) -> ConsumerId {
+        let handle = ConsumerHandle::new();
+        arbitrator.register_consumer(
+            Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                handle.clone(),
+            )),
+            handle,
+            test_label("out"),
+        )
+    }
     use clinker_record::owned_storage::SharedStorage;
     use clinker_record::{
         DocumentContext, DocumentId, EnvelopeRecord, FieldMetadata, Schema, SchemaBuilder, Value,
@@ -2640,9 +2655,7 @@ mod tests {
         let node_handle = ConsumerHandle::new();
         node_handle.set_bytes(16);
         let node_consumer = crate::executor::node_buffer::NodeBufferConsumer::new(node_handle);
-        let node_id = arbitrator.register_consumer(Arc::new(
-            crate::executor::node_buffer::NodeBufferConsumer::new(ConsumerHandle::new()),
-        ));
+        let node_id = register_fresh(&arbitrator);
         let (state, _key) = ledger_state(&arbitrator);
         state.handle.set_bytes(1 << 20);
         let ledger_consumer =
@@ -3127,12 +3140,8 @@ mod tests {
         let ledger_handle = ConsumerHandle::new();
         ledger_handle.set_bytes(1 << 20);
         let ledger_only = DocumentDlqConsumer::new(ledger_handle, Arc::new(AtomicU64::new(0)));
-        let node_id = arbitrator.register_consumer(Arc::new(
-            crate::executor::node_buffer::NodeBufferConsumer::new(ConsumerHandle::new()),
-        ));
-        let ledger_id = arbitrator.register_consumer(Arc::new(
-            crate::executor::node_buffer::NodeBufferConsumer::new(ConsumerHandle::new()),
-        ));
+        let node_id = register_fresh(&arbitrator);
+        let ledger_id = register_fresh(&arbitrator);
         let snapshot: [(ConsumerId, &dyn MemoryConsumer); 3] = [
             (ledger_id, &ledger_only),
             (node_id, &node_consumer),

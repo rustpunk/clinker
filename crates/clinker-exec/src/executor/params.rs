@@ -251,12 +251,13 @@ pub struct ExecutionReport {
     /// never spilled have no entry. Sampled with the on-disk figures, after
     /// all Source workers have joined.
     pub per_stage_spill_bytes_written: BTreeMap<String, u64>,
-    /// High-water mark of the arbitrator's summed pull-mode charged bytes
-    /// observed across streaming per-batch charges. For a streaming stage
-    /// this stays bounded to one in-flight batch (plus the bounded
-    /// channel's capacity) rather than the whole stage output — the
-    /// observable that proves the per-batch admit/discharge model. `0`
-    /// when no streaming charge fired (a fully materialized pipeline).
+    /// The run's charged peak: the most bytes the memory ledger held charged
+    /// at one instant, every registered consumer's handle charge and every
+    /// governed allocation together. Raised by every charge, not sampled, so
+    /// a streaming stage that admits and discharges one batch at a time
+    /// keeps it near one in-flight batch (plus the bounded channel's
+    /// capacity) rather than the whole stage output. `0` when nothing was
+    /// ever charged. Sampled after all Source workers have joined.
     pub peak_consumer_usage_bytes: u64,
     /// For each node whose retained state is registered with the arbitrator
     /// under the node's name, the highest number of bytes any one of that
@@ -265,9 +266,10 @@ pub struct ExecutionReport {
     /// another node's state never raises this node's figure. A node with
     /// several consumers reports the largest single consumer's mark, not
     /// their sum. Run-scoped state that no node owns (writer output staging,
-    /// the credential registry) has no entry. Unlike
-    /// [`Self::peak_consumer_usage_bytes`], which is a run-wide sum sampled
-    /// at streaming charges, this is the figure that says how much one
+    /// the credential registry) has no entry. A consumer's mark covers its
+    /// handle's charge plus the governed allocations made in its name.
+    /// Unlike [`Self::peak_consumer_usage_bytes`], the run-wide peak of
+    /// everything charged at once, this is the figure that says how much one
     /// node's state held. Sampled after all Source workers have joined.
     pub per_node_peak_charged_bytes: BTreeMap<String, u64>,
     /// `true` when the run unwound early because a shutdown signal

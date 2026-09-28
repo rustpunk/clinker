@@ -767,7 +767,6 @@ where
                         })?;
                         let prior = crate::executor::batch_handoff::StreamingReservation::retain(
                             ie_consumer_handle.clone(),
-                            ctx.memory_budget.clone(),
                             sorted_output_retained_bytes(&kernel.sorted, &ctx.allocation_resources)
                                 as u64,
                         );
@@ -2952,7 +2951,6 @@ fn adopt_spilled_runs_into_node_buffer(
     );
     ctx.node_buffer_consumer_ids
         .insert(node_idx.into(), (consumer_id, handle));
-    ctx.memory_budget.sample_peak_consumer_usage();
     if let Err(error) = declare_node_buffer_readers(ctx, current_dag, combine_name, node_idx) {
         if let Some((id, handle)) = ctx.node_buffer_consumer_ids.remove(&node_idx.into()) {
             handle.set_bytes(0);

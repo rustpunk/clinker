@@ -300,20 +300,22 @@ impl StreamingChargeHandle {
     /// deltas preserve concurrent Sink subtraction; drop releases only this
     /// owner's remaining portion of the counter.
     pub(crate) fn retain_bytes(&self, bytes: u64) -> StreamingReservation {
-        StreamingReservation::retain(self.handle.clone(), self.arbitrator.clone(), bytes)
+        StreamingReservation::retain(self.handle.clone(), bytes)
     }
 
+    /// Charge `bytes` of retained storage to this slot's counter, taking it
+    /// over from `prior`'s owner in one step so it is never charged twice.
     pub(crate) fn retain_from_prior(
         &self,
         bytes: u64,
         prior: Option<StreamingReservation>,
     ) -> StreamingReservation {
-        self.handle.add_bytes(bytes);
-        drop(prior);
-        self.arbitrator.sample_peak_consumer_usage();
+        match prior {
+            Some(prior) => prior.hand_over(&self.handle, bytes),
+            None => self.handle.add_bytes(bytes),
+        }
         StreamingReservation {
             handle: self.handle.clone(),
-            arbitrator: self.arbitrator.clone(),
             bytes,
         }
     }
@@ -570,28 +572,24 @@ impl StreamingChargeHandle {
 
 /// One portion of a streaming slot's charge, distinct from queued rows.
 pub(crate) struct StreamingReservation {
-    arbitrator: Arc<MemoryArbitrator>,
     handle: Arc<ConsumerHandle>,
     bytes: u64,
 }
 impl StreamingReservation {
-    pub(crate) fn retain(
-        handle: Arc<ConsumerHandle>,
-        arbitrator: Arc<MemoryArbitrator>,
-        bytes: u64,
-    ) -> Self {
+    pub(crate) fn retain(handle: Arc<ConsumerHandle>, bytes: u64) -> Self {
         handle.add_bytes(bytes);
-        arbitrator.sample_peak_consumer_usage();
-        Self {
-            handle,
-            arbitrator,
-            bytes,
-        }
+        Self { handle, bytes }
     }
 
     #[cfg(test)]
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes
+    }
+    /// Release this portion and charge `bytes` to `to` as one ownership
+    /// change ([`ConsumerHandle::take_over`]), so the state is charged to
+    /// exactly one owner at every instant.
+    pub(crate) fn hand_over(mut self, to: &ConsumerHandle, bytes: u64) {
+        to.take_over(&self.handle, std::mem::take(&mut self.bytes), bytes);
     }
     pub(crate) fn resize(&mut self, bytes: u64) {
         if bytes > self.bytes {
@@ -600,7 +598,6 @@ impl StreamingReservation {
             self.handle.sub_bytes(self.bytes - bytes);
         }
         self.bytes = bytes;
-        self.arbitrator.sample_peak_consumer_usage();
     }
     /// Replace a consumed row's producer-owned heap with the existing stream
     /// estimate in one atomic delta on the same counter. The Sink may subtract

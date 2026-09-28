@@ -9,11 +9,10 @@
 //! [`Shortfall`]s.
 
 use super::protocol::Refusal;
-use super::reservation::{LockedLedger, ReservationState, mirror_writer_handle};
+use super::reservation::{LockedLedger, ReservationState};
 use super::{ConsumerId, MemoryArbitrator};
 use clinker_plan::runtime_error::ConsumerLabel;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 /// Whose request a [`MemoryArbitrator::reserve`] is.
 ///
@@ -62,15 +61,12 @@ impl Grant {
     /// Charge `n` more bytes to this grant, attributed as the grant was.
     ///
     /// Check and charge are one step under the ledger lock: on a shortfall
-    /// neither the grant nor the ledger changes. Until every consumer's
-    /// handle charges the ledger, a grow is checked against the ledger's own
-    /// charges only, not against usage consumers report outside it.
+    /// neither the grant nor the ledger changes.
     pub fn try_grow(&mut self, n: u64) -> Result<(), Shortfall> {
         let mut ledger = self.state.ledger.lock();
-        if let Err(refusal) = ledger.try_charge(n, 0, self.attribution.map(|id| id.0)) {
+        if let Err(refusal) = ledger.try_charge(n, self.attribution.map(|id| id.0)) {
             return Err(shortfall(&ledger, n, self.attribution, refusal));
         }
-        mirror_writer_handle(&ledger);
         drop(ledger);
         // The ledger's total covers this grant's bytes and just admitted `n`
         // more without overflowing, so their sum fits too.
@@ -123,10 +119,8 @@ impl std::fmt::Debug for Grant {
 pub struct Shortfall {
     /// Bytes the request asked for.
     pub requested: u64,
-    /// Bytes the request could have been granted. While consumers still
-    /// report usage outside the ledger, this is the limit less both the
-    /// ledger's charges and that reported usage, so it can be smaller than
-    /// `snapshot.limit - snapshot.charged`.
+    /// Bytes the request could have been granted: the limit less the
+    /// charged total.
     pub available: u64,
     /// The request exceeds the whole limit (or cannot be represented), so no
     /// release could ever make it fit.
@@ -226,7 +220,7 @@ fn snapshot(
     }
 }
 
-fn shortfall(
+pub(super) fn shortfall(
     ledger: &LockedLedger,
     requested: u64,
     requester: Option<ConsumerId>,
@@ -252,44 +246,24 @@ impl MemoryArbitrator {
     /// Charge `bytes` to the ledger for `requester`, or refuse without
     /// charging anything.
     ///
-    /// Check and charge happen under the one ledger lock, so concurrent
-    /// requesters can never together pass the limit. A zero-byte request is
-    /// granted empty and never falls short. A request larger than the limit
-    /// is refused as oversized. The call never blocks on anything but the
-    /// ledger lock and never spills; a refusal is final for this call.
-    ///
-    /// Consumers that still report their usage outside the ledger count
-    /// against the same limit: their reports are summed before the lock is
-    /// taken, because reading them calls into the consumers.
+    /// Check and charge happen under the one ledger lock, against the same
+    /// total every registered consumer's handle charges, so concurrent
+    /// requesters and handle growths can never together pass the limit. A
+    /// zero-byte request is granted empty and never falls short. A request
+    /// larger than the limit is refused as oversized. The call never blocks
+    /// on anything but the ledger lock and never spills; a refusal is final
+    /// for this call.
     pub fn reserve(&self, bytes: u64, requester: Requester) -> Result<Grant, Shortfall> {
-        let outside = self.usage_outside_ledger();
         let mut ledger = self.admission.ledger.lock();
-        if let Err(refusal) = ledger.try_charge(bytes, outside, requester.consumer.map(|id| id.0)) {
+        if let Err(refusal) = ledger.try_charge(bytes, requester.consumer.map(|id| id.0)) {
             return Err(shortfall(&ledger, bytes, requester.consumer, refusal));
         }
-        mirror_writer_handle(&ledger);
-        let charged = ledger.charged();
         drop(ledger);
-        self.peak_consumer_usage
-            .fetch_max(outside.saturating_add(charged), Ordering::Relaxed);
         Ok(Grant {
             state: Arc::clone(&self.admission),
             bytes,
             attribution: requester.consumer,
         })
-    }
-
-    /// Usage reported by the registered consumers whose bytes the ledger
-    /// does not hold: every consumer except the admission-managed writer
-    /// consumer, whose handle mirrors the ledger itself.
-    fn usage_outside_ledger(&self) -> u64 {
-        self.consumers
-            .load()
-            .iter()
-            .filter(|(_, consumer)| !consumer.is_admission_managed())
-            .fold(0u64, |sum, (_, consumer)| {
-                sum.saturating_add(consumer.current_usage())
-            })
     }
 
     /// Bytes charged to the ledger now.
@@ -314,34 +288,35 @@ impl MemoryArbitrator {
     pub fn consumer_peak_charged_bytes(&self, id: ConsumerId) -> Option<u64> {
         self.admission.ledger.lock().consumer_mark(id.0)
     }
+
+    /// Number of nonzero releases the ledger has seen: every grant shrink or
+    /// drop, handle shrink, and unregistration of a consumer still holding
+    /// bytes advances it. An unchanged value across a span proves nothing
+    /// was released in it.
+    pub fn release_epoch(&self) -> u64 {
+        self.admission.ledger.lock().release_epoch()
+    }
 }
 
-/// Stand-ins for the handle charges a registered consumer will make through
-/// the ledger, so tests can place labelled holders beside governed grants.
+/// Labelled holders placed directly on the ledger, beside governed grants,
+/// without registering a consumer.
 #[cfg(test)]
 impl MemoryArbitrator {
     /// Charge `bytes` to `id`'s handle and record its label, unchecked.
     pub(crate) fn charge_labelled_handle(&self, id: ConsumerId, label: ConsumerLabel, bytes: u64) {
-        let mut ledger = self.admission.ledger.lock();
-        ledger.charge_handle(id.0, label, bytes);
-        mirror_writer_handle(&ledger);
+        self.admission.ledger.lock().bind_handle(id.0, label, bytes);
     }
 
     /// Release `bytes` of `id`'s handle charge.
     pub(crate) fn release_labelled_handle(&self, id: ConsumerId, bytes: u64) {
         let mut ledger = self.admission.ledger.lock();
-        ledger.release_handle(id.0, bytes);
-        mirror_writer_handle(&ledger);
+        let held = ledger.handle_bytes(id.0);
+        ledger.set_handle(id.0, held.saturating_sub(bytes));
     }
 
     /// Remove `id`'s entry as unregistration does, returning its mark.
     pub(crate) fn forget_consumer_entry(&self, id: ConsumerId) -> Option<u64> {
         self.admission.ledger.lock().remove_consumer(id.0)
-    }
-
-    /// Number of releases the ledger has seen.
-    pub(crate) fn release_epoch(&self) -> u64 {
-        self.admission.ledger.lock().release_epoch()
     }
 }
 
@@ -1045,6 +1020,44 @@ mod tests {
             arbitrator.per_node_peak_charged_bytes().get("by_region"),
             Some(&(14 * KIB))
         );
+        assert_eq!(arbitrator.charged_bytes(), 0);
+    }
+
+    #[test]
+    fn an_ownership_hand_off_is_charged_once() {
+        let arbitrator = arbitrator(MIB);
+        let (producer, producer_id) = register_node(&arbitrator, "sorted");
+        let (slot, slot_id) = register_node(&arbitrator, "sorted");
+        producer.try_grow(8 * KIB + 7).expect("fits");
+        let peak = arbitrator.peak_charged_bytes();
+        let epoch = arbitrator.release_epoch();
+
+        // The rows' new owner charges a different figure for them than the
+        // producer did; the total moves by the difference only.
+        slot.take_over(&producer, 8 * KIB, 6 * KIB);
+        assert_eq!(producer.bytes(), 7);
+        assert_eq!(slot.bytes(), 6 * KIB);
+        assert_eq!(arbitrator.charged_bytes(), 6 * KIB + 7);
+        assert_eq!(
+            arbitrator.peak_charged_bytes(),
+            peak,
+            "the moved bytes are never charged to both owners at once"
+        );
+        assert_eq!(
+            arbitrator.release_epoch(),
+            epoch + 1,
+            "a net fall is a release"
+        );
+        assert_eq!(slot.peak_bytes(), 6 * KIB);
+
+        // A hand-off to a larger figure raises the total by the difference.
+        producer.take_over(&slot, 6 * KIB, 9 * KIB);
+        assert_eq!(arbitrator.charged_bytes(), 9 * KIB + 7);
+        assert_eq!(arbitrator.peak_charged_bytes(), 9 * KIB + 7);
+        assert_eq!(slot.bytes(), 0);
+
+        arbitrator.unregister_consumer(slot_id);
+        arbitrator.unregister_consumer(producer_id);
         assert_eq!(arbitrator.charged_bytes(), 0);
     }
 

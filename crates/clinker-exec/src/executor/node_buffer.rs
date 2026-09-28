@@ -826,7 +826,6 @@ impl TransientNodeBufferReservation {
             });
         }
         self.handle.add_bytes(additional_bytes);
-        self.budget.sample_peak_consumer_usage();
         Ok(())
     }
 
@@ -922,7 +921,6 @@ pub(crate) fn reserve_node_buffer_materialization(
             surface: clinker_plan::runtime_error::MemorySurface::ScanMaterialization,
         },
     );
-    budget.sample_peak_consumer_usage();
     let reservation = TransientNodeBufferReservation {
         budget: std::sync::Arc::clone(budget),
         consumer_id,

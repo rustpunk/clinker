@@ -3197,6 +3197,14 @@ impl NodeBufferAdmission {
     fn release_prior(&mut self) {
         drop(self.prior.take());
     }
+    /// Charge `bytes` to `handle`, the slot that now owns these rows, taking
+    /// them over from the prior owner in one step when there is one.
+    fn charge_to(&mut self, handle: &crate::pipeline::memory::ConsumerHandle, bytes: u64) {
+        match self.prior.take() {
+            Some(prior) => prior.hand_over(handle, bytes),
+            None => handle.add_bytes(bytes),
+        }
+    }
 }
 
 pub(crate) fn admit_node_buffer_with_prior_owner(
@@ -3512,8 +3520,9 @@ fn admit_node_buffer_inner(
         if let Some((prev_id, _)) = ctx.node_buffer_consumer_ids.remove(&slot_key) {
             ctx.memory_budget.unregister_consumer(prev_id);
         }
+        // Registered empty: the slot's bytes are charged below, taken over
+        // from the rows' prior owner in one step when they have one.
         let handle = crate::pipeline::memory::ConsumerHandle::new();
-        handle.set_bytes(bytes);
         let label = ctx.planned_node_buffer_readers.slot_label(
             node_name,
             &slot_key,
@@ -3526,22 +3535,15 @@ fn admit_node_buffer_inner(
             handle.clone(),
             label,
         );
+        owned.charge_to(&handle, bytes);
         (consumer_id, handle)
     };
     ctx.node_buffer_consumer_ids
         .insert(slot_key, (consumer_id, handle.clone()));
-    // Establish the NodeBuffer owner first, then release only the prior
-    // producer portion before any local pressure or peak sample. These are
-    // legacy observations, not an atomic whole-engine ledger transfer.
+    // Establish the NodeBuffer owner first, then release any prior producer
+    // portion still held before any local pressure poll.
     owned.release_prior();
     let NodeBufferAdmission { rows, puncts, .. } = owned;
-    // Raise the run's high-water mark now that this slot's charge has
-    // joined the registry. Sampling at admission (not only on streaming
-    // batch charges) makes `peak_consumer_usage_bytes` a faithful peak
-    // over every coexisting `node_buffers` slot — which is the quantity
-    // dispatch order moves: finishing a chain's blocking consumer before
-    // charging the next chain's source keeps fewer slots live at once.
-    ctx.memory_budget.sample_peak_consumer_usage();
     debug_assert!(
         spill_allowed,
         "every published materialized node-buffer slot must be spill-eligible"
@@ -5486,7 +5488,7 @@ mod output_admission_ownership_tests {
                 0u64.into(),
             )];
             let bytes = estimate_node_buffer_bytes(&rows);
-            let owner = StreamingReservation::retain(prior_handle.clone(), budget.clone(), bytes);
+            let owner = StreamingReservation::retain(prior_handle.clone(), bytes);
             let mut owned = NodeBufferAdmission::with_prior_owner(rows, Vec::new(), Some(owner));
             assert_eq!(prior_handle.bytes(), bytes + 7);
             if mode == "unused" {
@@ -5495,7 +5497,6 @@ mod output_admission_ownership_tests {
                 drop(owned);
             } else {
                 let next = ConsumerHandle::new();
-                next.set_bytes(bytes);
                 let next_id = budget.register_consumer(
                     Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
                         next.clone(),
@@ -5503,8 +5504,10 @@ mod output_admission_ownership_tests {
                     next.clone(),
                     test_label("output"),
                 );
+                owned.charge_to(&next, bytes);
                 owned.release_prior();
-                budget.sample_peak_consumer_usage();
+                assert_eq!(next.bytes(), bytes);
+                assert_eq!(prior_handle.bytes(), 7);
                 assert_eq!(budget.sum_consumer_usage(), bytes + 7);
                 assert_eq!(
                     budget.peak_consumer_usage(),

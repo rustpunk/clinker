@@ -47,15 +47,20 @@ their heap allocations. The handles expose neither a detachable box nor its
 lease. Tests observe the charge at allocator deallocation, including unwinding,
 rather than treating payload destruction or a final zero balance as proof.
 
-The executor admission ledger serializes reservations and limit changes.
-Governed allocations charge it through `MemoryArbitrator::reserve`, which
-checks and charges under the ledger's one lock and returns a `Grant` or a
-`Shortfall`; concurrent requesters therefore can never together pass the
-limit. Until every consumer handle charges the same ledger, `reserve` also
-subtracts the usage the other registered consumers report, sampled before the
-lock because reading it calls into them; those samples remain estimates, not
-atomic grants. A `Shortfall` charges nothing and carries a snapshot taken
-under the same lock: the limit, the charged total, each labelled holder's
+The executor admission ledger is the run's one charged total; it serializes
+reservations, consumer charges and limit changes. Governed allocations charge
+it through `MemoryArbitrator::reserve`, which checks and charges under the
+ledger's one lock and returns a `Grant` or a `Shortfall`. Registering a
+consumer (`register_consumer` for run-scoped state, `register_node_consumer`
+for a node's state, each with the consumer's `ConsumerHandle` and a label)
+binds the handle to the same ledger: from then until the consumer
+unregisters, every charge through the handle is a ledger charge under that
+lock, and unregistering releases what the handle still holds.
+`ConsumerHandle::try_grow` and `try_resize` check a growth against the limit
+with every other charge, so a handle growth and a governed allocation, or two
+of either, can never together pass the limit; the older `set_bytes` /
+`add_bytes` charges are applied unchecked. A `Shortfall` charges nothing and
+carries a snapshot taken under the same lock: the limit, the charged total, each labelled holder's
 current bytes under its node name and an author-vocabulary surface, and the
 bytes no labelled holder owns, so
 the holders and that remainder add up to the charged total. A reserve made for
@@ -63,12 +68,13 @@ a consumer is attributed to it for the life of the grant, and the ledger keeps
 each consumer's high-water mark over its handle bytes plus its attributed
 bytes; attribution never changes what is admitted. Every release advances a
 release epoch. `writer_resource_usage()` derives current memory, peak memory,
-disk and descriptor usage from this ledger. `set_limit` refuses a limit below outstanding
-writer grants and leaves the previous limit unchanged; the disk setter likewise
+disk and descriptor usage from this ledger; its memory figures are what
+governed allocation grants hold, not the consumer handle charges beside them. `set_limit` refuses a limit below the
+charged total and leaves the previous limit unchanged; the disk setter likewise
 refuses a quota below the sum of outstanding writer disk and legacy spill bytes.
 
-The execution report samples the arbitrator's spill totals and peak consumer
-usage after dispatch has finished and every Source worker has joined. Ordered
+The execution report samples the arbitrator's spill totals and the ledger's
+charged peak after dispatch has finished and every Source worker has joined. Ordered
 Sources can still release staged spill charges while unwinding cancellation;
 sampling at dispatch close would report those already-released bytes as live.
 The total and per-stage spill fields include committed charges minus releases,
@@ -79,17 +85,23 @@ Two further report figures answer per-node questions those totals cannot.
 never lowered by a release, so a sort whose runs were merged and unlinked
 before the run ended still shows the bytes it wrote while its on-disk entry is
 back at zero. `per_node_peak_charged_bytes` gives, for each node whose state is
-registered under the node's name (`register_node_consumer`), the highest
-charge any one of its consumers reached. Every `ConsumerHandle` charge raises
-that consumer's mark, so the figure is exact per consumer rather than sampled,
-and another node's state never raises it. A node with several consumers
-reports the largest single consumer's mark. Run-scoped state that no node owns
-(writer output staging, the credential registry) registers through
-`register_consumer` and has no entry. The run-wide `peak_consumer_usage_bytes`
-remains a sum sampled at streaming charges.
+registered under the node's name (`register_node_consumer`, whose label names
+the node), the highest charge any one of its consumers reached. The ledger
+keeps each consumer's mark over its handle's bytes plus the governed
+allocations made in its name, and every charge to either raises it, so the
+figure is exact per consumer rather than sampled, and another node's state
+never raises it. A node with several consumers reports the largest single
+consumer's mark. Run-scoped state that no node owns (writer output staging,
+the credential registry, the document dead-letter state) registers through
+`register_consumer` and has no entry. The report's run-wide charged peak is
+the ledger's own: the most bytes charged at one instant, consumer handles and
+governed allocations together, raised by every charge rather than taken only
+when a streaming batch is charged.
 
-`WriterResourceConsumer` reports the ledger's exact live grant total through its
-`ConsumerHandle`. It is admission-managed and never backpressureable: parking
+`WriterResourceConsumer`'s `ConsumerHandle` charges nothing: its staging chunks
+are governed allocations the ledger already holds, so a handle charge would
+count every staged byte twice. It stays registered for its inventory row. It
+is admission-managed and never backpressureable: parking
 the synchronous writer would prevent its own release progress. Spill requests
 are consumed at chunk boundaries, and cancellation is checked before consulting
 pause state. Grants and cleanup debt keep the admission owner registered after

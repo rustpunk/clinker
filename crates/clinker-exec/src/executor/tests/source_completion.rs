@@ -59,7 +59,6 @@ fn source_completion_observes_worker_teardown_and_late_peak() {
             release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             // Work completed during join must contribute to the final peak.
             handle.set_bytes(512);
-            worker_memory.sample_peak_consumer_usage();
             drop(owned_spill);
             handle.set_bytes(0);
             worker_memory.unregister_consumer(consumer);
