@@ -13,7 +13,7 @@ use clinker_bench_support::cache::{BenchDataCache, DataSpec, NestedWrapper};
 use clinker_bench_support::{FieldKind, Scale};
 use clinker_exec::dlq::DiscardingDlqSink;
 use clinker_exec::executor::{
-    ExecutionReport, PipelineExecutor, PipelineRunParams, WriterRegistry,
+    ExecutionReport, MemoryTestOverrides, PipelineExecutor, PipelineRunParams, WriterRegistry,
 };
 use clinker_plan::config::pipeline_node::{PipelineNode, SourceBody};
 use clinker_plan::config::{CompileContext, InputFormat, load_config};
@@ -131,6 +131,10 @@ impl BenchPipelineRunner {
             batch_id: "bench-batch".to_string(),
             pipeline_vars: IndexMap::new(),
             shutdown_token: None,
+            // A bench measures the product: real process readings, even when
+            // feature unification under `cargo test` builds the executor with
+            // its test harness default.
+            memory_test: MemoryTestOverrides::process(),
             ..Default::default()
         };
 

@@ -1113,8 +1113,14 @@ pub struct MemoryArbitrator {
     writer_cleanup: Mutex<Option<Arc<dyn reservation::WriterCleanup>>>,
     /// Total memory limit in bytes (the hard limit). Default: 512MB.
     /// `AtomicU64` for `&self` access; production sets this once at
-    /// construction. Tests reconfigure via `set_limit`.
+    /// construction. Tests reconfigure via `set_limit`. This is the runtime
+    /// limit: every threshold and operator budget derives from it. It equals
+    /// `configured_limit` unless a test held the run to a smaller ledger
+    /// capacity.
     limit: AtomicU64,
+    /// The `memory.limit` the run was configured with. The startup check
+    /// judges this figure; nothing at runtime reads it.
+    configured_limit: AtomicU64,
     /// Fraction of limit at which proactive spill triggers (the soft
     /// limit). Default: 0.80. Dual-threshold model: 80% soft / 100%
     /// hard / 20% spike allowance — OTel Memory Limiter consensus.
@@ -1224,6 +1230,7 @@ impl MemoryArbitrator {
         drop(writer_cleanup.lock().unwrap_or_else(|e| e.into_inner()));
         Self {
             limit: AtomicU64::new(limit),
+            configured_limit: AtomicU64::new(limit),
             admission: Arc::new(reservation::ReservationState::new(limit)),
             writer_cleanup,
             spill_threshold_pct,
@@ -1342,16 +1349,43 @@ impl MemoryArbitrator {
         self.limit.load(Ordering::Relaxed)
     }
 
-    /// Configured memory limit in bytes (the hard limit).
+    /// The runtime memory limit in bytes (the hard limit): `memory.limit`,
+    /// or a smaller test capacity the run was held to. Every runtime reader
+    /// of the limit (thresholds, operator budgets) takes it from here.
     pub fn limit(&self) -> u64 {
         self.limit.load(Ordering::Relaxed)
     }
 
-    /// Reconfigure the hard limit. Production paths set this only at
-    /// construction; integration tests use this to drive deterministic
-    /// overflow scenarios without spawning processes of the requested
-    /// RSS size.
+    /// The `memory.limit` the arbitrator was built with, before any test
+    /// capacity. Only the startup check judges it.
+    pub fn configured_limit(&self) -> u64 {
+        self.configured_limit.load(Ordering::Relaxed)
+    }
+
+    /// The bytes [`Self::reserve`] grants against: the ledger's own copy of
+    /// the limit, read under the ledger lock.
+    pub fn ledger_capacity(&self) -> u64 {
+        self.admission.ledger.lock().limit()
+    }
+
+    /// Reconfigure the hard limit, as if `memory.limit` had been `n`.
+    /// Production paths set this only at construction; integration tests
+    /// use this to drive deterministic overflow scenarios without spawning
+    /// processes of the requested RSS size.
     pub fn set_limit(&self, n: u64) -> Result<(), ResourceError> {
+        self.set_runtime_limit(n)?;
+        self.configured_limit.store(n, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Hold the runtime limit to `capacity`, never above the configured
+    /// limit. Refused, leaving the limit unchanged, when more than the new
+    /// limit is already charged.
+    pub(crate) fn cap_runtime_limit(&self, capacity: u64) -> Result<(), ResourceError> {
+        self.set_runtime_limit(capacity.min(self.configured_limit()))
+    }
+
+    fn set_runtime_limit(&self, n: u64) -> Result<(), ResourceError> {
         let mut ledger = self.admission.ledger.lock();
         if let Err(charged) = ledger.set_limit(n) {
             return Err(ResourceError::new(
@@ -1362,6 +1396,19 @@ impl MemoryArbitrator {
         }
         self.limit.store(n, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Hold this arbitrator's runtime limit to `bytes` (never above its
+    /// configured limit), as a run built with a test ledger capacity is.
+    ///
+    /// # Panics
+    ///
+    /// When more than the new limit is already charged.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_test_capacity(&self, bytes: u64) {
+        if let Err(error) = self.cap_runtime_limit(bytes) {
+            panic!("test capacity {bytes} is below the bytes already charged: {error}");
+        }
     }
 
     /// Soft-limit fraction (constructor-set; default 0.80).

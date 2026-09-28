@@ -65,7 +65,11 @@ pub use document_dlq::{DocumentDlqTeardown, take_document_dlq_teardown_for_testi
 pub use ingest::build_source_format_reader;
 use ingest::{IngestTaskOutcome, ingest_source};
 use params::sum_cpu_io_totals;
-pub use params::{ExecutionReport, PipelineRunParams, PreviewPolicy, RunPolicy};
+pub use params::{
+    ExecutionReport, MemoryTestOverrides, PipelineRunParams, PreviewPolicy, RunPolicy,
+};
+#[cfg(any(test, feature = "test-utils"))]
+pub use params::{ForcedShortfall, IN_PROCESS_BASELINE_BYTES};
 pub use registry::WriterRegistry;
 pub(crate) use registry::build_format_writer;
 pub(crate) use route::CompiledRoute;
@@ -207,6 +211,7 @@ struct SourceCompletion {
     per_stage_spill_bytes_written: BTreeMap<String, u64>,
     peak_consumer_usage_bytes: u64,
     per_node_peak_charged_bytes: BTreeMap<String, u64>,
+    memory_limit_bytes: u64,
 }
 
 impl SourceCompletion {
@@ -222,6 +227,7 @@ impl SourceCompletion {
             per_stage_spill_bytes_written: memory.per_stage_spill_bytes_written(),
             peak_consumer_usage_bytes: memory.peak_consumer_usage(),
             per_node_peak_charged_bytes: memory.per_node_peak_charged_bytes(),
+            memory_limit_bytes: memory.ledger_capacity(),
         })
     }
 }
@@ -1285,6 +1291,7 @@ impl PipelineExecutor {
             per_stage_spill_bytes_written,
             peak_consumer_usage_bytes,
             per_node_peak_charged_bytes,
+            memory_limit_bytes,
         } = SourceCompletion::join(&memory_budget, || {
             ingest::join_source_workers(ingest_handles, "source-ingest-thread")
         })?;
@@ -1394,6 +1401,7 @@ impl PipelineExecutor {
             per_stage_spill_bytes_written,
             peak_consumer_usage_bytes,
             per_node_peak_charged_bytes,
+            memory_limit_bytes,
             interrupted,
             advisories,
         })

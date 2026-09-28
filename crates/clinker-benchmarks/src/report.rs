@@ -467,6 +467,7 @@ mod tests {
             per_stage_spill_bytes_written: Default::default(),
             peak_consumer_usage_bytes: 0,
             per_node_peak_charged_bytes: Default::default(),
+            memory_limit_bytes: 0,
             interrupted: false,
             advisories: Vec::new(),
         };
@@ -554,6 +555,7 @@ mod tests {
             per_stage_spill_bytes_written: Default::default(),
             peak_consumer_usage_bytes: 0,
             per_node_peak_charged_bytes: Default::default(),
+            memory_limit_bytes: 0,
             interrupted: false,
             advisories: Vec::new(),
         };

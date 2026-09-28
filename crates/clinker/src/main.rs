@@ -3489,6 +3489,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             spill_root_dir: spill_root_dir.clone(),
             spill_disk_cap_bytes,
             spill_compress: storage_config.spill.compress,
+            memory_test: clinker_exec::executor::MemoryTestOverrides::process(),
         };
         let report =
             PipelineExecutor::run_admitted_plan_with_readers_writers_in_context_with_policy(
@@ -3818,6 +3819,10 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         spill_root_dir: spill_root_dir.clone(),
         spill_disk_cap_bytes,
         spill_compress: storage_config.spill.compress,
+        // The binary always measures real process memory: feature
+        // unification under `cargo test` builds the executor with its
+        // in-process test default, which must never reach a real run.
+        memory_test: clinker_exec::executor::MemoryTestOverrides::process(),
     };
     // One CLI-owned fact source starts immediately before the finite executor.
     // Optional lineage receives only bounded owned snapshots from it; the sink

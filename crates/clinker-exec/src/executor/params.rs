@@ -131,6 +131,212 @@ pub struct PipelineRunParams {
     /// amortize LZ4's per-frame fixed cost. Threaded into the dispatch
     /// context and resolved per blocking operator at each spill site.
     pub spill_compress: clinker_plan::config::CompressMode,
+    /// Test levers on the memory figures the run starts from: a ledger
+    /// capacity below `memory.limit`, the baseline resident memory the
+    /// startup check compares against, and a one-shot forced shortfall.
+    ///
+    /// Production code can build only [`MemoryTestOverrides::process`],
+    /// which changes nothing: the run measures its baseline and enforces
+    /// `memory.limit`. The CLI names it explicitly so a binary built with
+    /// the test features on still reads real process memory.
+    #[doc(hidden)]
+    pub memory_test: MemoryTestOverrides,
+}
+
+/// Baseline resident memory the in-process test harness injects in place of
+/// a measurement, in bytes.
+///
+/// An in-process test shares its process with every sibling test, so a
+/// measured baseline depends on what else is running. A fixed figure makes
+/// the startup check (E312) decide the same way on every run.
+#[cfg(any(test, feature = "test-utils"))]
+pub const IN_PROCESS_BASELINE_BYTES: u64 = 16 << 20;
+
+/// Test-only memory figures for one run. See [`PipelineRunParams::memory_test`].
+///
+/// The fields are private: without the `test-utils` feature the only value
+/// that can be built is [`Self::process`]. With the feature (or in this
+/// crate's own tests) `Default` is the in-process harness default, which
+/// injects [`IN_PROCESS_BASELINE_BYTES`] as the baseline; a test opts back
+/// into a measured baseline with `with_process_memory()`.
+#[doc(hidden)]
+pub struct MemoryTestOverrides {
+    ledger_capacity: Option<u64>,
+    baseline_rss: Option<u64>,
+    #[cfg(any(test, feature = "test-utils"))]
+    forced_shortfall: Option<ForcedShortfall>,
+}
+
+impl MemoryTestOverrides {
+    /// Real process readings and no override: the run measures its baseline
+    /// resident memory and enforces `memory.limit` as configured.
+    pub fn process() -> Self {
+        Self {
+            ledger_capacity: None,
+            baseline_rss: None,
+            #[cfg(any(test, feature = "test-utils"))]
+            forced_shortfall: None,
+        }
+    }
+
+    /// The ledger capacity the run is held to, if any: the in-process
+    /// override, else (debug builds only) `CLINKER_TEST_LEDGER_CAPACITY`.
+    /// The run enforces the smaller of this and `memory.limit`.
+    pub(crate) fn ledger_capacity(&self) -> Option<u64> {
+        self.ledger_capacity.or_else(env_ledger_capacity)
+    }
+
+    /// The baseline resident memory to judge `memory.limit` against in place
+    /// of a measurement, if one is injected.
+    pub(crate) fn baseline_rss(&self) -> Option<u64> {
+        self.baseline_rss
+    }
+
+    /// The one-shot shortfall to arm on the run's arbitrator, if any.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn forced_shortfall(&self) -> Option<&ForcedShortfall> {
+        self.forced_shortfall.as_ref()
+    }
+}
+
+impl Default for MemoryTestOverrides {
+    /// The in-process harness default when the crate is built for tests;
+    /// [`Self::process`] otherwise.
+    fn default() -> Self {
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            Self {
+                baseline_rss: Some(IN_PROCESS_BASELINE_BYTES),
+                ..Self::process()
+            }
+        }
+        #[cfg(not(any(test, feature = "test-utils")))]
+        {
+            Self::process()
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl MemoryTestOverrides {
+    /// Hold the run's ledger to `bytes` while `memory.limit` stays as
+    /// configured. The run enforces the smaller of the two: every runtime
+    /// figure derived from the limit (spill and resume thresholds, operator
+    /// budgets, the bytes `reserve` grants against) follows it, while the
+    /// startup check still judges `memory.limit`. It never raises the limit.
+    pub fn with_ledger_capacity(mut self, bytes: u64) -> Self {
+        self.ledger_capacity = Some(bytes);
+        self
+    }
+
+    /// Judge `memory.limit` at startup against a baseline of `bytes` instead
+    /// of a measurement.
+    pub fn with_baseline_rss(mut self, bytes: u64) -> Self {
+        self.baseline_rss = Some(bytes);
+        self
+    }
+
+    /// Read real process memory: measure the baseline rather than inject one.
+    pub fn with_process_memory(mut self) -> Self {
+        self.baseline_rss = None;
+        self
+    }
+
+    /// Arm `shortfall` on the run's arbitrator before the run starts.
+    ///
+    /// Used only by tests that spill a whole unit and then reload it, where
+    /// no capacity both forces the spill and admits the reload. Each use
+    /// records that reason in its test's doc comment.
+    pub fn with_forced_shortfall(mut self, shortfall: ForcedShortfall) -> Self {
+        self.forced_shortfall = Some(shortfall);
+        self
+    }
+
+    /// The baseline this value injects in place of a measurement, if any.
+    pub fn injected_baseline_rss(&self) -> Option<u64> {
+        self.baseline_rss
+    }
+}
+
+/// Read `CLINKER_TEST_LEDGER_CAPACITY` (a plain byte count) for a debug
+/// build's run. Subprocess tests set it on the child so a real binary can be
+/// held to a small ledger while its `memory.limit` stays ample. An
+/// unparseable value is ignored with a warning.
+#[cfg(debug_assertions)]
+fn env_ledger_capacity() -> Option<u64> {
+    let raw = std::env::var("CLINKER_TEST_LEDGER_CAPACITY").ok()?;
+    match raw.trim().parse::<u64>() {
+        Ok(bytes) => Some(bytes),
+        Err(error) => {
+            tracing::warn!(
+                value = %raw,
+                %error,
+                "ignoring CLINKER_TEST_LEDGER_CAPACITY: expected a plain byte count"
+            );
+            None
+        }
+    }
+}
+
+/// Release builds never read the test capacity variable.
+#[cfg(not(debug_assertions))]
+fn env_ledger_capacity() -> Option<u64> {
+    None
+}
+
+/// A one-shot forced shortfall: the `nth` `reserve` whose requester's label
+/// `matcher` accepts falls short once, as if nothing were available, and
+/// every reserve after it takes the real path.
+///
+/// `nth` counts from 1 and counts only matching requests, so `nth = 1` is
+/// the next matching reserve. A request for zero bytes or for more than the
+/// whole limit never counts: those take the real path unchanged.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone)]
+pub struct ForcedShortfall {
+    matcher:
+        std::sync::Arc<dyn Fn(&clinker_plan::runtime_error::ConsumerLabel) -> bool + Send + Sync>,
+    nth: u32,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl ForcedShortfall {
+    /// Fall short on the `nth` (from 1) reserve whose requester `matcher`
+    /// accepts.
+    ///
+    /// # Panics
+    ///
+    /// When `nth` is 0: there is no zeroth request.
+    pub fn at(
+        matcher: impl Fn(&clinker_plan::runtime_error::ConsumerLabel) -> bool + Send + Sync + 'static,
+        nth: u32,
+    ) -> Self {
+        assert!(
+            nth >= 1,
+            "a forced shortfall counts matching reserves from 1; nth = 0 names no request"
+        );
+        Self {
+            matcher: std::sync::Arc::new(matcher),
+            nth,
+        }
+    }
+
+    pub(crate) fn accepts(&self, label: &clinker_plan::runtime_error::ConsumerLabel) -> bool {
+        (self.matcher)(label)
+    }
+
+    pub(crate) fn nth(&self) -> u32 {
+        self.nth
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl std::fmt::Debug for ForcedShortfall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ForcedShortfall")
+            .field("nth", &self.nth)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Summary returned after a pipeline execution completes (success or partial).
@@ -272,6 +478,12 @@ pub struct ExecutionReport {
     /// everything charged at once, this is the figure that says how much one
     /// node's state held. Sampled after all Source workers have joined.
     pub per_node_peak_charged_bytes: BTreeMap<String, u64>,
+    /// The memory limit the run's arbitrator enforced, in bytes: the figure
+    /// every `reserve` was granted against. It is `memory.limit` unless a
+    /// test held the run to a smaller ledger capacity, in which case it is
+    /// that capacity. Read from the arbitrator after all Source workers have
+    /// joined, not counted during the run.
+    pub memory_limit_bytes: u64,
     /// `true` when the run unwound early because a shutdown signal
     /// (SIGINT/SIGTERM, or a programmatic request) tripped the run's
     /// [`crate::pipeline::shutdown::ShutdownToken`]. The CLI maps this to
