@@ -99,8 +99,8 @@ Existing normal dependencies are intentional evidence:
 - **Inferred:** `cargo check -p clinker-exec --features bench-alloc --locked --offline`
 - **Inferred:** `cargo check --benches -p clinker-exec --locked --offline`
 - **Verified:** `cargo test -p clinker-exec --test format_pipelines --locked --offline`
-- **Inferred:** `cargo test -p clinker-exec --locked --offline <test_name>`
-- **Inferred:** `cargo test -p clinker-exec --locked --offline` (needs a soft `ulimit -n` of at least the 65536 floor — see `docs/ai/50_TESTING_AND_COMMANDS.md` section 4 for the measurement behind it and the raise-only snippet)
+- **Inferred:** `cargo test -p clinker-exec --features test-utils --locked --offline <test_name>`
+- **Inferred:** `cargo test -p clinker-exec --features test-utils --locked --offline` (needs a soft `ulimit -n` of at least the 65536 floor — see `docs/ai/50_TESTING_AND_COMMANDS.md` section 4 for the measurement behind it and the raise-only snippet). Without `--features test-utils` the tests that use the memory test levers and fault guards are compiled out; see section 5 of that document.
 
 For Rust source changes, also run the workspace gates from the root
 `AGENTS.md` unless the user explicitly scopes validation narrower.
