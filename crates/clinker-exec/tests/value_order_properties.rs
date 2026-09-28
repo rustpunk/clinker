@@ -258,7 +258,9 @@ fn relatives(v: &Value) -> Vec<Value> {
                     Value::Float(f64::INFINITY),
                 ]);
             }
-            if f.fract() == 0.0 && *f >= -9_223_372_036_854_775_808.0 && *f < 9_223_372_036_854_775_808.0
+            if f.fract() == 0.0
+                && *f >= -9_223_372_036_854_775_808.0
+                && *f < 9_223_372_036_854_775_808.0
             {
                 let i = *f as i64;
                 out.extend([Value::Integer(i), Value::Decimal(Decimal::from(i))]);
@@ -367,6 +369,12 @@ fn relatives_reach_cross_domain_ties() {
         .iter()
         .filter(|r| compare(&Value::Integer(TWO_POW_53), r) == Ordering::Equal)
         .count();
-    assert!(ties >= 3, "an integer must have tied relatives in other domains");
-    assert!(ties < related.len(), "an integer must have untied neighbours");
+    assert!(
+        ties >= 3,
+        "an integer must have tied relatives in other domains"
+    );
+    assert!(
+        ties < related.len(),
+        "an integer must have untied neighbours"
+    );
 }
