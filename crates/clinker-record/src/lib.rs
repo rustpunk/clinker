@@ -8,6 +8,7 @@ pub mod field_str;
 pub mod group_key;
 pub mod minimal;
 pub mod nested_key;
+pub mod order;
 pub mod owned_storage;
 pub mod provenance;
 pub mod record;
