@@ -109,6 +109,16 @@ const MANIFEST: &[ManifestEntry] = &[
         class: SpillClass::Spillable,
         table_row: "Cull",
     },
+    // The held rows of failed documents spill through the held log. The
+    // per-document dead-letter row ledger it also charges is charged-only
+    // exact dedup state, approved by the maintainer on 2026-09-24 with the
+    // compressed row-set ledger (see the `roaring` comment in the root
+    // Cargo.toml).
+    ManifestEntry {
+        name: "DocumentDlqConsumer",
+        class: SpillClass::Spillable,
+        table_row: "document dead-letter state",
+    },
     ManifestEntry {
         name: "CombineHashConsumer",
         class: SpillClass::ChargedOnly {
