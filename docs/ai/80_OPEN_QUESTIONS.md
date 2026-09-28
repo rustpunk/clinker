@@ -1240,3 +1240,12 @@ Numbers are never reused. One line per entry: the answer and its evidence.
   wrongly. The only evidence of a successful handshake is a dated manual note in
   that file. Closing this is the same loopback-TLS-server work as 59, tracked as
   #1079.
+- **61 (filed 2026-09-28):** A queued Source record is charged its exact
+  unadmitted heap, and that charge is an upper bound when records share one
+  foreign-provider allocation: N queued events holding the same foreign string
+  are charged N times, not once. Counting the physical size would need an
+  idempotent claim per allocation, so a second holder of the same bytes adds
+  nothing. The conservative bound over-reports memory rather than hiding it, so
+  it is safe but can make a run pause or spill earlier than necessary. The same
+  question applies downstream once foreign heap is charged there, tracked in
+  #1291.
