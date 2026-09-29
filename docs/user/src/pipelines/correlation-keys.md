@@ -53,7 +53,7 @@ A source whose declared `correlation_key:` field names a column not present in i
 
 ### Row order
 
-Declaring `correlation_key` on a Source changes the order its rows reach the rest of the pipeline. The planner inserts a sort after the Source, ascending on the correlation key and then on any declared `sort_order`, so that each group's rows are adjacent. Rows with equal keys keep their order in the file.
+Declaring `correlation_key` on a Source changes the order its rows reach the rest of the pipeline. When the Source's declared `sort_order` already begins with the correlation-key fields, in either direction, that declared order is kept as it is. Otherwise the planner inserts a sort after the Source, ascending on the correlation key and then on the remaining declared `sort_order` fields, so that each group's rows are adjacent. Rows with equal keys keep their order in the file.
 
 Every consumer that depends on row order sees this order: Sink output order, an Aggregate's first-arriving value, Cull and Reshape ties, and which build record a Combine's `match: first` picks. Adding a correlation key to an existing pipeline can therefore change those results even when no record fails.
 
