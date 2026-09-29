@@ -191,9 +191,9 @@ fn relaxed_aggregate_seeds_a_deferred_region_with_downstream_members() {
 /// the pipeline-scoped arbitrator's `peak_rss` above the hard limit and
 /// runs the combine-in-deferred-region topology through the executor's
 /// arbitrator-injection seam. The Combine's build phase polls
-/// `should_abort` and surfaces `MemoryBudgetExceeded { source: Arena }`
-/// naming the Combine, where `used` is the observed peak RSS and `limit`
-/// is the hard limit.
+/// `should_abort` and surfaces an E310 for the Combine's join build side,
+/// whose request is how far the observed peak RSS stands past the hard
+/// limit.
 ///
 /// Seeding `peak_rss` rather than setting a tight YAML budget is the
 /// only deterministic lever under pull-mode: at `cargo test` time the
