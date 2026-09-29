@@ -94,17 +94,34 @@ impl DecomposedPredicate {
     /// a range, or a `?? false` predicate kept whole. A range kernel that
     /// verifies the ranges itself must still evaluate such a residual for
     /// every pair, or that part of `where:` is never applied.
+    ///
+    /// A step of a decomposed N-ary combine whose slice has ranges and no
+    /// equality carries the whole predicate's residual, which may name an
+    /// input this step has not joined yet. Such a residual cannot be
+    /// evaluated at this step (the unjoined input's fields read as null, so
+    /// every pair would read as "not true"), so it reports `false` unless
+    /// every residual conjunct names only inputs of this step's ranges.
     pub fn residual_exceeds_ranges(&self) -> bool {
         let Some(residual) = self.residual.as_ref() else {
             return false;
         };
-        match residual.program.statements.first() {
-            Some(Statement::Filter { predicate, .. }) => {
-                false_coalesced_predicate(predicate).is_some()
-                    || split_conjunction(predicate).len() != self.ranges.len()
-            }
-            _ => true,
-        }
+        let Some(Statement::Filter { predicate, .. }) = residual.program.statements.first() else {
+            return true;
+        };
+        let conjuncts = split_conjunction(predicate);
+        let exceeds =
+            false_coalesced_predicate(predicate).is_some() || conjuncts.len() != self.ranges.len();
+        let step_inputs: HashSet<&str> = self
+            .ranges
+            .iter()
+            .flat_map(|r| [r.left_input.as_ref(), r.right_input.as_ref()])
+            .collect();
+        exceeds
+            && conjuncts.iter().all(|conjunct| {
+                collect_qualifiers(conjunct)
+                    .iter()
+                    .all(|q| step_inputs.contains(q.as_ref()))
+            })
     }
 }
 

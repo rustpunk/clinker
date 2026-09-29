@@ -87,7 +87,9 @@ const STRATEGIES: &[Strategy] = &[
 ];
 
 /// The Combine body. `Enrich` emits the driver and the build id; `Skip`
-/// filters every matched row out; `Fail` divides by the driver's `div`,
+/// filters every matched row out but keeps an `on_miss: null_fields` row,
+/// whose build fields are null, so a driver wrongly routed to `on_miss`
+/// shows in the output; `Fail` divides by the driver's `div`,
 /// which the failing drivers set to 0; `Collect` is the empty body a
 /// `match: collect` Combine takes.
 #[derive(Clone, Copy)]
@@ -103,7 +105,7 @@ impl Body {
         match self {
             Body::Enrich => "|\n        emit did = src_drv.did\n        emit bid = src_bld.bid",
             Body::Skip => {
-                "|\n        filter src_bld.bid < 0\n        emit did = src_drv.did\n        \
+                "|\n        filter (src_bld.bid ?? -1) < 0\n        emit did = src_drv.did\n        \
                  emit bid = src_bld.bid"
             }
             Body::Fail => {
@@ -737,4 +739,113 @@ fn a_failed_driver_consumes_no_output_allowance() {
             "[{label}] a dead-lettered driver is not an ok record"
         );
     }
+}
+
+// T8: N-ary decomposition.
+
+/// A decomposed three-input Combine whose first step is a pure-range IEJoin
+/// carries the whole predicate's residual, which names an input that step
+/// has not joined. The step must not evaluate it, or the unjoined input's
+/// fields read as null and every driver silently misses.
+#[test]
+fn a_pure_range_step_does_not_evaluate_a_residual_naming_a_later_input() {
+    let yaml = r#"
+pipeline:
+  name: nary_range_step
+nodes:
+  - type: source
+    name: a
+    config:
+      name: a
+      type: csv
+      path: a.csv
+      schema:
+        - { name: id, type: int }
+        - { name: x, type: int }
+        - { name: k, type: int }
+  - type: source
+    name: b
+    config:
+      name: b
+      type: csv
+      path: b.csv
+      schema:
+        - { name: bid, type: int }
+        - { name: y, type: int }
+  - type: source
+    name: c
+    config:
+      name: c
+      type: csv
+      path: c.csv
+      schema:
+        - { name: k, type: int }
+        - { name: v, type: int }
+  - type: combine
+    name: joined
+    input:
+      a: a
+      b: b
+      c: c
+    config:
+      where: 'a.x < b.y and a.k == c.k and c.v > 0'
+      match: all
+      on_miss: skip
+      cxl: |
+        emit id = a.id
+        emit bid = b.bid
+      propagate_ck: driver
+  - type: sink
+    name: out
+    input: joined
+    config:
+      name: out
+      type: json
+      options:
+        format: ndjson
+      path: out.ndjson
+"#;
+    let config = parse_config(yaml).expect("pipeline parses");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("compile for explain");
+    let (dag, _) = PipelineExecutor::explain_plan_dag(&plan).expect("explain dag");
+    let explain = dag.explain_text(&config);
+    assert!(
+        explain.contains("[combine:iejoin]"),
+        "the first step is a pure-range IEJoin, got explain:\n{explain}"
+    );
+    let file = |name: &str, body: &str| {
+        SourceInput::Files(vec![FileSlot::new(
+            PathBuf::from(name),
+            Box::new(Cursor::new(body.as_bytes().to_vec())),
+        )])
+    };
+    let readers: SourceReaders = HashMap::from([
+        ("a".to_string(), file("a.csv", "id,x,k\n1,1,1\n2,5,1\n")),
+        ("b".to_string(), file("b.csv", "bid,y\n1,3\n2,10\n")),
+        ("c".to_string(), file("c.csv", "k,v\n1,7\n")),
+    ]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
+        HashMap::from([("out".to_string(), Box::new(buf.clone()) as _)]);
+    let params = PipelineRunParams {
+        execution_id: "nary-range-step".to_string(),
+        batch_id: "batch".to_string(),
+        ..Default::default()
+    };
+    let (_, dlq) = dlq_sink::run_config_with_dlq(&config, readers, writers, &params)
+        .expect("the run completes");
+    assert!(dlq.is_empty(), "no pair fails: {dlq:?}");
+    let mut pairs: Vec<(i64, i64)> = buf
+        .as_string()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let row: serde_json::Value = serde_json::from_str(line).expect("an NDJSON row");
+            (int(&row, "id"), int(&row, "bid"))
+        })
+        .collect();
+    pairs.sort_unstable();
+    assert_eq!(pairs, [(1, 1), (1, 2), (2, 2)]);
 }
