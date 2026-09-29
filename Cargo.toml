@@ -107,6 +107,19 @@ fs4 = { version = "1", default-features = false, features = ["sync"] }
 # Pure Rust with no build script; the default `std` feature pulls `bytemuck`
 # and `byteorder`. Approved by the maintainer on 2026-09-24.
 roaring = "0.11"
+# An independent exact float sum, used only as a test oracle: clinker-record's
+# tests check the in-repo `ExactSum` (exact float `sum`/`avg`/`weighted_avg`)
+# against `bitrep::SumF64` bit for bit, folded and split-and-merged. A
+# dev-dependency of clinker-record and nothing else; it never reaches a
+# runtime build. Chosen over `xsum` (widely used, but it exposes no merge and
+# no serializable state, so it cannot check merged partial sums) and over no
+# oracle (which would leave the hand-rolled accumulator checked only by its
+# own fixed cases). Single author and first released in 2026-07, which is why
+# it is a test oracle and not the runtime implementation. MIT OR Apache-2.0,
+# no build script; `default-features = false` drops `std`, and with it every
+# optional dependency, so it adds exactly one package to the lock. Approved
+# by the maintainer on 2026-09-26.
+bitrep = { version = "=0.5.1", default-features = false }
 criterion = { version = "0.5", features = ["html_reports"] }
 serial_test = "3"
 petgraph = "0.8"

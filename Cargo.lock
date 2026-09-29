@@ -223,6 +223,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 
 [[package]]
+name = "bitrep"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6b324609691c7673751b8d875a9aeec38d7052f2e69370f988c78ddb5d5c3cb"
+
+[[package]]
 name = "bitvec"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -666,6 +672,7 @@ name = "clinker-record"
 version = "0.1.0"
 dependencies = [
  "ahash 0.8.12",
+ "bitrep",
  "chrono",
  "clinker-bench-support",
  "criterion",

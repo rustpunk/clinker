@@ -57,7 +57,9 @@ Current normal dependencies are intentional: `serde`, `serde_json`, `chrono`,
 `triomphe`; do not expose its raw owners or add other shared-owner operations.
 
 Current dev/bench dependencies are expected only for tests and benches:
-`criterion`, `clinker-bench-support`, and `postcard`.
+`criterion`, `clinker-bench-support`, `postcard`, and the exact `bitrep`
+pin, which is only the test oracle for `accumulator::ExactSum` and must never
+become a normal dependency.
 
 ### Forbidden or suspicious dependencies
 

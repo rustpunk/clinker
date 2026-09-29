@@ -16,7 +16,10 @@
 //! This is the fixed-point exact accumulator of the exact-summation
 //! literature, implemented here because a partial sum must also serialize
 //! into a spill run and subtract exactly for retraction, which the maintained
-//! float-summation crates do not offer together.
+//! float-summation crates do not offer together. `tests/exact_sum_oracle.rs`
+//! checks it bit for bit against an independent implementation, a
+//! dev-dependency only, on fixed ill-conditioned cases and on generated
+//! sequences, folded, merged and with an addend subtracted.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
