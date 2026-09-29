@@ -8,6 +8,7 @@
 //! node-rooted window arenas at EOF. The dispatcher's `Source` arm is a
 //! single delegating call into [`dispatch_source`].
 
+use clinker_core_types::QuoteName;
 use std::sync::Arc;
 
 use clinker_record::Record;
@@ -406,10 +407,11 @@ where
             op: "executor",
             node: name.clone(),
             detail: format!(
-                "Source '{name}' has no ingested records; \
+                "Source {name} has no ingested records; \
                          the executor's source-ingest pass missed this Source — \
                          likely a planner regression introducing a Source topology \
                          the ingest pass doesn't enumerate.",
+                name = name.quoted_name(),
             ),
         });
     };

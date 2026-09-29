@@ -386,7 +386,7 @@ fn config_rejects_policy_without_sort_order_with_a_paste_ready_fix() {
     let err = validate_source_sort_policy(&source.source, &source.schema)
         .expect_err("policy without sort_order must fail");
     let rendered = err.to_string();
-    assert!(rendered.contains("source 'rows'"), "{rendered}");
+    assert!(rendered.contains(r#"source "rows""#), "{rendered}");
     assert!(rendered.contains("on_unsorted"), "{rendered}");
     assert!(rendered.contains("sort_order: [key]"), "{rendered}");
     assert!(rendered.contains("remove `on_unsorted`"), "{rendered}");
@@ -423,7 +423,7 @@ fn config_rejects_source_null_drop_with_a_paste_ready_fix() {
     let err = validate_source_sort_policy(&source.source, &source.schema)
         .expect_err("source null drop must fail");
     let rendered = err.to_string();
-    assert!(rendered.contains("source 'rows'"), "{rendered}");
+    assert!(rendered.contains(r#"source "rows""#), "{rendered}");
     assert!(rendered.contains("null_order: drop"), "{rendered}");
     assert!(rendered.contains("null_order: first"), "{rendered}");
     assert!(rendered.contains("null_order: last"), "{rendered}");
@@ -511,7 +511,7 @@ fn barrier_error_releases_no_prefix_from_an_inverted_file() {
         let rendered = result
             .expect_err("an inversion must reject the file")
             .to_string();
-        assert!(rendered.contains("source 'rows'"), "{rendered}");
+        assert!(rendered.contains(r#"source "rows""#), "{rendered}");
         assert!(rendered.contains("bad.csv"), "{rendered}");
         assert!(
             rendered.contains("rows 1 and 2")
@@ -595,7 +595,7 @@ fn barrier_binding_rejects_readers_with_nested_or_repeated_frames() {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("source 'rows'"), "{rendered}");
+        assert!(rendered.contains(r#"source "rows""#), "{rendered}");
         assert!(rendered.contains("sort_order"), "{rendered}");
         assert!(rendered.contains("remove `sort_order`"), "{rendered}");
         assert!(rendered.contains("single"), "{rendered}");

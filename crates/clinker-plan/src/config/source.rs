@@ -1,6 +1,7 @@
 //! Source node configuration: file discovery, transports, and per-format input options.
 
 use super::*;
+use clinker_core_types::QuoteName;
 use clinker_format::{SplitToRows, SplitValues};
 use clinker_record::schema_def::LineSeparator;
 use serde::de::{self};
@@ -196,8 +197,8 @@ pub fn sortable_event_shape(
         InputFormat::X12(_) | InputFormat::Hl7(_) => Err(source_order_error(
             source,
             format!(
-                "[E366] source '{}' declares `sort_order`, but {} can emit nested, repeated, or inherited document frames inside one physical file; remove `sort_order` or normalize each logical frame into a separate flat or single-frame physical file before this source",
-                source.name,
+                "[E366] source {} declares `sort_order`, but {} can emit nested, repeated, or inherited document frames inside one physical file; remove `sort_order` or normalize each logical frame into a separate flat or single-frame physical file before this source",
+                source.name.quoted_name(),
                 source.format.format_name(),
             ),
         )),
@@ -224,8 +225,8 @@ pub fn validate_source_sort_policy(
         return Err(source_order_error(
             source,
             format!(
-                "source '{}' sets `on_unsorted` without a record-level `sort_order`; add `sort_order: [{example_field}]` or remove `on_unsorted`",
-                source.name
+                "source {} sets `on_unsorted` without a record-level `sort_order`; add `sort_order: [{example_field}]` or remove `on_unsorted`",
+                source.name.quoted_name()
             ),
         ));
     }
@@ -233,8 +234,8 @@ pub fn validate_source_sort_policy(
         return Err(source_order_error(
             source,
             format!(
-                "source '{}' declares an empty `sort_order`; add at least one field or remove `sort_order`",
-                source.name
+                "source {} declares an empty `sort_order`; add at least one field or remove `sort_order`",
+                source.name.quoted_name()
             ),
         ));
     }
@@ -250,8 +251,9 @@ pub fn validate_source_sort_policy(
             return Err(source_order_error(
                 source,
                 format!(
-                    "source '{}' repeats field '{}' in `sort_order`; keep each authored key once",
-                    source.name, field.field
+                    "source {} repeats field '{}' in `sort_order`; keep each authored key once",
+                    source.name.quoted_name(),
+                    field.field
                 ),
             ));
         }
@@ -259,8 +261,9 @@ pub fn validate_source_sort_policy(
             return Err(source_order_error(
                 source,
                 format!(
-                    "source '{}' uses `null_order: drop` for sort field '{}'; source verification cannot discard records, so use `null_order: first` or `null_order: last`",
-                    source.name, field.field
+                    "source {} uses `null_order: drop` for sort field '{}'; source verification cannot discard records, so use `null_order: first` or `null_order: last`",
+                    source.name.quoted_name(),
+                    field.field
                 ),
             ));
         }
@@ -275,8 +278,9 @@ pub fn validate_source_sort_policy(
             return Err(source_order_error(
                 source,
                 format!(
-                    "source '{}' sort field '{}' is not declared by its schema; choose one of: [{available}]",
-                    source.name, field.field
+                    "source {} sort field '{}' is not declared by its schema; choose one of: [{available}]",
+                    source.name.quoted_name(),
+                    field.field
                 ),
             ));
         }

@@ -28,6 +28,7 @@
 //! adds no allocation and no per-column hashing beyond the one map probe the
 //! rename already performed.
 
+use clinker_core_types::QuoteName;
 use std::collections::HashSet;
 
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
@@ -680,8 +681,9 @@ pub(crate) fn output_mapping_faults_spanned(
                 item_line: None,
                 code: "E364",
                 message: format!(
-                    "output '{out_name}': `mapping:` is a sequence of output columns, not a map \
-                     of column name to column name"
+                    "output {out_name}: `mapping:` is a sequence of output columns, not a map \
+                     of column name to column name",
+                    out_name = out_name.quoted_name()
                 ),
                 help,
             });
@@ -696,8 +698,9 @@ pub(crate) fn output_mapping_faults_spanned(
                 item_line: None,
                 code: "E364",
                 message: format!(
-                    "output '{out_name}': `mapping:` declares no columns, so it states that the \
-                     file carries none"
+                    "output {out_name}: `mapping:` declares no columns, so it states that the \
+                     file carries none",
+                    out_name = out_name.quoted_name()
                 ),
                 help: "list the columns the file should carry, one item each — a bare column \
                        name to carry it through, or an `output_name: source_column` pair to \
@@ -716,9 +719,10 @@ pub(crate) fn output_mapping_faults_spanned(
                 item_line: mapping.entry_line(duplicate_entries[0].0),
                 code: "E364",
                 message: format!(
-                    "output '{out_name}': `mapping:` declares the output column(s) {listed} \
+                    "output {out_name}: `mapping:` declares the output column(s) {listed} \
                      more than once; a written file cannot carry two columns under one name",
                     listed = quoted(&dups),
+                    out_name = out_name.quoted_name(),
                 ),
                 help: format!(
                     "keep one item per output column and delete the rest. To write one upstream \
@@ -746,10 +750,11 @@ pub(crate) fn output_mapping_faults_spanned(
                     item_line: mapping.entry_line(read_clashes[0].0),
                     code: "E364",
                     message: format!(
-                        "output '{out_name}': `mapping:` reads the column(s) {listed}, which this \
+                        "output {out_name}: `mapping:` reads the column(s) {listed}, which this \
                          output's own `exclude:` removes first — the entries can never produce a \
                          column",
                         listed = quoted(&listed_names),
+                        out_name = out_name.quoted_name(),
                     ),
                     help: format!(
                         "drop {listed} from `exclude:` if the mapping should write it, or drop \

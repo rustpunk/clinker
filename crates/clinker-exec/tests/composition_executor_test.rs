@@ -708,7 +708,7 @@ nodes:
     let err = result.expect_err("expected pipeline run to fail");
     let msg = err.to_string();
     assert!(
-        msg.contains("in composition 'doubler_call'"),
+        msg.contains("in composition \"doubler_call\""),
         "error must wrap inner failure with composition name; got: {msg}"
     );
 }

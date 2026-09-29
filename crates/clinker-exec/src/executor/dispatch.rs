@@ -16,6 +16,7 @@
 //! where `recursive_term.execute(partition, Arc::clone(&task_context))`
 //! re-enters the same execution loop with a different plan.
 
+use clinker_core_types::QuoteName;
 use clinker_record::owned_storage::SharedStorage;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -680,8 +681,9 @@ pub(crate) fn apply_source_attempt_population(
             op: "source-attempt-population",
             node: expected_source.to_string(),
             detail: format!(
-                "population for source '{}' reached consumer '{}'",
-                delta.source_name, expected_source
+                "population for source {} reached consumer '{}'",
+                delta.source_name.quoted_name(),
+                expected_source
             ),
         });
     }
@@ -768,8 +770,9 @@ pub(crate) fn consume_source_event(
                             op: "source-attempt-population",
                             node: expected_source.to_string(),
                             detail: format!(
-                                "rejected attempt for source '{}' reached consumer '{}'",
-                                event.source_name, expected_source
+                                "rejected attempt for source {} reached consumer '{}'",
+                                event.source_name.quoted_name(),
+                                expected_source
                             ),
                         });
                     }

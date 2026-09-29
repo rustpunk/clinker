@@ -44,7 +44,7 @@ nodes:
 The header record must carry a body document's grain. A grain-preserving Transform of the source's promoted header keeps it; a replacement from a different source establishes it via a business-key join against the body. A header record whose grain matches **no** in-flight body document (or carries the synthetic, ungrounded grain a Transform stamps onto a record it builds from scratch) cannot be placed, so the run fails with **E351** (run `clinker explain --code E351` for the full write-up):
 
 ```
-envelope 'framed': a wired header record carries document grain <grain>, which
+envelope "framed": a wired header record carries document grain <grain>, which
 matches no in-flight body grain (or is a synthetic / ungrounded grain). The node
 attaches a header to a body strictly by grain, so it cannot place a header that
 grounds to no body document.
@@ -53,7 +53,7 @@ grounds to no body document.
 Exactly **one** header record may carry each body document's grain. When the wired header stream carries **two or more** records on the same grain, the node has no rule to fold a second header onto an already-framed document, so it refuses to silently keep one and drop the rest. The run fails with **E352** (run `clinker explain --code E352` for the full write-up):
 
 ```
-envelope 'framed': the wired header input carries two or more records for
+envelope "framed": the wired header input carries two or more records for
 document grain <grain> — exactly one header record per document grain is
 required.
 ```
@@ -63,7 +63,7 @@ Deduplicate the header stream to one record per grain upstream — an aggregate 
 A wired `trailer:` input is still rejected this release with a clear "not yet supported" message:
 
 ```
-envelope node 'framed': explicit `trailer` input wiring is not yet supported —
+envelope node "framed": explicit `trailer` input wiring is not yet supported —
 omit it to frame with the body's own envelope
 ```
 
@@ -120,7 +120,7 @@ Only documents that contribute body records take part: a document that carries a
 When the body carries **two or more distinct non-empty headers**, `concat` refuses to silently keep one and drop the rest. The run fails with **E350** (run `clinker explain --code E350` for the full write-up):
 
 ```
-envelope 'framed': concat collapses the body into one framed document, but the
+envelope "framed": concat collapses the body into one framed document, but the
 body carried 2 distinct non-empty envelope headers — one document can frame only
 one header, so concat will not silently drop the rest. Make the headers identical
 upstream, or add a header-folding strategy that declares which header the

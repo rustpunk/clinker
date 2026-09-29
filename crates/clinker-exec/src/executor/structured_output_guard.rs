@@ -6,6 +6,7 @@
 //! concrete document grain: that would silently merge multiple documents into
 //! one interchange/message envelope.
 
+use clinker_core_types::QuoteName;
 use clinker_record::owned_storage::SharedStorage;
 use std::sync::Arc;
 
@@ -92,12 +93,12 @@ impl StructuredOutputDocumentGuard {
         match &self.first {
             Some((first_grain, _)) if *first_grain == grain => Ok(()),
             Some((first_grain, first_file)) => Err(format.error(format!(
-                "output '{output_name}': {} structured output cannot write a multi-document body into one envelope; first document grain {:?} from {:?}, then grain {:?} from {:?}. consolidate intentionally with an envelope node or route each document to a separate output path",
+                "output {output_name}: {} structured output cannot write a multi-document body into one envelope; first document grain {:?} from {:?}, then grain {:?} from {:?}. consolidate intentionally with an envelope node or route each document to a separate output path",
                 format.name(),
                 first_grain,
                 first_file,
                 grain,
-                doc_ctx.source_file(),
+                doc_ctx.source_file(), output_name = output_name.quoted_name(),
             ))),
             None => {
                 self.first = Some((grain, Arc::clone(doc_ctx.source_file())));

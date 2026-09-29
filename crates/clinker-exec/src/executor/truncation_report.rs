@@ -11,6 +11,7 @@
 //! a longest length and at most `TRUNCATION_EXAMPLE_LIMIT` record numbers per
 //! truncating column). Nothing here grows with the number of records.
 
+use clinker_core_types::QuoteName;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -100,10 +101,11 @@ fn render(sink: &str, summary: &TruncationSummary) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "W367 output '{sink}': {} value(s) truncated to fit under `truncation: warn`: {columns}. \
+        "W367 output {sink}: {} value(s) truncated to fit under `truncation: warn`: {columns}. \
          Widen the column, shorten the value upstream, or set `truncation: error` to reject \
          such records.",
-        summary.total_cells()
+        summary.total_cells(),
+        sink = sink.quoted_name()
     )
 }
 
@@ -236,7 +238,7 @@ nodes:
         let advisories = ledger.advisories(&sinks);
         assert_eq!(advisories.len(), 2, "{advisories:?}");
         assert!(
-            advisories[0].starts_with("W367 output 'z_out': 2 value(s)"),
+            advisories[0].starts_with("W367 output \"z_out\": 2 value(s)"),
             "{}",
             advisories[0]
         );
@@ -245,7 +247,7 @@ nodes:
             "{}",
             advisories[0]
         );
-        assert!(advisories[1].contains("'a_out'"), "{}", advisories[1]);
+        assert!(advisories[1].contains(r#""a_out""#), "{}", advisories[1]);
         assert!(
             advisories[1].contains("`truncation: error`"),
             "{}",

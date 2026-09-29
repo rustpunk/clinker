@@ -2,6 +2,7 @@
 //! thread body that widens, stamps, and pushes records into the dispatch
 //! channel.
 
+use clinker_core_types::QuoteName;
 #[cfg(test)]
 use clinker_record::owned_storage::OwnedKey;
 use clinker_record::owned_storage::{AllocationResources, OwnedMap, OwnedValues, SharedStorage};
@@ -609,8 +610,8 @@ pub(super) fn ingest_source(
         })
         .ok_or_else(|| {
             PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
-                "source '{}' not found in the compiled plan while building its reader",
-                src_cfg.name
+                "source {} not found in the compiled plan while building its reader",
+                src_cfg.name.quoted_name()
             )))
         })?;
     ingest_source_body(
@@ -690,8 +691,8 @@ fn ingest_source_body_inner(
             if files.is_empty() {
                 return Err(PipelineError::Config(
                     clinker_plan::config::ConfigError::Validation(format!(
-                        "source '{}' has empty file list",
-                        src_cfg.name
+                        "source {} has empty file list",
+                        src_cfg.name.quoted_name()
                     )),
                 ));
             }
@@ -843,9 +844,9 @@ fn drive_record_source(
             Some(wm) => {
                 let idx = widened_schema.index(wm.column.as_str()).ok_or_else(|| {
                     PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
-                        "source '{}' declares watermark.column = '{}' but no such column \
+                        "source {} declares watermark.column = '{}' but no such column \
                          exists on the runtime schema (declared columns: {:?})",
-                        src_cfg.name,
+                        src_cfg.name.quoted_name(),
                         wm.column,
                         widened_schema.columns(),
                     )))

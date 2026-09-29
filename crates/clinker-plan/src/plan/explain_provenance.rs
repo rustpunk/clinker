@@ -4,6 +4,7 @@
 //! to produce a human-readable provenance chain showing which configuration
 //! layer won and which were shadowed.
 
+use clinker_core_types::QuoteName;
 use std::fmt;
 
 use crate::config::composition::{
@@ -107,7 +108,11 @@ impl fmt::Display for ProvenanceExplainError {
             } => {
                 write!(f, "no provenance for '{node_name}.{param_name}'")?;
                 if valid_params.is_empty() {
-                    write!(f, "\n  node '{node_name}' has no tracked config params")
+                    write!(
+                        f,
+                        "\n  node {node_name} has no tracked config params",
+                        node_name = node_name.quoted_name()
+                    )
                 } else {
                     write!(f, "\n  valid params for '{node_name}':")?;
                     for p in valid_params {
@@ -120,7 +125,11 @@ impl fmt::Display for ProvenanceExplainError {
                 node_name,
                 valid_nodes,
             } => {
-                write!(f, "no provenance entries for node '{node_name}'")?;
+                write!(
+                    f,
+                    "no provenance entries for node {node_name}",
+                    node_name = node_name.quoted_name()
+                )?;
                 if valid_nodes.is_empty() {
                     write!(f, "\n  no composition nodes with tracked config found")
                 } else {
@@ -135,7 +144,11 @@ impl fmt::Display for ProvenanceExplainError {
                 source,
                 valid_sources,
             } => {
-                write!(f, "no schema provenance for source '{source}'")?;
+                write!(
+                    f,
+                    "no schema provenance for source {source}",
+                    source = source.quoted_name()
+                )?;
                 if valid_sources.is_empty() {
                     write!(f, "\n  no sources with tracked schema found")
                 } else {

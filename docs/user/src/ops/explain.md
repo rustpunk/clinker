@@ -265,7 +265,7 @@ printed before the run starts, and it carries four things:
 ```
 E363
 
-  × source 'src': `record_path` "$.rows" starts with the JSONPath root marker
+  × source "src": `record_path` "$.rows" starts with the JSONPath root marker
   │ `$.`, which is not part of the grammar; `record_path` is a dot-separated
   │ path of object keys, descended from the document root (for example
   │ `data.rows`). Write "rows" instead

@@ -7,6 +7,7 @@
 //! [`SortBuffer`]; forced spill drains through the shared
 //! [`SortedRunMerger`]. No source-local replay is involved.
 
+use clinker_core_types::QuoteName;
 use clinker_record::owned_storage::{AllocationResources, SharedStorage};
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
@@ -59,8 +60,11 @@ impl SourceOrderConfig {
         };
         if order.source_id != expected_source_id || order.source_name != expected_source_name {
             return Err(invariant(format!(
-                "compiled source order names id {:?} / source '{}', but ingest resolved id {:?} / source '{}'",
-                order.source_id, order.source_name, expected_source_id, expected_source_name,
+                "compiled source order names id {:?} / source {}, but ingest resolved id {:?} / source {}",
+                order.source_id,
+                order.source_name.quoted_name(),
+                expected_source_id,
+                expected_source_name.quoted_name(),
             )));
         }
         if order.scope != OrderScope::PerPhysicalFile {
@@ -1199,8 +1203,8 @@ impl SourceFileOrderBarrier {
     fn order_error(&self, file: &Arc<str>, inversion: &FirstInversion) -> SourceStreamError {
         SourceStreamError::OrderViolation(Box::new(PipelineError::Config(
             clinker_plan::config::ConfigError::Validation(format!(
-                "[E366] source '{}' file '{}' violates declared sort_order between rows {} and {}: {} precedes {}; reorder this physical file or set `on_unsorted: warn` to repair it before release",
-                self.config.source_name,
+                "[E366] source {} file '{}' violates declared sort_order between rows {} and {}: {} precedes {}; reorder this physical file or set `on_unsorted: warn` to repair it before release",
+                self.config.source_name.quoted_name(),
                 bounded_file_identity(file),
                 inversion.previous_row,
                 inversion.current_row,
@@ -1217,8 +1221,9 @@ impl SourceFileOrderBarrier {
     fn shape_error_for_file(&self, file: &str, detail: &str) -> SourceStreamError {
         SourceStreamError::OrderViolation(Box::new(PipelineError::Config(
             clinker_plan::config::ConfigError::Validation(format!(
-                "[E366] source '{}' file '{}' cannot preserve its declared sort_order: {detail}; remove `sort_order` or normalize the source to one flat or single-frame physical file",
-                self.config.source_name, file,
+                "[E366] source {} file '{}' cannot preserve its declared sort_order: {detail}; remove `sort_order` or normalize the source to one flat or single-frame physical file",
+                self.config.source_name.quoted_name(),
+                file,
             )),
         )))
     }

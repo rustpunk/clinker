@@ -26,6 +26,7 @@
 //! per-format capability table: [`output_encodes_multi_value`] for the write
 //! side, `input_multi_value_support` for the read side.
 
+use clinker_core_types::QuoteName;
 use std::collections::{BTreeSet, HashMap};
 
 use clinker_format::{Column, OnConflict, SourceSchema, SplitToRowsMode, under_field_path};
@@ -278,9 +279,10 @@ fn validate_source_declarations(
     if source.max_output_rows_per_input != 0 && fan_out.is_empty() {
         faults.push(DeclarationFault {
             message: format!(
-                "source '{}': `max_output_rows_per_input` is {}, but the source declares no \
+                "source {}: `max_output_rows_per_input` is {}, but the source declares no \
                  `split_to_rows` fan-out for that ceiling to bound",
-                source.name, source.max_output_rows_per_input
+                source.name.quoted_name(),
+                source.max_output_rows_per_input
             ),
             help: "add the intended `split_to_rows` entries, or remove \
                    `max_output_rows_per_input` (zero also disables the ceiling)"
@@ -317,9 +319,9 @@ fn validate_source_declarations(
         }
         faults.push(DeclarationFault {
             message: format!(
-                "source '{}': `{key}` is declared on a `{format}` source, whose reader is \
+                "source {}: `{key}` is declared on a `{format}` source, whose reader is \
                  never handed it — the declaration would be a silent no-op",
-                source.name
+                source.name.quoted_name()
             ),
             help: format!("remove the `{key}` block from this source: {remedy}"),
         });
@@ -347,9 +349,10 @@ fn validate_source_declarations(
         if a.field.is_empty() || a.field.split('.').any(str::is_empty) {
             faults.push(DeclarationFault {
                 message: format!(
-                    "source '{}': `split_to_rows` declares the field path '{}', which has an \
+                    "source {}: `split_to_rows` declares the field path '{}', which has an \
                      empty path segment",
-                    source.name, a.field
+                    source.name.quoted_name(),
+                    a.field
                 ),
                 help: "name the repeated element by its record-relative dotted path \
                        (`line_items`, `Items.Item`) — no leading, trailing, or doubled dot"
@@ -360,8 +363,9 @@ fn validate_source_declarations(
             if a.field == b.field {
                 faults.push(DeclarationFault {
                     message: format!(
-                        "source '{}': `split_to_rows` declares the field '{}' more than once",
-                        source.name, a.field
+                        "source {}: `split_to_rows` declares the field '{}' more than once",
+                        source.name.quoted_name(),
+                        a.field
                     ),
                     help: "declare each field once; a single entry already fans every \
                            occurrence of that element out to its own record"
@@ -371,10 +375,12 @@ fn validate_source_declarations(
                 if occurrence_tracked {
                     faults.push(DeclarationFault {
                         message: format!(
-                            "source '{}': `split_to_rows` fields '{}' and '{}' nest — on an xml \
+                            "source {}: `split_to_rows` fields '{}' and '{}' nest — on an xml \
                              source, declared fan-out fields must name disjoint (non-nested) \
                              element groups",
-                            source.name, a.field, b.field
+                            source.name.quoted_name(),
+                            a.field,
+                            b.field
                         ),
                         help: "fan out on the outer field alone, or on the inner one alone; the \
                                xml reader assigns each element to one occurrence group by \
@@ -391,11 +397,11 @@ fn validate_source_declarations(
                     // asked for one per inner occurrence.
                     faults.push(DeclarationFault {
                         message: format!(
-                            "source '{}': `split_to_rows` fields '{}' and '{}' nest, and the \
+                            "source {}: `split_to_rows` fields '{}' and '{}' nest, and the \
                              outer entry's `mode: extract` lifts the occurrence's own keys out \
                              from under '{outer_field}' — the inner entry addresses a path that \
                              no longer exists and would fan nothing out",
-                            source.name,
+                            source.name.quoted_name(),
                             a.field,
                             b.field,
                             outer_field = outer.field
@@ -426,8 +432,9 @@ fn validate_source_declarations(
         {
             faults.push(DeclarationFault {
                 message: format!(
-                    "source '{}': two `split_to_rows` entries write the position column '{}'",
-                    source.name, column
+                    "source {}: two `split_to_rows` entries write the position column '{}'",
+                    source.name.quoted_name(),
+                    column
                 ),
                 help: "give each entry its own `position_column`, or drop it from all but one \
                        — the two indexes are per-entry and cannot share a column"
@@ -440,8 +447,9 @@ fn validate_source_declarations(
         if in_cell[i + 1..].iter().any(|b| b.field == a.field) {
             faults.push(DeclarationFault {
                 message: format!(
-                    "source '{}': `split_values` declares the field '{}' more than once",
-                    source.name, a.field
+                    "source {}: `split_values` declares the field '{}' more than once",
+                    source.name.quoted_name(),
+                    a.field
                 ),
                 help: "declare each field once, with the delimiter its text actually uses"
                     .to_string(),
@@ -457,8 +465,9 @@ fn validate_source_declarations(
         if a.delimiter.is_empty() && !a.json {
             faults.push(DeclarationFault {
                 message: format!(
-                    "source '{}': `split_values` on field '{}' declares an empty delimiter",
-                    source.name, a.field
+                    "source {}: `split_values` on field '{}' declares an empty delimiter",
+                    source.name.quoted_name(),
+                    a.field
                 ),
                 help: "give a non-empty delimiter (the default is `;`), or drop the \
                        `split_values` entry if the cell holds a single value"
@@ -470,9 +479,10 @@ fn validate_source_declarations(
         if fan_out.iter().any(|e| e.field == a.field) {
             faults.push(DeclarationFault {
                 message: format!(
-                    "source '{}': field '{}' is declared in both `split_to_rows` and \
+                    "source {}: field '{}' is declared in both `split_to_rows` and \
                      `split_values`",
-                    source.name, a.field
+                    source.name.quoted_name(),
+                    a.field
                 ),
                 help: "fan the field out to rows, or parse it in-cell into several values \
                        — declaring both leaves no single shape for the column"
@@ -489,9 +499,9 @@ fn validate_source_declarations(
         if (!a.escape.is_empty() || a.json) && !csv_source {
             faults.push(DeclarationFault {
                 message: format!(
-                    "source '{}': `split_values` on field '{}' sets `{}`, which only the CSV \
+                    "source {}: `split_values` on field '{}' sets `{}`, which only the CSV \
                      reader honors — a `{}` reader splits on the bare delimiter and ignores it",
-                    source.name,
+                    source.name.quoted_name(),
                     a.field,
                     if a.json { "json" } else { "escape" },
                     source.format.format_name(),
@@ -509,9 +519,10 @@ fn validate_source_declarations(
         if csv_source && a.json && !a.escape.is_empty() {
             faults.push(DeclarationFault {
                 message: format!(
-                    "source '{}': `split_values` on field '{}' sets both `json: true` and \
+                    "source {}: `split_values` on field '{}' sets both `json: true` and \
                      `escape` — `json` reads the whole cell as a JSON array, so `escape` is unused",
-                    source.name, a.field
+                    source.name.quoted_name(),
+                    a.field
                 ),
                 help: "drop `escape` when `json: true`, or drop `json` to split on the delimiter \
                        with escape handling"
@@ -532,9 +543,11 @@ fn validate_source_declarations(
             if a.delimiter.chars().count() != 1 {
                 faults.push(DeclarationFault {
                     message: format!(
-                        "source '{}': `split_values` on field '{}' sets `escape` with a \
+                        "source {}: `split_values` on field '{}' sets `escape` with a \
                          multi-character delimiter '{}'",
-                        source.name, a.field, a.delimiter
+                        source.name.quoted_name(),
+                        a.field,
+                        a.delimiter
                     ),
                     help: "use a single-character `delimiter` with `escape`, or drop `escape` to \
                            split on the plain multi-character delimiter"
@@ -543,9 +556,11 @@ fn validate_source_declarations(
             } else if a.escape.chars().count() != 1 {
                 faults.push(DeclarationFault {
                     message: format!(
-                        "source '{}': `split_values` on field '{}' sets an `escape` '{}' that is \
+                        "source {}: `split_values` on field '{}' sets an `escape` '{}' that is \
                          not a single character",
-                        source.name, a.field, a.escape
+                        source.name.quoted_name(),
+                        a.field,
+                        a.escape
                     ),
                     help: "give a single-character `escape` (`\\` matches the sink default)"
                         .to_string(),
@@ -553,9 +568,11 @@ fn validate_source_declarations(
             } else if a.escape == a.delimiter {
                 faults.push(DeclarationFault {
                     message: format!(
-                        "source '{}': `split_values` on field '{}' sets the `escape` equal to the \
+                        "source {}: `split_values` on field '{}' sets the `escape` equal to the \
                          delimiter '{}'",
-                        source.name, a.field, a.delimiter
+                        source.name.quoted_name(),
+                        a.field,
+                        a.delimiter
                     ),
                     help:
                         "give an `escape` different from the `delimiter` — sharing one character \
@@ -576,8 +593,8 @@ fn validate_source_declarations(
             }) {
                 faults.push(DeclarationFault {
                     message: format!(
-                        "source '{}': `split_values` names the positional repeating group '{}' — delimiter-packed cells and repeated field groups are distinct encodings",
-                        source.name, entry.field
+                        "source {}: `split_values` names the positional repeating group '{}' — delimiter-packed cells and repeated field groups are distinct encodings",
+                        source.name.quoted_name(), entry.field
                     ),
                     help: format!(
                         "remove the `split_values` entry for '{}'; its `fields` and `occurs` layout already produces the array",
@@ -590,10 +607,11 @@ fn validate_source_declarations(
                 DeclaredField::Multiple => {}
                 DeclaredField::Single => faults.push(DeclarationFault {
                     message: format!(
-                        "source '{}': `split_values` names the field '{}', which the schema \
+                        "source {}: `split_values` names the field '{}', which the schema \
                          does not declare `multiple: true` — splitting it would produce \
                          several values for a single-valued column",
-                        source.name, entry.field
+                        source.name.quoted_name(),
+                        entry.field
                     ),
                     help: format!(
                         "add `multiple: true` to the '{}' schema column, or drop the \
@@ -603,10 +621,12 @@ fn validate_source_declarations(
                 }),
                 DeclaredField::AliasedTo(physical) => faults.push(DeclarationFault {
                     message: format!(
-                        "source '{}': `split_values` names the field '{}', which is the \
+                        "source {}: `split_values` names the field '{}', which is the \
                          column's exposed name — the column reads from the input field '{}', \
                          and the split runs against the names the document carries",
-                        source.name, entry.field, physical
+                        source.name.quoted_name(),
+                        entry.field,
+                        physical
                     ),
                     help: format!(
                         "name the input field: `split_values` on '{physical}' (the column's \
@@ -615,9 +635,10 @@ fn validate_source_declarations(
                 }),
                 DeclaredField::Absent => faults.push(DeclarationFault {
                     message: format!(
-                        "source '{}': `split_values` names the field '{}', which the schema \
+                        "source {}: `split_values` names the field '{}', which the schema \
                          does not declare at all",
-                        source.name, entry.field
+                        source.name.quoted_name(),
+                        entry.field
                     ),
                     help: format!(
                         "check the spelling against the `schema:` block, then declare the \
@@ -638,10 +659,11 @@ fn validate_source_declarations(
             ) {
                 faults.push(DeclarationFault {
                     message: format!(
-                        "source '{}': field '{}' is declared `multiple: true` and also fanned \
+                        "source {}: field '{}' is declared `multiple: true` and also fanned \
                          out by `split_to_rows` — the first collects its occurrences into one \
                          array, the second spends them one per record",
-                        source.name, entry.field
+                        source.name.quoted_name(),
+                        entry.field
                     ),
                     help: format!(
                         "drop `multiple: true` from the '{}' schema column to fan its \
@@ -754,10 +776,10 @@ fn validate_multi_value_input(
     }?;
     Some(DeclarationFault {
         message: format!(
-            "source '{name}': the schema declares the multi-value column(s) {named} \
+            "source {name}: the schema declares the multi-value column(s) {named} \
              (`multiple: true`), and a `{format}` source has no way to produce a field holding \
              more than one value",
-            name = source.name
+            name = source.name.quoted_name()
         ),
         help,
     })
@@ -986,10 +1008,10 @@ pub fn source_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
                 node_index,
                 code: "E360",
                 message: format!(
-                    "source '{}' declares `array_paths:`, which the multi-value declarations \
+                    "source {} declares `array_paths:`, which the multi-value declarations \
                      replaced — the key is no longer read, so leaving it in place would drop the \
                      fan-out silently",
-                    header.name
+                    header.name.quoted_name()
                 ),
                 help: "replace it: an `explode` path becomes a `split_to_rows:` entry (`mode: \
                        extract` lifts the element's fields to the top level, `mode: split` keeps \
@@ -1011,7 +1033,7 @@ pub fn source_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
             faults.push(NodeFault {
                 node_index,
                 code: "E358",
-                message: format!("source '{}': {}", header.name, fault.message),
+                message: format!("source {}: {}", header.name.quoted_name(), fault.message),
                 help: fault.help,
             });
         }
@@ -1081,9 +1103,9 @@ fn validate_join_declarations(output: &SinkConfig) -> Vec<DeclarationFault> {
     if !consumes {
         faults.push(DeclarationFault {
             message: format!(
-                "output '{}': `join_values` is declared on a `{format}` output, whose writer \
+                "output {}: `join_values` is declared on a `{format}` output, whose writer \
                  never consumes it — the declaration would be a silent no-op",
-                output.name
+                output.name.quoted_name()
             ),
             help: "remove the `join_values` block: the `csv` writer joins several values into \
                    one delimited cell, and the `xml` writer emits them as repeated child \
@@ -1101,8 +1123,9 @@ fn validate_join_declarations(output: &SinkConfig) -> Vec<DeclarationFault> {
         if entries[i + 1..].iter().any(|o| o.field == entry.field) {
             faults.push(DeclarationFault {
                 message: format!(
-                    "output '{}': `join_values` declares the field '{}' more than once",
-                    output.name, entry.field
+                    "output {}: `join_values` declares the field '{}' more than once",
+                    output.name.quoted_name(),
+                    entry.field
                 ),
                 help: "declare each field once, with the encoding it should use".to_string(),
             });
@@ -1135,10 +1158,11 @@ fn validate_join_declarations(output: &SinkConfig) -> Vec<DeclarationFault> {
             };
             faults.push(DeclarationFault {
                 message: format!(
-                    "output '{}': `join_values` on field '{}' sets `{knob}`, which only the `xml` \
+                    "output {}: `join_values` on field '{}' sets `{knob}`, which only the `xml` \
                      writer honors — a `csv` output joins the values into one delimited cell and \
                      never reads it",
-                    output.name, entry.field
+                    output.name.quoted_name(),
+                    entry.field
                 ),
                 help: "drop `repeat_as` / `wrap_in` on a CSV output (they name XML repeated \
                        elements), or write this stream to an `xml` output where they take effect"
@@ -1151,8 +1175,9 @@ fn validate_join_declarations(output: &SinkConfig) -> Vec<DeclarationFault> {
         if entry.on_conflict != OnConflict::EncodeJson && entry.delimiter.is_empty() {
             faults.push(DeclarationFault {
                 message: format!(
-                    "output '{}': `join_values` on field '{}' declares an empty delimiter",
-                    output.name, entry.field
+                    "output {}: `join_values` on field '{}' declares an empty delimiter",
+                    output.name.quoted_name(),
+                    entry.field
                 ),
                 help: "give a non-empty delimiter (the default is `;`) to separate the values in \
                        the joined cell"
@@ -1168,9 +1193,9 @@ fn validate_join_declarations(output: &SinkConfig) -> Vec<DeclarationFault> {
         if entry.on_conflict != OnConflict::EncodeJson && entry.delimiter.chars().count() > 1 {
             faults.push(DeclarationFault {
                 message: format!(
-                    "output '{}': `join_values` on field '{}' uses a multi-character delimiter \
+                    "output {}: `join_values` on field '{}' uses a multi-character delimiter \
                      '{}' with `on_conflict: {}`",
-                    output.name,
+                    output.name.quoted_name(),
                     entry.field,
                     entry.delimiter,
                     on_conflict_name(entry.on_conflict),
@@ -1189,9 +1214,11 @@ fn validate_join_declarations(output: &SinkConfig) -> Vec<DeclarationFault> {
             if entry.escape.chars().count() != 1 {
                 faults.push(DeclarationFault {
                     message: format!(
-                        "output '{}': `join_values` on field '{}' uses `on_conflict: escape` with \
+                        "output {}: `join_values` on field '{}' uses `on_conflict: escape` with \
                          an escape '{}' that is not a single character",
-                        output.name, entry.field, entry.escape
+                        output.name.quoted_name(),
+                        entry.field,
+                        entry.escape
                     ),
                     help: "give a single-character `escape` (the default is `\\`) — the reader \
                            un-escapes character by character"
@@ -1200,9 +1227,11 @@ fn validate_join_declarations(output: &SinkConfig) -> Vec<DeclarationFault> {
             } else if entry.escape == entry.delimiter {
                 faults.push(DeclarationFault {
                     message: format!(
-                        "output '{}': `join_values` on field '{}' uses `on_conflict: escape` with \
+                        "output {}: `join_values` on field '{}' uses `on_conflict: escape` with \
                          the escape equal to the delimiter '{}'",
-                        output.name, entry.field, entry.delimiter
+                        output.name.quoted_name(),
+                        entry.field,
+                        entry.delimiter
                     ),
                     help: "give an `escape` different from the `delimiter`; sharing one character \
                            makes an escaped delimiter and an escape marker indistinguishable on \
@@ -1278,7 +1307,7 @@ pub fn sink_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
             faults.push(NodeFault {
                 node_index,
                 code: "E359",
-                message: format!("output '{}': {}", header.name, fault.message),
+                message: format!("output {}: {}", header.name.quoted_name(), fault.message),
                 help: fault.help,
             });
         }
@@ -1355,12 +1384,12 @@ pub fn sink_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
                     node_index,
                     code: "E359",
                     message: format!(
-                        "output '{out}': the multi-value column(s) {columns} (`multiple: true`) \
+                        "output {out}: the multi-value column(s) {columns} (`multiple: true`) \
                          map to XML attribute(s) — the name's last segment starts with the \
                          attribute prefix '{prefix}' — and the XML writer encodes a `multiple:` \
                          field as repeated child elements, which an attribute cannot hold",
-                        out = header.name,
-                        columns = quoted_list(&attr_cols),
+                        out = header.name.quoted_name(),
+                        columns = quoted_list(&attr_cols)
                     ),
                     help: format!(
                         "emit the repeating field as a child element by removing the '{prefix}' \
@@ -1383,11 +1412,11 @@ pub fn sink_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
                     node_index,
                     code: "E359",
                     message: format!(
-                        "output '{out}': its own `schema:` declares the multi-value column(s) \
+                        "output {out}: its own `schema:` declares the multi-value column(s) \
                          {columns} (`multiple: true`), and a `{format}` output has no encoding for a \
                          field holding more than one value",
-                        out = header.name,
-                        columns = quoted_list(&declared),
+                        out = header.name.quoted_name(),
+                        columns = quoted_list(&declared)
                     ),
                     help: "drop `multiple: true` from the output column, or use a format with a \
                            native/delimited encoding; a fixed-width array requires an explicit \
@@ -1418,11 +1447,12 @@ pub fn sink_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
                 node_index,
                 code: "E359",
                 message: format!(
-                    "output '{out}': source '{source_name}' declares the multi-value column(s) \
+                    "output {out}: source {source_name} declares the multi-value column(s) \
                      {columns} (`multiple: true`), and a `{format}` output has no encoding for a \
                      field holding more than one value",
-                    out = header.name,
+                    out = header.name.quoted_name(),
                     columns = quoted_list(&columns),
+                    source_name = source_name.quoted_name(),
                 ),
                 help: "write this stream to a `json` output, collapse the column to a single \
                        value in a transform before the sink, or drop `multiple: true` from the \

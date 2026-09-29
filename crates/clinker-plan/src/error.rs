@@ -6,6 +6,7 @@
 //! runtime error enum that aggregates every subsystem failure with the
 //! `From` conversions that thread them together.
 
+use clinker_core_types::QuoteName;
 use clinker_record::owned_storage::SharedStorage;
 use std::fmt;
 
@@ -514,7 +515,8 @@ impl fmt::Display for PipelineError {
             } => {
                 write!(
                     f,
-                    "CXL compilation failed for transform '{transform_name}': "
+                    "CXL compilation failed for transform {transform_name}: ",
+                    transform_name = transform_name.quoted_name()
                 )?;
                 for msg in messages {
                     write!(f, "\n  {msg}")?;
@@ -542,8 +544,8 @@ impl fmt::Display for PipelineError {
             } => write!(
                 f,
                 "internal dispatch mismatch in {dispatcher}: expected {expected_kind}, got \
-                 {actual_kind} at node '{}'; contact support with this operator identity",
-                Self::bounded_dispatch_node_name(node),
+                 {actual_kind} at node {}; contact support with this operator identity",
+                (Self::bounded_dispatch_node_name(node)).quoted_name(),
             ),
             Self::Accumulator {
                 transform,
@@ -595,25 +597,32 @@ impl fmt::Display for PipelineError {
             } => write!(
                 f,
                 "E112 runtime composition recursion depth exceeded ({depth}) \
-                 in composition '{composition_name}'"
+                 in composition {composition_name}",
+                composition_name = composition_name.quoted_name()
             ),
             Self::CompositionBodyMissing { composition_name } => write!(
                 f,
-                "internal error in composition '{composition_name}': \
-                 body handle resolves to no entry in composition_bodies"
+                "internal error in composition {composition_name}: \
+                 body handle resolves to no entry in composition_bodies",
+                composition_name = composition_name.quoted_name()
             ),
             Self::CompositionUnknownPort {
                 composition_name,
                 port_name,
             } => write!(
                 f,
-                "internal error in composition '{composition_name}': \
-                 input port '{port_name}' has no body-side consumer"
+                "internal error in composition {composition_name}: \
+                 input port '{port_name}' has no body-side consumer",
+                composition_name = composition_name.quoted_name()
             ),
             Self::CompositionBodyError {
                 composition_name,
                 inner,
-            } => write!(f, "in composition '{composition_name}': {inner}"),
+            } => write!(
+                f,
+                "in composition {composition_name}: {inner}",
+                composition_name = composition_name.quoted_name()
+            ),
             Self::CorrelationGroupOverflow {
                 group_key,
                 max_group_buffer,
@@ -661,62 +670,68 @@ impl fmt::Display for PipelineError {
                 driver_row,
             } => write!(
                 f,
-                "E319 combine '{combine}': on_miss: error — no matching build row \
-                 for driver row {driver_row}"
+                "E319 combine {combine}: on_miss: error — no matching build row \
+                 for driver row {driver_row}",
+                combine = combine.quoted_name()
             ),
             Self::CombineRangeKeyOutOfRange { combine, value } => write!(
                 f,
-                "E326 combine '{combine}': range key {value} is outside the exact \
+                "E326 combine {combine}: range key {value} is outside the exact \
                  fixed-point range the decimal inequality-join axis supports — its \
                  magnitude exceeds ~1.7e20 or it carries more than 18 fractional \
                  digits, so it cannot be placed on the join's fixed-point grid \
                  without corrupting the comparison. The run stops rather than \
                  dropping the row or emitting a wrong match. Rescale or narrow the \
-                 compared values. See: clinker explain --code E326"
+                 compared values. See: clinker explain --code E326",
+                combine = combine.quoted_name()
             ),
             Self::CombineOutputCapExceeded { combine, cap } => write!(
                 f,
-                "E325 combine '{combine}': output exceeded max_output_rows of {cap} \
+                "E325 combine {combine}: output exceeded max_output_rows of {cap} \
                  rows. This is a result-size runaway guard, not an out-of-memory \
                  condition: the combine would emit more than the configured cap, so \
                  the run stops rather than truncating to a partial result. Raise \
                  max_output_rows if the large result is expected, or tighten the \
-                 combine predicate."
+                 combine predicate.",
+                combine = combine.quoted_name()
             ),
             Self::EnvelopeMultiHeaderConflict {
                 envelope,
                 header_count,
             } => write!(
                 f,
-                "E350 envelope '{envelope}': concat collapses the body into one \
+                "E350 envelope {envelope}: concat collapses the body into one \
                  framed document, but the body carried {header_count} distinct \
                  non-empty envelope headers — one document can frame only one \
                  header, so concat will not silently drop the rest. Make the \
                  headers identical upstream, or add a header-folding strategy \
                  that declares which header the consolidated document keeps. \
-                 See: clinker explain --code E350"
+                 See: clinker explain --code E350",
+                envelope = envelope.quoted_name()
             ),
             Self::EnvelopeHeaderGrainUnmatched { envelope, grain } => write!(
                 f,
-                "E351 envelope '{envelope}': a wired header record carries document \
+                "E351 envelope {envelope}: a wired header record carries document \
                  grain {grain}, which matches no in-flight body grain (or is a \
                  synthetic / ungrounded grain). The node attaches a header to a body \
                  strictly by grain, so it cannot place a header that grounds to no \
                  body document. Carry the body's grain onto the header record — a \
                  grain-preserving transform of the source's promoted header keeps it, \
                  or a business-key join against the body establishes it. \
-                 See: clinker explain --code E351"
+                 See: clinker explain --code E351",
+                envelope = envelope.quoted_name()
             ),
             Self::EnvelopeHeaderMultipleForGrain { envelope, grain } => write!(
                 f,
-                "E352 envelope '{envelope}': the wired header input carries two or \
+                "E352 envelope {envelope}: the wired header input carries two or \
                  more records for document grain {grain} — exactly one header \
                  record per document grain is required. The node attaches one \
                  header per grain and has no rule to fold a second, so it will not \
                  silently drop one. Deduplicate the header stream to one record \
                  per grain upstream (an aggregate or distinct on the grain's \
                  business key, or a transform that emits a single rewritten header \
-                 per source document). See: clinker explain --code E352"
+                 per source document). See: clinker explain --code E352",
+                envelope = envelope.quoted_name()
             ),
             Self::SpillCapExceeded {
                 node,
@@ -902,7 +917,7 @@ mod tests {
         assert_eq!(classification.retry_advice(), RetryAdvice::PolicyRequired);
         assert_eq!(
             error.to_string(),
-            "internal dispatch mismatch in dispatch_route: expected route, got transform at node 'normalize_orders'; contact support with this operator identity"
+            "internal dispatch mismatch in dispatch_route: expected route, got transform at node \"normalize_orders\"; contact support with this operator identity"
         );
 
         // Whatever the planner admitted as a name is the operator's own text,
@@ -915,7 +930,7 @@ mod tests {
         }
         .to_string();
         assert!(
-            awkward.contains("at node '/srv/private.csv record={token=secret}'"),
+            awkward.contains(r#"at node "/srv/private.csv record={token=secret}""#),
             "{awkward}"
         );
         assert!(awkward.len() < 320, "{awkward}");
@@ -948,7 +963,7 @@ mod tests {
             }
             .to_string();
             assert!(
-                rendered.contains(&format!("at node '{node}'")),
+                rendered.contains(&format!("at node {node}", node = node.quoted_name())),
                 "the reported identity must be the authored one: {rendered}"
             );
             rendered
@@ -983,7 +998,7 @@ mod tests {
             }
             .to_string();
             assert!(
-                rendered.contains(&format!("at node '{node}'")),
+                rendered.contains(&format!("at node {node}", node = node.quoted_name())),
                 "the reported identity must be the authored one: {rendered}"
             );
         }

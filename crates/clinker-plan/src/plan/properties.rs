@@ -14,6 +14,7 @@
 //! destructive operations can be explained to the user.
 
 use crate::config::SortField;
+use clinker_core_types::QuoteName;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -334,8 +335,9 @@ pub fn render_unordered_streaming_error(
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "error[CXL0419]: aggregate '{agg_name}' declared 'strategy: streaming' \
-         but its input is not sorted on group key {group_by:?}\n"
+        "error[CXL0419]: aggregate {agg_name} declared 'strategy: streaming' \
+         but its input is not sorted on group key {group_by:?}\n",
+        agg_name = agg_name.quoted_name()
     ));
 
     // Walk the chain: each hop is one note line. Emit hops in order from

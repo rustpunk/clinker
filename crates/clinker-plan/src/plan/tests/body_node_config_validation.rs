@@ -141,7 +141,7 @@ fn body_envelope_wired_trailer_rejected_with_e115() {
         panic!("expected an E115 diagnostic for the wired body trailer; got: {err:?}")
     });
     assert!(
-        diag.message.contains("envelope node 'framed'")
+        diag.message.contains(r#"envelope node "framed""#)
             && diag.message.contains("`trailer`")
             && diag.message.contains("not yet supported"),
         "the E115 message must carry the top-level not-yet-supported trailer wording: {:?}",
@@ -217,7 +217,7 @@ fn body_transform_zero_batch_size_rejected_with_e115() {
     });
     assert!(
         diag.message
-            .contains("transform 'shape': batch_size must be >= 1"),
+            .contains(r#"transform "shape": batch_size must be >= 1"#),
         "the E115 message must carry the top-level batch_size wording: {:?}",
         diag.message
     );

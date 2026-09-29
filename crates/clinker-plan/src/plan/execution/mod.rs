@@ -34,6 +34,7 @@ pub use streaming_class::{
     compute_streaming_combine_probe_edges, compute_transform_fused_sources,
 };
 
+use clinker_core_types::QuoteName;
 use clinker_record::owned_storage::SharedStorage;
 use std::collections::{BTreeSet, HashMap};
 
@@ -1514,15 +1515,16 @@ impl std::fmt::Display for PlanError {
             PlanError::MissingAnalyticWindow { transform } => {
                 write!(
                     f,
-                    "transform '{}' uses window.* but has no analytic_window config",
-                    transform
+                    "transform {} uses window.* but has no analytic_window config",
+                    transform.quoted_name()
                 )
             }
             PlanError::UnknownSource { name, transform } => {
                 write!(
                     f,
-                    "transform '{}' references unknown source '{}'",
-                    transform, name
+                    "transform {} references unknown source {}",
+                    transform.quoted_name(),
+                    name.quoted_name()
                 )
             }
             PlanError::CycleDetected { path } => {
@@ -1535,8 +1537,8 @@ impl std::fmt::Display for PlanError {
             } => {
                 write!(
                     f,
-                    "transform '{}' references unknown input '{}'. Available transforms: [{}]",
-                    transform,
+                    "transform {} references unknown input '{}'. Available transforms: [{}]",
+                    transform.quoted_name(),
                     reference,
                     available.join(", ")
                 )
@@ -1547,8 +1549,8 @@ impl std::fmt::Display for PlanError {
             PlanError::SelfReference { transform } => {
                 write!(
                     f,
-                    "transform '{}' references itself in input: field",
-                    transform
+                    "transform {} references itself in input: field",
+                    transform.quoted_name()
                 )
             }
             PlanError::PropertyDerivation(msg) => {
@@ -1560,31 +1562,32 @@ impl std::fmt::Display for PlanError {
             } => {
                 write!(
                     f,
-                    "aggregate extraction failed for transform '{}': {}",
-                    transform,
+                    "aggregate extraction failed for transform {}: {}",
+                    transform.quoted_name(),
                     diagnostics.join("; ")
                 )
             }
             PlanError::AggregateWithRoute { transform } => {
                 write!(
                     f,
-                    "aggregate transform '{}' cannot also declare a `route:` block",
-                    transform
+                    "aggregate transform {} cannot also declare a `route:` block",
+                    transform.quoted_name()
                 )
             }
             PlanError::AggregateWithMultipleInputs { transform } => {
                 write!(
                     f,
-                    "aggregate transform '{}' cannot consume multiple inputs",
-                    transform
+                    "aggregate transform {} cannot consume multiple inputs",
+                    transform.quoted_name()
                 )
             }
             PlanError::CorrelationKeyWithArena { transform } => {
                 write!(
                     f,
-                    "E150 transform '{transform}' uses analytic windows but at \
+                    "E150 transform {transform} uses analytic windows but at \
                      least one source declares a `correlation_key:`; per-group \
                      arena construction is not supported",
+                    transform = transform.quoted_name(),
                 )
             }
             PlanError::CompositionUntaggedIncomingEdge {
@@ -1594,9 +1597,10 @@ impl std::fmt::Display for PlanError {
             } => {
                 write!(
                     f,
-                    "E152 composition '{composition}' has untagged incoming edge from \
+                    "E152 composition {composition} has untagged incoming edge from \
                      '{producer}' ({scope}); every composition input edge must carry a \
                      port name (planner-pass invariant — see PlanEdge.port)",
+                    composition = composition.quoted_name(),
                 )
             }
         }

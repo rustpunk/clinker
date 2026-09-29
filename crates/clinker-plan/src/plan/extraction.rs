@@ -4,6 +4,7 @@
 //! extracting a subgraph into a composition, and [`write_extracted_composition`]
 //! to serialize the result as a `.comp.yaml` file.
 
+use clinker_core_types::QuoteName;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -96,7 +97,10 @@ pub fn analyze_extraction_boundary(
         if !name_to_idx.contains_key(name.as_str()) {
             errors.push(ExtractionError {
                 code: "E110".to_owned(),
-                message: format!("selected node '{name}' not found in the execution plan DAG"),
+                message: format!(
+                    "selected node {name} not found in the execution plan DAG",
+                    name = name.quoted_name()
+                ),
             });
         }
     }

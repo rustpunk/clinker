@@ -1,6 +1,7 @@
 //! Enforcer-sort and correlation-key node insertion passes.
 
 use super::*;
+use clinker_core_types::QuoteName;
 
 use std::collections::{HashMap, HashSet};
 
@@ -151,8 +152,8 @@ impl ExecutionPlanDag {
                 return Err(PipelineError::Compilation {
                     transform_name: boundary.output_name.clone(),
                     messages: vec![format!(
-                        "Sink '{}' uses {} writer mode after stage '{}' but authored keys [{}] require a complete-population stable sort; materialize the Sink after '{}' with:\nsort_order:\n{}\nor remove the Sink `sort_order` to keep streaming",
-                        boundary.output_name,
+                        "Sink {} uses {} writer mode after stage '{}' but authored keys [{}] require a complete-population stable sort; materialize the Sink after '{}' with:\nsort_order:\n{}\nor remove the Sink `sort_order` to keep streaming",
+                        boundary.output_name.quoted_name(),
                         boundary.mode.as_str(),
                         broken_stage,
                         authored_keys,
@@ -420,7 +421,8 @@ impl ExecutionPlanDag {
                 return Err(PipelineError::Compilation {
                     transform_name: source_name.clone(),
                     messages: vec![format!(
-                        "inject_correlation_sort: source '{source_name}' not found in DAG"
+                        "inject_correlation_sort: source {source_name} not found in DAG",
+                        source_name = source_name.quoted_name()
                     )],
                 });
             };

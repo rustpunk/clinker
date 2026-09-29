@@ -22,6 +22,7 @@ use super::*;
 use crate::config::composition::SchemaProvRecorder;
 use crate::config::pipeline_node::{PipelineNode, SourceBody};
 use crate::yaml::Spanned;
+use clinker_core_types::QuoteName;
 use clinker_format::{
     Column, Discriminator, EnvelopeFieldType, FixedWidthCountField, FixedWidthOccurs,
     NestedEnvelopeSection, RecordType, SourceSchema, SplitToRows, SplitToRowsMode, SplitValues,
@@ -1097,8 +1098,9 @@ fn is_composition_node(config: &PipelineConfig, name: &str) -> bool {
 
 fn unknown_composition_alias(key: &str, alias: &str) -> ConfigError {
     ConfigError::Validation(format!(
-        "[E230] channel source patch key '{key}' targets a source in composition '{alias}', \
-         but no composition node by that name exists in the pipeline"
+        "[E230] channel source patch key '{key}' targets a source in composition {alias}, \
+         but no composition node by that name exists in the pipeline",
+        alias = alias.quoted_name()
     ))
 }
 
@@ -1175,14 +1177,16 @@ fn unknown_source(src_name: &str, has_composition: bool) -> ConfigError {
         ""
     };
     ConfigError::Validation(format!(
-        "[E230] channel source patch targets unknown source '{src_name}': \
-         no source node by that name in the pipeline{hint}"
+        "[E230] channel source patch targets unknown source {src_name}: \
+         no source node by that name in the pipeline{hint}",
+        src_name = src_name.quoted_name()
     ))
 }
 
 fn unknown_column(src: &str, col: &str, op: &str) -> ConfigError {
     ConfigError::Validation(format!(
-        "[E231] channel schema patch on source '{src}': {op} of unknown column '{col}'"
+        "[E231] channel schema patch on source {src}: {op} of unknown column '{col}'",
+        src = src.quoted_name()
     ))
 }
 
@@ -1212,8 +1216,9 @@ pub(crate) fn apply_schema_ops(
     // generated, or external-file schema has no flat column list to patch here.
     let columns = schema.as_columns_mut().ok_or_else(|| {
         ConfigError::Validation(format!(
-            "[E237] channel schema patch on source '{src}': column ops apply only to a \
-             single-record (column-list) schema, not a multi-record / generated / file schema"
+            "[E237] channel schema patch on source {src}: column ops apply only to a \
+             single-record (column-list) schema, not a multi-record / generated / file schema",
+            src = src.quoted_name()
         ))
     })?;
     apply_column_ops(columns, ops, src, recorder)
@@ -1256,8 +1261,9 @@ fn apply_column_ops(
                 }
                 if to != col && columns.iter().any(|c| c.name == *to) {
                     return Err(ConfigError::Validation(format!(
-                        "[E233] channel schema patch on source '{src}': rename of '{col}' to \
-                         '{to}' collides with an existing column"
+                        "[E233] channel schema patch on source {src}: rename of '{col}' to \
+                         '{to}' collides with an existing column",
+                        src = src.quoted_name()
                     )));
                 }
                 let column = columns
@@ -1284,14 +1290,16 @@ fn apply_column_ops(
             SchemaColumnOp::Add(add) => {
                 if columns.iter().any(|c| c.name == *col) {
                     return Err(ConfigError::Validation(format!(
-                        "[E232] channel schema patch on source '{src}': add of column '{col}' \
-                         that already exists"
+                        "[E232] channel schema patch on source {src}: add of column '{col}' \
+                         that already exists",
+                        src = src.quoted_name()
                     )));
                 }
                 let ty = add.ty.clone().ok_or_else(|| {
                     ConfigError::Validation(format!(
-                        "[E236] channel schema patch on source '{src}': add of column '{col}' \
-                         requires a `type`"
+                        "[E236] channel schema patch on source {src}: add of column '{col}' \
+                         requires a `type`",
+                        src = src.quoted_name()
                     ))
                 })?;
                 let mut column = Column::bare(col.clone(), ty);
@@ -1453,7 +1461,8 @@ fn apply_split_values_ops(
 
 fn unknown_split_entry(src: &str, key: &str, field: &str) -> ConfigError {
     ConfigError::Validation(format!(
-        "[E234] channel {key} patch on source '{src}': remove of unknown field '{field}'"
+        "[E234] channel {key} patch on source {src}: remove of unknown field '{field}'",
+        src = src.quoted_name()
     ))
 }
 
@@ -1512,13 +1521,15 @@ fn apply_option_ops(
 
 fn options_rejected(src: &str, fmt: &str, err: &serde_json::Error) -> ConfigError {
     ConfigError::Validation(format!(
-        "[E235] channel options patch on source '{src}' ({fmt} format): {err}"
+        "[E235] channel options patch on source {src} ({fmt} format): {err}",
+        src = src.quoted_name()
     ))
 }
 
 fn options_internal(src: &str, err: &serde_json::Error) -> ConfigError {
     ConfigError::Validation(format!(
-        "[E235] channel options patch on source '{src}': could not read current options: {err}"
+        "[E235] channel options patch on source {src}: could not read current options: {err}",
+        src = src.quoted_name()
     ))
 }
 
@@ -1565,9 +1576,10 @@ fn apply_nested_section_op(
     let fmt = source.format.format_name();
     let InputFormat::X12(opts) = &mut source.format else {
         return Err(ConfigError::Validation(format!(
-            "[E238] channel {key} patch on source '{src}': X12 nested-envelope section ops \
+            "[E238] channel {key} patch on source {src}: X12 nested-envelope section ops \
              apply only to an `x12` source (source format is {fmt})",
             key = which.key(),
+            src = src.quoted_name(),
         )));
     };
     match op {
@@ -1575,9 +1587,10 @@ fn apply_nested_section_op(
             let removed = opts.as_mut().and_then(|o| which.slot(o).take());
             if removed.is_none() {
                 return Err(ConfigError::Validation(format!(
-                    "[E239] channel {key} patch on source '{src}': remove of a declaration the \
+                    "[E239] channel {key} patch on source {src}: remove of a declaration the \
                      source does not carry",
                     key = which.key(),
+                    src = src.quoted_name(),
                 )));
             }
         }
@@ -1604,9 +1617,10 @@ fn apply_nested_section_op(
                 None => {
                     let name = name.clone().ok_or_else(|| {
                         ConfigError::Validation(format!(
-                            "[E240] channel {key} patch on source '{src}': the source declares \
+                            "[E240] channel {key} patch on source {src}: the source declares \
                              no {key} yet, so the patch creates one and must carry a `name`",
                             key = which.key(),
+                            src = src.quoted_name(),
                         ))
                     })?;
                     let mut new_fields = IndexMap::new();
@@ -1633,8 +1647,9 @@ fn apply_nested_section_op(
 
 fn unknown_nested_field(src: &str, which: X12SectionSlot, field: &str) -> ConfigError {
     ConfigError::Validation(format!(
-        "[E239] channel {key} patch on source '{src}': remove of unknown field '{field}'",
+        "[E239] channel {key} patch on source {src}: remove of unknown field '{field}'",
         key = which.key(),
+        src = src.quoted_name(),
     ))
 }
 
@@ -1656,15 +1671,17 @@ fn apply_split_field_ops(
     let fmt = source.format.format_name();
     let InputFormat::Hl7(opts) = &mut source.format else {
         return Err(ConfigError::Validation(format!(
-            "[E238] channel split_fields patch on source '{src}': HL7 composite-field split \
-             ops apply only to an `hl7` source (source format is {fmt})"
+            "[E238] channel split_fields patch on source {src}: HL7 composite-field split \
+             ops apply only to an `hl7` source (source format is {fmt})",
+            src = src.quoted_name()
         )));
     };
     for (field, op) in ops {
         let position = Hl7FieldSplitOption::parse_field_position(field).ok_or_else(|| {
             ConfigError::Validation(format!(
-                "[E240] channel split_fields patch on source '{src}': {field:?} is not a \
-                 positional `fNN` column name (e.g. `f08`)"
+                "[E240] channel split_fields patch on source {src}: {field:?} is not a \
+                 positional `fNN` column name (e.g. `f08`)",
+                src = src.quoted_name()
             ))
         })?;
         match op {
@@ -1695,8 +1712,9 @@ fn apply_split_field_ops(
                 ] {
                     if *provided == Some(0) {
                         return Err(ConfigError::Validation(format!(
-                            "[E240] channel split_fields patch on source '{src}': split field \
-                             '{field}' sets `{axis}: 0`; every axis width must be at least 1"
+                            "[E240] channel split_fields patch on source {src}: split field \
+                             '{field}' sets `{axis}: 0`; every axis width must be at least 1",
+                            src = src.quoted_name()
                         )));
                     }
                 }
@@ -1721,9 +1739,10 @@ fn apply_split_field_ops(
                 } else {
                     let components = components.ok_or_else(|| {
                         ConfigError::Validation(format!(
-                            "[E240] channel split_fields patch on source '{src}': the source \
+                            "[E240] channel split_fields patch on source {src}: the source \
                              declares no split for field '{field}' yet, so the patch adds one \
-                             and must carry `components`"
+                             and must carry `components`",
+                            src = src.quoted_name()
                         ))
                     })?;
                     entries.push(Hl7FieldSplitOption {
@@ -1741,8 +1760,9 @@ fn apply_split_field_ops(
 
 fn unknown_split_field(src: &str, field: &str) -> ConfigError {
     ConfigError::Validation(format!(
-        "[E239] channel split_fields patch on source '{src}': remove of a split the source \
-         does not declare for field '{field}'"
+        "[E239] channel split_fields patch on source {src}: remove of a split the source \
+         does not declare for field '{field}'",
+        src = src.quoted_name()
     ))
 }
 
@@ -1770,8 +1790,9 @@ fn apply_record_ops(
     } = schema
     else {
         return Err(ConfigError::Validation(format!(
-            "[E241] channel records patch on source '{src}': `records` / `discriminator` ops \
-             apply only to a multi-record schema, not a single-record / generated / file schema"
+            "[E241] channel records patch on source {src}: `records` / `discriminator` ops \
+             apply only to a multi-record schema, not a single-record / generated / file schema",
+            src = src.quoted_name()
         )));
     };
 
@@ -1826,8 +1847,9 @@ fn apply_record_ops(
             RecordTypeOp::Add(add) => {
                 if record_types.iter().any(|rt| rt.id == *id) {
                     return Err(ConfigError::Validation(format!(
-                        "[E243] channel records patch on source '{src}': add of record type \
-                         '{id}' that already exists"
+                        "[E243] channel records patch on source {src}: add of record type \
+                         '{id}' that already exists",
+                        src = src.quoted_name()
                     )));
                 }
                 record_types.push(RecordType {
@@ -1861,8 +1883,9 @@ fn validate_discriminator(disc: &Discriminator, src: &str) -> Result<(), ConfigE
     let has_field = disc.field.is_some();
     let malformed = |reason: &str| {
         ConfigError::Validation(format!(
-            "[E244] channel discriminator patch on source '{src}': merged discriminator {reason}; \
-             a discriminator is a byte range (`start` + optional `width`) XOR a `field`"
+            "[E244] channel discriminator patch on source {src}: merged discriminator {reason}; \
+             a discriminator is a byte range (`start` + optional `width`) XOR a `field`",
+            src = src.quoted_name()
         ))
     };
     match (has_byte, has_field) {
@@ -1880,9 +1903,10 @@ fn check_tag_uniqueness(record_types: &[RecordType], src: &str) -> Result<(), Co
     for (i, rt) in record_types.iter().enumerate() {
         if record_types[..i].iter().any(|other| other.tag == rt.tag) {
             return Err(ConfigError::Validation(format!(
-                "[E245] channel records patch on source '{src}': discriminator tag '{tag}' is \
+                "[E245] channel records patch on source {src}: discriminator tag '{tag}' is \
                  declared by more than one record type after the patch",
-                tag = rt.tag
+                tag = rt.tag,
+                src = src.quoted_name()
             )));
         }
     }
@@ -1891,7 +1915,8 @@ fn check_tag_uniqueness(record_types: &[RecordType], src: &str) -> Result<(), Co
 
 fn unknown_record_type(src: &str, id: &str, op: &str) -> ConfigError {
     ConfigError::Validation(format!(
-        "[E242] channel records patch on source '{src}': {op} of unknown record type '{id}'"
+        "[E242] channel records patch on source {src}: {op} of unknown record type '{id}'",
+        src = src.quoted_name()
     ))
 }
 

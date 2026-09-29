@@ -1618,7 +1618,7 @@ nodes:
         .expect_err("a wired trailer port is still rejected at validation");
     let msg = err.to_string();
     assert!(
-        msg.contains("envelope node 'framed'")
+        msg.contains("envelope node \"framed\"")
             && msg.contains("`trailer`")
             && msg.contains("not yet supported"),
         "the rejection still names the trailer port specifically, got: {msg}"

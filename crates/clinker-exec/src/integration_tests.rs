@@ -1562,7 +1562,7 @@ nodes:
         match result {
             Err(PipelineError::Config(clinker_plan::config::ConfigError::Validation(msg))) => {
                 assert!(
-                    msg.contains("no reader registered for source 'src'"),
+                    msg.contains("no reader registered for source \"src\""),
                     "expected missing-reader message, got: {msg}"
                 );
             }
@@ -1755,7 +1755,7 @@ nodes:
         assert_eq!(run.advisories.len(), 1, "{:?}", run.advisories);
         assert!(
             run.advisories[0].starts_with(
-                "W367 output 'out': 2 value(s) truncated to fit under `truncation: warn`: \
+                "W367 output \"out\": 2 value(s) truncated to fit under `truncation: warn`: \
                  name ×2 (longest 11 bytes, width 5; records 2, 4)."
             ),
             "{}",

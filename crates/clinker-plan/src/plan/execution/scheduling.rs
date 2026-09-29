@@ -2,6 +2,7 @@
 //! selection, plus the `SchedulingHint` projection consumed by the executor.
 
 use super::*;
+use clinker_core_types::QuoteName;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -1422,8 +1423,9 @@ fn compile_source_order(
         .ok_or_else(|| PipelineError::Compilation {
             transform_name: source_name.to_string(),
             messages: vec![format!(
-                "source '{source_name}' declares `sort_order`, but its schema has not resolved to \
-             concrete columns; resolve the schema before compiling source ordering"
+                "source {source_name} declares `sort_order`, but its schema has not resolved to \
+             concrete columns; resolve the schema before compiling source ordering",
+                source_name = source_name.quoted_name()
             )],
         })?;
     let mut fields = Vec::with_capacity(specs.len());

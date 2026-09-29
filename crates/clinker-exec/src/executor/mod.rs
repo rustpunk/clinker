@@ -47,6 +47,7 @@ pub(crate) mod watermark;
 pub(crate) mod window_runtime;
 
 pub use batch_handoff::DEFAULT_BATCH_SIZE;
+use clinker_core_types::QuoteName;
 use context::{SourceRuntimePolicy, build_stable_eval_context};
 #[cfg(feature = "test-utils")]
 #[doc(hidden)]
@@ -855,8 +856,8 @@ impl PipelineExecutor {
             if !registered {
                 return Err(PipelineError::Config(
                     clinker_plan::config::ConfigError::Validation(format!(
-                        "no writer registered for output '{}'",
-                        output.name
+                        "no writer registered for output {}",
+                        output.name.quoted_name()
                     )),
                 ));
             }
@@ -1059,8 +1060,8 @@ impl PipelineExecutor {
                 }
                 let source_input = readers.remove(&src_cfg.name).ok_or_else(|| {
                     PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
-                        "no reader registered for source '{}'",
-                        src_cfg.name
+                        "no reader registered for source {}",
+                        src_cfg.name.quoted_name()
                     )))
                 })?;
                 // Single ConsumerHandle shared between the SourceConsumer

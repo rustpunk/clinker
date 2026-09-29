@@ -6,6 +6,7 @@
 //! source span, and a corrected path, reported before any input is opened —
 //! rather than an unspanned format error from the middle of a run.
 
+use clinker_core_types::QuoteName;
 use clinker_format::{RecordPath, RecordPathSyntax};
 
 use crate::config::InputFormat;
@@ -46,7 +47,7 @@ pub fn record_path_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
             faults.push(NodeFault {
                 node_index,
                 code: "E363",
-                message: format!("source '{}': {e}", header.name),
+                message: format!("source {}: {e}", header.name.quoted_name()),
                 help: e.help(),
             });
         }

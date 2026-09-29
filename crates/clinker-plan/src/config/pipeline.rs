@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::yaml::Spanned;
+use clinker_core_types::QuoteName;
 use clinker_record::owned_storage::SharedStorage;
 // Default `fNN`/`eNN` ceilings each reader enforces, referenced by the HL7
 // split-field reachability check and the `$doc` positional-bound validation
@@ -1115,11 +1116,11 @@ impl PipelineConfig {
                     Diagnostic::error(
                         "E349",
                         format!(
-                            "the rest source '{}' declares an `envelope:` block, but a rest \
+                            "the rest source {} declares an `envelope:` block, but a rest \
                              source pulls records page by page over HTTP and buffers no \
                              document — the declared sections are inert and every \
                              `$doc.<section>.<field>` against this source resolves to null",
-                            source.name
+                            source.name.quoted_name()
                         ),
                         LabeledSpan::primary(primary, String::new()),
                     )
@@ -1168,11 +1169,11 @@ impl PipelineConfig {
                     Diagnostic::error(
                         "E356",
                         format!(
-                            "the {fmt} source '{}' declares an `envelope:` block, but a plain \
+                            "the {fmt} source {} declares an `envelope:` block, but a plain \
                              single-schema {fmt} source carries no header/trailer structure to \
                              extract — the declared sections are inert and every \
                              `$doc.<section>.<field>` against this source resolves to null",
-                            source.name
+                            source.name.quoted_name()
                         ),
                         LabeledSpan::primary(primary, String::new()),
                     )
@@ -1299,8 +1300,8 @@ impl PipelineConfig {
                     diags.push(Diagnostic::error(
                         "E003",
                         format!(
-                            "transform '{}' uses window.* functions but declares no analytic_window",
-                            analysis.name
+                            "transform {} uses window.* functions but declares no analytic_window",
+                            analysis.name.quoted_name()
                         ),
                         LabeledSpan::primary(Span::SYNTHETIC, String::new()),
                     ));
@@ -1321,8 +1322,9 @@ impl PipelineConfig {
                     diags.push(Diagnostic::error(
                         "E003",
                         format!(
-                            "transform '{}' references unknown source '{}' in analytic_window",
-                            entries[i].name, source
+                            "transform {} references unknown source {} in analytic_window",
+                            (entries[i].name).quoted_name(),
+                            source.quoted_name()
                         ),
                         LabeledSpan::primary(Span::SYNTHETIC, String::new()),
                     ));
@@ -1567,11 +1569,14 @@ impl PipelineConfig {
                     diags.push(Diagnostic::error(
                         "E150c",
                         format!(
-                            "cross-source window references source '{other}' whose \
+                            "cross-source window references source {other} whose \
                              ingestion tier is downstream of the window-bearing \
-                             transform '{transform_name}' primary input source \
-                             '{primary_for_transform}'; promote '{other}' to an \
-                             earlier tier or remove the cross-source reference"
+                             transform {transform_name} primary input source \
+                             {primary_for_transform}; promote {other} to an \
+                             earlier tier or remove the cross-source reference",
+                            other = other.quoted_name(),
+                            transform_name = transform_name.quoted_name(),
+                            primary_for_transform = primary_for_transform.quoted_name()
                         ),
                         LabeledSpan::primary(Span::SYNTHETIC, String::new()),
                     ));
@@ -1590,9 +1595,10 @@ impl PipelineConfig {
                     diags.push(Diagnostic::error(
                         "E003",
                         format!(
-                            "windowed transform '{}' references cross-source '{}' \
+                            "windowed transform {} references cross-source {} \
                              which is not a known node in the plan",
-                            transform_name, other
+                            transform_name.quoted_name(),
+                            other.quoted_name()
                         ),
                         LabeledSpan::primary(Span::SYNTHETIC, String::new()),
                     ));
@@ -1602,9 +1608,10 @@ impl PipelineConfig {
                     diags.push(Diagnostic::error(
                         "E003",
                         format!(
-                            "windowed transform '{}' references cross-source '{}' \
+                            "windowed transform {} references cross-source {} \
                              whose Source node has no output schema",
-                            transform_name, other
+                            transform_name.quoted_name(),
+                            other.quoted_name()
                         ),
                         LabeledSpan::primary(Span::SYNTHETIC, String::new()),
                     ));
@@ -1624,9 +1631,9 @@ impl PipelineConfig {
                         diags.push(Diagnostic::error(
                             "E003",
                             format!(
-                                "windowed transform '{}' has no upstream input; \
+                                "windowed transform {} has no upstream input; \
                                  analytic_window requires a predecessor in the DAG",
-                                transform_name
+                                transform_name.quoted_name()
                             ),
                             LabeledSpan::primary(Span::SYNTHETIC, String::new()),
                         ));
@@ -1640,10 +1647,10 @@ impl PipelineConfig {
                         diags.push(Diagnostic::error(
                             "E150d",
                             format!(
-                                "windowed transform '{}' is rooted at a Merge node; \
+                                "windowed transform {} is rooted at a Merge node; \
                                  Merge concatenates streams without a single producer \
                                  identity, so a window cannot anchor to it",
-                                transform_name
+                                transform_name.quoted_name()
                             ),
                             LabeledSpan::primary(Span::SYNTHETIC, String::new()),
                         ));
@@ -1654,9 +1661,9 @@ impl PipelineConfig {
                             diags.push(Diagnostic::error(
                                 "E003",
                                 format!(
-                                    "windowed transform '{}' rooted at upstream node \
+                                    "windowed transform {} rooted at upstream node \
                                      '{}' which has no output schema",
-                                    transform_name,
+                                    transform_name.quoted_name(),
                                     other.name()
                                 ),
                                 LabeledSpan::primary(Span::SYNTHETIC, String::new()),
@@ -1673,11 +1680,11 @@ impl PipelineConfig {
                                 diags.push(Diagnostic::error(
                                     "E150b",
                                     format!(
-                                        "windowed transform '{}' references field '{}' \
+                                        "windowed transform {} references field '{}' \
                                          that the upstream operator '{}' does not emit; \
                                          a node-rooted window can only see columns \
                                          produced by its rooted operator",
-                                        transform_name,
+                                        transform_name.quoted_name(),
                                         f,
                                         other.name()
                                     ),
@@ -1716,13 +1723,15 @@ impl PipelineConfig {
                                         diags.push(Diagnostic::error(
                                             "E150e",
                                             format!(
-                                                "windowed transform '{transform_name}' \
+                                                "windowed transform {transform_name} \
                                                  references field '{f}' typed as Array; \
                                                  window builtin does not support \
                                                  array-typed field '{f}' from \
-                                                 `match: collect` combine '{combine_name}'; \
+                                                 `match: collect` combine {combine_name}; \
                                                  flatten the array upstream or use \
-                                                 `match: first | all`"
+                                                 `match: first | all`",
+                                                transform_name = transform_name.quoted_name(),
+                                                combine_name = combine_name.quoted_name()
                                             ),
                                             LabeledSpan::primary(Span::SYNTHETIC, String::new()),
                                         ));
@@ -2091,7 +2100,7 @@ impl PipelineConfig {
             diags.push(Diagnostic::error(
                 "E15Y",
                 format!(
-                    "E15Y aggregate '{}' has `strategy: streaming` but its \
+                    "E15Y aggregate {} has `strategy: streaming` but its \
                      `group_by` omits at least one correlation-key field \
                      visible upstream, which routes it through the retraction \
                      protocol. Streaming aggregates emit per group-boundary \
@@ -2099,7 +2108,7 @@ impl PipelineConfig {
                      rollback window. Use `strategy: hash` (the default), or \
                      include every correlation-key field in `group_by` so the \
                      aggregate stays on the strict-collateral path.",
-                    name
+                    name.quoted_name()
                 ),
                 LabeledSpan::primary(dag.graph[idx].span(), String::new()),
             ));
@@ -2731,7 +2740,8 @@ fn resolve_all_input_references(
         };
         let message = match qualifier {
             Some(q) => format!(
-                "at line {line}: combine '{consumer_name}' input '{q}' references undeclared upstream '{reference_full}'"
+                "at line {line}: combine {consumer_name} input '{q}' references undeclared upstream '{reference_full}'",
+                consumer_name = consumer_name.quoted_name()
             ),
             None => format!(
                 "node {consumer_name:?} input {reference_full:?} references an undeclared node"
@@ -3351,7 +3361,8 @@ fn closed_doc_path_problem(
             code: "E341",
             message: format!(
                 "`$doc.{section_name}.{field_name}` references envelope section \
-                 '{section_name}', but source '{source_name}' declares no such section"
+                 '{section_name}', but source {source_name} declares no such section",
+                source_name = source_name.quoted_name()
             ),
             help: format!(
                 "declare the section under the source's `envelope.sections`, or correct \
@@ -3364,8 +3375,9 @@ fn closed_doc_path_problem(
             code: "E341",
             message: format!(
                 "`$doc.{section_name}.{field_name}` references field '{field_name}' in \
-                 envelope section '{section_name}', but source '{source_name}' declares no \
-                 such field in that section"
+                 envelope section '{section_name}', but source {source_name} declares no \
+                 such field in that section",
+                source_name = source_name.quoted_name()
             ),
             help: format!(
                 "add '{field_name}' to `envelope.sections.{section_name}.fields`, or correct \
@@ -3436,8 +3448,9 @@ fn segment_positional_doc_path_problem(
             code: "E348",
             message: format!(
                 "`$doc.{section_name}.{field_name}` references envelope section \
-                 '{section_name}', but the {format} source '{source_name}' synthesizes no \
-                 such section"
+                 '{section_name}', but the {format} source {source_name} synthesizes no \
+                 such section",
+                source_name = source_name.quoted_name()
             ),
             help: format!(
                 "name a section this {format} source exposes ({known_list}), declare \
@@ -3514,8 +3527,9 @@ fn undeclared_field_in_closed_section(
         code: "E348",
         message: format!(
             "`$doc.{section_name}.{field_name}` references field '{field_name}' in section \
-             '{section_name}', but the {format} source '{source_name}' declares no such field \
-             in that section"
+             '{section_name}', but the {format} source {source_name} declares no such field \
+             in that section",
+            source_name = source_name.quoted_name()
         ),
         help: format!(
             "add '{field_name}' to that section's field schema ({declared_under}), or correct \
@@ -3542,11 +3556,12 @@ fn positional_field_problem(
             code: "E348",
             message: format!(
                 "`$doc.{section_name}.{field_name}` references positional element \
-                 '{field_name}', but the {format} source '{source_name}' exposes only \
+                 '{field_name}', but the {format} source {source_name} exposes only \
                  '{prefix}01'..'{prefix}{max:02}' on section '{section_name}' (its \
                  configured {bound_opt} is {max})",
                 max = max_positional,
                 bound_opt = positional_bound_option(prefix),
+                source_name = source_name.quoted_name(),
             ),
             help: format!(
                 "reference a positional element within range, or raise the source's \
@@ -3558,10 +3573,11 @@ fn positional_field_problem(
             code: "E348",
             message: format!(
                 "`$doc.{section_name}.{field_name}` references field '{field_name}' on section \
-                 '{section_name}', but the {format} source '{source_name}' exposes that \
+                 '{section_name}', but the {format} source {source_name} exposes that \
                  section's wire data only as positional elements \
                  ('{prefix}01'..'{prefix}{max:02}')",
                 max = max_positional,
+                source_name = source_name.quoted_name(),
             ),
             help: format!(
                 "reference a positional element ('{prefix}NN'), or declare '{field_name}' under \
@@ -4689,9 +4705,9 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
                 1 => {}
                 0 => {
                     return Err(ConfigError::Validation(format!(
-                        "[E211] source '{}': file transport declares no matcher; set exactly \
+                        "[E211] source {}: file transport declares no matcher; set exactly \
                          one of `path`, `glob`, `regex`, `paths`",
-                        input.name
+                        input.name.quoted_name()
                     )));
                 }
                 _ => {
@@ -4705,9 +4721,9 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
                     .filter_map(|(name, set)| set.then_some(name))
                     .collect();
                     return Err(ConfigError::Validation(format!(
-                        "[E210] source '{}': file transport declares more than one matcher \
+                        "[E210] source {}: file transport declares more than one matcher \
                          ({}); set exactly one of `path`, `glob`, `regex`, `paths`",
-                        input.name,
+                        input.name.quoted_name(),
                         which.join(", ")
                     )));
                 }
@@ -4728,10 +4744,10 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
             .collect();
             if !matchers.is_empty() {
                 return Err(ConfigError::Validation(format!(
-                    "[E219] source '{}': {} transport declares file matcher(s) ({}); the rest \
+                    "[E219] source {}: {} transport declares file matcher(s) ({}); the rest \
                      transport reads from its endpoint, not the filesystem — remove the \
                      matcher key(s)",
-                    input.name,
+                    input.name.quoted_name(),
                     input.transport.transport_name(),
                     matchers.join(", ")
                 )));
@@ -4742,9 +4758,9 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
             // bodies (`json`/`xml`) are meaningful.
             if !matches!(input.format, InputFormat::Json(_) | InputFormat::Xml(_)) {
                 return Err(ConfigError::Validation(format!(
-                    "[E220] source '{}': rest transport decodes response bodies through the \
+                    "[E220] source {}: rest transport decodes response bodies through the \
                      declared format, which must be `json` or `xml` (got `{}`)",
-                    input.name,
+                    input.name.quoted_name(),
                     input.format.format_name()
                 )));
             }
@@ -4781,11 +4797,11 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
                     && !pointer.starts_with('/')
                 {
                     return Err(ConfigError::Validation(format!(
-                        "[E222] source '{source}': envelope section '{section_name}' declares \
+                        "[E222] source {source}: envelope section '{section_name}' declares \
                          `json_pointer: {pointer:?}`, which is not a valid RFC 6901 pointer — a \
                          pointer must be empty (the whole document) or start with `/` (e.g. \
                          `/{pointer}`)",
-                        source = input.name,
+                        source = input.name.quoted_name(),
                     )));
                 }
             }
@@ -4821,7 +4837,7 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
                             }
                         };
                         return Err(ConfigError::Validation(format!(
-                            "[E357] source '{source}': envelope section '{section_name}' declares \
+                            "[E357] source {source}: envelope section '{section_name}' declares \
                              {declared} on a {fmt} source, but only the file-level header segment \
                              `{file_level_tag}` is extractable as a declared section — it is the \
                              one segment the reader resolves from its bounded header pre-scan. \
@@ -4829,8 +4845,8 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
                              and trailer segments are validated by the reader, not exposed as \
                              sections. Use `extract: {{ segment: {file_level_tag} }}`, or drop the \
                              section",
-                            source = input.name,
-                            fmt = input.format.format_name(),
+                            source = input.name.quoted_name(),
+                            fmt = input.format.format_name()
                         )));
                     }
                 }
@@ -4900,10 +4916,10 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
             && output.split.is_some()
         {
             return Err(ConfigError::Validation(format!(
-                "[{code}] output '{name}': `{format_token}` output cannot be combined \
+                "[{code}] output {name}: `{format_token}` output cannot be combined \
                  with `split` — {envelope_phrase} and cannot be divided across files; \
                  remove the `split` block or choose a splittable format",
-                name = output.name,
+                name = output.name.quoted_name(),
             )));
         }
     }
@@ -4938,7 +4954,7 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
         }
         if trace_output_lineage(config, &output.name).body_cardinality == Cardinality::Multi {
             return Err(ConfigError::Validation(format!(
-                "[E355] output '{name}': `{format}` output frames a single top-level \
+                "[E355] output {name}: `{format}` output frames a single top-level \
                  document envelope, but its body can carry more than one document with no \
                  consolidating node on the path — every input document's records would \
                  collapse into one envelope, silently merging distinct messages/interchanges. \
@@ -4946,8 +4962,8 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
                  into one document, route each document to its own output via a per-document \
                  `split:` / `{{source_file}}` path template, or choose a document-sequence \
                  format (csv / json / xml / fixed_width)",
-                name = output.name,
-                format = output.format.format_name(),
+                name = output.name.quoted_name(),
+                format = output.format.format_name()
             )));
         }
     }
@@ -4967,13 +4983,13 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
         for output in config.sink_configs() {
             if output.has_per_record_path_tokens() {
                 return Err(ConfigError::Validation(format!(
-                    "[E343] output '{name}': a per-source-file output template \
+                    "[E343] output {name}: a per-source-file output template \
                      (`{{source_file}}` / `{{source_path}}`) cannot be combined with a \
                      source declaring `dlq_granularity: document` — document-level \
                      dead-lettering buffers each document and flushes it to a single \
                      writer, which is incompatible with per-record file fan-out; use a \
                      single output path, or set `dlq_granularity: record`",
-                    name = output.name,
+                    name = output.name.quoted_name(),
                 )));
             }
         }
@@ -4996,12 +5012,13 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
             .map(|s| s.name.as_str())
             .unwrap_or("");
         return Err(ConfigError::Validation(format!(
-            "[E344] source '{source}': `dlq_granularity: document` cannot be combined \
+            "[E344] source {source}: `dlq_granularity: document` cannot be combined \
              with `error_handling.strategy: fail_fast` — document-level dead-lettering \
              keeps the run going past a bad document, which contradicts fail-fast's \
              abort-on-first-error. Use `strategy: continue` with \
              `dlq_granularity: document`, or set `dlq_granularity: record` to keep \
-             fail-fast"
+             fail-fast",
+            source = source.quoted_name()
         )));
     }
 
@@ -5023,12 +5040,14 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
             .map(|source| source.source.name.as_str())
             .unwrap_or("");
         return Err(ConfigError::Validation(format!(
-            "[E370] source '{document_source}' declares `dlq_granularity: document`, but \
-             source '{correlated_source}' declares `correlation_key` — document and \
+            "[E370] source {document_source} declares `dlq_granularity: document`, but \
+             source {correlated_source} declares `correlation_key` — document and \
              correlation rejection use different atomic populations and cannot share one \
              output writer boundary. Keep document rejection by removing every \
              `correlation_key`, or keep correlation rejection by setting \
-             `dlq_granularity: record`"
+             `dlq_granularity: record`",
+            document_source = document_source.quoted_name(),
+            correlated_source = correlated_source.quoted_name()
         )));
     }
 
@@ -5072,32 +5091,35 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
             let per_file_fanout = output.split.is_some() || output.has_per_record_path_tokens();
             if per_file_fanout {
                 return Err(ConfigError::Validation(format!(
-                    "[E347] output '{out}': `reconstruct_envelope` cannot be combined \
+                    "[E347] output {out}: `reconstruct_envelope` cannot be combined \
                      with per-file output splitting (`split:`) or a per-source-file path \
                      template (`{{source_file}}` / `{{source_path}}`) — envelope \
                      reconstruction frames one document stream into a single writer, \
                      which is incompatible with routing each record to a file-keyed \
                      writer. Use a single output path without `split:`, or drop \
                      `reconstruct_envelope`",
+                    out = out.quoted_name(),
                 )));
             }
             if has_document_dlq {
                 return Err(ConfigError::Validation(format!(
-                    "[E347] output '{out}': `reconstruct_envelope` cannot be combined with a \
+                    "[E347] output {out}: `reconstruct_envelope` cannot be combined with a \
                      source declaring `dlq_granularity: document` — document-level \
                      dead-lettering routes the Output through its own per-document buffer, \
                      which takes precedence over envelope framing and silently leaves the \
                      header/footer unwritten. Use `dlq_granularity: record`, or drop \
-                     `reconstruct_envelope`"
+                     `reconstruct_envelope`",
+                    out = out.quoted_name()
                 )));
             }
             if has_correlation_key {
                 return Err(ConfigError::Validation(format!(
-                    "[E347] output '{out}': `reconstruct_envelope` cannot be combined with a \
+                    "[E347] output {out}: `reconstruct_envelope` cannot be combined with a \
                      source declaring `correlation_key` — correlation buffering owns the \
                      writes through its own commit stage, which envelope framing bypasses, so \
                      dirty correlation groups would leak into the framed output and inflate \
-                     the success counts. Drop `correlation_key`, or drop `reconstruct_envelope`"
+                     the success counts. Drop `correlation_key`, or drop `reconstruct_envelope`",
+                    out = out.quoted_name()
                 )));
             }
 
@@ -5122,7 +5144,7 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
                 && let Some(stripper) = unconsolidated_stripper(config, out)
             {
                 return Err(ConfigError::Validation(format!(
-                    "[E347] output '{out}': `reconstruct_envelope` cannot be combined with an \
+                    "[E347] output {out}: `reconstruct_envelope` cannot be combined with an \
                      upstream node ('{stripper}') that strips document lineage unless an \
                      `envelope` node with `strategy: concat` consolidates the merged stream \
                      first — a Combine, Aggregate, or Composition emits records with no \
@@ -5130,7 +5152,8 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
                      them (the framing arm would stream them unframed, e.g. producing malformed \
                      JSON). Insert an `envelope` node with `strategy: concat` between '{stripper}' \
                      and this output to consolidate the merged stream into one document, or drop \
-                     `reconstruct_envelope`"
+                     `reconstruct_envelope`",
+                    out = out.quoted_name()
                 )));
             }
 
@@ -5165,11 +5188,12 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
                 if !feeding_sections.contains(section) {
                     let declared: Vec<&str> = feeding_sections.iter().copied().collect();
                     return Err(ConfigError::Validation(format!(
-                        "[E346] output '{out}': envelope {role} references section \
+                        "[E346] output {out}: envelope {role} references section \
                          '{section}' which no source feeding this output declares an \
                          `envelope:` section for. Sections declared by the feeding \
                          source(s): {declared:?}. Name a declared section, or add the \
-                         section to a feeding source's `envelope:` config"
+                         section to a feeding source's `envelope:` config",
+                        out = out.quoted_name()
                     )));
                 }
             }
@@ -5181,19 +5205,21 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
                 // present on the document).
                 if envelope_cfg.footer_from_doc.is_none() {
                     return Err(ConfigError::Validation(format!(
-                        "[E346] output '{out}': envelope `footer_record_count_field` requires \
+                        "[E346] output {out}: envelope `footer_record_count_field` requires \
                          `footer_from_doc` — the computed record count is injected into the \
                          footer section, so a footer section must be named for it to attach to. \
-                         Add `footer_from_doc`, or drop `footer_record_count_field`"
+                         Add `footer_from_doc`, or drop `footer_record_count_field`",
+                        out = out.quoted_name()
                     )));
                 }
                 if !supports_computed_footer {
                     return Err(ConfigError::Validation(format!(
-                        "[E346] output '{out}': envelope `footer_record_count_field` is not \
+                        "[E346] output {out}: envelope `footer_record_count_field` is not \
                          supported for {} output — a fixed-width line has no field to inject a \
                          computed count into without a width declaration. Drop \
                          `footer_record_count_field`, or use a CSV / JSON / XML output",
-                        output.format.format_name()
+                        output.format.format_name(),
+                        out = out.quoted_name()
                     )));
                 }
             }
@@ -5340,9 +5366,9 @@ pub(crate) fn validate_node_configs(nodes: &[Spanned<PipelineNode>]) -> Vec<Node
             violations.push(NodeConfigViolation {
                 node_index,
                 message: format!(
-                    "envelope node '{}': explicit `trailer` input wiring is not yet supported — \
+                    "envelope node {}: explicit `trailer` input wiring is not yet supported — \
                      omit it to frame with the body's own envelope",
-                    header.name
+                    header.name.quoted_name()
                 ),
             });
         }
@@ -5368,14 +5394,14 @@ pub(crate) fn validate_node_configs(nodes: &[Spanned<PipelineNode>]) -> Vec<Node
                 violations.push(NodeConfigViolation {
                     node_index,
                     message: format!(
-                        "transform '{}': declares: '{}' is a reserved ${} member name and cannot be used as a variable",
-                        header.name, entry.name, scope_label,
+                        "transform {}: declares: '{}' is a reserved ${} member name and cannot be used as a variable",
+                        header.name.quoted_name(), entry.name, scope_label,
                     ),
                 });
             }
             if let Some(default) = &entry.default
                 && let Err(err) = check_scoped_var_default(
-                    &format!("transform '{}' declares", header.name),
+                    &format!("transform {} declares", header.name.quoted_name()),
                     &entry.name,
                     entry.var_type,
                     default,
@@ -5412,7 +5438,7 @@ pub(crate) fn validate_node_configs(nodes: &[Spanned<PipelineNode>]) -> Vec<Node
             for error in transform::log_directive_set_validation_errors(directives) {
                 violations.push(NodeConfigViolation {
                     node_index,
-                    message: format!("transform '{}': {error}", header.name),
+                    message: format!("transform {}: {error}", header.name.quoted_name()),
                 });
             }
         }
@@ -5431,8 +5457,8 @@ pub(crate) fn validate_node_configs(nodes: &[Spanned<PipelineNode>]) -> Vec<Node
             violations.push(NodeConfigViolation {
                 node_index,
                 message: format!(
-                    "transform '{}': batch_size must be >= 1 (omit it to inherit pipeline.batch_size)",
-                    header.name,
+                    "transform {}: batch_size must be >= 1 (omit it to inherit pipeline.batch_size)",
+                    header.name.quoted_name(),
                 ),
             });
         }
@@ -5507,16 +5533,18 @@ fn validate_hl7_split_fields(source_name: &str, opts: &Hl7InputOptions) -> Resul
     for split in splits {
         let position = split.field_position().ok_or_else(|| {
             ConfigError::Validation(format!(
-                "source '{source_name}': split field {:?} is not a positional `fNN` column name \
+                "source {source_name}: split field {:?} is not a positional `fNN` column name \
                  (e.g. `f08`)",
-                split.field
+                split.field,
+                source_name = source_name.quoted_name()
             ))
         })?;
         if position > max_fields {
             return Err(ConfigError::Validation(format!(
-                "source '{source_name}': split field {:?} names position {position}, past the \
+                "source {source_name}: split field {:?} names position {position}, past the \
                  configured max_fields of {max_fields}; raise `max_fields` or remove the split",
-                split.field
+                split.field,
+                source_name = source_name.quoted_name()
             )));
         }
         for (axis, count) in [
@@ -5526,17 +5554,19 @@ fn validate_hl7_split_fields(source_name: &str, opts: &Hl7InputOptions) -> Resul
         ] {
             if count == 0 {
                 return Err(ConfigError::Validation(format!(
-                    "source '{source_name}': split field {:?} declares `{axis}: 0`; every axis \
+                    "source {source_name}: split field {:?} declares `{axis}: 0`; every axis \
                      width must be at least 1",
-                    split.field
+                    split.field,
+                    source_name = source_name.quoted_name()
                 )));
             }
         }
         if seen.contains(&position) {
             return Err(ConfigError::Validation(format!(
-                "source '{source_name}': field {:?} is split more than once; declare each split \
+                "source {source_name}: field {:?} is split more than once; declare each split \
                  field at most once",
-                split.field
+                split.field,
+                source_name = source_name.quoted_name()
             )));
         }
         seen.push(position);

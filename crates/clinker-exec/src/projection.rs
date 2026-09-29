@@ -1,3 +1,4 @@
+use clinker_core_types::QuoteName;
 use clinker_record::owned_storage::{OwnedKey, OwnedValues};
 #[cfg(test)]
 use clinker_record::owned_storage::{OwnedMap, SharedStorage};
@@ -589,9 +590,10 @@ impl MappingProbe {
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push(format!(
-                "W365 output '{output_name}': `mapping:` reads column(s) {listed}, which no \
+                "W365 output {output_name}: `mapping:` reads column(s) {listed}, which no \
                  record carried — those output columns are empty in every row. Check the \
-                 spelling, or remove the item if the column is gone from upstream"
+                 spelling, or remove the item if the column is gone from upstream",
+                output_name = output_name.quoted_name()
             ));
         }
         let shadowed: Vec<&str> = self
@@ -607,10 +609,11 @@ impl MappingProbe {
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push(format!(
-                "W366 output '{output_name}': upstream column(s) {listed} were dropped because \
+                "W366 output {output_name}: upstream column(s) {listed} were dropped because \
                  `mapping:` writes an output column of the same name; the mapped value is what \
                  the file carries. Rename the mapped column, or add the upstream name to this \
-                 output's `exclude:` to state the intent"
+                 output's `exclude:` to state the intent",
+                output_name = output_name.quoted_name()
             ));
         }
         out
