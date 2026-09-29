@@ -9,10 +9,16 @@
 //! `&mut` path to the executor context.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
 
-use super::MemoryArbitrator;
+use clinker_plan::config::CompressMode;
+
+use super::{ConsumerHandle, ConsumerId, MemoryArbitrator};
+use crate::executor::dispatch::{NodeBufferKey, NodeBufferReaderLedger};
+use crate::executor::node_buffer::NodeBuffer;
 
 /// Where the calling thread stands relative to one run's walk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,12 +32,185 @@ pub(crate) enum ThreadRole {
     OffWalk,
 }
 
-/// The walk-owned state a reclaim on the walk may spill.
-pub(crate) struct WalkReclaimSet {}
+/// A node-buffer slot's consumer registration: the id to unregister after its
+/// last reader, and the handle partial discharges and spills charge.
+pub(crate) type SlotRegistration = (ConsumerId, Arc<ConsumerHandle>);
+
+/// What the node-buffer spill sweep decides for a slot from the DAG it was
+/// published in, captured when the slot's consumer registers, so a reclaim
+/// can spill the slot without that DAG.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SlotSpill {
+    /// Whether the slot's compiled classification lets it spill.
+    pub(crate) spill_allowed: bool,
+    /// The keyed node's name, which a spill reports its file bytes under.
+    pub(crate) node_name: Box<str>,
+}
+
+/// One dispatch scope's node-buffer slots: the buffers, their consumer
+/// registrations, what a spill of each registered slot needs, and the
+/// remaining-reader ledger.
+///
+/// A composition body walks its own scope, swapped in for the parent's, so
+/// equal body-local and parent `NodeIndex` values never collide. A slot's
+/// registration and its spill facts change together, through
+/// [`Self::register`], [`Self::remove_registration`] and
+/// [`Self::take_registrations`] only.
+#[derive(Default)]
+pub(crate) struct NodeBufferSlots {
+    buffers: HashMap<NodeBufferKey, NodeBuffer>,
+    registrations: HashMap<NodeBufferKey, SlotRegistration>,
+    spill: HashMap<NodeBufferKey, SlotSpill>,
+    readers: NodeBufferReaderLedger,
+}
+
+impl NodeBufferSlots {
+    /// Every published buffer in this scope, by slot.
+    pub(crate) fn buffers(&self) -> &HashMap<NodeBufferKey, NodeBuffer> {
+        &self.buffers
+    }
+
+    pub(crate) fn buffer(&self, key: &NodeBufferKey) -> Option<&NodeBuffer> {
+        self.buffers.get(key)
+    }
+
+    pub(crate) fn contains_buffer(&self, key: &NodeBufferKey) -> bool {
+        self.buffers.contains_key(key)
+    }
+
+    /// Publish `buffer` at `key`, returning the buffer it replaced.
+    pub(crate) fn insert_buffer(
+        &mut self,
+        key: NodeBufferKey,
+        buffer: NodeBuffer,
+    ) -> Option<NodeBuffer> {
+        self.buffers.insert(key, buffer)
+    }
+
+    pub(crate) fn remove_buffer(&mut self, key: &NodeBufferKey) -> Option<NodeBuffer> {
+        self.buffers.remove(key)
+    }
+
+    /// Every registered slot's consumer registration.
+    pub(crate) fn registrations(&self) -> &HashMap<NodeBufferKey, SlotRegistration> {
+        &self.registrations
+    }
+
+    pub(crate) fn is_registered(&self, key: &NodeBufferKey) -> bool {
+        self.registrations.contains_key(key)
+    }
+
+    /// Record `key`'s consumer registration and its spill facts, returning a
+    /// registration it replaced.
+    pub(crate) fn register(
+        &mut self,
+        key: NodeBufferKey,
+        registration: SlotRegistration,
+        spill: SlotSpill,
+    ) -> Option<SlotRegistration> {
+        self.spill.insert(key.clone(), spill);
+        self.registrations.insert(key, registration)
+    }
+
+    /// Remove `key`'s registration and its spill facts. The caller
+    /// unregisters the returned consumer or hands it to a new owner.
+    pub(crate) fn remove_registration(&mut self, key: &NodeBufferKey) -> Option<SlotRegistration> {
+        self.spill.remove(key);
+        self.registrations.remove(key)
+    }
+
+    /// Remove every registration and its spill facts, leaving the buffers.
+    pub(crate) fn take_registrations(&mut self) -> HashMap<NodeBufferKey, SlotRegistration> {
+        self.spill.clear();
+        std::mem::take(&mut self.registrations)
+    }
+
+    /// The spill facts captured when `key`'s consumer registered.
+    pub(crate) fn slot_spill(&self, key: &NodeBufferKey) -> Option<&SlotSpill> {
+        self.spill.get(key)
+    }
+
+    pub(crate) fn readers(&self) -> &NodeBufferReaderLedger {
+        &self.readers
+    }
+
+    pub(crate) fn readers_mut(&mut self) -> &mut NodeBufferReaderLedger {
+        &mut self.readers
+    }
+
+    /// Discard a scope that will not be read again: drop every buffer while
+    /// its wrapper is still registered, then zero and unregister every
+    /// remaining registration.
+    pub(crate) fn release_residue(mut self, arbitrator: &MemoryArbitrator) {
+        drop(std::mem::take(&mut self.buffers));
+        for (_, (id, handle)) in self.take_registrations() {
+            handle.set_bytes(0);
+            arbitrator.unregister_consumer(id);
+        }
+    }
+}
+
+/// The run's spill settings a node-buffer spill needs, copied from the run
+/// when the walk starts.
+pub(crate) struct WalkSpillSettings {
+    pub(crate) spill_root: Arc<Path>,
+    pub(crate) spill_compress: CompressMode,
+    pub(crate) batch_size: usize,
+}
+
+/// The walk-owned state a reclaim on the walk may spill: the current dispatch
+/// scope's node-buffer slots and the settings their spill needs.
+///
+/// Walk-only (`!Send`, reached through an `Rc<RefCell<_>>`). A borrow of it is
+/// short and never held across a governed allocation, a `reserve`, a channel
+/// wait or a call into another dispatch arm.
+pub(crate) struct WalkReclaimSet {
+    slots: NodeBufferSlots,
+    spill_settings: WalkSpillSettings,
+}
 
 impl WalkReclaimSet {
-    pub(crate) fn new() -> Self {
-        Self {}
+    /// An empty set for a walk spilling under `spill_settings`.
+    pub(crate) fn new(spill_settings: WalkSpillSettings) -> Self {
+        Self {
+            slots: NodeBufferSlots::default(),
+            spill_settings,
+        }
+    }
+
+    /// The current dispatch scope's node-buffer slots.
+    pub(crate) fn slots(&self) -> &NodeBufferSlots {
+        &self.slots
+    }
+
+    pub(crate) fn slots_mut(&mut self) -> &mut NodeBufferSlots {
+        &mut self.slots
+    }
+
+    /// Make `slots` the current scope, returning the scope it replaces.
+    pub(crate) fn replace_slots(&mut self, slots: NodeBufferSlots) -> NodeBufferSlots {
+        std::mem::replace(&mut self.slots, slots)
+    }
+
+    /// Take the current scope, leaving an empty one.
+    pub(crate) fn take_slots(&mut self) -> NodeBufferSlots {
+        std::mem::take(&mut self.slots)
+    }
+
+    /// The current scope's buffers, mutably, beside its registrations and
+    /// the spill settings: what the node-buffer spill sweep works on.
+    pub(crate) fn spill_sweep_parts(
+        &mut self,
+    ) -> (
+        &mut HashMap<NodeBufferKey, NodeBuffer>,
+        &HashMap<NodeBufferKey, SlotRegistration>,
+        &WalkSpillSettings,
+    ) {
+        (
+            &mut self.slots.buffers,
+            &self.slots.registrations,
+            &self.spill_settings,
+        )
     }
 }
 
@@ -150,7 +329,11 @@ mod tests {
     }
 
     fn reclaim_set() -> Rc<RefCell<WalkReclaimSet>> {
-        Rc::new(RefCell::new(WalkReclaimSet::new()))
+        Rc::new(RefCell::new(WalkReclaimSet::new(WalkSpillSettings {
+            spill_root: Arc::from(std::env::temp_dir().as_path()),
+            spill_compress: CompressMode::Auto,
+            batch_size: 1024,
+        })))
     }
 
     fn owns(arbitrator: &MemoryArbitrator, set: &Rc<RefCell<WalkReclaimSet>>) -> bool {

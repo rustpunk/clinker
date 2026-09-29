@@ -118,7 +118,7 @@ where
         .map(String::as_str);
     let own_key = NodeBufferKey::from(node_idx);
     let (input_key, producer_name, producer_port): (NodeBufferKey, String, Option<String>) =
-        if ctx.node_buffers.contains_key(&own_key) {
+        if ctx.walk_reclaim.borrow().slots().contains_buffer(&own_key) {
             let (producer, port) = authored_input
                 .and_then(|input| input.split_once('.'))
                 .map_or(

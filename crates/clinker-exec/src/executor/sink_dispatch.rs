@@ -489,8 +489,12 @@ fn dispatch_sink_work(
         .ok_or_else(|| missing_sink_input_error(current_dag, node_idx, name))?;
     let producer = edge.source();
     let producer_port = edge.weight().producer_port.as_deref();
-    let input_key =
-        single_input_node_buffer_key(&ctx.node_buffers, node_idx, producer, producer_port);
+    let input_key = single_input_node_buffer_key(
+        ctx.walk_reclaim.borrow().slots().buffers(),
+        node_idx,
+        producer,
+        producer_port,
+    );
     let input = require_node_buffer_input(
         ctx,
         input_key,
@@ -1347,8 +1351,12 @@ fn drain_sink_input_event_iter(
         .ok_or_else(|| missing_sink_input_error(current_dag, node_idx, name))?;
     let producer = edge.source();
     let producer_port = edge.weight().producer_port.as_deref();
-    let input_key =
-        single_input_node_buffer_key(&ctx.node_buffers, node_idx, producer, producer_port);
+    let input_key = single_input_node_buffer_key(
+        ctx.walk_reclaim.borrow().slots().buffers(),
+        node_idx,
+        producer,
+        producer_port,
+    );
     let input = require_node_buffer_input(
         ctx,
         input_key,

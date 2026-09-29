@@ -1300,7 +1300,7 @@ use clinker_record::Schema;
 /// `(node, Some(port))` slot, and a predecessor-slot consumer (Merge / Combine)
 /// drains the slot named by its incoming edge's
 /// [`producer_port`](clinker_plan::plan::execution::PlanEdge::producer_port).
-/// Keeping `node_buffers` and `node_buffer_consumer_ids` keyed by the same type
+/// Keying a scope's buffers and their consumer registrations by the same type
 /// keeps the arbitrator's consumer registry aligned with the live slot map.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct NodeBufferKey {
@@ -1475,7 +1475,8 @@ impl NodeBufferReaderLedger {
 ///   reused at every per-record dispatch site.
 ///
 /// Owned (mutated across the walk):
-/// * `node_buffers` — `(Record, row_num)` queues threaded between arms.
+/// * `walk_reclaim` — the walk reclaim set, owning the node-buffer slots:
+///   `(Record, row_num)` queues threaded between arms.
 /// * `source_records` — per-source live crossbeam `Receiver`s keyed by
 ///   Source node name. The Source dispatch arm drains its receiver
 ///   via `recv`; the paired sender lives on a `std::thread` ingest
@@ -1546,28 +1547,17 @@ pub(crate) struct ExecutorContext<'a> {
     /// The walk's reclaimable state, shared with the walk frame the run
     /// installs on this thread, so a reclaim started from any governed
     /// allocation on the walk reaches it without `&mut` access to this
-    /// context. Borrowed in short scopes only.
+    /// context. It owns the current scope's node-buffer slots: the
+    /// `(Record, row_num)` queues threaded between arms, each slot's
+    /// `NodeBufferConsumer` registration (the id unregistered after the
+    /// slot's final reader, and the handle partial discharges drive), and the
+    /// producer-declared remaining readers. A composition body swaps in its
+    /// own slots so equal local `NodeIndex` values never collide across
+    /// scopes. Borrowed in short scopes only, never across a governed
+    /// allocation, a `reserve`, a channel wait or a call into another
+    /// dispatch arm.
     pub(crate) walk_reclaim:
         std::rc::Rc<std::cell::RefCell<crate::pipeline::memory::walk::WalkReclaimSet>>,
-    pub(crate) node_buffers: HashMap<NodeBufferKey, NodeBuffer>,
-    /// Per-slot consumer registration for `node_buffers`. `admit_node_buffer`
-    /// registers a `NodeBufferConsumer` with the pipeline-scoped arbitrator
-    /// and stores both the returned `ConsumerId` (used to `unregister_consumer`
-    /// after the slot's final reader) and a clone of the `Arc<ConsumerHandle>`
-    /// (used by partial-discharge sites to drive `handle.sub_bytes`). Keyed
-    /// by exact `NodeBufferKey`; body-scope swaps replace this map alongside
-    /// `node_buffers` so a body walk does not pollute the parent scope's registry.
-    pub(crate) node_buffer_consumer_ids: HashMap<
-        NodeBufferKey,
-        (
-            crate::pipeline::memory::ConsumerId,
-            std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
-        ),
-    >,
-    /// Producer-declared remaining readers for every materialized slot. Body
-    /// scopes swap this ledger alongside `node_buffers` so equal local
-    /// `NodeIndex` values cannot collide across scopes.
-    pub(crate) node_buffer_readers: NodeBufferReaderLedger,
     /// Immutable reader cardinality for each producer-owned slot in the
     /// current DAG scope. Built once in one edge pass, then consulted in O(1)
     /// at publication so wide multi-port fan-out does not rescan the graph per
@@ -2694,8 +2684,8 @@ pub(crate) fn node_buffer_spill_allowed(
     true
 }
 
-/// Admit `rows` into a `ctx.node_buffers` slot, choosing between the
-/// in-memory and on-disk variants based on the live RSS reading.
+/// Admit `rows` into a node-buffer slot of the walk reclaim set, choosing
+/// between the in-memory and on-disk variants based on the live RSS reading.
 ///
 /// 1. Empty input returns `NodeBuffer::Memory(Vec::new())`.
 /// 2. The slot's byte estimate seeds a fresh `NodeBufferConsumer`
@@ -2726,13 +2716,16 @@ pub(crate) fn drain_node_buffer_slot(
     key: impl Into<NodeBufferKey>,
 ) -> Option<NodeBuffer> {
     let key = key.into();
-    ctx.node_buffer_readers.discard(&key);
-    if let Some((id, _)) = ctx.node_buffer_consumer_ids.remove(&key) {
+    let (registration, buffer) = {
+        let mut set = ctx.walk_reclaim.borrow_mut();
+        let slots = set.slots_mut();
+        slots.readers_mut().discard(&key);
+        (slots.remove_registration(&key), slots.remove_buffer(&key))
+    };
+    if let Some((id, _)) = registration {
         ctx.memory_budget.unregister_consumer(id);
     }
-    ctx.node_buffers
-        .remove(&key)
-        .map(NodeBuffer::into_authoritative)
+    buffer.map(NodeBuffer::into_authoritative)
 }
 
 /// Build the cold-path invariant error for a required materialized input that
@@ -2820,9 +2813,9 @@ pub(crate) fn validate_completed_node_buffer_scope(
     ctx: &ExecutorContext<'_>,
     scope_name: &str,
 ) -> Result<(), PipelineError> {
-    if ctx.node_buffers.is_empty()
-        && ctx.node_buffer_readers.is_empty()
-        && ctx.node_buffer_consumer_ids.is_empty()
+    let set = ctx.walk_reclaim.borrow();
+    let slots = set.slots();
+    if slots.buffers().is_empty() && slots.readers().is_empty() && slots.registrations().is_empty()
     {
         return Ok(());
     }
@@ -2832,9 +2825,9 @@ pub(crate) fn validate_completed_node_buffer_scope(
         node: scope_name.to_string(),
         detail: format!(
             "completed node-buffer scope retained {} slot(s), {} reader-count entry/entries, and {} memory registration(s)",
-            ctx.node_buffers.len(),
-            ctx.node_buffer_readers.remaining.len(),
-            ctx.node_buffer_consumer_ids.len(),
+            slots.buffers().len(),
+            slots.readers().remaining.len(),
+            slots.registrations().len(),
         ),
     })
 }
@@ -2893,13 +2886,17 @@ fn require_node_buffer_input_inner(
     producer_port: Option<&str>,
     _transfer_last_registration: bool,
 ) -> Result<NodeBufferInput, PipelineError> {
-    let Some(remaining) = ctx.node_buffer_readers.remaining_for_slot(
-        &key,
-        ctx.node_buffers.contains_key(&key),
-        ctx.node_buffer_consumer_ids.contains_key(&key),
-        consumer_name,
-    )?
-    else {
+    let remaining = {
+        let set = ctx.walk_reclaim.borrow();
+        let slots = set.slots();
+        slots.readers().remaining_for_slot(
+            &key,
+            slots.contains_buffer(&key),
+            slots.is_registered(&key),
+            consumer_name,
+        )?
+    };
+    let Some(remaining) = remaining else {
         return Err(missing_node_buffer_input_error(
             consumer_name,
             producer_name,
@@ -2907,15 +2904,31 @@ fn require_node_buffer_input_inner(
         ));
     };
     if remaining > 1 {
-        let buffer = ctx.node_buffers.get_mut(&key).ok_or_else(|| {
+        // Making a slot re-readable can fold spilled runs, which allocates
+        // under the run's budget, so the slot leaves the walk reclaim set for
+        // the conversion and goes back whatever its outcome.
+        let taken = ctx
+            .walk_reclaim
+            .borrow_mut()
+            .slots_mut()
+            .remove_buffer(&key);
+        let mut shared = taken.ok_or_else(|| {
             node_buffer_reader_mismatch_error(
                 consumer_name,
                 &key,
                 "slot disappeared after reader-ledger validation",
             )
         })?;
-        let buffer = buffer.reread()?;
-        ctx.node_buffer_readers
+        let buffer = shared.reread();
+        ctx.walk_reclaim
+            .borrow_mut()
+            .slots_mut()
+            .insert_buffer(key.clone(), shared);
+        let buffer = buffer?;
+        ctx.walk_reclaim
+            .borrow_mut()
+            .slots_mut()
+            .readers_mut()
             .complete_clone(&key, consumer_name)?;
         return Ok(NodeBufferInput {
             allocation_resources: ctx.allocation_resources.clone(),
@@ -2924,12 +2937,21 @@ fn require_node_buffer_input_inner(
         });
     }
 
-    ctx.node_buffer_readers.complete_last(&key, consumer_name)?;
+    ctx.walk_reclaim
+        .borrow_mut()
+        .slots_mut()
+        .readers_mut()
+        .complete_last(&key, consumer_name)?;
     // The authoritative last reader takes the slot's existing registration as
     // a RAII guard for the complete synchronous read. This preserves the
     // original resident charge while a consuming drain moves memory out, and
     // gives spill-backed materialization a handle to charge its overlap.
-    let buffer = ctx.node_buffers.remove(&key).ok_or_else(|| {
+    let taken = ctx
+        .walk_reclaim
+        .borrow_mut()
+        .slots_mut()
+        .remove_buffer(&key);
+    let buffer = taken.ok_or_else(|| {
         node_buffer_reader_mismatch_error(
             consumer_name,
             &key,
@@ -2937,16 +2959,18 @@ fn require_node_buffer_input_inner(
         )
     })?;
     let buffer = buffer.into_authoritative();
-    let reservation = ctx
-        .node_buffer_consumer_ids
-        .remove(&key)
-        .map(|(id, handle)| {
-            TransientNodeBufferReservation::from_registration(
-                Arc::clone(&ctx.memory_budget),
-                id,
-                handle,
-            )
-        });
+    let registration = ctx
+        .walk_reclaim
+        .borrow_mut()
+        .slots_mut()
+        .remove_registration(&key);
+    let reservation = registration.map(|(id, handle)| {
+        TransientNodeBufferReservation::from_registration(
+            Arc::clone(&ctx.memory_budget),
+            id,
+            handle,
+        )
+    });
     Ok(NodeBufferInput {
         allocation_resources: ctx.allocation_resources.clone(),
         buffer,
@@ -2970,8 +2994,12 @@ pub(crate) fn require_single_input_node_buffer_slot(
     producer_name: &str,
     producer_port: Option<&str>,
 ) -> Result<NodeBufferInput, PipelineError> {
-    let key =
-        single_input_node_buffer_key(&ctx.node_buffers, consumer_idx, producer_idx, producer_port);
+    let key = single_input_node_buffer_key(
+        ctx.walk_reclaim.borrow().slots().buffers(),
+        consumer_idx,
+        producer_idx,
+        producer_port,
+    );
     require_node_buffer_input(ctx, key, consumer_name, producer_name, producer_port)
 }
 
@@ -3164,7 +3192,11 @@ pub(crate) fn declare_node_buffer_readers(
 ) -> Result<(), PipelineError> {
     let key = key.into();
     let readers = planned_materialized_reader_count(ctx, current_dag, &key)?;
-    ctx.node_buffer_readers.publish(key, readers, node_name)
+    ctx.walk_reclaim
+        .borrow_mut()
+        .slots_mut()
+        .readers_mut()
+        .publish(key, readers, node_name)
 }
 
 /// Admit a slot whose reader set is established by a scope-local publication
@@ -3253,9 +3285,11 @@ fn admit_owned_node_buffer_with_readers(
     if readers == 0 {
         return Ok(());
     }
-    if ctx.node_buffers.contains_key(&slot_key)
-        || ctx.node_buffer_consumer_ids.contains_key(&slot_key)
-    {
+    let occupied = {
+        let set = ctx.walk_reclaim.borrow();
+        set.slots().contains_buffer(&slot_key) || set.slots().is_registered(&slot_key)
+    };
+    if occupied {
         return Err(PipelineError::Internal {
             op: "executor",
             node: node_name.to_string(),
@@ -3264,12 +3298,25 @@ fn admit_owned_node_buffer_with_readers(
             ),
         });
     }
-    ctx.node_buffer_readers
+    ctx.walk_reclaim
+        .borrow_mut()
+        .slots_mut()
+        .readers_mut()
         .publish(slot_key.clone(), readers, node_name)?;
     match admit_node_buffer_inner(ctx, node_name, slot_key.clone(), owned, spill_allowed, None) {
         Ok(buffer) => {
-            if ctx.node_buffers.insert(slot_key.clone(), buffer).is_some() {
-                ctx.node_buffer_readers.discard(&slot_key);
+            let replaced = ctx
+                .walk_reclaim
+                .borrow_mut()
+                .slots_mut()
+                .insert_buffer(slot_key.clone(), buffer)
+                .is_some();
+            if replaced {
+                ctx.walk_reclaim
+                    .borrow_mut()
+                    .slots_mut()
+                    .readers_mut()
+                    .discard(&slot_key);
                 return Err(PipelineError::Internal {
                     op: "executor",
                     node: node_name.to_string(),
@@ -3281,8 +3328,13 @@ fn admit_owned_node_buffer_with_readers(
             Ok(())
         }
         Err(error) => {
-            ctx.node_buffer_readers.discard(&slot_key);
-            if let Some((id, handle)) = ctx.node_buffer_consumer_ids.remove(&slot_key) {
+            let registration = {
+                let mut set = ctx.walk_reclaim.borrow_mut();
+                let slots = set.slots_mut();
+                slots.readers_mut().discard(&slot_key);
+                slots.remove_registration(&slot_key)
+            };
+            if let Some((id, handle)) = registration {
                 handle.set_bytes(0);
                 ctx.memory_budget.unregister_consumer(id);
             }
@@ -3316,9 +3368,11 @@ pub(crate) fn admit_node_buffer_transferred(
     if readers == 0 {
         return Ok(());
     }
-    if ctx.node_buffers.contains_key(&slot_key)
-        || ctx.node_buffer_consumer_ids.contains_key(&slot_key)
-    {
+    let occupied = {
+        let set = ctx.walk_reclaim.borrow();
+        set.slots().contains_buffer(&slot_key) || set.slots().is_registered(&slot_key)
+    };
+    if occupied {
         return Err(PipelineError::Internal {
             op: "executor",
             node: node_name.to_string(),
@@ -3327,7 +3381,10 @@ pub(crate) fn admit_node_buffer_transferred(
             ),
         });
     }
-    ctx.node_buffer_readers
+    ctx.walk_reclaim
+        .borrow_mut()
+        .slots_mut()
+        .readers_mut()
         .publish(slot_key.clone(), readers, node_name)?;
     match admit_node_buffer_inner(
         ctx,
@@ -3342,8 +3399,18 @@ pub(crate) fn admit_node_buffer_transferred(
         Some(reservation),
     ) {
         Ok(buffer) => {
-            if ctx.node_buffers.insert(slot_key.clone(), buffer).is_some() {
-                ctx.node_buffer_readers.discard(&slot_key);
+            let replaced = ctx
+                .walk_reclaim
+                .borrow_mut()
+                .slots_mut()
+                .insert_buffer(slot_key.clone(), buffer)
+                .is_some();
+            if replaced {
+                ctx.walk_reclaim
+                    .borrow_mut()
+                    .slots_mut()
+                    .readers_mut()
+                    .discard(&slot_key);
                 return Err(PipelineError::Internal {
                     op: "executor",
                     node: node_name.to_string(),
@@ -3355,8 +3422,13 @@ pub(crate) fn admit_node_buffer_transferred(
             Ok(())
         }
         Err(error) => {
-            ctx.node_buffer_readers.discard(&slot_key);
-            if let Some((id, handle)) = ctx.node_buffer_consumer_ids.remove(&slot_key) {
+            let registration = {
+                let mut set = ctx.walk_reclaim.borrow_mut();
+                let slots = set.slots_mut();
+                slots.readers_mut().discard(&slot_key);
+                slots.remove_registration(&slot_key)
+            };
+            if let Some((id, handle)) = registration {
                 handle.set_bytes(0);
                 ctx.memory_budget.unregister_consumer(id);
             }
@@ -3377,6 +3449,32 @@ pub(crate) struct PlannedNodeBufferReaders {
 impl PlannedNodeBufferReaders {
     fn count(&self, key: &NodeBufferKey) -> usize {
         self.readers.get(key).map_or(0, Vec::len)
+    }
+
+    /// What a spill of `key`'s slot needs from this scope's DAG: whether it
+    /// may spill, and the keyed node's name its file bytes are reported
+    /// under. `producer` names the node for the error when `key` is not in
+    /// this scope.
+    pub(crate) fn slot_spill(
+        &self,
+        key: &NodeBufferKey,
+        spill_allowed: bool,
+        producer: &str,
+    ) -> Result<crate::pipeline::memory::walk::SlotSpill, PipelineError> {
+        let node_name = self
+            .node_names
+            .get(&key.node)
+            .ok_or_else(|| PipelineError::Internal {
+                op: "executor",
+                node: producer.to_string(),
+                detail: format!(
+                    "node-buffer slot {key:?} does not belong to the current DAG scope"
+                ),
+            })?;
+        Ok(crate::pipeline::memory::walk::SlotSpill {
+            spill_allowed,
+            node_name: node_name.clone(),
+        })
     }
 
     /// The label a slot's charge is reported under: the rows `producer`
@@ -3486,6 +3584,9 @@ fn admit_node_buffer_inner(
     spill_allowed: bool,
     transferred_reservation: Option<TransientNodeBufferReservation>,
 ) -> Result<NodeBuffer, PipelineError> {
+    let slot_spill =
+        ctx.planned_node_buffer_readers
+            .slot_spill(&slot_key, spill_allowed, node_name)?;
     let bytes = transferred_reservation
         .as_ref()
         .map(TransientNodeBufferReservation::bytes)
@@ -3535,7 +3636,12 @@ fn admit_node_buffer_inner(
         }
         (consumer_id, handle)
     } else {
-        if let Some((prev_id, _)) = ctx.node_buffer_consumer_ids.remove(&slot_key) {
+        let previous = ctx
+            .walk_reclaim
+            .borrow_mut()
+            .slots_mut()
+            .remove_registration(&slot_key);
+        if let Some((prev_id, _)) = previous {
             ctx.memory_budget.unregister_consumer(prev_id);
         }
         // Registered empty: the slot's bytes are charged below, taken over
@@ -3556,8 +3662,11 @@ fn admit_node_buffer_inner(
         owned.charge_to(&handle, bytes);
         (consumer_id, handle)
     };
-    ctx.node_buffer_consumer_ids
-        .insert(slot_key, (consumer_id, handle.clone()));
+    ctx.walk_reclaim.borrow_mut().slots_mut().register(
+        slot_key,
+        (consumer_id, handle.clone()),
+        slot_spill,
+    );
     // Establish the NodeBuffer owner first, then release any prior producer
     // portion still held before any local pressure poll.
     owned.release_prior();
@@ -4423,8 +4532,9 @@ pub(crate) fn merge_fused_interleave(
 /// Source's plan-time schema, seed `$record.<key>` defaults, seed
 /// `$source.<key>` defaults per `(source, file)`, advance the per-
 /// source running counter), runs the Transform's `evaluate_single_transform`
-/// per record, and emits records into `ctx.node_buffers[transform_idx]`
-/// at the close. See https://github.com/rustpunk/clinker/issues/74.
+/// per record, and emits records into the walk reclaim set's
+/// `transform_idx` slot at the close.
+/// See https://github.com/rustpunk/clinker/issues/74.
 ///
 /// Eligibility (windowed Transforms, multi-input Transforms, body-
 /// context Transforms, init-phase Transforms, fanned-out Sources) is
@@ -4913,14 +5023,32 @@ fn service_node_buffer_spill_requests(
 ) -> Result<(), PipelineError> {
     let is_spill_allowed = |idx: NodeIndex| node_buffer_spill_allowed(current_dag, idx);
     let node_name = |idx: NodeIndex| current_dag.graph[idx].name().to_string();
+    // The sweep only writes spill files and charges the disk quota; it makes
+    // no governed allocation, so it holds the set for its whole pass.
+    let mut set = ctx.walk_reclaim.borrow_mut();
+    // What each slot captured at registration is what this DAG answers, so a
+    // reclaim that has no DAG decides every slot the same way.
+    debug_assert!(
+        set.slots().registrations().keys().all(|key| {
+            set.slots().slot_spill(key).is_some_and(|captured| {
+                captured.spill_allowed == is_spill_allowed(key.node)
+                    && current_dag
+                        .graph
+                        .node_weight(key.node)
+                        .is_some_and(|node| *captured.node_name == *node.name())
+            })
+        }),
+        "a node-buffer slot's captured spill facts disagree with its DAG"
+    );
+    let (node_buffers, consumer_ids, settings) = set.spill_sweep_parts();
     service_pending_node_buffer_spills(
-        &mut ctx.node_buffers,
+        node_buffers,
         &NodeBufferSpillSweep {
-            consumer_ids: &ctx.node_buffer_consumer_ids,
+            consumer_ids,
             arbitrator: &ctx.memory_budget,
-            spill_root: ctx.spill_root_path.as_ref(),
-            spill_compress: ctx.spill_compress,
-            batch_size: ctx.batch_size,
+            spill_root: settings.spill_root.as_ref(),
+            spill_compress: settings.spill_compress,
+            batch_size: settings.batch_size,
             is_spill_allowed: &is_spill_allowed,
             node_name: &node_name,
         },
@@ -5023,9 +5151,10 @@ pub(crate) fn service_pending_node_buffer_spills(
 /// Execute one DAG node by routing it to its arm.
 ///
 /// Reads the node by `node_idx` from `current_dag.graph` and dispatches on
-/// `PlanNode` variant. Each arm reads from and writes to `ctx.node_buffers`
-/// and updates the cumulative counters / timers. Errors short-circuit only for
-/// invariant violations and `ErrorStrategy::FailFast` runtime failures;
+/// `PlanNode` variant. Each arm reads from and writes to the node-buffer
+/// slots in the walk reclaim set and updates the cumulative counters /
+/// timers. Errors short-circuit only for invariant violations and
+/// `ErrorStrategy::FailFast` runtime failures;
 /// per-record DLQ-able errors go through [`push_dlq`] under `Continue`.
 /// Output sink errors are collected into `ctx.output_errors` instead of
 /// short-circuiting so sibling outputs still get their chance to fail (and be

@@ -34,7 +34,7 @@
 //! stack disambiguates body-local edge ids from parent edge ids that
 //! happen to number the same.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use clinker_record::Record;
 use petgraph::Direction;
@@ -50,7 +50,6 @@ use crate::executor::dispatch::{
     planned_materialized_reader_counts, require_node_buffer_input,
     validate_completed_node_buffer_scope,
 };
-use crate::executor::node_buffer::NodeBuffer;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::CompositionBodyId;
 use clinker_plan::plan::deferred_region::{DeferredRegion, ParentContinuation};
@@ -229,7 +228,10 @@ fn dispatch_one_region(
     // producer's slot is preserved — `recompute_aggregates` populates it with
     // the post-recompute narrow rows.
     let stale_ported: Vec<NodeBufferKey> = ctx
-        .node_buffers
+        .walk_reclaim
+        .borrow()
+        .slots()
+        .buffers()
         .keys()
         .filter(|k| {
             k.producer_port.is_some()
@@ -416,18 +418,13 @@ fn recurse_into_body(
     };
     let body_dag = ExecutionPlanDag::from_body(bound_body);
 
-    // Swap to body-scope buffers so body NodeIndices index a fresh
-    // namespace (parent-scope NodeIndex 0 and body-scope NodeIndex 0
-    // collide numerically). Restore on every exit. The paired
-    // consumer-id map swaps alongside so body-scope NodeBufferConsumer
-    // registrations don't survive into the parent scope's arbitrator.
-    let body_buffers: HashMap<NodeBufferKey, NodeBuffer> = HashMap::new();
-    let saved_buffers = std::mem::replace(&mut ctx.node_buffers, body_buffers);
-    let saved_consumer_ids = std::mem::take(&mut ctx.node_buffer_consumer_ids);
-    // Remaining-reader counts key by the body-local `NodeBufferKey` space;
-    // swap alongside `node_buffers` so a body fanout does not collide with a
-    // parent count.
-    let saved_readers = std::mem::take(&mut ctx.node_buffer_readers);
+    // Swap to body-scope node-buffer slots so body NodeIndices index a
+    // fresh namespace (parent-scope NodeIndex 0 and body-scope NodeIndex 0
+    // collide numerically). Restore on every exit. The buffers, their
+    // registrations and the remaining-reader counts swap as one scope, so
+    // body-scope NodeBufferConsumer registrations don't survive into the
+    // parent scope and a body fanout does not collide with a parent count.
+    let saved_slots = ctx.walk_reclaim.borrow_mut().take_slots();
     let saved_planned_readers = std::mem::replace(
         &mut ctx.planned_node_buffer_readers,
         planned_materialized_reader_counts(&body_dag),
@@ -502,7 +499,12 @@ fn recurse_into_body(
         // body region.
         for body_region in body_dag.deferred_regions.values() {
             let producer = body_region.producer;
-            if ctx.node_buffers.contains_key(&producer.into()) {
+            if ctx
+                .walk_reclaim
+                .borrow()
+                .slots()
+                .contains_buffer(&producer.into())
+            {
                 continue;
             }
             if !ctx.relaxed_aggregator_states.contains_key(&producer) {
@@ -559,10 +561,14 @@ fn recurse_into_body(
 
     // Unregister every body-local NodeBufferConsumer so the
     // arbitrator's registry stays aligned with the post-swap parent
-    // scope's `node_buffers` map. The body-scope `node_buffer_consumer_ids`
-    // map is replaced below; failing to unregister here would leak
-    // wrappers whose `current_usage` reads zero forever.
-    let body_consumer_ids = std::mem::take(&mut ctx.node_buffer_consumer_ids);
+    // scope's slots. The body scope is replaced below; failing to
+    // unregister here would leak wrappers whose `current_usage` reads
+    // zero forever.
+    let body_consumer_ids = ctx
+        .walk_reclaim
+        .borrow_mut()
+        .slots_mut()
+        .take_registrations();
     for (_, (id, _)) in body_consumer_ids {
         ctx.memory_budget.unregister_consumer(id);
     }
@@ -583,9 +589,9 @@ fn recurse_into_body(
     ctx.window_runtime.remove_body_scope(bound_body.body_scope);
     ctx.current_body_node_input_refs = saved_body_refs;
     ctx.source_records = saved_combine;
-    ctx.node_buffers = saved_buffers;
-    ctx.node_buffer_consumer_ids = saved_consumer_ids;
-    ctx.node_buffer_readers = saved_readers;
+    // The body's remaining buffers drop here, after their registrations left.
+    let body_slots = ctx.walk_reclaim.borrow_mut().replace_slots(saved_slots);
+    drop(body_slots);
     ctx.planned_node_buffer_readers = saved_planned_readers;
     ctx.window_arena_consumer_ids = saved_arena_ids;
 

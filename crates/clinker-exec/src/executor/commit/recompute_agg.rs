@@ -4,7 +4,7 @@
 //! every triggered input row id, re-finalizes the aggregator in place
 //! against the surviving contributions, then projects the post-retract
 //! finalize output onto the producer's deferred-region `buffer_schema`
-//! and writes it into `ctx.node_buffers[producer_idx]`. The
+//! and writes it into the walk reclaim set's `producer_idx` slot. The
 //! deferred-region dispatcher consumes that slot to re-feed the
 //! downstream operator chain on the commit pass — one set of operator
 //! arms covers both forward and commit dispatch.

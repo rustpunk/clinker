@@ -1158,8 +1158,8 @@ impl Iterator for NodeBufferDrain {
     }
 }
 
-/// `MemoryConsumer` wrapper for one `ctx.node_buffers` slot. Holds an
-/// `Arc<ConsumerHandle>` shared with the dispatcher: every producer
+/// `MemoryConsumer` wrapper for one node-buffer slot in the walk reclaim set.
+/// Holds an `Arc<ConsumerHandle>` shared with the dispatcher: every producer
 /// admission updates `handle.bytes` from `NodeBuffer::unaccounted_memory_bytes`;
 /// every consumer drain decrements it. `try_spill` flips the handle's
 /// spill-request flag but performs no I/O itself; the dispatcher's

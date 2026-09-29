@@ -2925,9 +2925,12 @@ fn adopt_spilled_runs_into_node_buffer(
     puncts: Vec<crate::executor::stream_event::Punctuation>,
 ) -> Result<(), PipelineError> {
     use crate::executor::node_buffer::{NodeBuffer, NodeBufferConsumer};
-    if ctx.node_buffers.contains_key(&node_idx.into())
-        || ctx.node_buffer_consumer_ids.contains_key(&node_idx.into())
-    {
+    let slot_key = crate::executor::dispatch::NodeBufferKey::from(node_idx);
+    let occupied = {
+        let set = ctx.walk_reclaim.borrow();
+        set.slots().contains_buffer(&slot_key) || set.slots().is_registered(&slot_key)
+    };
+    if occupied {
         return Err(PipelineError::Internal {
             op: "executor",
             node: combine_name.to_string(),
@@ -2949,10 +2952,24 @@ fn adopt_spilled_runs_into_node_buffer(
         handle.clone(),
         label,
     );
-    ctx.node_buffer_consumer_ids
-        .insert(node_idx.into(), (consumer_id, handle));
+    ctx.walk_reclaim.borrow_mut().slots_mut().register(
+        slot_key.clone(),
+        (consumer_id, handle),
+        crate::pipeline::memory::walk::SlotSpill {
+            spill_allowed: crate::executor::dispatch::node_buffer_spill_allowed(
+                current_dag,
+                node_idx,
+            ),
+            node_name: Box::from(current_dag.graph[node_idx].name()),
+        },
+    );
     if let Err(error) = declare_node_buffer_readers(ctx, current_dag, combine_name, node_idx) {
-        if let Some((id, handle)) = ctx.node_buffer_consumer_ids.remove(&node_idx.into()) {
+        let registration = ctx
+            .walk_reclaim
+            .borrow_mut()
+            .slots_mut()
+            .remove_registration(&slot_key);
+        if let Some((id, handle)) = registration {
             handle.set_bytes(0);
             ctx.memory_budget.unregister_consumer(id);
         }
@@ -2969,7 +2986,13 @@ fn adopt_spilled_runs_into_node_buffer(
         merge_compress,
     );
     let buffer = NodeBuffer::merge_spilled(files, row_count, puncts, merge_budget);
-    if ctx.node_buffers.insert(node_idx.into(), buffer).is_some() {
+    let replaced = ctx
+        .walk_reclaim
+        .borrow_mut()
+        .slots_mut()
+        .insert_buffer(slot_key, buffer)
+        .is_some();
+    if replaced {
         drain_node_buffer_slot(ctx, node_idx);
         return Err(PipelineError::Internal {
             op: "executor",

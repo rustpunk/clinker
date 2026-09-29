@@ -1,4 +1,4 @@
-//! Producer-side spill helper for `ctx.node_buffers`.
+//! Producer-side spill helper for node-buffer slots in the walk reclaim set.
 //!
 //! When `MemoryArbitrator::should_spill()` trips at admission time, the
 //! producer flushes the in-memory `Vec<(Record, SourceRowId)>` to disk through

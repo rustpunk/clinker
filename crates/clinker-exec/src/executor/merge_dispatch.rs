@@ -115,7 +115,8 @@ where
     //
     // 2. **Non-fused** — concat mode, a mix of Source and non-Source
     //    predecessors, or any shared Source. Predecessor arms have
-    //    already populated `ctx.node_buffers`; this arm
+    //    already populated their node-buffer slots in the walk
+    //    reclaim set; this arm
     //    consumes those buffers in declaration order (Concat)
     //    or round-robins across them (Interleave).
     //
@@ -249,14 +250,17 @@ where
                 })
                 .unwrap_or(usize::MAX)
         });
-        let total: usize = ordered_inputs
-            .iter()
-            .map(|(src, port)| {
-                ctx.node_buffers
-                    .get(&NodeBufferKey::with_port(*src, port.as_deref()))
-                    .map_or(0, |b| b.len_hint())
-            })
-            .sum();
+        let total: usize = {
+            let set = ctx.walk_reclaim.borrow();
+            ordered_inputs
+                .iter()
+                .map(|(src, port)| {
+                    set.slots()
+                        .buffer(&NodeBufferKey::with_port(*src, port.as_deref()))
+                        .map_or(0, |b| b.len_hint())
+                })
+                .sum()
+        };
         let mut merged = Vec::with_capacity(total);
         let emit = |merged: &mut Vec<(Record, crate::executor::stream_event::SourceRowId)>,
                     upstream_name: &str,

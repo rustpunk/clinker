@@ -1857,6 +1857,10 @@ impl PipelineExecutor {
             streaming_charge_consumers.insert(producer_idx, (charge_consumer_id, charge_handle));
         }
 
+        let batch_size = config
+            .pipeline
+            .batch_size
+            .unwrap_or(crate::executor::batch_handoff::DEFAULT_BATCH_SIZE);
         let mut ctx = dispatch::ExecutorContext {
             writer_resources,
             allocation_resources,
@@ -1875,11 +1879,14 @@ impl PipelineExecutor {
             run_policy,
 
             walk_reclaim: std::rc::Rc::new(std::cell::RefCell::new(
-                crate::pipeline::memory::walk::WalkReclaimSet::new(),
+                crate::pipeline::memory::walk::WalkReclaimSet::new(
+                    crate::pipeline::memory::walk::WalkSpillSettings {
+                        spill_root: Arc::clone(&spill_root_path),
+                        spill_compress: params.spill_compress,
+                        batch_size,
+                    },
+                ),
             )),
-            node_buffers: HashMap::new(),
-            node_buffer_consumer_ids: HashMap::new(),
-            node_buffer_readers: dispatch::NodeBufferReaderLedger::default(),
             planned_node_buffer_readers: dispatch::planned_materialized_reader_counts(plan),
             window_arena_consumer_ids: HashMap::new(),
             source_records,
@@ -1945,10 +1952,7 @@ impl PipelineExecutor {
             kernel_pool,
             shutdown_token: params.shutdown_token.clone(),
             interrupted: false,
-            batch_size: config
-                .pipeline
-                .batch_size
-                .unwrap_or(crate::executor::batch_handoff::DEFAULT_BATCH_SIZE),
+            batch_size,
             spill_compress: params.spill_compress,
             // Seed the exec-time accumulator with the plan-time catalog's
             // Plane A row counts so a downstream node reading it sees the
@@ -2113,12 +2117,8 @@ impl PipelineExecutor {
         // Successful reads consume every declared reader and leave no slot;
         // this sweep is the early-error/interruption backstop for partially
         // consumed fan-out and composition inputs.
-        drop(std::mem::take(&mut ctx.node_buffers));
-        ctx.node_buffer_readers = dispatch::NodeBufferReaderLedger::default();
-        for (_, (id, handle)) in std::mem::take(&mut ctx.node_buffer_consumer_ids) {
-            handle.set_bytes(0);
-            ctx.memory_budget.unregister_consumer(id);
-        }
+        let residue = ctx.walk_reclaim.borrow_mut().take_slots();
+        residue.release_residue(&ctx.memory_budget);
 
         // A tripped shutdown token unwinds the walk via
         // `PipelineError::Interrupted`; that is a graceful early stop, not

@@ -178,7 +178,7 @@ where
         .or_insert(0);
     // Three input paths feed a Source's emit:
     //
-    // 1. Records already seeded into `ctx.node_buffers[node_idx]`
+    // 1. Records already seeded into the walk reclaim set's `node_idx` slot
     //    by the body executor at composition entry —
     //    composition input ports surface as synthetic Source
     //    nodes owning the records the parent scope harvested.
@@ -204,7 +204,11 @@ where
     // `Arc::ptr_eq` fast path on the first record. Structural
     // equality holds by construction.
     let source_slot_key = NodeBufferKey::from(node_idx);
-    let has_seeded_own_slot = ctx.node_buffers.contains_key(&source_slot_key);
+    let has_seeded_own_slot = ctx
+        .walk_reclaim
+        .borrow()
+        .slots()
+        .contains_buffer(&source_slot_key);
     if !has_seeded_own_slot && ctx.fused_sources.contains(name.as_str()) {
         return Ok(());
     }

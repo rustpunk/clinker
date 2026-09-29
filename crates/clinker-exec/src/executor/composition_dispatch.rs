@@ -9,7 +9,7 @@
 //! port-collection and body-walk helpers (`collect_port_records`,
 //! `execute_composition_body`) move with it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use clinker_record::Record;
 use indexmap::IndexMap;
@@ -17,16 +17,17 @@ use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
 use crate::executor::dispatch::{
-    ExecutorContext, NodeBufferKey, NodeBufferReaderLedger, admit_node_buffer,
-    admit_node_buffer_transferred, dispatch_plan_node, drain_node_buffer_slot,
-    finalize_node_rooted_windows, node_buffer_spill_allowed, planned_materialized_reader_counts,
-    require_node_buffer_input, require_node_buffer_input_transferred,
-    tee_emit_to_region_input_buffers, validate_completed_node_buffer_scope,
+    ExecutorContext, NodeBufferKey, admit_node_buffer, admit_node_buffer_transferred,
+    dispatch_plan_node, drain_node_buffer_slot, finalize_node_rooted_windows,
+    node_buffer_spill_allowed, planned_materialized_reader_counts, require_node_buffer_input,
+    require_node_buffer_input_transferred, tee_emit_to_region_input_buffers,
+    validate_completed_node_buffer_scope,
 };
 use crate::executor::node_buffer::{
     NodeBuffer, TransientNodeBufferReservation, reserve_node_buffer_materialization,
 };
 use crate::executor::schema_check::check_input_schema;
+use crate::pipeline::memory::walk::{NodeBufferSlots, SlotSpill};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 
@@ -141,19 +142,21 @@ where
         // claims them below.
         if let Some(&first_pred) = predecessors.first()
             && let Some(edge) = current_dag.graph.find_edge(first_pred, node_idx)
-            && let Some(records) = ctx.node_buffers.get(&NodeBufferKey::with_port(
+        {
+            let set = ctx.walk_reclaim.borrow();
+            if let Some(records) = set.slots().buffer(&NodeBufferKey::with_port(
                 first_pred,
                 current_dag.graph[edge].producer_port.as_deref(),
-            ))
-        {
-            for (record, _) in records.peek_mem_records() {
-                check_input_schema(
-                    &expected,
-                    record.schema(),
-                    name,
-                    "composition",
-                    &upstream_name,
-                )?;
+            )) {
+                for (record, _) in records.peek_mem_records() {
+                    check_input_schema(
+                        &expected,
+                        record.schema(),
+                        name,
+                        "composition",
+                        &upstream_name,
+                    )?;
+                }
             }
         }
     }
@@ -254,7 +257,10 @@ fn discard_deferred_body_residue(ctx: &mut ExecutorContext<'_>, body_dag: &Execu
         deferred_nodes.extend(region.outputs.iter().copied());
     }
     let stale_keys: Vec<NodeBufferKey> = ctx
-        .node_buffers
+        .walk_reclaim
+        .borrow()
+        .slots()
+        .buffers()
         .keys()
         .filter(|key| deferred_nodes.contains(&key.node))
         .cloned()
@@ -342,9 +348,9 @@ fn collect_port_records(
 ///
 /// Builds a transient body-scope `ExecutionPlanDag` and walks it
 /// through `dispatch_plan_node` — the same dispatcher entry the
-/// top-level walker uses. The body's `node_buffers` namespace
-/// is swapped in via `mem::replace` so body NodeIndices index a
-/// fresh space; the parent buffers are restored after the walk.
+/// top-level walker uses. The body's node-buffer slots are swapped
+/// into the walk reclaim set so body NodeIndices index a fresh
+/// space; the parent's slots are restored after the walk.
 /// Dispatch and output harvest are captured into one result so the single
 /// restoration path runs before success or any error is propagated.
 fn execute_composition_body(
@@ -379,9 +385,7 @@ fn execute_composition_body(
     // consumer id/handle into the body-local registry. The wrapper stays
     // continuously registered: there is no unregister/register gap and no
     // second charge for the same allocation.
-    let mut body_buffers: HashMap<NodeBufferKey, NodeBuffer> = HashMap::new();
-    let mut body_consumer_ids = HashMap::new();
-    let mut body_readers = NodeBufferReaderLedger::default();
+    let mut body_slots = NodeBufferSlots::default();
     let seed_result = (|| {
         for (slot_key, input) in resolved_inputs {
             let Some(reservation) = input.reservation else {
@@ -393,7 +397,7 @@ fn execute_composition_body(
                     ),
                 });
             };
-            if body_buffers.contains_key(&slot_key) || body_consumer_ids.contains_key(&slot_key) {
+            if body_slots.contains_buffer(&slot_key) || body_slots.is_registered(&slot_key) {
                 return Err(PipelineError::Internal {
                     op: "executor",
                     node: composition_name.to_string(),
@@ -402,21 +406,30 @@ fn execute_composition_body(
                     ),
                 });
             }
-            body_readers.publish(slot_key.clone(), 1, composition_name)?;
-            body_buffers.insert(
+            let Some(seeded_node) = body_dag.graph.node_weight(slot_key.node) else {
+                return Err(PipelineError::Internal {
+                    op: "executor",
+                    node: composition_name.to_string(),
+                    detail: format!("composition body seed {slot_key:?} is not a body node"),
+                });
+            };
+            let spill = SlotSpill {
+                spill_allowed: node_buffer_spill_allowed(&body_dag, slot_key.node),
+                node_name: Box::from(seeded_node.name()),
+            };
+            body_slots
+                .readers_mut()
+                .publish(slot_key.clone(), 1, composition_name)?;
+            body_slots.insert_buffer(
                 slot_key.clone(),
                 NodeBuffer::memory_from_records(input.records),
             );
-            body_consumer_ids.insert(slot_key, reservation.into_registration());
+            body_slots.register(slot_key, reservation.into_registration(), spill);
         }
         Ok::<(), PipelineError>(())
     })();
     if let Err(error) = seed_result {
-        drop(body_buffers);
-        for (_, (id, handle)) in body_consumer_ids {
-            handle.set_bytes(0);
-            ctx.memory_budget.unregister_consumer(id);
-        }
+        body_slots.release_residue(&ctx.memory_budget);
         return Err(error);
     }
 
@@ -427,19 +440,16 @@ fn execute_composition_body(
     // record stream back to the parent.
     let output_idx = bound_body.output_port_to_node_idx.values().next().copied();
 
-    // Swap node_buffers to a body-local namespace so body NodeIndices
-    // don't collide with the parent's. `source_records` is also
-    // swapped to an empty map so body-scope Source nodes resolve
-    // through `node_buffers` (port seeding from parent scope), not
+    // Swap the node-buffer slots to a body-local namespace so body
+    // NodeIndices don't collide with the parent's. `source_records` is
+    // also swapped to an empty map so body-scope Source nodes resolve
+    // through their seeded slots (port seeding from parent scope), not
     // through parent-scope source ingestion — bodies declare ports,
     // not top-level sources. Any non-port-seeded body Source surfaces
     // as the defense-in-depth `Internal` error from the Source arm.
-    let saved_buffers = std::mem::replace(&mut ctx.node_buffers, body_buffers);
-    let saved_consumer_ids =
-        std::mem::replace(&mut ctx.node_buffer_consumer_ids, body_consumer_ids);
-    // Remaining-reader counts key by the body-local `NodeBufferKey` space, so
-    // swap to a fresh ledger alongside `node_buffers`.
-    let saved_readers = std::mem::replace(&mut ctx.node_buffer_readers, body_readers);
+    // The buffers, their registrations and the remaining-reader counts all
+    // key by the body-local `NodeBufferKey` space, so they swap as one scope.
+    let saved_slots = ctx.walk_reclaim.borrow_mut().replace_slots(body_slots);
     let saved_planned_readers = std::mem::replace(
         &mut ctx.planned_node_buffer_readers,
         planned_materialized_reader_counts(&body_dag),
@@ -545,19 +555,13 @@ fn execute_composition_body(
     })();
 
     // One restoration path for body dispatch, output harvest, and success.
-    // Drop body-local buffers while their wrappers remain registered, then
-    // unregister every residual body registration before restoring the parent
-    // maps. Slots already drained by body operators removed their own entries,
-    // so this sweep covers only early-return residue.
+    // Put the parent's slots back, then drop the body-local buffers while
+    // their wrappers remain registered and unregister every residual body
+    // registration. Slots already drained by body operators removed their own
+    // entries, so this sweep covers only early-return residue.
     ctx.recursion_depth = ctx.recursion_depth.saturating_sub(1);
-    drop(std::mem::take(&mut ctx.node_buffers));
-    for (_, (id, handle)) in std::mem::take(&mut ctx.node_buffer_consumer_ids) {
-        handle.set_bytes(0);
-        ctx.memory_budget.unregister_consumer(id);
-    }
-    ctx.node_buffers = saved_buffers;
-    ctx.node_buffer_consumer_ids = saved_consumer_ids;
-    ctx.node_buffer_readers = saved_readers;
+    let body_slots = ctx.walk_reclaim.borrow_mut().replace_slots(saved_slots);
+    body_slots.release_residue(&ctx.memory_budget);
     ctx.planned_node_buffer_readers = saved_planned_readers;
     // Drop every residual body receiver before joining its finite ingest
     // workers. This unblocks a producer whose downstream body failed before
