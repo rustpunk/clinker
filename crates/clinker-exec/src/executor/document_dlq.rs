@@ -4135,4 +4135,192 @@ mod tests {
             );
         }
     }
+
+    /// Publish a resident node-buffer slot of `rows` records in `set`'s
+    /// running scope, its consumer registered under `node` and charged
+    /// `charge` bytes.
+    fn publish_resident_slot(
+        arbitrator: &MemoryArbitrator,
+        set: &std::rc::Rc<std::cell::RefCell<WalkReclaimSet>>,
+        node: &str,
+        rows: u64,
+        charge: u64,
+    ) -> (crate::executor::dispatch::NodeBufferKey, Arc<ConsumerHandle>) {
+        let handle = ConsumerHandle::new();
+        let id = arbitrator.register_node_consumer(
+            Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                Arc::clone(&handle),
+            )),
+            Arc::clone(&handle),
+            clinker_plan::runtime_error::ConsumerLabel {
+                node: node.to_string(),
+                surface: clinker_plan::runtime_error::MemorySurface::BufferedRows {
+                    from: node.to_string(),
+                    to: "out".to_string(),
+                },
+            },
+        );
+        handle.try_grow(charge).expect("the slot's charge fits");
+        let s = schema();
+        let records: Vec<(Record, SourceRowId)> =
+            (0..rows).map(|n| (rec(&s, n as i64, 0), row(2, n))).collect();
+        let key = crate::executor::dispatch::NodeBufferKey::from(
+            petgraph::graph::NodeIndex::new(0),
+        );
+        let mut set = set.borrow_mut();
+        set.slots_mut().register(
+            key.clone(),
+            (id, Arc::clone(&handle)),
+            crate::pipeline::memory::walk::SlotSpill {
+                spill_allowed: true,
+                node_name: Box::from(node),
+            },
+        );
+        set.slots_mut()
+            .insert_buffer(key.clone(), NodeBuffer::memory_from_records(records));
+        (key, handle)
+    }
+
+    /// A held-row admission that does not fit spills another walk victim
+    /// before the document state's own tails: the state is the requester,
+    /// elected last, and a resident node-buffer slot frees enough.
+    ///
+    /// Capacity: the slot charges `S` = 64 KiB and the twelve held rows `R`
+    /// bytes of tails plus their index and slots `F`; the capacity is
+    /// `S + R + F + 64`, so a new document's admission (its index entry, a
+    /// 200-byte frame and its failed-document slot) does not fit. The pass
+    /// aims at the resume watermark (60% of the capacity), which the slot's
+    /// 64 KiB covers alone, so it never reaches the requester. The test calls
+    /// the admission directly, holding the state's cell as a hold does, and
+    /// runs no boundary relief, so neither soft poll is reached.
+    #[test]
+    fn held_row_admission_spills_a_resident_slot_before_its_own_tails() {
+        const SLOT: u64 = 64 * 1024;
+        let root = tempfile::tempdir().expect("held-log root");
+        let walk_root = tempfile::tempdir().expect("walk spill root");
+        let arbitrator = electing_arbitrator(1 << 30);
+        let set = walk_set(walk_root.path());
+        let _walk = WalkContextGuard::install(&arbitrator, std::rc::Rc::clone(&set));
+        let cell = std::rc::Rc::new(std::cell::RefCell::new(held_state(
+            &arbitrator,
+            root.path(),
+            usize::MAX,
+        )));
+        set.borrow_mut()
+            .set_document_dlq(std::rc::Rc::clone(&cell));
+        let (slot_key, slot_handle) =
+            publish_resident_slot(&arbitrator, &set, "upstream", 256, SLOT);
+        for ordinal in 1..=12u64 {
+            hold_row(&mut cell.borrow_mut(), &doc_key((ordinal % 3) as usize), ordinal)
+                .expect("hold");
+        }
+        let resident = cell.borrow().held.resident_bytes();
+        assert!(resident > 0);
+        arbitrator.set_test_capacity(arbitrator.charged_bytes() + 64);
+
+        let admitted = {
+            let mut state = cell.borrow_mut();
+            state.held.admit_charge(
+                &arbitrator,
+                &doc_key(9),
+                200,
+                FAILED_DOCUMENT_BYTES,
+                "validate",
+                clinker_plan::runtime_error::MemorySurface::HeldFailingRows,
+            )
+        };
+        let admitted = admitted.expect("the pass spills the slot and the admission fits");
+        assert!(admitted > FAILED_DOCUMENT_BYTES + 200);
+        assert!(
+            matches!(
+                set.borrow().slots().buffer(&slot_key),
+                Some(NodeBuffer::Spilled { .. })
+            ),
+            "the resident slot went to disk"
+        );
+        assert_eq!(slot_handle.bytes(), 0, "the slot's charge left with its rows");
+        assert!(
+            arbitrator
+                .per_stage_spill_bytes_written()
+                .get("upstream")
+                .is_some_and(|bytes| *bytes > 0),
+            "the slot's spill is recorded under its node"
+        );
+        assert_eq!(
+            cell.borrow().held.resident_bytes(),
+            resident,
+            "the requester's own tails stay resident"
+        );
+        assert_eq!(files_in(root.path()), 0, "no held row was flushed");
+        assert!(
+            !cell.borrow().handle.take_spill_request(),
+            "the pass never reached the requester"
+        );
+    }
+
+    /// The admission's charge is the only charge a held row makes: marking
+    /// its document failed and appending its frame charge nothing again, and
+    /// the admission is exactly the append's growth plus the document's slot
+    /// on its first failure.
+    #[test]
+    fn held_row_admission_charges_each_byte_once() {
+        let root = tempfile::tempdir().expect("held-log root");
+        let arbitrator = ledger_arbitrator(1 << 30);
+        let mut state = held_state(&arbitrator, root.path(), usize::MAX);
+        let grown = |state: &DocumentDlqState| {
+            state.held.resident_bytes() + state.held.index_bytes()
+        };
+
+        let key = doc_key(0);
+        let frame = vec![7u8; 190];
+        let before = state.charged_bytes();
+        let held_before = grown(&state);
+        let admitted = state
+            .held
+            .admit_charge(
+                &arbitrator,
+                &key,
+                frame.len(),
+                FAILED_DOCUMENT_BYTES,
+                "validate",
+                clinker_plan::runtime_error::MemorySurface::HeldFailingRows,
+            )
+            .expect("admitted");
+        assert_eq!(
+            state.charged_bytes() - before,
+            admitted,
+            "the admission is the charge"
+        );
+        state.insert_failed(Arc::clone(&key), DlqFailureStamp::now());
+        assert_eq!(
+            state.charged_bytes() - before,
+            admitted,
+            "marking the document failed charges nothing again"
+        );
+        state.held.append(&key, &frame).expect("append");
+        assert_eq!(
+            state.charged_bytes() - before,
+            admitted,
+            "appending the frame charges nothing again"
+        );
+        assert_eq!(
+            admitted,
+            grown(&state) - held_before + FAILED_DOCUMENT_BYTES,
+            "the admission is the append's growth and the document's slot"
+        );
+
+        for (doc, ordinal, slot) in [
+            (doc_key(0), 2, 0),
+            (doc_key(1), 3, FAILED_DOCUMENT_BYTES),
+        ] {
+            let before = state.charged_bytes();
+            let held_before = grown(&state);
+            hold_row(&mut state, &doc, ordinal).expect("hold");
+            assert_eq!(
+                state.charged_bytes() - before,
+                grown(&state) - held_before + slot,
+                "a hold charges its growth, and a first failure its slot, once"
+            );
+        }
+    }
 }
