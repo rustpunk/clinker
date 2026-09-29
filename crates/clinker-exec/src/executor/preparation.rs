@@ -374,7 +374,15 @@ impl AllocationAuthority for AttributedAdmission {
         layout: Layout,
     ) -> Result<AllocationLease, ResourceError> {
         self.admission
-            .admit(owner, layout, self.requester, self.release.clone())
+            .admit(owner, layout, self.requester, self.release.clone(), false)
+    }
+    fn try_reserve_if_free(
+        self: Arc<Self>,
+        owner: OwnerId,
+        layout: Layout,
+    ) -> Result<AllocationLease, ResourceError> {
+        self.admission
+            .admit(owner, layout, self.requester, self.release.clone(), true)
     }
     fn release(&self, owner: OwnerId, bytes: usize) {
         self.release.release(owner, bytes);
@@ -418,8 +426,18 @@ impl AdmissionLink {
             .upgrade()
             .ok_or_else(|| ResourceError::new(ResourceErrorKind::Authority, 0, 0))
     }
-    fn admit_writer_memory(&self, bytes: usize, requester: Requester) -> Result<(), ResourceError> {
-        self.live()?.admit_writer_memory(bytes, requester)
+    fn admit_writer_memory(
+        &self,
+        bytes: usize,
+        requester: Requester,
+        if_free: bool,
+    ) -> Result<(), ResourceError> {
+        let run = self.live()?;
+        if if_free {
+            run.admit_writer_memory_if_free(bytes, requester)
+        } else {
+            run.admit_writer_memory(bytes, requester)
+        }
     }
     fn admit_writer_disk(&self, bytes: u64) -> Result<(), ResourceError> {
         self.live()?.admit_writer_disk(bytes)
@@ -586,24 +604,55 @@ impl ExecutorResources {
 }
 impl AdmissionAuthority {
     /// Admit `layout` for `requester` and issue a lease that releases through
-    /// `release`.
+    /// `release`. With `if_free`, the bytes are admitted only if they fit
+    /// now, with no reclaim.
     fn admit(
         &self,
         owner: OwnerId,
         layout: Layout,
         requester: Requester,
         release: Arc<dyn AllocationAuthority>,
+        if_free: bool,
     ) -> Result<AllocationLease, ResourceError> {
         let mut signal = ResourceSignal::new(self.telemetry.clone(), ResourceWork::Admission);
         let result = self
             .check_cancelled()
             .and_then(|()| {
                 self.arbitrator
-                    .admit_writer_memory(layout.size(), requester)
+                    .admit_writer_memory(layout.size(), requester, if_free)
             })
             .and_then(|()| AllocationLease::admitted(release, owner, layout.size()));
         signal.finish(result.as_ref().map(|_| ()).map_err(|error| *error));
         result
+    }
+
+    /// Admit `layout` in the name this thread's allocations are charged to:
+    /// the walk requester on the run's walk, no consumer elsewhere.
+    fn admit_on_this_thread(
+        &self,
+        owner: OwnerId,
+        layout: Layout,
+        if_free: bool,
+    ) -> Result<AllocationLease, ResourceError> {
+        match self.arbitrator.walk_requester() {
+            Some(consumer) => {
+                let release = self.walk_release(consumer);
+                self.admit(
+                    owner,
+                    layout,
+                    Requester::for_consumer(consumer),
+                    release,
+                    if_free,
+                )
+            }
+            None => self.admit(
+                owner,
+                layout,
+                Requester::governed(),
+                self.release.clone(),
+                if_free,
+            ),
+        }
     }
 
     /// The release authority for grants made in `consumer`'s name, reused
@@ -636,13 +685,15 @@ impl AllocationAuthority for AdmissionAuthority {
         owner: OwnerId,
         layout: Layout,
     ) -> Result<AllocationLease, ResourceError> {
-        match self.arbitrator.walk_requester() {
-            Some(consumer) => {
-                let release = self.walk_release(consumer);
-                self.admit(owner, layout, Requester::for_consumer(consumer), release)
-            }
-            None => self.admit(owner, layout, Requester::governed(), self.release.clone()),
-        }
+        self.admit_on_this_thread(owner, layout, false)
+    }
+    /// Admitted only if it fits now: never a reclaim, on the walk or off it.
+    fn try_reserve_if_free(
+        self: Arc<Self>,
+        owner: OwnerId,
+        layout: Layout,
+    ) -> Result<AllocationLease, ResourceError> {
+        self.admit_on_this_thread(owner, layout, true)
     }
     fn release(&self, _: OwnerId, bytes: usize) {
         self.release.state.release_writer_memory(bytes, None);
@@ -678,6 +729,13 @@ impl AllocationAuthority for ExecutorAuthority {
         layout: Layout,
     ) -> Result<AllocationLease, ResourceError> {
         self.admission.clone().try_reserve(owner, layout)
+    }
+    fn try_reserve_if_free(
+        self: Arc<Self>,
+        owner: OwnerId,
+        layout: Layout,
+    ) -> Result<AllocationLease, ResourceError> {
+        self.admission.clone().try_reserve_if_free(owner, layout)
     }
     fn release(&self, owner: OwnerId, bytes: usize) {
         self.admission.release(owner, bytes);

@@ -353,6 +353,18 @@ impl MemoryArbitrator {
         })
     }
 
+    /// Charge `bytes` for `requester` only if they fit now, for an optional
+    /// over-allocation the caller can do without (a growing buffer's spare
+    /// capacity), or refuse at once.
+    ///
+    /// On any thread, the walk included, a refusal runs no reclaim pass,
+    /// never waits, takes no place in any queue of waiting requests and is
+    /// recorded nowhere: the ledger is exactly as it was. The caller falls
+    /// back to the size it needs through [`Self::reserve`].
+    pub fn reserve_if_free(&self, bytes: u64, requester: Requester) -> Result<Grant, Shortfall> {
+        self.reserve(bytes, requester)
+    }
+
     /// One locked check-and-charge, with no reclaim.
     fn reserve_now(&self, bytes: u64, requester: Requester) -> Result<Grant, Shortfall> {
         let mut ledger = self.admission.ledger.lock();
@@ -2302,5 +2314,99 @@ mod walk_pass_tests {
         assert!(arbitrator.ledger_snapshot(0, governed()).unattributed >= 4096);
         drop(unattributed);
         drop(walk_frame);
+    }
+
+    #[test]
+    fn optional_growth_never_reclaims() {
+        use clinker_format::reserved::ReservedVec;
+        let arbitrator = run(MIB, Box::new(Priority));
+        let provider = crate::executor::preparation::ExecutorResources::new(
+            Arc::clone(&arbitrator),
+            crate::pipeline::shutdown::ShutdownToken::detached(),
+            None,
+            std::num::NonZeroUsize::MIN,
+            None,
+        )
+        .expect("provider");
+        let (victim, victim_handle) = register(&arbitrator, "victim", 0, 64 * KIB);
+        let mut buffer: ReservedVec<u8> =
+            ReservedVec::new(provider.allocation().scope().expect("scope"));
+        buffer.reserve_exact(2048).expect("initial capacity");
+        for _ in 0..2048 {
+            buffer.push(1).expect("within capacity");
+        }
+        // Leave exactly 3 KiB free: the next push needs 2049 bytes and
+        // prefers 4096.
+        let _filler = arbitrator
+            .reserve(MIB - arbitrator.charged_bytes() - 3 * KIB, governed())
+            .expect("filler fits");
+        let set = empty_set();
+        let _walk = walk(&arbitrator, &set);
+        let script = Scripted::default()
+            .resident(victim, &victim_handle)
+            .shared();
+
+        let before = arbitrator.reclaim_rounds();
+        scripted(&script, || buffer.push(1)).expect("the needed size fits");
+        assert_eq!(
+            buffer.capacity(),
+            2049,
+            "only the needed size was taken, not the doubled one"
+        );
+        assert_eq!(
+            arbitrator.reclaim_rounds(),
+            before,
+            "spare capacity never runs a reclaim pass"
+        );
+        assert_eq!(victim_handle.bytes(), 64 * KIB, "the victim stays resident");
+        assert!(script.borrow().spilled.is_empty());
+
+        // With room for less than even the needed size, the needed size
+        // takes the ordinary path, which spills the victim.
+        let free = MIB - arbitrator.charged_bytes();
+        let _tighter = arbitrator
+            .reserve(free - KIB, governed())
+            .expect("second filler fits");
+        scripted(&script, || buffer.push(1)).expect("the pass makes room");
+        assert_eq!(buffer.capacity(), 2050);
+        assert_eq!(arbitrator.reclaim_rounds() - before, 1);
+        assert_eq!(script.borrow().spilled, vec![victim]);
+    }
+
+    #[test]
+    fn if_free_refusal_leaves_no_trace() {
+        let arbitrator = run(MIB, Box::new(Priority));
+        let (victim, victim_handle) = register(&arbitrator, "victim", 0, 400 * KIB);
+        let _filler = arbitrator
+            .reserve(620 * KIB, governed())
+            .expect("filler fits");
+        let set = empty_set();
+        let _walk = walk(&arbitrator, &set);
+        let script = Scripted::default()
+            .resident(victim, &victim_handle)
+            .shared();
+        let snapshot = arbitrator.ledger_snapshot(0, governed());
+        let figures = (
+            arbitrator.charged_bytes(),
+            arbitrator.peak_charged_bytes(),
+            arbitrator.release_epoch(),
+            arbitrator.reclaim_rounds(),
+        );
+        let refused = scripted(&script, || arbitrator.reserve_if_free(10 * KIB, governed()))
+            .expect_err("10 KiB does not fit in the 4 KiB free");
+        assert_eq!(refused.requested, 10 * KIB);
+        assert_eq!(
+            (
+                arbitrator.charged_bytes(),
+                arbitrator.peak_charged_bytes(),
+                arbitrator.release_epoch(),
+                arbitrator.reclaim_rounds(),
+            ),
+            figures,
+            "a refused optional request changes no ledger figure and runs no pass"
+        );
+        assert_eq!(arbitrator.ledger_snapshot(0, governed()), snapshot);
+        assert!(script.borrow().spilled.is_empty());
+        assert_eq!(victim_handle.bytes(), 400 * KIB);
     }
 }

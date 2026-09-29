@@ -1166,6 +1166,19 @@ pub trait AllocationAuthority: Send + Sync {
         owner: OwnerId,
         layout: Layout,
     ) -> Result<AllocationLease, ResourceError>;
+    /// Admit `layout` only if it fits now, for an optional over-allocation
+    /// the caller can do without (a growing buffer's spare capacity). A
+    /// provider that would otherwise make room first (spill other state,
+    /// wait for a release) refuses at once instead, leaving no trace of the
+    /// attempt; the caller falls back to the size it needs through
+    /// [`Self::try_reserve`]. Unless overridden, the same as `try_reserve`.
+    fn try_reserve_if_free(
+        self: Arc<Self>,
+        owner: OwnerId,
+        layout: Layout,
+    ) -> Result<AllocationLease, ResourceError> {
+        self.try_reserve(owner, layout)
+    }
     fn release(&self, owner: OwnerId, bytes: usize);
     fn check_cancelled(&self) -> Result<(), ResourceError>;
 }
@@ -1298,6 +1311,15 @@ impl AllocationResources {
     ) -> Result<AllocationLease, ResourceError> {
         self.authority.clone().try_reserve(owner, layout)
     }
+    /// [`Self::reserve`] for an optional over-allocation: admitted only if
+    /// it fits now (see [`AllocationAuthority::try_reserve_if_free`]).
+    pub fn reserve_if_free(
+        &self,
+        owner: OwnerId,
+        layout: Layout,
+    ) -> Result<AllocationLease, ResourceError> {
+        self.authority.clone().try_reserve_if_free(owner, layout)
+    }
     /// Scope is inline, including identity and authority handle, with no heap
     /// allocation per writer. Its containing owner must account retained storage.
     pub fn scope(&self) -> Result<AllocationScope, ResourceError> {
@@ -1323,6 +1345,11 @@ impl AllocationScope {
     }
     pub fn reserve(&self, layout: Layout) -> Result<AllocationLease, ResourceError> {
         self.resources.reserve(self.owner, layout)
+    }
+    /// [`Self::reserve`] for an optional over-allocation the caller can do
+    /// without: admitted only if it fits now.
+    pub fn reserve_if_free(&self, layout: Layout) -> Result<AllocationLease, ResourceError> {
+        self.resources.reserve_if_free(self.owner, layout)
     }
     pub fn check_cancelled(&self) -> Result<(), ResourceError> {
         self.resources.authority.check_cancelled()

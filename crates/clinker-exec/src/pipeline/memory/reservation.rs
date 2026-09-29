@@ -170,7 +170,27 @@ impl MemoryArbitrator {
         bytes: usize,
         requester: Requester,
     ) -> Result<(), ResourceError> {
-        match self.reserve(bytes as u64, requester) {
+        Self::admitted(self.reserve(bytes as u64, requester), bytes)
+    }
+
+    /// [`Self::admit_writer_memory`] for an optional over-allocation, through
+    /// [`Self::reserve_if_free`]: admitted only if it fits now.
+    pub(crate) fn admit_writer_memory_if_free(
+        &self,
+        bytes: usize,
+        requester: Requester,
+    ) -> Result<(), ResourceError> {
+        Self::admitted(self.reserve_if_free(bytes as u64, requester), bytes)
+    }
+
+    /// Hand a reserve's grant to the caller's lease, or map its shortfall to
+    /// the admission error: `Finalized` for a closed ledger, `Budget`
+    /// otherwise.
+    fn admitted(
+        result: Result<super::ledger::Grant, super::ledger::Shortfall>,
+        bytes: usize,
+    ) -> Result<(), ResourceError> {
+        match result {
             Ok(grant) => {
                 grant.detach();
                 Ok(())

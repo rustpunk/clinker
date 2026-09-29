@@ -93,6 +93,13 @@ impl<T> ReservedVec<T> {
     /// Admit and allocate exactly the requested capacity, preserving the old
     /// allocation and contents on refusal or allocation failure.
     pub fn reserve_exact(&mut self, capacity: usize) -> Result<(), ResourceError> {
+        self.reserve_exact_with(capacity, false)
+    }
+
+    /// [`Self::reserve_exact`], admitting the capacity only if it fits now
+    /// when `if_free` is set: the request is optional, so it must never make
+    /// the provider free memory for it.
+    fn reserve_exact_with(&mut self, capacity: usize, if_free: bool) -> Result<(), ResourceError> {
         if capacity <= self.capacity {
             return Ok(());
         }
@@ -103,7 +110,11 @@ impl<T> ReservedVec<T> {
             self.capacity = capacity;
             return Ok(());
         }
-        let grant = self.scope.reserve(layout)?;
+        let grant = if if_free {
+            self.scope.reserve_if_free(layout)?
+        } else {
+            self.scope.reserve(layout)?
+        };
         // SAFETY: layout has positive size and valid alignment. Null is handled
         // as a recoverable failure, dropping the unused grant.
         let new = NonNull::new(allocate(layout).cast::<T>())
@@ -148,8 +159,11 @@ impl<T> ReservedVec<T> {
         if needed <= self.capacity {
             return Ok(());
         }
+        // The doubled capacity is spare room the vector can do without, so
+        // it is taken only if it fits now; the size it needs takes the
+        // ordinary path, which may make room.
         let preferred = self.capacity.checked_mul(2).unwrap_or(needed).max(needed);
-        match self.reserve_exact(preferred) {
+        match self.reserve_exact_with(preferred, preferred != needed) {
             Err(error) if preferred != needed && error.kind == ResourceErrorKind::Budget => {
                 self.reserve_exact(needed)
             }
