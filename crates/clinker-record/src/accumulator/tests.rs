@@ -291,31 +291,232 @@ fn test_sum_all_null() {
 }
 
 #[test]
-fn test_sum_kahan_precision() {
-    // Sum 1,000,000 × 0.1 should be closer to 100_000.0 than a naive sum.
+fn test_sum_of_many_floats_is_the_exact_sum_rounded_once() {
+    // The double nearest 0.1 is 0.1000000000000000055511151231257827..., so
+    // a million of them total exactly 100000.0000000000055511151231257827...
+    // The doubles next to 100000 are 2^-36 (about 1.46e-11) apart, and the
+    // excess is less than half of that, so the sum rounds to 100000.0. A
+    // left-to-right fold drifts to 100000.00000133288.
     let mut a = sum();
     for _ in 0..1_000_000 {
         a.add(&Value::Float(0.1));
     }
-    let result = a.finalize().unwrap();
-    let Value::Float(f) = result else {
-        panic!("expected Float, got {result:?}");
-    };
-    let kahan_err = (f - 100_000.0).abs();
+    assert_eq!(float_bits(&a.finalize().unwrap()), 100_000.0_f64.to_bits());
+}
 
-    // Naive summation for comparison.
-    let mut naive = 0.0_f64;
-    for _ in 0..1_000_000 {
-        naive += 0.1;
+// ---------- Exact float sums ----------
+
+/// A small deterministic generator for shuffles (SplitMix64).
+struct SplitMix(u64);
+
+impl SplitMix {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
     }
-    let naive_err = (naive - 100_000.0).abs();
 
-    assert!(
-        kahan_err <= naive_err,
-        "Kahan error {kahan_err} exceeded naive error {naive_err}"
+    fn shuffle<T>(&mut self, items: &mut [T]) {
+        for i in (1..items.len()).rev() {
+            let j = (self.next() % (i as u64 + 1)) as usize;
+            items.swap(i, j);
+        }
+    }
+}
+
+/// Every order of `values` when there are at most 7 of them, else 200
+/// seeded shuffles.
+fn arrival_orders(values: &[Value]) -> Vec<Vec<Value>> {
+    if values.len() <= 7 {
+        return permutations(values);
+    }
+    let mut rng = SplitMix(0x5EED);
+    (0..200)
+        .map(|_| {
+            let mut order = values.to_vec();
+            rng.shuffle(&mut order);
+            order
+        })
+        .collect()
+}
+
+/// A finalized float's bits, or a panic naming the value that is not a
+/// float.
+fn float_bits(value: &Value) -> u64 {
+    match value {
+        Value::Float(f) => f.to_bits(),
+        other => panic!("expected a float, got {other:?}"),
+    }
+}
+
+fn as_float(value: &Value) -> f64 {
+    f64::from_bits(float_bits(value))
+}
+
+/// `make`'s accumulator over `values` gives `expected` in every arrival order
+/// and for every split into two partial states merged either way.
+fn assert_order_and_split_independent(make: NewState, values: &[Value], expected: f64) {
+    for order in arrival_orders(values) {
+        let context = format!("{order:?}");
+        assert_eq!(
+            float_bits(&fold(make, &order).finalize().unwrap()),
+            expected.to_bits(),
+            "folded {context}"
+        );
+        for at in 0..=order.len() {
+            let (left, right) = order.split_at(at);
+            let mut ab = fold(make, left);
+            ab.merge(&fold(make, right));
+            let mut ba = fold(make, right);
+            ba.merge(&fold(make, left));
+            for merged in [ab, ba] {
+                assert_eq!(
+                    float_bits(&merged.finalize().unwrap()),
+                    expected.to_bits(),
+                    "split {left:?} | {right:?}"
+                );
+            }
+        }
+    }
+}
+
+fn floats(values: &[f64]) -> Vec<Value> {
+    values.iter().map(|f| Value::Float(*f)).collect()
+}
+
+#[test]
+fn float_sum_does_not_depend_on_arrival_or_split() {
+    // 1e16 + 1 is not a double (they are 2 apart there), so a fold that adds
+    // 1.0 to 1e16 first loses it; the exact sum is 1.
+    assert_order_and_split_independent(sum, &floats(&[1e16, 1.0, -1e16]), 1.0);
+    // Ten copies of the double nearest 0.1 total exactly
+    // 1.000000000000000055511151231257827..., which exceeds 1 by less than
+    // half the 2^-52 spacing above 1, so the sum is 1.0.
+    assert_order_and_split_independent(sum, &floats(&[0.1; 10]), 1.0);
+    // f64::MAX + f64::MAX is beyond the range, but the exact total is
+    // f64::MAX in every order.
+    assert_order_and_split_independent(sum, &floats(&[f64::MAX, f64::MAX, -f64::MAX]), f64::MAX);
+    // Subnormals of 1, 2, 3, -4 and 5 units of 2^-1074 total 7 units.
+    let units = |n: u64| f64::from_bits(n);
+    assert_order_and_split_independent(
+        sum,
+        &floats(&[units(1), units(2), units(3), -units(4), units(5)]),
+        units(7),
     );
-    // Kahan should get within ~1e-9.
-    assert!(kahan_err < 1e-6, "Kahan error {kahan_err} too large");
+    // The double nearest 1e-16 is just below it, so ten of them total just
+    // under 1e-15, which is 4.5036 spacings of 2^-52 above 1. The nearest
+    // double to 1 + that is 1 + 5 * 2^-52. A left-to-right fold from 1.0
+    // loses every 1e-16 (each is under half a spacing) and gives 1.0.
+    let mut one_and_tenths = vec![1.0];
+    one_and_tenths.extend([1e-16; 10]);
+    assert_order_and_split_independent(sum, &floats(&one_and_tenths), 1.0 + 5.0 * f64::EPSILON);
+}
+
+#[test]
+fn exact_sum_special_values_follow_ieee() {
+    let total = |values: &[Value]| fold(sum, values).finalize().unwrap();
+    let nan = Value::Float(f64::NAN);
+    let inf = Value::Float(f64::INFINITY);
+    let neg_inf = Value::Float(f64::NEG_INFINITY);
+    assert!(as_float(&total(&[Value::Float(1.0), nan.clone()])).is_nan());
+    assert!(as_float(&total(&[inf.clone(), neg_inf.clone()])).is_nan());
+    assert!(as_float(&total(&[inf.clone(), nan, Value::Integer(3)])).is_nan());
+    assert_eq!(
+        float_bits(&total(&[inf.clone(), Value::Float(-1e308)])),
+        f64::INFINITY.to_bits()
+    );
+    assert_eq!(float_bits(&total(&[neg_inf])), f64::NEG_INFINITY.to_bits());
+    assert_eq!(
+        float_bits(&total(&floats(&[f64::MAX, f64::MAX]))),
+        f64::INFINITY.to_bits()
+    );
+    assert_eq!(
+        float_bits(&total(&floats(&[-0.0, -0.0]))),
+        (-0.0_f64).to_bits()
+    );
+    assert_eq!(float_bits(&total(&floats(&[-0.0, 0.0]))), 0.0_f64.to_bits());
+    assert_eq!(float_bits(&total(&floats(&[1.0, -1.0]))), 0.0_f64.to_bits());
+    assert_eq!(
+        float_bits(&total(&[Value::Integer(0), Value::Float(-0.0)])),
+        0.0_f64.to_bits()
+    );
+}
+
+#[test]
+fn integer_promotion_does_not_depend_on_where_the_first_float_arrives() {
+    // The exact total is 2^61 + 4.5. The doubles next to 2^61 are 512 apart,
+    // so it rounds to 2^61. No integer is rounded through a float before the
+    // float arrives, so every order agrees.
+    let two_60 = 1_i64 << 60;
+    let values = [
+        Value::Integer(two_60 + 1),
+        Value::Integer(two_60 + 3),
+        Value::Float(0.5),
+    ];
+    for order in permutations(&values) {
+        assert_eq!(
+            float_bits(&fold(sum, &order).finalize().unwrap()),
+            2.0_f64.powi(61).to_bits(),
+            "{order:?}"
+        );
+    }
+}
+
+#[test]
+fn accumulator_enum_inline_size_does_not_grow() {
+    // 112 bytes before float sums were exact: the largest variant,
+    // `WeightedAvgState`, held two `i128`s, four `f64`s, two 16-byte
+    // `Decimal`s and four `bool`s (100 bytes, rounded up to the `i128`'s
+    // 16-byte alignment), and the enum's tag fits in a `bool`'s spare values.
+    // An exact float sum is one pointer inline, so no variant grew.
+    assert!(
+        std::mem::size_of::<AccumulatorEnum>() <= 112,
+        "AccumulatorEnum is {} bytes",
+        std::mem::size_of::<AccumulatorEnum>()
+    );
+}
+
+#[test]
+fn exact_sum_state_roundtrips_through_postcard() {
+    let mut a = sum();
+    add_all(
+        &mut a,
+        &[
+            Value::Integer(7),
+            Value::Float(0.1),
+            Value::Float(-1e300),
+            Value::Float(1e300),
+            Value::Float(-0.0),
+            Value::Float(f64::from_bits(1)),
+            Value::Integer(-2),
+        ],
+    );
+    let mut special = sum();
+    add_all(
+        &mut special,
+        &[
+            Value::Float(f64::INFINITY),
+            Value::Float(2.5),
+            Value::Integer(1),
+        ],
+    );
+    for state in [a, special] {
+        let bits = float_bits(&state.finalize().unwrap());
+        let restored: AccumulatorEnum =
+            postcard::from_bytes(&postcard::to_stdvec(&state).unwrap()).unwrap();
+        assert_eq!(restored, state, "postcard");
+        assert_eq!(float_bits(&restored.finalize().unwrap()), bits, "postcard");
+        let restored: AccumulatorEnum =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(restored, state, "serde_json");
+        assert_eq!(
+            float_bits(&restored.finalize().unwrap()),
+            bits,
+            "serde_json"
+        );
+    }
 }
 
 #[test]
@@ -1204,15 +1405,15 @@ fn test_sum_retract_roundtrip() {
 }
 
 #[test]
-fn test_sum_retract_to_empty_yields_zero() {
-    // Sum's "every contribution retracted" state finalizes to Integer(0):
-    // has_value stayed true after the first add, and the running int_sum
-    // returned to zero through symmetric subtraction. This matches the
-    // mathematical inverse of feed-then-retract on the integer path.
+fn test_sum_retract_to_empty_yields_null() {
+    // Retracting every contribution leaves the state of a Sum that saw
+    // nothing, which finalizes to null, as a fresh fold of the (empty)
+    // surviving rows does.
     let mut acc = sum();
     acc.add(&Value::Integer(7));
     acc.sub(&Value::Integer(7));
-    assert_eq!(acc.finalize().unwrap(), Value::Integer(0));
+    assert_eq!(acc, sum());
+    assert_eq!(acc.finalize().unwrap(), Value::Null);
 }
 
 #[test]

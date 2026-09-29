@@ -138,7 +138,18 @@ fn two_pass_rows() -> String {
     csv
 }
 
-/// Ledger capacity of the spilling run.
+/// Ledger capacity of the spilling run: 1 MiB (1,048,576 bytes).
+///
+/// With ample memory the fixture charges P = 2,229,080 bytes at its peak, of
+/// which the Aggregate's own state is 1,277,952: 4,096 groups, each holding
+/// its exact float sum's 312-byte state. It completes at M = 767,592 bytes
+/// and is refused at 744,564, where the Aggregate's 4,096 buffered output
+/// rows (720,896 bytes, which cannot spill) no longer fit. 1 MiB lies between
+/// M and P. The hash table's periodic memory check spills it at row 4,096,
+/// where the first pass ends, so the first pass's floats and the second
+/// pass's integers reach the finalize merge in different runs. The fixture
+/// is new, so there is no earlier limit L; every run's `memory.limit` is
+/// 512M.
 const TWO_PASS_SPILL_CAPACITY: u64 = 1024 * 1024;
 
 /// A group whose float lands in one spill run and whose integers land only in
