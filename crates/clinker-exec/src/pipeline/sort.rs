@@ -7,39 +7,30 @@ use std::cmp::Ordering;
 
 use clinker_record::{Record, RecordStorage, Value};
 
-use clinker_plan::config::{NullOrder, SortField, SortOrder};
+use clinker_plan::config::{NullOrder, OrderField, SortField, SortOrder};
 
 use crate::pipeline::sort_key::{
     compare_authored_keys, compare_authored_values, compare_authored_values_with_nulls,
 };
 
-/// Sort a partition's position vector in-place by sort_by fields.
+/// Sort a window partition's position vector in place by its `sort_by`
+/// fields.
 ///
-/// Stable sort preserves insertion order for equal keys.
-/// Null handling applied per-field via `NullOrder`.
+/// Every position stays: the fields are placement-only, so nulls go first
+/// or last and no row leaves the partition. The sort is stable, so equal
+/// keys keep arrival order.
 pub fn sort_partition<S: RecordStorage>(
     storage: &S,
-    positions: &mut Vec<u64>,
-    sort_by: &[SortField],
+    positions: &mut [u64],
+    sort_by: &[OrderField],
 ) {
-    // First pass: drop nulls for any field with NullOrder::Drop
-    for sf in sort_by {
-        if sf.null_order == Some(NullOrder::Drop) {
-            positions.retain(|&pos| {
-                let val = storage.resolve_field(pos, &sf.field);
-                !val.is_none_or(|v| v.is_null())
-            });
-        }
-    }
-
-    // Sort
     positions.sort_by(|&a, &b| compare_records(storage, a, b, sort_by));
 }
 
 /// Check if a partition is already sorted (linear scan).
 ///
 /// Returns true if all consecutive pairs are in the correct order.
-pub fn is_sorted<S: RecordStorage>(storage: &S, positions: &[u64], sort_by: &[SortField]) -> bool {
+pub fn is_sorted<S: RecordStorage>(storage: &S, positions: &[u64], sort_by: &[OrderField]) -> bool {
     positions
         .windows(2)
         .all(|pair| compare_records(storage, pair[0], pair[1], sort_by) != Ordering::Greater)
@@ -50,14 +41,13 @@ fn compare_records<S: RecordStorage>(
     storage: &S,
     a: u64,
     b: u64,
-    sort_by: &[SortField],
+    sort_by: &[OrderField],
 ) -> Ordering {
     for sf in sort_by {
         let va = storage.resolve_field(a, &sf.field);
         let vb = storage.resolve_field(b, &sf.field);
-        let null_order = sf.null_order.unwrap_or(NullOrder::Last);
 
-        let ord = compare_values_with_nulls(va, vb, sf.order, null_order);
+        let ord = compare_values_with_nulls(va, vb, sf.order, sf.null_order.into());
         if ord != Ordering::Equal {
             return ord;
         }
@@ -95,6 +85,7 @@ pub fn compare_values(a: &Value, b: &Value) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clinker_plan::config::NullPlacement;
     use clinker_record::owned_storage::SharedStorage;
     use clinker_record::{MinimalRecord, Schema, Value};
     use std::sync::Arc;
@@ -130,8 +121,8 @@ mod tests {
         }
     }
 
-    fn sf(field: &str, order: SortOrder, null_order: Option<NullOrder>) -> SortField {
-        SortField {
+    fn sf(field: &str, order: SortOrder, null_order: NullPlacement) -> OrderField {
+        OrderField {
             field: field.into(),
             order,
             null_order,
@@ -154,7 +145,7 @@ mod tests {
         sort_partition(
             &storage,
             &mut positions,
-            &[sf("amount", SortOrder::Asc, None)],
+            &[sf("amount", SortOrder::Asc, NullPlacement::Last)],
         );
         assert_eq!(positions, vec![1, 3, 0, 4, 2]); // 10, 20, 30, 40, 50
     }
@@ -175,7 +166,7 @@ mod tests {
         sort_partition(
             &storage,
             &mut positions,
-            &[sf("amount", SortOrder::Desc, None)],
+            &[sf("amount", SortOrder::Desc, NullPlacement::Last)],
         );
         assert_eq!(positions, vec![2, 4, 0, 3, 1]); // 50, 40, 30, 20, 10
     }
@@ -194,7 +185,7 @@ mod tests {
         sort_partition(
             &storage,
             &mut positions,
-            &[sf("amount", SortOrder::Asc, Some(NullOrder::First))],
+            &[sf("amount", SortOrder::Asc, NullPlacement::First)],
         );
         assert_eq!(positions[0], 1); // null first
         assert_eq!(positions[1], 2); // 10
@@ -215,31 +206,40 @@ mod tests {
         sort_partition(
             &storage,
             &mut positions,
-            &[sf("amount", SortOrder::Asc, Some(NullOrder::Last))],
+            &[sf("amount", SortOrder::Asc, NullPlacement::Last)],
         );
         assert_eq!(positions[0], 2); // 10
         assert_eq!(positions[1], 0); // 30
         assert_eq!(positions[2], 1); // null last
     }
 
+    /// A window partition keeps every row: `null_order` only decides
+    /// whether null keys sort before or after the values, in either
+    /// direction, and nulls keep their arrival order among themselves.
     #[test]
-    fn test_sort_null_drop() {
-        let storage = TestStorage::new(
-            &["amount"],
-            vec![
-                vec![Value::Integer(30)],
-                vec![Value::Null],
-                vec![Value::Integer(10)],
-            ],
-        );
-        let mut positions: Vec<u64> = vec![0, 1, 2];
-        sort_partition(
-            &storage,
-            &mut positions,
-            &[sf("amount", SortOrder::Asc, Some(NullOrder::Drop))],
-        );
-        assert_eq!(positions.len(), 2);
-        assert!(!positions.contains(&1)); // null dropped
+    fn window_partition_places_nulls_by_null_order() {
+        // Positions:      0        1     2       3     4
+        let values = vec![
+            Value::Integer(30),
+            Value::Null,
+            Value::Integer(10),
+            Value::Null,
+            Value::Integer(20),
+        ];
+        let storage = TestStorage::new(&["amount"], values.into_iter().map(|v| vec![v]).collect());
+        let cases = [
+            (SortOrder::Asc, NullPlacement::First, vec![1, 3, 2, 4, 0]),
+            (SortOrder::Asc, NullPlacement::Last, vec![2, 4, 0, 1, 3]),
+            (SortOrder::Desc, NullPlacement::First, vec![1, 3, 0, 4, 2]),
+            (SortOrder::Desc, NullPlacement::Last, vec![0, 4, 2, 1, 3]),
+        ];
+        for (order, placement, expected) in cases {
+            let sort_by = [sf("amount", order, placement)];
+            let mut positions: Vec<u64> = (0..5).collect();
+            sort_partition(&storage, &mut positions, &sort_by);
+            assert_eq!(positions, expected, "{order:?} {placement:?}");
+            assert!(is_sorted(&storage, &positions, &sort_by));
+        }
     }
 
     #[test]
@@ -256,7 +256,7 @@ mod tests {
         assert!(is_sorted(
             &storage,
             &positions,
-            &[sf("amount", SortOrder::Asc, None)]
+            &[sf("amount", SortOrder::Asc, NullPlacement::Last)]
         ));
     }
 
@@ -276,8 +276,8 @@ mod tests {
             &storage,
             &mut positions,
             &[
-                sf("dept", SortOrder::Asc, None),
-                sf("amount", SortOrder::Desc, None),
+                sf("dept", SortOrder::Asc, NullPlacement::Last),
+                sf("amount", SortOrder::Desc, NullPlacement::Last),
             ],
         );
         // A first (sorted by dept asc), then within A: 300, 100 (amount desc)
@@ -312,13 +312,21 @@ mod tests {
         let all: Vec<u64> = (0..11).collect();
 
         let mut ascending = all.clone();
-        sort_partition(&storage, &mut ascending, &[sf("v", SortOrder::Asc, None)]);
+        sort_partition(
+            &storage,
+            &mut ascending,
+            &[sf("v", SortOrder::Asc, NullPlacement::Last)],
+        );
         // -3, -0.0 ~ 0.0 (arrival), 1.5, 2 ~ 2.0 (arrival), 2^53, 2^53 + 1,
         // +inf, NaN ~ -NaN (arrival).
         assert_eq!(ascending, vec![6, 2, 4, 0, 3, 7, 10, 9, 8, 1, 5]);
 
         let mut descending = all.clone();
-        sort_partition(&storage, &mut descending, &[sf("v", SortOrder::Desc, None)]);
+        sort_partition(
+            &storage,
+            &mut descending,
+            &[sf("v", SortOrder::Desc, NullPlacement::Last)],
+        );
         assert_eq!(descending, vec![1, 5, 8, 9, 10, 3, 7, 0, 2, 4, 6]);
 
         // A partition long enough for the sort's run detection, cycling
@@ -345,7 +353,11 @@ mod tests {
         };
         let storage = TestStorage::new(&["v"], long.iter().cloned().map(|v| vec![v]).collect());
         let mut positions: Vec<u64> = (0..400).collect();
-        sort_partition(&storage, &mut positions, &[sf("v", SortOrder::Asc, None)]);
+        sort_partition(
+            &storage,
+            &mut positions,
+            &[sf("v", SortOrder::Asc, NullPlacement::Last)],
+        );
         for pair in positions.windows(2) {
             let (a, b) = (rank(&long[pair[0] as usize]), rank(&long[pair[1] as usize]));
             let ordering = a.0.cmp(&b.0).then(a.1.total_cmp(&b.1));

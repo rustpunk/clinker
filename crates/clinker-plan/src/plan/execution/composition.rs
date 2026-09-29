@@ -52,13 +52,29 @@ pub(crate) fn resolve_composition_body_windows(
             let Some(&transform_idx) = body.name_to_idx.get(*transform_name) else {
                 continue;
             };
+            // Schema binding validated this window's `sort_by`; a refused
+            // `null_order: drop` stopped compilation before this pass.
+            let Some(sort_by) = artifacts
+                .window_sort_by
+                .get(&body.graph[transform_idx].id())
+            else {
+                diags.push(body_window_diag(
+                    "E000",
+                    &body.graph[transform_idx],
+                    format!(
+                        "internal error: body window '{transform_name}' reached index planning \
+                         without a validated `sort_by`"
+                    ),
+                ));
+                continue;
+            };
 
             let mut arena_fields: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
             for gb in &wc.group_by {
                 arena_fields.insert(gb.clone());
             }
-            for sf in &wc.sort_by {
+            for sf in sort_by {
                 arena_fields.insert(sf.field.clone());
             }
             // Pull every field a body Transform references through
@@ -218,7 +234,7 @@ pub(crate) fn resolve_composition_body_windows(
             let req = RawIndexRequest {
                 root,
                 group_by: wc.group_by.clone(),
-                sort_by: wc.sort_by.clone(),
+                sort_by: sort_by.clone(),
                 arena_fields: arena_fields_vec,
                 already_sorted,
                 // `transform_index` indexes into a per-body Vec; the

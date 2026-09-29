@@ -257,10 +257,7 @@ pub fn validate_source_sort_policy(
             OrderingSite::SourceSortOrder,
         )
         .map_err(|refused| {
-            source_order_error(
-                source,
-                format!("source {}: {refused}", source.name.quoted_name()),
-            )
+            source_order_error(source, source_drop_message(&source.name, &refused))
         })?;
         if !seen.insert(field.field.clone()) {
             return Err(source_order_error(
@@ -293,6 +290,14 @@ pub fn validate_source_sort_policy(
     }
 
     Ok(validated)
+}
+
+/// The author-facing text of a Source `sort_order` field refused for
+/// `null_order: drop`. Schema binding reports it as a located diagnostic and
+/// [`validate_source_sort_policy`] returns it to direct callers, so both read
+/// the same words.
+pub(crate) fn source_drop_message(source_name: &str, refused: &DropNotAllowed) -> String {
+    format!("source {}: {refused}", source_name.quoted_name())
 }
 
 fn source_order_error(source: &SourceConfig, message: String) -> crate::error::PipelineError {

@@ -136,7 +136,10 @@ fn assert_one_drop_diagnostic(yaml: &str, node: &str, expected: &str) {
     let diag = matching[0];
     assert_eq!(diag.code, "E200", "wrong code for {:?}", diag.message);
     assert_eq!(diag.message, expected);
-    assert_eq!(diag.primary.span, span, "the refusal must point at {node:?}");
+    assert_eq!(
+        diag.primary.span, span,
+        "the refusal must point at {node:?}"
+    );
 }
 
 /// The group-ordering text for field `txn_date`, written out in full so a

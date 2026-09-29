@@ -1511,13 +1511,26 @@ impl PipelineConfig {
                 // skip — the missing-program diagnostic has already fired.
                 continue;
             };
+            // Schema binding validated this window's `sort_by`; a refused
+            // `null_order: drop` stopped compilation before lowering.
+            let Some(sort_by) = artifacts.window_sort_by.get(&graph[transform_idx].id()) else {
+                diags.push(Diagnostic::error(
+                    "E000",
+                    format!(
+                        "internal error: windowed transform '{transform_name}' reached index \
+                         planning without a validated `sort_by`"
+                    ),
+                    LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                ));
+                return Err(diags);
+            };
 
             let mut arena_fields: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
             for gb in &wc.group_by {
                 arena_fields.insert(gb.clone());
             }
-            for sf in &wc.sort_by {
+            for sf in sort_by {
                 arena_fields.insert(sf.field.clone());
             }
             for f in &report.transforms[i].accessed_fields {
@@ -1761,7 +1774,7 @@ impl PipelineConfig {
             raw_index_requests.push(crate::plan::index::RawIndexRequest {
                 root,
                 group_by: wc.group_by.clone(),
-                sort_by: wc.sort_by.clone(),
+                sort_by: sort_by.clone(),
                 arena_fields: arena_fields_vec,
                 already_sorted,
                 transform_index: i,
@@ -1823,8 +1836,12 @@ impl PipelineConfig {
                     anchor_schema,
                 }
             };
+            // Present for every transform the request pass above planned.
+            let Some(sort_by) = artifacts.window_sort_by.get(&graph[transform_idx].id()) else {
+                continue;
+            };
             let new_window_index =
-                crate::plan::index::find_index_for(&indices, &root, &wc.group_by, &wc.sort_by);
+                crate::plan::index::find_index_for(&indices, &root, &wc.group_by, sort_by);
             if let crate::plan::execution::PlanNode::Transform {
                 window_index,
                 partition_lookup,

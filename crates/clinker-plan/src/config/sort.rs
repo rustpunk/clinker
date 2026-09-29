@@ -95,10 +95,10 @@ fn default_sort_order() -> SortOrder {
 ///
 /// This is the vocabulary an author writes. `Drop` belongs to a Sink
 /// `sort_order`, whose job includes excluding rows. A Cull or Reshape
-/// `order_by` and a Source `sort_order` only order rows: they convert
-/// through [`OrderField::from_authored`], which refuses `Drop`, so their
-/// validated forms cannot hold it. A window `sort_by` still reads this
-/// authored form and removes null-keyed rows from its partition.
+/// `order_by`, a Source `sort_order` and a Transform
+/// `analytic_window.sort_by` only order rows: they convert through
+/// [`OrderField::from_authored`], which refuses `Drop`, so their validated
+/// forms cannot hold it.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]

@@ -1,6 +1,6 @@
 use clinker_bench_support::{LARGE, MEDIUM, RecordFactory, SMALL};
 use clinker_exec::pipeline::arena::Arena;
-use clinker_plan::config::{NullOrder, SortField, SortOrder};
+use clinker_plan::config::{NullPlacement, OrderField, SortOrder};
 use clinker_record::owned_storage::SharedStorage;
 use clinker_record::{MinimalRecord, Schema, Value};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
@@ -19,8 +19,8 @@ fn build_arena(record_count: usize, field_count: usize, null_ratio: f64) -> Aren
     Arena::from_parts(schema, minimals)
 }
 
-fn sort_field(name: &str, order: SortOrder, null_order: Option<NullOrder>) -> SortField {
-    SortField {
+fn sort_field(name: &str, order: SortOrder, null_order: NullPlacement) -> OrderField {
+    OrderField {
         field: name.to_string(),
         order,
         null_order,
@@ -31,7 +31,7 @@ fn sort_field(name: &str, order: SortOrder, null_order: Option<NullOrder>) -> So
 
 fn bench_sort_single_field(c: &mut Criterion) {
     let mut group = c.benchmark_group("sort_single_field");
-    let sort_by = vec![sort_field("f0", SortOrder::Asc, None)];
+    let sort_by = vec![sort_field("f0", SortOrder::Asc, NullPlacement::Last)];
 
     for count in [SMALL, MEDIUM, LARGE] {
         let arena = build_arena(count, 10, 0.0);
@@ -54,9 +54,9 @@ fn bench_sort_single_field(c: &mut Criterion) {
 fn bench_sort_multi_field(c: &mut Criterion) {
     let mut group = c.benchmark_group("sort_multi_field");
     let sort_by = vec![
-        sort_field("f0", SortOrder::Asc, None),
-        sort_field("f2", SortOrder::Desc, None),
-        sort_field("f4", SortOrder::Asc, None),
+        sort_field("f0", SortOrder::Asc, NullPlacement::Last),
+        sort_field("f2", SortOrder::Desc, NullPlacement::Last),
+        sort_field("f4", SortOrder::Asc, NullPlacement::Last),
     ];
 
     for count in [SMALL, MEDIUM, LARGE] {
@@ -79,7 +79,7 @@ fn bench_sort_multi_field(c: &mut Criterion) {
 
 fn bench_sort_with_nulls(c: &mut Criterion) {
     let mut group = c.benchmark_group("sort_with_nulls");
-    let sort_by = vec![sort_field("f0", SortOrder::Asc, Some(NullOrder::Last))];
+    let sort_by = vec![sort_field("f0", SortOrder::Asc, NullPlacement::Last)];
 
     for null_pct in [0, 10, 50] {
         let null_ratio = null_pct as f64 / 100.0;
@@ -102,7 +102,7 @@ fn bench_sort_with_nulls(c: &mut Criterion) {
 
 fn bench_sort_presorted(c: &mut Criterion) {
     let mut group = c.benchmark_group("sort_presorted");
-    let sort_by = vec![sort_field("f0", SortOrder::Asc, None)];
+    let sort_by = vec![sort_field("f0", SortOrder::Asc, NullPlacement::Last)];
 
     for count in [SMALL, MEDIUM, LARGE] {
         // Build a pre-sorted arena: sequential integers in f0
@@ -129,7 +129,7 @@ fn bench_sort_presorted(c: &mut Criterion) {
 
 fn bench_sort_reverse(c: &mut Criterion) {
     let mut group = c.benchmark_group("sort_reverse");
-    let sort_by = vec![sort_field("f0", SortOrder::Asc, None)];
+    let sort_by = vec![sort_field("f0", SortOrder::Asc, NullPlacement::Last)];
 
     for count in [SMALL, MEDIUM, LARGE] {
         let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["f0".into(), "f1".into()])));

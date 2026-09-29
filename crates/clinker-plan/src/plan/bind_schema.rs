@@ -138,6 +138,15 @@ pub struct CompileArtifacts {
     /// Bind→lowering handoff: lowering stamps it onto the node's
     /// `order_by`; the runtime never reads this side-table.
     pub group_order_by: HashMap<PlanNodeId, Vec<crate::config::OrderField>>,
+    /// Per-Transform validated `analytic_window.sort_by`, keyed by the
+    /// Transform's [`PlanNodeId`]: each authored entry converted to its
+    /// placement-only [`OrderField`](crate::config::OrderField), in
+    /// declaration order. Inserted for every Transform that declares an
+    /// `analytic_window` whose `sort_by` holds no refused `null_order: drop`,
+    /// top-level and composition-body alike. Bind→lowering handoff: the
+    /// window index requests are built from it; the runtime reads only the
+    /// resulting index specs.
+    pub window_sort_by: HashMap<PlanNodeId, Vec<crate::config::OrderField>>,
     /// Per-Transform typechecked log-directive gate predicates, keyed by the
     /// Transform node's [`PlanNodeId`] — one entry per `config.log` directive,
     /// in declaration order, `None` where the directive declared no
@@ -2661,6 +2670,22 @@ fn bind_schema_inner(
                     );
                     continue;
                 }
+                // A `sort_order` only states the order records arrive in,
+                // so `null_order: drop` is refused here, at the Source, under
+                // the code every ordering-only field uses. The rest of the
+                // ordering policy is checked when the source order compiles.
+                for spec in config.source.sort_order.iter().flatten() {
+                    if let Err(refused) = OrderField::from_authored(
+                        spec.clone().into_sort_field(),
+                        OrderingSite::SourceSortOrder,
+                    ) {
+                        diags.push(Diagnostic::error(
+                            "E200",
+                            crate::config::source::source_drop_message(&name, &refused),
+                            LabeledSpan::primary(span, String::new()),
+                        ));
+                    }
+                }
                 // Resolve the unified `schema:` (single-record column list,
                 // multi-record superset, external file, or engine-generated)
                 // to the effective column list this source seeds its row from.
@@ -2766,6 +2791,30 @@ fn bind_schema_inner(
                 artifacts.typed_insert(node_id, Arc::new(synthetic_typed_program(row)));
             }
             PipelineNode::Transform { header, config } => {
+                // A window `sort_by` only orders the rows of one partition,
+                // so each field converts to its placement-only form and a
+                // `null_order: drop` is refused at this Transform. The index
+                // requests are built from the validated list.
+                if let Some(window) = &config.analytic_window {
+                    let mut sort_by = Vec::with_capacity(window.sort_by.len());
+                    let mut refused_any = false;
+                    for sf in &window.sort_by {
+                        match OrderField::from_authored(sf.clone(), OrderingSite::WindowSortBy) {
+                            Ok(field) => sort_by.push(field),
+                            Err(refused) => {
+                                diags.push(Diagnostic::error(
+                                    "E200",
+                                    format!("transform {name:?}: {refused}"),
+                                    LabeledSpan::primary(span, String::new()),
+                                ));
+                                refused_any = true;
+                            }
+                        }
+                    }
+                    if !refused_any {
+                        artifacts.window_sort_by.insert(node_id, sort_by);
+                    }
+                }
                 // E108: check for enclosing-scope reference BEFORE upstream lookup.
                 if let Some(target) = upstream_target_name(&header.input.value)
                     && !schema_by_name.contains_key(target)
