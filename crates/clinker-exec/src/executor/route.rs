@@ -4,10 +4,11 @@ use std::sync::Arc;
 
 use clinker_plan::error::PipelineError;
 use clinker_record::Record;
-use cxl::eval::{EvalContext, EvalResult, ProgramEvaluator};
+use cxl::eval::{EvalContext, ProgramEvaluator};
 use cxl::typecheck::TypedProgram;
 
 use super::NullStorage;
+use crate::pipeline::combine_verdict::PredicateOutcome;
 
 /// Compiled route branch: a named CXL boolean condition evaluator.
 pub(crate) struct CompiledRouteBranch {
@@ -82,30 +83,36 @@ impl CompiledRoute {
     ) -> Result<Vec<String>, cxl::eval::EvalError> {
         match self.mode {
             clinker_plan::config::RouteMode::Exclusive => {
+                // The first branch whose condition is not "not true" decides:
+                // a true one takes the record, a failed one dead-letters it
+                // and neither a later branch nor the default is taken.
                 for branch in &mut self.branches {
-                    match branch
-                        .evaluator
-                        .eval_record::<NullStorage>(ctx, record, None)?
-                    {
-                        EvalResult::Emit { .. } | EvalResult::EmitMany { .. } => {
-                            return Ok(vec![branch.name.clone()]);
-                        }
-                        EvalResult::Skip(_) => continue,
+                    match PredicateOutcome::from_result(
+                        branch
+                            .evaluator
+                            .eval_record::<NullStorage>(ctx, record, None),
+                    ) {
+                        PredicateOutcome::True => return Ok(vec![branch.name.clone()]),
+                        PredicateOutcome::NotTrue => continue,
+                        PredicateOutcome::Failed(error) => return Err(error),
                     }
                 }
                 Ok(vec![self.default.clone()])
             }
             clinker_plan::config::RouteMode::Inclusive => {
                 let mut matched = Vec::new();
+                // A failed condition dead-letters the record: it takes no
+                // branch, not even one whose condition held, and not the
+                // default.
                 for branch in &mut self.branches {
-                    match branch
-                        .evaluator
-                        .eval_record::<NullStorage>(ctx, record, None)?
-                    {
-                        EvalResult::Emit { .. } | EvalResult::EmitMany { .. } => {
-                            matched.push(branch.name.clone());
-                        }
-                        EvalResult::Skip(_) => {}
+                    match PredicateOutcome::from_result(
+                        branch
+                            .evaluator
+                            .eval_record::<NullStorage>(ctx, record, None),
+                    ) {
+                        PredicateOutcome::True => matched.push(branch.name.clone()),
+                        PredicateOutcome::NotTrue => {}
+                        PredicateOutcome::Failed(error) => return Err(error),
                     }
                 }
                 if matched.is_empty() {
