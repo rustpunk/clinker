@@ -1795,6 +1795,16 @@ impl MemoryArbitrator {
         self.register_owned_consumer(false, consumer, handle, label)
     }
 
+    /// The consumer registered as `id`, while it is registered.
+    #[cfg(test)]
+    pub(crate) fn registered_consumer(&self, id: ConsumerId) -> Option<Arc<dyn MemoryConsumer>> {
+        self.consumers
+            .load()
+            .iter()
+            .find(|(registered, _)| *registered == id)
+            .map(|(_, consumer)| Arc::clone(consumer))
+    }
+
     /// Register a consumer that holds the retained state of the node named
     /// `label.node`, so the run's report can say how much that node held
     /// charged. `label.node` is the one spelling of the owner.

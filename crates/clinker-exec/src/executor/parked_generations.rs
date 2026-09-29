@@ -313,6 +313,17 @@ impl ParkedGenerations {
         Ok(Some(NodeBuffer::chained(parts)))
     }
 
+    /// Edge `key`'s consumer and the handle it charges.
+    #[cfg(test)]
+    pub(crate) fn edge_consumer(
+        &self,
+        key: &ParkedKey,
+    ) -> Option<(ConsumerId, Arc<ConsumerHandle>)> {
+        self.forward
+            .get(key)
+            .map(|edge| (edge.consumer, Arc::clone(&edge.handle)))
+    }
+
     /// Release every parked edge: drop its rows and spill files, release its
     /// charge and its disk-quota bytes, and unregister its consumer.
     pub(crate) fn release_all(&mut self) {
@@ -350,5 +361,143 @@ fn unregistered_edge(key: &ParkedKey) -> PipelineError {
         node: format!("edge-{}", key.1.index()),
         detail: "parked cross-region rows were added to an edge that was never registered"
             .to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::memory::Priority;
+    use crate::pipeline::memory::ledger::{PassKind, Requester};
+    use crate::pipeline::memory::walk::{WalkContextGuard, WalkReclaimSet, WalkSpillSettings};
+    use clinker_plan::plan::EntityRef;
+    use clinker_record::owned_storage::SharedStorage;
+    use clinker_record::{Schema, Value};
+
+    fn rows(first: u64, count: u64) -> Vec<(Record, SourceRowId)> {
+        let schema =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into(), "payload".into()])));
+        (first..first + count)
+            .map(|row| {
+                (
+                    Record::new(
+                        schema.clone(),
+                        vec![
+                            Value::Integer(row as i64),
+                            Value::String(format!("parked-{row:06}").repeat(8).into()),
+                        ],
+                    ),
+                    SourceRowId::new(clinker_plan::plan::PlanNodeId::new(3), row),
+                )
+            })
+            .collect()
+    }
+
+    /// The bytes a park of `rows` charges: every row's slots and payload.
+    fn resident_bytes(rows: &[(Record, SourceRowId)]) -> u64 {
+        NodeBuffer::memory_from_records(rows.to_vec()).reclaimable_bytes()
+    }
+
+    /// One edge parks twice with a cursor over its first segment still open
+    /// in between. The edge ranks by, and a pass electing it frees, only the
+    /// segment no cursor shares; once the cursor closes the first segment
+    /// counts again.
+    #[test]
+    fn reclaimable_excludes_segments_under_a_live_view() {
+        let root = tempfile::tempdir().expect("spill root");
+        let first = rows(0, 32);
+        let second = rows(32, 16);
+        let (first_bytes, second_bytes) = (resident_bytes(&first), resident_bytes(&second));
+        let limit = first_bytes + second_bytes + 1024;
+        let arbitrator = Arc::new(MemoryArbitrator::with_policy(
+            limit,
+            0.80,
+            0.70,
+            Box::new(Priority),
+        ));
+        let set = Rc::new(RefCell::new(WalkReclaimSet::new(WalkSpillSettings {
+            spill_root: Arc::from(root.path()),
+            spill_compress: CompressMode::Auto,
+            batch_size: 1024,
+        })));
+        let store = Rc::new(RefCell::new(ParkedGenerations::new(
+            Arc::clone(&arbitrator),
+            Arc::from(root.path()),
+            CompressMode::Auto,
+            1024,
+        )));
+        set.borrow_mut().set_parked_generations(Rc::clone(&store));
+        let _walk = WalkContextGuard::install(&arbitrator, Rc::clone(&set));
+        let consumers_before = arbitrator.consumer_count();
+
+        let key: ParkedKey = (None, EdgeIndex::new(4));
+        ParkedGenerations::park(&store, key, &first, "lookup", "enriched").expect("first park");
+        let view = store
+            .borrow_mut()
+            .publish_view(&key)
+            .expect("view")
+            .expect("the edge has rows");
+        ParkedGenerations::park(&store, key, &second, "lookup", "enriched").expect("second park");
+        let (consumer, handle) = store.borrow().edge_consumer(&key).expect("registered");
+        assert_eq!(handle.bytes(), first_bytes + second_bytes);
+        let registered = arbitrator
+            .registered_consumer(consumer)
+            .expect("the edge's consumer is registered");
+        assert_eq!(
+            registered.reclaimable_bytes(),
+            second_bytes,
+            "a segment an open cursor shares cannot be freed by a spill, so it does not rank"
+        );
+
+        let outcome = arbitrator
+            .reclaim_pass(
+                second_bytes,
+                Requester::governed(),
+                &mut *set.borrow_mut(),
+                PassKind::Ordinary,
+            )
+            .expect("the pass spills");
+        assert_eq!(
+            outcome.freed, second_bytes,
+            "the pass frees exactly the unviewed segment"
+        );
+        assert_eq!(
+            handle.bytes(),
+            first_bytes,
+            "the viewed segment stays charged"
+        );
+        assert!(arbitrator.per_stage_spill_bytes_written()["lookup"] > 0);
+        assert_eq!(registered.reclaimable_bytes(), 0);
+
+        drop(view);
+        assert_eq!(
+            registered.reclaimable_bytes(),
+            first_bytes,
+            "once the cursor closes, the first segment can be spilled again"
+        );
+        let reread: Vec<u64> = store
+            .borrow_mut()
+            .publish_view(&key)
+            .expect("view")
+            .expect("rows")
+            .drain()
+            .map(|event| match event.expect("read") {
+                crate::executor::stream_event::StreamEvent::Record(_, row) => row.ordinal(),
+                crate::executor::stream_event::StreamEvent::Punctuation(_) => u64::MAX,
+            })
+            .collect();
+        assert_eq!(
+            reread,
+            (0..48).collect::<Vec<u64>>(),
+            "both segments read back whole, in parking order"
+        );
+
+        store.borrow_mut().release_all();
+        assert_eq!(arbitrator.consumer_count(), consumers_before);
+        assert_eq!(
+            arbitrator.cumulative_spill_bytes(),
+            0,
+            "released files leave the quota"
+        );
     }
 }

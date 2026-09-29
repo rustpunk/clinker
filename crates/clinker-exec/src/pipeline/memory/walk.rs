@@ -30,6 +30,7 @@ use super::{ConsumerHandle, ConsumerId, MemoryArbitrator};
 use crate::executor::dispatch::{NodeBufferKey, NodeBufferReaderLedger, ResidentSlotSpill};
 use crate::executor::document_dlq::{DocumentBuckets, DocumentDlqState};
 use crate::executor::node_buffer::NodeBuffer;
+use crate::executor::parked_generations::ParkedGenerations;
 
 /// Where the calling thread stands relative to one run's walk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -258,6 +259,8 @@ pub(crate) struct WalkReclaimSet {
     /// the Output ends; one left behind because the set was borrowed then is
     /// dropped by the next pass that finds no bucket for it.
     document_buckets: HashMap<ConsumerId, DocumentBucketEntry>,
+    /// The run's rows parked for a deferred consumer.
+    parked: Option<Rc<RefCell<ParkedGenerations>>>,
 }
 
 /// The walk reclaim set's way to one Output bucket: the Output's cell of
@@ -286,7 +289,14 @@ impl WalkReclaimSet {
             spill_settings,
             document_dlq: None,
             document_buckets: HashMap::new(),
+            parked: None,
         }
+    }
+
+    /// Make the run's parked cross-region rows, in their own cell, victims
+    /// every pass on this walk can reach.
+    pub(crate) fn set_parked_generations(&mut self, store: Rc<RefCell<ParkedGenerations>>) {
+        self.parked = Some(store);
     }
 
     /// Make the Output bucket registered as consumer `id`, held in `cell`,
