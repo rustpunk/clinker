@@ -1031,6 +1031,12 @@ impl MemoryConsumer for DocumentDlqConsumer {
         self.handle.bytes()
     }
 
+    /// Only the held log's resident frames leave memory on a spill; the
+    /// index, failed-document slots and ledgers are exact state that stays.
+    fn reclaimable_bytes(&self) -> u64 {
+        self.resident.load(Ordering::Relaxed)
+    }
+
     fn peak_charged_bytes(&self) -> Option<u64> {
         Some(self.handle.peak_bytes())
     }
@@ -1440,6 +1446,8 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
         source_row: SourceRowId,
     ) -> Result<(), PipelineError> {
         let column_count = record.schema().column_count();
+        let reclaimable = crate::executor::node_buffer::record_byte_cost(column_count)
+            .saturating_add(record.legacy_estimated_heap_size() as u64);
         let bucket = Self::bucket_for(&mut self.buckets, &self.arbitrator, &self.output_name, key);
         bucket.buffer.push(record, source_row);
         bucket.handle.set_bytes(
@@ -1447,6 +1455,10 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
                 .buffer
                 .unaccounted_memory_bytes(&self.allocation_resources),
         );
+        // The bucket's resident tail is what its in-place spill frees.
+        bucket
+            .handle
+            .set_reclaimable(bucket.handle.reclaimable().saturating_add(reclaimable));
         if self.arbitrator.should_spill() {
             spill_bucket_in_place(
                 bucket,
@@ -1507,6 +1519,7 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
             ..
         } = bucket;
         handle.set_bytes(0);
+        handle.set_reclaimable(0);
         let result = (|| {
             // Drain in ARRIVAL order. The success sink is order-sensitive, and
             // a bucket that spilled and then kept a resident mem tail has its
@@ -1965,6 +1978,7 @@ fn spill_bucket_in_place(
     // The mem tail is now on disk; the bucket's live in-memory bytes are
     // zero (only spill chunks remain).
     bucket.handle.set_bytes(0);
+    bucket.handle.set_reclaimable(0);
     bucket.buffer = NodeBuffer::Spilled {
         chunks,
         pending_puncts: puncts,
@@ -2040,6 +2054,7 @@ fn reject_document_now(
             ..
         }) => {
             handle.set_bytes(0);
+            handle.set_reclaimable(0);
             (Some(buffer), Some(consumer_id))
         }
         None => (None, None),

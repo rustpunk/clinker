@@ -216,7 +216,8 @@ impl Arena {
 /// `i32::MAX - 1` — ranked just ahead of Sources (which at least pause)
 /// and behind every spillable consumer, so a policy elects an arena
 /// only when nothing else can act. The wrapper exists for attribution,
-/// not for victim selection.
+/// not for victim selection: `reclaimable_bytes` is 0, so no reclaim pass
+/// or victim policy elects it.
 pub(crate) struct ArenaConsumer {
     handle: Arc<ConsumerHandle>,
 }
@@ -232,6 +233,10 @@ impl ArenaConsumer {
 impl MemoryConsumer for ArenaConsumer {
     fn current_usage(&self) -> u64 {
         self.handle.bytes()
+    }
+
+    fn reclaimable_bytes(&self) -> u64 {
+        0
     }
 
     fn peak_charged_bytes(&self) -> Option<u64> {

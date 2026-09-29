@@ -464,6 +464,10 @@ impl Drop for ExecutorAuthority {
         self.arbitrator.retry_writer_cleanup();
     }
 }
+/// The run's writer resources: output staging, a fixed tail per writer
+/// that is a working floor, not reclaimable state. No reclaim pass or
+/// victim policy elects it (`reclaimable_bytes` is 0): the walk cannot spill
+/// a writer's staging, and no pass may wait for a writer to act.
 struct WriterResourceConsumer {
     handle: Arc<ConsumerHandle>,
 }
@@ -471,6 +475,10 @@ struct WriterResourceConsumer {
 impl MemoryConsumer for WriterResourceConsumer {
     fn current_usage(&self) -> u64 {
         self.handle.bytes()
+    }
+
+    fn reclaimable_bytes(&self) -> u64 {
+        0
     }
 
     fn peak_charged_bytes(&self) -> Option<u64> {

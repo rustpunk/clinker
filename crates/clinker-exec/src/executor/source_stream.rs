@@ -427,7 +427,10 @@ impl SourceIngestChannel {
 ///
 /// Sources do not spill: `try_spill` returns `Ok(0)` and the
 /// arbitrator's policy is expected to choose `pause` instead via
-/// `BackPressurePreferred`. `spill_priority = i32::MAX` so the
+/// `BackPressurePreferred`. The queued-event charge is heap no spill can
+/// free (a Source is relieved by pausing and by the walk draining its
+/// channel), so `reclaimable_bytes` is 0 and no reclaim pass ranks a Source
+/// by that charge. `spill_priority = i32::MAX` so the
 /// `Priority` fallback ranks Sources last among the spill candidates
 /// when no back-pressureable consumer is available.
 /// `can_back_pressure = true`; `pause` / `resume` forward to the
@@ -446,6 +449,10 @@ impl SourceConsumer {
 impl crate::pipeline::memory::MemoryConsumer for SourceConsumer {
     fn current_usage(&self) -> u64 {
         self.handle.bytes()
+    }
+
+    fn reclaimable_bytes(&self) -> u64 {
+        0
     }
 
     fn peak_charged_bytes(&self) -> Option<u64> {

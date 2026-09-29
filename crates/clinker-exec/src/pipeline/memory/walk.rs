@@ -53,6 +53,10 @@ pub(crate) struct SlotSpill {
 /// registrations, what a spill of each registered slot needs, and the
 /// remaining-reader ledger.
 ///
+/// Whenever a registered slot's buffer is published here, whichever of the
+/// two comes second records the buffer's reclaimable bytes on the slot's
+/// handle, so the slot ranks as a reclaim victim by what its spill frees.
+///
 /// A composition body walks its own scope, swapped in for the parent's, so
 /// equal body-local and parent `NodeIndex` values never collide. A slot's
 /// registration and its spill facts change together, through
@@ -86,6 +90,9 @@ impl NodeBufferSlots {
         key: NodeBufferKey,
         buffer: NodeBuffer,
     ) -> Option<NodeBuffer> {
+        if let Some((_, handle)) = self.registrations.get(&key) {
+            handle.set_reclaimable(buffer.reclaimable_bytes());
+        }
         self.buffers.insert(key, buffer)
     }
 
@@ -110,6 +117,9 @@ impl NodeBufferSlots {
         registration: SlotRegistration,
         spill: SlotSpill,
     ) -> Option<SlotRegistration> {
+        if let Some(buffer) = self.buffers.get(&key) {
+            registration.1.set_reclaimable(buffer.reclaimable_bytes());
+        }
         self.spill.insert(key.clone(), spill);
         self.registrations.insert(key, registration)
     }

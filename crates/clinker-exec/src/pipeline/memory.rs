@@ -474,6 +474,11 @@ pub struct ConsumerHandle {
     /// The ledger this handle charges while its consumer is registered.
     /// Locked before the ledger, never after it.
     binding: Mutex<Option<HandleBinding>>,
+    /// What a spill of the owner's state would free now, set by the owner
+    /// for a consumer whose resident state differs from its charge (a
+    /// node-buffer slot's rows carry a payload charged to whoever allocated
+    /// it). Ranking only: never charged, never summed into the ledger.
+    reclaimable: AtomicU64,
     spill_requested: AtomicBool,
     pause_signal: PauseSignal,
     /// Set while the walk thread is actively draining this consumer's
@@ -500,6 +505,7 @@ impl ConsumerHandle {
             bytes: AtomicU64::new(0),
             peak: AtomicU64::new(0),
             binding: Mutex::new(None),
+            reclaimable: AtomicU64::new(0),
             spill_requested: AtomicBool::new(false),
             pause_signal: PauseSignal::new(),
             active: AtomicBool::new(false),
@@ -766,6 +772,20 @@ impl ConsumerHandle {
         {
             self.raise_peak(mark);
         }
+    }
+
+    /// Record what a spill of the owner's state would free now. The owner
+    /// sets it where that state becomes resident and where it spills or
+    /// leaves; a consumer that reads it reports it as its
+    /// [`MemoryConsumer::reclaimable_bytes`]. Lock-free.
+    pub(crate) fn set_reclaimable(&self, bytes: u64) {
+        self.reclaimable.store(bytes, Ordering::Relaxed);
+    }
+
+    /// The figure [`Self::set_reclaimable`] last recorded; 0 until then.
+    /// Lock-free.
+    pub(crate) fn reclaimable(&self) -> u64 {
+        self.reclaimable.load(Ordering::Relaxed)
     }
 
     /// Flip the spill-request flag to `true`. Called by the consumer

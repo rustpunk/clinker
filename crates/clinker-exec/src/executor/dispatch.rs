@@ -5295,6 +5295,7 @@ impl ResidentSlotSpill<'_> {
             .resolve_for_schema(column_count, self.batch_size as u64);
         let (spilled, file_bytes) =
             buffer.spill_resident_memory(Some(self.spill_root), compress)?;
+        handle.set_reclaimable(spilled.reclaimable_bytes());
         node_buffers.insert(key.clone(), spilled);
         if file_bytes > 0 {
             // Rows are on disk now; the slot's in-memory charge is zero.

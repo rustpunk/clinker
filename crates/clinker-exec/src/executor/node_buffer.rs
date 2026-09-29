@@ -476,6 +476,26 @@ impl NodeBuffer {
         })
     }
 
+    /// Bytes a spill of this slot would free now: each resident record's
+    /// slot cost plus its own heap payload (strings, lists, record
+    /// variables). The payload counts even when another consumer is charged
+    /// for it, because the spill drops it. Rows already on disk count 0.
+    /// What the slot's consumer ranks by as a reclaim victim; never charged.
+    pub(crate) fn reclaimable_bytes(&self) -> u64 {
+        let events = match self {
+            Self::Memory(events) => events.as_slice(),
+            Self::Mixed { mem, .. } => mem.as_slice(),
+            Self::Spilled { .. } | Self::MergeSpilled { .. } => return 0,
+            Self::ReReadable(backing) => backing.memory_events(),
+        };
+        events.iter().fold(0u64, |bytes, event| match event {
+            StreamEvent::Record(record, _) => bytes
+                .saturating_add(record_byte_cost(record.schema().column_count()))
+                .saturating_add(record.legacy_estimated_heap_size() as u64),
+            StreamEvent::Punctuation(_) => bytes,
+        })
+    }
+
     /// Actual resident fixed-row attribution to this run, with each row's
     /// private values backing classified independently. Does not allocate.
     pub(crate) fn unaccounted_memory_bytes(&self, resources: &AllocationResources) -> u64 {
@@ -786,6 +806,9 @@ impl TransientNodeBufferReservation {
         id: crate::pipeline::memory::ConsumerId,
         handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
     ) -> Self {
+        // The rows leave the slot with the reservation, so no pass may elect
+        // this consumer for them any more.
+        handle.set_reclaimable(0);
         Self {
             budget,
             consumer_id: id,
@@ -951,6 +974,11 @@ pub(crate) fn node_buffer_shortfall_error(
 /// service a spill request, so it advertises neither reclamation nor
 /// back-pressure. Its owner releases the charge only when the materialization is dropped
 /// or transfers it into a composition body slot.
+///
+/// `reclaimable_bytes` is the figure its handle records, which is 0 for the
+/// materialization itself. Only once its rows are published as a composition
+/// body's seed slot, where the walk can spill them, does the slot record
+/// their resident bytes there.
 struct TransientNodeBufferConsumer {
     handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
 }
@@ -964,6 +992,10 @@ impl TransientNodeBufferConsumer {
 impl crate::pipeline::memory::MemoryConsumer for TransientNodeBufferConsumer {
     fn current_usage(&self) -> u64 {
         self.handle.bytes()
+    }
+
+    fn reclaimable_bytes(&self) -> u64 {
+        self.handle.reclaimable()
     }
 
     fn peak_charged_bytes(&self) -> Option<u64> {
@@ -1210,6 +1242,15 @@ impl NodeBufferConsumer {
 impl crate::pipeline::memory::MemoryConsumer for NodeBufferConsumer {
     fn current_usage(&self) -> u64 {
         self.handle.bytes()
+    }
+
+    /// The slot's resident rows with their payload
+    /// ([`NodeBuffer::reclaimable_bytes`]), recorded on the handle whenever
+    /// the walk publishes the slot's buffer and whenever the slot spills; 0
+    /// for a slot that holds nothing resident, and for a handle that backs
+    /// no walk-owned slot (a streaming hand-off's in-flight batches).
+    fn reclaimable_bytes(&self) -> u64 {
+        self.handle.reclaimable()
     }
 
     fn peak_charged_bytes(&self) -> Option<u64> {
