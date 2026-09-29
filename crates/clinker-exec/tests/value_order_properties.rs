@@ -21,15 +21,23 @@
 //! leap second and the instant it ties), so ties and near-ties across domains
 //! are frequent rather than accidental.
 //!
-//! Case counts: 1,024 per pair property and 512 for the triple property.
+//! The Sort node's authored key adds null placement, direction and several
+//! fields on top of the value order, so a last property proves its byte key
+//! and its comparator agree on whole records as well.
+//!
+//! Case counts: 1,024 per pair property (the authored-key property included)
+//! and 512 for the triple property.
 
 use std::cmp::Ordering;
 use std::hash::{DefaultHasher, Hasher};
+use std::sync::Arc;
 
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
-use clinker_record::Value;
+use clinker_exec::pipeline::sort_key::{compare_authored_keys, stable_sort_key_for_record};
+use clinker_plan::config::{NullOrder, SortField, SortOrder};
 use clinker_record::order::{NumericTieClass, compare, encode, hash_tie_class, ties};
-use clinker_record::owned_storage::OwnedValues;
+use clinker_record::owned_storage::{OwnedValues, SharedStorage};
+use clinker_record::{Record, Schema, Value};
 use proptest::prelude::*;
 use rust_decimal::Decimal;
 
@@ -524,6 +532,78 @@ proptest! {
         ] {
             check_transitive(x, y, z)?;
         }
+    }
+}
+
+/// One sort field's content in one record: a value (possibly null) or no
+/// column of that name at all.
+#[derive(Debug, Clone)]
+enum Slot {
+    Present(Value),
+    Absent,
+}
+
+fn slot(v: Value) -> impl Strategy<Value = Slot> {
+    prop_oneof![
+        6 => Just(Slot::Present(v)),
+        1 => Just(Slot::Present(Value::Null)),
+        1 => Just(Slot::Absent),
+    ]
+}
+
+/// The two records' slots for one sort field, drawn from the pair generator
+/// so a field ties as often as it differs and later fields get to decide.
+fn slot_pair() -> BoxedStrategy<(Slot, Slot)> {
+    pair().prop_flat_map(|(a, b)| (slot(a), slot(b))).boxed()
+}
+
+/// A record holding the present slots under the names `f0`, `f1`, …; an
+/// absent slot has no column, so `Record::get` finds nothing for it.
+fn slot_record<'a>(slots: impl Iterator<Item = &'a Slot>) -> Record {
+    let mut names = Vec::new();
+    let mut values = Vec::new();
+    for (index, slot) in slots.enumerate() {
+        if let Slot::Present(v) = slot {
+            names.push(format!("f{index}").into());
+            values.push(v.clone());
+        }
+    }
+    Record::new(
+        SharedStorage::from_arc(Arc::new(Schema::new(names))),
+        values,
+    )
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(1024))]
+
+    /// The Sort node's byte key orders two records exactly as its comparator
+    /// does, over one to three fields with any direction and nulls first or
+    /// last: the spilled merge and the streaming aggregate compare the bytes,
+    /// the resident sort the comparator.
+    #[test]
+    fn authored_key_encoder_agrees_with_authored_comparator(
+        fields in prop::collection::vec((slot_pair(), any::<bool>(), any::<bool>()), 1..=3),
+    ) {
+        let sort_by: Vec<SortField> = fields
+            .iter()
+            .enumerate()
+            .map(|(index, (_, descending, nulls_first))| SortField {
+                field: format!("f{index}"),
+                order: if *descending { SortOrder::Desc } else { SortOrder::Asc },
+                null_order: Some(if *nulls_first { NullOrder::First } else { NullOrder::Last }),
+            })
+            .collect();
+        let a = slot_record(fields.iter().map(|((a, _), _, _)| a));
+        let b = slot_record(fields.iter().map(|((_, b), _, _)| b));
+        prop_assert_eq!(
+            stable_sort_key_for_record(&a, &sort_by).cmp(&stable_sort_key_for_record(&b, &sort_by)),
+            compare_authored_keys(&a, &b, &sort_by),
+            "{:?} vs {:?} under {:?}",
+            fields.iter().map(|((a, _), _, _)| a).collect::<Vec<_>>(),
+            fields.iter().map(|((_, b), _, _)| b).collect::<Vec<_>>(),
+            sort_by
+        );
     }
 }
 

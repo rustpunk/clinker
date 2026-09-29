@@ -410,4 +410,187 @@ mod tests {
             _ => panic!("expected InMemory"),
         }
     }
+
+    mod resident_and_spilled {
+        use super::*;
+        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
+        use crate::pipeline::sort_key::compare_authored_keys;
+        use crate::pipeline::spill_merge::{MergeBudget, merge_sorted_runs};
+        use proptest::prelude::*;
+        use rust_decimal::Decimal;
+
+        /// Sort-key values weighted so NaNs of both signs, signed zeros,
+        /// integers, floats and decimals of equal value, nulls and exact
+        /// duplicates all turn up in one batch.
+        fn sort_value() -> impl Strategy<Value = Value> {
+            prop_oneof![
+                2 => Just(Value::Null),
+                1 => Just(Value::Float(f64::NAN)),
+                1 => Just(Value::Float(-f64::NAN)),
+                1 => Just(Value::Float(f64::from_bits(0xFFF0_0000_0000_0042))),
+                1 => Just(Value::Float(0.0)),
+                1 => Just(Value::Float(-0.0)),
+                1 => Just(Value::Float(f64::INFINITY)),
+                1 => Just(Value::Float(f64::NEG_INFINITY)),
+                1 => Just(Value::Integer((1 << 53) + 1)),
+                1 => Just(Value::Float(9_007_199_254_740_992.0)),
+                3 => (-3i64..=3).prop_map(Value::Integer),
+                3 => (-6i64..=6).prop_map(|halves| Value::Float(halves as f64 / 2.0)),
+                3 => (-30i64..=30, 0u32..=2).prop_map(|(m, s)| Value::Decimal(Decimal::new(m, s))),
+            ]
+        }
+
+        fn schema() -> SharedStorage<Schema> {
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["v".into(), "id".into()])))
+        }
+
+        /// A value's identity down to its bits, so a NaN's sign and payload
+        /// and a zero's sign count: the property checks that each output row
+        /// is the exact record its payload says it is.
+        fn bits(v: Option<&Value>) -> String {
+            match v {
+                Some(Value::Float(f)) => format!("float {:#x}", f.to_bits()),
+                other => format!("{other:?}"),
+            }
+        }
+
+        fn identities(rows: &[(Record, u64)]) -> Vec<(String, u64)> {
+            rows.iter()
+                .map(|(record, payload)| (bits(record.get("v")), *payload))
+                .collect()
+        }
+
+        proptest! {
+            // 128 cases; each spills up to 40 single-row runs three times
+            // over, and the whole property runs in about a second.
+            #![proptest_config(ProptestConfig::with_cases(128))]
+
+            /// A Sort's output is the same (record, payload) sequence whether
+            /// it stays resident or spills runs of 1, 2 or 7 rows and merges
+            /// them, and that sequence is a stable sort by the authored
+            /// comparator. A comparator that was not a total order (a NaN
+            /// equal to everything) would let run boundaries change it.
+            ///
+            /// Every record here has the same shape (two inline values, a
+            /// `u64` payload), so each push charges the buffer the same
+            /// number of bytes, measured below as `row_bytes`. A threshold of
+            /// `k × row_bytes` makes `should_spill` report exactly after the
+            /// `k`-th push since the last run, so every run but the last holds
+            /// `k` rows.
+            #[test]
+            fn sort_output_is_identical_in_memory_and_spilled(
+                values in prop::collection::vec(sort_value(), 0..=40),
+                descending in any::<bool>(),
+                nulls_first in any::<bool>(),
+            ) {
+                let schema = schema();
+                let sort_by = vec![sf_nulls(
+                    "v",
+                    if descending { SortOrder::Desc } else { SortOrder::Asc },
+                    if nulls_first { NullOrder::First } else { NullOrder::Last },
+                )];
+                let input: Vec<(Record, u64)> = values
+                    .iter()
+                    .enumerate()
+                    .map(|(id, v)| {
+                        let record = Record::new(
+                            schema.clone(),
+                            vec![v.clone(), Value::Integer(id as i64)],
+                        );
+                        (record, id as u64)
+                    })
+                    .collect();
+
+                let mut reference = input.clone();
+                reference.sort_by(|(a, _), (b, _)| compare_authored_keys(a, b, &sort_by));
+                let reference = identities(&reference);
+
+                let mut resident: SortBuffer<u64> = SortBuffer::new(
+                    sort_by.clone(),
+                    usize::MAX,
+                    None,
+                    true,
+                    schema.clone(),
+                    test_allocation_resources(),
+                );
+                for (record, payload) in input.iter().cloned() {
+                    resident.push(record, payload);
+                }
+                let resident = match resident.finish().unwrap().0 {
+                    SortedOutput::InMemory(rows) => identities(&rows),
+                    SortedOutput::Spilled(_) => panic!("an unbounded threshold spilled"),
+                };
+                prop_assert_eq!(&resident, &reference);
+
+                let Some((first, first_payload)) = input.first().cloned() else {
+                    return Ok(());
+                };
+                let mut probe: SortBuffer<u64> = SortBuffer::new(
+                    sort_by.clone(),
+                    usize::MAX,
+                    None,
+                    true,
+                    schema.clone(),
+                    test_allocation_resources(),
+                );
+                probe.push(first, first_payload);
+                let row_bytes = probe.bytes_used();
+                prop_assert!(row_bytes > 0);
+
+                // Charged with every run the merge reads, as a sort's own spills
+                // are; `record_spill_bytes` reports whether the disk cap is
+                // exceeded, which an uncapped arbitrator never is.
+                let arbitrator =
+                    MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
+                for rows_per_run in [1usize, 2, 7] {
+                    let mut buffer: SortBuffer<u64> = SortBuffer::new(
+                        sort_by.clone(),
+                        rows_per_run * row_bytes,
+                        None,
+                        true,
+                        schema.clone(),
+                        test_allocation_resources(),
+                    );
+                    let mut pending = 0usize;
+                    for (record, payload) in input.iter().cloned() {
+                        let before = buffer.bytes_used();
+                        buffer.push(record, payload);
+                        prop_assert_eq!(buffer.bytes_used() - before, row_bytes);
+                        pending += 1;
+                        if buffer.should_spill() {
+                            prop_assert_eq!(pending, rows_per_run);
+                            let written = buffer.sort_and_spill().unwrap();
+                            prop_assert!(!arbitrator.record_spill_bytes("sort", written));
+                            pending = 0;
+                        }
+                    }
+                    let (sorted, residue) = buffer.finish().unwrap();
+                    let rows = match sorted {
+                        SortedOutput::InMemory(rows) => {
+                            prop_assert!(input.len() < rows_per_run);
+                            rows
+                        }
+                        SortedOutput::Spilled(files) => {
+                            prop_assert_eq!(files.len(), input.len().div_ceil(rows_per_run));
+                            prop_assert!(!arbitrator.record_spill_bytes("sort", residue));
+                            let budget = MergeBudget {
+                                budget: &arbitrator,
+                                node: "sort",
+                                compress: true,
+                                charge_owner: None,
+                            };
+                            merge_sorted_runs(files, &sort_by, "resident versus spilled", budget)
+                                .unwrap()
+                        }
+                    };
+                    prop_assert_eq!(
+                        &identities(&rows),
+                        &resident,
+                        "runs of {} rows changed the output",
+                        rows_per_run
+                    );
+                }
+            }
+        }
+    }
 }
