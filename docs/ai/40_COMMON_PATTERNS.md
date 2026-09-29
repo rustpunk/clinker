@@ -222,7 +222,10 @@ permanent stability.
   `f64` widening or a per-type byte encoding reintroduces the disagreement the
   module removes. The Sort node's comparator and byte key
   (`pipeline/sort_key.rs`) and group keys (`GroupByKey`, whose equality, hash
-  and `encode_tie_bytes` are the order's tie) are on it; the Cull and Reshape
+  and `encode_tie_bytes` are the order's tie) are on it, and Aggregate `min`
+  and `max` pick by `clinker_record::accumulator::extremum_order`, which is
+  `compare` refined by a fixed representative among tied values (it never
+  reverses `compare`, so it is not a second order); the Cull and Reshape
   group sorts call the Sort node's comparator over the plan node's
   placement-only `order_by`, so they carry no rule of their own. The module
   defines ordering, not predicates: a comparison
