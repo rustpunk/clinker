@@ -715,10 +715,15 @@ struct SortMergeStats {
 /// or body evaluation errors, and `on_miss: error` driver misses.
 /// Returns [`PipelineError::Internal`] on planner-shape violations
 /// (e.g. invocation with no range conjuncts) and on spill I/O failures.
+///
+/// Runs on the calling thread, so its budget checks and spills run there;
+/// only range-key extraction and the sort buffers' comparator sorts run on
+/// `pool`.
 pub(crate) fn execute_combine_sort_merge(
     args: SortMergeExec<'_>,
+    pool: &Arc<rayon::ThreadPool>,
 ) -> Result<SortMergeOutput, PipelineError> {
-    let (output, _stats) = execute_combine_sort_merge_with_stats(args)?;
+    let (output, _stats) = execute_combine_sort_merge_with_stats(args, pool)?;
     Ok(output)
 }
 
@@ -746,12 +751,13 @@ pub(crate) struct SortMergeOutput {
 /// through [`execute_combine_sort_merge`].
 fn execute_combine_sort_merge_with_stats(
     args: SortMergeExec<'_>,
+    pool: &Arc<rayon::ThreadPool>,
 ) -> Result<(SortMergeOutput, SortMergeStats), PipelineError> {
     // This kernel is the sole byte writer for its operator-private handle.
     // Restore only its prior attribution after error-owned locals have dropped.
     let consumer = args.consumer_handle.clone();
     let baseline = consumer.bytes();
-    let result = execute_combine_sort_merge_inner(args);
+    let result = execute_combine_sort_merge_inner(args, pool);
     if result.is_err() {
         consumer.set_bytes(baseline);
     }
@@ -760,6 +766,7 @@ fn execute_combine_sort_merge_with_stats(
 
 fn execute_combine_sort_merge_inner(
     args: SortMergeExec<'_>,
+    pool: &Arc<rayon::ThreadPool>,
 ) -> Result<(SortMergeOutput, SortMergeStats), PipelineError> {
     let SortMergeExec {
         allocation_resources,
@@ -905,23 +912,25 @@ fn execute_combine_sort_merge_inner(
     // driver keeps its unique global input index (`driver_idx`) as the
     // deterministic output-order tie-break under a repeated `RecordOrder` (a
     // chained upstream can fan one input row into several sharing one order).
-    let driver_keyed: Vec<(Record, RecordOrder, u64, Option<Value>)> = driver_records
-        .into_par_iter()
-        .enumerate()
-        .map(|(driver_idx, (record, order))| {
-            let mut range_buf: Vec<Value> = Vec::new();
-            let key = extract_range_key(
-                &driver_extractor,
-                ctx,
-                &record,
-                resolver_mapping,
-                true,
-                &mut range_buf,
-            )
-            .map_err(|e| key_eval_error(name, "driving", e))?;
-            Ok::<_, PipelineError>((record, order, driver_idx as u64, key))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let driver_keyed: Vec<(Record, RecordOrder, u64, Option<Value>)> = pool.install(|| {
+        driver_records
+            .into_par_iter()
+            .enumerate()
+            .map(|(driver_idx, (record, order))| {
+                let mut range_buf: Vec<Value> = Vec::new();
+                let key = extract_range_key(
+                    &driver_extractor,
+                    ctx,
+                    &record,
+                    resolver_mapping,
+                    true,
+                    &mut range_buf,
+                )
+                .map_err(|e| key_eval_error(name, "driving", e))?;
+                Ok::<_, PipelineError>((record, order, driver_idx as u64, key))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })?;
     // `(record, key, (order, driver_idx))`: the range key drives Phase A's sort;
     // `(order, driver_idx)` is the payload carried verbatim through the spill
     // envelope — the order tag plus the deterministic tie-break under a repeated
@@ -937,23 +946,25 @@ fn execute_combine_sort_merge_inner(
         }
     }
 
-    let build_keyed: Vec<(Record, BuildTag, Option<Value>)> = build_records
-        .into_par_iter()
-        .enumerate()
-        .map(|(build_idx, (record, row))| {
-            let mut range_buf: Vec<Value> = Vec::new();
-            let key = extract_range_key(
-                &build_extractor,
-                ctx,
-                &record,
-                resolver_mapping,
-                false,
-                &mut range_buf,
-            )
-            .map_err(|e| key_eval_error(name, "build", e))?;
-            Ok::<_, PipelineError>((record, (build_idx as u64, row), key))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let build_keyed: Vec<(Record, BuildTag, Option<Value>)> = pool.install(|| {
+        build_records
+            .into_par_iter()
+            .enumerate()
+            .map(|(build_idx, (record, row))| {
+                let mut range_buf: Vec<Value> = Vec::new();
+                let key = extract_range_key(
+                    &build_extractor,
+                    ctx,
+                    &record,
+                    resolver_mapping,
+                    false,
+                    &mut range_buf,
+                )
+                .map_err(|e| key_eval_error(name, "build", e))?;
+                Ok::<_, PipelineError>((record, (build_idx as u64, row), key))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })?;
     let mut build_pairs: Vec<(Record, Value, BuildTag)> = Vec::new();
     for (record, tag, key) in build_keyed {
         if let Some(k) = key {
@@ -972,30 +983,36 @@ fn execute_combine_sort_merge_inner(
     //    build merge lazily one record per open run, the window spills past
     //    `byte_limit`, and the output spills past its own threshold. The
     //    pre-sorted path only avoids the sort *work*.
-    let (driver_stream, driver_charge) = sort_side_stream(SideStreamBuild {
-        allocation_resources,
-        pairs: driver_pairs,
-        name,
-        range_field: &driver_field,
-        budget,
-        spill_compress,
-        consumer_handle: &consumer_handle,
-        spill_dir,
-        presorted,
-        side: "driver",
-    })?;
-    let (build_cursor, build_resident_charge) = sort_side_stream(SideStreamBuild {
-        allocation_resources,
-        pairs: build_pairs,
-        name,
-        range_field: &build_field,
-        budget,
-        spill_compress,
-        consumer_handle: &consumer_handle,
-        spill_dir,
-        presorted,
-        side: "build",
-    })?;
+    let (driver_stream, driver_charge) = sort_side_stream(
+        SideStreamBuild {
+            allocation_resources,
+            pairs: driver_pairs,
+            name,
+            range_field: &driver_field,
+            budget,
+            spill_compress,
+            consumer_handle: &consumer_handle,
+            spill_dir,
+            presorted,
+            side: "driver",
+        },
+        pool,
+    )?;
+    let (build_cursor, build_resident_charge) = sort_side_stream(
+        SideStreamBuild {
+            allocation_resources,
+            pairs: build_pairs,
+            name,
+            range_field: &build_field,
+            budget,
+            spill_compress,
+            consumer_handle: &consumer_handle,
+            spill_dir,
+            presorted,
+            side: "build",
+        },
+        pool,
+    )?;
     if !presorted {
         stats.phase_a_sort_invocations = 2;
     }
@@ -1025,7 +1042,8 @@ fn execute_combine_sort_merge_inner(
         spill_compress,
         output_row_schema,
         allocation_resources.clone(),
-    );
+    )
+    .with_kernel_pool(Arc::clone(pool));
     // Parallel `(order, driver_idx, build_idx)` sort key per deferred output-eval
     // failure, so the dead-letter rows re-order into the same layout-independent
     // order as the emitted rows.
@@ -1353,13 +1371,16 @@ fn checked_presorted_charge<P>(
 /// caller's pre-sorted certification is verified in release (not merely
 /// `debug_assert`ed): a mis-certified input fails loud rather than diverging
 /// across budgets.
-fn sort_side_stream<P>(args: SideStreamBuild<'_, P>) -> Result<(SideStream<P>, u64), PipelineError>
+fn sort_side_stream<P>(
+    args: SideStreamBuild<'_, P>,
+    pool: &Arc<rayon::ThreadPool>,
+) -> Result<(SideStream<P>, u64), PipelineError>
 where
     P: Serialize + DeserializeOwned + Send + Ord + crate::pipeline::sort_buffer::HeapBytes,
 {
     let consumer = args.consumer_handle.clone();
     let baseline = consumer.bytes();
-    let result = sort_side_stream_inner(args);
+    let result = sort_side_stream_inner(args, pool);
     if result.is_err() {
         consumer.set_bytes(baseline);
     }
@@ -1368,6 +1389,7 @@ where
 
 fn sort_side_stream_inner<P>(
     args: SideStreamBuild<'_, P>,
+    pool: &Arc<rayon::ThreadPool>,
 ) -> Result<(SideStream<P>, u64), PipelineError>
 where
     P: Serialize + DeserializeOwned + Send + Ord + crate::pipeline::sort_buffer::HeapBytes,
@@ -1437,7 +1459,8 @@ where
         spill_compress,
         schema,
         allocation_resources.clone(),
-    );
+    )
+    .with_kernel_pool(Arc::clone(pool));
 
     let mut local_charged: u64 = 0;
     for (record, _key, payload) in pairs {
@@ -2690,7 +2713,10 @@ mod tests {
         };
         // Drain the output handle while the TempDir is still alive: a spilled
         // handle's sorted runs live inside it, so the drain must precede the drop.
-        let out = match execute_combine_sort_merge_with_stats(args) {
+        let out = match execute_combine_sort_merge_with_stats(
+            args,
+            crate::test_support::test_kernel_pool(),
+        ) {
             Ok((output, stats)) => drain_sorted(output.sorted).map(|records| (records, stats)),
             Err(e) => Err(e),
         };
@@ -4001,18 +4027,21 @@ mod tests {
         budget.set_max_spill_bytes(1).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let handle = crate::pipeline::memory::ConsumerHandle::new();
-        let err = sort_side_stream(SideStreamBuild {
-            allocation_resources: &test_allocation_resources(),
-            pairs,
-            name: "sm",
-            range_field: &Some("k".to_string()),
-            budget: &budget,
-            spill_compress: true,
-            consumer_handle: &handle,
-            spill_dir: dir.path(),
-            presorted: false,
-            side: "driver",
-        })
+        let err = sort_side_stream(
+            SideStreamBuild {
+                allocation_resources: &test_allocation_resources(),
+                pairs,
+                name: "sm",
+                range_field: &Some("k".to_string()),
+                budget: &budget,
+                spill_compress: true,
+                consumer_handle: &handle,
+                spill_dir: dir.path(),
+                presorted: false,
+                side: "driver",
+            },
+            crate::test_support::test_kernel_pool(),
+        )
         .err()
         .expect("a one-byte disk cap must abort the driver phase A spill");
         match err {
@@ -4055,18 +4084,21 @@ mod tests {
         budget.set_max_spill_bytes(1).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let handle = crate::pipeline::memory::ConsumerHandle::new();
-        let err = sort_side_stream(SideStreamBuild {
-            allocation_resources: &test_allocation_resources(),
-            pairs,
-            name: "sm",
-            range_field: &Some("k".to_string()),
-            budget: &budget,
-            spill_compress: true,
-            consumer_handle: &handle,
-            spill_dir: dir.path(),
-            presorted: false,
-            side: "build",
-        })
+        let err = sort_side_stream(
+            SideStreamBuild {
+                allocation_resources: &test_allocation_resources(),
+                pairs,
+                name: "sm",
+                range_field: &Some("k".to_string()),
+                budget: &budget,
+                spill_compress: true,
+                consumer_handle: &handle,
+                spill_dir: dir.path(),
+                presorted: false,
+                side: "build",
+            },
+            crate::test_support::test_kernel_pool(),
+        )
         .err()
         .expect("a one-byte disk cap must abort the build phase A spill");
         match err {
@@ -4095,18 +4127,21 @@ mod tests {
         std::fs::create_dir(&spill_root).unwrap();
         std::fs::remove_dir(&spill_root).unwrap();
         let handle = crate::pipeline::memory::ConsumerHandle::new();
-        let err = sort_side_stream(SideStreamBuild {
-            allocation_resources: &test_allocation_resources(),
-            pairs,
-            name: "sm",
-            range_field: &Some("k".to_string()),
-            budget: &budget,
-            spill_compress: true,
-            consumer_handle: &handle,
-            spill_dir: &spill_root,
-            presorted: false,
-            side: "driver",
-        })
+        let err = sort_side_stream(
+            SideStreamBuild {
+                allocation_resources: &test_allocation_resources(),
+                pairs,
+                name: "sm",
+                range_field: &Some("k".to_string()),
+                budget: &budget,
+                spill_compress: true,
+                consumer_handle: &handle,
+                spill_dir: &spill_root,
+                presorted: false,
+                side: "driver",
+            },
+            crate::test_support::test_kernel_pool(),
+        )
         .err()
         .expect(
             "phase A must spill into the configured (now-removed) root and fail \
@@ -4827,18 +4862,21 @@ mod tests {
         consumer.set_bytes(777);
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing");
-        let error = sort_side_stream(SideStreamBuild {
-            allocation_resources: &resources,
-            pairs: phase_a_driver_pairs(30),
-            name: "open-failure",
-            range_field: &Some("k".into()),
-            budget: &budget,
-            spill_compress: false,
-            consumer_handle: &consumer,
-            spill_dir: &missing,
-            presorted: false,
-            side: "driver",
-        })
+        let error = sort_side_stream(
+            SideStreamBuild {
+                allocation_resources: &resources,
+                pairs: phase_a_driver_pairs(30),
+                name: "open-failure",
+                range_field: &Some("k".into()),
+                budget: &budget,
+                spill_compress: false,
+                consumer_handle: &consumer,
+                spill_dir: &missing,
+                presorted: false,
+                side: "driver",
+            },
+            crate::test_support::test_kernel_pool(),
+        )
         .err()
         .expect("missing spill directory must fail");
         assert!(matches!(error, PipelineError::Io(_)));

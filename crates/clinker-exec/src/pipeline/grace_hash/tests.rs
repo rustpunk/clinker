@@ -569,28 +569,31 @@ fn combine_driver_identity_survives_grace_hash_partition_pair() {
         .lock()
         .unwrap()
         .seed_row_count_from_bytes("products", Some(12 * 1024));
-    let result = execute_combine_grace_hash(GraceHashExec {
-        name: "grace_test",
-        build_qualifier: "products",
-        driver_records: drivers,
-        build_records: crate::test_support::with_build_row_ids(builds),
-        decomposed: &decomposed,
-        body_program: None,
-        resolver_mapping: &resolver_mapping,
-        output_schema: Some(&combined_schema),
-        match_mode: clinker_plan::config::pipeline_node::MatchMode::All,
-        on_miss: clinker_plan::config::pipeline_node::OnMiss::Skip,
-        max_output_rows: None,
-        partition_bits: 4,
-        propagate_ck: &clinker_plan::config::pipeline_node::PropagateCkSpec::Driver,
-        ctx: &ctx,
-        budget: &budget,
-        spill_dir: dir.path(),
-        spill_compress: true,
-        consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
-        strategy: clinker_plan::config::ErrorStrategy::FailFast,
-        stats_sink: test_stats_sink(&stats_catalog, "products", "products"),
-    })
+    let result = execute_combine_grace_hash(
+        GraceHashExec {
+            name: "grace_test",
+            build_qualifier: "products",
+            driver_records: drivers,
+            build_records: crate::test_support::with_build_row_ids(builds),
+            decomposed: &decomposed,
+            body_program: None,
+            resolver_mapping: &resolver_mapping,
+            output_schema: Some(&combined_schema),
+            match_mode: clinker_plan::config::pipeline_node::MatchMode::All,
+            on_miss: clinker_plan::config::pipeline_node::OnMiss::Skip,
+            max_output_rows: None,
+            partition_bits: 4,
+            propagate_ck: &clinker_plan::config::pipeline_node::PropagateCkSpec::Driver,
+            ctx: &ctx,
+            budget: &budget,
+            spill_dir: dir.path(),
+            spill_compress: true,
+            consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
+            strategy: clinker_plan::config::ErrorStrategy::FailFast,
+            stats_sink: test_stats_sink(&stats_catalog, "products", "products"),
+        },
+        crate::test_support::test_kernel_pool(),
+    )
     .expect("grace hash E2E")
     .records;
 
@@ -841,28 +844,31 @@ fn execute_grace_hash_spill_then_reload_correct() {
         .tempdir()
         .unwrap();
     let stats_catalog = fresh_stats_catalog();
-    let result = execute_combine_grace_hash(GraceHashExec {
-        name: "grace_spill_test",
-        build_qualifier: "products",
-        driver_records: drivers,
-        build_records: crate::test_support::with_build_row_ids(builds),
-        decomposed: &decomposed,
-        body_program: None,
-        resolver_mapping: &resolver_mapping,
-        output_schema: Some(&combined_schema),
-        match_mode: clinker_plan::config::pipeline_node::MatchMode::All,
-        on_miss: clinker_plan::config::pipeline_node::OnMiss::Skip,
-        max_output_rows: None,
-        partition_bits: 4,
-        propagate_ck: &clinker_plan::config::pipeline_node::PropagateCkSpec::Driver,
-        ctx: &ctx,
-        budget: &budget,
-        spill_dir: dir.path(),
-        spill_compress: true,
-        consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
-        strategy: clinker_plan::config::ErrorStrategy::FailFast,
-        stats_sink: test_stats_sink(&stats_catalog, "products", "products"),
-    })
+    let result = execute_combine_grace_hash(
+        GraceHashExec {
+            name: "grace_spill_test",
+            build_qualifier: "products",
+            driver_records: drivers,
+            build_records: crate::test_support::with_build_row_ids(builds),
+            decomposed: &decomposed,
+            body_program: None,
+            resolver_mapping: &resolver_mapping,
+            output_schema: Some(&combined_schema),
+            match_mode: clinker_plan::config::pipeline_node::MatchMode::All,
+            on_miss: clinker_plan::config::pipeline_node::OnMiss::Skip,
+            max_output_rows: None,
+            partition_bits: 4,
+            propagate_ck: &clinker_plan::config::pipeline_node::PropagateCkSpec::Driver,
+            ctx: &ctx,
+            budget: &budget,
+            spill_dir: dir.path(),
+            spill_compress: true,
+            consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
+            strategy: clinker_plan::config::ErrorStrategy::FailFast,
+            stats_sink: test_stats_sink(&stats_catalog, "products", "products"),
+        },
+        crate::test_support::test_kernel_pool(),
+    )
     .expect("grace hash spill E2E")
     .records;
 
@@ -1034,28 +1040,31 @@ fn execute_grace_hash_aborts_on_disk_quota_overflow() {
         .tempdir()
         .unwrap();
     let stats_catalog = fresh_stats_catalog();
-    let result = execute_combine_grace_hash(GraceHashExec {
-        name: "grace_quota_test",
-        build_qualifier: "products",
-        driver_records: drivers,
-        build_records: crate::test_support::with_build_row_ids(builds),
-        decomposed: &decomposed,
-        body_program: None,
-        resolver_mapping: &resolver_mapping,
-        output_schema: Some(&combined_schema),
-        match_mode: clinker_plan::config::pipeline_node::MatchMode::All,
-        on_miss: clinker_plan::config::pipeline_node::OnMiss::Skip,
-        max_output_rows: None,
-        partition_bits: 4,
-        propagate_ck: &clinker_plan::config::pipeline_node::PropagateCkSpec::Driver,
-        ctx: &ctx,
-        budget: &budget,
-        spill_dir: dir.path(),
-        spill_compress: true,
-        consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
-        strategy: clinker_plan::config::ErrorStrategy::FailFast,
-        stats_sink: test_stats_sink(&stats_catalog, "products", "products"),
-    });
+    let result = execute_combine_grace_hash(
+        GraceHashExec {
+            name: "grace_quota_test",
+            build_qualifier: "products",
+            driver_records: drivers,
+            build_records: crate::test_support::with_build_row_ids(builds),
+            decomposed: &decomposed,
+            body_program: None,
+            resolver_mapping: &resolver_mapping,
+            output_schema: Some(&combined_schema),
+            match_mode: clinker_plan::config::pipeline_node::MatchMode::All,
+            on_miss: clinker_plan::config::pipeline_node::OnMiss::Skip,
+            max_output_rows: None,
+            partition_bits: 4,
+            propagate_ck: &clinker_plan::config::pipeline_node::PropagateCkSpec::Driver,
+            ctx: &ctx,
+            budget: &budget,
+            spill_dir: dir.path(),
+            spill_compress: true,
+            consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
+            strategy: clinker_plan::config::ErrorStrategy::FailFast,
+            stats_sink: test_stats_sink(&stats_catalog, "products", "products"),
+        },
+        crate::test_support::test_kernel_pool(),
+    );
 
     let err = result.expect_err("disk quota must abort the combine");
     match &err {

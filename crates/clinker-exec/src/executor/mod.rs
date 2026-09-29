@@ -415,8 +415,9 @@ impl PipelineExecutor {
     /// ```
     ///
     /// The executor is fully synchronous: it drives source ingest on
-    /// `std::thread` workers, runs CPU-bound operator kernels (sort,
-    /// grace-hash, IEJoin, sort-merge) on a shared Rayon pool, and
+    /// `std::thread` workers, runs the parallel sections of CPU-bound
+    /// operator kernels (sort, grace-hash, IEJoin, sort-merge) on a
+    /// run-scoped Rayon pool, and
     /// blocks the calling thread on bounded crossbeam channels for
     /// back-pressure. No async runtime is required.
     pub fn run_plan_with_readers_writers<W: Into<WriterRegistry>>(

@@ -711,8 +711,12 @@ impl GraceHashExecutor {
 /// Output preserves driver order across the in-memory probe phase and
 /// emits reloaded matches after the in-memory matches; downstream sort
 /// is the caller's responsibility (matches the IEJoin contract).
+///
+/// Runs on the calling thread, so its budget checks and spills run there;
+/// only the per-record build-key extraction runs on `pool`.
 pub(crate) fn execute_combine_grace_hash(
     args: GraceHashExec<'_>,
+    pool: &Arc<rayon::ThreadPool>,
 ) -> Result<CombineKernelOutput, PipelineError> {
     let GraceHashExec {
         name,
@@ -815,21 +819,22 @@ pub(crate) fn execute_combine_grace_hash(
     let build_hash_state = executor.hash_state().clone();
     // Each build row's arrival position, minted here where the Combine
     // receives its build input, before partitioning moves rows apart.
-    let hashed_build: Vec<(Record, RecordOrder, BuildSeq, u64)> = build_records
-        .into_par_iter()
-        .enumerate()
-        .map(|(position, (record, row))| {
-            let keys =
-                build_extractor
-                    .extract(ctx, &record)
-                    .map_err(|e| PipelineError::Compilation {
+    let hashed_build: Vec<(Record, RecordOrder, BuildSeq, u64)> = pool.install(|| {
+        build_records
+            .into_par_iter()
+            .enumerate()
+            .map(|(position, (record, row))| {
+                let keys = build_extractor.extract(ctx, &record).map_err(|e| {
+                    PipelineError::Compilation {
                         transform_name: name.to_string(),
                         messages: vec![format!("grace hash build key eval error: {e}")],
-                    })?;
-            let hash = hash_composite_key(&keys, &build_hash_state);
-            Ok::<_, PipelineError>((record, row, BuildSeq(position as u64), hash))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+                    }
+                })?;
+                let hash = hash_composite_key(&keys, &build_hash_state);
+                Ok::<_, PipelineError>((record, row, BuildSeq(position as u64), hash))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })?;
 
     // Maintain three planner-grade sketches over the build-side join keys
     // in the single build pass, reusing the composite-key hashes already

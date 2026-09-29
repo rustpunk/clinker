@@ -88,6 +88,22 @@ pub(crate) fn single_csv_document_metadata_bytes(
     bytes as u64
 }
 
+/// The kernel pool a unit test hands a join kernel in place of the run's pool.
+/// One pool for the whole test binary, sized like rayon's default pool, so a
+/// kernel test parallelizes as it did before kernels took their pool as an
+/// argument.
+pub(crate) fn test_kernel_pool() -> &'static std::sync::Arc<rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<std::sync::Arc<rayon::ThreadPool>> =
+        std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        std::sync::Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .build()
+                .expect("build the test kernel pool"),
+        )
+    })
+}
+
 /// Pair each build fixture record with the row id its Source would mint:
 /// ordinal `index + 1` under Source node 1.
 ///

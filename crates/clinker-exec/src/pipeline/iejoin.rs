@@ -586,8 +586,12 @@ pub(crate) struct IEJoinExec<'a> {
     pub strategy: clinker_plan::config::ErrorStrategy,
 }
 
+/// Runs on the calling thread, so its budget checks and spills run there;
+/// only the per-record key scan and the sort buffers' comparator sorts run on
+/// `pool`.
 pub(crate) fn execute_combine_iejoin(
     args: IEJoinExec<'_>,
+    pool: &Arc<rayon::ThreadPool>,
 ) -> Result<BlockBandOutput, PipelineError> {
     let IEJoinExec {
         allocation_resources,
@@ -762,38 +766,43 @@ pub(crate) fn execute_combine_iejoin(
     // an independent `RecordScan`; the block-band drain replays those outcomes
     // in ascending index order into the external-sort buffers, so the sliced
     // blocks are a pure function of the data, not of pool scheduling.
-    let driver_scans: Vec<RecordScan> = driver_records
-        .par_iter()
-        .map(|(rec, _rn)| {
-            // Driver-side key extraction routes through `CombineResolver` so
-            // chain-buried qualifiers (e.g. `b.id` against an N-ary
-            // decomposition step's encoded intermediate record) resolve via the
-            // resolved column map rather than `Record`'s bare-name fallback.
-            let driver_resolver = CombineResolver::new(resolver_mapping, rec, None);
-            scan_record(
-                &driver_extractor,
-                &driver_range_extractor,
-                &range_kinds,
-                ctx,
-                &driver_resolver,
-            )
-            .map_err(|e| scan_key_error(name, "driving", e))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let driver_scans: Vec<RecordScan> = pool.install(|| {
+        driver_records
+            .par_iter()
+            .map(|(rec, _rn)| {
+                // Driver-side key extraction routes through `CombineResolver` so
+                // chain-buried qualifiers (e.g. `b.id` against an N-ary
+                // decomposition step's encoded intermediate record) resolve via
+                // the resolved column map rather than `Record`'s bare-name
+                // fallback.
+                let driver_resolver = CombineResolver::new(resolver_mapping, rec, None);
+                scan_record(
+                    &driver_extractor,
+                    &driver_range_extractor,
+                    &range_kinds,
+                    ctx,
+                    &driver_resolver,
+                )
+                .map_err(|e| scan_key_error(name, "driving", e))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })?;
 
-    let build_scans: Vec<RecordScan> = build_records
-        .par_iter()
-        .map(|(rec, _)| {
-            scan_record(
-                &build_extractor,
-                &build_range_extractor,
-                &range_kinds,
-                ctx,
-                rec,
-            )
-            .map_err(|e| scan_key_error(name, "build", e))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let build_scans: Vec<RecordScan> = pool.install(|| {
+        build_records
+            .par_iter()
+            .map(|(rec, _)| {
+                scan_record(
+                    &build_extractor,
+                    &build_range_extractor,
+                    &range_kinds,
+                    ctx,
+                    rec,
+                )
+                .map_err(|e| scan_key_error(name, "build", e))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })?;
 
     let op1 = range_ops[0];
     let op2 = if n_ranges >= 2 {
@@ -811,32 +820,35 @@ pub(crate) fn execute_combine_iejoin(
     // axes spill, so the join completes within the budget instead of aborting —
     // a hot equality value degrades to a pure-range band join over its own
     // same-hash blocks rather than materializing that group resident.
-    block::execute_block_band(block::BlockBandExec {
-        allocation_resources,
-        name,
-        build_qualifier,
-        driver_records,
-        driver_scans,
-        build_records,
-        build_scans,
-        op1,
-        op2,
-        residual_eval,
-        body_eval,
-        resolver_mapping,
-        output_schema,
-        match_mode,
-        on_miss,
-        max_output_rows,
-        propagate_ck,
-        ctx,
-        budget,
-        consumer,
-        spill_dir,
-        spill_compress,
-        strategy,
-        options: block::BlockBandOptions::default(),
-    })
+    block::execute_block_band(
+        block::BlockBandExec {
+            allocation_resources,
+            name,
+            build_qualifier,
+            driver_records,
+            driver_scans,
+            build_records,
+            build_scans,
+            op1,
+            op2,
+            residual_eval,
+            body_eval,
+            resolver_mapping,
+            output_schema,
+            match_mode,
+            on_miss,
+            max_output_rows,
+            propagate_ck,
+            ctx,
+            budget,
+            consumer,
+            spill_dir,
+            spill_compress,
+            strategy,
+            options: block::BlockBandOptions::default(),
+        },
+        pool,
+    )
 }
 
 // ──────────────────────────────────────────────────────────────────────────

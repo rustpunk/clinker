@@ -733,17 +733,17 @@ where
                     .resolve_for_schema(ie_column_count, ctx.batch_size as u64);
                 let iejoin_ctx = ctx.merged_eval_ctx();
                 // CPU-bound block-band IEJoin kernel — external-sort +
-                // block-band range walk over a bounded working set. The
-                // kernel owns its inputs (`driver_buf`, `build_buf`)
-                // and borrows only `&ctx.memory_budget` + the local
-                // `iejoin_ctx`, so it runs on the shared Rayon pool. Row
-                // order is the deterministic `(driver order, driver_idx,
-                // build_idx)` the output sort returns, not pool scheduling.
+                // block-band range walk over a bounded working set. It runs
+                // on the walk, so its budget checks and spills run here; only
+                // its key scan and comparator sorts go to the run's kernel
+                // pool. Row order is the deterministic `(driver order,
+                // driver_idx, build_idx)` the output sort returns, not pool
+                // scheduling.
                 let kernel = consume_materialized_inputs(
                     [_driver_clone_reservation, _build_clone_reservation],
                     || {
-                        let kernel = ctx.kernel_pool.install(|| {
-                            execute_combine_iejoin(IEJoinExec {
+                        let kernel = execute_combine_iejoin(
+                            IEJoinExec {
                                 allocation_resources: &ctx.allocation_resources,
                                 name,
                                 build_qualifier: &build_qualifier,
@@ -763,8 +763,9 @@ where
                                 spill_dir: ctx.spill_root_path.as_ref(),
                                 spill_compress: ie_spill_compress,
                                 strategy: ctx.strategy,
-                            })
-                        })?;
+                            },
+                            &ctx.kernel_pool,
+                        )?;
                         let prior = crate::executor::batch_handoff::StreamingReservation::retain(
                             ie_consumer_handle.clone(),
                             sorted_output_retained_bytes(&kernel.sorted, &ctx.allocation_resources)
@@ -901,13 +902,12 @@ where
                     .resolve_for_schema(grace_column_count, ctx.batch_size as u64);
                 let grace_ctx = ctx.merged_eval_ctx();
                 // CPU-bound grace-hash join kernel: partition build +
-                // probe + spill I/O. The kernel owns its inputs and
-                // borrows only `&ctx.memory_budget`, the local
-                // `grace_ctx`, and the spill dir, so it runs on the
-                // shared Rayon pool. Emitted-row order is fixed by the
-                // kernel's deterministic partition-then-probe walk.
-                let kernel_out = ctx.kernel_pool.install(|| {
-                    execute_combine_grace_hash(GraceHashExec {
+                // probe + spill I/O. It runs on the walk, so its budget
+                // checks and spills run here; only its build-key extraction
+                // goes to the run's kernel pool. Emitted-row order is fixed
+                // by the kernel's deterministic partition-then-probe walk.
+                let kernel_out = execute_combine_grace_hash(
+                    GraceHashExec {
                         name,
                         build_qualifier: &build_qualifier,
                         driver_records: driver_buf,
@@ -932,8 +932,9 @@ where
                             node: build_upstream,
                             column: &build_qualifier,
                         },
-                    })
-                })?;
+                    },
+                    &ctx.kernel_pool,
+                )?;
                 let crate::pipeline::combine::CombineKernelOutput {
                     records: output_records,
                     output_eval_failures,
@@ -1049,13 +1050,12 @@ where
                     .resolve_for_schema(sm_column_count, ctx.batch_size as u64);
                 let sm_ctx = ctx.merged_eval_ctx();
                 // CPU-bound sort-merge join kernel: two-cursor merge
-                // over pre-sorted inputs. The kernel owns its inputs
-                // and borrows only `&ctx.memory_budget`, the local
-                // `sm_ctx`, and the spill dir, so it runs on the
-                // shared Rayon pool. The two-cursor merge emits in a
-                // deterministic order independent of pool scheduling.
-                let kernel_out = ctx.kernel_pool.install(|| {
-                    execute_combine_sort_merge(SortMergeExec {
+                // over pre-sorted inputs. It runs on the walk, so its budget
+                // checks and spills run here; only its range-key extraction
+                // and comparator sorts go to the run's kernel pool. The
+                // two-cursor merge emits in a deterministic order.
+                let kernel_out = execute_combine_sort_merge(
+                    SortMergeExec {
                         allocation_resources: &ctx.allocation_resources,
                         name,
                         build_qualifier: &build_qualifier,
@@ -1076,8 +1076,9 @@ where
                         spill_compress: sm_spill_compress,
                         consumer_handle: sm_consumer_handle,
                         strategy: ctx.strategy,
-                    })
-                })?;
+                    },
+                    &ctx.kernel_pool,
+                )?;
                 let crate::pipeline::sort_merge_join::SortMergeOutput {
                     sorted,
                     row_count,

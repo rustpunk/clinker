@@ -460,8 +460,8 @@ impl std::error::Error for CombineError {
 
 /// One recoverable output-stage eval failure surfaced by a combine kernel.
 ///
-/// Kernels run inside the Rayon pool with only a `&MemoryArbitrator` and a
-/// local `EvalContext` — they hold no `&mut ExecutorContext`, so they cannot
+/// Kernels run with only a `&MemoryArbitrator` and a local `EvalContext` —
+/// they hold no `&mut ExecutorContext`, so they cannot
 /// route a failing row to the dead-letter queue or rewind a source's
 /// rollback cursor themselves. Instead a recoverable failure is captured
 /// here and handed back to the dispatcher, which drains it through the same

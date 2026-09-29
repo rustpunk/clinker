@@ -2055,13 +2055,12 @@ pub(crate) struct ExecutorContext<'a> {
     pub(crate) streaming_output_tasks:
         Vec<std::thread::JoinHandle<crate::executor::StreamingOutputTaskOutput>>,
 
-    /// Shared Rayon pool for CPU-bound owned-input kernels (sort,
-    /// grace-hash partition build, IEJoin range-walk, sort-merge). Sized
-    /// off the run's thread budget; each kernel extracts its owned input
-    /// out of `ctx` and runs under `pool.install(...)`, so the closures
-    /// capture only owned data plus `&memory_budget` and stay order-
-    /// preserving (the kernels emit in a deterministic order independent
-    /// of pool scheduling).
+    /// The run's Rayon pool for the parallel sections of the CPU-bound
+    /// kernels (sort, grace-hash, IEJoin, sort-merge). Sized off the run's
+    /// thread budget. A kernel runs on the walk and wraps only its pure
+    /// parallel blocks (per-record key extraction, the comparator sort) in
+    /// `pool.install(...)`, so its budget checks and spills never run on a
+    /// pool worker; its output order does not depend on pool scheduling.
     pub(crate) kernel_pool: Arc<rayon::ThreadPool>,
 
     /// Per-run shutdown handle, cloned from `PipelineRunParams`. The
