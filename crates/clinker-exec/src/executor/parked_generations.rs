@@ -39,18 +39,13 @@ use petgraph::graph::EdgeIndex;
 
 use crate::executor::node_buffer::{NodeBuffer, ReReadableNodeBuffer};
 use crate::executor::stream_event::SourceRowId;
+use crate::pipeline::memory::walk::{WalkOwnedRegistration, WalkOwnedSpill, register_walk_owned};
 use crate::pipeline::memory::{ConsumerHandle, ConsumerId, ConsumerSpillError, MemoryArbitrator};
 
 /// A crossing edge: the composition body whose graph the edge belongs to
 /// (`None` at the top level, where edge ids have their own namespace), and
 /// the edge.
 pub(crate) type ParkedKey = (Option<CompositionBodyId>, EdgeIndex);
-
-/// Every parked edge's consumer, and the handle a reclaim raises its spill
-/// request on when the store is busy. Shared with the walk reclaim set, and
-/// never borrowed across a reservation, so a pass can tell which consumers
-/// are the store's without borrowing the store.
-pub(crate) type ParkedIndex = Rc<RefCell<HashMap<ConsumerId, Arc<ConsumerHandle>>>>;
 
 /// Which pass parked a crossing edge's rows, and so how long they live.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,7 +71,6 @@ pub(crate) struct ParkedGenerations {
     forward: HashMap<ParkedKey, ParkedEdge>,
     /// Rows parked during the running iteration of the commit.
     commit_pass: HashMap<ParkedKey, ParkedEdge>,
-    index: ParkedIndex,
 }
 
 /// One crossing edge's parked rows and the consumer that charges them.
@@ -90,6 +84,10 @@ struct ParkedEdge {
     producer: Box<str>,
     /// In the order they were parked.
     segments: Vec<ParkedSegment>,
+    /// The store's entry in the walk reclaim set under this edge's consumer,
+    /// made right after the consumer registers at the edge's first park; it
+    /// leaves the set when the edge is released.
+    walk_entry: Option<WalkOwnedRegistration>,
 }
 
 /// One run of parked rows.
@@ -215,20 +213,17 @@ impl ParkedGenerations {
             batch_size,
             forward: HashMap::new(),
             commit_pass: HashMap::new(),
-            index: Rc::new(RefCell::new(HashMap::new())),
         }
-    }
-
-    /// Every parked edge's consumer and handle, for the walk reclaim set.
-    pub(crate) fn index(&self) -> ParkedIndex {
-        Rc::clone(&self.index)
     }
 
     /// Park a copy of `rows` for the crossing edge `key`, from the node named
     /// `from` into the deferred consumer named `to`, in `generation`.
     ///
     /// The first park on an edge registers its consumer, even for no rows, so
-    /// the commit reads an empty input rather than a missing one. A spill
+    /// the commit reads an empty input rather than a missing one, and
+    /// registers the store under that consumer in the walk reclaim set
+    /// ([`register_walk_owned`]), so any reclaim pass on the walk can spill
+    /// the edge. A spill
     /// request raised on the edge since its last park is answered first. The
     /// copy's resident size is grown on the edge's handle with no borrow of
     /// the store held, so a reclaim that growth starts on the walk can spill
@@ -244,7 +239,14 @@ impl ParkedGenerations {
         from: &str,
         to: &str,
     ) -> Result<(), PipelineError> {
-        let handle = store.borrow_mut().edge_handle(generation, key, from, to);
+        let (handle, registered) = store.borrow_mut().edge_handle(generation, key, from, to);
+        if let Some(consumer) = registered {
+            let arbitrator = Arc::clone(&store.borrow().arbitrator);
+            let walk_entry = register_walk_owned(&arbitrator, consumer, &handle, store)?;
+            store
+                .borrow_mut()
+                .keep_walk_entry(generation, &key, walk_entry)?;
+        }
         if rows.is_empty() {
             return Ok(());
         }
@@ -288,16 +290,17 @@ impl ParkedGenerations {
     }
 
     /// The consumer handle of edge `key` in `generation`, registering the
-    /// edge on first use.
+    /// edge on first use; the consumer is returned beside it when this call
+    /// registered it.
     fn edge_handle(
         &mut self,
         generation: Generation,
         key: ParkedKey,
         from: &str,
         to: &str,
-    ) -> Arc<ConsumerHandle> {
+    ) -> (Arc<ConsumerHandle>, Option<ConsumerId>) {
         if let Some(edge) = self.edges(generation).get(&key) {
-            return Arc::clone(&edge.handle);
+            return (Arc::clone(&edge.handle), None);
         }
         let handle = ConsumerHandle::new();
         let reclaim = Arc::new(ParkedEdgeConsumer {
@@ -315,9 +318,6 @@ impl ParkedGenerations {
                 },
             },
         );
-        self.index
-            .borrow_mut()
-            .insert(consumer, Arc::clone(&handle));
         self.edges_mut(generation).insert(
             key,
             ParkedEdge {
@@ -326,9 +326,25 @@ impl ParkedGenerations {
                 reclaim,
                 producer: Box::from(from),
                 segments: Vec::new(),
+                walk_entry: None,
             },
         );
-        handle
+        (handle, Some(consumer))
+    }
+
+    /// Keep edge `key`'s walk reclaim registration with the edge.
+    fn keep_walk_entry(
+        &mut self,
+        generation: Generation,
+        key: &ParkedKey,
+        walk_entry: WalkOwnedRegistration,
+    ) -> Result<(), PipelineError> {
+        let edge = self
+            .edges_mut(generation)
+            .get_mut(key)
+            .ok_or_else(|| unregistered_edge(key))?;
+        edge.walk_entry = Some(walk_entry);
+        Ok(())
     }
 
     /// Add `segment`, whose resident size `charged` bytes the edge's handle
@@ -546,25 +562,36 @@ impl ParkedGenerations {
         }
     }
 
-    /// Drop `edge`'s segments, then release what it held and unregister it.
+    /// Drop `edge`'s segments, then release what it held, take it out of the
+    /// walk reclaim set and unregister it.
     fn release_edge(&self, edge: ParkedEdge) {
         let ParkedEdge {
             consumer,
             handle,
             producer,
             segments,
+            walk_entry,
             ..
         } = edge;
         let file_bytes: u64 = segments.iter().map(|segment| segment.file_bytes).sum();
         drop(segments);
         self.arbitrator.release_spill_bytes(&producer, file_bytes);
         handle.shrink(handle.bytes());
-        // Stale only if a pass holds the index, which it never does across a
-        // release; the pass then finds no edge for the consumer.
-        if let Ok(mut index) = self.index.try_borrow_mut() {
-            index.remove(&consumer);
-        }
+        drop(walk_entry);
         self.arbitrator.unregister_consumer(consumer);
+    }
+}
+
+impl WalkOwnedSpill for ParkedGenerations {
+    /// A pass that elects a parked edge's consumer spills that edge's
+    /// resident segments ([`ParkedGenerations::spill_consumer`]); a consumer
+    /// whose edge was released is not held here.
+    fn spill_owned(
+        &mut self,
+        id: ConsumerId,
+        _arbitrator: &MemoryArbitrator,
+    ) -> Result<bool, PipelineError> {
+        Ok(self.spill_consumer(id)?.is_some())
     }
 }
 

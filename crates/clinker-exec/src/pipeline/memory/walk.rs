@@ -15,9 +15,8 @@
 //! reaches the state its callers are holding. Outside the frames the set
 //! also reaches every walk-owned state registered through
 //! [`register_walk_owned`] (the document dead-letter state's held rows, an
-//! Output's per-document buckets, an operator's sorts and tables), which
-//! any pass can spill in place, and the rows the run parks for a deferred
-//! consumer, whose resident segments any pass can spill.
+//! Output's per-document buckets, the rows parked for a deferred consumer,
+//! an operator's sorts and tables), which any pass can spill in place.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -32,7 +31,6 @@ use super::reservation::ReservationState;
 use super::{ConsumerHandle, ConsumerId, MemoryArbitrator};
 use crate::executor::dispatch::{NodeBufferKey, NodeBufferReaderLedger, ResidentSlotSpill};
 use crate::executor::node_buffer::NodeBuffer;
-use crate::executor::parked_generations::{ParkedGenerations, ParkedIndex};
 
 /// Where the calling thread stands relative to one run's walk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -252,8 +250,6 @@ pub(crate) struct WalkReclaimSet {
     /// slots, kept while a composition body it entered runs.
     parents: Vec<NodeBufferSlots>,
     spill_settings: WalkSpillSettings,
-    /// The run's rows parked for a deferred consumer.
-    parked: Option<ParkedEntry>,
     /// The walk-owned cells registered through [`register_walk_owned`], by
     /// the consumer each charges. Run-scoped, outside every frame, so a
     /// composition body's shortfall reaches the state its callers own.
@@ -273,14 +269,6 @@ struct OwnedEntry {
     handle: Arc<ConsumerHandle>,
 }
 
-/// The walk reclaim set's way to the run's parked cross-region rows: the
-/// store's own cell, which a pass spills an elected edge through, and the
-/// index of the store's consumers, read without borrowing the store.
-struct ParkedEntry {
-    store: Rc<RefCell<ParkedGenerations>>,
-    index: ParkedIndex,
-}
-
 impl WalkReclaimSet {
     /// An empty set for a walk spilling under `spill_settings`.
     pub(crate) fn new(spill_settings: WalkSpillSettings) -> Self {
@@ -288,7 +276,6 @@ impl WalkReclaimSet {
             slots: NodeBufferSlots::default(),
             parents: Vec::new(),
             spill_settings,
-            parked: None,
             owned: HashMap::new(),
             next_owned_serial: 0,
         }
@@ -330,45 +317,6 @@ impl WalkReclaimSet {
     #[cfg(test)]
     pub(crate) fn owned_cell_count(&self, id: ConsumerId) -> usize {
         self.owned.get(&id).map_or(0, Vec::len)
-    }
-
-    /// Make the run's parked cross-region rows, in their own cell, victims
-    /// every pass on this walk can reach. Borrows the store once, to read
-    /// the index of its consumers; the set then keeps the store alive for as
-    /// long as the set lives.
-    pub(crate) fn set_parked_generations(&mut self, store: Rc<RefCell<ParkedGenerations>>) {
-        let index = store.borrow().index();
-        self.parked = Some(ParkedEntry { store, index });
-    }
-
-    /// Spill the parked edge registered as consumer `id`; `None` when no
-    /// parked edge is. A borrowed store means a park or a read of it is part
-    /// way through a step of its own: the edge is `Busy` and its spill
-    /// request is raised, which its next park answers. A spill never
-    /// reserves memory; past the spill cap it fails with E320.
-    fn spill_parked_edge(
-        &mut self,
-        id: ConsumerId,
-    ) -> Result<Option<VictimOutcome>, PipelineError> {
-        let Some(entry) = &self.parked else {
-            return Ok(None);
-        };
-        let handle = entry
-            .index
-            .try_borrow()
-            .ok()
-            .and_then(|index| index.get(&id).cloned());
-        let Some(handle) = handle else {
-            return Ok(None);
-        };
-        let Ok(mut store) = entry.store.try_borrow_mut() else {
-            handle.request_spill();
-            return Ok(Some(VictimOutcome::Busy));
-        };
-        Ok(Some(match store.spill_consumer(id)? {
-            Some(_) => VictimOutcome::Spilled,
-            None => VictimOutcome::NotOwned,
-        }))
     }
 
     /// Spill the walk-owned state registered under consumer `id`.
@@ -601,8 +549,7 @@ impl WalkReclaim for WalkReclaimSet {
     /// The frame that registered consumer `id` spills its slot. The running
     /// scope's frame is searched first, then each calling scope's outwards,
     /// so a composition body's shortfall reaches the resident slots its
-    /// callers hold. After the frames, a parked edge's consumer spills the
-    /// edge's resident segments, and the walk-owned state registered under
+    /// callers hold. After the frames, the walk-owned state registered under
     /// `id` through [`register_walk_owned`] spills in place. Any other
     /// consumer is `NotOwned`.
     fn spill_victim(
@@ -615,9 +562,6 @@ impl WalkReclaim for WalkReclaimSet {
             if let Some(outcome) = frame.spill_registered(id, arbitrator, spill_settings)? {
                 return Ok(outcome);
             }
-        }
-        if let Some(outcome) = self.spill_parked_edge(id)? {
-            return Ok(outcome);
         }
         self.spill_owned_victim(id, arbitrator)
     }

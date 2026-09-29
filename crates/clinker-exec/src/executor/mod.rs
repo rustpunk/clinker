@@ -2012,11 +2012,6 @@ impl PipelineExecutor {
             // supersedes one with an exec-measured figure.
             runtime_statistics: Arc::new(std::sync::Mutex::new(statistics.clone())),
         };
-        // Rows parked for a deferred consumer are victims any reclaim pass on
-        // the walk can spill.
-        ctx.walk_reclaim
-            .borrow_mut()
-            .set_parked_generations(std::rc::Rc::clone(&ctx.parked_generations));
         // This thread is the run's walk from here until the function returns,
         // by any path; the guard drops before `ctx`.
         let _walk_frame = crate::pipeline::memory::walk::WalkContextGuard::install(
@@ -2026,7 +2021,8 @@ impl PipelineExecutor {
         // The document dead-letter state's held rows are a victim any
         // reclaim pass on the walk can flush. Registered once the walk frame
         // is installed, and declared after the guard so the registration
-        // drops first.
+        // drops first. Rows parked for a deferred consumer register edge by
+        // edge, at each edge's first park.
         let _document_dlq_reclaim = ctx
             .document_dlq
             .as_ref()

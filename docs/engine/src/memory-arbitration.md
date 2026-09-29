@@ -78,17 +78,8 @@ On the walk thread a `Shortfall` is not yet a refusal. A `reserve`, a
 walk that does not fit runs a reclaim pass without holding the ledger lock:
 the registered consumers that cannot be paused and hold bytes are taken in the
 run's policy order (ties to the older consumer), the requesting consumer last,
-and each whose state the walk owns is spilled there and then. The walk owns a
-node-buffer slot of the running dispatch scope, or of any scope that entered
-it through a composition body, so a body that falls short can spill a
-resident slot its callers still hold; the run's document dead-letter state,
-whose held failing rows a pass flushes; each per-document bucket of the
-Output running under the document granularity; and every edge of the run's
-parked cross-region rows. The document state, an Output's buckets and the
-parked rows each live in a cell of their own that the walk reclaim set
-holds beside the slot frames, so a pass reaches them while their owner is
-between steps. The body itself never reads, replaces or removes a
-caller's slot. A consumer whose state the walk
+and each whose state the walk owns is spilled there and then (see "How a
+pass reaches state" below). A consumer whose state the walk
 does not own is skipped and never asked to act; one the running dispatch arm
 holds (a slot out of its scope, a cell its owner is borrowing) frees nothing
 this pass and has its own spill request raised, which its owner answers at
@@ -105,6 +96,56 @@ taken with the retry after that final pass. Every other thread's request is
 checked once and never spills. Governed allocations the walk makes while a
 dispatch arm runs are charged to that node's first registered consumer, and
 release against it however the arm has moved on.
+
+#### How a pass reaches state
+
+A pass reaches an elected consumer's state through the walk reclaim set, in
+one of two ways:
+
+- **Node-buffer slots** live in the set's frames: one frame per dispatch
+  scope, the top level's and one per composition body running inside it. A
+  pass searches the running scope's frame first, then each calling scope's,
+  so a body that falls short can spill a resident slot its callers still
+  hold, though the body itself never reads, replaces or removes a caller's
+  slot.
+- **Walk-owned state** lives in a cell of its own (`Rc<RefCell<_>>`) that is
+  registered under the consumer it charges through `register_walk_owned`
+  (`crates/clinker-exec/src/pipeline/memory/walk.rs`). This covers sorts,
+  aggregate tables, grace partitions, join state, output buffers, the run's
+  document dead-letter state, an Output's per-document buckets and the rows
+  parked for a deferred consumer. The registry is run-scoped, outside every
+  frame, and holds only a `Weak` to each cell, so an owner dropped on any
+  exit is never reached. Several cells may register under one consumer; one
+  cell may serve several consumers and spills only what the elected one
+  charges. The owner keeps the registration beside its state, so both drop
+  together. It borrows its cell only for one operation of its own, never
+  across a call that can charge another consumer, a channel wait or a call
+  into another dispatch arm. Its spill never reserves.
+
+State owned by a thread other than the walk (a Source reader, a streaming
+writer or worker) is not reached by a pass: its consumer is skipped.
+
+Each victim a pass asks ends in one of three outcomes:
+
+- **Spilled.** The walk owns the state and spilled whatever of it was
+  resident, now, on the walk. For walk-owned state, at least one free cell
+  held state for the consumer.
+- **Busy.** The walk owns the state but its owner holds it right now (a slot
+  out of its scope, or a cell its owner is mutating or is itself the
+  requester). The pass frees nothing from it and raises the consumer's
+  spill request, which the owner answers at its next push, yield or batch
+  boundary.
+- **NotOwned.** The walk holds no spillable state for the consumer: a slot
+  its compiled classification keeps in memory, state another thread owns,
+  or a registered owner that is gone or no longer holds that consumer. It is
+  skipped and never asked to act.
+
+Spillable state that no pass can reach is a false E310: a request that does
+not fit is refused while megabytes it could have freed stay resident. So
+every walk-owned spillable state registers through `register_walk_owned`,
+and nothing walk-owned and spillable is `NotOwned`. Registering changes
+none of a consumer's figures (registration with the arbitrator, bytes,
+priority, spill triggers or admission); it only makes the state reachable.
 
 The execution report samples the arbitrator's spill totals and the ledger's
 charged peak after dispatch has finished and every Source worker has joined. Ordered
