@@ -1907,6 +1907,70 @@ fn preserve_synthesis_field_sum_renders_the_per_grain_total() {
 }
 
 #[test]
+fn envelope_footer_finalize_failure_is_an_accumulator_error() {
+    // Two `i64::MAX` ids overflow the footer's integer `sum`. That is a data
+    // error in one aggregate, so the run reports the aggregate error naming
+    // the Envelope node and the footer field, not an internal engine error.
+    // A footer section has no dead-letter route yet, so the failure stops the
+    // run under either strategy.
+    for strategy in ["fail_fast", "continue"] {
+        let yaml = synthesis_pipeline("concat", "total: sum(id)").replacen(
+            "\nnodes:\n",
+            &format!("\nerror_handling:\n  strategy: {strategy}\nnodes:\n"),
+            1,
+        );
+        let mut config =
+            clinker_plan::config::parse_config(&yaml).expect("parse synthesis pipeline");
+        for spanned in &mut config.nodes {
+            if let clinker_plan::config::PipelineNode::Source { config: body, .. } =
+                &mut spanned.value
+            {
+                body.source.path = None;
+            }
+        }
+        let plan = config
+            .compile(&clinker_plan::config::CompileContext::default())
+            .expect("compile synthesis pipeline");
+        let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
+            "edi".to_string(),
+            SourceInput::Records(Box::new(ScriptedReader::new(concat_doc(
+                "a.x12",
+                "ISA",
+                &[i64::MAX, i64::MAX],
+            )))),
+        )]);
+        let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+            "out".to_string(),
+            Box::new(SharedBuffer::new()) as Box<dyn Write + Send>,
+        )]);
+        let result = PipelineExecutor::run_plan_with_readers_writers(
+            &plan,
+            readers,
+            writers,
+            &PipelineRunParams {
+                execution_id: "synth-exec".to_string(),
+                batch_id: "synth-batch".to_string(),
+                ..Default::default()
+            },
+        );
+        match result {
+            Err(clinker_plan::error::PipelineError::Accumulator {
+                transform,
+                binding,
+                source: clinker_record::accumulator::AccumulatorError::SumOverflow { .. },
+            }) => {
+                assert_eq!(transform, "framed", "{strategy}");
+                assert_eq!(binding, "interchange.total", "{strategy}");
+            }
+            other => panic!(
+                "{strategy}: expected the footer's aggregate error, got {:?}",
+                other.map(|_| "a completed run")
+            ),
+        }
+    }
+}
+
+#[test]
 fn concat_synthesis_field_min_and_max_render_the_exact_extremes() {
     // min(id) and max(id) over [10,2,30,4] under concat must render 2 and 30 —
     // the Field path feeds each `id` value into the Min / Max accumulator. Using

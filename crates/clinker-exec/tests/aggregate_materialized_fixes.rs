@@ -159,7 +159,7 @@ fn finalize_failure_attributes_dlq_to_the_failing_document() {
         .error_detail()
         .expect("include_reason defaults to true");
     assert!(
-        detail.contains("SumOverflow"),
+        detail.contains("integer sum overflow"),
         "the failure is an integer sum overflow, got: {detail}",
     );
     // A finalize failure carries a synthetic source row, not a real ordinal:

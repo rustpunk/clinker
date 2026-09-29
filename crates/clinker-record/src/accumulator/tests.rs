@@ -143,35 +143,28 @@ fn test_avg_decimal_merge_with_integer_only_state() {
 }
 
 #[test]
-fn test_avg_float_then_decimal_is_null() {
-    // A binary float cannot join the exact decimal total, whether it arrives
-    // before or after the first decimal. Null rather than silently dropping
-    // the float and reporting the decimal-only quotient. Reachable only on an
-    // untyped column; typecheck rejects a float/decimal mix for typed columns.
+fn test_avg_float_then_decimal_is_a_mixed_error() {
+    // A binary float cannot join an exact decimal total, whether it arrives
+    // before or after the first decimal. The true average (1.5 + 2.5) / 2 has
+    // no honest value in either type, so the group is an error, never a null
+    // and never the decimal-only quotient.
     let mut a = avg();
     add_all(&mut a, &[Value::Float(1.5), dec(250, 2)]);
-    // The true avg is (1.5 + 2.5) / 2 = 2.0; dropping the float would report
-    // 2.5 / 2 = 1.25. Neither is honest, so finalize returns Null.
-    assert_eq!(a.finalize().unwrap(), Value::Null);
+    assert_eq!(a.finalize(), Err(AccumulatorError::MixedDecimalFloat));
 }
 
 #[test]
-fn test_avg_decimal_then_float_is_null() {
-    // A binary float observed after a decimal cannot join the exact decimal
-    // total either. Null rather than silently dropping it. Reachable only on
-    // an untyped column.
+fn test_avg_decimal_then_float_is_a_mixed_error() {
+    // A binary float observed after a decimal is the same mix.
     let mut a = avg();
     add_all(&mut a, &[dec(200, 2), Value::Float(1.5)]);
-    // The true avg is (2.0 + 1.5) / 2 = 1.75; dropping the float would report
-    // 2.0 / 2 = 1.0. Neither is honest, so finalize returns Null.
-    assert_eq!(a.finalize().unwrap(), Value::Null);
+    assert_eq!(a.finalize(), Err(AccumulatorError::MixedDecimalFloat));
 }
 
 #[test]
-fn test_avg_merge_float_mode_with_decimal_mode_is_null() {
+fn test_avg_merge_of_float_and_decimal_partials_is_a_mixed_error() {
     // A float partial merged with a decimal partial, either way, holds a float
-    // and a decimal, which cannot combine exactly: both merge directions give
-    // Null.
+    // and a decimal: both merge directions are the error.
     let build_float = || {
         let mut s = avg();
         add_all(&mut s, &[Value::Float(1.5)]);
@@ -184,10 +177,247 @@ fn test_avg_merge_float_mode_with_decimal_mode_is_null() {
     };
     let mut df = build_decimal();
     df.merge(&build_float());
-    assert_eq!(df.finalize().unwrap(), Value::Null);
+    assert_eq!(df.finalize(), Err(AccumulatorError::MixedDecimalFloat));
     let mut fd = build_float();
     fd.merge(&build_decimal());
-    assert_eq!(fd.finalize().unwrap(), Value::Null);
+    assert_eq!(fd.finalize(), Err(AccumulatorError::MixedDecimalFloat));
+}
+
+/// A decimal of `mantissa × 10^exponent` with no fractional digits, for
+/// values beyond an `i64` mantissa.
+fn big_dec(mantissa: i128, exponent: u32) -> Value {
+    Value::Decimal(rust_decimal::Decimal::from_i128_with_scale(
+        mantissa * 10_i128.pow(exponent),
+        0,
+    ))
+}
+
+#[test]
+fn sum_of_decimal_and_float_is_a_mixed_error() {
+    let mixes = [
+        vec![dec(15, 1), Value::Float(2.25)],
+        vec![Value::Float(2.25), dec(15, 1)],
+        vec![Value::Integer(1), dec(15, 1), Value::Float(2.25)],
+        vec![dec(15, 1), Value::Float(f64::NAN)],
+    ];
+    for values in mixes {
+        assert_eq!(
+            fold(sum, &values).finalize(),
+            Err(AccumulatorError::MixedDecimalFloat),
+            "sum of {values:?}"
+        );
+    }
+}
+
+#[test]
+fn sum_merge_of_decimal_and_float_partials_is_a_mixed_error() {
+    let decimal_partial = || fold(sum, &[dec(15, 1)]);
+    let float_partial = || fold(sum, &[Value::Float(2.25)]);
+    let integer_partial = || fold(sum, &[Value::Integer(1)]);
+    let mut df = decimal_partial();
+    df.merge(&float_partial());
+    assert_eq!(df.finalize(), Err(AccumulatorError::MixedDecimalFloat));
+    let mut fd = float_partial();
+    fd.merge(&decimal_partial());
+    assert_eq!(fd.finalize(), Err(AccumulatorError::MixedDecimalFloat));
+    // Three partials, merged in every order.
+    let partials = [decimal_partial(), float_partial(), integer_partial()];
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        let mut merged = partials[order[0]].clone();
+        merged.merge(&partials[order[1]]);
+        merged.merge(&partials[order[2]]);
+        assert_eq!(
+            merged.finalize(),
+            Err(AccumulatorError::MixedDecimalFloat),
+            "partials merged in order {order:?}"
+        );
+    }
+}
+
+#[test]
+fn retracting_the_floats_clears_the_mixed_error() {
+    for make in [sum as NewState, avg] {
+        let mut acc = fold(make, &[dec(15, 1), Value::Float(2.25)]);
+        assert_eq!(acc.finalize(), Err(AccumulatorError::MixedDecimalFloat));
+        acc.sub(&Value::Float(2.25));
+        assert_eq!(acc, fold(make, &[dec(15, 1)]), "state after the retraction");
+        assert_identical(
+            &acc.finalize().unwrap(),
+            &dec(15, 1),
+            "after the retraction",
+        );
+    }
+    let rows = [
+        (dec(15, 1), Value::Integer(1)),
+        (Value::Float(2.0), Value::Integer(1)),
+    ];
+    let mut acc = weighted_fold(&rows);
+    assert_eq!(acc.finalize(), Err(AccumulatorError::MixedDecimalFloat));
+    acc.sub_weighted(&rows[1].0, &rows[1].1);
+    assert_eq!(acc, weighted_fold(&rows[..1]), "state after the retraction");
+    assert_identical(&acc.finalize().unwrap(), &dec(15, 1), "weighted_avg");
+}
+
+#[test]
+fn mixed_error_does_not_depend_on_arrival_or_split() {
+    let values = [
+        Value::Integer(1),
+        dec(15, 1),
+        Value::Float(2.25),
+        Value::Float(f64::NAN),
+    ];
+    for make in [sum as NewState, avg] {
+        for order in permutations(&values) {
+            assert_eq!(
+                fold(make, &order).finalize(),
+                Err(AccumulatorError::MixedDecimalFloat),
+                "folded {order:?}"
+            );
+            for at in 0..=order.len() {
+                let (left, right) = order.split_at(at);
+                let mut ab = fold(make, left);
+                ab.merge(&fold(make, right));
+                let mut ba = fold(make, right);
+                ba.merge(&fold(make, left));
+                for merged in [ab, ba] {
+                    assert_eq!(
+                        merged.finalize(),
+                        Err(AccumulatorError::MixedDecimalFloat),
+                        "split {left:?} | {right:?}"
+                    );
+                }
+            }
+        }
+    }
+    // The same values as `weighted_avg` rows of weight 1.
+    for order in permutations(&values) {
+        let order: Vec<(Value, Value)> =
+            order.into_iter().map(|v| (v, Value::Integer(1))).collect();
+        assert_eq!(
+            weighted_fold(&order).finalize(),
+            Err(AccumulatorError::MixedDecimalFloat),
+            "weighted rows {order:?}"
+        );
+        for at in 0..=order.len() {
+            let (left, right) = order.split_at(at);
+            let mut ab = weighted_fold(left);
+            ab.merge(&weighted_fold(right));
+            let mut ba = weighted_fold(right);
+            ba.merge(&weighted_fold(left));
+            for merged in [ab, ba] {
+                assert_eq!(
+                    merged.finalize(),
+                    Err(AccumulatorError::MixedDecimalFloat),
+                    "weighted split {left:?} | {right:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn weighted_avg_decimal_failures_are_errors() {
+    // A held row whose `value * weight` has no decimal value fails the group;
+    // retracting that row leaves the other rows' result.
+    let overflowing = (big_dec(7, 28), Value::Integer(2));
+    let healthy = (dec(15, 1), Value::Integer(1));
+    let mut acc = weighted_fold(&[healthy.clone(), overflowing.clone()]);
+    assert_eq!(acc.finalize(), Err(AccumulatorError::ProductOverflow));
+    acc.sub_weighted(&overflowing.0, &overflowing.1);
+    assert_eq!(acc, weighted_fold(std::slice::from_ref(&healthy)));
+    assert_identical(
+        &acc.finalize().unwrap(),
+        &dec(15, 1),
+        "after the retraction",
+    );
+
+    // Weights that total exactly zero divide by zero, in every domain.
+    let zero_weight_groups = [
+        vec![(Value::Integer(5), Value::Integer(0))],
+        vec![
+            (Value::Float(1.5), Value::Float(1.0)),
+            (Value::Float(2.5), Value::Float(-1.0)),
+        ],
+        vec![
+            (dec(15, 1), Value::Integer(1)),
+            (dec(25, 1), Value::Integer(-1)),
+        ],
+    ];
+    for rows in zero_weight_groups {
+        assert_eq!(
+            weighted_fold(&rows).finalize(),
+            Err(AccumulatorError::ZeroTotalWeight),
+            "rows {rows:?}"
+        );
+    }
+
+    // Only a group with no non-null row is null.
+    assert_eq!(weighted_fold(&[]).finalize(), Ok(Value::Null));
+    assert_eq!(
+        weighted_fold(&[(Value::Null, Value::Integer(1)), (dec(15, 1), Value::Null),]).finalize(),
+        Ok(Value::Null)
+    );
+}
+
+#[test]
+fn avg_and_weighted_avg_decimal_out_of_range_is_an_error() {
+    let seven_e28 = big_dec(7, 28);
+    assert_eq!(
+        fold(avg, &[seven_e28.clone(), seven_e28.clone()]).finalize(),
+        Err(AccumulatorError::DecimalOutOfRange)
+    );
+    assert_eq!(
+        weighted_fold(&[
+            (seven_e28.clone(), Value::Integer(1)),
+            (seven_e28, Value::Integer(1)),
+        ])
+        .finalize(),
+        Err(AccumulatorError::DecimalOutOfRange)
+    );
+}
+
+#[test]
+fn every_accumulator_error_names_its_rule_and_a_fix() {
+    // Every error but the integer overflow, whose message predates the rule
+    // and is kept as it is, carries a backticked CXL form the author can
+    // paste, in author vocabulary.
+    for error in [
+        AccumulatorError::DecimalOutOfRange,
+        AccumulatorError::QuotientOutOfRange,
+        AccumulatorError::ProductOverflow,
+        AccumulatorError::ZeroTotalWeight,
+        AccumulatorError::MixedDecimalFloat,
+    ] {
+        let message = error.to_string();
+        let backticked = message.split('`').skip(1).step_by(2).count();
+        assert!(backticked >= 1, "{error:?} gives no fix: {message}");
+        assert!(
+            !message.contains("Decimal") && !message.contains("Float") && !message.contains("::"),
+            "{error:?} names a Rust type: {message}"
+        );
+    }
+    assert!(
+        !AccumulatorError::DecimalOutOfRange
+            .to_string()
+            .contains("integer"),
+        "a decimal overflow is not an integer overflow"
+    );
+    let seven_e28 = big_dec(7, 28);
+    assert_eq!(
+        fold(sum, &[seven_e28.clone(), seven_e28]).finalize(),
+        Err(AccumulatorError::DecimalOutOfRange)
+    );
+    assert_eq!(
+        AccumulatorError::SumOverflow { field: None }.to_string(),
+        "integer sum overflow (i64 range exceeded)"
+    );
 }
 
 #[test]
@@ -1228,11 +1458,12 @@ fn weighted_avg_merge_keeps_an_integer_only_partial() {
 }
 
 #[test]
-fn test_weighted_avg_zero_weight() {
-    // V-7-2a: zero total weight → Null, not NaN/Infinity.
+fn test_weighted_avg_zero_total_weight_is_an_error() {
+    // A zero total weight divides by zero, as the scalar `x / 0` does: an
+    // error, not a null.
     let mut a = weighted_avg();
     a.add_weighted(&Value::Integer(5), &Value::Integer(0));
-    assert_eq!(a.finalize().unwrap(), Value::Null);
+    assert_eq!(a.finalize(), Err(AccumulatorError::ZeroTotalWeight));
 }
 
 // ---------- WeightedAvg over decimals (exactness) ----------
@@ -1325,34 +1556,31 @@ fn test_weighted_avg_decimal_merge_both_decimal_exact() {
 }
 
 #[test]
-fn test_weighted_avg_decimal_mixed_with_float_is_null() {
-    // A float mixed with a decimal cannot fold exactly (reachable only on an
-    // untyped column; typecheck rejects the mix for typed columns). The result
-    // is Null rather than a silently-wrong average.
+fn test_weighted_avg_decimal_mixed_with_float_is_a_mixed_error() {
+    // One row holding a decimal and a float operand is a mix on its own, in
+    // either position.
     let mut a = weighted_avg();
     a.add_weighted(&dec(200, 2), &Value::Float(2.0));
-    assert_eq!(a.finalize().unwrap(), Value::Null);
+    assert_eq!(a.finalize(), Err(AccumulatorError::MixedDecimalFloat));
+    let mut b = weighted_avg();
+    b.add_weighted(&Value::Float(2.0), &dec(15, 1));
+    assert_eq!(b.finalize(), Err(AccumulatorError::MixedDecimalFloat));
 }
 
 #[test]
-fn test_weighted_avg_float_then_decimal_is_null() {
-    // A float row cannot join the exact decimal totals, whether it arrives
-    // before or after the first decimal row. Null rather than silently dropping
-    // the float row and reporting the decimal-only quotient. Reachable only on
-    // an untyped column.
+fn test_weighted_avg_float_then_decimal_is_a_mixed_error() {
+    // A float row and a decimal row in one group, whichever arrives first,
+    // are the same mix: never a null and never the decimal-only quotient.
     let mut a = weighted_avg();
-    a.add_weighted(&Value::Float(1.5), &Value::Integer(1)); // float path first
-    a.add_weighted(&dec(250, 2), &Value::Integer(1)); // then a decimal row
-    // The true weighted avg is (1.5 + 2.5) / 2 = 2.0; dropping the float total
-    // would report 2.5. Neither is honest, so finalize returns Null.
-    assert_eq!(a.finalize().unwrap(), Value::Null);
+    a.add_weighted(&Value::Float(1.5), &Value::Integer(1));
+    a.add_weighted(&dec(250, 2), &Value::Integer(1));
+    assert_eq!(a.finalize(), Err(AccumulatorError::MixedDecimalFloat));
 }
 
 #[test]
-fn test_weighted_avg_merge_float_mode_with_decimal_mode_is_null() {
+fn test_weighted_avg_merge_of_float_and_decimal_partials_is_a_mixed_error() {
     // A float partial merged with a decimal partial, either way, holds a float
-    // row and a decimal row, which cannot combine exactly: both merge
-    // directions give Null.
+    // row and a decimal row: both merge directions are the error.
     let build_float = || {
         let mut s = weighted_avg();
         s.add_weighted(&Value::Float(1.5), &Value::Integer(1));
@@ -1365,10 +1593,10 @@ fn test_weighted_avg_merge_float_mode_with_decimal_mode_is_null() {
     };
     let mut df = build_decimal();
     df.merge(&build_float());
-    assert_eq!(df.finalize().unwrap(), Value::Null);
+    assert_eq!(df.finalize(), Err(AccumulatorError::MixedDecimalFloat));
     let mut fd = build_float();
     fd.merge(&build_decimal());
-    assert_eq!(fd.finalize().unwrap(), Value::Null);
+    assert_eq!(fd.finalize(), Err(AccumulatorError::MixedDecimalFloat));
 }
 
 #[test]

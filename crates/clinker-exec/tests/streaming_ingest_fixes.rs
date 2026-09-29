@@ -35,6 +35,11 @@
 //!    model still flushes each document's groups on its own close, splitting
 //!    the documents rather than folding them into one cross-document result.
 //!
+//! 4. A group whose `sum` holds a decimal and a float fails with the typed
+//!    accumulator error. Under `continue` the materialized per-document flush
+//!    dead-letters that group with the error's message, naming the author's
+//!    `emit`, and writes the other documents' groups.
+//!
 //! The fused tests assert (via the `--explain` `buffer: streaming`
 //! classification) that the fused producer actually drives the
 //! streaming-ingest path rather than the materialized drain.
@@ -49,6 +54,9 @@ use clinker_bench_support::io::SharedBuffer;
 use clinker_exec::executor::{PipelineExecutor, PipelineRunParams};
 use clinker_exec::source::multi_file::FileSlot;
 use clinker_plan::config::{CompileContext, parse_config};
+
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
 
 /// Slice the indented `--explain` property block for the node whose stanza
 /// starts with `slug:`, up to the next blank line. The physical-properties
@@ -679,4 +687,127 @@ fn streaming_no_document_single_table_byte_identical() {
         report.counters.ok_count, 1,
         "exactly one global-fold row for the single sentinel bucket"
     );
+}
+
+/// An Aggregate whose `sum` argument is a decimal on some rows and a float on
+/// others. `amount.clamp(0, 100)` is typed `numeric`, so the typechecker cannot
+/// see that one branch is a decimal and the other a float; the run-time rule
+/// catches the group that holds both. A direct `Source → Aggregate` edge keeps
+/// the materialized per-document flush (a bare Source is not a certified
+/// streaming producer), so each file's groups are finalized on their own.
+const MIXED_DECIMAL_FLOAT_YAML: &str = r#"
+pipeline:
+  name: mixed_decimal_float
+error_handling:
+  strategy: continue
+  dlq:
+    path: rejected.csv
+nodes:
+  - type: source
+    name: events
+    config:
+      name: events
+      type: csv
+      glob: ./*.csv
+      files:
+        on_no_match: skip
+      schema:
+        - { name: category, type: string }
+        - { name: kind, type: string }
+        - { name: amount, type: decimal }
+        - { name: price, type: float }
+  - type: aggregate
+    name: by_category
+    input: events
+    config:
+      group_by:
+        - category
+      cxl: |
+        emit category = category
+        emit total = sum(if kind == "d" then amount.clamp(0, 100) else price)
+  - type: sink
+    name: out
+    input: by_category
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_unmapped: true
+"#;
+
+#[test]
+fn mixed_decimal_float_group_is_dead_lettered_materialized() {
+    // Three documents, one group each: `a` adds a decimal and a float, `b`
+    // only floats, `c` only decimals. Each failing group sits alone in its
+    // document, so the test does not depend on which sibling groups a
+    // finalize failure leaves behind.
+    let files = [
+        (
+            "a.csv",
+            "category,kind,amount,price\na,d,1.50,9.5\na,f,1.00,2.25\n",
+        ),
+        (
+            "b.csv",
+            "category,kind,amount,price\nb,f,1.00,2.25\nb,f,1.00,0.5\n",
+        ),
+        (
+            "c.csv",
+            "category,kind,amount,price\nc,d,1.50,9.5\nc,d,2.25,9.5\n",
+        ),
+    ];
+    let config = parse_config(MIXED_DECIMAL_FLOAT_YAML).expect("parse mixed pipeline");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("a numeric-typed branch compiles; the run-time rule is its backstop");
+    let readers = file_readers(
+        &files
+            .iter()
+            .map(|(name, body)| (*name, (*body).to_string()))
+            .collect::<Vec<_>>(),
+    );
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
+    )]);
+    let sink = dlq_sink::CollectingDlqSink::new();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        dlq_sink::registry(writers, &sink),
+        &run_params(),
+    )
+    .expect("under continue a failed group does not fail the run");
+
+    let output = buf.as_string();
+    let mut body: Vec<String> = output.lines().skip(1).map(|s| s.to_string()).collect();
+    body.sort();
+    assert_eq!(
+        body,
+        vec!["b,2.75".to_string(), "c,3.75".to_string()],
+        "the float group and the decimal group are written; the mixed group is not"
+    );
+    assert_eq!(
+        report.counters.dlq_count, 1,
+        "one aggregate_finalize dead letter"
+    );
+    let rows = sink.rows();
+    assert_eq!(rows.len(), 1, "one dead-letter row written");
+    let entry = &rows[0];
+    assert_eq!(
+        entry.category(),
+        Some(clinker_core_types::dlq::DlqErrorCategory::AggregateFinalize.as_str()),
+    );
+    let detail = entry
+        .error_detail()
+        .expect("include_reason defaults to true");
+    assert!(
+        detail.contains("decimal and float in one group") && detail.contains(".to_decimal()"),
+        "the reason is the typed error's message with its fix, got: {detail}"
+    );
+    assert!(
+        detail.contains("aggregate by_category.total:") && !detail.contains("__agg_"),
+        "the reason names the author's `emit`, not an engine label, got: {detail}"
+    );
+    assert_eq!(entry.source_file(), "a.csv", "the mixed group's document");
 }
