@@ -5,8 +5,8 @@
 //! through the `combine_output_row` path after the kernel returns. Each
 //! failure writes the driver row as its trigger and, right after it, the
 //! matched build row as a collateral. These tests pin what those rows say
-//! under a spilling and a resident arbitrator (for IEJoin and sort-merge, the
-//! spilling one is the resident arbitrator held to a small ledger capacity):
+//! under a spilling and a resident arbitrator (for IEJoin, the spilling one
+//! is the resident arbitrator held to a small ledger capacity):
 //!
 //! - a build-side row names the build record's own Source and its own row,
 //!   whichever spill path the build record took;
@@ -41,10 +41,15 @@ const GENERATED_COLUMNS: [&str; 3] = ["_cxl_dlq_id", PAIRING_COLUMN, "_cxl_dlq_t
 /// `should_spill()` holds for the whole run, so every kernel that consults it
 /// spills its build side, while `should_abort()` never fires.
 ///
-/// Only the grace-hash cases still use it. Grace-hash growth reads process
-/// memory rather than the ledger, so a ledger capacity small enough to make it
-/// spill aborts the run and one large enough to admit it never spills; these
-/// cases move onto a capacity once grace-hash growth charges the arbitrator.
+/// The grace-hash and sort-merge cases still use it. Grace-hash growth reads
+/// process memory rather than the ledger, so a ledger capacity small enough to
+/// make it spill aborts the run and one large enough to admit it never spills;
+/// these cases move onto a capacity once grace-hash growth charges the
+/// arbitrator. The sort-merge cases have no capacity that is stable under a
+/// loaded test process: below the ample peak, a Source's admission off the
+/// walk is refused whenever the ledger is momentarily full, because a Source
+/// reader cannot yet wait for a reclaim. They move onto a capacity once it
+/// can.
 fn spilling_arbitrator() -> Arc<MemoryArbitrator> {
     Arc::new(MemoryArbitrator::with_policy(
         10 * 1024 * 1024 * 1024,
@@ -66,8 +71,8 @@ fn resident_arbitrator() -> Arc<MemoryArbitrator> {
 }
 
 /// The arbitrators a kernel shape runs under: the spilling and resident pair
-/// the grace-hash cases use, and a resident arbitrator held to a ledger
-/// capacity for the IEJoin and sort-merge cases.
+/// the grace-hash and sort-merge cases use, and a resident arbitrator held to
+/// a ledger capacity for the IEJoin cases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Budget {
     Spilling,
@@ -101,13 +106,6 @@ impl Budget {
 /// The cases used to run under a 10 GiB limit with a near-zero soft
 /// threshold, which lies above both.
 const IEJOIN_CAPACITY: u64 = 160 * 1024;
-
-/// The ledger capacity the sort-merge cases spill under: 120 KiB. The runs
-/// complete at 40,000 bytes (below 27,280 the Combine's node-buffer
-/// materialization is refused with E310), and the same fixture with ample
-/// memory charges 127,840 bytes at its peak. The cases used to run under a
-/// 10 GiB limit with a near-zero soft threshold, which lies above both.
-const SORT_MERGE_CAPACITY: u64 = 120 * 1024;
 
 /// Run `yaml` with the named CSV `inputs` (Source name, CSV text) under
 /// `arb`, returning the run result, the text the sink named `out` received,
@@ -583,17 +581,12 @@ fn sort_merge_build_rows_carry_their_own_source_row() {
         ),
         "the presorted single-range fixture must plan the sort-merge kernel"
     );
-    let (low, ample) = run_capacity_pair(
-        &yaml,
-        &range_drivers(),
-        &range_builds(),
-        SORT_MERGE_CAPACITY,
-    );
-    for (arm, rows) in [("capacity", low), ("ample", ample)] {
+    for budget in Budget::BOTH {
+        let rows = run_fixture(&yaml, &range_drivers(), &range_builds(), budget);
         assert_build_rows_attributed(
             &rows,
             RANGE_DRIVERS * RANGE_BUILDS,
-            &format!("sort-merge, {arm}"),
+            &format!("sort-merge, {budget:?}"),
         );
     }
 }
@@ -642,12 +635,8 @@ fn sort_merge_dead_letters_identical_across_memory_limits() {
         compiled_combine_strategy(&yaml, COMBINE),
         CombineStrategy::SortMerge
     ));
-    let (spilled, resident) = run_capacity_pair(
-        &yaml,
-        &range_drivers(),
-        &range_builds(),
-        SORT_MERGE_CAPACITY,
-    );
+    let spilled = run_fixture(&yaml, &range_drivers(), &range_builds(), Budget::Spilling);
+    let resident = run_fixture(&yaml, &range_drivers(), &range_builds(), Budget::Resident);
     assert_eq!(spilled.len(), 2 * RANGE_DRIVERS * RANGE_BUILDS);
     assert!(
         masked(&spilled) == masked(&resident),
