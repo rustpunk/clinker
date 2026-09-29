@@ -134,6 +134,8 @@ pub struct Shortfall {
     pub snapshot: LedgerSnapshot,
     /// The ledger was closed to new charges when the request arrived.
     closed: bool,
+    /// A test's armed forced shortfall refused the request.
+    forced: bool,
 }
 
 impl Shortfall {
@@ -141,6 +143,14 @@ impl Shortfall {
     /// rather than because the request did not fit.
     pub(crate) fn is_closed(&self) -> bool {
         self.closed
+    }
+
+    /// Whether a test's armed forced shortfall
+    /// (`crate::executor::ForcedShortfall`) refused the request rather than
+    /// a real shortage. Always false in a build without the `test-utils`
+    /// feature or `cfg(test)`, where nothing can arm one.
+    pub fn forced(&self) -> bool {
+        self.forced
     }
 }
 
@@ -244,6 +254,7 @@ pub(super) fn shortfall(
         oversized,
         snapshot: snapshot(ledger, requested, requester),
         closed,
+        forced: false,
     }
 }
 
@@ -359,6 +370,7 @@ fn take_forced_shortfall(
         oversized: false,
         snapshot: snapshot(ledger, bytes, Some(consumer)),
         closed: false,
+        forced: false,
     })
 }
 
@@ -385,8 +397,9 @@ impl MemoryArbitrator {
         self.arm_forced_shortfall(crate::executor::ForcedShortfall::at(matcher, nth));
     }
 
-    /// Arm `shortfall` on the ledger, replacing any arm that has not fired.
-    pub(crate) fn arm_forced_shortfall(&self, shortfall: crate::executor::ForcedShortfall) {
+    /// Arm `shortfall` on the ledger, replacing any arm that has not fired
+    /// its last time.
+    pub fn arm_forced_shortfall(&self, shortfall: crate::executor::ForcedShortfall) {
         self.admission.ledger.lock().attachment.forced_shortfall =
             Some(ArmedShortfall { shortfall, seen: 0 });
     }

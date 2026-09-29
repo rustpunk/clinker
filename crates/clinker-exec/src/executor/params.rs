@@ -192,7 +192,7 @@ impl MemoryTestOverrides {
         self.baseline_rss
     }
 
-    /// The one-shot shortfall to arm on the run's arbitrator, if any.
+    /// The forced shortfall to arm on the run's arbitrator, if any.
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn forced_shortfall(&self) -> Option<&ForcedShortfall> {
         self.forced_shortfall.as_ref()
@@ -244,9 +244,10 @@ impl MemoryTestOverrides {
 
     /// Arm `shortfall` on the run's arbitrator before the run starts.
     ///
-    /// Used only by tests that spill a whole unit and then reload it, where
-    /// no capacity both forces the spill and admits the reload. Each use
-    /// records that reason in its test's doc comment.
+    /// For the two kinds of test [`ForcedShortfall`] permits: a whole-unit
+    /// spill-then-reload test, and a spill-path-equivalence test run twice
+    /// at one ample limit. Each use records its reason in its test's doc
+    /// comment.
     pub fn with_forced_shortfall(mut self, shortfall: ForcedShortfall) -> Self {
         self.forced_shortfall = Some(shortfall);
         self
@@ -284,25 +285,52 @@ fn env_ledger_capacity() -> Option<u64> {
     None
 }
 
-/// A one-shot forced shortfall: the `nth` `reserve` whose requester's label
-/// `matcher` accepts falls short once, as if nothing were available, and
-/// every reserve after it takes the real path.
+/// A targeted forced shortfall: charges by a requester whose label `matcher`
+/// accepts fall short as if nothing were available, from the `nth` matching
+/// charge on, [`Self::times`] times, [`Self::every`] matching charges apart.
 ///
-/// `nth` counts from 1 and counts only matching requests, so `nth = 1` is
-/// the next matching reserve. A request for zero bytes or for more than the
-/// whole limit never counts: those take the real path unchanged.
+/// Every charge path counts: `MemoryArbitrator::reserve`, `Grant::try_grow`
+/// and `ConsumerHandle::try_grow` / `try_resize` all reach the one locked
+/// admission check that consults it. `nth` counts from 1 and counts only
+/// matching charges, so `nth = 1` is the next one. A charge for zero bytes or
+/// for more than the whole limit, a charge on a closed ledger, a governed
+/// charge and one by an unlabelled consumer never count. A due firing waits
+/// for a matching charge whose requester holds resident bytes (its handle
+/// plus the grants made in its name), so a forced refusal always leaves the
+/// requester something to free. The refusal is the one a real shortage
+/// gives, with nothing charged, and reports itself as forced
+/// (`Shortfall::forced`); every charge that does not fire takes the real
+/// path.
+///
+/// Two kinds of test may use it, and each records its reason in its doc
+/// comment:
+/// - a test that spills a whole unit and then reloads it, where no ledger
+///   capacity both forces the spill and admits the reload;
+/// - a spill-path-equivalence test (spilled output equals resident output).
+///   It runs twice at the same ample limit: unarmed, asserting no spill
+///   bytes were written; armed, asserting [`Self::fired`] counted its
+///   firings and the named node's `per_stage_spill_bytes_written` is above
+///   0.
+///
+/// Proving that the arbitrator spills under real pressure is not one of
+/// them: that stays with the two-direction pairs on a derived ledger
+/// capacity.
 #[cfg(any(test, feature = "test-utils"))]
 #[derive(Clone)]
 pub struct ForcedShortfall {
     matcher:
         std::sync::Arc<dyn Fn(&clinker_plan::runtime_error::ConsumerLabel) -> bool + Send + Sync>,
     nth: u32,
+    times: u32,
+    every: u32,
+    fired: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 #[cfg(any(test, feature = "test-utils"))]
 impl ForcedShortfall {
-    /// Fall short on the `nth` (from 1) reserve whose requester `matcher`
-    /// accepts.
+    /// Fall short once, on the `nth` (from 1) charge whose requester
+    /// `matcher` accepts, or on the first matching charge after it at which
+    /// the requester holds resident bytes.
     ///
     /// # Panics
     ///
@@ -313,12 +341,53 @@ impl ForcedShortfall {
     ) -> Self {
         assert!(
             nth >= 1,
-            "a forced shortfall counts matching reserves from 1; nth = 0 names no request"
+            "a forced shortfall counts matching charges from 1; nth = 0 names no request"
         );
         Self {
             matcher: std::sync::Arc::new(matcher),
             nth,
+            times: 1,
+            every: 1,
+            fired: std::sync::Arc::default(),
         }
+    }
+
+    /// Fall short `n` times in all (once unless set); the arm is gone after
+    /// the last firing.
+    ///
+    /// # Panics
+    ///
+    /// When `n` is 0: an arm that never fires forces nothing.
+    pub fn times(mut self, n: u32) -> Self {
+        assert!(
+            n >= 1,
+            "a forced shortfall fires at least once; times(0) never fires"
+        );
+        self.times = n;
+        self
+    }
+
+    /// Space the firings `charges` matching charges apart (1 unless set):
+    /// after a firing on matching charge k, the next is due on matching
+    /// charge k + `charges`, or on the first one after it at which the
+    /// requester holds resident bytes.
+    ///
+    /// # Panics
+    ///
+    /// When `charges` is 0: two firings cannot fall on one charge.
+    pub fn every(mut self, charges: u32) -> Self {
+        assert!(
+            charges >= 1,
+            "forced shortfalls fall at least one matching charge apart; every(0) names none"
+        );
+        self.every = charges;
+        self
+    }
+
+    /// The number of firings so far. Every clone of this value shares the
+    /// counter, so a test keeps it before handing the value to a run.
+    pub fn fired(&self) -> std::sync::Arc<std::sync::atomic::AtomicU32> {
+        std::sync::Arc::clone(&self.fired)
     }
 
     pub(crate) fn accepts(&self, label: &clinker_plan::runtime_error::ConsumerLabel) -> bool {
@@ -328,6 +397,21 @@ impl ForcedShortfall {
     pub(crate) fn nth(&self) -> u32 {
         self.nth
     }
+
+    /// How many times the arm fires in all.
+    pub(crate) fn firings(&self) -> u32 {
+        self.times
+    }
+
+    /// Matching charges from one firing to the next.
+    pub(crate) fn spacing(&self) -> u32 {
+        self.every
+    }
+
+    pub(crate) fn record_firing(&self) {
+        self.fired
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -335,6 +419,8 @@ impl std::fmt::Debug for ForcedShortfall {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ForcedShortfall")
             .field("nth", &self.nth)
+            .field("times", &self.times)
+            .field("every", &self.every)
             .finish_non_exhaustive()
     }
 }

@@ -12,11 +12,12 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use clinker_bench_support::io::SharedBuffer;
 use clinker_exec::executor::{
-    ExecutionReport, IN_PROCESS_BASELINE_BYTES, MemoryTestOverrides, PipelineExecutor,
-    PipelineRunParams, SourceReaders, single_file_reader,
+    ExecutionReport, ForcedShortfall, IN_PROCESS_BASELINE_BYTES, MemoryTestOverrides,
+    PipelineExecutor, PipelineRunParams, SourceReaders, single_file_reader,
 };
 use clinker_exec::pipeline::memory::ledger::{Requester, Shortfall};
 use clinker_exec::pipeline::memory::{
@@ -347,15 +348,21 @@ impl MemoryConsumer for HandleConsumer {
 }
 
 fn register(arbitrator: &MemoryArbitrator, node: &str) -> ConsumerId {
+    register_handle(arbitrator, node).0
+}
+
+/// Register a consumer for `node` and keep its handle, so a test can grow it.
+fn register_handle(arbitrator: &MemoryArbitrator, node: &str) -> (ConsumerId, Arc<ConsumerHandle>) {
     let handle = ConsumerHandle::new();
-    arbitrator.register_node_consumer(
+    let id = arbitrator.register_node_consumer(
         Arc::new(HandleConsumer(Arc::clone(&handle))),
-        handle,
+        Arc::clone(&handle),
         ConsumerLabel {
             node: node.to_string(),
             surface: MemorySurface::GroupState,
         },
-    )
+    );
+    (id, handle)
 }
 
 /// The forced refusal is the one a real shortage gives, with nothing
@@ -399,4 +406,150 @@ fn forced_shortfall_fires_once_for_the_matching_requester() {
         .expect("the arm fires once and is gone");
     drop((first, unmatched, governed, third, after));
     assert_eq!(arbitrator.charged_bytes(), 0);
+}
+
+/// An arbitrator large enough that no charge here is short for real.
+fn ample_arbitrator() -> MemoryArbitrator {
+    MemoryArbitrator::with_policy(512 * MIB, 0.80, 0.70, Box::new(NoOpPolicy))
+}
+
+fn only_r(label: &ConsumerLabel) -> bool {
+    label.node == "r"
+}
+
+#[test]
+fn forced_shortfall_fires_on_grant_growth() {
+    let arbitrator = ample_arbitrator();
+    let r = Requester::for_consumer(register(&arbitrator, "r"));
+    let mut grant = arbitrator.reserve(KIB, r).expect("an unarmed reserve");
+    arbitrator.force_shortfall_once(only_r, 1);
+
+    let shortfall = grant
+        .try_grow(KIB)
+        .expect_err("growing a grant is a matching charge and falls short");
+    assert!(shortfall.forced(), "the refusal says it was forced");
+    assert_eq!(shortfall.available, 0, "nothing is reported available");
+    assert_eq!(shortfall.requested, KIB);
+    assert_eq!(shortfall.snapshot.charged, KIB, "nothing was charged");
+    assert_eq!(grant.bytes(), KIB, "the grant is unchanged");
+
+    grant.try_grow(KIB).expect("the retry grows by the real path");
+    assert_eq!(grant.bytes(), 2 * KIB);
+    assert_eq!(arbitrator.charged_bytes(), 2 * KIB);
+}
+
+#[test]
+fn forced_shortfall_fires_on_handle_growth() {
+    let arbitrator = ample_arbitrator();
+    let (_, handle) = register_handle(&arbitrator, "r");
+    handle.try_grow(4 * KIB).expect("an unarmed growth");
+
+    arbitrator.force_shortfall_once(only_r, 1);
+    let shortfall = handle
+        .try_grow(KIB)
+        .expect_err("a handle growth is a matching charge and falls short");
+    assert!(shortfall.forced());
+    assert_eq!(shortfall.available, 0);
+    assert_eq!(handle.bytes(), 4 * KIB, "nothing was charged");
+    handle.try_grow(KIB).expect("the retry grows");
+    assert_eq!(handle.bytes(), 5 * KIB);
+
+    arbitrator.force_shortfall_once(only_r, 1);
+    let shortfall = handle
+        .try_resize(8 * KIB)
+        .expect_err("a resize that grows is a matching charge and falls short");
+    assert!(shortfall.forced());
+    assert_eq!(shortfall.requested, 3 * KIB, "the growth is what was asked");
+    assert_eq!(handle.bytes(), 5 * KIB, "the charge is unchanged");
+    handle.try_resize(8 * KIB).expect("the retry resizes");
+    assert_eq!(handle.bytes(), 8 * KIB);
+    assert_eq!(arbitrator.charged_bytes(), 8 * KIB);
+}
+
+#[test]
+fn forced_shortfall_never_fires_while_the_target_holds_nothing() {
+    let arbitrator = ample_arbitrator();
+    let r = Requester::for_consumer(register(&arbitrator, "r"));
+    let other = Requester::for_consumer(register(&arbitrator, "other"));
+    let shortfall = ForcedShortfall::at(only_r, 1);
+    let fired = shortfall.fired();
+    arbitrator.arm_forced_shortfall(shortfall);
+
+    let governed = arbitrator
+        .reserve(KIB, Requester::governed())
+        .expect("a governed reserve never counts");
+    let unmatched = arbitrator
+        .reserve(KIB, other)
+        .expect("another consumer's reserve never counts");
+    let first = arbitrator
+        .reserve(KIB, r)
+        .expect("r holds nothing, so its first matching reserve counts but does not fire");
+    assert_eq!(fired.load(Ordering::Relaxed), 0);
+
+    let shortfall = arbitrator
+        .reserve(KIB, r)
+        .expect_err("r now holds its first grant, so the due firing falls");
+    assert!(shortfall.forced());
+    assert_eq!(shortfall.snapshot.charged, 3 * KIB, "nothing was charged");
+    assert_eq!(fired.load(Ordering::Relaxed), 1);
+
+    let retry = arbitrator.reserve(KIB, r).expect("the arm is spent");
+    drop((governed, unmatched, first, retry));
+    assert_eq!(arbitrator.charged_bytes(), 0);
+}
+
+#[test]
+fn forced_shortfall_repeats_times_spaced_every() {
+    let arbitrator = ample_arbitrator();
+    let r = Requester::for_consumer(register(&arbitrator, "r"));
+    let held = arbitrator.reserve(KIB, r).expect("an unarmed reserve");
+    let shortfall = ForcedShortfall::at(only_r, 1).times(3).every(2);
+    let fired = shortfall.fired();
+    arbitrator.arm_forced_shortfall(shortfall);
+
+    let mut grants = Vec::new();
+    let mut outcomes = Vec::new();
+    for _ in 0..8 {
+        match arbitrator.reserve(KIB, r) {
+            Ok(grant) => {
+                grants.push(grant);
+                outcomes.push(true);
+            }
+            Err(shortfall) => {
+                assert!(shortfall.forced(), "every refusal here is forced");
+                outcomes.push(false);
+            }
+        }
+    }
+    assert_eq!(
+        outcomes,
+        [false, true, false, true, false, true, true, true],
+        "fires on matching charges 1, 3 and 5, and never after"
+    );
+    assert_eq!(fired.load(Ordering::Relaxed), 3);
+    drop((held, grants));
+    assert_eq!(arbitrator.charged_bytes(), 0);
+}
+
+#[test]
+fn forced_shortfall_is_marked_forced() {
+    let arbitrator = ample_arbitrator();
+    let r = Requester::for_consumer(register(&arbitrator, "r"));
+    let held = arbitrator.reserve(KIB, r).expect("an unarmed reserve");
+    arbitrator.force_shortfall_once(only_r, 1);
+    let forced = arbitrator
+        .reserve(KIB, r)
+        .expect_err("the armed reserve falls short");
+    assert!(forced.forced(), "a forced refusal reports it");
+    drop(held);
+
+    let full = MemoryArbitrator::with_policy(4 * KIB, 0.80, 0.70, Box::new(NoOpPolicy));
+    let r = Requester::for_consumer(register(&full, "r"));
+    let all = full.reserve(4 * KIB, r).expect("fills the ledger");
+    let real = full
+        .reserve(KIB, r)
+        .expect_err("a full ledger falls short for real");
+    assert!(!real.forced(), "a real shortage is not forced");
+    assert_eq!(real.available, 0);
+    drop(all);
 }
