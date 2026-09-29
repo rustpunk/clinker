@@ -2139,6 +2139,7 @@ fn replay_held(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::memory::walk::{WalkContextGuard, WalkReclaimSet, WalkSpillSettings};
 
     fn test_label(node: &str) -> clinker_plan::runtime_error::ConsumerLabel {
         clinker_plan::runtime_error::ConsumerLabel {
@@ -3968,5 +3969,123 @@ mod tests {
             "the peak stays at its high-water mark"
         );
         assert_eq!(files_in(root.path()), 0);
+    }
+
+    /// A walk with its reclaim set, spilling node-buffer slots into `root`.
+    fn walk_set(root: &std::path::Path) -> std::rc::Rc<std::cell::RefCell<WalkReclaimSet>> {
+        std::rc::Rc::new(std::cell::RefCell::new(WalkReclaimSet::new(
+            WalkSpillSettings {
+                spill_root: Arc::from(root),
+                spill_compress: CompressMode::Auto,
+                batch_size: 1024,
+            },
+        )))
+    }
+
+    /// A consumer holding nothing that asks for memory on the walk: its
+    /// request is not the document state's, and it has nothing a pass could
+    /// spill.
+    fn probe(arbitrator: &MemoryArbitrator) -> Arc<ConsumerHandle> {
+        let handle = ConsumerHandle::new();
+        arbitrator.register_consumer(
+            Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                Arc::clone(&handle),
+            )),
+            Arc::clone(&handle),
+            test_label("probe"),
+        );
+        handle
+    }
+
+    /// A request another consumer makes on the walk spills the held failing
+    /// rows of failed documents when it does not fit beside them, and they
+    /// replay afterwards in the order they were held.
+    ///
+    /// Capacity: the 24 held rows leave `R` bytes of resident tails and
+    /// `F` bytes of index entries and failed-document slots charged, and the
+    /// capacity is set to `R + F + FREE`. The probe asks for `FREE + R / 2`:
+    /// more than is free, less than is free once the tails are on disk. The
+    /// tails are the only state any pass could spill.
+    ///
+    /// While the document state's cell is borrowed (as it is while the state
+    /// admits a row of its own) the same pass frees nothing from it: the
+    /// state is busy, and its spill request is raised instead. No boundary
+    /// relief runs between the holds and the requests, so the extent log's
+    /// own soft-threshold poll cannot flush the tails for the pass.
+    #[test]
+    fn held_rows_are_spilled_by_a_pass_another_walk_request_starts() {
+        const FREE: u64 = 1024;
+        let root = tempfile::tempdir().expect("held-log root");
+        let walk_root = tempfile::tempdir().expect("walk spill root");
+        let arbitrator = electing_arbitrator(1 << 30);
+        let set = walk_set(walk_root.path());
+        let _walk = WalkContextGuard::install(&arbitrator, std::rc::Rc::clone(&set));
+        let cell = std::rc::Rc::new(std::cell::RefCell::new(held_state(
+            &arbitrator,
+            root.path(),
+            usize::MAX,
+        )));
+        set.borrow_mut()
+            .set_document_dlq(std::rc::Rc::clone(&cell));
+
+        let docs: Vec<DocKey> = (0..3).map(doc_key).collect();
+        let mut expected: HashMap<DocKey, Vec<SourceRowId>> = HashMap::new();
+        for ordinal in 1..=24u64 {
+            let doc = &docs[(ordinal % 3) as usize];
+            hold_row(&mut cell.borrow_mut(), doc, ordinal).expect("hold");
+            expected
+                .entry(Arc::clone(doc))
+                .or_default()
+                .push(row(1, ordinal));
+        }
+        let (resident, charged) = {
+            let state = cell.borrow();
+            (state.held.resident_bytes(), state.charged_bytes())
+        };
+        assert!(resident > 2 * FREE, "the tails hold more than is free");
+        arbitrator.set_test_capacity(arbitrator.charged_bytes() + FREE);
+        let probe = probe(&arbitrator);
+        let request = FREE + resident / 2;
+
+        let busy = cell.borrow_mut();
+        assert!(
+            probe.try_grow(request).is_err(),
+            "with the document state busy the pass frees nothing from it"
+        );
+        drop(busy);
+        assert_eq!(cell.borrow().held.resident_bytes(), resident);
+        assert_eq!(files_in(root.path()), 0, "nothing was flushed");
+        assert!(
+            cell.borrow().handle.take_spill_request(),
+            "the busy state's spill request is raised, for its next boundary"
+        );
+
+        probe
+            .try_grow(request)
+            .expect("the pass flushes the held rows and the request fits");
+        {
+            let state = cell.borrow();
+            assert_eq!(state.held.resident_bytes(), 0, "every tail is on disk");
+            assert_eq!(
+                state.charged_bytes(),
+                charged - resident,
+                "the state's charge fell by what its tails held"
+            );
+        }
+        assert_eq!(files_in(root.path()), 1, "the held rows moved to one file");
+        assert_eq!(
+            arbitrator.per_stage_spill_bytes().get("validate").copied(),
+            Some(arbitrator.cumulative_spill_bytes()),
+            "the flush is attributed to the failing node"
+        );
+        assert!(arbitrator.cumulative_spill_bytes() > 0);
+        probe.shrink(probe.bytes());
+        for doc in &docs {
+            assert_eq!(
+                take_held_rows(&mut cell.borrow_mut(), doc),
+                expected[doc],
+                "a rejection replays the held rows from disk in order, the trigger first"
+            );
+        }
     }
 }

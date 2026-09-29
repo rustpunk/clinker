@@ -26,6 +26,7 @@ use clinker_plan::error::PipelineError;
 use super::reservation::ReservationState;
 use super::{ConsumerHandle, ConsumerId, MemoryArbitrator};
 use crate::executor::dispatch::{NodeBufferKey, NodeBufferReaderLedger, ResidentSlotSpill};
+use crate::executor::document_dlq::DocumentDlqState;
 use crate::executor::node_buffer::NodeBuffer;
 
 /// Where the calling thread stands relative to one run's walk.
@@ -240,6 +241,7 @@ pub(crate) struct WalkReclaimSet {
     /// slots, kept while a composition body it entered runs.
     parents: Vec<NodeBufferSlots>,
     spill_settings: WalkSpillSettings,
+    document_dlq: Option<Rc<RefCell<DocumentDlqState>>>,
 }
 
 impl WalkReclaimSet {
@@ -249,7 +251,12 @@ impl WalkReclaimSet {
             slots: NodeBufferSlots::default(),
             parents: Vec::new(),
             spill_settings,
+            document_dlq: None,
         }
+    }
+
+    pub(crate) fn set_document_dlq(&mut self, state: Rc<RefCell<DocumentDlqState>>) {
+        self.document_dlq = Some(state);
     }
 
     /// The running dispatch scope's node-buffer slots: the top frame.
