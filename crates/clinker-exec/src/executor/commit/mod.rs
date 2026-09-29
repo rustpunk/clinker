@@ -64,7 +64,8 @@ use std::collections::HashMap;
 use clinker_record::GroupByKey;
 
 use crate::executor::dispatch::{
-    CommitStepPath, CorrelationGroupBuffer, ExecutorContext, commit_correlation_buffers,
+    CommitStepPath, CorrelationGroupBuffer, ExecutorContext, cell_holds_failure,
+    commit_correlation_buffers, held_trigger_rows,
 };
 use clinker_plan::config::CorrelationFanoutPolicy;
 use clinker_plan::error::PipelineError;
@@ -249,8 +250,10 @@ fn close_converged_transform_signals(ctx: &mut ExecutorContext<'_>) {
 
 /// Capture every error_messages / error_rows entry from the live
 /// correlation buffer into the cross-iteration archive, deduplicating
-/// against entries already there (by `(key, row_num)` so the same
-/// failure observed across iterations counts once). Records are NOT
+/// against entries already there by cell, row, message and role
+/// ([`cell_holds_failure`]), so the same failure observed across
+/// iterations under fresh stamps counts once while each failing driver's
+/// copy of a shared build row stays distinct. Records are NOT
 /// archived — they are speculative per-iteration writes that
 /// `restore_baseline` discards.
 fn archive_iteration_errors(
@@ -263,12 +266,9 @@ fn archive_iteration_errors(
             continue;
         }
         let entry = archive.entry(key.clone()).or_default();
+        let live_triggers = held_trigger_rows(&group.error_messages);
         for err in &group.error_messages {
-            let already = entry
-                .error_messages
-                .iter()
-                .any(|e| e.row_num == err.row_num && e.error_message == err.error_message);
-            if !already {
+            if !cell_holds_failure(&entry.error_messages, err, err.held_role(&live_triggers)) {
                 entry.error_messages.push(err.clone());
             }
         }
@@ -291,12 +291,10 @@ fn merge_archive_into_live(
     };
     for (key, archived) in archive {
         let entry = live_map.entry(key).or_default();
+        let archived_triggers = held_trigger_rows(&archived.error_messages);
         for err in archived.error_messages {
-            let already = entry
-                .error_messages
-                .iter()
-                .any(|e| e.row_num == err.row_num && e.error_message == err.error_message);
-            if !already {
+            let role = err.held_role(&archived_triggers);
+            if !cell_holds_failure(&entry.error_messages, &err, role) {
                 entry.error_messages.push(err);
             }
         }

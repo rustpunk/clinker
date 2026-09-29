@@ -5286,6 +5286,62 @@ impl CorrelationErrorRecord {
     pub(crate) fn is_trigger(&self) -> bool {
         self.failed_at.is_trigger()
     }
+
+    /// This record's role in its cell, given the cell's
+    /// [`held_trigger_rows`]: a trigger, or a collateral held with the
+    /// trigger of the named row. It names the trigger by row rather than by
+    /// stamp, so it is the same for a failure observed again, under fresh
+    /// stamps, on a later retraction iteration.
+    pub(crate) fn held_role(
+        &self,
+        trigger_rows: &HashMap<uuid::Uuid, crate::executor::stream_event::SourceRowId>,
+    ) -> HeldRole {
+        if self.is_trigger() {
+            HeldRole::Trigger
+        } else {
+            HeldRole::HeldWith(trigger_rows.get(&self.failed_at.trigger_id()).copied())
+        }
+    }
+}
+
+/// A held failure's role in its correlation cell (see
+/// [`CorrelationErrorRecord::held_role`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum HeldRole {
+    /// The group's own failure.
+    Trigger,
+    /// A collateral held with the trigger of this row, or `None` when that
+    /// trigger is not in the cell.
+    HeldWith(Option<crate::executor::stream_event::SourceRowId>),
+}
+
+/// The row of every trigger in `cell`, by its stamp's id.
+pub(crate) fn held_trigger_rows(
+    cell: &[CorrelationErrorRecord],
+) -> HashMap<uuid::Uuid, crate::executor::stream_event::SourceRowId> {
+    cell.iter()
+        .filter(|err| err.is_trigger())
+        .map(|err| (err.failed_at.id(), err.row_num))
+        .collect()
+}
+
+/// Whether `cell` already holds the failure `err` records, whose role in
+/// its own cell is `role`: the same row, the same message and the same
+/// role. The relaxed-key commit archives each retraction iteration's held
+/// failures and folds them back with this identity, so a failure observed
+/// again on a later iteration is held once, while each failing driver's
+/// copy of a shared build row stays distinct.
+pub(crate) fn cell_holds_failure(
+    cell: &[CorrelationErrorRecord],
+    err: &CorrelationErrorRecord,
+    role: HeldRole,
+) -> bool {
+    let trigger_rows = held_trigger_rows(cell);
+    cell.iter().any(|held| {
+        held.row_num == err.row_num
+            && held.error_message == err.error_message
+            && held.held_role(&trigger_rows) == role
+    })
 }
 
 #[cfg(test)]
