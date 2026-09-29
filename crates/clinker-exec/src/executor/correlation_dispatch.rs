@@ -172,8 +172,18 @@ fn commit_one_group(
     // reconstructing identity from a diagnostic source name.
     let mut seen_rows: HashSet<crate::executor::stream_event::SourceRowId> = HashSet::new();
     // Held failures, in parking order, one trigger row per failure, each
-    // followed by its contributing build row.
-    write_held_failures(ctx, &error_messages, &mut seen_rows)?;
+    // followed by its contributing build row. A contributing build row did
+    // not fail, so it stays out of `seen_rows`: its own buffered slot in this
+    // group is spared or condemned below like any other row, and is only
+    // kept from a second dead letter once condemned.
+    let mut written_build_rows: HashSet<crate::executor::stream_event::SourceRowId> =
+        HashSet::new();
+    write_held_failures(
+        ctx,
+        &error_messages,
+        &mut seen_rows,
+        &mut written_build_rows,
+    )?;
     // Collateral entries: every other distinct row that flowed through
     // the group's Output buffers but didn't itself error. Two sparing
     // axes apply, in order:
@@ -230,7 +240,7 @@ fn commit_one_group(
                 .push(slot.clone());
             continue;
         }
-        if !seen_rows.insert(slot.row_num) {
+        if !seen_rows.insert(slot.row_num) || written_build_rows.contains(&slot.row_num) {
             continue;
         }
         push_dlq(
@@ -282,7 +292,12 @@ fn commit_overflowed_group(
     }
 
     let mut seen_rows: HashSet<crate::executor::stream_event::SourceRowId> = HashSet::new();
-    write_held_failures(ctx, error_messages, &mut seen_rows)?;
+    let mut written_build_rows: HashSet<crate::executor::stream_event::SourceRowId> =
+        HashSet::new();
+    write_held_failures(ctx, error_messages, &mut seen_rows, &mut written_build_rows)?;
+    // Overflow spares nothing, so a build row already written with its
+    // failure is not written again.
+    seen_rows.extend(written_build_rows);
 
     let overflow_msg = PipelineError::CorrelationGroupOverflow {
         group_key: format_group_key(group_key),
@@ -361,7 +376,9 @@ fn commit_overflowed_group(
 }
 
 /// Write a group's held failures in parking order, recording each written
-/// row in `seen_rows`.
+/// trigger row in `seen_rows` and each written contributing build row in
+/// `build_rows`. The two are kept apart because a build row did not fail:
+/// the dirty commit still decides whether its own buffered slot is spared.
 ///
 /// Every held failure writes one trigger row, with its own category,
 /// message, stage, route, triggering field and value, and stamp, and then
@@ -374,11 +391,12 @@ fn write_held_failures(
     ctx: &mut ExecutorContext<'_>,
     error_messages: &[HeldFailure],
     seen_rows: &mut HashSet<crate::executor::stream_event::SourceRowId>,
+    build_rows: &mut HashSet<crate::executor::stream_event::SourceRowId>,
 ) -> Result<(), PipelineError> {
     for failure in error_messages {
         seen_rows.insert(failure.row_num);
         if let Some(build_row) = failure.contributing_build_row() {
-            seen_rows.insert(build_row);
+            build_rows.insert(build_row);
         }
         write_failure(ctx, failure.clone())?;
     }
