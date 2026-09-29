@@ -1543,6 +1543,12 @@ pub(crate) struct ExecutorContext<'a> {
     pub(crate) run_policy: crate::executor::RunPolicy,
 
     // Owned mutable per-walk state.
+    /// The walk's reclaimable state, shared with the walk frame the run
+    /// installs on this thread, so a reclaim started from any governed
+    /// allocation on the walk reaches it without `&mut` access to this
+    /// context. Borrowed in short scopes only.
+    pub(crate) walk_reclaim:
+        std::rc::Rc<std::cell::RefCell<crate::pipeline::memory::walk::WalkReclaimSet>>,
     pub(crate) node_buffers: HashMap<NodeBufferKey, NodeBuffer>,
     /// Per-slot consumer registration for `node_buffers`. `admit_node_buffer`
     /// registers a `NodeBufferConsumer` with the pipeline-scoped arbitrator
@@ -5029,6 +5035,18 @@ pub(crate) fn dispatch_plan_node(
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
 ) -> Result<(), PipelineError> {
+    // Every node runs on the walk that owns this context's reclaim set; a
+    // reclaim started from a governed allocation in any arm relies on it.
+    debug_assert_eq!(
+        crate::pipeline::memory::walk::thread_role(&ctx.memory_budget),
+        crate::pipeline::memory::walk::ThreadRole::Walk,
+        "a plan node was dispatched off the run's walk"
+    );
+    debug_assert!(
+        crate::pipeline::memory::walk::walk_reclaim_set(&ctx.memory_budget)
+            .is_some_and(|installed| std::rc::Rc::ptr_eq(&installed, &ctx.walk_reclaim)),
+        "the walk frame installed for this run does not own this context's reclaim set"
+    );
     // Service any spill requests the arbitrator flagged on resident slots at
     // a prior admission boundary before doing this node's work, so an
     // elected victim actually frees its memory instead of only carrying a

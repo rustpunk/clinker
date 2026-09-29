@@ -1874,6 +1874,9 @@ impl PipelineExecutor {
             strategy,
             run_policy,
 
+            walk_reclaim: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::pipeline::memory::walk::WalkReclaimSet::new(),
+            )),
             node_buffers: HashMap::new(),
             node_buffer_consumer_ids: HashMap::new(),
             node_buffer_readers: dispatch::NodeBufferReaderLedger::default(),
@@ -1953,6 +1956,12 @@ impl PipelineExecutor {
             // supersedes one with an exec-measured figure.
             runtime_statistics: Arc::new(std::sync::Mutex::new(statistics.clone())),
         };
+        // This thread is the run's walk from here until the function returns,
+        // by any path; the guard drops before `ctx`.
+        let _walk_frame = crate::pipeline::memory::walk::WalkContextGuard::install(
+            &ctx.memory_budget,
+            std::rc::Rc::clone(&ctx.walk_reclaim),
+        );
 
         // Resolve dispatch order through the memory arbitrator rather
         // than walking `topo_order` blindly. `scheduled_pass_order` runs
