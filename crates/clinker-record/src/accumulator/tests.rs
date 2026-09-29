@@ -467,7 +467,10 @@ fn assert_identical(actual: &Value, expected: &Value, context: &str) {
     );
 }
 
-fn fold(make: fn() -> AccumulatorEnum, values: &[Value]) -> AccumulatorEnum {
+/// A constructor of an empty `min` or `max` accumulator.
+type NewState = fn() -> AccumulatorEnum;
+
+fn fold(make: NewState, values: &[Value]) -> AccumulatorEnum {
     let mut acc = make();
     add_all(&mut acc, values);
     acc
@@ -497,7 +500,7 @@ fn min_max_do_not_depend_on_arrival_order() {
     ];
     let lo = Value::Integer(0);
     let hi = Value::Float(f64::NAN);
-    let folds: [(fn() -> AccumulatorEnum, &Value); 2] = [(min, &lo), (max, &hi)];
+    let folds: [(NewState, &Value); 2] = [(min, &lo), (max, &hi)];
     for order in permutations(&values) {
         for (make, expected) in folds {
             let context = format!("{order:?}");
