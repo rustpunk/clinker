@@ -35,8 +35,15 @@
 //! fields on top of the value order, so a last property proves its byte key
 //! and its comparator agree on whole records as well.
 //!
+//! Aggregate `min` and `max` pick by the value order refined among tied values
+//! by a fixed representative (`extremum_order`), so one property proves that
+//! refinement a total order that never reverses the comparator, and another
+//! that `min` and `max` over a multiset of numbers do not depend on arrival
+//! order or on how the values were split into partial states and merged.
+//!
 //! Case counts: 1,024 per pair property (the group-key and authored-key
-//! properties included) and 512 for the triple property.
+//! properties included) and 512 for the triple, `extremum_order` and
+//! `min`/`max` properties.
 
 use std::cmp::Ordering;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -45,6 +52,7 @@ use std::sync::Arc;
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use clinker_exec::pipeline::sort_key::{compare_authored_keys, stable_sort_key_for_record};
 use clinker_plan::config::{NullOrder, SortField, SortOrder};
+use clinker_record::accumulator::{AccumulatorEnum, MinMaxState, extremum_order};
 use clinker_record::order::{NumericTieClass, compare, encode, hash_tie_class, ties};
 use clinker_record::owned_storage::{OwnedValues, SharedStorage};
 use clinker_record::{GroupByKey, Record, Schema, Value, value_to_group_key};
@@ -721,6 +729,137 @@ proptest! {
             fields.iter().map(|((_, b), _, _)| b).collect::<Vec<_>>(),
             sort_by
         );
+    }
+}
+
+/// Whether two values are the same down to a float's sign and payload bits
+/// and a decimal's scale and sign, which `Value`'s `==` does not see.
+fn identical(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
+        (Value::Decimal(x), Value::Decimal(y)) => x.serialize() == y.serialize(),
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| identical(p, q))
+        }
+        (Value::Map(x), Value::Map(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y.iter())
+                    .all(|((kx, vx), (ky, vy))| kx.as_str() == ky.as_str() && identical(vx, vy))
+        }
+        _ => a == b,
+    }
+}
+
+/// A multiset of numbers dense in ties: draws from a few numbers' relatives
+/// (the same number in another domain, adjacent floats, rescaled decimals,
+/// NaN of either sign and payload), with the odd null.
+fn number_multiset() -> BoxedStrategy<Vec<Value>> {
+    prop::collection::vec(number(), 1..5)
+        .prop_flat_map(|bases| {
+            let pool: Vec<Value> = bases
+                .iter()
+                .flat_map(relatives)
+                .filter(|v| matches!(v, Value::Integer(_) | Value::Float(_) | Value::Decimal(_)))
+                .collect();
+            prop::collection::vec(
+                prop_oneof![9 => prop::sample::select(pool), 1 => Just(Value::Null)],
+                0..24,
+            )
+        })
+        .boxed()
+}
+
+fn min_state() -> AccumulatorEnum {
+    AccumulatorEnum::Min(MinMaxState::default())
+}
+
+fn max_state() -> AccumulatorEnum {
+    AccumulatorEnum::Max(MinMaxState::default())
+}
+
+/// A constructor of an empty `min` or `max` accumulator.
+type NewState = fn() -> AccumulatorEnum;
+
+fn fold(make: NewState, values: &[Value]) -> AccumulatorEnum {
+    let mut acc = make();
+    for v in values {
+        acc.add(v);
+    }
+    acc
+}
+
+fn finalized(acc: &AccumulatorEnum) -> Value {
+    acc.finalize().expect("min and max finalize without error")
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// `extremum_order` is a total order, `Equal` only for identical values,
+    /// that agrees with the comparator on every pair the comparator does not
+    /// tie.
+    #[test]
+    fn extremum_order_refines_the_value_order((a, b, c) in triple()) {
+        for (x, y) in [(&a, &b), (&b, &c), (&a, &c)] {
+            let xy = extremum_order(x, y);
+            prop_assert_eq!(xy, extremum_order(y, x).reverse(), "{:?} vs {:?}", x, y);
+            prop_assert_eq!(xy == Ordering::Equal, identical(x, y), "{:?} vs {:?}", x, y);
+            let by_order = compare(x, y);
+            if by_order != Ordering::Equal {
+                prop_assert_eq!(xy, by_order, "{:?} vs {:?}", x, y);
+            }
+        }
+        for [x, y, z] in [[&a, &b, &c], [&a, &c, &b], [&b, &a, &c], [&b, &c, &a], [&c, &a, &b], [&c, &b, &a]] {
+            if extremum_order(x, y) != Ordering::Greater && extremum_order(y, z) != Ordering::Greater {
+                prop_assert_ne!(extremum_order(x, z), Ordering::Greater, "{:?} / {:?} / {:?}", x, y, z);
+            }
+        }
+    }
+
+    /// `min` and `max` over a multiset of numbers, folded in any arrival order
+    /// and split into 1-8 partial states merged in any order, finalize to the
+    /// first and last value of the multiset sorted by `extremum_order` (null
+    /// when every value is null), which is also what folding the sorted
+    /// multiset gives.
+    #[test]
+    fn min_max_are_independent_of_arrival_and_merge_partition(
+        (values, arrived) in number_multiset()
+            .prop_flat_map(|values| (Just(values.clone()), Just(values).prop_shuffle())),
+        cuts in prop::collection::vec(any::<prop::sample::Index>(), 0..8),
+        merge_order in prop::collection::vec(any::<prop::sample::Index>(), 8),
+    ) {
+        let mut sorted: Vec<Value> = values.iter().filter(|v| !v.is_null()).cloned().collect();
+        sorted.sort_by(extremum_order);
+        let lowest = sorted.first().cloned().unwrap_or(Value::Null);
+        let highest = sorted.last().cloned().unwrap_or(Value::Null);
+
+        let mut bounds: Vec<usize> = cuts.iter().map(|i| i.index(arrived.len() + 1)).collect();
+        bounds.extend([0, arrived.len()]);
+        bounds.sort_unstable();
+        let parts: Vec<&[Value]> = bounds.windows(2).map(|w| &arrived[w[0]..w[1]]).collect();
+        let mut order: Vec<usize> = (0..parts.len()).collect();
+        for i in (1..order.len()).rev() {
+            order.swap(i, merge_order[i].index(i + 1));
+        }
+
+        let folds: [(NewState, &Value); 2] =
+            [(min_state, &lowest), (max_state, &highest)];
+        for (make, expected) in folds {
+            let from_sorted = finalized(&fold(make, &sorted));
+            prop_assert!(identical(&from_sorted, expected), "sorted fold {:?} vs {:?}", from_sorted, expected);
+            let arrival = finalized(&fold(make, &arrived));
+            prop_assert!(identical(&arrival, expected), "{:?}: {:?} vs {:?}", arrived, arrival, expected);
+            let mut merged = fold(make, parts[order[0]]);
+            for &p in &order[1..] {
+                merged.merge(&fold(make, parts[p]));
+            }
+            let merged = finalized(&merged);
+            prop_assert!(
+                identical(&merged, expected),
+                "{:?} merged in order {:?}: {:?} vs {:?}", parts, order, merged, expected
+            );
+        }
     }
 }
 
