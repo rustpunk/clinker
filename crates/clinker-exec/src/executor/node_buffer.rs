@@ -824,6 +824,13 @@ impl TransientNodeBufferReservation {
         self.handle.set_bytes(bytes);
     }
 
+    /// Restate the reservation's bytes after a representation transition
+    /// has completed.
+    pub(crate) fn resize(&self, bytes: u64, _node: &str) -> Result<(), PipelineError> {
+        self.handle.set_bytes(bytes);
+        Ok(())
+    }
+
     /// Current bytes held by this reservation.
     pub(crate) fn bytes(&self) -> u64 {
         self.handle.bytes()
@@ -1965,6 +1972,67 @@ mod tests {
         drop(primary);
         assert_eq!(budget.consumer_count(), 0);
         assert_eq!(budget.sum_consumer_usage(), 0);
+    }
+
+    #[test]
+    fn transient_reservation_resize_checks_a_rise_and_releases_a_fall() {
+        let kib = 1024u64;
+        let capacity = 64 * kib;
+        let budget = roomy_arbitrator();
+        budget.set_test_capacity(capacity);
+        let reservation = reserve_node_buffer_materialization(16 * kib, &budget, "canonicalize")
+            .expect("the first 16 KiB fit the capacity");
+        assert_eq!(budget.charged_bytes(), 16 * kib);
+
+        reservation
+            .resize(40 * kib, "canonicalize")
+            .expect("a rise that fits is granted");
+        assert_eq!(
+            budget.charged_bytes(),
+            40 * kib,
+            "a granted rise is charged exactly"
+        );
+
+        // Off the walk nothing is reclaimed, so a rise past the capacity is
+        // refused at once.
+        match reservation.resize(capacity + 1, "canonicalize") {
+            Err(PipelineError::MemoryBudgetExceeded { node, source, .. }) => {
+                assert_eq!(node, "canonicalize");
+                assert_eq!(source, clinker_plan::BudgetCategory::NodeBuffer);
+            }
+            Ok(()) => panic!("a rise past the capacity must be refused with E310"),
+            Err(other) => panic!("expected E310 naming the node; got {other:?}"),
+        }
+        assert_eq!(
+            budget.charged_bytes(),
+            40 * kib,
+            "a refused rise charges nothing"
+        );
+        assert_eq!(reservation.bytes(), 40 * kib);
+
+        reservation
+            .resize(8 * kib, "canonicalize")
+            .expect("a fall is a release and always succeeds");
+        assert_eq!(
+            budget.charged_bytes(),
+            8 * kib,
+            "a fall releases exactly the difference"
+        );
+        drop(reservation);
+        assert_eq!(budget.charged_bytes(), 0);
+
+        let unlimited = Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
+            0,
+            0.80,
+            0.70,
+            Box::new(crate::pipeline::memory::NoOpPolicy),
+        ));
+        let reservation = reserve_node_buffer_materialization(kib, &unlimited, "canonicalize")
+            .expect("a zero limit is unchecked");
+        reservation
+            .resize(1 << 30, "canonicalize")
+            .expect("a zero limit records a rise unchecked");
+        assert_eq!(unlimited.charged_bytes(), 1 << 30);
     }
 
     #[test]

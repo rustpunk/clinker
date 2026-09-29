@@ -4064,6 +4064,65 @@ mod tests {
     }
 
     #[test]
+    fn sources_pause_on_charged_bytes_without_the_poll() {
+        use crate::executor::node_buffer::NodeBufferConsumer;
+        use crate::executor::source_stream::SourceConsumer;
+        // A 1 MiB limit: the test process's own memory is far above it, so a
+        // decision read from the process's memory would pause at once. The
+        // resume controller decides on charged bytes alone.
+        let mib = 1024u64 * 1024;
+        let arb = MemoryArbitrator::with_policy(
+            mib,
+            0.80,
+            0.70,
+            Box::new(BackPressurePreferred::wrapping(Priority)),
+        );
+        assert!(
+            rss_bytes().is_none_or(|rss| rss > 4 * mib),
+            "the premise: the process holds far more than the limit"
+        );
+        let source = ConsumerHandle::new();
+        arb.register_consumer(
+            Arc::new(SourceConsumer::new(source.clone())),
+            source.clone(),
+            test_label("orders"),
+        );
+        let slot = ConsumerHandle::new();
+        arb.register_node_consumer(
+            Arc::new(NodeBufferConsumer::new(slot.clone())),
+            slot.clone(),
+            test_label("orders_slot"),
+        );
+
+        slot.set_bytes(mib / 2);
+        arb.reconcile_backpressure();
+        assert!(
+            !source.is_paused(),
+            "charged bytes below the soft limit pause nothing, however much the process holds"
+        );
+
+        slot.set_bytes(mib * 9 / 10);
+        arb.reconcile_backpressure();
+        assert!(
+            source.is_paused(),
+            "charged bytes above 0.80 of the limit pause"
+        );
+
+        slot.set_bytes(mib / 2);
+        arb.reconcile_backpressure();
+        assert!(
+            !source.is_paused(),
+            "charged bytes below the resume watermark resume"
+        );
+
+        assert!(
+            !slot.take_spill_request(),
+            "reconciling pauses and resumes only; it asks nothing to spill"
+        );
+        assert!(arb.per_stage_spill_bytes_written().is_empty());
+    }
+
+    #[test]
     fn reconcile_backpressure_exempts_the_actively_drained_source() {
         use crate::executor::source_stream::SourceConsumer;
         // A Source the walk is currently draining (active) is never paused,
