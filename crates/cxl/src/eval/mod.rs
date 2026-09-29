@@ -231,10 +231,7 @@ impl ProgramEvaluator {
 
 /// Convert a GroupKeyError to an EvalError.
 pub(super) fn group_key_error_to_eval_error(e: GroupKeyError) -> EvalError {
-    let got = match &e {
-        GroupKeyError::NanInGroupBy { .. } => "NaN",
-        GroupKeyError::UnsupportedType { type_name, .. } => type_name,
-    };
+    let GroupKeyError::UnsupportedType { type_name: got, .. } = e;
     EvalError::new(
         EvalErrorKind::TypeMismatch {
             expected: "hashable value",

@@ -1,7 +1,7 @@
 //! SecondaryIndex for window partition lookup.
 //!
-//! Maps composite group keys to Arena record positions. NaN values
-//! in group_by keys are rejected as hard errors.
+//! Maps composite group keys to Arena record positions. Keys group by the
+//! value order's ties: numbers by exact value, every NaN as one key.
 //!
 //! `GroupByKey`, `GroupKeyError`, and `value_to_group_key()` live in
 //! `clinker-record` (foundation crate) so `cxl::eval` can use them
@@ -26,7 +26,8 @@ impl SecondaryIndex {
     /// Iterates all arena records, extracts group_by fields, builds composite
     /// keys, and appends each record's position to its group's Vec.
     ///
-    /// - NaN in any group_by field → `GroupKeyError::NanInGroupBy` (hard error).
+    /// - An array or map in any group_by field → `GroupKeyError::UnsupportedType`.
+    /// - A NaN of either sign is one key, so NaN rows form one partition.
     /// - Null in any group_by field → record excluded from all groups (debug log).
     pub fn build<S: RecordStorage>(
         storage: &S,
@@ -171,21 +172,25 @@ mod tests {
     }
 
     #[test]
-    fn test_secondary_index_nan_rejection() {
+    fn nan_rows_of_both_signs_form_one_partition() {
         let storage = TestStorage::new(
             &["amount"],
-            vec![vec![Value::Float(1.0)], vec![Value::Float(f64::NAN)]],
+            vec![
+                vec![Value::Float(1.0)],
+                vec![Value::Float(f64::NAN)],
+                vec![Value::Null],
+                vec![Value::Float(-f64::NAN)],
+            ],
         );
 
-        let result = SecondaryIndex::build(&storage, &["amount".into()]);
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            GroupKeyError::NanInGroupBy { field, row } => {
-                assert_eq!(field, "amount");
-                assert_eq!(row, 1);
-            }
-            other => panic!("Expected NanInGroupBy, got: {:?}", other),
-        }
+        let index = SecondaryIndex::build(&storage, &["amount".into()]).unwrap();
+        assert_eq!(
+            index.group_count(),
+            2,
+            "one NaN partition and 1.0; null excluded"
+        );
+        let nan_key = vec![GroupByKey::Float(f64::NAN.to_bits())];
+        assert_eq!(index.get(&nan_key).unwrap(), &[1, 3]);
     }
 
     #[test]

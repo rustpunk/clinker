@@ -2490,23 +2490,30 @@ fn distinct_partition_reset() {
     assert_eq!(projs, vec![emit_7(), dup(), emit_7(), dup()]);
 }
 
-/// A NaN distinct key surfaces a `GroupKeyError`-derived error from the
-/// run (NaN is not hashable as a group key), rather than silently
-/// emitting or skipping.
+/// Every NaN, whatever its sign, is one distinct value: the first NaN row
+/// emits, a later NaN of the other sign is its duplicate, and a finite value
+/// is a key of its own.
 #[test]
-fn distinct_nan_key_errors() {
-    let stream = vec![(
-        None,
-        HashMap::from([("k".to_string(), Value::Float(f64::NAN))]),
-    )];
+fn distinct_treats_every_nan_as_one_value() {
+    let row = |v: f64| (None, HashMap::from([("k".to_string(), Value::Float(v))]));
+    let stream = vec![row(f64::NAN), row(-f64::NAN), row(1.0)];
     let projs = eval_distinct_stream("distinct by k\nemit out = k", &["k"], stream);
+    assert_eq!(projs.len(), 3);
     match &projs[0] {
-        ResultProjection::Err { kind, .. } => assert!(
-            kind.contains("TypeMismatch"),
-            "expected NaN group-key error, got {kind}"
+        ResultProjection::Emit { fields, .. } => assert!(
+            matches!(fields.as_slice(), [(name, Value::Float(f))] if name == "out" && f.is_nan()),
+            "the first NaN row emits its key, got {fields:?}"
         ),
-        other => panic!("expected NaN distinct error, got {other:?}"),
+        other => panic!("the first NaN row emits, got {other:?}"),
     }
+    assert_eq!(projs[1], ResultProjection::Skip(SkipReason::Duplicate));
+    assert_eq!(
+        projs[2],
+        ResultProjection::Emit {
+            fields: vec![("out".to_string(), Value::Float(1.0))],
+            record_vars: vec![],
+        }
+    );
 }
 
 /// A bare `distinct` (no field) keys on every input field through the
