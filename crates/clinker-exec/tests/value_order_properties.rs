@@ -21,6 +21,11 @@
 //! leap second and the instant it ties), so ties and near-ties across domains
 //! are frequent rather than accidental.
 //!
+//! The comparator answers two integers, two floats or two strings without its
+//! domain dispatch, so one property draws those pairs densely and checks the
+//! answer against each type's own order and against the encoder, which shares
+//! no code with that shortcut.
+//!
 //! The Sort node's authored key adds null placement, direction and several
 //! fields on top of the value order, so a last property proves its byte key
 //! and its comparator agree on whole records as well.
@@ -420,6 +425,36 @@ fn triple() -> BoxedStrategy<(Value, Value, Value)> {
     .boxed()
 }
 
+/// Two integers, two floats or two strings: the pairs the comparator answers
+/// without its domain dispatch. Each type is drawn half independently and half
+/// as a value and a neighbour (the next integer, the same float or its
+/// negation or its next float, the same string or it extended), so ties, NaN
+/// against NaN, the two zeros and shared prefixes are frequent.
+fn same_type_pair() -> BoxedStrategy<(Value, Value)> {
+    prop_oneof![
+        (edge_i64(), edge_i64()).prop_map(|(x, y)| (Value::Integer(x), Value::Integer(y))),
+        (edge_i64(), -1i64..=1)
+            .prop_map(|(x, step)| (Value::Integer(x), Value::Integer(x.saturating_add(step)))),
+        (edge_f64(), edge_f64()).prop_map(|(x, y)| (Value::Float(x), Value::Float(y))),
+        (edge_f64(), 0u8..3).prop_map(|(x, neighbour)| {
+            let y = match neighbour {
+                0 => x,
+                1 => -x,
+                _ => x.next_up(),
+            };
+            (Value::Float(x), Value::Float(y))
+        }),
+        (text(), text()).prop_map(|(x, y)| (Value::from(x.as_str()), Value::from(y.as_str()))),
+        (text(), text()).prop_map(|(x, suffix)| {
+            (
+                Value::from(x.as_str()),
+                Value::from(format!("{x}{suffix}").as_str()),
+            )
+        }),
+    ]
+    .boxed()
+}
+
 fn non_nan_number() -> impl Strategy<Value = Value> {
     number().prop_filter(
         "a NaN is not a non-NaN number",
@@ -490,6 +525,26 @@ proptest! {
         if let (Some(ca), Some(cb)) = (tie_class(&a), tie_class(&b)) {
             prop_assert_eq!(ca == cb, ties(&a, &b), "{:?} vs {:?}", a, b);
         }
+    }
+
+    #[test]
+    fn same_type_pairs_order_by_their_type_and_their_keys((a, b) in same_type_pair()) {
+        let expected = match (&a, &b) {
+            (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
+            (Value::Float(x), Value::Float(y)) => match (x.is_nan(), y.is_nan()) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                // `partial_cmp` already ties -0.0 with 0.0.
+                (false, false) => x.partial_cmp(y).expect("neither side is NaN"),
+            },
+            (Value::String(x), Value::String(y)) => {
+                x.as_str().as_bytes().cmp(y.as_str().as_bytes())
+            }
+            _ => unreachable!("the strategy draws same-type pairs only"),
+        };
+        prop_assert_eq!(compare(&a, &b), expected, "{:?} vs {:?}", a, b);
+        prop_assert_eq!(key(&a).cmp(&key(&b)), expected, "{:?} vs {:?}", a, b);
     }
 
     #[test]

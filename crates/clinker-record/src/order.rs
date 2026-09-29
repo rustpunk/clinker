@@ -150,7 +150,24 @@ impl Domain<'_> {
 /// Total over every [`Value`]: reflexive, antisymmetric and transitive, NaN and
 /// mixed domains included, so a stable sort's output does not depend on where
 /// run boundaries fall. Allocates only to order a map's entries by key.
+///
+/// Two integers, two floats or two strings are compared here directly, with
+/// the same expression their domain's arm uses; every other pair, mixed
+/// numeric domains included, takes the domain dispatch. Sort keys are
+/// usually one type per field, and this keeps that case small enough to
+/// inline into a sort's comparison loop.
+#[inline]
 pub fn compare(a: &Value, b: &Value) -> Ordering {
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
+        (Value::Float(x), Value::Float(y)) => f64_orderable_bits(*x).cmp(&f64_orderable_bits(*y)),
+        (Value::String(x), Value::String(y)) => x.as_str().as_bytes().cmp(y.as_str().as_bytes()),
+        _ => compare_domains(a, b),
+    }
+}
+
+/// [`compare`] through the domain table, for every pair of values.
+fn compare_domains(a: &Value, b: &Value) -> Ordering {
     match (Domain::of(a), Domain::of(b)) {
         (Domain::Null, Domain::Null) => Ordering::Equal,
         (Domain::Bool(x), Domain::Bool(y)) => x.cmp(&y),
@@ -1073,6 +1090,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The same-type shortcut in `compare` must answer exactly what the
+    /// domain dispatch answers, on every ordered pair of the fixed cases:
+    /// NaNs of every sign and payload, both zeros, the integer and float
+    /// extremes, strings with NUL and non-ASCII bytes, and every mixed pair,
+    /// which must fall through to the dispatch unchanged.
+    #[test]
+    fn same_type_shortcut_agrees_with_the_domain_dispatch() {
+        let cases = fixed_cases();
+        let mut shortcut_pairs = 0;
+        for a in &cases {
+            for b in &cases {
+                shortcut_pairs += usize::from(matches!(
+                    (a, b),
+                    (Value::Integer(_), Value::Integer(_))
+                        | (Value::Float(_), Value::Float(_))
+                        | (Value::String(_), Value::String(_))
+                ));
+                assert_eq!(compare(a, b), compare_domains(a, b), "{a:?} vs {b:?}");
+            }
+        }
+        // 12 integers, 26 floats (5 of them NaN) and 7 strings.
+        assert_eq!(shortcut_pairs, 12 * 12 + 26 * 26 + 7 * 7);
     }
 
     #[test]
