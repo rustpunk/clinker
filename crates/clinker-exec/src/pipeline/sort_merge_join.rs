@@ -1721,7 +1721,11 @@ fn handle_on_miss(
                 node: ectx.name.to_string(),
                 detail: "combine body typed program missing for on_miss: null_fields".to_string(),
             })?;
-            match evaluator.eval_record::<NullStorage>(ectx.ctx, &resolver, None) {
+            match evaluator.eval_record::<NullStorage>(
+                &ectx.ctx.with_row(driver.order.ordinal()),
+                &resolver,
+                None,
+            ) {
                 Ok(EvalResult::Emit {
                     fields,
                     record_vars,
@@ -1868,7 +1872,10 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
 
     let name = ectx.name;
     let resolver_mapping = ectx.resolver_mapping;
-    let ctx = ectx.ctx;
+    // Every pair of this driver is evaluated under the driver's row, so a
+    // failure reports the row the other join strategies report.
+    let row_ctx = ectx.ctx.with_row(driver_order.ordinal());
+    let ctx = &row_ctx;
 
     match match_mode {
         MatchMode::Collect => {

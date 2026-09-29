@@ -36,6 +36,14 @@ run wrote.
   and is not retracted from relaxed Aggregates.
 - A row that fails on two inclusive Route branches writes two trigger rows,
   one per branch, including in an overflowing group.
+- Every join strategy writes the same rows for the same failing input. The
+  hash build-probe strategy used to dead-letter a driver at its first
+  failing match and drop the output of its other matches; it now evaluates
+  every matched pair like the other strategies: each failing pair is one
+  failure, and the driver's successful matches are still written. A failing
+  residual is not a match, so `match: first` goes on to the next candidate.
+  IEJoin and sort-merge failures now name the driver's row in their error
+  detail, as the hash strategies do.
 - Under a key, `dlq_count`, `records_dlq` and the `dlq.max_rate` numerators
   therefore rise to the counts the same failures give without a key, plus
   the rows the failing groups condemn.
