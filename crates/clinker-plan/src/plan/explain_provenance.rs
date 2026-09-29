@@ -106,7 +106,11 @@ impl fmt::Display for ProvenanceExplainError {
                 param_name,
                 valid_params,
             } => {
-                write!(f, "no provenance for '{node_name}.{param_name}'")?;
+                write!(
+                    f,
+                    "no provenance for {}.{param_name}",
+                    node_name.quoted_name()
+                )?;
                 if valid_params.is_empty() {
                     write!(
                         f,

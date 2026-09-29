@@ -3,9 +3,13 @@
 //! Node names are unrestricted: an author may name a Source `it's src`, or
 //! put a double quote or a backslash in a Sink's name. Every diagnostic that
 //! quotes a node name prints it through [`QuoteName::quoted_name`], in double
-//! quotes with Rust's string escaping of `"`, `\` and control characters,
-//! so the name reads the same way it is written as a double-quoted YAML
-//! scalar and can never be misread as ending early.
+//! quotes with `"`, `\`, control characters and invisible characters (such as
+//! a zero-width space or a bidirectional control) escaped. The quoted name is
+//! therefore unambiguous: it can never be misread as ending early, and a
+//! character the author cannot see is shown rather than hidden. Everything
+//! else, including an apostrophe and a combining accent, prints as written.
+//! The escapes are Rust's (`\u{200b}`), not YAML's, so the form identifies a
+//! name; it is not meant to be pasted back into a pipeline file.
 
 use std::fmt;
 
@@ -15,7 +19,20 @@ pub struct QuotedName<'a>(&'a str);
 
 impl fmt::Display for QuotedName<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self.0)
+        // `str::escape_debug` escapes a grapheme extender only where it opens
+        // the string, so a decomposed accent prints as written. It also
+        // escapes `'`, which needs no escape inside double quotes, so each run
+        // between apostrophes is escaped on its own and the apostrophes are
+        // written back as they are. An extender straight after an apostrophe
+        // therefore opens a run and shows as an escape: still unambiguous.
+        f.write_str("\"")?;
+        for (index, run) in self.0.split('\'').enumerate() {
+            if index > 0 {
+                f.write_str("'")?;
+            }
+            write!(f, "{}", run.escape_debug())?;
+        }
+        f.write_str("\"")
     }
 }
 
@@ -24,7 +41,8 @@ impl fmt::Display for QuotedName<'_> {
 /// Implemented for `str`, so a `String`, `&str` or `Arc<str>` name calls it
 /// through auto-deref: `format!("source {}", source.name.quoted_name())`.
 pub trait QuoteName {
-    /// The name in double quotes, escaped as a Rust string literal is.
+    /// The name in double quotes, with quotes, backslashes, control and
+    /// invisible characters escaped. See the [module docs](self).
     fn quoted_name(&self) -> QuotedName<'_>;
 }
 

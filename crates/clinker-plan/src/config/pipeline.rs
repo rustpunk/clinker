@@ -1662,9 +1662,9 @@ impl PipelineConfig {
                                 "E003",
                                 format!(
                                     "windowed transform {} rooted at upstream node \
-                                     '{}' which has no output schema",
+                                     {} which has no output schema",
                                     transform_name.quoted_name(),
-                                    other.name()
+                                    other.name().quoted_name()
                                 ),
                                 LabeledSpan::primary(Span::SYNTHETIC, String::new()),
                             ));
@@ -1681,12 +1681,12 @@ impl PipelineConfig {
                                     "E150b",
                                     format!(
                                         "windowed transform {} references field '{}' \
-                                         that the upstream operator '{}' does not emit; \
+                                         that the upstream operator {} does not emit; \
                                          a node-rooted window can only see columns \
                                          produced by its rooted operator",
                                         transform_name.quoted_name(),
                                         f,
-                                        other.name()
+                                        other.name().quoted_name()
                                     ),
                                     LabeledSpan::primary(Span::SYNTHETIC, String::new()),
                                 ));
@@ -2740,8 +2740,9 @@ fn resolve_all_input_references(
         };
         let message = match qualifier {
             Some(q) => format!(
-                "at line {line}: combine {consumer_name} input '{q}' references undeclared upstream '{reference_full}'",
-                consumer_name = consumer_name.quoted_name()
+                "at line {line}: combine {consumer_name} input '{q}' references undeclared upstream {reference_full}",
+                consumer_name = consumer_name.quoted_name(),
+                reference_full = reference_full.quoted_name()
             ),
             None => format!(
                 "node {consumer_name:?} input {reference_full:?} references an undeclared node"

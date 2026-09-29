@@ -1537,9 +1537,9 @@ impl std::fmt::Display for PlanError {
             } => {
                 write!(
                     f,
-                    "transform {} references unknown input '{}'. Available transforms: [{}]",
+                    "transform {} references unknown input {}. Available transforms: [{}]",
                     transform.quoted_name(),
-                    reference,
+                    reference.quoted_name(),
                     available.join(", ")
                 )
             }

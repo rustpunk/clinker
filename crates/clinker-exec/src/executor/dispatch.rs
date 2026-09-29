@@ -681,9 +681,9 @@ pub(crate) fn apply_source_attempt_population(
             op: "source-attempt-population",
             node: expected_source.to_string(),
             detail: format!(
-                "population for source {} reached consumer '{}'",
+                "population for source {} reached consumer {}",
                 delta.source_name.quoted_name(),
-                expected_source
+                expected_source.quoted_name()
             ),
         });
     }
@@ -770,9 +770,9 @@ pub(crate) fn consume_source_event(
                             op: "source-attempt-population",
                             node: expected_source.to_string(),
                             detail: format!(
-                                "rejected attempt for source {} reached consumer '{}'",
+                                "rejected attempt for source {} reached consumer {}",
                                 event.source_name.quoted_name(),
-                                expected_source
+                                expected_source.quoted_name()
                             ),
                         });
                     }
