@@ -2469,4 +2469,53 @@ mod walk_pass_tests {
             "its bytes still count toward the ledger"
         );
     }
+
+    /// A Source's handle charges the heap its queued events hold, which no
+    /// spill can free: a Source is relieved by pausing and by the walk
+    /// draining its channel. It reports nothing reclaimable, and a pass at a
+    /// full ledger elects the slot beside it and never the Source.
+    #[test]
+    fn source_queue_charge_is_never_elected() {
+        use crate::executor::source_stream::SourceConsumer;
+        let arbitrator = run(MIB + 256 * KIB, Box::new(Priority));
+        let source_handle = ConsumerHandle::new();
+        let source_consumer = Arc::new(SourceConsumer::new(Arc::clone(&source_handle)));
+        let source = arbitrator.register_consumer(
+            source_consumer.clone(),
+            Arc::clone(&source_handle),
+            ConsumerLabel {
+                node: "orders".to_string(),
+                surface: MemorySurface::RowsRead,
+            },
+        );
+        source_handle.set_bytes(256 * KIB);
+        let (slot, slot_handle) = register(&arbitrator, "slot", 0, MIB);
+        assert_eq!(
+            arbitrator.charged_bytes(),
+            MIB + 256 * KIB,
+            "the ledger is full"
+        );
+
+        assert_eq!(source_consumer.reclaimable_bytes(), 0);
+        assert_eq!(source_consumer.current_usage(), 262_144);
+        let script = Scripted::default().resident(slot, &slot_handle).shared();
+        arbitrator
+            .reclaim_pass(
+                MIB,
+                governed(),
+                &mut *script.borrow_mut(),
+                PassKind::Ordinary,
+            )
+            .expect("the pass runs");
+        assert_eq!(
+            script.borrow().elected,
+            vec![slot],
+            "only the slot is elected, though the pass aims past its bytes"
+        );
+        assert_eq!(
+            holder_bytes(&arbitrator, source),
+            256 * KIB,
+            "the queue charge stays"
+        );
+    }
 }

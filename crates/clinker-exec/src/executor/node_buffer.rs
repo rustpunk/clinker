@@ -2316,6 +2316,79 @@ mod tests {
         assert_eq!(consumer.try_spill(4096).unwrap(), 8192);
     }
 
+    /// A published slot reports as reclaimable what spilling it frees now:
+    /// each resident row's slot cost plus its record's own heap payload, not
+    /// the residue its handle charges. Once the slot spills it reports 0.
+    #[test]
+    fn node_buffer_slot_reclaims_its_resident_rows_with_their_payload() {
+        use crate::pipeline::memory::walk::{
+            SlotSpill, VictimOutcome, WalkReclaim, WalkReclaimSet, WalkSpillSettings,
+        };
+        use crate::pipeline::memory::{ConsumerHandle, MemoryConsumer, NoOpPolicy};
+        use clinker_plan::config::CompressMode;
+
+        let root = tempfile::tempdir().expect("spill root");
+        let arbitrator = crate::pipeline::memory::MemoryArbitrator::with_policy(
+            64 * 1024 * 1024,
+            0.80,
+            0.70,
+            Box::new(NoOpPolicy),
+        );
+        let handle = ConsumerHandle::new();
+        let consumer = Arc::new(NodeBufferConsumer::new(handle.clone()));
+        let id = arbitrator.register_node_consumer(
+            consumer.clone(),
+            handle.clone(),
+            clinker_plan::runtime_error::ConsumerLabel {
+                node: "rows".to_string(),
+                surface: clinker_plan::runtime_error::MemorySurface::BufferedRows {
+                    from: "rows".to_string(),
+                    to: "next".to_string(),
+                },
+            },
+        );
+        // The handle charges only the slot's residue; the payload is charged
+        // to whoever allocated it.
+        handle.set_bytes(16);
+        let s = schema();
+        let rows: Vec<(Record, u64)> = (0..4)
+            .map(|n| (rec(&s, n, &"x".repeat(100)), n as u64))
+            .collect();
+        let payload: u64 = rows
+            .iter()
+            .map(|(record, _)| record.legacy_estimated_heap_size() as u64)
+            .sum();
+        assert!(payload >= 400, "every row carries its string payload");
+        let expected = 4 * record_byte_cost(2) + payload;
+
+        let mut set = WalkReclaimSet::new(WalkSpillSettings {
+            spill_root: Arc::from(root.path()),
+            spill_compress: CompressMode::Auto,
+            batch_size: 1024,
+        });
+        let key =
+            crate::executor::dispatch::NodeBufferKey::from(petgraph::graph::NodeIndex::new(0));
+        set.slots_mut().register(
+            key.clone(),
+            (id, handle.clone()),
+            SlotSpill {
+                spill_allowed: true,
+                node_name: Box::from("rows"),
+            },
+        );
+        set.slots_mut()
+            .insert_buffer(key, NodeBuffer::memory_from_records(rows));
+        assert_eq!(consumer.reclaimable_bytes(), expected);
+        assert_eq!(consumer.current_usage(), 16, "the charge is unchanged");
+
+        assert_eq!(
+            set.spill_victim(id, &arbitrator).expect("spill"),
+            VictimOutcome::Spilled
+        );
+        assert_eq!(consumer.reclaimable_bytes(), 0, "nothing is resident");
+        assert!(arbitrator.unregister_consumer(id).is_some());
+    }
+
     /// The block-band buffered-spilled drain adopts the emit-phase sorted runs
     /// whole: [`NodeBuffer::merge_spilled`] holds the `(order, driver_idx,
     /// build_idx)` runs on disk and k-way-merges them lazily at drain, projecting

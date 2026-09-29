@@ -1594,4 +1594,118 @@ mod tests {
             assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
         }
     }
+
+    /// A writer's output staging is a fixed tail no spill frees on demand,
+    /// and no pass may wait for the writer to act: the writer's consumer
+    /// reports nothing reclaimable, and a pass at a full ledger elects the
+    /// spillable slot beside it, never the writer, even when the slot alone
+    /// does not cover what the pass aims to free.
+    #[test]
+    fn writer_staging_is_never_elected() {
+        use crate::pipeline::memory::ledger::{PassKind, Requester};
+        use crate::pipeline::memory::walk::{VictimOutcome, WalkReclaim};
+        use crate::pipeline::memory::{ConsumerId, ConsumerSpillError, Priority};
+        use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface};
+
+        const KIB: u64 = 1024;
+        const MIB: u64 = 1024 * KIB;
+
+        /// A spillable slot whose every charged byte a spill frees.
+        struct Slot(Arc<ConsumerHandle>);
+        impl MemoryConsumer for Slot {
+            fn current_usage(&self) -> u64 {
+                self.0.bytes()
+            }
+            fn spill_priority(&self) -> i32 {
+                0
+            }
+            fn try_spill(&self, _: u64) -> Result<u64, ConsumerSpillError> {
+                Ok(0)
+            }
+            fn can_back_pressure(&self) -> bool {
+                false
+            }
+        }
+
+        /// Records every consumer the pass elects; spills only the slot.
+        struct Recorder {
+            elected: Vec<ConsumerId>,
+            slot: (ConsumerId, Arc<ConsumerHandle>),
+        }
+        impl WalkReclaim for Recorder {
+            fn spill_victim(
+                &mut self,
+                id: ConsumerId,
+                _: &MemoryArbitrator,
+            ) -> Result<VictimOutcome, clinker_plan::error::PipelineError> {
+                self.elected.push(id);
+                if id == self.slot.0 {
+                    self.slot.1.shrink(self.slot.1.bytes());
+                    Ok(VictimOutcome::Spilled)
+                } else {
+                    Ok(VictimOutcome::NotOwned)
+                }
+            }
+        }
+
+        let arbitrator =
+            MemoryArbitrator::with_policy(MIB + 64 * KIB, 0.8, 0.7, Box::new(Priority));
+        let writer_handle = ConsumerHandle::new();
+        let writer = Arc::new(WriterResourceConsumer {
+            handle: writer_handle.clone(),
+        });
+        arbitrator.register_consumer(
+            writer.clone(),
+            writer_handle.clone(),
+            ConsumerLabel {
+                node: "output".to_string(),
+                surface: MemorySurface::OutputStaging,
+            },
+        );
+        writer_handle.set_bytes(64 * KIB);
+        let slot_handle = ConsumerHandle::new();
+        let slot = arbitrator.register_node_consumer(
+            Arc::new(Slot(slot_handle.clone())),
+            slot_handle.clone(),
+            ConsumerLabel {
+                node: "rows".to_string(),
+                surface: MemorySurface::BufferedRows {
+                    from: "rows".to_string(),
+                    to: "output".to_string(),
+                },
+            },
+        );
+        slot_handle.set_bytes(MIB);
+        assert_eq!(
+            arbitrator.charged_bytes(),
+            MIB + 64 * KIB,
+            "the ledger is full"
+        );
+
+        assert_eq!(writer.reclaimable_bytes(), 0);
+        assert_eq!(writer.current_usage(), 64 * KIB);
+        let mut recorder = Recorder {
+            elected: Vec::new(),
+            slot: (slot, slot_handle.clone()),
+        };
+        let outcome = arbitrator
+            .reclaim_pass(
+                MIB,
+                Requester::governed(),
+                &mut recorder,
+                PassKind::Ordinary,
+            )
+            .expect("the pass runs");
+        assert_eq!(
+            recorder.elected,
+            vec![slot],
+            "only the slot is elected, though the pass aims past its bytes"
+        );
+        assert_eq!(outcome.freed, MIB);
+        assert_eq!(
+            arbitrator.charged_bytes(),
+            64 * KIB,
+            "the staging tail stays charged"
+        );
+    }
 }
