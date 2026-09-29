@@ -1571,10 +1571,10 @@ mod tests {
 
     // This node folds a blank partition value into the null group
     // (`partition_key`), and a blank key is exactly the case most likely to
-    // produce a giant group, since every blank row merges into one. Naming
-    // that group `[gid=null]` alone would send the author hunting for missing
-    // values they do not have, so the diagnostic must say that `null` covers
-    // empty strings too.
+    // produce a giant group, since every blank row merges into one. The report
+    // names such a group by its first row like any other, and the remedy it
+    // routes to must say that `null` covers empty strings too, or the author
+    // hunts for missing values they do not have.
     #[test]
     fn a_blank_partition_value_group_is_named_unambiguously() {
         let schema = schema();
@@ -1612,16 +1612,16 @@ mod tests {
             Some(0),
             "the group must still be named: {report:?}"
         );
-        // `partition_key` funnels six distinct causes into the null group, and
-        // naming only the blank case sends an author looking for blanks, finding
-        // too few to explain the size, and stopping. The remedy the report
-        // routes to must name every cause the code folds in.
+        // `partition_key` funnels several distinct causes into the null group,
+        // and naming only the blank case sends an author looking for blanks,
+        // finding too few to explain the size, and stopping. The remedy the
+        // report routes to must name every cause the code folds in. A NaN is
+        // its own group key, so it is not one of them.
         let remedy = crate::executor::util::e310_section("Rows held for Reshape groups");
         for cause in [
             "missing column",
             "explicit null",
             "empty string",
-            "NaN",
             "array- or map-valued",
         ] {
             assert!(

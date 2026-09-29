@@ -1410,7 +1410,7 @@ nodes:
 
 #[cfg(feature = "test-utils")]
 #[test]
-fn decode_second_file_header_refusal_remains_resource_error() {
+fn decode_second_file_header_refusal_is_the_sources_e310() {
     let root = tempfile::tempdir().unwrap();
     let header = format!("{}\n", "x".repeat(2 * 1024 * 1024));
     let error = decode_file_run_at_capacity(
@@ -1422,8 +1422,9 @@ fn decode_second_file_header_refusal_remains_resource_error() {
     )
     .unwrap_err();
     assert!(
-        matches!(error, clinker_plan::error::PipelineError::Format(
-        clinker_format::FormatError::Resource(ref error)) if error.kind == ResourceErrorKind::Budget),
+        matches!(&error, clinker_plan::error::PipelineError::MemoryBudgetExceeded { report }
+            if report.requester.as_ref().map(|label| &label.surface)
+                == Some(&clinker_plan::runtime_error::MemorySurface::RowsRead)),
         "{error:?}"
     );
 }
@@ -2271,16 +2272,17 @@ fn decode_header_and_body_refusal_remain_typed() {
             1024 * 1024,
         )
         .unwrap_err();
-        let clinker_plan::error::PipelineError::Format(clinker_format::FormatError::Resource(
-            resource,
-        )) = error
-        else {
+        let clinker_plan::error::PipelineError::MemoryBudgetExceeded { report } = error else {
             panic!("decoder allocation must fail with typed budget evidence: {error:?}");
         };
-        assert_eq!(resource.kind, ResourceErrorKind::Budget);
-        assert!(resource.requested >= oversized.len());
-        assert!(resource.available <= 1024 * 1024);
-        assert!(resource.requested > resource.available);
+        let available = report.limit_bytes.saturating_sub(report.charged_bytes);
+        assert_eq!(
+            report.requester.as_ref().map(|label| &label.surface),
+            Some(&clinker_plan::runtime_error::MemorySurface::RowsRead)
+        );
+        assert!(report.requested_bytes >= oversized.len() as u64);
+        assert!(available <= 1024 * 1024);
+        assert!(report.requested_bytes > available);
         assert!(
             std::fs::read(root.path().join("output.csv"))
                 .unwrap()
@@ -4874,7 +4876,10 @@ fn decode_multi_record_resource_refusal_aborts_despite_continue() {
         )
         .unwrap_err();
         assert!(
-            matches!(error, clinker_plan::error::PipelineError::Format(clinker_format::FormatError::Resource(error)) if error.kind == ResourceErrorKind::Budget)
+            matches!(&error, clinker_plan::error::PipelineError::MemoryBudgetExceeded { report }
+                if report.requester.as_ref().map(|label| &label.surface)
+                    == Some(&clinker_plan::runtime_error::MemorySurface::RowsRead)),
+            "{error:?}"
         );
         assert!(
             std::fs::read(root.path().join("output.csv"))

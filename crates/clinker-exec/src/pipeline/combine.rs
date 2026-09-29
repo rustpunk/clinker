@@ -1743,6 +1743,59 @@ mod tests {
         assert!(std::error::Error::source(&spill).is_none());
     }
 
+    #[test]
+    fn a_build_failure_is_a_memory_refusal_only_when_memory_ran_out() {
+        use clinker_plan::error::PipelineError;
+        use clinker_plan::runtime_error::MemorySurface;
+        let budget = test_budget(512);
+
+        // The table alone outgrew the limit: the refusal of its bytes.
+        let alone = CombineError::MemoryLimitExceeded {
+            used: 1024,
+            limit: 512,
+        }
+        .into_build_error("enrich", &budget);
+        let PipelineError::MemoryBudgetExceeded { report } = alone else {
+            panic!("a table larger than the limit is E310; got {alone:?}");
+        };
+        assert_eq!(
+            report
+                .requester
+                .as_ref()
+                .map(|label| (label.node.as_str(), &label.surface)),
+            Some(("enrich", &MemorySurface::JoinBuildSide))
+        );
+        assert_eq!(report.requested_bytes, 1024);
+        assert!(report.oversized);
+
+        // The run was past its limit while the table still fit: the backstop.
+        budget.set_peak_rss_for_test(512 + 300);
+        let backstop = CombineError::MemoryLimitExceeded {
+            used: 100,
+            limit: 512,
+        }
+        .into_build_error("enrich", &budget);
+        let PipelineError::MemoryBudgetExceeded { report } = backstop else {
+            panic!("a run past its limit is E310; got {backstop:?}");
+        };
+        assert_eq!(report.requested_bytes, 300);
+
+        // A build key that fails to evaluate is the probe side's key error,
+        // never a memory refusal.
+        let key = CombineError::KeyEvalFailed {
+            source: Box::new(EvalError::new(
+                cxl::eval::EvalErrorKind::DivisionByZero,
+                cxl::lexer::Span::new(0, 0),
+            )),
+            side: "build",
+        }
+        .into_build_error("enrich", &budget);
+        assert!(
+            matches!(&key, PipelineError::Compilation { transform_name, .. } if transform_name == "enrich"),
+            "{key:?}"
+        );
+    }
+
     // ──────────────────────────────────────────────────────────────────
     // CombineHashTable tests
     // ──────────────────────────────────────────────────────────────────
