@@ -819,6 +819,11 @@ pub(crate) enum QualificationLineageSinkMode {
     WriteFailedMidRecord,
     FlushFailed,
     HangAfterFirstWrite,
+    /// Takes the first record at once, then holds every later write for the
+    /// given time before accepting it. The run's terminal record is the second
+    /// write, offered just before the flush, so the hold starts at a known
+    /// instant relative to the flush deadline and races it.
+    StallAfterFirstWrite(std::time::Duration),
 }
 
 #[cfg(debug_assertions)]
@@ -846,6 +851,11 @@ impl std::io::Write for QualificationLineageSink {
                 // takes part of a record, and the caller is obliged to offer the
                 // rest in a further call — which this then refuses.
                 bytes = &bytes[..bytes.len().div_ceil(2)];
+            }
+            QualificationLineageSinkMode::StallAfterFirstWrite(hold) => {
+                if self.writes > 1 {
+                    std::thread::sleep(hold);
+                }
             }
             QualificationLineageSinkMode::FlushFailed
             | QualificationLineageSinkMode::HangAfterFirstWrite => {}
@@ -904,6 +914,21 @@ pub(crate) fn external_lineage_sink(path: &std::path::Path) -> Box<dyn std::io::
             "write-failed-mid-record" => Some(QualificationLineageSinkMode::WriteFailedMidRecord),
             "flush-failed" => Some(QualificationLineageSinkMode::FlushFailed),
             "hang-after-first-write" => Some(QualificationLineageSinkMode::HangAfterFirstWrite),
+            // A stall of unknown length would quietly become the plain sink
+            // and turn a deadline race into a clean run that proves nothing,
+            // so a missing or malformed length stops the run instead.
+            "stall-after-first-write" => {
+                let millis = std::env::var("CLINKER_TEST_LINEAGE_STALL_MS")
+                    .ok()
+                    .and_then(|millis| millis.parse::<u64>().ok())
+                    .expect(
+                        "CLINKER_TEST_LINEAGE_SINK=stall-after-first-write needs \
+                         CLINKER_TEST_LINEAGE_STALL_MS set to a whole number of milliseconds",
+                    );
+                Some(QualificationLineageSinkMode::StallAfterFirstWrite(
+                    std::time::Duration::from_millis(millis),
+                ))
+            }
             _ => None,
         }
     }) {

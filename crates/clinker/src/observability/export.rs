@@ -478,7 +478,15 @@ enum WorkerCommand {
 /// The real condition needs a collector that accepts a connection and then
 /// does not answer, which no offline test has. Holding the worker here reaches
 /// the same branch — the flush deadline expires, `finish` detaches the worker,
-/// and the arena is read while that worker is still draining it.
+/// and the arena is read while that worker is still draining it. Applied at
+/// the start of every final flush, so the drain a dropped worker requests on
+/// an early return is held the same way and that path's own deadline is
+/// exercised too.
+///
+/// The hold announces when it starts and when it lets go. A dropped worker's
+/// drain reports nothing else a test can see, so these are the only witness
+/// that the hold was reached and whether the run was still waiting when it
+/// ended.
 #[cfg(debug_assertions)]
 fn injected_flush_hold() {
     let Some(millis) = std::env::var_os("CLINKER_TEST_OTLP_FLUSH_HOLD_MS") else {
@@ -487,7 +495,9 @@ fn injected_flush_hold() {
     let Ok(millis) = millis.to_string_lossy().parse::<u64>() else {
         return;
     };
+    eprintln!("clinker-test: OTLP final flush held");
     thread::sleep(Duration::from_millis(millis));
+    eprintln!("clinker-test: OTLP final flush released");
 }
 
 /// One finite run's sole telemetry receiver and blocking exporter worker.
@@ -556,8 +566,6 @@ impl OtlpWorker {
                     state.drain_available();
                     match commands.recv_timeout(IDLE_POLL) {
                         Ok(WorkerCommand::Finish(snapshot)) => {
-                            #[cfg(debug_assertions)]
-                            injected_flush_hold();
                             state.enter_final_flush();
                             state.drain_final();
                             state.deliver_lifecycle(snapshot.as_ref());
@@ -743,6 +751,8 @@ impl WorkerState<'_> {
     /// parent when its flush deadline expires — abandons a delivery, which is
     /// what keeps the flush bounded.
     fn enter_final_flush(&mut self) {
+        #[cfg(debug_assertions)]
+        injected_flush_hold();
         self.final_flush = true;
     }
 
