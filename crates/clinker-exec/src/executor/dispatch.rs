@@ -1370,6 +1370,12 @@ impl NodeBufferReaderLedger {
         Ok(())
     }
 
+    /// How many readers the slot at `key` still expects.
+    #[cfg(test)]
+    pub(crate) fn remaining(&self, key: &NodeBufferKey) -> Option<usize> {
+        self.remaining.get(key).copied()
+    }
+
     fn remaining_for_slot(
         &self,
         key: &NodeBufferKey,
@@ -2733,15 +2739,32 @@ pub(crate) fn missing_node_buffer_input_error(
 /// complete synchronous operation.
 #[must_use = "a materialized input must retain its scan reservation"]
 pub(crate) struct NodeBufferInput {
-    allocation_resources: clinker_record::owned_storage::AllocationResources,
-    buffer: NodeBuffer,
-    reservation: Option<TransientNodeBufferReservation>,
+    read: NodeBufferRead,
+}
+
+enum NodeBufferRead {
+    /// The slot's last read: the slot itself, and its registration as a
+    /// reservation when it had one.
+    Last {
+        allocation_resources: clinker_record::owned_storage::AllocationResources,
+        buffer: NodeBuffer,
+        reservation: Option<TransientNodeBufferReservation>,
+    },
+    /// A sequential cursor over a slot later readers still need.
+    Shared(NodeBuffer),
 }
 
 impl NodeBufferInput {
     /// Split the input from its optional materialization/transfer lifetime guard.
     pub(crate) fn into_parts(self) -> (NodeBuffer, Option<TransientNodeBufferReservation>) {
-        (self.buffer, self.reservation)
+        match self.read {
+            NodeBufferRead::Last {
+                buffer,
+                reservation,
+                ..
+            } => (buffer, reservation),
+            NodeBufferRead::Shared(cursor) => (cursor, None),
+        }
     }
 
     /// Prepare a consumer that will collect the sequential scan into a full
@@ -2753,23 +2776,73 @@ impl NodeBufferInput {
         budget: &Arc<crate::pipeline::memory::MemoryArbitrator>,
         node: &str,
     ) -> Result<(NodeBuffer, Option<TransientNodeBufferReservation>), PipelineError> {
-        let materialized_bytes = self
-            .buffer
-            .materialization_bytes_without_transfer(&self.allocation_resources);
-        let overlap_bytes = self.buffer.transferred_materialization_overlap_bytes();
-        let reservation = match self.reservation {
-            Some(reservation) => {
-                reservation.reserve_additional(overlap_bytes, node)?;
-                reservation
+        match self.read {
+            NodeBufferRead::Last {
+                allocation_resources,
+                buffer,
+                reservation,
+            } => {
+                let reservation = match reservation {
+                    Some(reservation) => {
+                        reservation.reserve_additional(
+                            buffer.transferred_materialization_overlap_bytes(),
+                            node,
+                        )?;
+                        reservation
+                    }
+                    None => crate::executor::node_buffer::reserve_node_buffer_materialization(
+                        buffer.materialization_bytes_without_transfer(&allocation_resources),
+                        budget,
+                        node,
+                    )?,
+                };
+                Ok((buffer, Some(reservation)))
             }
-            None => crate::executor::node_buffer::reserve_node_buffer_materialization(
-                materialized_bytes,
-                budget,
-                node,
-            )?,
-        };
-        Ok((self.buffer, Some(reservation)))
+            NodeBufferRead::Shared(cursor) => {
+                let reservation =
+                    crate::executor::node_buffer::reserve_node_buffer_materialization(
+                        cursor.estimated_materialized_bytes(),
+                        budget,
+                        node,
+                    )?;
+                Ok((cursor, Some(reservation)))
+            }
+        }
     }
+}
+
+/// Read the slot at `key` of the walk reclaim set `reclaim` for `reader`,
+/// when more readers than this one still need it.
+pub(crate) fn shared_node_buffer_read(
+    reclaim: &std::rc::Rc<std::cell::RefCell<crate::pipeline::memory::walk::WalkReclaimSet>>,
+    key: NodeBufferKey,
+    reader: &str,
+) -> Result<NodeBufferInput, PipelineError> {
+    // Making a slot re-readable can fold spilled runs, which allocates under
+    // the run's budget, so the slot leaves the walk reclaim set for the
+    // conversion and goes back whatever its outcome.
+    let taken = reclaim.borrow_mut().slots_mut().remove_buffer(&key);
+    let mut shared = taken.ok_or_else(|| {
+        node_buffer_reader_mismatch_error(
+            reader,
+            &key,
+            "slot disappeared after reader-ledger validation",
+        )
+    })?;
+    let buffer = shared.reread();
+    reclaim
+        .borrow_mut()
+        .slots_mut()
+        .insert_buffer(key.clone(), shared);
+    let buffer = buffer?;
+    reclaim
+        .borrow_mut()
+        .slots_mut()
+        .readers_mut()
+        .complete_clone(&key, reader)?;
+    Ok(NodeBufferInput {
+        read: NodeBufferRead::Shared(buffer),
+    })
 }
 
 #[cold]
@@ -2884,37 +2957,7 @@ fn require_node_buffer_input_inner(
         ));
     };
     if remaining > 1 {
-        // Making a slot re-readable can fold spilled runs, which allocates
-        // under the run's budget, so the slot leaves the walk reclaim set for
-        // the conversion and goes back whatever its outcome.
-        let taken = ctx
-            .walk_reclaim
-            .borrow_mut()
-            .slots_mut()
-            .remove_buffer(&key);
-        let mut shared = taken.ok_or_else(|| {
-            node_buffer_reader_mismatch_error(
-                consumer_name,
-                &key,
-                "slot disappeared after reader-ledger validation",
-            )
-        })?;
-        let buffer = shared.reread();
-        ctx.walk_reclaim
-            .borrow_mut()
-            .slots_mut()
-            .insert_buffer(key.clone(), shared);
-        let buffer = buffer?;
-        ctx.walk_reclaim
-            .borrow_mut()
-            .slots_mut()
-            .readers_mut()
-            .complete_clone(&key, consumer_name)?;
-        return Ok(NodeBufferInput {
-            allocation_resources: ctx.allocation_resources.clone(),
-            buffer,
-            reservation: None,
-        });
+        return shared_node_buffer_read(&ctx.walk_reclaim, key, consumer_name);
     }
 
     ctx.walk_reclaim
@@ -2952,9 +2995,11 @@ fn require_node_buffer_input_inner(
         )
     });
     Ok(NodeBufferInput {
-        allocation_resources: ctx.allocation_resources.clone(),
-        buffer,
-        reservation,
+        read: NodeBufferRead::Last {
+            allocation_resources: ctx.allocation_resources.clone(),
+            buffer,
+            reservation,
+        },
     })
 }
 
