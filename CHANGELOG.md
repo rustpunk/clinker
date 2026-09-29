@@ -366,6 +366,11 @@ E310 totals: needed 2.0 MiB more for group state, but memory.limit 8.0 MiB is fu
   own, or than the limit leaves beside state that cannot spill, says
   `one request ... needs N, more than memory.limit L can hold — spilling
   cannot help`.
+- A step that stops because the process's own memory passed the limit,
+  rather than the charged total, says so: `E310 <node>: process memory
+  peaked at P resident, over memory.limit L, while <node> held <what>; the
+  run had charged C`, and its suggested limit is that reading rounded up.
+  It never claims the limit is fully held.
 - Below it: the charged total against the limit, the five largest holders
   and why each still held its memory, what the reclaim round asked and
   freed, the smallest limit that would have granted the request in YAML

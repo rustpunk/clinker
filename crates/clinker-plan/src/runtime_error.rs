@@ -233,6 +233,9 @@ pub struct ConsumerLabel {
 /// then the charged total, the largest holders, what the reclaim round did, a
 /// limit that would have granted the request in both the YAML and the CLI
 /// spelling, and a remedy keyed to the largest holder that cannot spill.
+/// When [`LimitReading::ProcessMemory`] was the reading over the limit, the
+/// headline and the limit line state the process reading instead of a
+/// request, and nothing claims the charged state fills the limit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MemoryShortfallReport {
     /// The node that asked for memory and what the memory was for; `None`
@@ -555,14 +558,23 @@ impl std::fmt::Display for MemoryShortfallReport {
         }
 
         let suggested = suggested_limit_text(self.suggested_limit_bytes);
+        write!(f, "\n  fix: raise the limit to at least {suggested} — ")?;
+        match self.reading {
+            LimitReading::Charged => write!(
+                f,
+                "this request needed {}",
+                Bytes(self.charged_bytes.saturating_add(self.requested_bytes))
+            )?,
+            LimitReading::ProcessMemory {
+                peak_resident_bytes,
+            } => write!(f, "process memory reached {}", Bytes(peak_resident_bytes))?,
+        }
         write!(
             f,
-            "\n  fix: raise the limit to at least {suggested} — this request needed {}; \
-             later stages may need more\
+            "; later stages may need more\
              \n    pipeline:\
              \n      memory: {{ limit: \"{suggested}\" }}\
-             \n    or: --memory-limit {suggested}",
-            Bytes(self.charged_bytes.saturating_add(self.requested_bytes))
+             \n    or: --memory-limit {suggested}"
         )?;
 
         // An oversized request's remedy is the one for what the requester was
@@ -611,7 +623,12 @@ impl std::fmt::Display for MemoryShortfallReport {
                 requester.node, requester.surface
             )?;
         }
-        if self.charged_bytes > 0 && self.unspillable_bytes >= self.charged_bytes {
+        // The charged state fills the limit only in the ledger form; under a
+        // process-memory reading the charged total sits below it.
+        if self.reading == LimitReading::Charged
+            && self.charged_bytes > 0
+            && self.unspillable_bytes >= self.charged_bytes
+        {
             f.write_str(
                 "\n  spilling cannot help: the state that fills the limit cannot be written to disk",
             )?;
@@ -627,6 +644,21 @@ impl MemoryShortfallReport {
             write!(f, " {}", requester.node)?;
         }
         f.write_str(": ")?;
+        if let LimitReading::ProcessMemory {
+            peak_resident_bytes,
+        } = self.reading
+        {
+            write!(
+                f,
+                "process memory peaked at {} resident, over memory.limit {}",
+                Bytes(peak_resident_bytes),
+                Bytes(self.limit_bytes)
+            )?;
+            if let Some(requester) = &self.requester {
+                write!(f, ", while {} held {}", requester.node, requester.surface)?;
+            }
+            return write!(f, "; the run had charged {}", Bytes(self.charged_bytes));
+        }
         if self.oversized {
             f.write_str("one request")?;
             if let Some(requester) = &self.requester {

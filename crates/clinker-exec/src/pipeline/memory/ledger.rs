@@ -754,7 +754,19 @@ impl MemoryArbitrator {
         requested: u64,
     ) -> Box<MemoryShortfallReport> {
         let snapshot = self.ledger_snapshot(requested, Requester::governed());
-        let oversized = requested > snapshot.limit;
+        self.off_ledger_report(snapshot, node, surface)
+    }
+
+    /// The report for a refusal decided outside the ledger, from `snapshot`,
+    /// naming `node` and `surface` as the requester: no reclaim round, and
+    /// oversized when the snapshot's request alone is larger than the limit.
+    fn off_ledger_report(
+        &self,
+        snapshot: LedgerSnapshot,
+        node: &str,
+        surface: MemorySurface,
+    ) -> Box<MemoryShortfallReport> {
+        let oversized = snapshot.requested > snapshot.limit;
         build_report(
             self,
             snapshot,
@@ -774,13 +786,50 @@ impl MemoryArbitrator {
         }
     }
 
-    /// The E310 for a backstop that found the run already past its limit
-    /// ([`Self::should_abort`] true) while `node` held `surface`: the request
-    /// it reports is how far past the limit the larger of peak RSS and the
-    /// charged total stands.
+    /// The E310 report for a backstop that found the run already past its
+    /// limit ([`Self::should_abort`] true) while `node` held `surface`.
+    ///
+    /// The report says which reading was over the limit, from one ledger
+    /// snapshot and the process's peak resident reading taken now. When the
+    /// charged total is over, it is the ledger form and its request is how
+    /// far over the charged total stands. When only the process's memory is
+    /// over, it is the process-memory form: the request is how far over the
+    /// peak stands, the suggested limit is the peak rounded up (a limit that
+    /// peak would not have passed), and nothing is oversized, because no one
+    /// request was measured. A charged total that has fallen back under the
+    /// limit since the backstop checked, with no process reading over it,
+    /// reports the ledger form with a request of 0.
+    pub fn backstop_report(
+        &self,
+        node: &str,
+        surface: MemorySurface,
+    ) -> Box<MemoryShortfallReport> {
+        let limit = self.hard_limit();
+        let mut snapshot = self.ledger_snapshot(0, Requester::governed());
+        let charged_over_by = snapshot.charged.saturating_sub(limit);
+        match self.peak_rss().filter(|peak| *peak > limit) {
+            Some(peak) if charged_over_by == 0 => {
+                snapshot.requested = peak - limit;
+                let mut report = self.off_ledger_report(snapshot, node, surface);
+                report.reading = LimitReading::ProcessMemory {
+                    peak_resident_bytes: peak,
+                };
+                report.suggested_limit_bytes = suggested_limit_floor(peak, 0);
+                report.oversized = false;
+                report
+            }
+            _ => {
+                snapshot.requested = charged_over_by;
+                self.off_ledger_report(snapshot, node, surface)
+            }
+        }
+    }
+
+    /// [`Self::backstop_report`] as the run-ending E310.
     pub fn backstop_refusal(&self, node: &str, surface: MemorySurface) -> PipelineError {
-        let used = self.peak_rss().unwrap_or(0).max(self.sum_consumer_usage());
-        self.refusal(node, surface, used.saturating_sub(self.hard_limit()))
+        PipelineError::MemoryBudgetExceeded {
+            report: self.backstop_report(node, surface),
+        }
     }
 
     /// High-water mark of `id`'s handle bytes plus the bytes granted in its
@@ -2055,7 +2104,11 @@ mod tests {
         );
         assert_eq!(report.charged_bytes, MIB);
         assert_eq!(report.limit_bytes, limit);
-        assert_eq!(report.requested_bytes, peak - limit, "how far over the limit");
+        assert_eq!(
+            report.requested_bytes,
+            peak - limit,
+            "how far over the limit"
+        );
         assert_eq!(
             report.suggested_limit_bytes, peak,
             "a limit at the process reading would not have tripped the backstop"
