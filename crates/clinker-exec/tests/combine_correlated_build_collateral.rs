@@ -594,6 +594,67 @@ fn driver_and_build_groups(strategy: &Strategy) -> (&'static str, &'static str) 
     }
 }
 
+/// The build Source also feeds an Aggregate grouped by `k`, which omits the
+/// correlation key, so the relaxed-key retraction runs at commit.
+const BUILD_AGGREGATE: &str = r#"  - type: aggregate
+    name: bld_totals
+    input: src_bld
+    config:
+      group_by: [k]
+      cxl: |
+        emit k = k
+        emit total = sum(base)
+  - type: sink
+    name: agg_out
+    input: bld_totals
+    config:
+      name: agg_out
+      type: csv
+      path: agg_out.csv
+"#;
+
+/// A relaxed-key retraction takes back only rows that failed. The build row
+/// held with a failing driver's group did not fail, so the Aggregate over
+/// the build Source keeps its contribution: its total is the build row's
+/// `base`.
+#[test]
+fn build_row_held_with_a_failure_is_not_retracted_from_a_relaxed_aggregate() {
+    for strategy in all_strategies() {
+        let tag = strategy.tag;
+        let (group, build_group) = driver_and_build_groups(strategy);
+        let yaml = yaml_with(strategy, "", BUILD_AGGREGATE);
+        let (out, rows) = run_yaml(
+            &yaml,
+            strategy,
+            &[(1, group, 0)],
+            build_group,
+            &["out", "agg_out"],
+        );
+        assert_eq!(
+            rows.len(),
+            2,
+            "[{tag}] the failing driver and its build row: {:?}",
+            describe(&rows)
+        );
+        assert_driver_then_build(tag, &rows[0], &rows[1], 1);
+        let totals = &out["agg_out"];
+        assert_eq!(
+            totals.len(),
+            1,
+            "[{tag}] the build Source's one group is aggregated: {totals:?}"
+        );
+        let total: f64 = totals[0]
+            .get("total")
+            .unwrap_or_else(|| panic!("[{tag}] the aggregate has a total: {totals:?}"))
+            .parse()
+            .unwrap_or_else(|_| panic!("[{tag}] total is numeric: {totals:?}"));
+        assert_eq!(
+            total, BASE,
+            "[{tag}] the build row's contribution is not retracted: {totals:?}"
+        );
+    }
+}
+
 /// `max_group_buffer` counts a failure once. One failing and one succeeding
 /// driver share a group under a cap of 2: the failure and the succeeding
 /// driver's output are the group's two held entries. The build row held
