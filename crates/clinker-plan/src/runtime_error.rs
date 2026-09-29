@@ -245,6 +245,10 @@ pub struct MemoryShortfallReport {
     /// group is at fault (a Cull or Reshape group too large to hold whole);
     /// `None` otherwise.
     pub group_first_row: Option<RowPosition>,
+    /// An estimate of how many distinct join keys the partition of a join's
+    /// build side held, when the join stopped while matching one partition
+    /// it could not split further; `None` otherwise. A count, never a key.
+    pub join_partition_distinct_keys: Option<u64>,
     /// The reading of the run's memory that was over the limit: the charged
     /// total, or the process's own memory. The headline and the suggested
     /// limit state only what this reading established.
@@ -764,6 +768,7 @@ mod tests {
                 surface: MemorySurface::JoinBuildSide,
             }),
             group_first_row: None,
+            join_partition_distinct_keys: None,
             reading: LimitReading::ProcessMemory {
                 peak_resident_bytes: 12 * MIB,
             },
@@ -823,6 +828,47 @@ mod tests {
             headline,
             "E310: process memory peaked at 12.0 MiB resident, over memory.limit 8.0 MiB; \
              the run had charged 3.0 MiB"
+        );
+    }
+
+    #[test]
+    fn a_join_partition_line_gives_its_distinct_key_estimate_after_the_headline() {
+        let mut report = process_memory_report();
+        report.join_partition_distinct_keys = Some(48_210);
+        let rendered = report.to_string();
+        assert_eq!(
+            rendered.lines().nth(1),
+            Some("  join partition: about 48210 distinct keys"),
+            "{rendered}"
+        );
+
+        report.group_first_row = Some(RowPosition {
+            source: "orders".to_string(),
+            row: 4,
+        });
+        let rendered = report.to_string();
+        assert!(
+            rendered
+                .lines()
+                .nth(1)
+                .is_some_and(|line| line.starts_with("  group: "))
+                && rendered.lines().nth(2) == Some("  join partition: about 48210 distinct keys"),
+            "the partition line follows the group line: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_join_partition_of_one_key_says_repartitioning_cannot_split_it() {
+        let mut report = process_memory_report();
+        report.join_partition_distinct_keys = Some(1);
+        let rendered = report.to_string();
+        assert_eq!(
+            rendered.lines().nth(1),
+            Some(
+                "  join partition: about 1 distinct key; one key's rows cannot be split \
+                 across partitions, so repartitioning cannot make them fit"
+            ),
+            "{rendered}"
         );
     }
 

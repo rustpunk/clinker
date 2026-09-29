@@ -2162,9 +2162,250 @@ fn test_bnl_result_batching() {
     );
 }
 
+/// The hash of `record`'s build-side join key, as the join partitions it.
+fn build_key_hash(h: &BnlHarness, record: &Record) -> u64 {
+    let ctx = EvalContext::test_with_file(&h.stable, &h.source_file, 0);
+    let keys = h.build_extractor.extract(&ctx, record).unwrap();
+    hash_composite_key(&keys, &h.hash_state)
+}
+
+/// A build record keyed `key`, and a probe record keyed `key`.
+fn keyed_build(h: &BnlHarness, key: i64, tag: usize) -> Record {
+    record_for(
+        &h.build_schema,
+        vec![
+            Value::Integer(key),
+            Value::String(format!("b-{key}-{tag}").into()),
+        ],
+    )
+}
+
+fn keyed_probe(h: &BnlHarness, key: i64) -> Record {
+    record_for(
+        &h.driver_schema,
+        vec![
+            Value::Integer(key),
+            Value::String(format!("d-{key}").into()),
+        ],
+    )
+}
+
+/// Run the chunked loop over `sp`'s `builds` under a 1-byte hard limit,
+/// which the host's resident memory always exceeds, and return the E310
+/// report it fails with.
+fn chunked_loop_over_a_one_byte_limit(
+    h: &BnlHarness,
+    sp: &SpilledPartition,
+    builds: Vec<Record>,
+) -> Box<clinker_plan::runtime_error::MemoryShortfallReport> {
+    let budget = MemoryArbitrator::with_policy(1, 1.0, 0.70, Box::new(NoOpPolicy));
+    let mut output: Vec<(Record, RecordOrder)> = Vec::new();
+    let mut body_eval: Option<ProgramEvaluator> = None;
+    let err = with_reload_context(h, |rc| {
+        bnl_fallback(
+            rc,
+            sp,
+            crate::test_support::with_build_row_ids(builds),
+            &mut body_eval,
+            &budget,
+            &mut GraceEmitSink {
+                records: &mut output,
+                failures: &mut Vec::new(),
+                name: "grace_test",
+                max_output_rows: None,
+            },
+            &mut BnlStats::default(),
+        )
+        .expect_err("a 1-byte hard limit must stop the chunked loop")
+    });
+    match err {
+        PipelineError::MemoryBudgetExceeded { report } => report,
+        other => panic!("the chunked loop must stop with E310; got {other:?}"),
+    }
+}
+
+/// Reload `sp` through the full spilled-partition path under a 1-byte
+/// hard limit, which the host's resident memory always exceeds, and
+/// return the E310 report it fails with.
+fn reload_over_a_one_byte_limit(
+    h: &BnlHarness,
+    sp: SpilledPartition,
+) -> Box<clinker_plan::runtime_error::MemoryShortfallReport> {
+    let budget = MemoryArbitrator::with_policy(1, 1.0, 0.70, Box::new(NoOpPolicy));
+    let mut output: Vec<(Record, RecordOrder)> = Vec::new();
+    let mut body_eval: Option<ProgramEvaluator> = None;
+    let err = with_reload_context(h, |rc| {
+        process_spilled_partition(
+            rc,
+            sp,
+            &mut body_eval,
+            &budget,
+            &mut GraceEmitSink {
+                records: &mut output,
+                failures: &mut Vec::new(),
+                name: "grace_test",
+                max_output_rows: None,
+            },
+        )
+        .expect_err("a 1-byte hard limit must stop the reload")
+    });
+    match err {
+        PipelineError::MemoryBudgetExceeded { report } => report,
+        other => panic!("the reload must stop with E310; got {other:?}"),
+    }
+}
+
+/// One join key carries every row of a spilled partition. No
+/// repartitioning separates rows that share a key, so the reload falls
+/// back to the chunked loop, and the E310 it stops with says the
+/// partition holds about one distinct key and why the split cannot help.
+#[test]
+fn a_one_key_partition_that_stops_over_the_limit_reports_about_one_distinct_key() {
+    if crate::pipeline::memory::rss_bytes().is_none() {
+        // Without an RSS reading a 1-byte limit never trips the abort.
+        return;
+    }
+    let h = build_bnl_harness();
+    let key = 7_654_321;
+    let builds: Vec<Record> = (0..200).map(|tag| keyed_build(&h, key, tag)).collect();
+    let probes: Vec<Record> = (0..5).map(|_| keyed_probe(&h, key)).collect();
+    let parent_bits = 2u8;
+    let partition =
+        PartitionAssigner::new(parent_bits).partition_for(build_key_hash(&h, &builds[0]));
+    let sp = spill_for_bnl(&h, &builds, &probes, partition, parent_bits);
+
+    let report = reload_over_a_one_byte_limit(&h, sp);
+    assert_eq!(
+        report.join_partition_distinct_keys,
+        Some(1),
+        "a partition of one key's rows holds about one distinct key: {report:?}"
+    );
+    let rendered = report.to_string();
+    assert!(
+        rendered.contains(
+            "\n  join partition: about 1 distinct key; one key's rows cannot be split across \
+             partitions, so repartitioning cannot make them fit"
+        ),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("7654321"),
+        "the report never prints the key: {rendered}"
+    );
+}
+
+/// A spilled partition splits once by the join key; the half holding a
+/// hot key cannot be split again, so the chunked loop runs on that half.
+/// The E310 counts the distinct keys of that half, as the sketch
+/// rebuilt for it during the split saw them, not those of the partition it
+/// was split from.
+#[test]
+fn a_split_partition_reports_the_distinct_keys_of_the_half_that_stopped() {
+    if crate::pipeline::memory::rss_bytes().is_none() {
+        return;
+    }
+    let h = build_bnl_harness();
+    let parent = PartitionAssigner::new(2);
+    let child = parent.double().unwrap();
+    let grandchild = child.double().unwrap();
+    let hash_of = |key: i64| build_key_hash(&h, &keyed_build(&h, key, 0));
+
+    // A hot key whose half is the first one the split recurses into.
+    let hot = (0..10_000i64)
+        .find(|&key| {
+            let hash = hash_of(key);
+            child.partition_for(hash) == parent.partition_for(hash) * 2
+        })
+        .expect("half of all keys land in the first half");
+    let hot_hash = hash_of(hot);
+    let partition = parent.partition_for(hot_hash);
+    // Keys sharing the hot key's partition: ten that follow it into its
+    // half but not into its quarter, and forty that land in the other half.
+    let mut with_hot = Vec::new();
+    let mut other_half = Vec::new();
+    for key in (0..1_000_000i64).filter(|&key| key != hot) {
+        if with_hot.len() == 10 && other_half.len() == 40 {
+            break;
+        }
+        let hash = hash_of(key);
+        if parent.partition_for(hash) != partition {
+            continue;
+        }
+        if child.partition_for(hash) != child.partition_for(hot_hash) {
+            if other_half.len() < 40 {
+                other_half.push(key);
+            }
+        } else if grandchild.partition_for(hash) != grandchild.partition_for(hot_hash)
+            && with_hot.len() < 10
+        {
+            with_hot.push(key);
+        }
+    }
+    assert_eq!((with_hot.len(), other_half.len()), (10, 40));
+
+    // 100 hot rows beside 10 + 40 single-row keys: the first split leaves
+    // the hot half at 110 of 150 rows, under the irreducible share, so it
+    // recurses; the hot half's own split leaves 100 of 110 in one quarter,
+    // over it, so that half runs the chunked loop.
+    let mut builds: Vec<Record> = (0..100).map(|tag| keyed_build(&h, hot, tag)).collect();
+    builds.extend(with_hot.iter().map(|&key| keyed_build(&h, key, 0)));
+    builds.extend(other_half.iter().map(|&key| keyed_build(&h, key, 0)));
+    let hot_half: Vec<Record> = builds[..110].to_vec();
+    let irreducible_share = 1.0 - SKEW_REDUCTION_THRESHOLD;
+    assert!(
+        hot_half.len() as f64 <= irreducible_share * builds.len() as f64
+            && 100.0 > irreducible_share * hot_half.len() as f64,
+        "the first split must recurse and the second must not"
+    );
+
+    let sp = spill_for_bnl(&h, &builds, &[], partition, 2);
+    let report = reload_over_a_one_byte_limit(&h, sp);
+    // The half holds 11 distinct keys; the partition it was split from
+    // held 51. A 64-register estimate of 11 keys lands within a few keys.
+    let estimate = report
+        .join_partition_distinct_keys
+        .expect("the stopped half carries its estimate");
+    assert!(
+        (8..=15).contains(&estimate),
+        "the half's 11 keys, not the whole partition's 51: {report:?}"
+    );
+}
+
+/// A partition deep in the split (eight partition bits) holding 200
+/// distinct keys. Every key in it shares the hash bits that chose the
+/// partition, so the estimate must be read from other bits of the hash: it
+/// reports about 200 keys, never about one.
+#[test]
+fn a_deep_partition_of_many_keys_does_not_report_one_key() {
+    if crate::pipeline::memory::rss_bytes().is_none() {
+        return;
+    }
+    let h = build_bnl_harness();
+    let bits = 8u8;
+    let assigner = PartitionAssigner::new(bits);
+    let hash_of = |key: i64| build_key_hash(&h, &keyed_build(&h, key, 0));
+    let partition = assigner.partition_for(hash_of(0));
+    let builds: Vec<Record> = (0..i64::MAX)
+        .filter(|&key| assigner.partition_for(hash_of(key)) == partition)
+        .take(200)
+        .map(|key| keyed_build(&h, key, 0))
+        .collect();
+    let sp = spill_for_bnl(&h, &builds, &[], partition, bits);
+
+    let report = chunked_loop_over_a_one_byte_limit(&h, &sp, builds);
+    let estimate = report
+        .join_partition_distinct_keys
+        .expect("the stopped partition carries its estimate");
+    assert!(
+        (100..=400).contains(&estimate),
+        "200 distinct keys estimate near 200, not {estimate}: {report:?}"
+    );
+}
+
 /// Hard-gate 5: hard-limit abort surfaces E310 for the combine's join
-/// build side. The host RSS trivially exceeds a 1-byte limit, so
-/// `should_abort` returns true on the very first poll inside BNL.
+/// build side with the partition's approximate distinct-key count. The
+/// host RSS trivially exceeds a 1-byte limit, so `should_abort` returns
+/// true on the very first poll inside BNL.
 #[test]
 fn test_e310_hard_limit_abort() {
     if crate::pipeline::memory::rss_bytes().is_none() {
@@ -2227,6 +2468,18 @@ fn test_e310_hard_limit_abort() {
             assert!(
                 report.requested_bytes > 0,
                 "the backstop reports how far past the limit the run was: {report:?}"
+            );
+            let est = report
+                .join_partition_distinct_keys
+                .expect("the abort carries the partition's distinct-key estimate");
+            assert!(
+                (100..=400).contains(&est),
+                "200 distinct keys estimate near 200, not {est}: {report:?}"
+            );
+            let rendered = report.to_string();
+            assert!(
+                rendered.contains(&format!("\n  join partition: about {est} distinct keys\n")),
+                "{rendered}"
             );
         }
         other => {

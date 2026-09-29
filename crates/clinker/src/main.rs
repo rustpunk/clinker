@@ -7817,6 +7817,7 @@ mod tests {
                             surface: MemorySurface::GroupState,
                         }),
                         group_first_row: None,
+                        join_partition_distinct_keys: None,
                         reading: LimitReading::Charged,
                         requested_bytes: 1,
                         limit_bytes: 1,

@@ -334,6 +334,7 @@ fn build_report(
     Box::new(MemoryShortfallReport {
         requester,
         group_first_row: None,
+        join_partition_distinct_keys: None,
         reading: LimitReading::Charged,
         requested_bytes: requested,
         limit_bytes: snapshot.limit,
