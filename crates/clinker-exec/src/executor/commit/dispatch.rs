@@ -50,6 +50,7 @@ use crate::executor::dispatch::{
     planned_materialized_reader_counts, require_node_buffer_input,
     validate_completed_node_buffer_scope,
 };
+use crate::pipeline::memory::walk::{NodeBufferSlots, WalkReclaimSet};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::CompositionBodyId;
 use clinker_plan::plan::deferred_region::{DeferredRegion, ParentContinuation};
@@ -418,13 +419,20 @@ fn recurse_into_body(
     };
     let body_dag = ExecutionPlanDag::from_body(bound_body);
 
-    // Swap to body-scope node-buffer slots so body NodeIndices index a
-    // fresh namespace (parent-scope NodeIndex 0 and body-scope NodeIndex 0
-    // collide numerically). Restore on every exit. The buffers, their
-    // registrations and the remaining-reader counts swap as one scope, so
+    // Push an empty body-scope frame of node-buffer slots so body
+    // NodeIndices index a fresh namespace (parent-scope NodeIndex 0 and
+    // body-scope NodeIndex 0 collide numerically). The buffers, their
+    // registrations and the remaining-reader counts move as one frame, so
     // body-scope NodeBufferConsumer registrations don't survive into the
     // parent scope and a body fanout does not collide with a parent count.
-    let saved_slots = ctx.walk_reclaim.borrow_mut().take_slots();
+    // The parent's frame stays beneath, where a reclaim started inside the
+    // body can still spill the parent's resident slots. The guard pops the
+    // frame on an early return or an unwind; every other exit pops it below.
+    let body_frame = WalkReclaimSet::push_frame(
+        &ctx.walk_reclaim,
+        NodeBufferSlots::default(),
+        &ctx.memory_budget,
+    );
     let saved_planned_readers = std::mem::replace(
         &mut ctx.planned_node_buffer_readers,
         planned_materialized_reader_counts(&body_dag),
@@ -464,12 +472,13 @@ fn recurse_into_body(
     // `correlation_buffers`.
     //
     // Wrapped in an immediately-invoked closure so the parent-scope
-    // borrows can be restored explicitly on every exit path below
+    // context fields can be restored explicitly on every exit path below
     // regardless of whether the inner walk succeeds: the harvest result
     // is bound here, the swaps are reversed, then the result is
-    // unwrapped via `?`. A `Drop`-guard would extend the `&mut ctx`
-    // borrow through the recursive dispatch calls, which the borrow
-    // checker rejects.
+    // unwrapped via `?`. A `Drop`-guard over those fields would extend the
+    // `&mut ctx` borrow through the recursive dispatch calls, which the
+    // borrow checker rejects; the slot frame's guard holds the reclaim set
+    // by `Rc`, not through `ctx`.
     type CommitHarvest = (
         Vec<(Record, crate::executor::stream_event::SourceRowId)>,
         Vec<crate::executor::node_buffer::TransientNodeBufferReservation>,
@@ -559,11 +568,11 @@ fn recurse_into_body(
         Ok((harvested, harvest_reservations))
     })();
 
-    // Unregister every body-local NodeBufferConsumer so the
-    // arbitrator's registry stays aligned with the post-swap parent
-    // scope's slots. The body scope is replaced below; failing to
-    // unregister here would leak wrappers whose `current_usage` reads
-    // zero forever.
+    // Unregister every body-local NodeBufferConsumer, taken from the body's
+    // frame while it is still the top, so the arbitrator's registry stays
+    // aligned with the parent scope's slots once that frame pops below;
+    // failing to unregister here would leak wrappers whose `current_usage`
+    // reads zero forever.
     let body_consumer_ids = ctx
         .walk_reclaim
         .borrow_mut()
@@ -589,9 +598,9 @@ fn recurse_into_body(
     ctx.window_runtime.remove_body_scope(bound_body.body_scope);
     ctx.current_body_node_input_refs = saved_body_refs;
     ctx.source_records = saved_combine;
-    // The body's remaining buffers drop here, after their registrations left.
-    let body_slots = ctx.walk_reclaim.borrow_mut().replace_slots(saved_slots);
-    drop(body_slots);
+    // Pop the body's frame; its remaining buffers drop here, after their
+    // registrations left.
+    drop(body_frame.pop());
     ctx.planned_node_buffer_readers = saved_planned_readers;
     ctx.window_arena_consumer_ids = saved_arena_ids;
 

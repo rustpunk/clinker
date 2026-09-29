@@ -1553,13 +1553,14 @@ pub(crate) struct ExecutorContext<'a> {
     /// The walk's reclaimable state, shared with the walk frame the run
     /// installs on this thread, so a reclaim started from any governed
     /// allocation on the walk reaches it without `&mut` access to this
-    /// context. It owns the current scope's node-buffer slots: the
+    /// context. It owns each open scope's node-buffer slots: the
     /// `(Record, row_num)` queues threaded between arms, each slot's
     /// `NodeBufferConsumer` registration (the id unregistered after the
     /// slot's final reader, and the handle partial discharges drive), and the
-    /// producer-declared remaining readers. A composition body swaps in its
-    /// own slots so equal local `NodeIndex` values never collide across
-    /// scopes. Borrowed in short scopes only, never across a governed
+    /// producer-declared remaining readers. A composition body pushes its
+    /// own slots as a frame above its caller's so equal local `NodeIndex`
+    /// values never collide across scopes; arms see only the top frame.
+    /// Borrowed in short scopes only, never across a governed
     /// allocation, a `reserve`, a channel wait or a call into another
     /// dispatch arm.
     pub(crate) walk_reclaim:

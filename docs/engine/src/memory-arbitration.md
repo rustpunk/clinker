@@ -78,8 +78,11 @@ On the walk thread a `Shortfall` is not yet a refusal. A `reserve`, a
 walk that does not fit runs a reclaim pass without holding the ledger lock:
 the registered consumers that cannot be paused and hold bytes are taken in the
 run's policy order (ties to the older consumer), the requesting consumer last,
-and each whose state the walk owns — today a node-buffer slot of the current
-dispatch scope — is spilled there and then. A consumer whose state the walk
+and each whose state the walk owns — today a node-buffer slot of the running
+dispatch scope, or of any scope that entered it through a composition body,
+so a body that falls short can spill a resident slot its callers still hold —
+is spilled there and then. The body itself never reads, replaces or removes a
+caller's slot. A consumer whose state the walk
 does not own is skipped and never asked to act; one the running dispatch arm
 holds frees nothing this pass and has its own spill request raised. A pass
 aims to bring the ledger, with the request charged, down to the resume

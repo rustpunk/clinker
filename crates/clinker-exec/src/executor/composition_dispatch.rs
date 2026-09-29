@@ -27,7 +27,7 @@ use crate::executor::node_buffer::{
     NodeBuffer, TransientNodeBufferReservation, reserve_node_buffer_materialization,
 };
 use crate::executor::schema_check::check_input_schema;
-use crate::pipeline::memory::walk::{NodeBufferSlots, SlotSpill};
+use crate::pipeline::memory::walk::{NodeBufferSlots, SlotSpill, WalkReclaimSet};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 
@@ -349,9 +349,10 @@ fn collect_port_records(
 ///
 /// Builds a transient body-scope `ExecutionPlanDag` and walks it
 /// through `dispatch_plan_node` — the same dispatcher entry the
-/// top-level walker uses. The body's node-buffer slots are swapped
-/// into the walk reclaim set so body NodeIndices index a fresh
-/// space; the parent's slots are restored after the walk.
+/// top-level walker uses. The body's node-buffer slots are pushed as a
+/// frame on the walk reclaim set so body NodeIndices index a fresh
+/// space; the parent's slots stay beneath it, out of the body's reach
+/// except to a reclaim, and are the top frame again after the walk.
 /// Dispatch and output harvest are captured into one result so the single
 /// restoration path runs before success or any error is propagated.
 fn execute_composition_body(
@@ -441,16 +442,19 @@ fn execute_composition_body(
     // record stream back to the parent.
     let output_idx = bound_body.output_port_to_node_idx.values().next().copied();
 
-    // Swap the node-buffer slots to a body-local namespace so body
-    // NodeIndices don't collide with the parent's. `source_records` is
-    // also swapped to an empty map so body-scope Source nodes resolve
-    // through their seeded slots (port seeding from parent scope), not
-    // through parent-scope source ingestion — bodies declare ports,
-    // not top-level sources. Any non-port-seeded body Source surfaces
-    // as the defense-in-depth `Internal` error from the Source arm.
-    // The buffers, their registrations and the remaining-reader counts all
-    // key by the body-local `NodeBufferKey` space, so they swap as one scope.
-    let saved_slots = ctx.walk_reclaim.borrow_mut().replace_slots(body_slots);
+    // Push the body's node-buffer slots as a body-local frame so body
+    // NodeIndices don't collide with the parent's. The buffers, their
+    // registrations and the remaining-reader counts all key by the
+    // body-local `NodeBufferKey` space, so they move as one frame. The
+    // parent's frame stays beneath it, where a reclaim started inside the
+    // body can still spill the parent's resident slots. The guard pops the
+    // frame on an early return or an unwind; every other exit pops it below.
+    // `source_records` is swapped to an empty map so body-scope Source nodes
+    // resolve through their seeded slots (port seeding from parent scope),
+    // not through parent-scope source ingestion — bodies declare ports, not
+    // top-level sources. Any non-port-seeded body Source surfaces as the
+    // defense-in-depth `Internal` error from the Source arm.
+    let body_frame = WalkReclaimSet::push_frame(&ctx.walk_reclaim, body_slots, &ctx.memory_budget);
     let saved_planned_readers = std::mem::replace(
         &mut ctx.planned_node_buffer_readers,
         planned_materialized_reader_counts(&body_dag),
@@ -556,12 +560,13 @@ fn execute_composition_body(
     })();
 
     // One restoration path for body dispatch, output harvest, and success.
-    // Put the parent's slots back, then drop the body-local buffers while
-    // their wrappers remain registered and unregister every residual body
-    // registration. Slots already drained by body operators removed their own
-    // entries, so this sweep covers only early-return residue.
+    // Pop the body's frame so the parent's slots are the top frame again,
+    // then drop the body-local buffers while their wrappers remain
+    // registered and unregister every residual body registration. Slots
+    // already drained by body operators removed their own entries, so this
+    // sweep covers only early-return residue.
     ctx.recursion_depth = ctx.recursion_depth.saturating_sub(1);
-    let body_slots = ctx.walk_reclaim.borrow_mut().replace_slots(saved_slots);
+    let body_slots = body_frame.pop();
     body_slots.release_residue(&ctx.memory_budget);
     ctx.planned_node_buffer_readers = saved_planned_readers;
     // Drop every residual body receiver before joining its finite ingest

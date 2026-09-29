@@ -65,8 +65,7 @@ pub(crate) struct SlotSpill {
 ///
 /// A composition body walks its own scope, pushed as a frame above the
 /// parent's, so equal body-local and parent `NodeIndex` values never collide.
-/// A slot's
-/// registration and its spill facts change together, through
+/// A slot's registration and its spill facts change together, through
 /// [`Self::register`], [`Self::remove_registration`] and
 /// [`Self::take_registrations`] only.
 #[derive(Default)]
@@ -262,11 +261,6 @@ impl WalkReclaimSet {
         &mut self.slots
     }
 
-    /// Make `slots` the current scope, returning the scope it replaces.
-    pub(crate) fn replace_slots(&mut self, slots: NodeBufferSlots) -> NodeBufferSlots {
-        std::mem::replace(&mut self.slots, slots)
-    }
-
     /// Take the top frame's slots, leaving an empty one. The run's teardown
     /// takes the top level's slots this way once every body frame is gone.
     pub(crate) fn take_slots(&mut self) -> NodeBufferSlots {
@@ -371,8 +365,29 @@ impl FrameGuard {
 }
 
 impl Drop for FrameGuard {
+    /// An exit that did not pop the frame: an error returned early or an
+    /// unwind. The caller's frame is restored, then the body's residue is
+    /// released with no borrow of the set held.
     fn drop(&mut self) {
-        let _ = (&self.set, &self.arbitrator, self.depth, self.pushed);
+        if !self.pushed {
+            return;
+        }
+        // Every borrow of the set ends before any call that could return or
+        // unwind to here, so the set is free; were one still held, a second
+        // borrow would panic inside an unwind, so the frame is left instead.
+        let Ok(mut set) = self.set.try_borrow_mut() else {
+            return;
+        };
+        debug_assert_eq!(
+            set.depth(),
+            self.depth,
+            "a body's frame is popped only while it is the top frame"
+        );
+        let frame = set.pop_frame();
+        drop(set);
+        if let Some(frame) = frame {
+            frame.release_residue(&self.arbitrator);
+        }
     }
 }
 
@@ -413,15 +428,22 @@ pub(crate) trait WalkReclaim {
 }
 
 impl WalkReclaim for WalkReclaimSet {
+    /// The frame that registered consumer `id` spills its slot. The running
+    /// scope's frame is searched first, then each calling scope's outwards,
+    /// so a composition body's shortfall reaches the resident slots its
+    /// callers hold. A consumer no frame registered is `NotOwned`.
     fn spill_victim(
         &mut self,
         id: ConsumerId,
         arbitrator: &MemoryArbitrator,
     ) -> Result<VictimOutcome, PipelineError> {
-        Ok(self
-            .slots
-            .spill_registered(id, arbitrator, &self.spill_settings)?
-            .unwrap_or(VictimOutcome::NotOwned))
+        let spill_settings = &self.spill_settings;
+        for frame in std::iter::once(&mut self.slots).chain(self.parents.iter_mut().rev()) {
+            if let Some(outcome) = frame.spill_registered(id, arbitrator, spill_settings)? {
+                return Ok(outcome);
+            }
+        }
+        Ok(VictimOutcome::NotOwned)
     }
 }
 
@@ -721,10 +743,8 @@ mod frame_tests {
             },
         );
         handle.set_bytes(charge);
-        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
-            "id".into(),
-            "payload".into(),
-        ])));
+        let schema =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into(), "payload".into()])));
         let records: Vec<(Record, u64)> = (0..rows)
             .map(|row| {
                 (
@@ -867,7 +887,10 @@ mod frame_tests {
         let set = set.borrow();
         assert_eq!(set.frame_depth(), 1);
         assert!(
-            matches!(set.slots().buffer(&parent_key), Some(NodeBuffer::Spilled { .. })),
+            matches!(
+                set.slots().buffer(&parent_key),
+                Some(NodeBuffer::Spilled { .. })
+            ),
             "the parent's slot is on disk once its frame is back on top"
         );
         assert!(set.slots().is_registered(&parent_key));
