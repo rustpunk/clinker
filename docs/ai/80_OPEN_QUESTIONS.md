@@ -958,6 +958,28 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
   exists, and update the Route page's Constraints section.
 - Implementation owner: Planner maintainers.
 
+## Aggregate findings
+
+### 91. `sum` of a column that mixes decimals and floats returns the decimal total without the floats
+
+- Filed: 2026-09-29.
+- Status: Open; needs a maintainer decision.
+- Priority: Low.
+- Evidence: `SumState::finalize` in
+  `crates/clinker-record/src/accumulator/mod.rs` returns the exact decimal
+  total (decimals plus integers) whenever the group has a decimal addend, and
+  the float addends take no part in it. `avg` and `weighted_avg` return null
+  for the same mix, because a binary float cannot join an exact decimal total.
+  Typecheck keeps a `sum` column in one numeric domain, so the mix is
+  reachable only on an untyped column. The behaviour predates the exact float
+  sum and was kept unchanged by it.
+- Files/modules involved: `crates/clinker-record/src/accumulator/mod.rs`
+  (`SumState`, `AvgState`, `WeightedAvgState`).
+- Suggested way to resolve it: Decide whether `sum` should return null for
+  the mix, as `avg` and `weighted_avg` do, or surface an error; either is a
+  user-visible change with a changelog entry.
+- Implementation owner: Accumulator maintainers.
+
 ## Resolved Archive
 
 ### 61. Decoded allocation ownership

@@ -144,11 +144,10 @@ fn test_avg_decimal_merge_with_integer_only_state() {
 
 #[test]
 fn test_avg_float_then_decimal_is_null() {
-    // A binary float accumulated BEFORE the first decimal row cannot widen into
-    // the exact decimal sum (only the integer sum is seeded on the switch).
-    // Poison to Null rather than silently dropping the float and reporting the
-    // decimal-only quotient. Reachable only on an untyped column; typecheck
-    // rejects a float/decimal mix for typed columns.
+    // A binary float cannot join the exact decimal total, whether it arrives
+    // before or after the first decimal. Null rather than silently dropping
+    // the float and reporting the decimal-only quotient. Reachable only on an
+    // untyped column; typecheck rejects a float/decimal mix for typed columns.
     let mut a = avg();
     add_all(&mut a, &[Value::Float(1.5), dec(250, 2)]);
     // The true avg is (1.5 + 2.5) / 2 = 2.0; dropping the float would report
@@ -158,9 +157,9 @@ fn test_avg_float_then_decimal_is_null() {
 
 #[test]
 fn test_avg_decimal_then_float_is_null() {
-    // A binary float observed AFTER decimal mode lands only in the Kahan float
-    // sum, which the decimal quotient never reads. Poison to Null rather than
-    // silently dropping it. Reachable only on an untyped column.
+    // A binary float observed after a decimal cannot join the exact decimal
+    // total either. Null rather than silently dropping it. Reachable only on
+    // an untyped column.
     let mut a = avg();
     add_all(&mut a, &[dec(200, 2), Value::Float(1.5)]);
     // The true avg is (2.0 + 1.5) / 2 = 1.75; dropping the float would report
@@ -170,9 +169,9 @@ fn test_avg_decimal_then_float_is_null() {
 
 #[test]
 fn test_avg_merge_float_mode_with_decimal_mode_is_null() {
-    // Merging a float-mode partial (its exact contribution reads only its
-    // integer sum) into a decimal-mode partial — or vice versa — would drop the
-    // float side's total. Both merge directions poison to Null.
+    // A float partial merged with a decimal partial, either way, holds a float
+    // and a decimal, which cannot combine exactly: both merge directions give
+    // Null.
     let build_float = || {
         let mut s = avg();
         add_all(&mut s, &[Value::Float(1.5)]);
@@ -414,6 +413,176 @@ fn float_sum_does_not_depend_on_arrival_or_split() {
     assert_order_and_split_independent(sum, &floats(&one_and_tenths), 1.0 + 5.0 * f64::EPSILON);
 }
 
+/// A `weighted_avg` over `rows` of (value, weight).
+fn weighted_fold(rows: &[(Value, Value)]) -> AccumulatorEnum {
+    let mut acc = weighted_avg();
+    for (v, w) in rows {
+        acc.add_weighted(v, w);
+    }
+    acc
+}
+
+#[test]
+fn float_avg_and_weighted_avg_do_not_depend_on_arrival_or_split() {
+    // The exact sum of 1e16, 1.0 and -1e16 is 1, so the average is 1.0 / 3.0
+    // rounded once.
+    assert_order_and_split_independent(avg, &floats(&[1e16, 1.0, -1e16]), 1.0 / 3.0);
+    // Ten tenths sum exactly to a value that rounds to 1.0; 1.0 / 10.0 is the
+    // double nearest 0.1.
+    assert_order_and_split_independent(avg, &floats(&[0.1; 10]), 0.1);
+
+    // Products 1e16, 2.0 and -1e16 total exactly 2.0; weights 1, 2 and 1
+    // total 4.0; 2.0 / 4.0 = 0.5.
+    let rows = [
+        (Value::Float(1e16), Value::Float(1.0)),
+        (Value::Float(1.0), Value::Float(2.0)),
+        (Value::Float(-1e16), Value::Integer(1)),
+    ];
+    // Ten rows of (0.1, 1.0) and one of (1, 1): products total exactly
+    // 2.000000000000000055511151231257827..., which rounds to 2.0; weights
+    // total 11.0; 2.0 / 11.0 rounded once.
+    let mut tenths: Vec<(Value, Value)> = vec![(Value::Float(0.1), Value::Float(1.0)); 10];
+    tenths.push((Value::Integer(1), Value::Integer(1)));
+    let pair = |(v, w): &(Value, Value)| {
+        Value::Array(crate::owned_storage::OwnedValues::from_vec(vec![
+            v.clone(),
+            w.clone(),
+        ]))
+    };
+    let unpair = |row: &Value| -> (Value, Value) {
+        let Value::Array(items) = row else {
+            unreachable!("rows are pairs")
+        };
+        (items[0].clone(), items[1].clone())
+    };
+    for (rows, expected) in [(rows.to_vec(), 0.5_f64), (tenths, 2.0 / 11.0)] {
+        let rows: Vec<Value> = rows.iter().map(pair).collect();
+        for order in arrival_orders(&rows) {
+            let order: Vec<(Value, Value)> = order.iter().map(unpair).collect();
+            let context = format!("{order:?}");
+            assert_eq!(
+                float_bits(&weighted_fold(&order).finalize().unwrap()),
+                expected.to_bits(),
+                "folded {context}"
+            );
+            for at in 0..=order.len() {
+                let (left, right) = order.split_at(at);
+                let mut ab = weighted_fold(left);
+                ab.merge(&weighted_fold(right));
+                let mut ba = weighted_fold(right);
+                ba.merge(&weighted_fold(left));
+                for merged in [ab, ba] {
+                    assert_eq!(
+                        float_bits(&merged.finalize().unwrap()),
+                        expected.to_bits(),
+                        "split {left:?} | {right:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Every subset of `0..n`, as a bit mask.
+fn subsets(n: usize) -> impl Iterator<Item = u32> {
+    0..(1u32 << n)
+}
+
+/// Assert that `after` retracting some values equals `survivors` folded
+/// fresh, field for field, and finalizes to the same bits.
+fn assert_same_state(after: &AccumulatorEnum, survivors: &AccumulatorEnum, context: &str) {
+    assert_eq!(after, survivors, "state after retracting {context}");
+    let (a, b) = (after.finalize().unwrap(), survivors.finalize().unwrap());
+    assert!(
+        identical(&a, &b),
+        "result after retracting {context}: {a:?} != {b:?}"
+    );
+}
+
+#[test]
+fn sum_avg_weighted_avg_retract_exactly() {
+    let values = [
+        Value::Integer(7),
+        Value::Float(1e300),
+        Value::Float(0.1),
+        Value::Integer(-3),
+        Value::Float(-1e300),
+        Value::Float(f64::NAN),
+        Value::Float(f64::from_bits(1)),
+        Value::Null,
+    ];
+    for make in [sum as NewState, avg] {
+        for mask in subsets(values.len()) {
+            let retracted = |i: usize| mask & (1 << i) != 0;
+            let mut acc = fold(make, &values);
+            for (i, value) in values.iter().enumerate() {
+                if retracted(i) {
+                    acc.sub(value);
+                }
+            }
+            let survivors: Vec<Value> = values
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !retracted(*i))
+                .map(|(_, v)| v.clone())
+                .collect();
+            assert_same_state(&acc, &fold(make, &survivors), &format!("mask {mask:#b}"));
+        }
+    }
+
+    // Retracting the only float returns a Sum to its integer type; retracting
+    // the NaN removes it from the result; retracting every non-null addend
+    // gives null.
+    let mut acc = fold(sum, &[Value::Integer(2), Value::Float(0.5)]);
+    acc.sub(&Value::Float(0.5));
+    assert_eq!(acc.finalize().unwrap(), Value::Integer(2));
+    let mut acc = fold(sum, &[Value::Float(1.5), Value::Float(f64::NAN)]);
+    acc.sub(&Value::Float(f64::NAN));
+    assert_eq!(float_bits(&acc.finalize().unwrap()), 1.5_f64.to_bits());
+    for make in [sum as NewState, avg] {
+        let mut acc = fold(make, &[Value::Float(1.5), Value::Integer(2), Value::Null]);
+        acc.sub(&Value::Integer(2));
+        acc.sub(&Value::Float(1.5));
+        assert_eq!(acc, make());
+        assert_eq!(acc.finalize().unwrap(), Value::Null);
+    }
+
+    let rows = [
+        (Value::Integer(2), Value::Integer(3)),
+        (Value::Float(1e300), Value::Float(1.0)),
+        (Value::Float(0.1), Value::Integer(4)),
+        (Value::Integer(-1), Value::Float(0.5)),
+        (Value::Float(-1e300), Value::Float(1.0)),
+        (Value::Float(f64::NAN), Value::Integer(1)),
+        (Value::Null, Value::Integer(9)),
+    ];
+    for mask in subsets(rows.len()) {
+        let retracted = |i: usize| mask & (1 << i) != 0;
+        let mut acc = weighted_fold(&rows);
+        for (i, (v, w)) in rows.iter().enumerate() {
+            if retracted(i) {
+                acc.sub_weighted(v, w);
+            }
+        }
+        let survivors: Vec<(Value, Value)> = rows
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !retracted(*i))
+            .map(|(_, row)| row.clone())
+            .collect();
+        assert_same_state(&acc, &weighted_fold(&survivors), &format!("rows {mask:#b}"));
+    }
+    let mut acc = weighted_fold(&rows[..2]);
+    acc.sub_weighted(&rows[1].0, &rows[1].1);
+    assert_eq!(
+        float_bits(&acc.finalize().unwrap()),
+        (6.0_f64 / 3.0).to_bits()
+    );
+    acc.sub_weighted(&rows[0].0, &rows[0].1);
+    assert_eq!(acc, weighted_avg());
+    assert_eq!(acc.finalize().unwrap(), Value::Null);
+}
+
 #[test]
 fn exact_sum_special_values_follow_ieee() {
     let total = |values: &[Value]| fold(sum, values).finalize().unwrap();
@@ -629,21 +798,15 @@ fn test_avg_all_null() {
 }
 
 #[test]
-fn test_avg_kahan() {
-    // 1M × 0.1 averaged → 0.1 exactly (within Kahan tolerance).
+fn test_avg_of_many_floats_divides_the_exact_sum_rounded_once() {
+    // A million copies of the double nearest 0.1 sum exactly to a value that
+    // rounds to 100000.0 (see the matching sum test); 100000.0 / 1000000.0 is
+    // the double nearest 0.1.
     let mut a = avg();
     for _ in 0..1_000_000 {
         a.add(&Value::Float(0.1));
     }
-    let result = a.finalize().unwrap();
-    let Value::Float(f) = result else {
-        panic!("expected Float, got {result:?}");
-    };
-    assert!(
-        (f - 0.1).abs() < 1e-12,
-        "avg error {} too large",
-        (f - 0.1).abs()
-    );
+    assert_eq!(float_bits(&a.finalize().unwrap()), 0.1_f64.to_bits());
 }
 
 // ---------- Min ----------
@@ -1173,10 +1336,10 @@ fn test_weighted_avg_decimal_mixed_with_float_is_null() {
 
 #[test]
 fn test_weighted_avg_float_then_decimal_is_null() {
-    // A binary float accumulated BEFORE the first decimal row cannot widen into
-    // the exact decimal sums (only the integer accumulators are seeded on the
-    // switch). Poison to Null rather than silently dropping the float total and
-    // reporting the decimal-only quotient. Reachable only on an untyped column.
+    // A float row cannot join the exact decimal totals, whether it arrives
+    // before or after the first decimal row. Null rather than silently dropping
+    // the float row and reporting the decimal-only quotient. Reachable only on
+    // an untyped column.
     let mut a = weighted_avg();
     a.add_weighted(&Value::Float(1.5), &Value::Integer(1)); // float path first
     a.add_weighted(&dec(250, 2), &Value::Integer(1)); // then a decimal row
@@ -1187,9 +1350,9 @@ fn test_weighted_avg_float_then_decimal_is_null() {
 
 #[test]
 fn test_weighted_avg_merge_float_mode_with_decimal_mode_is_null() {
-    // Merging a float-mode partial (its exact contribution reads only its
-    // integer sums) into a decimal-mode partial — or vice versa — would drop
-    // the float side's total. Both merge directions poison to Null.
+    // A float partial merged with a decimal partial, either way, holds a float
+    // row and a decimal row, which cannot combine exactly: both merge
+    // directions give Null.
     let build_float = || {
         let mut s = weighted_avg();
         s.add_weighted(&Value::Float(1.5), &Value::Integer(1));
@@ -1374,13 +1537,11 @@ fn test_for_type_roundtrip() {
 
 // ---------- Reversibility classification ----------
 //
-// Sum / Count / Collect / Any expose an O(1) inverse operation that can
-// recover state byte-equivalent to never having observed a retracted
-// contribution. Min, Max, Avg, WeightedAvg are classified BufferRequired:
-// Min/Max because they are positional (the prior extremum is unrecoverable
-// once shadowed); Avg/WeightedAvg because incremental retract on the
-// Kahan-compensated f64 paths drifts away from a re-fold over surviving
-// rows.
+// Sum / Count / Collect / Any / Avg / WeightedAvg expose an O(1) inverse
+// operation that recovers a state equal to never having observed a retracted
+// contribution; Sum, Avg and WeightedAvg hold every part exactly, so the
+// inverse is exact. Min and Max are classified BufferRequired because they
+// are positional: the prior extremum is unrecoverable once shadowed.
 
 #[test]
 fn test_reversibility_sum() {
@@ -1417,15 +1578,12 @@ fn test_reversibility_max() {
 
 #[test]
 fn test_reversibility_avg() {
-    assert_eq!(avg().reversibility(), Reversibility::BufferRequired);
+    assert_eq!(avg().reversibility(), Reversibility::Reversible);
 }
 
 #[test]
 fn test_reversibility_weighted_avg() {
-    assert_eq!(
-        weighted_avg().reversibility(),
-        Reversibility::BufferRequired
-    );
+    assert_eq!(weighted_avg().reversibility(), Reversibility::Reversible);
 }
 
 // ============================================================================

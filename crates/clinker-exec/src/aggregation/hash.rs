@@ -600,19 +600,17 @@ impl HashAggregator {
                     CompiledBindingArg::Pair(a, b) => {
                         let va = eval_binding_arg_value(a, record, ctx)?;
                         let vb = eval_binding_arg_value(b, record, ctx)?;
-                        // Lineage + Pair only co-occur on a relaxed-CK
-                        // aggregate whose only Pair binding is
-                        // WeightedAvg, which is BufferRequired and would
-                        // route through buffer-mode instead. The branch
-                        // is kept defensively so a future Pair binding
-                        // that enters the Reversible set does not break
-                        // here.
+                        // A WeightedAvg binding is reversible, so a
+                        // relaxed aggregate retracts it on this path: cache
+                        // both operands for `retract_row`'s `sub_weighted`,
+                        // and count the heap the add allocates, which the
+                        // retraction gives back.
                         row_heap_bytes = row_heap_bytes
                             .saturating_add(va.heap_size())
                             .saturating_add(vb.heap_size());
                         row_values.push(va.clone());
                         row_values.push(vb.clone());
-                        acc.add_weighted(&va, &vb);
+                        delta += acc.add_weighted(&va, &vb);
                     }
                     CompiledBindingArg::Field(idx) => {
                         let v = record
@@ -941,12 +939,9 @@ impl HashAggregator {
             for (binding, acc) in bindings.iter().zip(state.row.iter_mut()) {
                 match &binding.arg {
                     BindingArg::Pair(_, _) => {
-                        // Lineage + Pair only co-occurs through the
-                        // defensive branch in `add_record`; today every
-                        // Pair-shaped binding (`WeightedAvg`) is
-                        // BufferRequired and runs through the buffer
-                        // arm above.
-                        debug_assert!(false, "Pair binding under lineage path is unreachable");
+                        let v = values.get(value_cursor).cloned().unwrap_or(Value::Null);
+                        let w = values.get(value_cursor + 1).cloned().unwrap_or(Value::Null);
+                        total_delta += acc.sub_weighted(&v, &w);
                         value_cursor += 2;
                     }
                     _ => {
