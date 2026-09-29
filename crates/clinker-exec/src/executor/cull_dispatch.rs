@@ -1112,9 +1112,9 @@ fn unaccounted_input_bytes(
 /// # Errors
 ///
 /// Returns [`PipelineError::Internal`] when a `partition_by` value cannot form
-/// a group key (a NaN, array, or map cell) — the same hard failure the
-/// aggregate raises, so the two keyings stay in lockstep rather than the buffer
-/// silently degrading a cell the aggregate rejects.
+/// a group key (an array or map cell; a NaN is one key) — the same hard
+/// failure the aggregate raises, so the two keyings stay in lockstep rather
+/// than the buffer silently degrading a cell the aggregate rejects.
 fn partition_key(
     node_name: &str,
     record: &Record,

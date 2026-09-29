@@ -57,12 +57,14 @@ Cull groups a record under a single **null group** in two cases: the column is a
 Everything else is either its own group or a hard error:
 
 - An **empty string** (`""`) is its own group, distinct from `account=null`.
-- A `NaN` float, or an array- or map-valued cell, **aborts the run** rather than grouping — a partition key must be a single scalar value. This abort currently presents as an *internal error*, but it is a data condition, not an engine defect: fix the offending column rather than treating the message as an engine invariant failure.
+- Numbers group by exact value, as in [Aggregate](aggregate.md#group-by-fields): `1`, `1.0` and the decimal `1` are one group, and distinct integers never merge, however large.
+- A `NaN` float, of either sign, is one group of its own, distinct from the null group.
+- An array- or map-valued cell **aborts the run** rather than grouping — a partition key must be a single scalar value. This abort currently presents as an *internal error*, but it is a data condition, not an engine defect: fix the offending column rather than treating the message as an engine invariant failure.
 
-[Reshape](reshape.md#values-reshape-cannot-key) treats both of those differently:
-it folds empty strings, NaNs, and multi-value cells all into its null group
-instead. The blank-versus-null divergence is tracked in
-[#1022](https://github.com/rustpunk/clinker/issues/1022). The unkeyable-value
+[Reshape](reshape.md#values-reshape-cannot-key) treats empty strings and
+multi-value cells differently: it folds both into its null group instead. The
+blank-versus-null divergence is tracked in
+[#1022](https://github.com/rustpunk/clinker/issues/1022). The multi-value
 behavior is separate; until both rules are deliberately aligned or retained,
 do not assume one node's grouping matches the other's.
 

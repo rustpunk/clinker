@@ -31,6 +31,23 @@ The `group_by:` field is a list of field names from the input schema. Records sh
 
 This produces one output record per unique `(region, department)` combination.
 
+Values are the same group key when they are equal under the rule sorting uses
+(see [How values are ordered](sink.md#how-values-are-ordered)):
+
+- Numbers group by exact value, whatever their type: `1`, `1.0` and the
+  decimal `1` are one group, and distinct integers are never merged, however
+  large.
+- `-0.0` and `0.0` are one group.
+- Every `NaN`, of either sign, is one group, separate from the group of null
+  values.
+- A group reports the value of its first-arriving row. An integer column is
+  written as integers; a column holding both `5` and `5.0` writes `5` if the
+  integer arrived first and `5.0` if the float did. The value is the same
+  whether or not the Aggregate spilled to disk.
+
+The same rule groups Cull and Reshape `partition_by`, a window's `group_by`,
+correlation keys, `distinct` and output splitting.
+
 ## Global aggregation
 
 An empty `group_by` list treats the entire input as a single group, producing exactly one output record:

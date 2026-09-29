@@ -217,12 +217,13 @@ permanent stability.
   `crates/clinker-exec/tests/value_order_properties.rs`.
 - **Counterexamples / limits:** A local comparator, `Value::partial_cmp`, an
   `f64` widening or a per-type byte encoding reintroduces the disagreement the
-  module removes. Existing sites that still carry their own rule (the Sort
-  node's comparator and byte key in `pipeline/sort_key.rs`, `value_to_group_key`,
-  Cull and Reshape group sorting) are moving onto it and are not precedent. The
-  module defines ordering, not predicates: a comparison operator decides its
-  own answer for a NaN or null operand.
-- **Verified:** 2026-09-28.
+  module removes. The Sort node's comparator and byte key
+  (`pipeline/sort_key.rs`) and group keys (`GroupByKey`, whose equality, hash
+  and `encode_tie_bytes` are the order's tie) are on it; Cull and Reshape
+  group sorting still carry their own rule, are moving onto it and are not
+  precedent. The module defines ordering, not predicates: a comparison
+  operator decides its own answer for a NaN or null operand.
+- **Verified:** 2026-09-29.
 
 ## Construction And Organization Patterns
 

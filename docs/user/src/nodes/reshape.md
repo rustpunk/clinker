@@ -70,8 +70,9 @@ Reshape groups a record under a single **null group** whenever it cannot build a
 - the column being absent from the record
 - an explicit null
 - an **empty string** (`""`)
-- a `NaN` float
 - an array- or map-valued cell (a multi-value column)
+
+A `NaN` float, of either sign, is one group of its own, not part of the null group. Numbers group by exact value, as in [Aggregate](aggregate.md#group-by-fields): `1`, `1.0` and the decimal `1` are one group, and distinct integers never merge, however large.
 
 So `account=""` and `account=null` land in the *same* Reshape group. Note that [Cull](cull.md#values-cull-cannot-key) does **not** fold empty strings — there, `account=""` and `account=null` are two groups. The difference is unintentional and tracked in [#1022](https://github.com/rustpunk/clinker/issues/1022); until it is resolved, do not assume one node's grouping matches the other's for blank values.
 

@@ -158,6 +158,35 @@ run wrote.
   therefore rise to the counts the same failures give without a key, plus
   the rows the failing groups condemn.
 
+### Changed — records group by exact numeric value, and NaN is one group
+
+Every place that puts records into groups now decides whether two values
+are the same group by the rule sorting uses (see
+[How values are ordered](docs/user/src/nodes/sink.md#how-values-are-ordered)):
+Aggregate `group_by`, Cull and Reshape `partition_by`, a window's `group_by`,
+correlation keys, `distinct` and output splitting. Output changes where a
+group key holds:
+
+- **Integers above 2^53.** Distinct integers are distinct groups however
+  large. Integers used to be grouped through a float, so neighbours such as
+  `9007199254740992` and `9007199254740993` merged into one group.
+- **An integer and a decimal of equal value** are one group, as an integer
+  and a float of equal value already were. They used to be two groups.
+- **Negative zero.** `-0.0` and `0.0` remain one group.
+- **NaN.** Every NaN key, whatever its sign, is one group, separate from the
+  null group. A NaN key used to stop the run in Aggregate, Cull, window
+  partitions, `distinct` and output splitting, and to join the null group in
+  Reshape and in correlation keys.
+- **The written group value.** A group reports the value of its first-arriving
+  row, the same with or without spilling to disk. An integer group-by column is
+  now written as integers (JSON `42` where it was `42.0`), and integers above
+  2^53 are written exactly where they were rounded. A column that holds both
+  integers and floats writes each group as its first row held it.
+
+Reshape still puts empty strings and array- or map-valued cells in its null
+group, unlike Cull
+([#1022](https://github.com/rustpunk/clinker/issues/1022)).
+
 ### Fixed — sorting places NaN, negative zero and mixed numbers by one rule
 
 A Sink or Source `sort_order` and a window's `sort_by` now order every value
