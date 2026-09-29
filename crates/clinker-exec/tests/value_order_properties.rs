@@ -26,15 +26,20 @@
 //! answer against each type's own order and against the encoder, which shares
 //! no code with that shortcut.
 //!
+//! Group keys (`GroupByKey`) must tie exactly as the order does, because a
+//! hash table groups by key equality while a spilled or streamed grouping
+//! detects groups by byte ties, so one property proves key equality, key
+//! hashing and the keys' tie bytes agree with the order.
+//!
 //! The Sort node's authored key adds null placement, direction and several
 //! fields on top of the value order, so a last property proves its byte key
 //! and its comparator agree on whole records as well.
 //!
-//! Case counts: 1,024 per pair property (the authored-key property included)
-//! and 512 for the triple property.
+//! Case counts: 1,024 per pair property (the group-key and authored-key
+//! properties included) and 512 for the triple property.
 
 use std::cmp::Ordering;
-use std::hash::{DefaultHasher, Hasher};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
@@ -42,7 +47,7 @@ use clinker_exec::pipeline::sort_key::{compare_authored_keys, stable_sort_key_fo
 use clinker_plan::config::{NullOrder, SortField, SortOrder};
 use clinker_record::order::{NumericTieClass, compare, encode, hash_tie_class, ties};
 use clinker_record::owned_storage::{OwnedValues, SharedStorage};
-use clinker_record::{Record, Schema, Value};
+use clinker_record::{GroupByKey, Record, Schema, Value, value_to_group_key};
 use proptest::prelude::*;
 use rust_decimal::Decimal;
 
@@ -563,6 +568,63 @@ proptest! {
             compare(&first, &Value::Float(f64::INFINITY)),
             Ordering::Greater
         );
+    }
+}
+
+/// Pairs of values a group key accepts (every scalar, NaN included; arrays
+/// and maps are not group keys), drawn as [`pair`] draws them, with either or
+/// both sides sometimes replaced by a null.
+fn group_key_pair() -> BoxedStrategy<(Value, Value)> {
+    let groupable = |v: &Value| !matches!(v, Value::Array(_) | Value::Map(_));
+    (
+        pair().prop_filter("arrays and maps are not group keys", move |(a, b)| {
+            groupable(a) && groupable(b)
+        }),
+        0u8..6,
+    )
+        .prop_map(|((a, b), nulls)| match nulls {
+            0 => (Value::Null, b),
+            1 => (a, Value::Null),
+            2 => (Value::Null, Value::Null),
+            _ => (a, b),
+        })
+        .boxed()
+}
+
+/// The group key a grouping node builds for `v`: a null keys as `Null`.
+fn group_key(v: &Value) -> GroupByKey {
+    value_to_group_key(v, "k", 0)
+        .expect("a scalar is a group key")
+        .unwrap_or(GroupByKey::Null)
+}
+
+fn group_key_hash(k: &GroupByKey) -> u64 {
+    let mut state = DefaultHasher::new();
+    k.hash(&mut state);
+    state.finish()
+}
+
+fn tie_bytes(k: &GroupByKey) -> Vec<u8> {
+    let mut out = Vec::new();
+    k.encode_tie_bytes(&mut out);
+    out
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(1024))]
+
+    /// Group keys are equal exactly when their values tie in the value order
+    /// (two nulls included), equal keys hash equally, and their tie bytes
+    /// are equal exactly when the keys are: a hash table, a spilled merge and
+    /// a sorted grouping form the same groups.
+    #[test]
+    fn group_key_equality_is_the_order_tie((a, b) in group_key_pair()) {
+        let (ka, kb) = (group_key(&a), group_key(&b));
+        prop_assert_eq!(ka == kb, ties(&a, &b), "{:?} vs {:?}", a, b);
+        if ka == kb {
+            prop_assert_eq!(group_key_hash(&ka), group_key_hash(&kb), "{:?} vs {:?}", a, b);
+        }
+        prop_assert_eq!(tie_bytes(&ka) == tie_bytes(&kb), ka == kb, "{:?} vs {:?}", a, b);
     }
 }
 
