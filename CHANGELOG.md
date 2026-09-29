@@ -4,6 +4,22 @@ All notable changes to Clinker are tracked here.
 
 ## Unreleased
 
+### Changed — a Combine's `match: first`, `all` and `collect` follow the build input's arrival order on every join strategy
+
+`match: first` now picks the earliest matching build record in the build
+input's arrival order, whichever join strategy the planner picks. The hash
+and grace-hash strategies, which run every equality-only Combine, used to
+pick the most recently arrived matching record instead, while the range
+strategies picked the earliest; adding a range condition every record
+satisfies could therefore change which record enriched a driver. The same
+order now sets the row order of `match: all` within a driver and the element
+order of a `match: collect` array.
+
+- To pick the latest record, deliver the build input sorted descending, for
+  example with a descending `sort_order` on the build Source.
+- A `correlation_key` on the build Source sorts its rows by the key before
+  they reach the Combine, and "first" follows that order.
+
 ### Changed — terminal Output nodes are now Sinks
 
 **Breaking YAML and Rust API change.** The terminal destination node is now

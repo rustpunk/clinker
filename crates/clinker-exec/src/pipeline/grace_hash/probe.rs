@@ -13,6 +13,7 @@ use cxl::eval::{EvalContext, EvalResult, ProgramEvaluator, SkipReason};
 use super::RecordOrder;
 use crate::executor::combine::{CombineResolver, CombineResolverMapping};
 use crate::executor::widen_record_to_schema;
+use crate::pipeline::combine::BuildSeq;
 use crate::pipeline::combine::{CombineOutputEvalFailure, ProbeIter};
 use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
 use clinker_plan::error::PipelineError;
@@ -23,12 +24,75 @@ use clinker_plan::plan::combine::DecomposedPredicate;
 /// every code path truncates at the same threshold.
 const COLLECT_PER_GROUP_CAP: usize = 10_000;
 
-/// Outcome of [`super::GraceHashExecutor::probe_record`]. Either an
-/// in-memory probe iterator (caller walks matches inline) or a marker
-/// that the record was written to a probe-side spill file.
+/// Outcome of [`super::GraceHashExecutor::probe_record`]. Either the
+/// in-memory matches (caller walks them inline) or a marker that the
+/// record was written to a probe-side spill file.
 pub(crate) enum ProbeOutcome<'a> {
-    InMemory(ProbeIter<'a>),
+    InMemory(ProbeMatches<'a>),
     Spilled,
+}
+
+/// One probe's candidates against a built hash table, with the
+/// [`BuildSeq`]s of the build rows that table was built from.
+///
+/// Invariant: `build_seqs[i]` is the arrival position of the build record
+/// the table reports at `ProbeCandidate.index == i`, and a probe yields a
+/// key's candidates in ascending arrival position. [`CandidateOrder`]
+/// checks both, so a table that walked its candidates out of arrival order
+/// fails as `PipelineError::Internal` instead of picking another row.
+pub(crate) struct ProbeMatches<'a> {
+    pub(crate) candidates: ProbeIter<'a>,
+    pub(crate) build_seqs: &'a [BuildSeq],
+}
+
+/// The candidate order of one probe: each candidate's [`BuildSeq`], checked
+/// to rise strictly, so `first`, `all` and `collect` follow build arrival
+/// order by construction rather than by the table's layout.
+struct CandidateOrder<'a> {
+    build_seqs: &'a [BuildSeq],
+    last: Option<BuildSeq>,
+    name: &'a str,
+}
+
+impl<'a> CandidateOrder<'a> {
+    fn new(build_seqs: &'a [BuildSeq], name: &'a str) -> Self {
+        Self {
+            build_seqs,
+            last: None,
+            name,
+        }
+    }
+
+    /// The arrival position of the candidate at `index`, after checking it
+    /// follows the previous candidate's.
+    fn next(&mut self, index: usize) -> Result<BuildSeq, PipelineError> {
+        let seq = self
+            .build_seqs
+            .get(index)
+            .copied()
+            .ok_or_else(|| PipelineError::Internal {
+                op: "grace_hash probe",
+                node: self.name.to_string(),
+                detail: format!(
+                    "hash table candidate index {index} has no build arrival position; the \
+                     partition holds {}",
+                    self.build_seqs.len()
+                ),
+            })?;
+        if self.last.is_some_and(|last| seq <= last) {
+            return Err(PipelineError::Internal {
+                op: "grace_hash probe",
+                node: self.name.to_string(),
+                detail: format!(
+                    "build candidates out of arrival order: position {} after {}",
+                    seq.0,
+                    self.last.map_or(0, |last| last.0)
+                ),
+            });
+        }
+        self.last = Some(seq);
+        Ok(seq)
+    }
 }
 
 /// Mutable emission targets threaded through every grace-hash emit path
@@ -94,7 +158,7 @@ pub(super) fn emit_for_probe<'a>(
     args: &EmitArgs<'_>,
     probe_record: &Record,
     rn: RecordOrder,
-    probe_iter: ProbeIter<'a>,
+    matches: ProbeMatches<'a>,
     body_evaluator: Option<&mut ProgramEvaluator>,
     ctx: &EvalContext<'_>,
     sink: &mut GraceEmitSink<'_>,
@@ -110,12 +174,18 @@ pub(super) fn emit_for_probe<'a>(
         propagate_ck,
         strategy,
     } = *args;
+    let ProbeMatches {
+        candidates: probe_iter,
+        build_seqs,
+    } = matches;
+    let mut order = CandidateOrder::new(build_seqs, name);
     match match_mode {
         MatchMode::Collect => {
             let mut arr: Vec<Value> = Vec::new();
             let mut first_build: Option<Record> = None;
             let mut truncated = false;
             for cand in probe_iter {
+                order.next(cand.index)?;
                 if let Some(residual) = decomposed.residual.as_ref() {
                     let resolver =
                         CombineResolver::new(resolver_mapping, probe_record, Some(cand.record));
@@ -191,6 +261,7 @@ pub(super) fn emit_for_probe<'a>(
             let matched: Vec<Record> = {
                 let mut acc: Vec<Record> = Vec::new();
                 for cand in probe_iter {
+                    order.next(cand.index)?;
                     if let Some(residual) = decomposed.residual.as_ref() {
                         let resolver =
                             CombineResolver::new(resolver_mapping, probe_record, Some(cand.record));

@@ -69,11 +69,11 @@ use clinker_record::{Record, Schema, Value};
 use cxl::ast::Expr;
 use cxl::eval::{EvalContext, ProgramEvaluator};
 use cxl::typecheck::TypedProgram;
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 
 use crate::executor::combine::{CombineResolver, CombineResolverMapping};
 use crate::pipeline::combine::{
-    CombineHashTable, CombineKernelOutput, CombineOutputEvalFailure, KeyExtractor,
+    BuildSeq, CombineHashTable, CombineKernelOutput, CombineOutputEvalFailure, KeyExtractor,
     hash_composite_key,
 };
 use crate::pipeline::grace_spill::{
@@ -88,8 +88,8 @@ use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::combine::DecomposedPredicate;
 
-use build::{GraceHll, PartitionAssigner, estimated_record_bytes};
-use probe::{EmitArgs, GraceEmitSink, ProbeOutcome, emit_for_probe};
+use build::{GraceHll, PartitionAssigner, estimated_build_entry_bytes};
+use probe::{EmitArgs, GraceEmitSink, ProbeMatches, ProbeOutcome, emit_for_probe};
 use spill::{ReloadContext, SpilledPartition, process_spilled_partition};
 
 /// Period (matches emitted) between [`MemoryArbitrator::should_abort`] polls
@@ -126,13 +126,15 @@ pub(crate) type RecordOrder = crate::executor::stream_event::SourceRowId;
 
 /// One partition's state inside [`GraceHashExecutor`].
 enum PartitionState {
-    /// Build records accumulating in memory. `bytes_estimated` is a
-    /// running sum used to pick a spill victim (Largest-Size policy).
+    /// Build records accumulating in memory, in build arrival order, each
+    /// with its [`BuildSeq`]. `bytes_estimated` is a running sum of
+    /// [`estimated_build_entry_bytes`] used to pick a spill victim
+    /// (Largest-Size policy).
     /// `distinct_sketch` is fed on every insert; it survives the
     /// Building → OnDisk transition so the BNL fallback can report
     /// approximate cardinality if a partition trips E310.
     Building {
-        records: Vec<Record>,
+        records: Vec<(Record, BuildSeq)>,
         bytes_estimated: usize,
         distinct_sketch: GraceHll,
     },
@@ -161,8 +163,14 @@ enum PartitionState {
         hash_bits: u8,
         distinct_sketch: GraceHll,
     },
-    /// In-memory hash table built; ready for probe.
-    Ready { hash_table: CombineHashTable },
+    /// In-memory hash table built; ready for probe. `build_seqs[i]` is the
+    /// [`BuildSeq`] of the build record the table reports at
+    /// `ProbeCandidate.index == i`: the table keeps insertion order, and
+    /// both are built from the same pairs in the same order.
+    Ready {
+        hash_table: CombineHashTable,
+        build_seqs: Vec<BuildSeq>,
+    },
     /// Fully processed; resources released.
     Done,
 }
@@ -366,11 +374,12 @@ impl GraceHashExecutor {
     pub(crate) fn add_build_record(
         &mut self,
         record: Record,
+        seq: BuildSeq,
         hash: u64,
         budget: &MemoryArbitrator,
     ) -> Result<(), GraceSpillError> {
         let p = self.assigner.partition_for(hash) as usize;
-        let bytes = estimated_record_bytes(&record);
+        let bytes = estimated_build_entry_bytes(&record);
 
         // First peek at partition state without taking ownership of
         // the record. The OnDisk path needs the partition's hash_bits
@@ -397,7 +406,7 @@ impl GraceHashExecutor {
                     distinct_sketch,
                 } = &mut self.partitions[p]
                 {
-                    records.push(record);
+                    records.push((record, seq));
                     *bytes_estimated += bytes;
                     distinct_sketch.add(hash);
                     // Mirror the admitted bytes into the consumer
@@ -413,7 +422,7 @@ impl GraceHashExecutor {
                     p as u16,
                     self.spill_compress,
                 )?;
-                w.write_record(&record)?;
+                w.write_record(&record, seq)?;
                 let (new_path, written) = w.finish()?;
                 if let PartitionState::OnDisk {
                     build_files,
@@ -494,8 +503,8 @@ impl GraceHashExecutor {
             self.spill_compress,
         )?;
         let count = records.len() as u64;
-        for r in records {
-            writer.write_record(&r)?;
+        for (r, seq) in records {
+            writer.write_record(&r, seq)?;
         }
         let (path, written) = writer.finish()?;
         self.partitions[idx] = PartitionState::OnDisk {
@@ -533,7 +542,11 @@ impl GraceHashExecutor {
             let prev = std::mem::replace(&mut self.partitions[i], PartitionState::Done);
             let new_state = match prev {
                 PartitionState::Building { records, .. } => {
-                    if records.is_empty() {
+                    // The table takes the records as it indexes them, so
+                    // no second record vector is held while it builds.
+                    let build_seqs: Vec<BuildSeq> = records.iter().map(|(_, seq)| *seq).collect();
+                    let records = records.into_iter().map(|(record, _)| record);
+                    if build_seqs.is_empty() {
                         // Empty partition fast-path: still construct an
                         // empty hash table so probe lookups hit the
                         // Ready branch and emit zero matches uniformly.
@@ -546,7 +559,10 @@ impl GraceHashExecutor {
                                     source: BudgetCategory::Arena,
                                     detail: Some(format!("grace hash build: {e}")),
                                 })?;
-                        PartitionState::Ready { hash_table: table }
+                        PartitionState::Ready {
+                            hash_table: table,
+                            build_seqs,
+                        }
                     } else {
                         let estimated = Some(records.len());
                         let table =
@@ -558,7 +574,10 @@ impl GraceHashExecutor {
                                     source: BudgetCategory::Arena,
                                     detail: Some(format!("grace hash build: {e}")),
                                 })?;
-                        PartitionState::Ready { hash_table: table }
+                        PartitionState::Ready {
+                            hash_table: table,
+                            build_seqs,
+                        }
                     }
                 }
                 other => other,
@@ -582,9 +601,13 @@ impl GraceHashExecutor {
     ) -> Result<ProbeOutcome<'a>, GraceSpillError> {
         let p = self.assigner.partition_for(hash) as usize;
         match &mut self.partitions[p] {
-            PartitionState::Ready { hash_table } => {
-                Ok(ProbeOutcome::InMemory(hash_table.probe(probe_keys)))
-            }
+            PartitionState::Ready {
+                hash_table,
+                build_seqs,
+            } => Ok(ProbeOutcome::InMemory(ProbeMatches {
+                candidates: hash_table.probe(probe_keys),
+                build_seqs,
+            })),
             PartitionState::OnDisk {
                 probe_writer,
                 probe_files,
@@ -787,9 +810,12 @@ pub(crate) fn execute_combine_grace_hash(
     // hash seed is cloned out of the executor first; `RandomState::clone`
     // preserves the seed, so every worker hashes identically.
     let build_hash_state = executor.hash_state().clone();
-    let hashed_build: Vec<(Record, u64)> = build_records
+    // Each build row's arrival position, minted here where the Combine
+    // receives its build input, before partitioning moves rows apart.
+    let hashed_build: Vec<(Record, BuildSeq, u64)> = build_records
         .into_par_iter()
-        .map(|record| {
+        .enumerate()
+        .map(|(position, record)| {
             let keys =
                 build_extractor
                     .extract(ctx, &record)
@@ -798,7 +824,7 @@ pub(crate) fn execute_combine_grace_hash(
                         messages: vec![format!("grace hash build key eval error: {e}")],
                     })?;
             let hash = hash_composite_key(&keys, &build_hash_state);
-            Ok::<_, PipelineError>((record, hash))
+            Ok::<_, PipelineError>((record, BuildSeq(position as u64), hash))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -832,7 +858,7 @@ pub(crate) fn execute_combine_grace_hash(
     );
     let mut build_sketches =
         crate::sketch::BuildKeySketches::new(build_row_count.map(|rc| rc.rows));
-    for (record, hash) in hashed_build {
+    for (record, seq, hash) in hashed_build {
         // Re-derive the representative key value only when Misra-Gries opens
         // a counter (a bounded number of times across the whole build), so
         // the per-row cost stays a single hash and no value is retained per
@@ -845,7 +871,7 @@ pub(crate) fn execute_combine_grace_hash(
                 .unwrap_or(Value::Null)
         });
         executor
-            .add_build_record(record, hash, budget)
+            .add_build_record(record, seq, hash, budget)
             .map_err(|e| grace_spill_error(e, name, "build add failed"))?;
     }
 
@@ -913,12 +939,12 @@ pub(crate) fn execute_combine_grace_hash(
             .map_err(|e| grace_spill_error(e, name, "probe failed"))?;
 
         match outcome {
-            ProbeOutcome::InMemory(probe_iter) => {
+            ProbeOutcome::InMemory(matches) => {
                 emit_for_probe(
                     &emit_args,
                     &probe_record,
                     rn,
-                    probe_iter,
+                    matches,
                     body_evaluator.as_mut(),
                     &row_ctx,
                     &mut GraceEmitSink {

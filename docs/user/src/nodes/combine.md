@@ -105,6 +105,12 @@ This is a runtime routing decision on the data, distinct from the plan-time `E31
 
 Emit one output row per driver record, using the first matching build-side record. Standard 1:1 enrichment. Default.
 
+"First" means the earliest in the build input's arrival order: of the build records that match a driver, the one the build input delivered first. The same order sets the row order of [`match: all`](#match-all) within a driver and the element order of a [`match: collect`](#match-collect) array. It holds identically for every join strategy the planner may pick, whatever the memory limit and whatever shape the `where:` predicate has.
+
+- **To pick a different record, order the build input upstream.** For example, to enrich each driver with the *latest* price, deliver the build input sorted descending on its date, such as with a descending [`sort_order`](source.md) on the build Source. A Combine has no ordering option of its own.
+- **A correlation key orders its Source.** Declaring `correlation_key` on the build Source makes the planner sort that Source's rows by the key, then by their order in the file, before they reach the Combine. That order is what "first" follows. See [Correlation keys](../pipelines/correlation-keys.md#row-order).
+- **An unseeded `interleave` Merge has no fixed order.** When the build input is such a Merge, its cross-input order follows arrival at run time, so "first" follows that unfixed order too. Use `concat`, or a seeded `interleave`, for a build input whose order must be the same on every run.
+
 ```yaml
   config:
     where: "orders.product_id == products.product_id"
@@ -120,7 +126,7 @@ The `where:` predicate selects the match; the `cxl:` body is a **post-match proj
 
 ### `match: all`
 
-Emit one output row for every matching build-side record. 1:N fan-out -- if a driver record matches three build records, three rows are emitted.
+Emit one output row for every matching build-side record. 1:N fan-out -- if a driver record matches three build records, three rows are emitted, in the build input's arrival order (see [`match: first`](#match-first)).
 
 ```yaml
   config:
@@ -133,7 +139,7 @@ Emit one output row for every matching build-side record. 1:N fan-out -- if a dr
 
 ### `match: collect`
 
-Gather every matching build-side record into a single Array-typed field on the output row. The driver record appears once; the build matches are aggregated into an array. The `cxl:` body must be empty under `collect` -- the combine node synthesizes the output as `{ driver fields..., <build_qualifier>: Array }`.
+Gather every matching build-side record into a single Array-typed field on the output row. The driver record appears once; the build matches are aggregated into an array, in the build input's arrival order (see [`match: first`](#match-first)). The `cxl:` body must be empty under `collect` -- the combine node synthesizes the output as `{ driver fields..., <build_qualifier>: Array }`.
 
 ```yaml
   config:

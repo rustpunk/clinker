@@ -830,13 +830,12 @@ pub(crate) fn execute_combine_iejoin(
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Shared emit path (equi+range groups and pure-range blocks)
+// Emit path of the block-band kernel (pure-range and equi+range)
 // ──────────────────────────────────────────────────────────────────────────
 
-/// Immutable per-combine configuration threaded through the shared emit
-/// path. Both the equi+range group loop and the pure-range block scheduler
-/// build one and reuse it across every emit call, so the two strategies
-/// synthesize output rows identically. Private to this module and its
+/// Immutable per-combine configuration threaded through the emit path. The
+/// block-band scheduler builds one and reuses it across every emit call, for
+/// pure-range and equi+range combines alike. Private to this module and its
 /// `block` child.
 struct EmitConfig<'a> {
     allocation_resources: &'a clinker_record::owned_storage::AllocationResources,
@@ -866,15 +865,13 @@ struct Evaluators {
 /// key under which its match state is tracked in [`MatchState`], and its unique
 /// global input index for deterministic output tagging.
 ///
-/// The equi+range path keys by global driver index (each driver lands in
-/// exactly one bucket-and-eq-group); the block path keys by the driver's
-/// local index within its driver block (each driver lands in exactly one
-/// block). Either way a driver's match state lives under one stable key.
+/// The block path keys by the driver's local index within its driver block
+/// (each driver lands in exactly one block), so a driver's match state lives
+/// under one stable key.
 ///
 /// `driver_idx` is the driver's position in the combine's driver input, always
-/// unique even when a chained upstream stamps duplicate `order` tags. The block
-/// path tags each emitted row with it so the final sort is total; the equi+range
-/// path leaves it unread (it emits no row tags).
+/// unique even when a chained upstream stamps duplicate `order` tags. Each
+/// emitted row is tagged with it so the final sort is total.
 struct DriverRef<'a> {
     record: &'a Record,
     order: RecordOrder,
@@ -895,11 +892,10 @@ struct EmitBatch<'a> {
 
 /// One accumulated collect-array element, ordered by a build-order key so a
 /// bounded max-heap can retain the smallest-key [`COLLECT_PER_GROUP_CAP`]
-/// matches deterministically. `order_key` is the build's original input index
-/// on the pure-range block path (making the kept set and its order a pure
-/// function of the data) and a per-driver insertion counter on the equi+range
-/// path (which preserves visitation order and the first-`CAP` truncation the
-/// path had before). Ordering ignores `value`, which is not `Ord`.
+/// matches deterministically. `order_key` is the build's original input index,
+/// its build arrival position, so the kept set and its order follow build
+/// arrival order, as on every join strategy. Ordering ignores `value`, which
+/// is not `Ord`.
 struct CollectEntry {
     order_key: u64,
     value: Value,
@@ -991,38 +987,30 @@ struct MatchState<'a> {
     allocation_resources: &'a clinker_record::owned_storage::AllocationResources,
     unaccounted_held_bytes: u64,
     /// `matched[key]` is set once a driver has emitted at least one match.
-    /// Drives the `First`-mode dedup (equi+range path) and, for the `All`
-    /// mode, the end-of-join unmatched sweep. The block path's `First`
-    /// selection uses `first_match` instead, so it never reads this for
-    /// `First`.
+    /// Drives the `All` mode's unmatched sweep. `First` selection uses
+    /// `first_match` instead, so it never reads this.
     matched: Vec<bool>,
     /// Bounded max-heap per driver of the smallest-`order_key`
     /// [`COLLECT_PER_GROUP_CAP`] collect matches. Draining it sorted yields
     /// the deterministic collect array.
     collect_accum: HashMap<usize, BinaryHeap<CollectEntry>>,
     collect_truncated: HashMap<usize, ()>,
-    /// The matched build with the smallest `order_key`, kept for `$ck`
-    /// propagation onto the collect row. Min-keyed so the propagated build is
-    /// a pure function of the data on the block path (min build input index),
-    /// and the first-visited build on the equi+range path (min insertion
-    /// counter) — matching that path's prior behavior.
+    /// The matched build with the smallest `order_key`, the earliest-arriving,
+    /// kept for `$ck` propagation onto the collect row, so the propagated
+    /// build is the collect array's first element.
     first_collected_builds: HashMap<usize, (u64, Record)>,
-    /// The block path's `First`-mode candidate per driver: the residual-passing
-    /// match with the smallest build input index, held until the driver block
-    /// finalizes and emits it. Empty on the equi+range path, which emits the
-    /// first-visited match immediately. Bounded by one build record per driver.
+    /// The `First`-mode candidate per driver: the residual-passing match with
+    /// the smallest build input index, the earliest-arriving build row, held
+    /// until the driver block finalizes and emits it. Bounded by one build
+    /// record per driver.
     first_match: HashMap<usize, (u64, Record)>,
     /// Running byte total of every cloned build record and collect entry held
     /// above (`first_match`, `first_collected_builds`, and the `collect_accum`
-    /// heaps). Both paths fold it into their pre-output budget gates so a
-    /// `match: first` / `collect` join over wide build records aborts with the
-    /// typed budget error instead of growing this residency unbounded: the block
-    /// path via its per-pair pre-output gate (and it drains collect per driver
-    /// block), the equi+range path via each group's pre-output peak plus the
-    /// every-10K accumulation poll — its per-driver heaps and min-order `$ck`
-    /// build drain only in the single end-of-join flush loop, after every bucket
-    /// and group completes. It stays zero for both paths' `first` / `all` modes,
-    /// which emit each match immediately and hold no build records across pairs.
+    /// heaps). The per-pair pre-output gate folds it in, so a `match: first` /
+    /// `collect` join over wide build records aborts with the typed budget
+    /// error instead of growing this residency unbounded; collect drains per
+    /// driver block. It stays zero under `all`, which emits each match
+    /// immediately and holds no build records across pairs.
     held_bytes: u64,
 }
 
@@ -1044,8 +1032,7 @@ impl<'a> MatchState<'a> {
     }
 
     /// The live bytes of held `First` / collect candidates, folded into the
-    /// pre-output budget gates on both the block path (per-pair) and the
-    /// equi+range path (per-group peak plus the every-10K accumulation poll).
+    /// block path's per-pair pre-output budget gate.
     fn held_bytes(&self) -> u64 {
         self.held_bytes
     }
@@ -1902,15 +1889,11 @@ fn pwmj_numeric_state_bytes(n_left: usize, n_right: usize) -> usize {
     index_arrays.saturating_add(sort_scratch)
 }
 
-/// Build the typed pre-output budget-abort error, shared by both dispatch
-/// shapes. On the equi+range path it fires when the resident partition and
-/// per-group sort arrays exceed the budget (gated through the arbitrator's
-/// `should_abort_local`, since that path holds its inputs resident with no
-/// spill). On the block-band path it is a strictly LOCAL last resort — the one
-/// loaded block-pair's resident bytes plus kernel aux exceed the hard limit
-/// even alone — gated by a direct `peak > hard_limit` comparison, never by
-/// global process pressure, because that path answers pressure by spilling.
-/// Either way it surfaces `MemoryBudgetExceeded` with `BudgetCategory::Arena`,
+/// Build the typed pre-output budget-abort error. It is a strictly LOCAL last
+/// resort — the one loaded block-pair's resident bytes plus kernel aux exceed
+/// the hard limit even alone — gated by a direct `peak > hard_limit`
+/// comparison, never by global process pressure, because the block-band path
+/// answers pressure by spilling. It surfaces `MemoryBudgetExceeded` with `BudgetCategory::Arena`,
 /// the same shape the output-buffer poll and every other budget-checked
 /// operator surface use.
 fn pre_output_budget_error(name: &str, used: u64, limit: u64) -> PipelineError {

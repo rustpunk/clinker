@@ -609,6 +609,20 @@ impl KeyExtractor {
 // CombineHashTable
 // ──────────────────────────────────────────────────────────────────────────
 
+/// A build row's position in the stream a Combine's build input delivers
+/// during one run, counted from 0 as rows reach the build port.
+///
+/// It is the Combine's candidate order: `match: first` takes the lowest,
+/// `match: all` emits in ascending order within a driver, and `match:
+/// collect` builds its array in ascending order, on every join strategy. It
+/// orders rows and is distinct from the row's `SourceRowId`, which names it.
+/// A strategy that holds build rows away from their arrival order (in a
+/// partition, a spill file or a chunk) carries it beside each row as a value.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub(crate) struct BuildSeq(pub(crate) u64);
+
 /// Yielded by [`ProbeIter`] for each build-side record that (a) hashed the
 /// same bucket as the probe key AND (b) passed post-probe key equality
 /// verification.
@@ -635,17 +649,21 @@ pub struct ProbeCandidate<'a> {
 /// accounts every one of them per the DataFusion #14222/#5490/#6170 lessons):
 ///
 /// ```text
-/// index:      HashTable<(u64, u32)>   — (key_hash, chain_head_index)
+/// index:      HashTable<(u64, u32, u32)> — (key_hash, chain_head_index, chain_tail_index)
 /// chain:      Vec<u32>                 — chain[i] = next index with same hash, or SENTINEL
 /// records:    Vec<Record>              — build-side records in insertion order
 /// keys_cache: Vec<Vec<Value>>          — per-record extracted key values, built once
 /// ```
 ///
-/// **Chain semantics:** collisions prepend. When record `j` is inserted and
-/// finds the bucket already occupied with head `i`, `chain[j]` is set to `i`
-/// and the bucket is updated to point at `j`. Iteration walks from the
-/// current head through `chain[...]` until `SENTINEL`. Every candidate along
-/// the chain is verified against the probe keys via
+/// **Chain semantics:** collisions append. When record `j` is inserted and
+/// finds the bucket already occupied with tail `t`, `chain[t]` is set to `j`
+/// and the bucket's tail is updated to `j`; the head never changes. Iteration
+/// walks from the head through `chain[...]` until `SENTINEL`, so a probe
+/// yields a key's build rows in insertion order, the build input's arrival
+/// order: `match: first` takes the earliest, and `all` and `collect` follow
+/// arrival order. The tail index fits in the bucket entry's padding, so the
+/// entry stays 16 bytes. Every candidate along the chain is verified against
+/// the probe keys via
 /// [`keys_equal_canonicalized`] — hash collisions do not produce spurious
 /// matches (DataFusion #843 lesson).
 ///
@@ -654,7 +672,7 @@ pub struct ProbeCandidate<'a> {
 /// concurrent probe workers without synchronization. The `hash_state` is
 /// captured at build time and reused for probe so hashes agree.
 pub struct CombineHashTable {
-    index: HashTable<(u64, u32)>,
+    index: HashTable<(u64, u32, u32)>,
     chain: Vec<u32>,
     records: Vec<Record>,
     keys_cache: Vec<Vec<Value>>,
@@ -677,6 +695,10 @@ impl CombineHashTable {
     ///   the rehash. When `None`, we fall back to `records.len()` —
     ///   always an upper bound on final table size.
     ///
+    /// `records` is consumed as it is indexed, so a caller that holds each
+    /// record beside other state can pass an iterator that moves the records
+    /// out without collecting them into a second vector first.
+    ///
     /// **Build records with NULL keys are indexed harmlessly:** they hash
     /// to the NULL sentinel and form chains alongside any collisions. They
     /// never match any probe because (a) the probe path short-circuits when
@@ -684,13 +706,18 @@ impl CombineHashTable {
     /// a non-null probe key, [`keys_equal_canonicalized`] rejects `Null` on
     /// both sides per SQL 3VL. Indexing them simplifies the build loop
     /// (no skip branch) and has no runtime cost beyond the chain slot.
-    pub fn build(
-        records: Vec<Record>,
+    pub fn build<I>(
+        records: I,
         extractor: &KeyExtractor,
         ctx: &EvalContext<'_>,
         budget: &MemoryArbitrator,
         estimated_rows: Option<usize>,
-    ) -> Result<Self, CombineError> {
+    ) -> Result<Self, CombineError>
+    where
+        I: IntoIterator<Item = Record>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let records = records.into_iter();
         let expected = estimated_rows.unwrap_or(records.len());
 
         // `u32::MAX` is reserved as SENTINEL. Refuse inputs that would
@@ -706,13 +733,13 @@ impl CombineHashTable {
             });
         }
 
-        let mut index: HashTable<(u64, u32)> = HashTable::with_capacity(expected);
+        let mut index: HashTable<(u64, u32, u32)> = HashTable::with_capacity(expected);
         let mut chain: Vec<u32> = Vec::with_capacity(records.len());
         let mut keys_cache: Vec<Vec<Value>> = Vec::with_capacity(records.len());
         let mut arena: Vec<Record> = Vec::with_capacity(records.len());
         let hash_state = RandomState::new();
 
-        for (i, rec) in records.into_iter().enumerate() {
+        for (i, rec) in records.enumerate() {
             let keys = extractor
                 .extract(ctx, &rec)
                 .map_err(|e| CombineError::KeyEvalFailed {
@@ -723,24 +750,23 @@ impl CombineHashTable {
             let hash = hash_composite_key(&keys, &hash_state);
             let new_idx = i as u32;
 
-            // Prepend-on-collision: the new record becomes the chain head;
-            // the old head is stored in chain[new_idx].
-            let old_head = match index.entry(
+            // Append-on-collision: the new record becomes the chain tail, so
+            // the chain from the head stays in insertion order.
+            chain.push(SENTINEL);
+            match index.entry(
                 hash,
-                |&(stored_hash, _)| stored_hash == hash,
-                |&(stored_hash, _)| stored_hash,
+                |&(stored_hash, _, _)| stored_hash == hash,
+                |&(stored_hash, _, _)| stored_hash,
             ) {
                 hashbrown::hash_table::Entry::Occupied(mut o) => {
-                    let prev = o.get().1;
-                    o.get_mut().1 = new_idx;
-                    prev
+                    let old_tail = o.get().2;
+                    chain[old_tail as usize] = new_idx;
+                    o.get_mut().2 = new_idx;
                 }
                 hashbrown::hash_table::Entry::Vacant(v) => {
-                    v.insert((hash, new_idx));
-                    SENTINEL
+                    v.insert((hash, new_idx, new_idx));
                 }
-            };
-            chain.push(old_head);
+            }
             keys_cache.push(keys);
             arena.push(rec);
 
@@ -819,8 +845,8 @@ impl CombineHashTable {
         let hash = hash_composite_key(probe_keys, &self.hash_state);
         let head = self
             .index
-            .find(hash, |&(stored_hash, _)| stored_hash == hash)
-            .map(|&(_, h)| h)
+            .find(hash, |&(stored_hash, _, _)| stored_hash == hash)
+            .map(|&(_, head, _)| head)
             .unwrap_or(SENTINEL);
 
         ProbeIter {
@@ -867,6 +893,7 @@ impl CombineHashTable {
 
 /// Iterator returned by [`CombineHashTable::probe`]. Walks the collision
 /// chain from the matched bucket head through `chain[...]` until `SENTINEL`,
+/// in insertion order (ascending [`ProbeCandidate::index`]),
 /// yielding only candidates whose cached build-side key values match the
 /// probe's (canonicalized element-wise equality). Hash collisions between
 /// non-equal keys are filtered silently so the caller never sees false
@@ -906,7 +933,7 @@ impl<'a> Iterator for ProbeIter<'a> {
 /// the error path can report accurate `used` without constructing a
 /// fully-assembled `CombineHashTable`.
 fn partial_memory_bytes(
-    index: &HashTable<(u64, u32)>,
+    index: &HashTable<(u64, u32, u32)>,
     chain: &[u32],
     arena: &[Record],
     keys_cache: &[Vec<Value>],

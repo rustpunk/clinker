@@ -50,6 +50,28 @@ fn test_stats_sink<'a>(
     }
 }
 
+thread_local! {
+    static NEXT_SEQ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The next build arrival position on this test's thread, so the build rows
+/// a test adds rise in arrival order as the build input would deliver them.
+fn fresh_seq() -> crate::pipeline::combine::BuildSeq {
+    NEXT_SEQ.with(|next| {
+        let seq = next.get();
+        next.set(seq + 1);
+        crate::pipeline::combine::BuildSeq(seq)
+    })
+}
+
+/// `records` with their build arrival positions, in the order given.
+fn with_seqs(records: Vec<Record>) -> Vec<(Record, crate::pipeline::combine::BuildSeq)> {
+    records
+        .into_iter()
+        .map(|record| (record, fresh_seq()))
+        .collect()
+}
+
 fn record_for(schema: &SharedStorage<Schema>, values: Vec<Value>) -> Record {
     Record::new(schema.clone(), values)
 }
@@ -154,7 +176,7 @@ fn pipeline_temp_dir_owns_spill_files_on_drop() {
     // Deposit a record and force a spill so a file actually exists.
     let rec = record_for(&schema, vec![Value::Integer(7)]);
     let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
-    exec.add_build_record(rec, 0, &budget).unwrap();
+    exec.add_build_record(rec, fresh_seq(), 0, &budget).unwrap();
     exec.spill_partition(0, &budget).unwrap();
     let spilled_inside = std::fs::read_dir(&pipeline_path).unwrap().count();
     assert!(spilled_inside >= 1, "spill_partition must commit a file");
@@ -192,7 +214,7 @@ fn pipeline_temp_dir_cleans_on_panic_unwind() {
         let schema = schema_with(&["k"]);
         let rec = record_for(&schema, vec![Value::Integer(99)]);
         let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
-        exec.add_build_record(rec, 0, &budget).unwrap();
+        exec.add_build_record(rec, fresh_seq(), 0, &budget).unwrap();
         exec.spill_partition(0, &budget).unwrap();
         panic!("simulated mid-spill panic");
     }));
@@ -228,7 +250,8 @@ fn spill_activates_under_tiny_budget() {
         );
         // Synthetic hash: distribute uniformly across 16 partitions.
         let hash = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        exec.add_build_record(rec, hash, &budget).unwrap();
+        exec.add_build_record(rec, fresh_seq(), hash, &budget)
+            .unwrap();
     }
     let on_disk = exec
         .partitions
@@ -284,7 +307,7 @@ fn spill_activates_on_charged_bytes_without_rss() {
         &schema,
         vec![Value::Integer(0), Value::String("row-0".into())],
     );
-    exec.add_build_record(rec, 0, &budget).unwrap();
+    exec.add_build_record(rec, fresh_seq(), 0, &budget).unwrap();
 
     let on_disk = exec
         .partitions
@@ -322,7 +345,7 @@ fn lazy_probe_spill_routes_to_partition_file() {
     let probe_partition_hash: u64 = 0x0000_0000_0000_1234;
     for i in 0..64i64 {
         let rec = record_for(&schema, vec![Value::Integer(i)]);
-        exec.add_build_record(rec, probe_partition_hash, &budget)
+        exec.add_build_record(rec, fresh_seq(), probe_partition_hash, &budget)
             .unwrap();
     }
     // Force spill of partition 0.
@@ -1069,7 +1092,7 @@ fn build_eviction_spill_commit_trips_disk_cap_mid_stream() {
             ],
         );
         let hash = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        match exec.add_build_record(rec, hash, &budget) {
+        match exec.add_build_record(rec, fresh_seq(), hash, &budget) {
             Ok(()) => fed += 1,
             Err(e) => {
                 hit = Some(e);
@@ -1174,6 +1197,7 @@ fn build_ondisk_immediate_write_commit_trips_disk_cap() {
             &schema,
             vec![Value::Integer(0), Value::String("seed".into())],
         ),
+        fresh_seq(),
         hash_p0,
         &budget,
     )
@@ -1199,7 +1223,7 @@ fn build_ondisk_immediate_write_commit_trips_disk_cap() {
             &schema,
             vec![Value::Integer(i), Value::String(format!("row-{i}").into())],
         );
-        match exec.add_build_record(rec, hash_p0, &budget) {
+        match exec.add_build_record(rec, fresh_seq(), hash_p0, &budget) {
             Ok(()) => fed += 1,
             Err(e) => {
                 hit = Some(e);
@@ -1283,12 +1307,14 @@ fn probe_finalize_spill_commit_trips_disk_cap_per_partition() {
     // Drive partitions 0 and 1 OnDisk by hand (cap unlimited during build).
     exec.add_build_record(
         record_for(&schema, vec![Value::Integer(0)]),
+        fresh_seq(),
         hash_p0,
         &budget,
     )
     .unwrap();
     exec.add_build_record(
         record_for(&schema, vec![Value::Integer(1)]),
+        fresh_seq(),
         hash_p1,
         &budget,
     )
@@ -1430,7 +1456,8 @@ fn build_spill_reload_records_match() {
         })
         .collect();
     for (i, r) in originals.iter().enumerate() {
-        exec.add_build_record(r.clone(), i as u64, &budget).unwrap();
+        exec.add_build_record(r.clone(), fresh_seq(), i as u64, &budget)
+            .unwrap();
     }
     // Force-spill every partition.
     for idx in 0..exec.partitions.len() {
@@ -1442,7 +1469,7 @@ fn build_spill_reload_records_match() {
         for path in &sp.build_files {
             let reader = GraceSpillReader::open(path, schema.clone()).unwrap();
             for r in reader {
-                reloaded.push(r.unwrap());
+                reloaded.push(r.unwrap().0);
             }
         }
     }
@@ -1677,7 +1704,7 @@ fn spill_for_bnl(
     let mut bw = GraceSpillWriter::new(h.spill_dir.path(), hash_bits, partition_id, true).unwrap();
     let mut sketch = GraceHll::new();
     for r in build_records {
-        bw.write_record(r).unwrap();
+        bw.write_record(r, fresh_seq()).unwrap();
         // Feed the HLL via the build-side hash of the join key.
         let stable = cxl::eval::StableEvalContext::test_default();
         let source_file: Arc<str> = Arc::from("test.csv");
@@ -1786,7 +1813,7 @@ fn test_skew_detection_triggers_bnl() {
         bnl_fallback(
             rc,
             &sp,
-            builds,
+            with_seqs(builds),
             &mut body_eval,
             &budget,
             &mut GraceEmitSink {
@@ -1846,7 +1873,7 @@ fn test_bnl_fallback_correct_output() {
         bnl_fallback(
             rc,
             &sp,
-            builds,
+            with_seqs(builds),
             &mut body_eval,
             &budget,
             &mut GraceEmitSink {
@@ -1937,7 +1964,7 @@ fn test_bnl_bounded_memory() {
         bnl_fallback(
             rc,
             &sp,
-            builds,
+            with_seqs(builds),
             &mut body_eval,
             &budget,
             &mut GraceEmitSink {
@@ -2007,7 +2034,7 @@ fn test_bnl_bounded_memory() {
         bnl_fallback(
             rc,
             &sp2,
-            builds2,
+            with_seqs(builds2),
             &mut body_eval2,
             &big_budget,
             &mut GraceEmitSink {
@@ -2074,7 +2101,7 @@ fn test_bnl_result_batching() {
         bnl_fallback(
             rc,
             &sp,
-            builds,
+            with_seqs(builds),
             &mut body_eval,
             &budget,
             &mut GraceEmitSink {
@@ -2141,7 +2168,7 @@ fn test_e310_hard_limit_abort() {
         bnl_fallback(
             rc,
             &sp,
-            builds,
+            with_seqs(builds),
             &mut body_eval,
             &budget,
             &mut GraceEmitSink {

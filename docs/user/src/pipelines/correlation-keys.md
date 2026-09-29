@@ -51,6 +51,12 @@ The group identity is captured at ingest, so **rewriting the key column in a lat
 
 A source whose declared `correlation_key:` field names a column not present in its own `schema:` block is rejected at compile time with diagnostic **E153**. The fix is to add the field to the schema or remove it from `correlation_key:`.
 
+### Row order
+
+Declaring `correlation_key` on a Source changes the order its rows reach the rest of the pipeline. The planner inserts a sort after the Source, ascending on the correlation key and then on any declared `sort_order`, so that each group's rows are adjacent. Rows with equal keys keep their order in the file.
+
+Every consumer that depends on row order sees this order: Sink output order, an Aggregate's first-arriving value, Cull and Reshape ties, and which build record a Combine's `match: first` picks. Adding a correlation key to an existing pipeline can therefore change those results even when no record fails.
+
 ## DLQ semantics
 
 When a record fails inside a correlation group:

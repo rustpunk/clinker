@@ -14,9 +14,9 @@ use cxl::eval::{EvalContext, ProgramEvaluator};
 
 use super::RecordOrder;
 use super::build::{BuildChunkIter, GraceHll, PartitionAssigner};
-use super::probe::{EmitArgs, GraceEmitSink, emit_for_probe};
+use super::probe::{EmitArgs, GraceEmitSink, ProbeMatches, emit_for_probe};
 use crate::executor::combine::CombineResolver;
-use crate::pipeline::combine::{CombineHashTable, KeyExtractor, hash_composite_key};
+use crate::pipeline::combine::{BuildSeq, CombineHashTable, KeyExtractor, hash_composite_key};
 use crate::pipeline::grace_spill::{
     GraceSpillReader, GraceSpillWriter, SpillFilePath, grace_spill_error,
 };
@@ -105,7 +105,7 @@ pub(super) fn process_spilled_partition(
     // The reader's footer is cross-checked against the SpilledPartition
     // metadata so a misrouted file (e.g. probe slot vs. build slot)
     // surfaces as an error rather than a silent join miscompute.
-    let mut build_records: Vec<Record> = Vec::with_capacity(sp.build_count as usize);
+    let mut build_records: Vec<(Record, BuildSeq)> = Vec::with_capacity(sp.build_count as usize);
     for path in &sp.build_files {
         let reader = GraceSpillReader::open(path, build_schema.clone()).map_err(|e| {
             PipelineError::Internal {
@@ -180,14 +180,14 @@ pub(super) fn process_spilled_partition(
         // stream keeps the child sketch in step with its records
         // rather than carrying parent-level state forward.
         let parent_id = sp.partition_id as u64;
-        let mut child_a: Vec<Record> = Vec::new();
-        let mut child_b: Vec<Record> = Vec::new();
+        let mut child_a: Vec<(Record, BuildSeq)> = Vec::new();
+        let mut child_b: Vec<(Record, BuildSeq)> = Vec::new();
         let mut child_a_sketch = GraceHll::new();
         let mut child_b_sketch = GraceHll::new();
         for r in build_records {
             let keys =
                 build_extractor
-                    .extract(ctx, &r)
+                    .extract(ctx, &r.0)
                     .map_err(|e| PipelineError::Compilation {
                         transform_name: name.to_string(),
                         messages: vec![format!("grace hash repartition key eval: {e}")],
@@ -264,8 +264,8 @@ pub(super) fn process_spilled_partition(
                 spill_compress,
             )
             .map_err(|e| grace_spill_error(e, name, "repartition build writer"))?;
-            for r in &child_build {
-                bw.write_record(r)
+            for (r, seq) in &child_build {
+                bw.write_record(r, *seq)
                     .map_err(|e| grace_spill_error(e, name, "repartition build write"))?;
             }
             let (bpath, b_written) = bw
@@ -329,7 +329,11 @@ pub(super) fn process_spilled_partition(
         );
     }
 
-    // Build the in-memory hash table for the reloaded partition.
+    // Build the in-memory hash table for the reloaded partition. The table
+    // keeps insertion order, so `build_seqs` aligns with its candidate
+    // indices, and takes the records as it indexes them.
+    let build_seqs: Vec<BuildSeq> = build_records.iter().map(|(_, seq)| *seq).collect();
+    let build_records = build_records.into_iter().map(|(record, _)| record);
     let hash_table = CombineHashTable::build(
         build_records,
         build_extractor,
@@ -360,12 +364,15 @@ pub(super) fn process_spilled_partition(
                     transform_name: name.to_string(),
                     messages: vec![format!("grace hash reload probe key eval: {e}")],
                 })?;
-            let probe_iter = hash_table.probe(&probe_keys_buf);
+            let matches = ProbeMatches {
+                candidates: hash_table.probe(&probe_keys_buf),
+                build_seqs: &build_seqs,
+            };
             emit_for_probe(
                 rc.emit,
                 &probe_record,
                 row_id,
-                probe_iter,
+                matches,
                 body_evaluator.as_mut(),
                 &row_ctx,
                 sink,
@@ -427,7 +434,7 @@ pub(crate) struct BnlStats {
 pub(super) fn bnl_fallback(
     rc: &ReloadContext<'_>,
     sp: &SpilledPartition,
-    build_records: Vec<Record>,
+    build_records: Vec<(Record, BuildSeq)>,
     body_evaluator: &mut Option<ProgramEvaluator>,
     budget: &MemoryArbitrator,
     sink: &mut GraceEmitSink<'_>,
@@ -464,6 +471,11 @@ pub(super) fn bnl_fallback(
         stats.chunks_processed += 1;
         stats.peak_chunk_records = stats.peak_chunk_records.max(chunk.len());
         let chunk_len = chunk.len();
+        // The chunk's table keeps insertion order, so `chunk_seqs` aligns
+        // with its candidate indices, and takes the records as it indexes
+        // them.
+        let chunk_seqs: Vec<BuildSeq> = chunk.iter().map(|(_, seq)| *seq).collect();
+        let chunk = chunk.into_iter().map(|(record, _)| record);
         let table =
             CombineHashTable::build(chunk, rc.build_extractor, rc.ctx, budget, Some(chunk_len))
                 .map_err(|e| PipelineError::MemoryBudgetExceeded {
@@ -497,13 +509,16 @@ pub(super) fn bnl_fallback(
                         transform_name: name.to_string(),
                         messages: vec![format!("grace hash bnl probe key eval: {e}")],
                     })?;
-                let probe_iter = table.probe(&probe_keys_buf);
+                let matches = ProbeMatches {
+                    candidates: table.probe(&probe_keys_buf),
+                    build_seqs: &chunk_seqs,
+                };
                 let pre = sink.records.len();
                 emit_for_probe(
                     rc.emit,
                     &probe_record,
                     row_id,
-                    probe_iter,
+                    matches,
                     body_evaluator.as_mut(),
                     &row_ctx,
                     sink,
