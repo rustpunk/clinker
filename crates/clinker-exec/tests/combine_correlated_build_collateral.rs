@@ -7,13 +7,17 @@
 //! collateral of that group: it is written, or rolled back, exactly when
 //! the driver's group is. It never condemns a group by itself, so another
 //! driver that matched the same build record keeps its output unless its
-//! own group failed.
+//! own group failed. Each failing driver writes its own copy of the build
+//! row, paired with that driver's failure, even when two failing drivers
+//! share a group.
 //!
-//! Every case joins on a column that is not the correlation key, so the
-//! build record's correlation value is independent of its drivers'. Each
-//! case runs once per physical join strategy that reaches the Combine
-//! output dead-letter path, and asserts through `--explain` that the
-//! strategy it names is the one selected.
+//! The hash, grace-hash and IEJoin cases join on a column that is not the
+//! correlation key, so the build record's correlation value is independent
+//! of its drivers'. Sort-merge joins on a range over the correlation key,
+//! the only shape that keeps its sort licence under correlation. Each case
+//! runs once per physical join strategy that reaches the Combine output
+//! dead-letter path, and asserts through `--explain` that the strategy it
+//! names is the one selected.
 //!
 //! Rows are read by column name through the collecting test sink, never by
 //! position.
@@ -37,40 +41,55 @@ use dlq_sink::DlqRow;
 const BASE: f64 = 10.0;
 
 /// One physical join strategy that reaches the Combine output dead-letter
-/// path: its `--explain` tag, its `where` clause and an optional strategy
-/// hint.
+/// path: its `--explain` tag, its `where` clause, an optional strategy hint,
+/// and whether both sources declare a `sort_order` on the correlation key.
 struct Strategy {
     tag: &'static str,
     predicate: &'static str,
     hint: Option<&'static str>,
+    sorted_on_key: bool,
 }
 
-/// The equi strategies join on `k`; the range strategies on `v`. No
-/// strategy joins on the correlation key `cid`.
+/// The equi strategies join on `k`; IEJoin on `v`. None of these joins on
+/// the correlation key `cid`.
 ///
-/// Sort-merge is absent because no shape of this kind selects it. Each
+/// Sort-merge is absent here because no shape of this kind selects it. Each
 /// correlated source is re-sorted on its correlation key first (`cid, lo`
 /// and `cid, v` for declared `sort_order`s on `lo` and `v`), so a range on
 /// a non-key column loses its sort licence and the planner picks IEJoin.
-/// The dead-letter rule under test lives in the one function every strategy
-/// reaches, so sort-merge follows the same rule if a future plan selects it.
+/// [`SORT_MERGE`] reaches it with a range on the correlation key itself.
 const STRATEGIES: &[Strategy] = &[
     Strategy {
         tag: "hash_build_probe",
         predicate: "d.k == b.k",
         hint: None,
+        sorted_on_key: false,
     },
     Strategy {
         tag: "grace_hash",
         predicate: "d.k == b.k",
         hint: Some("grace_hash"),
+        sorted_on_key: false,
     },
     Strategy {
         tag: "iejoin",
         predicate: "d.lo <= b.v and d.hi >= b.v",
         hint: None,
+        sorted_on_key: false,
     },
 ];
+
+/// Sort-merge: both sources declare `sort_order` on an int correlation key
+/// and the Combine, qualifying its inputs by Source name, joins on a single
+/// range over it, so the sort licence survives the correlation sort.
+/// Because it joins on the correlation key, it fits only cases whose build
+/// row's `cid` is at or after every driver's, with numeric `cid` values.
+const SORT_MERGE: Strategy = Strategy {
+    tag: "sort_merge",
+    predicate: "src_drv.cid <= src_bld.cid",
+    hint: None,
+    sorted_on_key: true,
+};
 
 /// A two-source correlated Combine: both sources declare
 /// `correlation_key: cid`, the body divides the build's `base` by the
@@ -81,6 +100,20 @@ fn yaml(strategy: &Strategy) -> String {
         .map(|hint| format!("\n      strategy: {hint}"))
         .unwrap_or_default();
     let predicate = strategy.predicate;
+    // A range needs an orderable key, so the sort-merge shape types `cid`
+    // as an int. The planner finds a range input's sort licence only when
+    // its qualifier names the Source, so that shape qualifies by Source
+    // name.
+    let (sort_order, cid_type, dq, bq) = if strategy.sorted_on_key {
+        (
+            "\n      sort_order:\n        - field: cid",
+            "int",
+            "src_drv",
+            "src_bld",
+        )
+    } else {
+        ("", "string", "d", "b")
+    };
     format!(
         r#"
 pipeline:
@@ -96,10 +129,10 @@ nodes:
       name: src_drv
       type: csv
       path: drv.csv
-      correlation_key: cid
+      correlation_key: cid{sort_order}
       schema:
         - {{ name: did, type: int }}
-        - {{ name: cid, type: string }}
+        - {{ name: cid, type: {cid_type} }}
         - {{ name: k, type: int }}
         - {{ name: lo, type: int }}
         - {{ name: hi, type: int }}
@@ -110,25 +143,25 @@ nodes:
       name: src_bld
       type: csv
       path: bld.csv
-      correlation_key: cid
+      correlation_key: cid{sort_order}
       schema:
         - {{ name: bid, type: int }}
-        - {{ name: cid, type: string }}
+        - {{ name: cid, type: {cid_type} }}
         - {{ name: k, type: int }}
         - {{ name: v, type: int }}
         - {{ name: base, type: int }}
   - type: combine
     name: enriched
     input:
-      d: src_drv
-      b: src_bld
+      {dq}: src_drv
+      {bq}: src_bld
     config:
       where: '{predicate}'
       match: first
       on_miss: skip{hint}
       cxl: |
-        emit did = d.did
-        emit q = b.base / d.div
+        emit did = {dq}.did
+        emit q = {bq}.base / {dq}.div
       propagate_ck: driver
   - type: sink
     name: out
@@ -470,6 +503,45 @@ fn failing_driver_still_condemns_its_own_group() {
             trigger_id(condemned),
             id(trigger),
             "[{tag}] the condemned output pairs with group A's failing driver"
+        );
+    }
+}
+
+/// Two failing drivers in the same group (`A`, or `1` for sort-merge) match
+/// one build row in another group (`B`, or `2`). Each failure writes its
+/// own copy of the build row: the build row is written once per failing
+/// driver, right after that driver's trigger and paired with its failure,
+/// not once per group.
+#[test]
+fn build_row_is_written_once_per_failing_driver_in_one_group() {
+    for strategy in STRATEGIES.iter().chain(std::iter::once(&SORT_MERGE)) {
+        let tag = strategy.tag;
+        let (group, build_group) = if strategy.sorted_on_key {
+            ("1", "2")
+        } else {
+            ("A", "B")
+        };
+        let (out, rows) = run(strategy, &[(1, group, 0), (2, group, 0)], build_group);
+
+        assert!(
+            out.is_empty(),
+            "[{tag}] both drivers failed, so no output is written: {out:?}"
+        );
+        assert_eq!(
+            rows.len(),
+            4,
+            "[{tag}] each failing driver is followed by its own copy of the build row, \
+             and no correlated row: {:?}",
+            describe(&rows)
+        );
+        for (pair, did) in rows.chunks(2).zip([1, 2]) {
+            assert_driver_then_build(tag, &pair[0], &pair[1], did);
+        }
+        assert_ne!(
+            trigger_id(&rows[1]),
+            trigger_id(&rows[3]),
+            "[{tag}] the two build rows pair with different failures: {:?}",
+            describe(&rows)
         );
     }
 }
