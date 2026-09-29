@@ -1,5 +1,6 @@
 pub mod arena;
 pub mod combine;
+pub(crate) mod combine_verdict;
 pub mod grace_hash;
 pub(crate) mod grace_spill;
 pub mod iejoin;

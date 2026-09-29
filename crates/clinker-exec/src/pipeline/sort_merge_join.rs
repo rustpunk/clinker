@@ -59,6 +59,9 @@ use indexmap::IndexMap;
 use crate::executor::combine::{CombineResolver, CombineResolverMapping};
 use crate::executor::widen_record_to_schema;
 use crate::pipeline::combine::{CombineOutputEvalFailure, KeyExtractor, MatchedBuildFailure};
+use crate::pipeline::combine_verdict::{
+    Admit, DriverScan, DriverVerdict, MissToken, PredicateOutcome, eval_predicate,
+};
 use crate::pipeline::memory::MemoryArbitrator;
 #[cfg(test)]
 use crate::pipeline::memory::NoOpPolicy;
@@ -1645,6 +1648,7 @@ fn push_output_row(
 /// One driver row's identity for the emit helpers: record, order tag, and
 /// unique global input index. Bundled so the emit helpers stay under clippy's
 /// argument cap.
+#[derive(Clone, Copy)]
 struct DriverRow<'a> {
     record: &'a Record,
     order: RecordOrder,
@@ -1692,17 +1696,20 @@ fn emit_collect_row(
     )
 }
 
-/// Handle one zero-match driver under `first` / `all`: `Skip` drops it, `Error`
+/// Handle one driver with no true and no failed candidate under `first` /
+/// `all`, which `_miss` proves: `Skip` drops it, `Error`
 /// records it so the walk can cite the globally lowest-`RecordOrder` miss
 /// afterward (a single running minimum, not a resident vector of every
 /// unmatched driver), and `NullFields` runs the body over the driver alone and
 /// routes the widened row through the output sort — a recoverable eval failure
 /// defers to `fail.failures` with its canonical sort tag, or fails fast.
+#[allow(clippy::too_many_arguments)]
 fn handle_on_miss(
     ectx: &EmitCtx<'_>,
     mspill: &MergeSpill<'_>,
     driver: DriverRow<'_>,
     on_miss: OnMiss,
+    _miss: MissToken,
     body_eval: Option<&mut ProgramEvaluator>,
     output: &mut SortBuffer<(RecordOrder, u64, u64)>,
     fail: &mut FailSink<'_>,
@@ -1820,7 +1827,16 @@ fn dispatch_driver_miss(args: DispatchMiss<'_, '_>) -> Result<(), PipelineError>
             failure_tags,
             min_miss,
         };
-        handle_on_miss(ectx, mspill, driver, on_miss, body_eval, output, &mut fail)
+        handle_on_miss(
+            ectx,
+            mspill,
+            driver,
+            on_miss,
+            MissToken::no_candidates(),
+            body_eval,
+            output,
+            &mut fail,
+        )
     }
 }
 
@@ -1849,9 +1865,10 @@ struct EmitDriverArgs<'a, 'b> {
 /// run directly, with no per-pair `apply_op`. Rows route through the
 /// payload-ordered output sort, so the emit order is free: the canonical
 /// `(order, driver_idx, build_idx)` order is realized by the sort regardless of
-/// this walk's emit sequence. Honors `match: collect | first | all` and the
-/// residual filter / body evaluator; a zero-match driver falls through to the
-/// on_miss dispatch.
+/// this walk's emit sequence. Each entry's residual outcome feeds the driver's
+/// [`DriverScan`], which decides `match: collect | first | all` as every join
+/// strategy does; only a driver with no true and no failed candidate reaches
+/// the on_miss dispatch.
 fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
     let EmitDriverArgs {
         ectx,
@@ -1877,68 +1894,100 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
     let row_ctx = ectx.ctx.with_row(driver_order.ordinal());
     let ctx = &row_ctx;
 
+    let mut residual_eval = decomposed
+        .residual
+        .as_ref()
+        .map(|residual| ProgramEvaluator::new(Arc::clone(residual), false));
+    let fail_fast = ectx.strategy == clinker_plan::config::ErrorStrategy::FailFast;
+    let driver = DriverRow {
+        record: driver_record,
+        order: driver_order,
+        idx: driver_idx,
+    };
+    // One pair's failure with its canonical sort tag.
+    let failure_for =
+        |inner: &Record, build_idx: u64, build_row: RecordOrder, error| TaggedFailure {
+            failure: CombineOutputEvalFailure {
+                probe_record: driver_record.clone(),
+                row: driver_order,
+                matched_build: Some(MatchedBuildFailure {
+                    record: inner.clone(),
+                    row: build_row,
+                }),
+                error,
+                failed_at: crate::executor::DlqFailureStamp::now(),
+            },
+            tag: (driver_order, driver_idx, build_idx),
+        };
+
     match match_mode {
         MatchMode::Collect => {
+            let mut scan: DriverScan<(), TaggedFailure> = DriverScan::new(MatchMode::Collect);
             let mut arr: Vec<Value> = Vec::new();
             let mut first_build: Option<Record> = None;
             let mut truncated = false;
+            // The window replays a driver's candidates in build arrival
+            // order; `build_idx` is each one's arrival position.
             for entry in window.replay(mspill) {
                 let (inner, _build_key, (build_idx, build_row)) = entry?;
-                if let Some(residual) = decomposed.residual.as_ref() {
-                    let resolver =
-                        CombineResolver::new(resolver_mapping, driver_record, Some(&inner));
-                    let mut residual_eval = ProgramEvaluator::new(Arc::clone(residual), false);
-                    match residual_eval.eval_record::<NullStorage>(ctx, &resolver, None) {
-                        Ok(EvalResult::Skip(_)) => continue,
-                        Ok(EvalResult::Emit { .. }) => {}
-                        Ok(EvalResult::EmitMany { .. }) => {
-                            return Err(PipelineError::Internal {
-                                op: "sort_merge_join residual",
-                                node: name.to_string(),
-                                detail: "emit_each fan-out is not supported in a combine residual filter".into(),
-                            });
-                        }
-                        Err(e) => {
-                            if ectx.strategy == clinker_plan::config::ErrorStrategy::FailFast {
-                                return Err(PipelineError::from(e));
-                            }
-                            failures.push(CombineOutputEvalFailure {
-                                probe_record: driver_record.clone(),
-                                row: driver_order,
-                                matched_build: Some(MatchedBuildFailure {
-                                    record: inner.clone(),
-                                    row: build_row,
-                                }),
-                                error: e,
-                                failed_at: crate::executor::DlqFailureStamp::now(),
-                            });
-                            failure_tags.push((driver_order, driver_idx, build_idx));
+                let admit = match residual_outcome(
+                    residual_eval.as_mut(),
+                    resolver_mapping,
+                    driver_record,
+                    &inner,
+                    ctx,
+                    name,
+                )? {
+                    PredicateOutcome::True => scan.observe_true(build_idx, || ()),
+                    PredicateOutcome::NotTrue => continue,
+                    PredicateOutcome::Failed(e) => scan
+                        .observe_failed(build_idx, || failure_for(&inner, build_idx, build_row, e)),
+                };
+                match admit {
+                    Admit::Take => {
+                        if arr.len() >= COLLECT_PER_GROUP_CAP {
+                            // Past the cap no element is kept, but every later
+                            // candidate is still evaluated so each failure
+                            // among them is written.
+                            truncated = true;
                             continue;
                         }
+                        if first_build.is_none() {
+                            first_build = Some(inner.clone());
+                        }
+                        // Build-side records contribute only their user-declared
+                        // field values to the collect array. `iter_user_fields`
+                        // filters every engine-stamped column — both `$ck.*`
+                        // (correlation lineage; not meaningful nested inside a
+                        // collect-array entry) and `$widened` (auto_widen
+                        // sidecar; build-side sidecars drop at the join boundary
+                        // by design, mirroring `propagate_ck: Driver`). Without
+                        // this filter, a build record's `$widened` `Value::Map`
+                        // payload nests inside the collect-mode `Value::Map` and
+                        // reaches the writer as a nested Map, triggering
+                        // `FormatError::UnserializableMapValue`.
+                        let mut m: IndexMap<OwnedKey, Value> = IndexMap::new();
+                        for (fname, val) in inner.iter_user_fields() {
+                            m.insert(fname.into(), val.clone());
+                        }
+                        arr.push(Value::Map(OwnedMap::from_map(m)));
                     }
+                    Admit::Fail(tagged) => {
+                        if fail_fast {
+                            return Err(PipelineError::from(tagged.failure.error));
+                        }
+                        tagged.push(failures, failure_tags);
+                        // The array is unknown now; release what it held.
+                        arr = Vec::new();
+                        first_build = None;
+                    }
+                    Admit::Decides { .. } | Admit::Ignore => {}
                 }
-                if arr.len() >= COLLECT_PER_GROUP_CAP {
-                    truncated = true;
-                    break;
-                }
-                if first_build.is_none() {
-                    first_build = Some(inner.clone());
-                }
-                // Build-side records contribute only their user-declared field
-                // values to the collect array. `iter_user_fields` filters every
-                // engine-stamped column — both `$ck.*` (correlation lineage; not
-                // meaningful nested inside a collect-array entry) and `$widened`
-                // (auto_widen sidecar; build-side sidecars drop at the join
-                // boundary by design, mirroring `propagate_ck: Driver`). Without
-                // this filter, a build record's `$widened` `Value::Map` payload
-                // nests inside the collect-mode `Value::Map` and reaches the
-                // writer as a nested Map, triggering
-                // `FormatError::UnserializableMapValue`.
-                let mut m: IndexMap<OwnedKey, Value> = IndexMap::new();
-                for (fname, val) in inner.iter_user_fields() {
-                    m.insert(fname.into(), val.clone());
-                }
-                arr.push(Value::Map(OwnedMap::from_map(m)));
+            }
+            match scan.finish() {
+                DriverVerdict::Collected => {}
+                DriverVerdict::CollectFailed => return Ok(()),
+                other => return Err(other.mode_mismatch("sort_merge_join", name)),
             }
             if truncated {
                 eprintln!(
@@ -1946,192 +1995,250 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
                      {COLLECT_PER_GROUP_CAP} matches for driver row {driver_order}"
                 );
             }
-            emit_collect_row(
-                ectx,
-                mspill,
-                DriverRow {
-                    record: driver_record,
-                    order: driver_order,
-                    idx: driver_idx,
-                },
-                arr,
-                first_build.as_ref(),
-                output,
-            )
+            emit_collect_row(ectx, mspill, driver, arr, first_build.as_ref(), output)
         }
 
         MatchMode::First | MatchMode::All => {
-            let mut emitted_any = false;
-            // Loop-invariant: First commits to one build and treats the body as a
-            // post-match projection; All scans every window entry.
-            let select_first = matches!(match_mode, MatchMode::First);
+            let mut scan: DriverScan<(Record, u64, RecordOrder), TaggedFailure> =
+                DriverScan::new(match_mode);
+            // The window replays a driver's candidates in build arrival
+            // order; `build_idx` is each one's arrival position, so a `first`
+            // driver stops at its deciding candidate.
             for entry in window.replay(mspill) {
-                let (inner, _build_key, (build_idx, build_row)) = entry?;
-                let out_key = (driver_order, driver_idx, build_idx);
-
-                if let Some(residual) = decomposed.residual.as_ref() {
-                    let resolver =
-                        CombineResolver::new(resolver_mapping, driver_record, Some(&inner));
-                    let mut residual_eval = ProgramEvaluator::new(Arc::clone(residual), false);
-                    match residual_eval.eval_record::<NullStorage>(ctx, &resolver, None) {
-                        Ok(EvalResult::Skip(_)) => continue,
-                        Ok(EvalResult::Emit { .. }) => {}
-                        Ok(EvalResult::EmitMany { .. }) => {
-                            return Err(PipelineError::Internal {
-                                op: "sort_merge_join residual",
-                                node: name.to_string(),
-                                detail: "emit_each fan-out is not supported in a combine residual filter".into(),
-                            });
-                        }
-                        Err(e) => {
-                            if ectx.strategy == clinker_plan::config::ErrorStrategy::FailFast {
-                                return Err(PipelineError::from(e));
-                            }
-                            failures.push(CombineOutputEvalFailure {
-                                probe_record: driver_record.clone(),
-                                row: driver_order,
-                                matched_build: Some(MatchedBuildFailure {
-                                    record: inner.clone(),
-                                    row: build_row,
-                                }),
-                                error: e,
-                                failed_at: crate::executor::DlqFailureStamp::now(),
-                            });
-                            failure_tags.push(out_key);
-                            continue;
-                        }
-                    }
+                if scan.settled() {
+                    break;
                 }
-
-                if let Some(evaluator) = body_eval.as_deref_mut() {
-                    // First selects this residual-passing build and treats the
-                    // body as a post-match projection: record the predicate
-                    // match up front so a body skip drops only this row instead
-                    // of falling through to on_miss, then stop after this one
-                    // build rather than retrying a later match.
-                    if select_first {
-                        emitted_any = true;
-                    }
-                    let resolver =
-                        CombineResolver::new(resolver_mapping, driver_record, Some(&inner));
-                    match evaluator.eval_record::<NullStorage>(ctx, &resolver, None) {
-                        Ok(EvalResult::Emit {
-                            fields,
-                            record_vars,
-                            ..
-                        }) => {
-                            let mut rec = match ectx.output_schema {
-                                Some(s) => widen_record_to_schema(driver_record, s),
-                                None => driver_record.clone(),
-                            };
-                            for (n, v) in fields {
-                                rec.set(&n, v);
-                            }
-                            for (k, v) in *record_vars {
-                                let _ = rec.set_record_var(&k, v);
-                            }
-                            crate::executor::copy_build_ck_columns(
-                                &mut rec,
+                let (inner, _build_key, (build_idx, build_row)) = entry?;
+                match residual_outcome(
+                    residual_eval.as_mut(),
+                    resolver_mapping,
+                    driver_record,
+                    &inner,
+                    ctx,
+                    name,
+                )? {
+                    PredicateOutcome::True => {
+                        if let Admit::Take =
+                            scan.observe_true(build_idx, || (inner.clone(), build_idx, build_row))
+                        {
+                            emit_pair(
+                                PairArgs {
+                                    ectx,
+                                    mspill,
+                                    driver,
+                                    ctx,
+                                    fail_fast,
+                                },
                                 &inner,
-                                ectx.propagate_ck,
-                            );
-                            push_output_row(output, rec, out_key, mspill)?;
-                            emitted_any = true;
+                                build_idx,
+                                build_row,
+                                body_eval.as_deref_mut(),
+                                output,
+                                failures,
+                                failure_tags,
+                            )?;
                         }
-                        Ok(EvalResult::Skip(SkipReason::Filtered)) => {}
-                        Ok(EvalResult::Skip(SkipReason::Duplicate)) => {}
-                        Ok(EvalResult::EmitMany { .. }) => {
-                            return Err(PipelineError::Internal {
-                                op: "sort_merge_join body",
-                                node: name.to_string(),
-                                detail: "emit_each fan-out is not supported in a combine body"
-                                    .into(),
-                            });
-                        }
-                        Err(e) => {
-                            if ectx.strategy == clinker_plan::config::ErrorStrategy::FailFast {
-                                return Err(PipelineError::from(e));
+                    }
+                    PredicateOutcome::NotTrue => {}
+                    PredicateOutcome::Failed(e) => {
+                        if let Admit::Fail(tagged) = scan.observe_failed(build_idx, || {
+                            failure_for(&inner, build_idx, build_row, e)
+                        }) {
+                            if fail_fast {
+                                return Err(PipelineError::from(tagged.failure.error));
                             }
-                            failures.push(CombineOutputEvalFailure {
-                                probe_record: driver_record.clone(),
-                                row: driver_order,
-                                matched_build: Some(MatchedBuildFailure {
-                                    record: inner.clone(),
-                                    row: build_row,
-                                }),
-                                error: e,
-                                failed_at: crate::executor::DlqFailureStamp::now(),
-                            });
-                            failure_tags.push(out_key);
-                            // First already committed to this build; the deferred
-                            // dead-letter above is its only output and the trailing
-                            // break stops the scan. All falls through to the next
-                            // window entry.
+                            tagged.push(failures, failure_tags);
                         }
-                    }
-                    if select_first {
-                        break;
-                    }
-                } else if let Some(target_schema) = ectx.output_schema {
-                    // Body-less synthetic chain step: concatenate driver and
-                    // inner values onto the encoded output schema. Mirrors the
-                    // shape used by IEJoin / grace-hash for N-ary decomposition
-                    // steps.
-                    let mut values: Vec<Value> = Vec::with_capacity(target_schema.column_count());
-                    values.extend(driver_record.values().iter().cloned());
-                    values.extend(inner.values().iter().cloned());
-                    if values.len() != target_schema.column_count() {
-                        return Err(PipelineError::Internal {
-                            op: "combine",
-                            node: name.to_string(),
-                            detail: format!(
-                                "synthetic sort-merge step produced {} values; \
-                                 encoded schema has {} columns",
-                                values.len(),
-                                target_schema.column_count()
-                            ),
-                        });
-                    }
-                    let rec = Record::new(target_schema.clone(), values);
-                    push_output_row(output, rec, out_key, mspill)?;
-                    emitted_any = true;
-                    if select_first {
-                        break;
-                    }
-                } else {
-                    // No body and no output schema (test-mode pass-through):
-                    // emit one record per match carrying the driver record
-                    // verbatim.
-                    push_output_row(output, driver_record.clone(), out_key, mspill)?;
-                    emitted_any = true;
-                    if select_first {
-                        break;
                     }
                 }
             }
 
-            if !emitted_any {
-                let mut fail = FailSink {
+            match scan.finish() {
+                DriverVerdict::Pairs => Ok(()),
+                DriverVerdict::Selected((inner, build_idx, build_row)) => emit_pair(
+                    PairArgs {
+                        ectx,
+                        mspill,
+                        driver,
+                        ctx,
+                        fail_fast,
+                    },
+                    &inner,
+                    build_idx,
+                    build_row,
+                    body_eval.as_deref_mut(),
+                    output,
                     failures,
                     failure_tags,
-                    min_miss,
-                };
-                handle_on_miss(
-                    ectx,
-                    mspill,
-                    DriverRow {
-                        record: driver_record,
-                        order: driver_order,
-                        idx: driver_idx,
-                    },
-                    on_miss,
-                    body_eval,
-                    output,
-                    &mut fail,
-                )?;
+                ),
+                DriverVerdict::FailedFirst(tagged) => {
+                    if fail_fast {
+                        return Err(PipelineError::from(tagged.failure.error));
+                    }
+                    tagged.push(failures, failure_tags);
+                    Ok(())
+                }
+                DriverVerdict::Miss(miss) => {
+                    let mut fail = FailSink {
+                        failures,
+                        failure_tags,
+                        min_miss,
+                    };
+                    handle_on_miss(
+                        ectx, mspill, driver, on_miss, miss, body_eval, output, &mut fail,
+                    )
+                }
+                other => Err(other.mode_mismatch("sort_merge_join", name)),
             }
-            Ok(())
         }
+    }
+}
+
+/// One pair's deferred failure and its canonical `(order, driver_idx,
+/// build_idx)` sort tag.
+struct TaggedFailure {
+    failure: CombineOutputEvalFailure,
+    tag: (RecordOrder, u64, u64),
+}
+
+impl TaggedFailure {
+    fn push(
+        self,
+        failures: &mut Vec<CombineOutputEvalFailure>,
+        failure_tags: &mut Vec<(RecordOrder, u64, u64)>,
+    ) {
+        failures.push(self.failure);
+        failure_tags.push(self.tag);
+    }
+}
+
+/// The residual's outcome for one `(driver, build)` pair, or `True` when the
+/// predicate has no residual beyond its range key.
+fn residual_outcome(
+    residual_eval: Option<&mut ProgramEvaluator>,
+    resolver_mapping: &CombineResolverMapping,
+    driver_record: &Record,
+    inner: &Record,
+    ctx: &EvalContext<'_>,
+    name: &str,
+) -> Result<PredicateOutcome, PipelineError> {
+    let Some(residual_eval) = residual_eval else {
+        return Ok(PredicateOutcome::True);
+    };
+    let resolver = CombineResolver::new(resolver_mapping, driver_record, Some(inner));
+    eval_predicate::<NullStorage>(
+        residual_eval,
+        ctx,
+        &resolver,
+        "sort_merge_join residual",
+        name,
+    )
+}
+
+/// The per-driver context [`emit_pair`] reads.
+#[derive(Clone, Copy)]
+struct PairArgs<'a, 'b> {
+    ectx: &'b EmitCtx<'a>,
+    mspill: &'b MergeSpill<'b>,
+    driver: DriverRow<'b>,
+    ctx: &'b EvalContext<'b>,
+    fail_fast: bool,
+}
+
+/// Emit one true `(driver, build)` pair: the body (a skip drops only this
+/// row, a failure defers with its sort tag), or for a body-less synthetic
+/// step the driver-then-build value concat, or in test-mode pass-through the
+/// driver record verbatim.
+#[allow(clippy::too_many_arguments)]
+fn emit_pair(
+    args: PairArgs<'_, '_>,
+    inner: &Record,
+    build_idx: u64,
+    build_row: RecordOrder,
+    body_eval: Option<&mut ProgramEvaluator>,
+    output: &mut SortBuffer<(RecordOrder, u64, u64)>,
+    failures: &mut Vec<CombineOutputEvalFailure>,
+    failure_tags: &mut Vec<(RecordOrder, u64, u64)>,
+) -> Result<(), PipelineError> {
+    let PairArgs {
+        ectx,
+        mspill,
+        driver,
+        ctx,
+        fail_fast,
+    } = args;
+    let name = ectx.name;
+    let out_key = (driver.order, driver.idx, build_idx);
+    if let Some(evaluator) = body_eval {
+        let resolver = CombineResolver::new(ectx.resolver_mapping, driver.record, Some(inner));
+        match evaluator.eval_record::<NullStorage>(ctx, &resolver, None) {
+            Ok(EvalResult::Emit {
+                fields,
+                record_vars,
+                ..
+            }) => {
+                let mut rec = match ectx.output_schema {
+                    Some(s) => widen_record_to_schema(driver.record, s),
+                    None => driver.record.clone(),
+                };
+                for (n, v) in fields {
+                    rec.set(&n, v);
+                }
+                for (k, v) in *record_vars {
+                    let _ = rec.set_record_var(&k, v);
+                }
+                crate::executor::copy_build_ck_columns(&mut rec, inner, ectx.propagate_ck);
+                push_output_row(output, rec, out_key, mspill)
+            }
+            Ok(EvalResult::Skip(SkipReason::Filtered | SkipReason::Duplicate)) => Ok(()),
+            Ok(EvalResult::EmitMany { .. }) => Err(PipelineError::Internal {
+                op: "sort_merge_join body",
+                node: name.to_string(),
+                detail: "emit_each fan-out is not supported in a combine body".into(),
+            }),
+            Err(e) => {
+                if fail_fast {
+                    return Err(PipelineError::from(e));
+                }
+                failures.push(CombineOutputEvalFailure {
+                    probe_record: driver.record.clone(),
+                    row: driver.order,
+                    matched_build: Some(MatchedBuildFailure {
+                        record: inner.clone(),
+                        row: build_row,
+                    }),
+                    error: e,
+                    failed_at: crate::executor::DlqFailureStamp::now(),
+                });
+                failure_tags.push(out_key);
+                Ok(())
+            }
+        }
+    } else if let Some(target_schema) = ectx.output_schema {
+        // Body-less synthetic chain step: concatenate driver and inner values
+        // onto the encoded output schema. Mirrors the shape used by IEJoin /
+        // grace-hash for N-ary decomposition steps.
+        let mut values: Vec<Value> = Vec::with_capacity(target_schema.column_count());
+        values.extend(driver.record.values().iter().cloned());
+        values.extend(inner.values().iter().cloned());
+        if values.len() != target_schema.column_count() {
+            return Err(PipelineError::Internal {
+                op: "combine",
+                node: name.to_string(),
+                detail: format!(
+                    "synthetic sort-merge step produced {} values; \
+                     encoded schema has {} columns",
+                    values.len(),
+                    target_schema.column_count()
+                ),
+            });
+        }
+        let rec = Record::new(target_schema.clone(), values);
+        push_output_row(output, rec, out_key, mspill)
+    } else {
+        // No body and no output schema (test-mode pass-through): emit one
+        // record per match carrying the driver record verbatim.
+        push_output_row(output, driver.record.clone(), out_key, mspill)
     }
 }
 

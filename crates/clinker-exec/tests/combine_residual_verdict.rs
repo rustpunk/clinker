@@ -380,13 +380,20 @@ fn describe(rows: &[DlqRow]) -> Vec<(String, u64, bool, Option<String>)> {
 /// condemned: each trigger's driver row and the build row written after it.
 fn failures(rows: &[DlqRow]) -> Vec<(u64, Option<u64>)> {
     let correlated = Some(DlqErrorCategory::Correlated.as_str());
-    let kept: Vec<&DlqRow> = rows.iter().filter(|row| row.category() != correlated).collect();
+    let kept: Vec<&DlqRow> = rows
+        .iter()
+        .filter(|row| row.category() != correlated)
+        .collect();
     let mut out = Vec::new();
     let mut n = 0;
     while n < kept.len() {
         let trigger = kept[n];
         assert!(trigger.trigger(), "a failure starts with its trigger row");
-        assert_eq!(trigger.source_name(), "src_drv", "the trigger is a driver row");
+        assert_eq!(
+            trigger.source_name(),
+            "src_drv",
+            "the trigger is a driver row"
+        );
         assert_eq!(
             trigger.category(),
             Some(DlqErrorCategory::CombineOutputRow.as_str()),
@@ -534,7 +541,11 @@ fn first_ignores_a_failure_after_its_match() {
             .iter()
             .map(|row| (int(row, "did"), int(row, "bid")))
             .collect();
-        assert_eq!(picked, [(1, 1)], "[{label}] the earliest build row is picked");
+        assert_eq!(
+            picked,
+            [(1, 1)],
+            "[{label}] the earliest build row is picked"
+        );
     });
 }
 
@@ -552,7 +563,11 @@ fn first_picks_the_earliest_true_candidate_on_every_strategy() {
             .iter()
             .map(|row| (int(row, "did"), int(row, "bid")))
             .collect();
-        assert_eq!(picked, [(1, 2)], "[{label}] the earliest true build row is picked");
+        assert_eq!(
+            picked,
+            [(1, 2)],
+            "[{label}] the earliest true build row is picked"
+        );
     });
 }
 

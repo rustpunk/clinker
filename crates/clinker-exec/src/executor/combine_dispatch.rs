@@ -29,6 +29,9 @@ use crate::executor::{
     DlqEntry, DlqFailureStamp, NullStorage, stage_metrics, widen_record_to_schema,
 };
 use crate::pipeline::combine::MatchedBuildFailure;
+use crate::pipeline::combine_verdict::{
+    Admit, DriverScan, DriverVerdict, MissToken, PredicateOutcome, eval_predicate,
+};
 use crate::pipeline::iejoin::RecordOrder;
 use clinker_plan::BudgetCategory;
 use clinker_plan::config::ErrorStrategy;
@@ -1856,17 +1859,137 @@ impl CombineProbeKernel<'_> {
         Ok(())
     }
 
+    /// The residual's outcome for one `(driver, build)` pair, or `True` when
+    /// the predicate has no residual beyond its equality keys.
+    fn residual_outcome(
+        &self,
+        residual_eval: Option<&mut ProgramEvaluator>,
+        eval_ctx: &cxl::eval::EvalContext<'_>,
+        probe_record: &Record,
+        build_record: &Record,
+    ) -> Result<PredicateOutcome, PipelineError> {
+        let Some(residual_eval) = residual_eval else {
+            return Ok(PredicateOutcome::True);
+        };
+        let resolver = crate::executor::combine::CombineResolver::new(
+            self.resolver_mapping,
+            probe_record,
+            Some(build_record),
+        );
+        eval_predicate::<NullStorage>(
+            residual_eval,
+            eval_ctx,
+            &resolver,
+            "combine residual",
+            self.name,
+        )
+    }
+
+    /// Apply `on_miss` to a driver whose scan found no true and no failed
+    /// candidate: `skip` drops it, `error` raises E319, `null_fields` runs the
+    /// body over the driver alone. `_miss` is the scan's proof that the
+    /// driver is a miss.
+    fn apply_on_miss(
+        &self,
+        _miss: MissToken,
+        eval_ctx: &cxl::eval::EvalContext<'_>,
+        probe_record: &Record,
+        rn: crate::executor::stream_event::SourceRowId,
+        sink: ProbeSink<'_>,
+    ) -> Result<(), PipelineError> {
+        use crate::executor::combine::CombineResolver;
+        use clinker_plan::config::pipeline_node::OnMiss;
+        let ProbeSink {
+            rows: out,
+            failures,
+            counters,
+        } = sink;
+        let name = self.name;
+        match self.on_miss {
+            OnMiss::Skip => Ok(()),
+            OnMiss::Error => Err(PipelineError::CombineMissingMatch {
+                combine: name.to_string(),
+                driver_row: rn.ordinal(),
+            }),
+            OnMiss::NullFields => {
+                let resolver = CombineResolver::new(self.resolver_mapping, probe_record, None);
+                let body = self
+                    .body_program
+                    .as_ref()
+                    .ok_or_else(|| PipelineError::Internal {
+                        op: "combine",
+                        node: name.to_string(),
+                        detail: "combine body typed program missing for on_miss: null_fields"
+                            .to_string(),
+                    })?;
+                let mut evaluator = ProgramEvaluator::new(Arc::clone(body), false);
+                match evaluator.eval_record::<NullStorage>(eval_ctx, &resolver, None) {
+                    Ok(EvalResult::Emit {
+                        fields: emitted,
+                        record_vars,
+                        ..
+                    }) => {
+                        let mut rec = match self.combine_output_schema.as_ref() {
+                            Some(s) => widen_record_to_schema(probe_record, s),
+                            None => probe_record.clone(),
+                        };
+                        for (n, v) in emitted {
+                            rec.set(&n, v);
+                        }
+                        for (k, v) in *record_vars {
+                            let _ = rec.set_record_var(&k, v);
+                        }
+                        self.check_output_cap(out.len())?;
+                        out.push((rec, rn));
+                        Ok(())
+                    }
+                    Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                        counters.filtered += 1;
+                        Ok(())
+                    }
+                    Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                        counters.distinct += 1;
+                        Ok(())
+                    }
+                    Ok(EvalResult::EmitMany { .. }) => Err(PipelineError::Internal {
+                        op: "combine on_miss body",
+                        node: name.to_string(),
+                        detail: "emit_each fan-out is not supported in a combine body".into(),
+                    }),
+                    Err(e) => {
+                        if self.fail_fast {
+                            return Err(PipelineError::from(e));
+                        }
+                        // on_miss path: no build row matched, so only the
+                        // driver source rewinds.
+                        failures.push(ProbeFailure {
+                            probe_record: probe_record.clone(),
+                            rn,
+                            matched_build: None,
+                            error: e,
+                            failed_at: DlqFailureStamp::now(),
+                        });
+                        Ok(())
+                    }
+                }
+            }
+        }
+    }
+
     /// Probe one driver record against the materialized hash table, pushing
     /// every emitted `(Record, row_num)` into `out`, every recoverable
     /// output-stage failure into `failures`, and accumulating `distinct` /
     /// `filtered` skips into `counters`.
     ///
-    /// Every matched pair is evaluated, as the join kernels evaluate it: a
-    /// failing residual or body on one pair is one failure, with that pair's
-    /// build row, and the driver's other pairs still match and emit. A
-    /// failing residual does not count as a match, so under `match: first`
-    /// the next candidate is tried. A probe-key or `on_miss: null_fields`
-    /// failure is one failure with no build row. Fatal errors (`FailFast`
+    /// Each candidate's residual outcome feeds one [`DriverScan`], so the
+    /// driver's verdict is the one every join strategy reaches: a failing
+    /// residual is neither a match nor a miss. Under `all` each failed pair is
+    /// one failure, with that pair's build row, and each true pair runs the
+    /// body; under `first` the earliest candidate that is not "not true"
+    /// decides; under `collect` a failed candidate leaves no row. Only a
+    /// driver with no true and no failed candidate reaches `on_miss`. A
+    /// probe-key or `on_miss: null_fields` failure is one failure with no
+    /// build row. Fatal errors (`FailFast`
     /// surfacing, `on_miss: error`, planner-invariant violations) return
     /// `Err`. The caller routes `failures` through the DLQ; the signature is
     /// `&mut ExecutorContext`-free so the streaming probe thread can call it.
@@ -1884,7 +2007,7 @@ impl CombineProbeKernel<'_> {
             counters,
         } = sink;
         use crate::executor::combine::CombineResolver;
-        use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
+        use clinker_plan::config::pipeline_node::MatchMode;
 
         let name = self.name;
 
@@ -1912,68 +2035,85 @@ impl CombineProbeKernel<'_> {
             return Ok(());
         }
 
+        let mut residual_eval = self
+            .decomposed
+            .residual
+            .as_ref()
+            .map(|residual| ProgramEvaluator::new(Arc::clone(residual), false));
+
         match self.match_mode {
             MatchMode::Collect => {
+                let mut scan: DriverScan<(), ProbeFailure> = DriverScan::new(MatchMode::Collect);
                 let mut arr: Vec<Value> = Vec::new();
                 let mut first_collected_build: Option<Record> = None;
                 let mut truncated = false;
                 let probe_iter = self.hash_table.probe(probe_keys_buf);
-                for candidate in probe_iter {
-                    if let Some(residual) = self.decomposed.residual.as_ref() {
-                        let resolver = CombineResolver::new(
-                            self.resolver_mapping,
-                            probe_record,
-                            Some(candidate.record),
-                        );
-                        let mut residual_eval = ProgramEvaluator::new(Arc::clone(residual), false);
-                        match residual_eval.eval_record::<NullStorage>(eval_ctx, &resolver, None) {
-                            Ok(EvalResult::Skip(SkipReason::Filtered)) => continue,
-                            Ok(EvalResult::Emit { .. }) => {}
-                            Ok(EvalResult::EmitMany { .. }) => {
-                                return Err(PipelineError::Internal {
-                                    op: "combine residual",
-                                    node: name.to_string(),
-                                    detail:
-                                        "emit_each fan-out is not supported in a combine residual filter"
-                                            .into(),
-                                });
-                            }
-                            Ok(EvalResult::Skip(SkipReason::Duplicate)) => continue,
-                            Err(e) => {
-                                if self.fail_fast {
-                                    return Err(PipelineError::from(e));
-                                }
-                                failures.push(ProbeFailure {
-                                    probe_record: probe_record.clone(),
-                                    rn,
-                                    matched_build: Some(MatchedBuildFailure {
-                                        record: candidate.record.clone(),
-                                        row: self.build_row_id(candidate.index)?,
-                                    }),
-                                    error: e,
-                                    failed_at: DlqFailureStamp::now(),
-                                });
+                // The table yields a key's candidates in build arrival order,
+                // so the walk position is the candidate order.
+                for (order, candidate) in probe_iter.enumerate() {
+                    let order = order as u64;
+                    let admit = match self.residual_outcome(
+                        residual_eval.as_mut(),
+                        eval_ctx,
+                        probe_record,
+                        candidate.record,
+                    )? {
+                        PredicateOutcome::True => scan.observe_true(order, || ()),
+                        PredicateOutcome::NotTrue => continue,
+                        PredicateOutcome::Failed(e) => {
+                            let row = self.build_row_id(candidate.index)?;
+                            scan.observe_failed(order, || ProbeFailure {
+                                probe_record: probe_record.clone(),
+                                rn,
+                                matched_build: Some(MatchedBuildFailure {
+                                    record: candidate.record.clone(),
+                                    row,
+                                }),
+                                error: e,
+                                failed_at: DlqFailureStamp::now(),
+                            })
+                        }
+                    };
+                    match admit {
+                        Admit::Take => {
+                            if arr.len() >= COLLECT_PER_GROUP_CAP {
+                                // Past the cap no element is kept, but every
+                                // later candidate is still evaluated so each
+                                // failure among them is written.
+                                truncated = true;
                                 continue;
                             }
+                            if first_collected_build.is_none() {
+                                first_collected_build = Some(candidate.record.clone());
+                            }
+                            // Build a `Value::Map` for every matched build
+                            // record, preserving its own schema order.
+                            // `iter_user_fields` filters engine-stamped columns
+                            // (`$ck.*`, `$widened`) so a build record's sidecar
+                            // Map payload never nests and reaches the writer as
+                            // a nested Map.
+                            let mut m: IndexMap<OwnedKey, Value> = IndexMap::new();
+                            for (fname, val) in candidate.record.iter_user_fields() {
+                                m.insert(fname.into(), val.clone());
+                            }
+                            arr.push(Value::Map(OwnedMap::from_map(m)));
                         }
+                        Admit::Fail(failure) => {
+                            if self.fail_fast {
+                                return Err(PipelineError::from(failure.error));
+                            }
+                            failures.push(failure);
+                            // The array is unknown now; release what it held.
+                            arr = Vec::new();
+                            first_collected_build = None;
+                        }
+                        Admit::Decides { .. } | Admit::Ignore => {}
                     }
-                    if arr.len() >= COLLECT_PER_GROUP_CAP {
-                        truncated = true;
-                        break;
-                    }
-                    if first_collected_build.is_none() {
-                        first_collected_build = Some(candidate.record.clone());
-                    }
-                    // Build a `Value::Map` for every matched build record,
-                    // preserving its own schema order. `iter_user_fields`
-                    // filters engine-stamped columns (`$ck.*`, `$widened`)
-                    // so a build record's sidecar Map payload never nests
-                    // and reaches the writer as a nested Map.
-                    let mut m: IndexMap<OwnedKey, Value> = IndexMap::new();
-                    for (fname, val) in candidate.record.iter_user_fields() {
-                        m.insert(fname.into(), val.clone());
-                    }
-                    arr.push(Value::Map(OwnedMap::from_map(m)));
+                }
+                match scan.finish() {
+                    DriverVerdict::Collected => {}
+                    DriverVerdict::CollectFailed => return Ok(()),
+                    other => return Err(other.mode_mismatch("combine", name)),
                 }
                 if truncated {
                     eprintln!(
@@ -2003,136 +2143,89 @@ impl CombineProbeKernel<'_> {
             }
 
             MatchMode::First | MatchMode::All => {
-                // Residual-filter + emit pass. Clone each surviving build
-                // record before dropping the iterator so the evaluator
-                // borrow doesn't alias the hash-table borrow.
-                let matched_records: Vec<MatchedBuildFailure> = {
-                    let probe_iter = self.hash_table.probe(probe_keys_buf);
-                    let mut matched: Vec<MatchedBuildFailure> = Vec::new();
-                    for candidate in probe_iter {
-                        if let Some(residual) = self.decomposed.residual.as_ref() {
-                            let resolver = CombineResolver::new(
-                                self.resolver_mapping,
-                                probe_record,
-                                Some(candidate.record),
-                            );
-                            let mut residual_eval =
-                                ProgramEvaluator::new(Arc::clone(residual), false);
-                            match residual_eval
-                                .eval_record::<NullStorage>(eval_ctx, &resolver, None)
-                            {
-                                Ok(EvalResult::Skip(_)) => continue,
-                                Ok(EvalResult::Emit { .. }) => {}
-                                Ok(EvalResult::EmitMany { .. }) => {
-                                    return Err(PipelineError::Internal {
-                                        op: "combine residual",
-                                        node: name.to_string(),
-                                        detail:
-                                            "emit_each fan-out is not supported in a combine residual filter"
-                                                .into(),
-                                    });
-                                }
-                                Err(e) => {
-                                    if self.fail_fast {
-                                        return Err(PipelineError::from(e));
-                                    }
-                                    failures.push(ProbeFailure {
-                                        probe_record: probe_record.clone(),
-                                        rn,
-                                        matched_build: Some(MatchedBuildFailure {
-                                            record: candidate.record.clone(),
-                                            row: self.build_row_id(candidate.index)?,
-                                        }),
-                                        error: e,
-                                        failed_at: DlqFailureStamp::now(),
-                                    });
-                                    continue;
-                                }
+                // Residual pass. Clone each true candidate's build record
+                // before dropping the iterator so the body evaluator borrow
+                // doesn't alias the hash-table borrow.
+                let mut scan: DriverScan<MatchedBuildFailure, ProbeFailure> =
+                    DriverScan::new(self.match_mode);
+                let mut taken: Vec<MatchedBuildFailure> = Vec::new();
+                let probe_iter = self.hash_table.probe(probe_keys_buf);
+                // The table yields a key's candidates in build arrival order,
+                // so the walk position is the candidate order and a `first`
+                // driver stops at its deciding candidate.
+                for (order, candidate) in probe_iter.enumerate() {
+                    if scan.settled() {
+                        break;
+                    }
+                    let order = order as u64;
+                    let row = self.build_row_id(candidate.index)?;
+                    match self.residual_outcome(
+                        residual_eval.as_mut(),
+                        eval_ctx,
+                        probe_record,
+                        candidate.record,
+                    )? {
+                        PredicateOutcome::True => {
+                            let admit = scan.observe_true(order, || MatchedBuildFailure {
+                                record: candidate.record.clone(),
+                                row,
+                            });
+                            if let Admit::Take = admit {
+                                taken.push(MatchedBuildFailure {
+                                    record: candidate.record.clone(),
+                                    row,
+                                });
                             }
                         }
-                        matched.push(MatchedBuildFailure {
-                            record: candidate.record.clone(),
-                            row: self.build_row_id(candidate.index)?,
-                        });
-                        if matches!(self.match_mode, MatchMode::First) {
-                            break;
+                        PredicateOutcome::NotTrue => {}
+                        PredicateOutcome::Failed(e) => {
+                            let admit = scan.observe_failed(order, || ProbeFailure {
+                                probe_record: probe_record.clone(),
+                                rn,
+                                matched_build: Some(MatchedBuildFailure {
+                                    record: candidate.record.clone(),
+                                    row,
+                                }),
+                                error: e,
+                                failed_at: DlqFailureStamp::now(),
+                            });
+                            if let Admit::Fail(failure) = admit {
+                                if self.fail_fast {
+                                    return Err(PipelineError::from(failure.error));
+                                }
+                                failures.push(failure);
+                            }
                         }
                     }
-                    matched
+                }
+
+                let matched_records = match scan.finish() {
+                    DriverVerdict::Selected(pick) => vec![pick],
+                    DriverVerdict::Pairs => taken,
+                    DriverVerdict::FailedFirst(failure) => {
+                        if self.fail_fast {
+                            return Err(PipelineError::from(failure.error));
+                        }
+                        failures.push(failure);
+                        return Ok(());
+                    }
+                    DriverVerdict::Miss(miss) => {
+                        return self.apply_on_miss(
+                            miss,
+                            eval_ctx,
+                            probe_record,
+                            rn,
+                            ProbeSink {
+                                rows: out,
+                                failures,
+                                counters,
+                            },
+                        );
+                    }
+                    other => return Err(other.mode_mismatch("combine", name)),
                 };
 
-                if matched_records.is_empty() {
-                    match self.on_miss {
-                        OnMiss::Skip => Ok(()),
-                        OnMiss::Error => Err(PipelineError::CombineMissingMatch {
-                            combine: name.to_string(),
-                            driver_row: rn.ordinal(),
-                        }),
-                        OnMiss::NullFields => {
-                            let resolver =
-                                CombineResolver::new(self.resolver_mapping, probe_record, None);
-                            let body = self.body_program.as_ref().ok_or_else(|| {
-                                PipelineError::Internal {
-                                    op: "combine",
-                                    node: name.to_string(),
-                                    detail: "combine body typed program missing for on_miss: null_fields"
-                                        .to_string(),
-                                }
-                            })?;
-                            let mut evaluator = ProgramEvaluator::new(Arc::clone(body), false);
-                            match evaluator.eval_record::<NullStorage>(eval_ctx, &resolver, None) {
-                                Ok(EvalResult::Emit {
-                                    fields: emitted,
-                                    record_vars,
-                                    ..
-                                }) => {
-                                    let mut rec = match self.combine_output_schema.as_ref() {
-                                        Some(s) => widen_record_to_schema(probe_record, s),
-                                        None => probe_record.clone(),
-                                    };
-                                    for (n, v) in emitted {
-                                        rec.set(&n, v);
-                                    }
-                                    for (k, v) in *record_vars {
-                                        let _ = rec.set_record_var(&k, v);
-                                    }
-                                    self.check_output_cap(out.len())?;
-                                    out.push((rec, rn));
-                                    Ok(())
-                                }
-                                Ok(EvalResult::Skip(SkipReason::Filtered)) => {
-                                    counters.filtered += 1;
-                                    Ok(())
-                                }
-                                Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
-                                    counters.distinct += 1;
-                                    Ok(())
-                                }
-                                Ok(EvalResult::EmitMany { .. }) => Err(PipelineError::Internal {
-                                    op: "combine on_miss body",
-                                    node: name.to_string(),
-                                    detail: "emit_each fan-out is not supported in a combine body"
-                                        .into(),
-                                }),
-                                Err(e) => {
-                                    if self.fail_fast {
-                                        return Err(PipelineError::from(e));
-                                    }
-                                    // on_miss path: no build row matched, so
-                                    // only the driver source rewinds.
-                                    failures.push(ProbeFailure {
-                                        probe_record: probe_record.clone(),
-                                        rn,
-                                        matched_build: None,
-                                        error: e,
-                                        failed_at: DlqFailureStamp::now(),
-                                    });
-                                    Ok(())
-                                }
-                            }
-                        }
-                    }
-                } else if let Some(body) = self.body_program.as_ref() {
+                if let Some(body) = self.body_program.as_ref() {
                     let mut evaluator = ProgramEvaluator::new(Arc::clone(body), false);
                     for matched in &matched_records {
                         let resolver = CombineResolver::new(
