@@ -724,19 +724,21 @@ pub(crate) fn execute_combine_iejoin(
     let driver_range_extractor = KeyExtractor::new(driver_range_progs);
     let build_range_extractor = KeyExtractor::new(build_range_progs);
 
-    // Residual evaluator (for 3+ range conjuncts; the first two run
-    // through the IEJoin/PWMJ kernel and the rest re-check via the
-    // residual). The residual lives over the merged row, so it needs
-    // the full CombineResolver.
+    // Residual evaluator: the kernel verifies the first two range
+    // conjuncts, so the residual re-checks the predicate for every pair
+    // when there is a third range or a conjunct that is not a range at
+    // all. The residual lives over the merged row, so it needs the full
+    // CombineResolver.
     let n_ranges = range_ops.len();
-    let residual_eval: Option<ProgramEvaluator> = if n_ranges > 2 {
-        decomposed
-            .residual
-            .as_ref()
-            .map(|r| ProgramEvaluator::new(Arc::clone(r), false))
-    } else {
-        None
-    };
+    let residual_eval: Option<ProgramEvaluator> =
+        if n_ranges > 2 || decomposed.residual_exceeds_ranges() {
+            decomposed
+                .residual
+                .as_ref()
+                .map(|r| ProgramEvaluator::new(Arc::clone(r), false))
+        } else {
+            None
+        };
     let body_eval = body_program.map(|p| ProgramEvaluator::new(Arc::clone(p), false));
 
     // Pre-scan: extract each record's canonical equality-key bytes and its range
@@ -857,7 +859,8 @@ struct EmitConfig<'a> {
     strategy: clinker_plan::config::ErrorStrategy,
 }
 
-/// The residual (3+ range conjuncts) and body evaluators. Both are stateful
+/// The residual (a third range conjunct, or a conjunct that is not a range)
+/// and body evaluators. Both are stateful
 /// (`eval_record` takes `&mut self`), so they are owned here and borrowed
 /// mutably by the emit path.
 struct Evaluators {
@@ -1347,7 +1350,8 @@ struct PairBudget<'a> {
 }
 
 /// Emit every qualifying `(driver, build)` pair in `pairs` under the
-/// combine's match mode, applying the residual filter (3+ range conjuncts) and
+/// combine's match mode, applying the residual filter (when the predicate has more than the two
+/// kernel-verified range conjuncts) and
 /// the `First`-mode selection. `pairs` carries local indices into
 /// `driver_slice` / `build_slice`; per-driver state is tracked in `state` under
 /// [`DriverRef::key`].
@@ -1385,9 +1389,9 @@ fn emit_pairs(
         // build-side dead letter reports the build's own row.
         let build_row = batch.build_row[bi_local];
 
-        // 3+ range conjuncts: the residual re-checks the full predicate over
-        // the merged row (the kernel verified only the first two axes). See
-        // the module doc.
+        // The residual re-checks the full predicate over the merged row when
+        // it holds more than the first two range axes the kernel verified.
+        // See the module doc.
         if let Some(residual) = evals.residual.as_mut() {
             let resolver =
                 CombineResolver::new(cfg.resolver_mapping, driver_record, Some(build_record));

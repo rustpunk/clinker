@@ -88,6 +88,26 @@ pub struct DecomposedPredicate {
     pub residual: Option<Arc<TypedProgram>>,
 }
 
+impl DecomposedPredicate {
+    /// Whether the residual program checks anything beyond the range
+    /// conjuncts folded into it: a conjunct that is neither an equality nor
+    /// a range, or a `?? false` predicate kept whole. A range kernel that
+    /// verifies the ranges itself must still evaluate such a residual for
+    /// every pair, or that part of `where:` is never applied.
+    pub fn residual_exceeds_ranges(&self) -> bool {
+        let Some(residual) = self.residual.as_ref() else {
+            return false;
+        };
+        match residual.program.statements.first() {
+            Some(Statement::Filter { predicate, .. }) => {
+                false_coalesced_predicate(predicate).is_some()
+                    || split_conjunction(predicate).len() != self.ranges.len()
+            }
+            _ => true,
+        }
+    }
+}
+
 /// Shape-only projection of [`DecomposedPredicate`] for `--explain` output.
 ///
 /// Carries counts plus a `has_residual` flag — the full conjunct/program
