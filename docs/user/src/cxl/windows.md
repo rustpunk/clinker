@@ -34,7 +34,7 @@ nodes:
 | Field | Description |
 |-------|-------------|
 | `group_by` | List of fields to partition the window by (the SQL `PARTITION BY` axis). |
-| `sort_by` | List of `{ field, order }` ordering specifications (`order` is `asc` or `desc`). |
+| `sort_by` | List of `{ field, order }` ordering specifications (`order` is `asc` or `desc`). Values compare by the rule every sort uses; see [How values are ordered](../nodes/sink.md#how-values-are-ordered). |
 | `source` | Optional explicit source-name reference for cross-source windows. |
 | `on` | Optional cross-source partition-lookup field. |
 

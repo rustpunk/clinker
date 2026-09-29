@@ -283,7 +283,9 @@ planner can admit order-dependent strategies such as streaming aggregation:
 ```
 
 Clinker binds these fields to the declared source schema, compares the typed
-values, and verifies each physical file independently before any record from
+values by the same rule every sort uses (see
+[How values are ordered](sink.md#how-values-are-ordered)), and verifies each
+physical file independently before any record from
 that file reaches an order-dependent consumer. The declaration never means
 that a multi-file source is globally sorted: the last key in one file is not
 compared with the first key in the next file.

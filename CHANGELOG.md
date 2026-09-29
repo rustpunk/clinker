@@ -158,6 +158,32 @@ run wrote.
   therefore rise to the counts the same failures give without a key, plus
   the rows the failing groups condemn.
 
+### Fixed — sorting places NaN, negative zero and mixed numbers by one rule
+
+A Sink or Source `sort_order` and a window's `sort_by` now order every value
+by one rule, described in
+[How values are ordered](docs/user/src/nodes/sink.md#how-values-are-ordered).
+Output changes where a sort key holds:
+
+- **NaN.** Every NaN, whatever its sign, is one value that sorts after `inf`
+  in ascending order and first in descending order. A NaN used to compare
+  equal to every value, which made it a barrier: the records around it could
+  be left unsorted, and the output could depend on the memory limit, because a
+  sort that spilled to disk split the records at different places.
+- **Negative zero.** `-0.0` and `0.0` are equal, so they keep their arrival
+  order.
+- **Integers, floats and decimals in one column.** They compare by exact
+  value: the integer `9007199254740993` sorts after the float
+  `9007199254740992.0`, and an integer and a decimal of equal value are equal.
+  A sort that spilled to disk used to compare an integer with a float by raw
+  bytes of different meaning.
+- **Values of different types in one column** order by a fixed rank: booleans,
+  numbers, strings, dates, datetimes, arrays, maps. They used to compare equal.
+- **Leap seconds.** A leap-second datetime sorts with the instant one second
+  later, as a sort that spilled to disk already did.
+
+Nulls are still placed only by `null_order`.
+
 ### Changed — terminal Output nodes are now Sinks
 
 **Breaking YAML and Rust API change.** The terminal destination node is now

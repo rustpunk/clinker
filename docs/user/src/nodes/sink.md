@@ -631,6 +631,36 @@ promise. Author enough fields for a total business order before using an exact
 byte comparison; otherwise validate the decoded record multiset and aggregate
 values instead.
 
+### How values are ordered
+
+Every sort uses one rule for comparing two values: a Sink or Source
+`sort_order`, a window's `sort_by`, and the check that verifies a Source's
+declared order. The rule does not depend on the memory limit, so a sort that
+spills to disk writes the same records in the same order as one that fits in
+memory.
+
+- **Nulls** are placed only by `null_order`: first, last or dropped. A missing
+  column counts as a null.
+- **Values of one type** order naturally: numbers by value, strings by UTF-8
+  code point (no locale collation, so `"Z"` sorts before `"a"`), `false` before
+  `true`, and dates and datetimes chronologically. A leap-second datetime sorts
+  with the instant one second later that has the same fraction.
+- **Integers, floats and decimals** compare by their exact value, not through
+  a rounded floating-point copy. The integer `1`, the float `1.0` and the
+  decimal `1.00` are equal. The integer `9007199254740993` sorts after the
+  float `9007199254740992.0`, although the two round to the same float. The
+  decimal `0.1` sorts before the float `0.1`, whose exact binary value is
+  slightly larger.
+- **Zero** has one position: `-0.0` and `0.0` are equal.
+- **NaN** is one value, whatever its sign. It sorts after every number,
+  `inf` included, in ascending order, and so comes first in descending order.
+- **Values of different types**, which a column can hold when an expression's
+  branches produce different types, order by type: booleans, then numbers,
+  then strings, then dates, then datetimes, then arrays, then maps.
+
+Values the rule calls equal keep their arrival order, as described above, at
+every memory limit.
+
 ### Physical writer boundaries
 
 Planning derives the writer boundary from the finalized graph, not from how
