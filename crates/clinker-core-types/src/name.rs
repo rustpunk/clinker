@@ -51,6 +51,29 @@ mod tests {
     }
 
     #[test]
+    fn an_apostrophe_or_a_quote_in_a_name_stays_unambiguous() {
+        assert_eq!("it's src".quoted_name().to_string(), r#""it's src""#);
+        assert_eq!(r#"say "hi""#.quoted_name().to_string(), r#""say \"hi\"""#);
+    }
+
+    #[test]
+    fn a_combining_accent_prints_as_written() {
+        assert_eq!(
+            "cafe\u{301}".quoted_name().to_string(),
+            "\"cafe\u{301}\"",
+            "a decomposed accent is part of the name as the author wrote it"
+        );
+    }
+
+    #[test]
+    fn an_invisible_character_is_shown_as_an_escape() {
+        assert_eq!(
+            "zero\u{200b}width".quoted_name().to_string(),
+            r#""zero\u{200b}width""#
+        );
+    }
+
+    #[test]
     fn owned_and_shared_names_call_it_through_deref() {
         let owned = String::from("sink");
         let shared: std::sync::Arc<str> = std::sync::Arc::from("src");
