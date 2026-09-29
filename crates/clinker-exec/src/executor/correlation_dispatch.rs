@@ -120,7 +120,7 @@ fn commit_one_group(
     // own. A parked collateral (a Combine build-side dead letter held with
     // its failing driver's group) never makes a group dirty by itself; it is
     // only ever parked beside the trigger that condemned it.
-    let Some(first_err) = error_messages.iter().find(|err| err.trigger) else {
+    let Some(first_err) = error_messages.iter().find(|err| err.is_trigger()) else {
         if !error_rows.is_empty() || !error_messages.is_empty() {
             return Err(PipelineError::Internal {
                 op: "correlation-commit",
@@ -165,7 +165,7 @@ fn commit_one_group(
     // role in the group's failure.
     let failing_sources: HashSet<Arc<str>> = error_messages
         .iter()
-        .filter(|err| err.trigger)
+        .filter(|err| err.is_trigger())
         .map(|err| source_name_arc_of(&err.original_record))
         .collect();
 
@@ -388,7 +388,7 @@ fn write_held_failures(
     let mut collaterals: HashSet<(crate::executor::stream_event::SourceRowId, uuid::Uuid)> =
         HashSet::new();
     for err in error_messages {
-        let first_for_its_failure = if err.trigger {
+        let first_for_its_failure = if err.is_trigger() {
             trigger_rows.insert(err.row_num)
         } else {
             collaterals.insert((err.row_num, err.failed_at.trigger_id()))
@@ -406,7 +406,7 @@ fn write_held_failures(
                 original_record: err.original_record.clone(),
                 stage: err.stage.clone(),
                 route: err.route.clone(),
-                trigger: err.trigger,
+                trigger: err.is_trigger(),
                 source_name: source_name_arc_of(&err.original_record),
                 triggering_field: None,
                 triggering_value: None,

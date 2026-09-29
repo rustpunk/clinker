@@ -64,8 +64,7 @@ use std::collections::HashMap;
 use clinker_record::GroupByKey;
 
 use crate::executor::dispatch::{
-    CommitStepPath, CorrelationErrorRecord, CorrelationGroupBuffer, ExecutorContext,
-    commit_correlation_buffers,
+    CommitStepPath, CorrelationGroupBuffer, ExecutorContext, commit_correlation_buffers,
 };
 use clinker_plan::config::CorrelationFanoutPolicy;
 use clinker_plan::error::PipelineError;
@@ -270,16 +269,7 @@ fn archive_iteration_errors(
                 .iter()
                 .any(|e| e.row_num == err.row_num && e.error_message == err.error_message);
             if !already {
-                entry.error_messages.push(CorrelationErrorRecord {
-                    row_num: err.row_num,
-                    original_record: err.original_record.clone(),
-                    category: err.category,
-                    error_message: err.error_message.clone(),
-                    stage: err.stage.clone(),
-                    route: err.route.clone(),
-                    failed_at: err.failed_at,
-                    trigger: err.trigger,
-                });
+                entry.error_messages.push(err.clone());
             }
         }
         for &row in &group.error_rows {

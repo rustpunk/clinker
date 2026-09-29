@@ -139,7 +139,7 @@ pub(crate) fn detect_retract_scope(
         let schema = group
             .error_messages
             .iter()
-            .find(|err| err.trigger)
+            .find(|err| err.is_trigger())
             .map(|err| err.original_record.schema().clone());
         let mut has_source_ck = false;
         let mut had_synthetic_lookup = false;
@@ -246,7 +246,7 @@ pub(crate) fn detect_retract_scope(
         // (a Combine build row held with its failing driver's group) did
         // not fail, so its contributions stay.
         if has_source_ck || !had_synthetic_lookup {
-            for err in group.error_messages.iter().filter(|err| err.trigger) {
+            for err in group.error_messages.iter().filter(|err| err.is_trigger()) {
                 affected_rows.insert(err.row_num);
             }
         }

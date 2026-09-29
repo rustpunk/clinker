@@ -234,6 +234,11 @@ impl DlqFailureStamp {
         self.trigger_id
     }
 
+    /// Whether this stamp is a trigger's: its trigger id is its own id.
+    pub(crate) fn is_trigger(&self) -> bool {
+        self.trigger_id == self.id
+    }
+
     /// When the failure was observed: the row's `_cxl_dlq_timestamp`.
     pub fn at(&self) -> chrono::DateTime<chrono::Utc> {
         self.at
