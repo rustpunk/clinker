@@ -367,14 +367,14 @@ pub struct ReclaimReport {
 /// `requested` bytes beside `charged` bytes already held. Never below
 /// `charged + requested`; saturates at the largest whole MiB a `u64` holds.
 pub fn suggested_limit_floor(charged: u64, requested: u64) -> u64 {
-    charged.saturating_add(requested)
+    round_up_to_mebibyte(charged.saturating_add(requested))
 }
 
 /// `bytes` rounded up to a whole MiB and written the way `memory.limit` and
 /// `--memory-limit` accept it: `<n>G` when the result is a whole number of
 /// GiB, else `<n>M`. The value it names is never below `bytes`.
 pub fn suggested_limit_text(bytes: u64) -> String {
-    let mebibytes = bytes / MIB;
+    let mebibytes = round_up_to_mebibyte(bytes) / MIB;
     if mebibytes > 0 && mebibytes.is_multiple_of(1024) {
         format!("{}G", mebibytes / 1024)
     } else {
@@ -384,7 +384,6 @@ pub fn suggested_limit_text(bytes: u64) -> String {
 
 const MIB: u64 = 1024 * 1024;
 
-#[allow(dead_code)]
 fn round_up_to_mebibyte(bytes: u64) -> u64 {
     match bytes.div_ceil(MIB).checked_mul(MIB) {
         Some(rounded) => rounded,
@@ -480,6 +479,13 @@ impl std::fmt::Display for MemoryShortfallReport {
                         "holders"
                     },
                     Bytes(self.other_holders_bytes)
+                )?;
+            }
+            if self.unattributed_bytes > 0 {
+                write!(
+                    f,
+                    "\n    not held by any one node  {}",
+                    Bytes(self.unattributed_bytes)
                 )?;
             }
         }

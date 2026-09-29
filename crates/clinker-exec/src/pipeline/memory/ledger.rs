@@ -163,8 +163,9 @@ pub struct Shortfall {
     /// A test's armed forced shortfall refused the request.
     forced: bool,
     /// What the walk's reclaim round did before refusing; `None` when the
-    /// request was refused without one.
-    round: Option<RoundRecord>,
+    /// request was refused without one. Boxed: most refusals are retried or
+    /// recovered from, and carry none.
+    round: Option<Box<RoundRecord>>,
 }
 
 impl Shortfall {
@@ -184,8 +185,8 @@ impl Shortfall {
 
     /// Record the reclaim round that ran before this refusal, if one did.
     fn after_round(mut self, round: Option<RoundRecord>) -> Self {
-        if round.is_some() {
-            self.round = round;
+        if let Some(round) = round {
+            self.round = Some(Box::new(round));
         }
         self
     }
@@ -296,7 +297,7 @@ impl Shortfall {
 
         let requested = snapshot.requested;
         Box::new(MemoryShortfallReport {
-            requester: snapshot.requester_label,
+            requester: snapshot.requester_label.map(|label| *label),
             requested_bytes: requested,
             limit_bytes: snapshot.limit,
             charged_bytes: snapshot.charged,
@@ -304,9 +305,9 @@ impl Shortfall {
             holders,
             other_holders_count: u32::try_from(others.len()).unwrap_or(u32::MAX),
             other_holders_bytes,
-            unattributed_bytes: 0,
+            unattributed_bytes: snapshot.unattributed,
             unspillable_bytes,
-            reclaim: reclaim.filter(|_| false),
+            reclaim,
             suggested_limit_bytes: suggested_limit_floor(snapshot.charged, requested),
             oversized: self.oversized
                 || requested.saturating_add(unspillable_bytes) > snapshot.limit,
@@ -353,7 +354,8 @@ pub struct LedgerSnapshot {
     /// The consumer the request was made for, if any.
     pub requester: Option<ConsumerId>,
     /// The label the requesting consumer is recorded under, if it has one.
-    pub requester_label: Option<ConsumerLabel>,
+    /// Boxed: most snapshots are dropped unread.
+    pub requester_label: Option<Box<ConsumerLabel>>,
     /// Labelled consumers holding charged bytes, largest first.
     pub holders: Vec<HolderSnapshot>,
     /// Charged bytes no labelled consumer holds: grants made in no
@@ -385,7 +387,7 @@ fn snapshot(
         charged: ledger.charged(),
         requested,
         requester,
-        requester_label: requester.and_then(|id| ledger.label(id.0).cloned()),
+        requester_label: requester.and_then(|id| ledger.label(id.0).cloned().map(Box::new)),
         holders: holders
             .into_iter()
             .map(|(id, label, charged)| HolderSnapshot {

@@ -277,7 +277,11 @@ fn report_figures_come_from_one_snapshot() {
         std::thread::spawn(move || {
             let mut rounds = 0u64;
             while !stop.load(Ordering::Relaxed) {
-                churn_handle.set_bytes(if rounds % 2 == 0 { 128 * KIB } else { 0 });
+                churn_handle.set_bytes(if rounds.is_multiple_of(2) {
+                    128 * KIB
+                } else {
+                    0
+                });
                 let grant = arbitrator.reserve(32 * KIB, Requester::governed());
                 drop(grant);
                 rounds += 1;
