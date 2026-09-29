@@ -2637,8 +2637,16 @@ pub(crate) fn park_cross_region(
             ),
         });
     };
+    // Rows a region member parks during the commit pass belong to that
+    // iteration; the forward pass's are read by every iteration.
+    let generation = if ctx.in_deferred_dispatch {
+        crate::executor::parked_generations::Generation::CommitPass
+    } else {
+        crate::executor::parked_generations::Generation::Forward
+    };
     crate::executor::parked_generations::ParkedGenerations::park(
         &ctx.parked_generations,
+        generation,
         (active_body, edge_id),
         rows,
         current_dag.graph[producer_idx].name(),

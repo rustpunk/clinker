@@ -106,16 +106,44 @@ pub(crate) struct DlqEvent {
 /// `ctx.correlation_max_group_buffer` directly, and the per-group
 /// emission shape carries enough context in the buffer cell itself
 /// to format DLQ trigger messages without the carrier's name.
+///
+/// However it returns, the commit releases every row the run parked for a
+/// deferred consumer before it does: once the commit is over nothing reads
+/// them again.
 pub(crate) fn orchestrate(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
 ) -> Result<(), PipelineError> {
-    if !is_relaxed_pipeline(ctx, current_dag) {
+    #[cfg(test)]
+    let parked_before = ctx.parked_generations.borrow().consumer_ids();
+    let result = if is_relaxed_pipeline(ctx, current_dag) {
+        ctx.commit_step_path = CommitStepPath::ThreePhase;
+        orchestrate_relaxed(ctx, current_dag)
+    } else {
         ctx.commit_step_path = CommitStepPath::FastPath;
-        return commit_correlation_buffers(ctx, current_dag);
-    }
-    ctx.commit_step_path = CommitStepPath::ThreePhase;
+        commit_correlation_buffers(ctx, current_dag)
+    };
+    ctx.parked_generations.borrow_mut().release_all();
+    #[cfg(test)]
+    COMMIT_OBSERVATION.with(|observed| {
+        observed.set(Some(CommitObservation {
+            parked_edges_before: parked_before.len(),
+            parked_edges_after: ctx.parked_generations.borrow().edge_count(),
+            parked_consumers_still_registered: parked_before
+                .iter()
+                .filter(|id| ctx.memory_budget.registered_consumer(**id).is_some())
+                .count(),
+        }));
+    });
+    result
+}
 
+/// The cascading-retraction commit of a relaxed pipeline, described in the
+/// module-level docs.
+fn orchestrate_relaxed(
+    ctx: &mut ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
+) -> Result<(), PipelineError> {
     // Initial detect — every source row already in the trigger set
     // before any deferred-dispatch iteration.
     let mut scope = detect::detect_retract_scope(ctx, current_dag);
@@ -188,6 +216,9 @@ pub(crate) fn orchestrate(
         }
         iter += 1;
         ctx.counters.retraction.iterations += 1;
+        // What the previous iteration's commit pass parked between regions
+        // was that iteration's; this iteration's members park their own.
+        ctx.parked_generations.borrow_mut().start_iteration();
 
         recompute_agg::recompute_aggregates(ctx, current_dag, &scope, &iteration_rows)?;
         // The deferred-region members route per-record errors into the

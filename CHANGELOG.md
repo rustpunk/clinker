@@ -127,6 +127,24 @@ and applies the `null_order` written there, `last` by default for `asc` and
 
 Closes [#1281](https://github.com/rustpunk/clinker/issues/1281).
 
+### Fixed — a relaxed-key commit that recomputes reads its held inputs on every recompute
+
+When an aggregate's `group_by` omits a correlation-key field, the steps below
+it run at the commit and run again for every recompute a failure triggers.
+Rows they read from elsewhere in the pipeline — the other input of a
+Combine fed by a Source, a Route branch, a Cull port or a composition body's
+input — were lost after the first pass, so a pipeline that needed a second
+recompute stopped with an internal error ("planned input … was
+unavailable"). Every recompute now reads those rows again, unchanged and in
+arrival order. The same pipelines also stopped with an internal error when
+two such aggregates fed one step, or when the held input came from inside a
+composition body; both now run.
+
+The held rows now count against `memory.limit` and may spill to disk under
+memory pressure, instead of being checked only against the process's
+resident memory. A Route or Cull that feeds a deferred step no longer stops
+the run with an E310 naming its process memory.
+
 ### Changed — null_order: drop is accepted only on a Sink sort_order
 
 `null_order: drop` excludes records whose key is null, which only a Sink's

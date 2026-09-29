@@ -33,7 +33,7 @@
 //! stack disambiguates body-local edge ids from parent edge ids that
 //! happen to number the same.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use clinker_record::Record;
 use petgraph::Direction;
@@ -44,8 +44,8 @@ use super::DlqEvent;
 use super::detect::RetractScope;
 use crate::executor::dispatch::{
     DlqCaptureMark, ExecutorContext, NodeBufferKey, admit_node_buffer,
-    admit_node_buffer_transferred, dispatch_plan_node, drain_node_buffer_slot,
-    estimate_node_buffer_unaccounted_bytes, node_buffer_spill_allowed,
+    admit_node_buffer_transferred, crosses_into_deferred_consumer, dispatch_plan_node,
+    drain_node_buffer_slot, estimate_node_buffer_unaccounted_bytes, node_buffer_spill_allowed,
     planned_materialized_reader_counts, publish_node_buffer_view, require_node_buffer_input,
     validate_completed_node_buffer_scope,
 };
@@ -172,17 +172,60 @@ fn dispatch_deferred_inner(
 
 /// The producers of `current_dag`'s deferred regions, in the order the
 /// commit walks their regions, each once.
+///
+/// Every participating node belongs to the one region
+/// `ExecutionPlanDag::deferred_region_at` names, even where the regions of
+/// two relaxed aggregates overlap downstream. An edge from a node of one
+/// region into a node of another carries rows the first parks for the
+/// second, so the first is walked before the second; regions with no such
+/// edge between them follow their producers' topological order, never map
+/// order. The edges between regions always run the same way (from the
+/// region the planner registered first), so the order exists; should it
+/// not, the regions left over follow in topological order.
 pub(crate) fn region_walk_order(current_dag: &ExecutionPlanDag) -> Vec<NodeIndex> {
-    // `current_dag.deferred_regions` keys every participating NodeIndex
-    // (producer + members + outputs) to a shared `DeferredRegion`, so
-    // deduplicate by producer to walk each region exactly once.
-    let mut walked_producers: HashSet<NodeIndex> = HashSet::new();
-    current_dag
+    let owner = |node: NodeIndex| {
+        current_dag
+            .deferred_region_at(node)
+            .map(|region| region.producer)
+    };
+    let mut topo_position: HashMap<NodeIndex, usize> = HashMap::new();
+    let mut topo_walk = Topo::new(&current_dag.graph);
+    while let Some(node) = topo_walk.next(&current_dag.graph) {
+        let next = topo_position.len();
+        topo_position.insert(node, next);
+    }
+    let position = |node: &NodeIndex| topo_position.get(node).copied().unwrap_or(usize::MAX);
+
+    let producers: BTreeSet<(usize, NodeIndex)> = current_dag
         .deferred_regions
         .values()
-        .map(|region| region.producer)
-        .filter(|producer| walked_producers.insert(*producer))
-        .collect()
+        .map(|region| (position(&region.producer), region.producer))
+        .collect();
+    let mut reads_from: HashMap<NodeIndex, HashSet<NodeIndex>> = HashMap::new();
+    for edge in current_dag.graph.edge_references() {
+        if let (Some(from), Some(to)) = (owner(edge.source()), owner(edge.target()))
+            && from != to
+        {
+            reads_from.entry(to).or_default().insert(from);
+        }
+    }
+
+    let mut order: Vec<NodeIndex> = Vec::with_capacity(producers.len());
+    let mut pending = producers;
+    while let Some(ready) = pending
+        .iter()
+        .find(|(_, producer)| {
+            reads_from
+                .get(producer)
+                .is_none_or(|sources| sources.iter().all(|source| order.contains(source)))
+        })
+        .or_else(|| pending.first())
+        .copied()
+    {
+        pending.remove(&ready);
+        order.push(ready.1);
+    }
+    order
 }
 
 /// Walk one region's members in topological order over a sub-graph
@@ -203,12 +246,21 @@ fn dispatch_one_region(
     // The producer itself is NOT redispatched — its `node_buffers`
     // slot is already populated by `recompute_aggregates` with the
     // post-recompute narrow rows. Members and outputs run.
+    // Where the regions of two relaxed aggregates overlap downstream, a node
+    // is in both regions' member sets but belongs to one of them; it runs
+    // once per iteration, in the walk of the region it belongs to, reading
+    // what the other region parked for it.
     let in_region: HashSet<NodeIndex> = region
         .members
         .iter()
         .chain(region.outputs.iter())
         .chain(std::iter::once(&region.producer))
         .copied()
+        .filter(|&node| {
+            current_dag
+                .deferred_region_at(node)
+                .is_some_and(|owner| owner.producer == region.producer)
+        })
         .collect();
 
     let mut topo_walk = Topo::new(&current_dag.graph);
@@ -260,7 +312,7 @@ fn dispatch_one_region(
             // do not redispatch.
             continue;
         }
-        seed_cross_region_inputs_for(ctx, current_dag, idx, region, active_body)?;
+        seed_cross_region_inputs_for(ctx, current_dag, idx, active_body)?;
         let capture = ctx.dlq.arm_capture();
         // Count one partition emit per windowed-Transform member
         // dispatched on the commit pass. Each such Transform
@@ -302,10 +354,10 @@ fn drain_dlq_capture(
         .take_capture(capture, |source_row| events.push(DlqEvent { source_row }));
 }
 
-/// For each in-edge of `consumer_idx` whose source is OUTSIDE the
-/// region (or in a different region), publish a fresh cursor over the rows
-/// parked for `(active_body, edge_idx)`. Internal-region edges are skipped
-/// — `node_buffers` already carries those records from the upstream
+/// For each in-edge of `consumer_idx` whose rows were parked (its source is
+/// outside every region, or in another region), publish a fresh cursor over
+/// the rows parked for `(active_body, edge_idx)`. Internal-region edges are
+/// skipped — `node_buffers` already carries those records from the upstream
 /// member's emit on this same commit pass.
 ///
 /// The Combine arm (and any other multi-input member) reads its inputs
@@ -319,25 +371,16 @@ fn seed_cross_region_inputs_for(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     consumer_idx: NodeIndex,
-    region: &DeferredRegion,
     active_body: Option<CompositionBodyId>,
 ) -> Result<(), PipelineError> {
+    // Exactly the edges whose rows were parked: the one predicate decides
+    // both, so an in-region edge (whose rows `node_buffers` carries from
+    // this same commit pass) is never looked for among the parked ones.
     let crossings: Vec<(NodeIndex, EdgeIndex)> = current_dag
         .graph
         .edges_directed(consumer_idx, Direction::Incoming)
-        .filter_map(|e| {
-            let source = e.source();
-            // Skip in-region edges — node_buffers already carries the
-            // upstream member's commit-pass emit.
-            let in_region = region.members.contains(&source)
-                || region.outputs.contains(&source)
-                || source == region.producer;
-            if in_region {
-                None
-            } else {
-                Some((source, e.id()))
-            }
-        })
+        .filter(|e| crosses_into_deferred_consumer(current_dag, e.source(), consumer_idx))
+        .map(|e| (e.source(), e.id()))
         .collect();
 
     for (source_idx, edge_id) in crossings {

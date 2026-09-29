@@ -17,6 +17,12 @@
 //! disk. Any reclaim pass on the walk can spill an edge the arbitrator
 //! elects. A spill is recorded against the producer once, when it is
 //! written; reading it again on a later iteration charges nothing more.
+//!
+//! Rows parked on the forward pass are read by every iteration of the
+//! commit. Rows a region member parks during the commit pass itself, for a
+//! member of another region, belong to that iteration only: they are kept
+//! in a generation of their own, which the next iteration discards before it
+//! parks its own.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -46,6 +52,16 @@ pub(crate) type ParkedKey = (Option<CompositionBodyId>, EdgeIndex);
 /// are the store's without borrowing the store.
 pub(crate) type ParkedIndex = Rc<RefCell<HashMap<ConsumerId, Arc<ConsumerHandle>>>>;
 
+/// Which pass parked a crossing edge's rows, and so how long they live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Generation {
+    /// Parked on the forward pass: read by every iteration of the commit.
+    Forward,
+    /// Parked by a region member during one iteration of the commit: read by
+    /// that iteration only.
+    CommitPass,
+}
+
 /// The run's parked cross-region rows, by crossing edge.
 ///
 /// Run-scoped and walk-only. Every edge's consumer is unregistered and every
@@ -56,7 +72,10 @@ pub(crate) struct ParkedGenerations {
     spill_root: Arc<Path>,
     spill_compress: CompressMode,
     batch_size: usize,
+    /// Rows parked on the forward pass.
     forward: HashMap<ParkedKey, ParkedEdge>,
+    /// Rows parked during the running iteration of the commit.
+    commit_pass: HashMap<ParkedKey, ParkedEdge>,
     index: ParkedIndex,
 }
 
@@ -195,6 +214,7 @@ impl ParkedGenerations {
             spill_compress,
             batch_size,
             forward: HashMap::new(),
+            commit_pass: HashMap::new(),
             index: Rc::new(RefCell::new(HashMap::new())),
         }
     }
@@ -205,7 +225,7 @@ impl ParkedGenerations {
     }
 
     /// Park a copy of `rows` for the crossing edge `key`, from the node named
-    /// `from` into the deferred consumer named `to`.
+    /// `from` into the deferred consumer named `to`, in `generation`.
     ///
     /// The first park on an edge registers its consumer, even for no rows, so
     /// the commit reads an empty input rather than a missing one. A spill
@@ -218,17 +238,18 @@ impl ParkedGenerations {
     /// is never refused for memory; past the spill cap it fails with E320.
     pub(crate) fn park(
         store: &Rc<RefCell<Self>>,
+        generation: Generation,
         key: ParkedKey,
         rows: &[(Record, SourceRowId)],
         from: &str,
         to: &str,
     ) -> Result<(), PipelineError> {
-        let handle = store.borrow_mut().edge_handle(key, from, to);
+        let handle = store.borrow_mut().edge_handle(generation, key, from, to);
         if rows.is_empty() {
             return Ok(());
         }
         if handle.take_spill_request() {
-            store.borrow_mut().spill_edge(&key)?;
+            store.borrow_mut().spill_edge(generation, &key)?;
         }
         let segment = NodeBuffer::memory_from_records(
             rows.iter()
@@ -241,19 +262,41 @@ impl ParkedGenerations {
         let charged = if handle.try_grow(bytes).is_ok() {
             bytes
         } else {
-            store.borrow_mut().spill_edge(&key)?;
+            store.borrow_mut().spill_edge(generation, &key)?;
             if handle.try_grow(bytes).is_ok() {
                 bytes
             } else {
                 0
             }
         };
-        store.borrow_mut().append(key, segment, charged)
+        store.borrow_mut().append(generation, key, segment, charged)
     }
 
-    /// The consumer handle of edge `key`, registering the edge on first use.
-    fn edge_handle(&mut self, key: ParkedKey, from: &str, to: &str) -> Arc<ConsumerHandle> {
-        if let Some(edge) = self.forward.get(&key) {
+    /// The edges parked in `generation`.
+    fn edges(&self, generation: Generation) -> &HashMap<ParkedKey, ParkedEdge> {
+        match generation {
+            Generation::Forward => &self.forward,
+            Generation::CommitPass => &self.commit_pass,
+        }
+    }
+
+    fn edges_mut(&mut self, generation: Generation) -> &mut HashMap<ParkedKey, ParkedEdge> {
+        match generation {
+            Generation::Forward => &mut self.forward,
+            Generation::CommitPass => &mut self.commit_pass,
+        }
+    }
+
+    /// The consumer handle of edge `key` in `generation`, registering the
+    /// edge on first use.
+    fn edge_handle(
+        &mut self,
+        generation: Generation,
+        key: ParkedKey,
+        from: &str,
+        to: &str,
+    ) -> Arc<ConsumerHandle> {
+        if let Some(edge) = self.edges(generation).get(&key) {
             return Arc::clone(&edge.handle);
         }
         let handle = ConsumerHandle::new();
@@ -275,7 +318,7 @@ impl ParkedGenerations {
         self.index
             .borrow_mut()
             .insert(consumer, Arc::clone(&handle));
-        self.forward.insert(
+        self.edges_mut(generation).insert(
             key,
             ParkedEdge {
                 consumer,
@@ -293,6 +336,7 @@ impl ParkedGenerations {
     /// was charged for is written to disk first.
     fn append(
         &mut self,
+        generation: Generation,
         key: ParkedKey,
         segment: NodeBuffer,
         charged: u64,
@@ -303,7 +347,7 @@ impl ParkedGenerations {
             (segment, 0)
         };
         let producer = self
-            .forward
+            .edges(generation)
             .get(&key)
             .map(|edge| edge.producer.clone())
             .ok_or_else(|| unregistered_edge(&key))?;
@@ -311,7 +355,7 @@ impl ParkedGenerations {
         // quota bytes are released with the segment like any other's.
         let recorded = self.record_spill(&producer, file_bytes);
         let edge = self
-            .forward
+            .edges_mut(generation)
             .get_mut(&key)
             .ok_or_else(|| unregistered_edge(&key))?;
         match (edge.segments.last_mut(), segment) {
@@ -342,27 +386,33 @@ impl ParkedGenerations {
     /// store's; `None` when it is not. A reclaim pass on the walk calls it
     /// for an elected edge.
     pub(crate) fn spill_consumer(&mut self, id: ConsumerId) -> Result<Option<u64>, PipelineError> {
-        let Some(key) = self
-            .forward
-            .iter()
-            .find(|(_, edge)| edge.consumer == id)
-            .map(|(key, _)| *key)
-        else {
-            return Ok(None);
-        };
-        self.spill_edge(&key).map(Some)
+        for generation in [Generation::Forward, Generation::CommitPass] {
+            let found = self
+                .edges(generation)
+                .iter()
+                .find(|(_, edge)| edge.consumer == id)
+                .map(|(key, _)| *key);
+            if let Some(key) = found {
+                return self.spill_edge(generation, &key).map(Some);
+            }
+        }
+        Ok(None)
     }
 
     /// Spill every resident segment of edge `key` that no cursor is reading,
     /// releasing its charge; returns the bytes released. A segment a live
     /// cursor shares stays resident: writing it out would free nothing.
-    pub(crate) fn spill_edge(&mut self, key: &ParkedKey) -> Result<u64, PipelineError> {
+    pub(crate) fn spill_edge(
+        &mut self,
+        generation: Generation,
+        key: &ParkedKey,
+    ) -> Result<u64, PipelineError> {
         let (root, compress, batch_size) = (
             Arc::clone(&self.spill_root),
             self.spill_compress,
             self.batch_size,
         );
-        let Some(edge) = self.forward.get_mut(key) else {
+        let Some(edge) = self.edges_mut(generation).get_mut(key) else {
             return Ok(0);
         };
         let mut freed = 0u64;
@@ -426,23 +476,37 @@ impl ParkedGenerations {
     }
 
     /// A cursor over every row parked for edge `key`, segment by segment in
-    /// the order they were parked; `None` when nothing was ever parked for
-    /// it. The segments stay here, so every later call reads the same rows
-    /// again. The cursor shares the segments' backing: it adds no charge, and
-    /// while it lives a spill of the edge cannot free the segments it reads.
+    /// the order they were parked, the forward pass's before the running
+    /// iteration's; `None` when nothing was parked for it in either. The
+    /// segments stay here, so every later call reads the same rows again. The
+    /// cursor shares the segments' backing: it adds no charge, and while it
+    /// lives a spill of the edge cannot free the segments it reads.
     pub(crate) fn publish_view(
         &mut self,
         key: &ParkedKey,
     ) -> Result<Option<NodeBuffer>, PipelineError> {
-        let Some(edge) = self.forward.get_mut(key) else {
-            return Ok(None);
-        };
-        let mut parts = Vec::with_capacity(edge.segments.len());
-        for segment in &mut edge.segments {
-            parts.push(segment.buffer.reread_backing()?);
+        let mut parts = Vec::new();
+        let mut parked = false;
+        for generation in [Generation::Forward, Generation::CommitPass] {
+            let Some(edge) = self.edges_mut(generation).get_mut(key) else {
+                continue;
+            };
+            parked = true;
+            for segment in &mut edge.segments {
+                parts.push(segment.buffer.reread_backing()?);
+            }
+            edge.publish_reclaimable();
         }
-        edge.publish_reclaimable();
-        Ok(Some(NodeBuffer::chained(parts)))
+        Ok(parked.then(|| NodeBuffer::chained(parts)))
+    }
+
+    /// Begin a retraction iteration of the commit: release the rows the
+    /// previous iteration's commit pass parked, which this iteration parks
+    /// afresh.
+    pub(crate) fn start_iteration(&mut self) {
+        for (_, edge) in std::mem::take(&mut self.commit_pass) {
+            self.release_edge(edge);
+        }
     }
 
     /// Edge `key`'s consumer and the handle it charges.
@@ -456,9 +520,27 @@ impl ParkedGenerations {
             .map(|edge| (edge.consumer, Arc::clone(&edge.handle)))
     }
 
-    /// Release every parked edge: drop its rows and spill files, release its
-    /// charge and its disk-quota bytes, and unregister its consumer.
+    /// Every parked edge, in either generation.
+    #[cfg(test)]
+    pub(crate) fn edge_count(&self) -> usize {
+        self.forward.len() + self.commit_pass.len()
+    }
+
+    /// Every parked edge's consumer, in either generation.
+    #[cfg(test)]
+    pub(crate) fn consumer_ids(&self) -> Vec<ConsumerId> {
+        self.forward
+            .values()
+            .chain(self.commit_pass.values())
+            .map(|edge| edge.consumer)
+            .collect()
+    }
+
+    /// Release every parked edge of both generations: drop its rows and
+    /// spill files, release its charge and its disk-quota bytes, and
+    /// unregister its consumer. The store stays usable.
     pub(crate) fn release_all(&mut self) {
+        self.start_iteration();
         for (_, edge) in std::mem::take(&mut self.forward) {
             self.release_edge(edge);
         }
@@ -569,13 +651,29 @@ mod tests {
         let consumers_before = arbitrator.consumer_count();
 
         let key: ParkedKey = (None, EdgeIndex::new(4));
-        ParkedGenerations::park(&store, key, &first, "lookup", "enriched").expect("first park");
+        ParkedGenerations::park(
+            &store,
+            Generation::Forward,
+            key,
+            &first,
+            "lookup",
+            "enriched",
+        )
+        .expect("first park");
         let view = store
             .borrow_mut()
             .publish_view(&key)
             .expect("view")
             .expect("the edge has rows");
-        ParkedGenerations::park(&store, key, &second, "lookup", "enriched").expect("second park");
+        ParkedGenerations::park(
+            &store,
+            Generation::Forward,
+            key,
+            &second,
+            "lookup",
+            "enriched",
+        )
+        .expect("second park");
         let (consumer, handle) = store.borrow().edge_consumer(&key).expect("registered");
         assert_eq!(handle.bytes(), first_bytes + second_bytes);
         let registered = arbitrator
@@ -714,8 +812,15 @@ mod tests {
         let consumers_before = walk.arbitrator.consumer_count();
         let key: ParkedKey = (None, EdgeIndex::new(1));
         for rows in &chunks {
-            ParkedGenerations::park(&walk.store, key, rows, "lookup", "enriched")
-                .expect("a park is never refused for memory");
+            ParkedGenerations::park(
+                &walk.store,
+                Generation::Forward,
+                key,
+                rows,
+                "lookup",
+                "enriched",
+            )
+            .expect("a park is never refused for memory");
         }
         let (_, handle) = walk.store.borrow().edge_consumer(&key).expect("edge");
         assert_eq!(handle.bytes(), 0, "every parked row is on disk");
@@ -758,7 +863,15 @@ mod tests {
         let walk = parked_walk(64 * 1024 * 1024, root.path());
         let key: ParkedKey = (None, EdgeIndex::new(1));
         for rows in &chunks {
-            ParkedGenerations::park(&walk.store, key, rows, "lookup", "enriched").expect("park");
+            ParkedGenerations::park(
+                &walk.store,
+                Generation::Forward,
+                key,
+                rows,
+                "lookup",
+                "enriched",
+            )
+            .expect("park");
         }
         let (_, handle) = walk.store.borrow().edge_consumer(&key).expect("edge");
         assert_eq!(handle.bytes(), parked_bytes);
