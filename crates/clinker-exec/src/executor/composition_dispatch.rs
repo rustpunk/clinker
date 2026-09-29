@@ -307,7 +307,7 @@ fn collect_port_records(
         )?;
         // Composition port seeding takes records only; the body operates in
         // its own document-boundary scope and re-emits at the call site.
-        let (input, reservation) = input.into_parts();
+        let (input, reservation) = input.into_parts()?;
         let materialized_bytes =
             input.materialization_bytes_without_transfer(&ctx.allocation_resources);
         let transferred_overlap_bytes = input.transferred_materialization_overlap_bytes();

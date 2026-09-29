@@ -1367,7 +1367,7 @@ fn drain_sink_input_event_iter(
     let (input, reservation) = if materializes {
         input.into_materialized_parts(&ctx.memory_budget, name)?
     } else {
-        input.into_parts()
+        input.into_parts()?
     };
     Ok(SinkInputEventIter {
         events: Box::new(input.drain()),

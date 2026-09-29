@@ -236,7 +236,7 @@ where
             "composition input",
             None,
         )?;
-        let (seeded, reservation) = seeded.into_parts();
+        let (seeded, reservation) = seeded.into_parts()?;
         // Body-context port source — records were seeded by
         // `execute_composition_body` from parent-scope
         // output. The seeded records still carry the parent

@@ -2737,6 +2737,10 @@ pub(crate) fn missing_node_buffer_input_error(
 /// One materialized slot read plus the optional reservation for its resident
 /// scan materialization. The guard must remain live through the consumer's
 /// complete synchronous operation.
+///
+/// A read of a slot that later readers still need is pending until the
+/// consumer says how it reads: until then it has no cursor on the slot and is
+/// not counted as a read.
 #[must_use = "a materialized input must retain its scan reservation"]
 pub(crate) struct NodeBufferInput {
     read: NodeBufferRead,
@@ -2750,20 +2754,24 @@ enum NodeBufferRead {
         buffer: NodeBuffer,
         reservation: Option<TransientNodeBufferReservation>,
     },
-    /// A sequential cursor over a slot later readers still need.
-    Shared(NodeBuffer),
+    /// A read of a slot later readers still need.
+    Shared(PendingSharedRead),
 }
 
 impl NodeBufferInput {
-    /// Split the input from its optional materialization/transfer lifetime guard.
-    pub(crate) fn into_parts(self) -> (NodeBuffer, Option<TransientNodeBufferReservation>) {
+    /// Split the input from its optional materialization/transfer lifetime
+    /// guard, for a consumer that streams the input rather than collecting
+    /// it. A read of a shared slot takes its cursor here and is counted.
+    pub(crate) fn into_parts(
+        self,
+    ) -> Result<(NodeBuffer, Option<TransientNodeBufferReservation>), PipelineError> {
         match self.read {
             NodeBufferRead::Last {
                 buffer,
                 reservation,
                 ..
-            } => (buffer, reservation),
-            NodeBufferRead::Shared(cursor) => (cursor, None),
+            } => Ok((buffer, reservation)),
+            NodeBufferRead::Shared(pending) => Ok((pending.take_cursor()?, None)),
         }
     }
 
@@ -2771,6 +2779,13 @@ impl NodeBufferInput {
     /// resident vector. A standalone reservation covers the materialized
     /// footprint when ownership was not transferred; a transferred
     /// registration charges only the representation overlap.
+    ///
+    /// A read of a shared slot reserves its copy first, while the slot is
+    /// still in the walk reclaim set with no cursor on it, so the reclaim
+    /// pass that reservation may start can spill the shared slot like any
+    /// other. It takes its cursor (from disk, if the slot spilled) and is
+    /// counted as a read only once the reservation is granted; a refused
+    /// reservation leaves the slot and its reader count as they were.
     pub(crate) fn into_materialized_parts(
         self,
         budget: &Arc<crate::pipeline::memory::MemoryArbitrator>,
@@ -2798,50 +2813,104 @@ impl NodeBufferInput {
                 };
                 Ok((buffer, Some(reservation)))
             }
-            NodeBufferRead::Shared(cursor) => {
+            NodeBufferRead::Shared(pending) => {
                 let reservation =
                     crate::executor::node_buffer::reserve_node_buffer_materialization(
-                        cursor.estimated_materialized_bytes(),
+                        pending.copy_bytes()?,
                         budget,
                         node,
                     )?;
-                Ok((cursor, Some(reservation)))
+                Ok((pending.take_cursor()?, Some(reservation)))
             }
         }
     }
 }
 
-/// Read the slot at `key` of the walk reclaim set `reclaim` for `reader`,
-/// when more readers than this one still need it.
+/// A read of a slot that later readers still need, not yet taken: the slot
+/// stays in the walk reclaim set, uncounted and with no cursor on it, so a
+/// reclaim pass may still spill it.
+///
+/// Holds the walk's reclaim set handle, so it is walk-only (`!Send`), like
+/// the set. It borrows the set only briefly and never across a reservation.
+struct PendingSharedRead {
+    reclaim: std::rc::Rc<std::cell::RefCell<crate::pipeline::memory::walk::WalkReclaimSet>>,
+    key: NodeBufferKey,
+    reader: Box<str>,
+}
+
+impl PendingSharedRead {
+    /// The bytes this reader's collected copy of the slot will hold. The
+    /// estimate counts every row at its decoded size, so it is the same
+    /// whether the slot is resident or on disk, and so whether or not a pass
+    /// spills the slot before the copy is made.
+    fn copy_bytes(&self) -> Result<u64, PipelineError> {
+        let set = self.reclaim.borrow();
+        let buffer = set
+            .slots()
+            .buffer(&self.key)
+            .ok_or_else(|| self.slot_missing())?;
+        Ok(buffer.estimated_materialized_bytes())
+    }
+
+    /// Take this reader's cursor on the slot, which stays published for the
+    /// readers after it, and count the read.
+    fn take_cursor(self) -> Result<NodeBuffer, PipelineError> {
+        // Making a slot re-readable can fold spilled runs, which allocates
+        // under the run's budget, so the slot leaves the walk reclaim set for
+        // the conversion and goes back whatever its outcome.
+        let taken = self
+            .reclaim
+            .borrow_mut()
+            .slots_mut()
+            .remove_buffer(&self.key);
+        let mut shared = taken.ok_or_else(|| self.slot_missing())?;
+        let cursor = shared.reread();
+        self.reclaim
+            .borrow_mut()
+            .slots_mut()
+            .insert_buffer(self.key.clone(), shared);
+        let cursor = cursor?;
+        self.reclaim
+            .borrow_mut()
+            .slots_mut()
+            .readers_mut()
+            .complete_clone(&self.key, &self.reader)?;
+        Ok(cursor)
+    }
+
+    #[cold]
+    fn slot_missing(&self) -> PipelineError {
+        node_buffer_reader_mismatch_error(
+            &self.reader,
+            &self.key,
+            "slot disappeared after reader-ledger validation",
+        )
+    }
+}
+
+/// Open a read of the slot at `key` of the walk reclaim set `reclaim` for
+/// `reader`, when more readers than this one still need it.
+///
+/// The read stays pending: the slot is neither re-read nor counted until the
+/// consumer resolves the input through [`NodeBufferInput::into_parts`] or
+/// [`NodeBufferInput::into_materialized_parts`]. Fails when the slot is not
+/// published in `reclaim`.
 pub(crate) fn shared_node_buffer_read(
     reclaim: &std::rc::Rc<std::cell::RefCell<crate::pipeline::memory::walk::WalkReclaimSet>>,
     key: NodeBufferKey,
     reader: &str,
 ) -> Result<NodeBufferInput, PipelineError> {
-    // Making a slot re-readable can fold spilled runs, which allocates under
-    // the run's budget, so the slot leaves the walk reclaim set for the
-    // conversion and goes back whatever its outcome.
-    let taken = reclaim.borrow_mut().slots_mut().remove_buffer(&key);
-    let mut shared = taken.ok_or_else(|| {
-        node_buffer_reader_mismatch_error(
-            reader,
-            &key,
-            "slot disappeared after reader-ledger validation",
-        )
-    })?;
-    let buffer = shared.reread();
-    reclaim
-        .borrow_mut()
-        .slots_mut()
-        .insert_buffer(key.clone(), shared);
-    let buffer = buffer?;
-    reclaim
-        .borrow_mut()
-        .slots_mut()
-        .readers_mut()
-        .complete_clone(&key, reader)?;
+    let published = reclaim.borrow().slots().contains_buffer(&key);
+    let pending = PendingSharedRead {
+        reclaim: std::rc::Rc::clone(reclaim),
+        key,
+        reader: reader.into(),
+    };
+    if !published {
+        return Err(pending.slot_missing());
+    }
     Ok(NodeBufferInput {
-        read: NodeBufferRead::Shared(buffer),
+        read: NodeBufferRead::Shared(pending),
     })
 }
 
@@ -2888,8 +2957,10 @@ pub(crate) fn validate_completed_node_buffer_scope(
 /// Read one published materialized slot according to its producer-declared
 /// remaining-reader count.
 ///
-/// Earlier readers receive a sequential scan and decrement only after that
-/// scan is acquired. The last reader removes the authoritative slot and
+/// Earlier readers receive a pending read ([`shared_node_buffer_read`]) that
+/// takes its sequential scan, and decrements the count, only when the
+/// consumer resolves it; a materializing consumer reserves its copy first.
+/// The last reader removes the authoritative slot and
 /// transfers its ordinary node-buffer registration. A present empty buffer is a
 /// valid zero-row input; missing, zero, or inconsistent ledger state fails as
 /// an internal executor invariant instead of becoming an empty stream.
