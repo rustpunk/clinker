@@ -422,6 +422,233 @@ fn test_max_strings() {
     assert_eq!(a.finalize().unwrap(), Value::String("c".into()));
 }
 
+// ---------- Min/Max on the value order ----------
+
+/// Every ordering of `items`.
+fn permutations(items: &[Value]) -> Vec<Vec<Value>> {
+    if items.len() <= 1 {
+        return vec![items.to_vec()];
+    }
+    let mut all = Vec::new();
+    for i in 0..items.len() {
+        let mut rest = items.to_vec();
+        let first = rest.remove(i);
+        for mut tail in permutations(&rest) {
+            tail.insert(0, first.clone());
+            all.push(tail);
+        }
+    }
+    all
+}
+
+/// Whether `a` and `b` are the same value down to a float's sign and payload
+/// bits and a decimal's scale and sign, which `Value`'s `==` does not see.
+fn identical(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
+        (Value::Decimal(x), Value::Decimal(y)) => x.serialize() == y.serialize(),
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| identical(p, q))
+        }
+        (Value::Map(x), Value::Map(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y.iter())
+                    .all(|((kx, vx), (ky, vy))| kx.as_str() == ky.as_str() && identical(vx, vy))
+        }
+        _ => a == b,
+    }
+}
+
+fn assert_identical(actual: &Value, expected: &Value, context: &str) {
+    assert!(
+        identical(actual, expected),
+        "{context}: got {actual:?}, expected {expected:?}"
+    );
+}
+
+fn fold(make: fn() -> AccumulatorEnum, values: &[Value]) -> AccumulatorEnum {
+    let mut acc = make();
+    add_all(&mut acc, values);
+    acc
+}
+
+/// `min` and `max` over two values, in both arrival orders.
+fn assert_min_max(values: [Value; 2], lo: &Value, hi: &Value) {
+    let [a, b] = values;
+    for order in [[a.clone(), b.clone()], [b, a]] {
+        let context = format!("{order:?}");
+        assert_identical(&fold(min, &order).finalize().unwrap(), lo, &context);
+        assert_identical(&fold(max, &order).finalize().unwrap(), hi, &context);
+    }
+}
+
+#[test]
+fn min_max_do_not_depend_on_arrival_order() {
+    let values = [
+        Value::Integer(0),
+        Value::Float(-0.0),
+        Value::Float(0.0),
+        Value::Integer(1),
+        Value::Float(1.0),
+        dec(100, 2),
+        Value::Float(f64::NAN),
+        Value::Null,
+    ];
+    let lo = Value::Integer(0);
+    let hi = Value::Float(f64::NAN);
+    let folds: [(fn() -> AccumulatorEnum, &Value); 2] = [(min, &lo), (max, &hi)];
+    for order in permutations(&values) {
+        for (make, expected) in folds {
+            let context = format!("{order:?}");
+            assert_identical(&fold(make, &order).finalize().unwrap(), expected, &context);
+            // Split into two partial states at every point, merged both ways.
+            for at in 0..=order.len() {
+                let (left, right) = order.split_at(at);
+                let mut ab = fold(make, left);
+                ab.merge(&fold(make, right));
+                let mut ba = fold(make, right);
+                ba.merge(&fold(make, left));
+                let context = format!("{left:?} | {right:?}");
+                assert_identical(&ab.finalize().unwrap(), expected, &context);
+                assert_identical(&ba.finalize().unwrap(), expected, &context);
+            }
+        }
+    }
+}
+
+#[test]
+fn min_max_follow_the_one_order() {
+    const TWO_POW_53: i64 = 1 << 53;
+    // Exact across integer and float: 2^53 + 1 is above the float 2^53.
+    assert_min_max(
+        [
+            Value::Integer(TWO_POW_53 + 1),
+            Value::Float(TWO_POW_53 as f64),
+        ],
+        &Value::Float(TWO_POW_53 as f64),
+        &Value::Integer(TWO_POW_53 + 1),
+    );
+    // A float after an integer is compared, not skipped.
+    assert_min_max(
+        [Value::Integer(5), Value::Float(3.0)],
+        &Value::Float(3.0),
+        &Value::Integer(5),
+    );
+    // Tied decimals: fewer fractional digits first.
+    assert_min_max([dec(10, 1), dec(100, 2)], &dec(10, 1), &dec(100, 2));
+    // Tied integer and float: the integer first.
+    assert_min_max(
+        [Value::Integer(1), Value::Float(1.0)],
+        &Value::Integer(1),
+        &Value::Float(1.0),
+    );
+    // Tied integer and decimal: the integer first.
+    assert_min_max(
+        [Value::Integer(1), dec(1, 0)],
+        &Value::Integer(1),
+        &dec(1, 0),
+    );
+    // Signed zeros: the smaller sign first.
+    assert_min_max(
+        [Value::Float(-0.0), Value::Float(0.0)],
+        &Value::Float(-0.0),
+        &Value::Float(0.0),
+    );
+    // NaN is above infinity; NaNs of both signs tie, the negative one first.
+    assert_min_max(
+        [Value::Float(f64::NAN), Value::Float(f64::INFINITY)],
+        &Value::Float(f64::INFINITY),
+        &Value::Float(f64::NAN),
+    );
+    assert_min_max(
+        [Value::Float(-f64::NAN), Value::Float(f64::NAN)],
+        &Value::Float(-f64::NAN),
+        &Value::Float(f64::NAN),
+    );
+    // Nulls are skipped; an all-null group is null.
+    assert_min_max(
+        [Value::Null, Value::Float(2.5)],
+        &Value::Float(2.5),
+        &Value::Float(2.5),
+    );
+    assert_min_max([Value::Null, Value::Null], &Value::Null, &Value::Null);
+}
+
+fn datetime(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32, nano: u32) -> Value {
+    Value::DateTime(
+        chrono::NaiveDate::from_ymd_opt(y, mo, d)
+            .and_then(|date| date.and_hms_nano_opt(h, mi, s, nano))
+            .expect("test datetime"),
+    )
+}
+
+#[test]
+fn extremum_order_is_total_and_keeps_the_comparators_order() {
+    let array = |items| Value::Array(crate::owned_storage::OwnedValues::from_vec(items));
+    let values = vec![
+        Value::Integer(0),
+        Value::Float(-0.0),
+        Value::Float(0.0),
+        Value::Integer(1),
+        Value::Float(1.0),
+        dec(1, 0),
+        dec(10, 1),
+        dec(100, 2),
+        dec(-100, 2),
+        Value::Integer(1 << 53),
+        Value::Integer((1 << 53) + 1),
+        Value::Float((1u64 << 53) as f64),
+        Value::Float(f64::INFINITY),
+        Value::Float(f64::NEG_INFINITY),
+        Value::Float(f64::NAN),
+        Value::Float(-f64::NAN),
+        Value::Float(f64::from_bits(0x7FF0_0000_0000_0001)),
+        Value::Bool(false),
+        Value::Bool(true),
+        Value::String("".into()),
+        Value::String("a".into()),
+        Value::String("b".into()),
+        Value::Date(chrono::NaiveDate::from_ymd_opt(2024, 2, 29).expect("test date")),
+        Value::Date(chrono::NaiveDate::from_ymd_opt(2024, 3, 1).expect("test date")),
+        // A leap second ties the next second's instant with the same fraction.
+        datetime(2016, 12, 31, 23, 59, 59, 1_500_000_000),
+        datetime(2017, 1, 1, 0, 0, 0, 500_000_000),
+        array(vec![Value::Integer(1)]),
+        array(vec![Value::Float(1.0)]),
+        Value::map(vec![("a", Value::Integer(1)), ("b", Value::Integer(2))]),
+        Value::map(vec![("b", Value::Integer(2)), ("a", Value::Integer(1))]),
+    ];
+    for a in &values {
+        for b in &values {
+            let ab = extremum_order(a, b);
+            assert_eq!(
+                ab,
+                extremum_order(b, a).reverse(),
+                "antisymmetric: {a:?} {b:?}"
+            );
+            assert_eq!(
+                ab == Ordering::Equal,
+                identical(a, b),
+                "Equal only for identical values: {a:?} {b:?}"
+            );
+            let by_order = crate::order::compare(a, b);
+            if by_order != Ordering::Equal {
+                assert_eq!(ab, by_order, "keeps the value order: {a:?} {b:?}");
+            }
+            for c in &values {
+                if ab != Ordering::Greater && extremum_order(b, c) != Ordering::Greater {
+                    assert_ne!(
+                        extremum_order(a, c),
+                        Ordering::Greater,
+                        "transitive: {a:?} {b:?} {c:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 // ---------- Collect ----------
 
 #[test]

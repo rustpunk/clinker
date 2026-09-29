@@ -17,6 +17,7 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use serde::{Deserialize, Serialize};
 
+use crate::order;
 use crate::value::Value;
 
 /// Convert an `i128` integer accumulator to an exact `Decimal`, or `None` when
@@ -535,30 +536,102 @@ impl AvgState {
 
 // ----------------------------------------------------------------------------
 
+/// The order Aggregate `min` and `max` pick by: the one value order
+/// ([`order::compare`]), with a fixed representative among the values it ties.
+///
+/// The value order ties values that print differently — `1`, `1.0` and the
+/// decimal `1.00`; `-0.0` and `0.0`; NaNs of either sign and any payload — so
+/// keeping whichever tied value arrived first would make the answer depend on
+/// arrival order. Among tied values this orders an integer before a decimal
+/// before a float, a decimal with fewer fractional digits (a smaller stored
+/// scale) first, and floats by [`f64::total_cmp`] (so `-0.0` before `0.0` and
+/// a negative-sign NaN before a positive one). `min` therefore returns `1` for
+/// `1` and `1.0`, and `max` returns `1.0`.
+///
+/// It never reverses two values the value order separates, so it is not a
+/// second order: numbers still compare by exact value across integer, float
+/// and decimal, and NaN is above every other number. It is total, and `Equal`
+/// only for two identical values, so a fold that keeps a value only when it
+/// is strictly before (or after) the current one depends only on the multiset
+/// of values it is given. Callers skip nulls; a null passed here sorts below
+/// every other value, as in the value order. Pure; allocates only where the
+/// value order does (to order a map's entries).
+pub fn extremum_order(a: &Value, b: &Value) -> Ordering {
+    order::compare(a, b).then_with(|| representative_order(a, b))
+}
+
+/// Order two values the value order ties, so that only identical values are
+/// `Equal`. Tied arrays have the same length and tied elements; tied maps have
+/// the same keys and tied values, possibly in a different insertion order.
+fn representative_order(a: &Value, b: &Value) -> Ordering {
+    match (a, b) {
+        (Value::Float(x), Value::Float(y)) => x.total_cmp(y),
+        (Value::Decimal(x), Value::Decimal(y)) => x
+            .scale()
+            .cmp(&y.scale())
+            .then_with(|| x.is_sign_positive().cmp(&y.is_sign_positive())),
+        // Tied datetimes differ only at a leap second, which the value order
+        // places on the following second; chrono keeps the leap instant first.
+        (Value::DateTime(x), Value::DateTime(y)) => x.cmp(y),
+        (Value::Array(x), Value::Array(y)) => x
+            .iter()
+            .zip(y.iter())
+            .map(|(p, q)| extremum_order(p, q))
+            .find(|ordering| ordering.is_ne())
+            .unwrap_or(Ordering::Equal),
+        (Value::Map(x), Value::Map(y)) => x
+            .iter()
+            .zip(y.iter())
+            .map(|((kx, vx), (ky, vy))| {
+                kx.as_str()
+                    .as_bytes()
+                    .cmp(ky.as_str().as_bytes())
+                    .then_with(|| extremum_order(vx, vy))
+            })
+            .find(|ordering| ordering.is_ne())
+            .unwrap_or(Ordering::Equal),
+        _ => numeric_kind_rank(a).cmp(&numeric_kind_rank(b)),
+    }
+}
+
+/// Rank of a number's type among tied values: integer, then decimal, then
+/// float. Two tied non-numeric values of the same type are identical, and
+/// share a rank.
+fn numeric_kind_rank(v: &Value) -> u8 {
+    match v {
+        Value::Integer(_) => 0,
+        Value::Decimal(_) => 1,
+        Value::Float(_) => 2,
+        _ => 3,
+    }
+}
+
 /// Min/Max state — stores the extremum `Value` seen so far. The comparison
 /// direction (Min vs Max) is determined by the `AccumulatorEnum` variant, not
 /// by a flag on the state.
+///
+/// Values are picked by [`extremum_order`], which is total, so no non-null
+/// value is ever skipped as incomparable and the result depends only on the
+/// multiset of values added or merged: not on arrival order, not on how
+/// partial states were split and merged, and so not on the memory limit or
+/// the aggregate strategy. Nulls are skipped; an all-null group is null.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct MinMaxState {
     pub current: Option<Value>,
 }
 
 impl MinMaxState {
+    /// Keep `value` when [`extremum_order`] puts it strictly before (`keep_if`
+    /// `Less`, for min) or strictly after (`Greater`, for max) the current
+    /// extremum. `Equal` means identical, so keeping the current value on a
+    /// tie cannot depend on arrival order.
     fn add_with(&mut self, value: &Value, keep_if: Ordering) {
         if value.is_null() {
             return;
         }
         match &self.current {
-            None => self.current = Some(value.clone()),
-            Some(cur) => {
-                // Cross-type comparisons return None — skip the incomparable
-                // value here; the executor DLQs records with type conflicts.
-                if let Some(cmp) = value.partial_cmp(cur)
-                    && cmp == keep_if
-                {
-                    self.current = Some(value.clone());
-                }
-            }
+            Some(cur) if extremum_order(value, cur) != keep_if => {}
+            _ => self.current = Some(value.clone()),
         }
     }
 
