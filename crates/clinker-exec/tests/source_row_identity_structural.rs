@@ -10,7 +10,8 @@ use std::path::PathBuf;
 
 use clinker_bench_support::io::SharedBuffer;
 use clinker_exec::executor::{
-    ExecutionReport, PipelineExecutor, PipelineRunParams, SourceReaders, SourceRowId,
+    ExecutionReport, MemoryTestOverrides, PipelineExecutor, PipelineRunParams, SourceReaders,
+    SourceRowId,
 };
 use clinker_exec::source::multi_file::FileSlot;
 use clinker_plan::config::{CompileContext, parse_config};
@@ -19,6 +20,10 @@ use clinker_plan::plan::execution::PlanNode;
 
 #[path = "common/dlq_sink.rs"]
 mod dlq_sink;
+
+#[cfg(feature = "test-utils")]
+#[path = "common/memory_pressure.rs"]
+mod memory_pressure;
 
 use dlq_sink::{CollectingDlqSink, DlqRow};
 
@@ -49,6 +54,16 @@ fn run(
     readers: SourceReaders,
     outputs: &[&str],
 ) -> (ExecutionReport, Vec<DlqRow>) {
+    run_with(plan, readers, outputs, MemoryTestOverrides::default())
+}
+
+/// [`run`] with the run's memory test levers.
+fn run_with(
+    plan: &CompiledPlan,
+    readers: SourceReaders,
+    outputs: &[&str],
+    memory_test: MemoryTestOverrides,
+) -> (ExecutionReport, Vec<DlqRow>) {
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = outputs
         .iter()
         .map(|name| {
@@ -61,6 +76,7 @@ fn run(
     let params = PipelineRunParams {
         execution_id: "source-row-structural".to_string(),
         batch_id: "source-row-structural".to_string(),
+        memory_test,
         ..Default::default()
     };
     let sink = CollectingDlqSink::new();
@@ -233,14 +249,23 @@ nodes:
     assert_eq!(trigger.source_file(), "po.x12");
 }
 
+/// The ledger capacity the spilled reshape identity run is held to: 48 KiB,
+/// the limit it ran under before capacity existed, kept verbatim. The run
+/// needs more than 41,600 bytes to complete (below that the Transform's
+/// node-buffer materialization is refused with E310), and the same input with
+/// ample memory charges 72,000 bytes at its peak.
+#[cfg(feature = "test-utils")]
+const RESHAPE_IDENTITY_CAPACITY: u64 = 48 * 1024;
+
+#[cfg(feature = "test-utils")]
 fn run_reshape_identity(
-    memory_limit: &str,
+    memory_test: MemoryTestOverrides,
 ) -> (ExecutionReport, Vec<DlqRow>, SourceRowId, SourceRowId) {
-    let plan = compile(&format!(
+    let plan = compile(
         r#"
 pipeline:
   name: reshape_identity
-  memory: {{ limit: "{memory_limit}", backpressure: spill }}
+  memory: { limit: "512M", backpressure: spill }
 error_handling:
   strategy: continue
   dlq:
@@ -253,9 +278,9 @@ nodes:
       type: csv
       path: a.csv
       schema:
-        - {{ name: account, type: string }}
-        - {{ name: rank, type: int }}
-        - {{ name: tag, type: string }}
+        - { name: account, type: string }
+        - { name: rank, type: int }
+        - { name: tag, type: string }
   - type: source
     name: src_b
     config:
@@ -263,20 +288,20 @@ nodes:
       type: csv
       path: b.csv
       schema:
-        - {{ name: account, type: string }}
-        - {{ name: rank, type: int }}
-        - {{ name: tag, type: string }}
+        - { name: account, type: string }
+        - { name: rank, type: int }
+        - { name: tag, type: string }
   - type: merge
     name: merged
     inputs: [src_b, src_a]
-    config: {{ mode: concat }}
+    config: { mode: concat }
   - type: reshape
     name: backfill
     input: merged
     config:
       partition_by: [account]
       order_by:
-        - {{ field: rank, order: asc }}
+        - { field: rank, order: asc }
       rules:
         - name: synthesize_first
           when: "tag == 'b-000'"
@@ -300,7 +325,7 @@ nodes:
       type: csv
       path: out.csv
 "#,
-    ));
+    );
     let expected_a = source_identity(&plan, "src_a", 1);
     let expected_b = source_identity(&plan, "src_b", 1);
     let mut csv_a = String::from("account,rank,tag\n");
@@ -325,10 +350,11 @@ nodes:
             ),
         ),
     ]);
-    let (report, rows) = run(&plan, readers, &["out"]);
+    let (report, rows) = run_with(&plan, readers, &["out"], memory_test);
     (report, rows, expected_a, expected_b)
 }
 
+#[cfg(feature = "test-utils")]
 fn reshape_observed_identity(rows: &[DlqRow]) -> Vec<(String, (String, u64))> {
     rows.iter()
         .map(|row| {
@@ -342,14 +368,23 @@ fn reshape_observed_identity(rows: &[DlqRow]) -> Vec<(String, (String, u64))> {
 }
 
 /// A typed source identity in the form a dead-letter row carries it.
+#[cfg(feature = "test-utils")]
 fn identity_cell(name: &str, id: SourceRowId) -> (String, u64) {
     (name.to_string(), id.ordinal())
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn reshape_resident_and_spilled_paths_preserve_pairing_and_authored_order() {
-    let (spilled, spilled_dlq, expected_a, expected_b) = run_reshape_identity("48K");
-    let (resident, resident_dlq, resident_a, resident_b) = run_reshape_identity("512M");
+    use memory_pressure::{assert_capacity_below_ample_peak, assert_spill_engaged};
+
+    let (spilled, spilled_dlq, expected_a, expected_b) = run_reshape_identity(
+        MemoryTestOverrides::default().with_ledger_capacity(RESHAPE_IDENTITY_CAPACITY),
+    );
+    let (resident, resident_dlq, resident_a, resident_b) =
+        run_reshape_identity(MemoryTestOverrides::default());
+    assert_spill_engaged(&spilled);
+    assert_capacity_below_ample_peak(RESHAPE_IDENTITY_CAPACITY, &resident);
 
     assert!(
         spilled.cumulative_spill_bytes > 0,

@@ -20,23 +20,40 @@
 //! so the fixtures stay in the ordinary era; out-of-range key exactness is pinned
 //! by the in-crate `sort_key` unit tests and out-of-range `Value::DateTime`
 //! spill/reload exactness by the `clinker-record` value round-trip tests.
+//!
+//! Every run is configured at an ample `memory.limit`; the spilling runs are
+//! held to a small ledger capacity instead.
+
+#![cfg(feature = "test-utils")]
 
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
 
 use chrono::{Duration, NaiveDate, NaiveDateTime};
 use clinker_bench_support::io::SharedBuffer;
-use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, SourceReaders};
+use clinker_exec::executor::{
+    MemoryTestOverrides, PipelineExecutor, PipelineRunParams, SourceReaders,
+};
 use clinker_plan::config::{CompileContext, PipelineConfig};
+use clinker_plan::plan::execution::PlanNode;
 
-/// Tight budget: small enough that the block-band external-sort threshold binds
-/// and the sides spill; the hash aggregate's group-count threshold also trips.
-const TIGHT_LIMIT: &str = "1M";
+#[path = "common/memory_pressure.rs"]
+mod memory_pressure;
+
+use memory_pressure::{assert_capacity_below_ample_peak, assert_spill_engaged};
+
+/// Tight ledger capacity of the group-by run: 80 KiB, small enough that the
+/// hash aggregate's group-count threshold trips. The run completes at 80,000
+/// bytes (at 70,000 the CSV reader's 16 KiB admission falls short), and the
+/// same input with ample memory charges 84,632 bytes at its peak. The 1M limit
+/// the test ran under before capacity existed lies above that peak, so the
+/// capacity is taken inside the window.
+const TIGHT_CAPACITY: u64 = 80 * 1024;
 /// Roomy budget: far above the working set, so nothing spills — the resident
-/// half of every across-budget pair.
+/// half of every across-budget pair, and the `memory.limit` of every run.
 const ROOMY_LIMIT: &str = "512M";
 
-// Keep the fixed-width materialization at 90% of the hard limit: it fits the
+// Keep the fixed-width materialization at 90% of the limit: it fits the
 // scan while remaining above the 80% soft-spill threshold. Use the compiled
 // schema, including engine-stamped columns, and the live carrier layouts.
 fn tight_scan_limit(plan: &clinker_plan::plan::CompiledPlan, rows: usize) -> usize {
@@ -69,15 +86,22 @@ fn dt_string(offset_ns: i64) -> String {
 }
 
 /// Outcome of one pipeline run: the primary output CSV plus the total committed
-/// spill bytes.
+/// spill bytes, and the run's report.
 struct RunResult {
     output: String,
     spill_bytes: u64,
+    report: clinker_exec::executor::ExecutionReport,
 }
 
 /// Compile a config and run it over in-memory CSV inputs, capturing the named
-/// output. Source readers are keyed by source-node name.
-fn run_config(config: PipelineConfig, inputs: &[(&str, &str)], output_name: &str) -> RunResult {
+/// output, held to `capacity` bytes of ledger when one is given. Source
+/// readers are keyed by source-node name.
+fn run_config(
+    config: PipelineConfig,
+    inputs: &[(&str, &str)],
+    output_name: &str,
+    capacity: Option<u64>,
+) -> RunResult {
     let plan = config
         .compile(&CompileContext::default())
         .expect("datetime yaml must compile");
@@ -98,9 +122,14 @@ fn run_config(config: PipelineConfig, inputs: &[(&str, &str)], output_name: &str
         output_name.to_string(),
         Box::new(buf.clone()) as Box<dyn Write + Send>,
     )]);
+    let memory_test = match capacity {
+        Some(bytes) => MemoryTestOverrides::default().with_ledger_capacity(bytes),
+        None => MemoryTestOverrides::default(),
+    };
     let params = PipelineRunParams {
         execution_id: "datetime-nanos".to_string(),
         batch_id: "datetime-nanos-batch".to_string(),
+        memory_test,
         ..Default::default()
     };
     let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
@@ -108,26 +137,52 @@ fn run_config(config: PipelineConfig, inputs: &[(&str, &str)], output_name: &str
     RunResult {
         output: buf.as_string(),
         spill_bytes: report.cumulative_spill_bytes,
+        report,
     }
 }
 
-/// Run an inline template with its `__LIMIT__` / `__SORT_DRV__` / `__SORT_BLD__`
-/// placeholders filled, over in-memory CSV inputs.
+/// Fill an inline template's `__LIMIT__` / `__SORT_DRV__` / `__SORT_BLD__`
+/// placeholders and parse it.
+fn config(yaml_template: &str, limit: &str, sort_drv: &str, sort_bld: &str) -> PipelineConfig {
+    let yaml = yaml_template
+        .replace("__LIMIT__", limit)
+        .replace("__SORT_DRV__", sort_drv)
+        .replace("__SORT_BLD__", sort_bld);
+    clinker_plan::yaml::from_str(&yaml).expect("datetime yaml must parse")
+}
+
+/// Run an inline template at [`ROOMY_LIMIT`], held to `capacity` bytes of
+/// ledger when one is given, over in-memory CSV inputs.
 fn run(
     yaml_template: &str,
-    limit: &str,
+    capacity: Option<u64>,
     sort_drv: &str,
     sort_bld: &str,
     inputs: &[(&str, &str)],
     output_name: &str,
 ) -> RunResult {
-    let yaml = yaml_template
-        .replace("__LIMIT__", limit)
-        .replace("__SORT_DRV__", sort_drv)
-        .replace("__SORT_BLD__", sort_bld);
-    let config: PipelineConfig =
-        clinker_plan::yaml::from_str(&yaml).expect("datetime yaml must parse");
-    run_config(config, inputs, output_name)
+    run_config(
+        config(yaml_template, ROOMY_LIMIT, sort_drv, sort_bld),
+        inputs,
+        output_name,
+        capacity,
+    )
+}
+
+/// The strategy the planner selects for the single Combine `yaml` compiles
+/// to, rendered as its `Debug` form.
+fn planned_combine_strategy(config: &PipelineConfig) -> String {
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("datetime yaml must compile");
+    plan.dag()
+        .graph
+        .node_weights()
+        .find_map(|node| match node {
+            PlanNode::Combine { strategy, .. } => Some(format!("{strategy:?}")),
+            _ => None,
+        })
+        .expect("the plan contains a Combine")
 }
 
 /// Parse an output CSV into a header-keyed row multiset (sorted `Vec`), so two
@@ -290,27 +345,44 @@ fn datetime_single_inequality_matches_oracle_across_strategies_and_budgets() {
     let drv_sort = sort_order_block("ts");
     let bld_sort = sort_order_block("threshold");
 
-    let sizing_yaml = JOIN_YAML
-        .replace("__LIMIT__", ROOMY_LIMIT)
-        .replace("__SORT_DRV__", "")
-        .replace("__SORT_BLD__", "");
-    let sizing_config: PipelineConfig = clinker_plan::yaml::from_str(&sizing_yaml).unwrap();
-    let sizing_plan = sizing_config.compile(&CompileContext::default()).unwrap();
-    let join_tight_limit = tight_scan_limit(&sizing_plan, n_drivers as usize + 2).to_string();
+    let sizing_plan = config(JOIN_YAML, ROOMY_LIMIT, "", "")
+        .compile(&CompileContext::default())
+        .unwrap();
+    let join_tight_limit = tight_scan_limit(&sizing_plan, n_drivers as usize + 2);
+    // The layout-sized limit these runs had before capacity existed, kept
+    // verbatim as their capacity (2,418,383 bytes on 64-bit targets): the
+    // IEJoin run completes under it, and the same input with ample memory
+    // charges 7,811,776 bytes at its peak.
+    let join_tight_capacity = join_tight_limit as u64;
+
+    // The planner reads the configured limit when it chooses a strategy, so
+    // the ample limit every run now has must choose what the old tight limit
+    // chose.
+    for (drv, bld) in [("", ""), (drv_sort.as_str(), bld_sort.as_str())] {
+        let old =
+            planned_combine_strategy(&config(JOIN_YAML, &join_tight_limit.to_string(), drv, bld));
+        let ample = planned_combine_strategy(&config(JOIN_YAML, ROOMY_LIMIT, drv, bld));
+        assert_eq!(
+            old, ample,
+            "the ample limit must plan the strategy the tight limit planned"
+        );
+    }
 
     // IEJoin (no sort_order) at both budgets.
-    let iejoin_tight = run(JOIN_YAML, &join_tight_limit, "", "", &inputs, "out");
-    let iejoin_roomy = run(JOIN_YAML, ROOMY_LIMIT, "", "", &inputs, "out");
+    let iejoin_tight = run(JOIN_YAML, Some(join_tight_capacity), "", "", &inputs, "out");
+    let iejoin_roomy = run(JOIN_YAML, None, "", "", &inputs, "out");
+    assert_spill_engaged(&iejoin_tight.report);
+    assert_capacity_below_ample_peak(join_tight_capacity, &iejoin_roomy.report);
     // SortMerge (both sources presorted on the range axis) at both budgets.
     let sortmerge_tight = run(
         JOIN_YAML,
-        &join_tight_limit,
+        Some(join_tight_capacity),
         &drv_sort,
         &bld_sort,
         &inputs,
         "out",
     );
-    let sortmerge_roomy = run(JOIN_YAML, ROOMY_LIMIT, &drv_sort, &bld_sort, &inputs, "out");
+    let sortmerge_roomy = run(JOIN_YAML, None, &drv_sort, &bld_sort, &inputs, "out");
 
     for (label, r) in [
         ("iejoin/tight", &iejoin_tight),
@@ -392,10 +464,11 @@ fn datetime_group_by_keeps_sub_microsecond_keys_distinct_through_spill() {
     csv.push_str(&format!("{}\n", dt_string(special_ns + 100))); // …:20.000000100
     csv.push_str(&format!("{}\n", dt_string(special_ns + 900))); // …:20.000000900
 
-    let config: PipelineConfig =
-        clinker_plan::yaml::from_str(&GROUP_BY_YAML.replace("__LIMIT__", TIGHT_LIMIT))
-            .expect("group-by yaml must parse");
-    let result = run_config(config, &[("events", &csv)], "out");
+    let group_by = || config(GROUP_BY_YAML, ROOMY_LIMIT, "", "");
+    let result = run_config(group_by(), &[("events", &csv)], "out", Some(TIGHT_CAPACITY));
+    let ample = run_config(group_by(), &[("events", &csv)], "out", None);
+    assert_spill_engaged(&result.report);
+    assert_capacity_below_ample_peak(TIGHT_CAPACITY, &ample.report);
 
     assert!(
         result.spill_bytes > 0,

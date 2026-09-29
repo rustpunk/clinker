@@ -27,6 +27,9 @@ use clinker_record::PipelineCounters;
 
 #[path = "common/dlq_sink.rs"]
 mod dlq_sink;
+#[cfg(feature = "test-utils")]
+#[path = "common/memory_pressure.rs"]
+mod memory_pressure;
 
 use dlq_sink::{CollectingDlqSink, DlqRow};
 
@@ -1481,23 +1484,27 @@ nodes:
     );
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn upstream_spill_still_rejects_whole_document() {
     // Regression guard for the document-DLQ + record-spill combination.
     // The inter-stage buffer feeding the Output is forced to disk under a
-    // tight memory budget; the Output reloads those records from the spill
+    // tight ledger capacity; the Output reloads those records from the spill
     // BEFORE deciding each document. Because a record's document context —
     // including the source file the grain keys on — now survives the spill
     // round-trip, a document one record of which fails is still rejected
     // whole even when its other records passed through a spilling stage:
     // every record dead-letters and none reach the success sink.
+    use clinker_exec::executor::MemoryTestOverrides;
+    use memory_pressure::{assert_capacity_below_ample_peak, assert_spill_engaged};
+
     //
-    // RSS-gated: without an RSS reading the buffer stays in memory and never
-    // spills, so skip rather than assert a false negative (matching the
-    // existing soft-spill coverage).
-    if clinker_exec::pipeline::memory::rss_bytes().is_none() {
-        return;
-    }
+    // 2 MiB of ledger, the limit the test ran under before capacity existed,
+    // kept verbatim: the run needs more than 1,345,545 bytes (the Output's
+    // node-buffer materialization; below it E310 names `out`) and completes
+    // at 1,500,000, and the same input with ample memory charges 3,240,435
+    // bytes at its peak.
+    let capacity: u64 = 2 * 1024 * 1024;
 
     // One large document: many records with a long free-text field (so the
     // inter-stage buffer is heap-dominated and crosses the spill floor),
@@ -1513,7 +1520,7 @@ fn upstream_spill_still_rejects_whole_document() {
     let yaml = r#"
 pipeline:
   name: doc_dlq_spill
-  memory: { limit: "2M", backpressure: spill }
+  memory: { limit: "512M", backpressure: spill }
 error_handling:
   strategy: continue
   dlq:
@@ -1554,34 +1561,42 @@ nodes:
         .compile(&CompileContext::default())
         .expect("compile upstream-spill pipeline");
 
-    let slots = vec![FileSlot::new(
-        PathBuf::from("big.csv"),
-        Box::new(Cursor::new(doc.as_bytes().to_vec())),
-    )];
-    let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
-        "events".to_string(),
-        clinker_exec::executor::SourceInput::Files(slots),
-    )]);
-    let buf = SharedBuffer::new();
-    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
-        "out".to_string(),
-        Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
-    )]);
-    let params = PipelineRunParams {
-        execution_id: "e".to_string(),
-        batch_id: "b".to_string(),
-        pipeline_vars: indexmap::IndexMap::new(),
-        shutdown_token: None,
-        ..Default::default()
+    let run = |memory_test: MemoryTestOverrides| {
+        let slots = vec![FileSlot::new(
+            PathBuf::from("big.csv"),
+            Box::new(Cursor::new(doc.as_bytes().to_vec())),
+        )];
+        let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
+            "events".to_string(),
+            clinker_exec::executor::SourceInput::Files(slots),
+        )]);
+        let buf = SharedBuffer::new();
+        let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+            "out".to_string(),
+            Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
+        )]);
+        let params = PipelineRunParams {
+            execution_id: "e".to_string(),
+            batch_id: "b".to_string(),
+            pipeline_vars: indexmap::IndexMap::new(),
+            shutdown_token: None,
+            memory_test,
+            ..Default::default()
+        };
+        let sink = CollectingDlqSink::new();
+        let report = PipelineExecutor::run_plan_with_readers_writers(
+            &plan,
+            readers,
+            dlq_sink::registry(writers, &sink),
+            &params,
+        )
+        .expect("run upstream-spill pipeline");
+        (report, buf, sink)
     };
-    let sink = CollectingDlqSink::new();
-    let report = PipelineExecutor::run_plan_with_readers_writers(
-        &plan,
-        readers,
-        dlq_sink::registry(writers, &sink),
-        &params,
-    )
-    .expect("run upstream-spill pipeline");
+    let (ample, _, _) = run(MemoryTestOverrides::default());
+    let (report, buf, sink) = run(MemoryTestOverrides::default().with_ledger_capacity(capacity));
+    assert_spill_engaged(&report);
+    assert_capacity_below_ample_peak(capacity, &ample);
 
     // An UPSTREAM stage must actually have spilled — otherwise this guards
     // nothing about the document-context-through-spill round-trip. Per-stage

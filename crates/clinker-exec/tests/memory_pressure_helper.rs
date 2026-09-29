@@ -19,10 +19,12 @@ mod resource_fixtures;
 use std::collections::HashMap;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_exec::executor::{
-    ExecutionReport, PipelineExecutor, PipelineRunParams, single_file_reader,
-};
-use clinker_plan::config::{CompileContext, PipelineConfig, parse_config};
+use clinker_exec::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams};
+#[cfg(feature = "test-utils")]
+use clinker_exec::executor::{MemoryTestOverrides, single_file_reader};
+#[cfg(feature = "test-utils")]
+use clinker_plan::config::PipelineConfig;
+use clinker_plan::config::{CompileContext, parse_config};
 use memory_pressure::{PressureRun, assert_arbitrated};
 
 const MIB: u64 = 1024 * 1024;
@@ -231,6 +233,7 @@ fn from_report_reads_spill_bytes_written_not_bytes_left_on_disk() {
 /// A Source that declares `sort_order: [key]` and repairs unsorted input.
 /// Its order barrier sorts the rows through spilled runs under a small
 /// limit, merges them, and deletes every run before the report is taken.
+#[cfg(feature = "test-utils")]
 fn order_repair_yaml(limit: &str) -> String {
     format!(
         r#"
@@ -260,10 +263,18 @@ nodes:
     )
 }
 
-fn run_order_repair(limit: &str) -> (ExecutionReport, Vec<u8>) {
+/// The order-repair config at `limit`, with the CSV workspace added.
+#[cfg(feature = "test-utils")]
+fn order_repair_config(limit: &str) -> PipelineConfig {
     let mut config: PipelineConfig =
         clinker_plan::yaml::from_str(&order_repair_yaml(limit)).expect("parse order repair");
     resource_fixtures::add_csv_workspace(&mut config, &CompileContext::default());
+    config
+}
+
+#[cfg(feature = "test-utils")]
+fn run_order_repair(limit: &str, memory_test: MemoryTestOverrides) -> (ExecutionReport, Vec<u8>) {
+    let config = order_repair_config(limit);
     let plan = config
         .compile(&CompileContext::default())
         .expect("compile order repair");
@@ -284,18 +295,40 @@ fn run_order_repair(limit: &str) -> (ExecutionReport, Vec<u8>) {
         &plan,
         readers,
         writers,
-        &PipelineRunParams::default(),
+        &PipelineRunParams {
+            memory_test,
+            ..Default::default()
+        },
     )
     .expect("the order repair completes");
     (report, buf.contents())
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_sort_that_deleted_its_runs_still_reads_as_spilled() {
+    use memory_pressure::{assert_capacity_below_ample_peak, assert_spill_engaged};
+
     // The order barrier records its repair runs under this stage key.
     const REPAIR: &str = "source-order:rows:records";
 
-    let (report, low_output) = run_order_repair("40K");
+    // The low run is held to 88 KiB of ledger. It completes at 80,000 bytes
+    // (at 76,000 the CSV reader's 16 KiB admission falls short), and the same
+    // input with ample memory charges 99,568 bytes at its peak. The limit it
+    // had before capacity existed, the authored 40K plus the CSV workspace the
+    // fixture adds (106,496 bytes), lies above that peak, so the capacity is
+    // taken inside the window, and never above that old limit.
+    const CAPACITY: u64 = 88 * 1024;
+    let old_limit = clinker_plan::config::utils::parse_memory_limit_bytes(
+        order_repair_config("40K").pipeline.memory.limit.as_deref(),
+    )
+    .expect("parse the old limit");
+    assert!(CAPACITY <= old_limit);
+    let capacity = CAPACITY;
+    let (report, low_output) = run_order_repair(
+        "64M",
+        MemoryTestOverrides::default().with_ledger_capacity(capacity),
+    );
     assert_eq!(
         report
             .per_stage_spill_bytes
@@ -315,17 +348,19 @@ fn a_sort_that_deleted_its_runs_still_reads_as_spilled() {
         "the repair spilled under 40K: {:?}",
         report.per_stage_spill_bytes_written
     );
-    // The CSV workspace fixture adds its own reservation to `memory.limit`,
-    // so the run enforces more than the authored 40K; the helper would
-    // refuse 40 * 1024 here, so the test states the limit the run's report
-    // says it enforced.
+    // The run enforces its ledger capacity, more than the authored 40K; the
+    // helper would refuse 40 * 1024 here, so the test states the limit the
+    // run's report says it enforced.
     let low_limit = report.memory_limit_bytes;
     assert!(low_limit > 40 * 1024);
     let low = PressureRun::from_report(&report, REPAIR, low_limit, low_output.clone());
     assert_eq!(low.node_spill_bytes, written);
     assert!(low.total_spill_bytes >= written);
+    let low_report = report;
 
-    let (report, ample_output) = run_order_repair("64M");
+    assert_spill_engaged(&low_report);
+    let (report, ample_output) = run_order_repair("64M", MemoryTestOverrides::default());
+    assert_capacity_below_ample_peak(capacity, &report);
     let ample_limit = report.memory_limit_bytes;
     let ample = PressureRun::from_report(&report, REPAIR, ample_limit, ample_output);
     assert_eq!(ample.node_spill_bytes, 0);

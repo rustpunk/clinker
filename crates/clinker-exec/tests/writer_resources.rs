@@ -1408,17 +1408,17 @@ nodes:
     }
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn decode_second_file_header_refusal_remains_resource_error() {
     let root = tempfile::tempdir().unwrap();
     let header = format!("{}\n", "x".repeat(2 * 1024 * 1024));
-    let error = decode_file_run(
+    let error = decode_file_run_at_capacity(
         root.path(),
         &[b"value\n1\n", header.as_bytes()],
         "",
         "        - { name: value, type: int }",
-        "1M",
-        None,
+        1024 * 1024,
     )
     .unwrap_err();
     assert!(
@@ -2001,6 +2001,30 @@ fn decode_file_run(
     )
 }
 
+/// [`decode_file_run`] under an ample `memory.limit`, held to `capacity`
+/// bytes of ledger: the admission refusals a small limit used to force.
+#[cfg(feature = "test-utils")]
+fn decode_file_run_at_capacity(
+    root: &std::path::Path,
+    inputs: &[&[u8]],
+    source_options: &str,
+    schema: &str,
+    capacity: u64,
+) -> Result<clinker_exec::executor::ExecutionReport, clinker_plan::error::PipelineError> {
+    decode_file_run_with_params(
+        root,
+        inputs,
+        source_options,
+        schema,
+        "512M",
+        &clinker_exec::executor::PipelineRunParams {
+            memory_test: clinker_exec::executor::MemoryTestOverrides::default()
+                .with_ledger_capacity(capacity),
+            ..Default::default()
+        },
+    )
+}
+
 fn decode_file_run_with_params(
     root: &std::path::Path,
     inputs: &[&[u8]],
@@ -2228,6 +2252,7 @@ fn decode_split_json_rejection_dead_letters_nested_original_values() {
     }
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn decode_header_and_body_refusal_remain_typed() {
     for header in [true, false] {
@@ -2238,13 +2263,12 @@ fn decode_header_and_body_refusal_remain_typed() {
         } else {
             format!("value\n{oversized}\n")
         };
-        let error = decode_file_run(
+        let error = decode_file_run_at_capacity(
             root.path(),
             &[input.as_bytes()],
             "",
             "        - { name: value, type: string }",
-            "1M",
-            None,
+            1024 * 1024,
         )
         .unwrap_err();
         let clinker_plan::error::PipelineError::Format(clinker_format::FormatError::Resource(
@@ -4810,6 +4834,7 @@ fn decode_multi_record_pending_growth_refuses_admission_and_allocator() {
     }
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn decode_multi_record_resource_refusal_aborts_despite_continue() {
     let oversized = "x".repeat(2 * 1024 * 1024);
@@ -4840,13 +4865,12 @@ fn decode_multi_record_resource_refusal_aborts_despite_continue() {
         let root = tempfile::tempdir().unwrap();
         let options =
             format!("      options: {{ has_header: {has_header}, encoding: iso-8859-1 }}");
-        let error = decode_file_run(
+        let error = decode_file_run_at_capacity(
             root.path(),
             &[input.as_bytes()],
             &options,
             schema,
-            "1M",
-            None,
+            1024 * 1024,
         )
         .unwrap_err();
         assert!(

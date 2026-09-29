@@ -3,13 +3,18 @@
 #[path = "common/pipeline_resource_fixtures.rs"]
 mod resource_fixtures;
 
+#[cfg(feature = "test-utils")]
+#[path = "common/memory_pressure.rs"]
+mod memory_pressure;
+
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::PathBuf;
 
 use clinker_bench_support::io::SharedBuffer;
 use clinker_exec::executor::{
-    ExecutionReport, PipelineExecutor, PipelineRunParams, SourceInput, SourceReaders,
+    ExecutionReport, MemoryTestOverrides, PipelineExecutor, PipelineRunParams, SourceInput,
+    SourceReaders,
 };
 use clinker_exec::source::multi_file::FileSlot;
 use clinker_plan::config::{CompileContext, parse_config};
@@ -44,6 +49,16 @@ fn run(
     readers: SourceReaders,
     output_names: &[&str],
 ) -> (ExecutionReport, HashMap<String, String>) {
+    run_with(plan, readers, output_names, MemoryTestOverrides::default())
+}
+
+/// [`run`] with the run's memory test levers.
+fn run_with(
+    plan: &CompiledPlan,
+    readers: SourceReaders,
+    output_names: &[&str],
+    memory_test: MemoryTestOverrides,
+) -> (ExecutionReport, HashMap<String, String>) {
     let buffers: HashMap<String, SharedBuffer> = output_names
         .iter()
         .map(|name| ((*name).to_string(), SharedBuffer::new()))
@@ -57,7 +72,11 @@ fn run(
             )
         })
         .collect();
-    let report = PipelineExecutor::run_plan_with_readers_writers(plan, readers, writers, &params())
+    let params = PipelineRunParams {
+        memory_test,
+        ..params()
+    };
+    let report = PipelineExecutor::run_plan_with_readers_writers(plan, readers, writers, &params)
         .expect("identity-effects fixture executes");
     let outputs = buffers
         .into_iter()
@@ -263,6 +282,7 @@ nodes:
     }
 }
 
+#[cfg(feature = "test-utils")]
 fn fanout_plan(memory_limit: &str) -> CompiledPlan {
     let payload = "x".repeat(4 * 1024);
     let yaml = format!(
@@ -338,6 +358,7 @@ nodes:
         .expect("fanout fixture compiles")
 }
 
+#[cfg(feature = "test-utils")]
 fn large_csv(prefix: &str) -> String {
     // Source queues carry only identity. Independent payload allocations are
     // created by the fused transforms to pressure downstream fan-out storage.
@@ -348,6 +369,7 @@ fn large_csv(prefix: &str) -> String {
     csv
 }
 
+#[cfg(feature = "test-utils")]
 fn large_readers(plan: &CompiledPlan) -> SourceReaders {
     resource_fixtures::predecoded_csv_readers(
         plan.config(),
@@ -356,20 +378,39 @@ fn large_readers(plan: &CompiledPlan) -> SourceReaders {
     )
 }
 
+/// The ledger capacity the forced-spill fan-out run is held to: 80 KiB. The
+/// run completes at 70,000 bytes (at 60,000 the CSV readers' 16 KiB
+/// admissions fall short), and the same input with ample memory charges
+/// 96,072 bytes at its peak. The limit the test ran under before capacity
+/// existed, 64K plus the CSV writer workspace (196,608 bytes), lies above
+/// that peak, so the capacity is taken inside the window, with margin to both
+/// ends.
+#[cfg(feature = "test-utils")]
+const FANOUT_SPILL_CAPACITY: u64 = 80 * 1024;
+
+#[cfg(feature = "test-utils")]
 #[test]
 fn deliveries_match_across_resident_and_forced_spill_fanout() {
-    let resident_plan = fanout_plan("1G");
-    let spilled_plan = fanout_plan("64K");
-    let resident = run(
-        &resident_plan,
-        large_readers(&resident_plan),
-        &["audit", "report"],
+    use memory_pressure::{assert_capacity_below_ample_peak, assert_spill_engaged};
+
+    let old_limit = clinker_plan::config::utils::parse_memory_limit_bytes(
+        fanout_plan("64K").config().pipeline.memory.limit.as_deref(),
+    )
+    .expect("parse the old limit");
+    assert!(
+        FANOUT_SPILL_CAPACITY <= old_limit,
+        "the capacity never exceeds the limit the test ran under before capacity existed"
     );
-    let spilled = run(
-        &spilled_plan,
-        large_readers(&spilled_plan),
+    let plan = fanout_plan("1G");
+    let resident = run(&plan, large_readers(&plan), &["audit", "report"]);
+    let spilled = run_with(
+        &plan,
+        large_readers(&plan),
         &["audit", "report"],
+        MemoryTestOverrides::default().with_ledger_capacity(FANOUT_SPILL_CAPACITY),
     );
+    assert_spill_engaged(&spilled.0);
+    assert_capacity_below_ample_peak(FANOUT_SPILL_CAPACITY, &resident.0);
     assert!(
         spilled.0.cumulative_spill_bytes > 0,
         "fanout must exercise spill"

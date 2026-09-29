@@ -25,21 +25,39 @@ use std::io::{Cursor, Write};
 
 use clinker_bench_support::io::SharedBuffer;
 use clinker_exec::executor::{
-    PipelineExecutor, PipelineRunParams, SourceReaders, single_file_reader,
+    ExecutionReport, MemoryTestOverrides, PipelineExecutor, PipelineRunParams, SourceReaders,
+    single_file_reader,
 };
 use clinker_plan::config::{CompileContext, parse_config};
+
+#[cfg(feature = "test-utils")]
+#[path = "common/memory_pressure.rs"]
+mod memory_pressure;
 
 /// Outcome of one successful pipeline run.
 struct RunOutcome {
     /// Full primary-output CSV text (header included).
     output: String,
     /// Total committed spill bytes for the run.
+    #[cfg_attr(not(feature = "test-utils"), allow(dead_code))]
     spill_bytes: u64,
+    /// The run's report.
+    #[cfg_attr(not(feature = "test-utils"), allow(dead_code))]
+    report: ExecutionReport,
 }
 
 /// Compile and execute `yaml` over the named in-memory CSV inputs, returning the
 /// captured `out` CSV and spill total, or the formatted pipeline error.
 fn try_run(yaml: &str, inputs: &[(&str, String)]) -> Result<RunOutcome, String> {
+    try_run_with(yaml, inputs, MemoryTestOverrides::default())
+}
+
+/// [`try_run`] with the run's memory test levers.
+fn try_run_with(
+    yaml: &str,
+    inputs: &[(&str, String)],
+    memory_test: MemoryTestOverrides,
+) -> Result<RunOutcome, String> {
     let config = parse_config(yaml).map_err(|e| format!("parse: {e:?}"))?;
     let plan = config
         .compile(&CompileContext::default())
@@ -61,12 +79,14 @@ fn try_run(yaml: &str, inputs: &[(&str, String)]) -> Result<RunOutcome, String> 
     let params = PipelineRunParams {
         execution_id: "mb-f-855".to_string(),
         batch_id: "mb-f-855-batch".to_string(),
+        memory_test,
         ..Default::default()
     };
     match PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params) {
         Ok(report) => Ok(RunOutcome {
             output: buf.as_string(),
             spill_bytes: report.cumulative_spill_bytes,
+            report,
         }),
         Err(e) => Err(format!("run: {e:?}")),
     }
@@ -612,19 +632,47 @@ fn block_band_first_skip_does_not_retry_higher_index_build() {
 
 // ── block path: byte-identical across memory budgets ──────────────────────────
 
-/// Tight budget: the block-band external-sort threshold (`soft / 4`) binds and
-/// the sides spill. Under `backpressure: spill` a sub-baseline-RSS limit is not
-/// rejected at startup but completes by spilling.
-const TIGHT_LIMIT: &str = "3M";
-/// Roomy budget: everything stays resident, so no block-band spill occurs.
+/// Tight ledger capacity: the block-band external-sort threshold (`soft / 4`)
+/// binds and the sides spill. It is the limit the test ran under before
+/// capacity existed, kept verbatim.
+#[cfg(feature = "test-utils")]
+const TIGHT_CAPACITY: u64 = 3 * 1024 * 1024;
+/// That old limit as the config spelled it, compiled only to confirm the ample
+/// limit plans the same Combine strategy.
+#[cfg(feature = "test-utils")]
+const OLD_TIGHT_LIMIT: &str = "3M";
+/// Roomy budget: everything stays resident, so no block-band spill occurs. It
+/// is the `memory.limit` of both runs.
+#[cfg(feature = "test-utils")]
 const ROOMY_LIMIT: &str = "512M";
+
+/// The Combine strategy `yaml` plans, as its `Debug` form.
+#[cfg(feature = "test-utils")]
+fn planned_combine_strategy(yaml: &str) -> String {
+    let plan = parse_config(yaml)
+        .expect("parse for the planned strategy")
+        .compile(&CompileContext::default())
+        .expect("compile for the planned strategy");
+    plan.dag()
+        .graph
+        .node_weights()
+        .find_map(|node| match node {
+            clinker_plan::plan::execution::PlanNode::Combine { strategy, .. } => {
+                Some(format!("{strategy:?}"))
+            }
+            _ => None,
+        })
+        .expect("the plan contains a Combine")
+}
 
 /// A fixed prime stride so driver keys tile `[0, span)` and overflow the tight
 /// `soft / 4` sort threshold into multiple blocks and spilled runs.
+#[cfg(feature = "test-utils")]
 fn tiled_key(i: i64, span: i64) -> i64 {
     i.wrapping_mul(2_617).rem_euclid(span)
 }
 
+#[cfg(feature = "test-utils")]
 const BLOCK_BUDGET_YAML: &str = r#"
 pipeline:
   name: mb_f_855_block_budget
@@ -677,6 +725,7 @@ nodes:
 /// span, plus `n_miss` out-of-range drivers. Returns the driver/build CSVs and
 /// the expected sorted `did` output under `on_miss: null_fields` (drivers whose
 /// band keeps, plus every out-of-range miss).
+#[cfg(feature = "test-utils")]
 fn block_budget_workload(
     n_drivers: i64,
     n_bands: i64,
@@ -722,21 +771,31 @@ fn block_budget_workload(
 /// reading is absent at both: `keep=0` bands drop their drivers silently while
 /// out-of-range misses emit under `null_fields`. The tight run must actually
 /// spill so the two layouts genuinely differ.
+#[cfg(feature = "test-utils")]
 #[test]
 fn block_path_body_skip_byte_identical_across_budgets() {
+    use memory_pressure::{assert_capacity_below_ample_peak, assert_spill_engaged};
+
     let (driver_csv, build_csv, expected) = block_budget_workload(8_000, 40, 1_000, 200);
     let inputs = [("drivers", driver_csv), ("builds", build_csv)];
+    let yaml = BLOCK_BUDGET_YAML.replace("__LIMIT__", ROOMY_LIMIT);
+    let old_strategy =
+        planned_combine_strategy(&BLOCK_BUDGET_YAML.replace("__LIMIT__", OLD_TIGHT_LIMIT));
+    assert_eq!(
+        planned_combine_strategy(&yaml),
+        old_strategy,
+        "the ample limit must plan the Combine strategy the old tight limit planned"
+    );
 
-    let tight = try_run(
-        &BLOCK_BUDGET_YAML.replace("__LIMIT__", TIGHT_LIMIT),
+    let tight = try_run_with(
+        &yaml,
         &inputs,
+        MemoryTestOverrides::default().with_ledger_capacity(TIGHT_CAPACITY),
     )
     .expect("tight-budget block run");
-    let roomy = try_run(
-        &BLOCK_BUDGET_YAML.replace("__LIMIT__", ROOMY_LIMIT),
-        &inputs,
-    )
-    .expect("roomy-budget block run");
+    let roomy = try_run(&yaml, &inputs).expect("roomy-budget block run");
+    assert_spill_engaged(&tight.report);
+    assert_capacity_below_ample_peak(TIGHT_CAPACITY, &roomy.report);
 
     assert!(
         tight.spill_bytes > 0,

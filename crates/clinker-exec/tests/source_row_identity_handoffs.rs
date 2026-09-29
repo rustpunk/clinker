@@ -10,6 +10,9 @@
 
 #[path = "common/dlq_sink.rs"]
 mod dlq_sink;
+#[cfg(feature = "test-utils")]
+#[path = "common/memory_pressure.rs"]
+mod memory_pressure;
 
 use clinker_record::owned_storage::SharedStorage;
 use std::collections::HashMap;
@@ -17,7 +20,8 @@ use std::io::Cursor;
 
 use clinker_bench_support::io::SharedBuffer;
 use clinker_exec::executor::{
-    ExecutionReport, PipelineExecutor, PipelineRunParams, SourceReaders, SourceRowId,
+    ExecutionReport, MemoryTestOverrides, PipelineExecutor, PipelineRunParams, SourceReaders,
+    SourceRowId,
 };
 use clinker_exec::pipeline::sort_buffer::{SortBuffer, SortedOutput};
 use clinker_plan::config::{CompileContext, parse_config};
@@ -66,6 +70,16 @@ fn run(
     inputs: &[(&str, &str)],
     outputs: &[&str],
 ) -> (ExecutionReport, Vec<DlqRow>) {
+    run_with(plan, inputs, outputs, MemoryTestOverrides::default())
+}
+
+/// [`run`] with the run's memory test levers.
+fn run_with(
+    plan: &CompiledPlan,
+    inputs: &[(&str, &str)],
+    outputs: &[&str],
+    memory_test: MemoryTestOverrides,
+) -> (ExecutionReport, Vec<DlqRow>) {
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = outputs
         .iter()
         .map(|name| {
@@ -78,6 +92,7 @@ fn run(
     let params = PipelineRunParams {
         execution_id: "source-row-handoffs".to_string(),
         batch_id: "source-row-handoffs".to_string(),
+        memory_test,
         ..Default::default()
     };
     let sink = CollectingDlqSink::new();
@@ -353,6 +368,7 @@ fn fanout_dispatch_has_no_scalar_cull_reconstruction_and_charges_typed_carriers(
     );
 }
 
+#[cfg(feature = "test-utils")]
 fn fanout_spill_pipeline(memory_limit: &str) -> CompiledPlan {
     compile(&format!(
         r#"
@@ -410,6 +426,7 @@ nodes:
     ))
 }
 
+#[cfg(feature = "test-utils")]
 fn fanout_spill_csv(rows: u64) -> String {
     let mut csv = String::from("id,region,payload,value,ts\n");
     for ordinal in 1..=rows {
@@ -421,18 +438,29 @@ fn fanout_spill_csv(rows: u64) -> String {
     csv
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn fanout_resident_and_node_buffer_spill_keep_identical_typed_membership() {
-    if clinker_exec::pipeline::memory::rss_bytes().is_none() {
-        return;
-    }
+    use memory_pressure::{assert_capacity_below_ample_peak, assert_spill_engaged};
 
     const ROWS: u64 = 2_000;
+    // 1 MiB, the limit the test ran under before capacity existed, kept
+    // verbatim: the run needs at least 736,600 bytes (the Route's node-buffer
+    // materialization; below it E310 names `selected`) and completes at
+    // 800,000, and the same input with ample memory charges 1,856,600 bytes
+    // at its peak.
+    let capacity: u64 = 1024 * 1024;
     let csv = fanout_spill_csv(ROWS);
-    let resident_plan = fanout_spill_pipeline("1G");
-    let spilled_plan = fanout_spill_pipeline("1M");
-    let (resident, resident_rows) = run(&resident_plan, &[("src", &csv)], &["out"]);
-    let (spilled, spilled_rows) = run(&spilled_plan, &[("src", &csv)], &["out"]);
+    let plan = fanout_spill_pipeline("1G");
+    let (resident, resident_rows) = run(&plan, &[("src", &csv)], &["out"]);
+    let (spilled, spilled_rows) = run_with(
+        &plan,
+        &[("src", &csv)],
+        &["out"],
+        MemoryTestOverrides::default().with_ledger_capacity(capacity),
+    );
+    assert_spill_engaged(&spilled);
+    assert_capacity_below_ample_peak(capacity, &resident);
 
     let resident_membership: Vec<RowIdentity> = resident_rows.iter().map(row_identity).collect();
     let spilled_membership: Vec<RowIdentity> = spilled_rows.iter().map(row_identity).collect();

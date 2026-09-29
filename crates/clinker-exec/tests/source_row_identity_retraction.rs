@@ -2,6 +2,9 @@
 
 #[path = "common/dlq_sink.rs"]
 mod dlq_sink;
+#[cfg(feature = "test-utils")]
+#[path = "common/memory_pressure.rs"]
+mod memory_pressure;
 #[path = "common/pipeline_resource_fixtures.rs"]
 mod resource_fixtures;
 
@@ -13,7 +16,8 @@ use std::time::Duration;
 
 use clinker_bench_support::io::SharedBuffer;
 use clinker_exec::executor::{
-    ExecutionReport, PipelineExecutor, PipelineRunParams, SourceInput, SourceReaders,
+    ExecutionReport, MemoryTestOverrides, PipelineExecutor, PipelineRunParams, SourceInput,
+    SourceReaders,
 };
 use clinker_exec::source::multi_file::FileSlot;
 use clinker_format::FormatError;
@@ -105,6 +109,15 @@ fn run_failure_pipeline_with_readers(
     plan: &CompiledPlan,
     readers: SourceReaders,
 ) -> (ExecutionReport, String, Vec<DlqRow>) {
+    run_failure_pipeline_with(plan, readers, MemoryTestOverrides::default())
+}
+
+/// [`run_failure_pipeline_with_readers`] with the run's memory test levers.
+fn run_failure_pipeline_with(
+    plan: &CompiledPlan,
+    readers: SourceReaders,
+    memory_test: MemoryTestOverrides,
+) -> (ExecutionReport, String, Vec<DlqRow>) {
     let output = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
         "out".to_string(),
@@ -115,6 +128,7 @@ fn run_failure_pipeline_with_readers(
         batch_id: "batch".to_string(),
         pipeline_vars: indexmap::IndexMap::new(),
         shutdown_token: None,
+        memory_test,
         ..Default::default()
     };
     let sink = CollectingDlqSink::new();
@@ -191,6 +205,7 @@ fn dlq_row_and_document_evidence_distinguish_same_ordinals() {
     );
 }
 
+#[cfg(feature = "test-utils")]
 fn large_source(prefix: &str) -> String {
     const ROWS: usize = 320;
     let note = "x".repeat(8 * 1024);
@@ -335,16 +350,18 @@ fn predecoded_startup_releases_waiter_when_peer_exits() {
     );
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn dlq_document_collateral_preserves_identity_and_records_when_spilled() {
-    if clinker_exec::pipeline::memory::rss_bytes().is_none() {
-        return;
-    }
+    use memory_pressure::{assert_capacity_below_ample_peak, assert_spill_engaged};
 
+    // 1 MiB, the limit the test ran under before capacity existed, kept
+    // verbatim: the run completes at 250,000 bytes, and the same input with
+    // ample memory charges 3,532,464 bytes at its peak.
+    let capacity: u64 = 1024 * 1024;
     let src_a = large_source("a");
     let src_b = large_source("b");
-    let resident_plan = pressure_plan("1G");
-    let spilled_plan = pressure_plan("1M");
+    let plan = pressure_plan("1G");
     // Isolate downstream collateral spilling from initial document admission:
     // neither foreign-record queue may bulk-fill until both initial contexts
     // exist. This is a fixture precondition, not a Source startup guarantee.
@@ -366,10 +383,14 @@ fn dlq_document_collateral_preserves_identity_and_records_when_spilled() {
             })
             .collect()
     };
-    let (resident, _, resident_rows) =
-        run_failure_pipeline_with_readers(&resident_plan, readers(&resident_plan));
-    let (spilled, output, spilled_rows) =
-        run_failure_pipeline_with_readers(&spilled_plan, readers(&spilled_plan));
+    let (resident, _, resident_rows) = run_failure_pipeline_with_readers(&plan, readers(&plan));
+    let (spilled, output, spilled_rows) = run_failure_pipeline_with(
+        &plan,
+        readers(&plan),
+        MemoryTestOverrides::default().with_ledger_capacity(capacity),
+    );
+    assert_spill_engaged(&spilled);
+    assert_capacity_below_ample_peak(capacity, &resident);
 
     assert_eq!(resident.counters.dlq_count, 640);
     assert_eq!(resident_rows.len(), 640);

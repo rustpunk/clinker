@@ -13,6 +13,10 @@ use clinker_exec::executor::{PipelineExecutor, PipelineRunParams};
 use clinker_exec::source::multi_file::FileSlot;
 use clinker_plan::config::{CompileContext, parse_config};
 
+#[cfg(feature = "test-utils")]
+#[path = "common/memory_pressure.rs"]
+mod memory_pressure;
+
 const YAML: &str = r#"
 pipeline:
   name: envelope_demo
@@ -131,17 +135,18 @@ fn envelope_sections_available_on_every_body_record() {
 /// `$doc.<section>.<field>` must resolve correctly even when the body record
 /// carrying that context has round-tripped through an upstream record spill.
 /// A Route fans the envelope source's body out through a materialized branch
-/// whose `node_buffers` spill records to disk under a 1 MiB budget (the
-/// RSS-soft predicate from `route_fanout_soft_spill.rs`); the downstream
+/// whose `node_buffers` spill records to disk under a small ledger capacity
+/// (the soft-spill posture of `route_fanout_soft_spill.rs`); the downstream
 /// Transform then reads `$doc.BatchInfo.batch_id` off the re-hydrated records.
 /// If the envelope context were dropped on the spill round-trip, the spilled
 /// records would re-hydrate to the empty synthetic context and `$doc.*` would
 /// resolve to null — so a non-null, correct value on every spilled body row
 /// is the end-to-end proof the interned context survived.
+#[cfg(feature = "test-utils")]
 const SPILL_ENVELOPE_YAML: &str = r#"
 pipeline:
   name: envelope_spill
-  memory: { limit: "1M", backpressure: spill }
+  memory: { limit: "512M", backpressure: spill }
 nodes:
   - type: source
     name: payments
@@ -189,16 +194,21 @@ nodes:
       path: out.csv
 "#;
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn doc_context_resolves_after_upstream_record_spill() {
-    // RSS-based spill predicate: without RSS reading the upstream
-    // node_buffer never spills, so the round-trip under test never fires.
-    if clinker_exec::pipeline::memory::rss_bytes().is_none() {
-        return;
-    }
+    use clinker_exec::executor::MemoryTestOverrides;
+    use memory_pressure::{assert_capacity_below_ample_peak, assert_spill_engaged};
 
+    // 832 KiB of ledger. The run needs more than 408,000 bytes (the Route's
+    // node-buffer materialization; below it E310 names `split`) and completes
+    // at 600,000, and the same input with ample memory charges 912,000 bytes
+    // at its peak. The 1 MiB limit the test ran under before capacity existed
+    // lies above that peak, so the capacity is taken inside the window, with
+    // margin to both ends.
+    let capacity: u64 = 832 * 1024;
     // One document, many body rows with a wide `pad` column so the Route
-    // branch slot crosses the RSS soft floor and spills its records through
+    // branch slot crosses the soft floor and spills its records through
     // the inter-stage SpillWriter. The envelope sections live once per
     // document, interned a single time on spill regardless of row count.
     const ROWS: usize = 1_500;
@@ -219,29 +229,37 @@ fn doc_context_resolves_after_upstream_record_spill() {
         .compile(&CompileContext::default())
         .expect("compile spill-envelope pipeline");
 
-    let file = FileSlot::new(
-        PathBuf::from("payments.xml"),
-        Box::new(Cursor::new(xml.into_bytes())),
-    );
-    let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
-        "payments".to_string(),
-        clinker_exec::executor::SourceInput::Files(vec![file]),
-    )]);
-    let buf = SharedBuffer::new();
-    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
-        "out".to_string(),
-        Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
-    )]);
-    let params = PipelineRunParams {
-        execution_id: "e".to_string(),
-        batch_id: "b".to_string(),
-        pipeline_vars: indexmap::IndexMap::new(),
-        shutdown_token: None,
-        ..Default::default()
+    let run = |memory_test: MemoryTestOverrides| {
+        let file = FileSlot::new(
+            PathBuf::from("payments.xml"),
+            Box::new(Cursor::new(xml.clone().into_bytes())),
+        );
+        let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
+            "payments".to_string(),
+            clinker_exec::executor::SourceInput::Files(vec![file]),
+        )]);
+        let buf = SharedBuffer::new();
+        let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+            "out".to_string(),
+            Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
+        )]);
+        let params = PipelineRunParams {
+            execution_id: "e".to_string(),
+            batch_id: "b".to_string(),
+            pipeline_vars: indexmap::IndexMap::new(),
+            shutdown_token: None,
+            memory_test,
+            ..Default::default()
+        };
+        let report =
+            PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+                .expect("run spill-envelope pipeline");
+        (report, buf)
     };
-
-    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
-        .expect("run spill-envelope pipeline");
+    let (ample, _) = run(MemoryTestOverrides::default());
+    let (report, buf) = run(MemoryTestOverrides::default().with_ledger_capacity(capacity));
+    assert_spill_engaged(&report);
+    assert_capacity_below_ample_peak(capacity, &ample);
     assert_eq!(report.counters.total_count as usize, ROWS, "all body rows");
     assert_eq!(report.counters.dlq_count, 0);
 

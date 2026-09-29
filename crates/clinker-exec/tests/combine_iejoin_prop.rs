@@ -8,9 +8,9 @@
 //!
 //! The `pure_range` module drives whole pure-range combine pipelines through the
 //! public executor at BOTH a tight (spilling) and a roomy (resident) memory
-//! budget, asserting the emitted rows equal the oracle at each. The tight budget
-//! runs under `backpressure: spill` so it forces the block-band external-sort /
-//! k-way-merge / block-reload path regardless of the host's baseline RSS, and
+//! budget, asserting the emitted rows equal the oracle at each. Both run at an
+//! ample `memory.limit`; the tight one is held to a small ledger capacity, which
+//! forces the block-band external-sort / k-way-merge / block-reload path, and
 //! `cumulative_spill_bytes` confirms the spill actually happened. These cover
 //! branches the unit tests cannot reach through the body-less synthetic harness:
 //! a three-conjunct residual re-check, on_miss null-fields under a spilled layout
@@ -29,6 +29,9 @@
 //! `test_iejoin_fixtures_exist`.
 #[path = "common/dlq_sink.rs"]
 mod dlq_sink;
+#[cfg(feature = "test-utils")]
+#[path = "common/memory_pressure.rs"]
+mod memory_pressure;
 
 use std::collections::HashSet;
 
@@ -214,52 +217,92 @@ fn test_iejoin_fixtures_exist() {
 /// End-to-end oracle-equivalence for the pure-range block-band path, driven
 /// through the public executor at a spilling (tight) and a resident (roomy)
 /// budget. See the module docstring for the branch inventory.
+#[cfg(feature = "test-utils")]
 mod pure_range {
     use std::collections::{HashMap, HashSet};
     use std::io::{Cursor, Write};
 
     use clinker_bench_support::io::SharedBuffer;
     use clinker_core_types::dlq::DlqErrorCategory;
-    use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, SourceReaders};
+    use clinker_exec::executor::{
+        MemoryTestOverrides, PipelineExecutor, PipelineRunParams, SourceReaders,
+    };
     use clinker_plan::config::{BackpressureKnob, CompileContext, PipelineConfig};
 
     use super::dlq_sink;
     use super::nested_loop_oracle;
 
-    /// Tight budget: small enough that the block-band external-sort threshold
-    /// (`soft / 4`) binds and the sides spill. Run under `backpressure: spill`
-    /// so a sub-baseline-RSS limit is not rejected at startup (the `pause`
-    /// policy would reject it) but instead completes by spilling — making the
-    /// forced-spill layout independent of the host's baseline RSS.
-    const TIGHT_LIMIT: &str = "3M";
-    /// Roomy budget: far above the working set, so every side stays resident and
-    /// no block-band spill occurs — the resident half of the across-budget pair.
+    /// Every run's `memory.limit`: far above the working set, so a run with no
+    /// ledger capacity keeps every side resident and no block-band spill occurs
+    /// — the resident half of the across-budget pair.
     const ROOMY_LIMIT: &str = "512M";
+    /// The ledger capacity of the tight half: small enough that the block-band
+    /// external-sort threshold (`soft / 4`) binds and the sides spill. It is
+    /// the limit these tests ran under before capacity existed, kept verbatim.
+    const TIGHT_CAPACITY: u64 = 3 * 1024 * 1024;
+    /// That old limit as the config spelled it, compiled only to confirm the
+    /// ample limit plans the same Combine strategy.
+    const OLD_TIGHT_LIMIT: &str = "3M";
+
+    /// The two halves of every across-budget pair.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Budget {
+        /// Held to [`TIGHT_CAPACITY`] bytes of ledger.
+        Tight,
+        /// No capacity: the ample [`ROOMY_LIMIT`] alone.
+        Roomy,
+    }
 
     /// Outcome of one pipeline run: the primary output CSV, the total committed
-    /// spill bytes, and the count of recoverable Combine output-row dead-letter
-    /// rows the run wrote.
+    /// spill bytes, the count of recoverable Combine output-row dead-letter
+    /// rows the run wrote, and the run's report.
     struct RunResult {
         output: String,
         spill_bytes: u64,
         combine_dlq: usize,
+        report: clinker_exec::executor::ExecutionReport,
     }
 
-    /// Fill an inline template's `__LIMIT__` / `__POLICY__` placeholders per
-    /// budget, then compile and run it over in-memory CSV inputs.
+    /// The tight run wrote spill bytes, and the roomy run of the same input
+    /// charged more than the tight capacity at its peak, so the tight run could
+    /// not have held its state resident.
+    fn assert_tight_engaged(tight: &RunResult, roomy: &RunResult) {
+        super::memory_pressure::assert_spill_engaged(&tight.report);
+        super::memory_pressure::assert_capacity_below_ample_peak(TIGHT_CAPACITY, &roomy.report);
+    }
+
+    /// Fill an inline template's `__LIMIT__` / `__POLICY__` placeholders,
+    /// then compile and run it over in-memory CSV inputs at `budget`.
     fn run(
         yaml_template: &str,
-        limit: &str,
+        budget: Budget,
         policy: &str,
         inputs: &[(&str, &str)],
         output_name: &str,
     ) -> RunResult {
         let yaml = yaml_template
-            .replace("__LIMIT__", limit)
+            .replace("__LIMIT__", ROOMY_LIMIT)
             .replace("__POLICY__", policy);
         let config: PipelineConfig =
             clinker_plan::yaml::from_str(&yaml).expect("pure-range yaml must parse");
-        run_config(config, inputs, output_name)
+        run_config(config, inputs, output_name, budget)
+    }
+
+    /// The Combine strategy `config` plans, as its `Debug` form.
+    fn planned_combine_strategy(config: &PipelineConfig) -> String {
+        let plan = config
+            .compile(&CompileContext::default())
+            .expect("pure-range yaml must compile");
+        plan.dag()
+            .graph
+            .node_weights()
+            .find_map(|node| match node {
+                clinker_plan::plan::execution::PlanNode::Combine { strategy, .. } => {
+                    Some(format!("{strategy:?}"))
+                }
+                _ => None,
+            })
+            .expect("the plan contains a Combine")
     }
 
     /// Map a `backpressure` YAML string to its knob.
@@ -294,18 +337,43 @@ mod pure_range {
     /// Execute a fixture pipeline at the given budget over in-memory CSV inputs.
     fn fixture_run(
         stem: &str,
-        limit: &str,
+        budget: Budget,
         policy: &str,
         inputs: &[(&str, &str)],
         output_name: &str,
     ) -> RunResult {
-        run_config(fixture_config(stem, limit, policy), inputs, output_name)
+        run_config(
+            fixture_config(stem, ROOMY_LIMIT, policy),
+            inputs,
+            output_name,
+            budget,
+        )
     }
 
-    /// Compile a config and run it over in-memory CSV inputs, capturing the named
-    /// output. Source readers are keyed by source-node name; the writer by output
-    /// name.
-    fn run_config(config: PipelineConfig, inputs: &[(&str, &str)], output_name: &str) -> RunResult {
+    /// Compile a config and run it over in-memory CSV inputs at `budget`,
+    /// capturing the named output. Source readers are keyed by source-node
+    /// name; the writer by output name. A tight run first confirms that the
+    /// config's ample limit plans the Combine strategy the old tight limit
+    /// planned: the planner reads the configured limit when it has row-count
+    /// statistics.
+    fn run_config(
+        config: PipelineConfig,
+        inputs: &[(&str, &str)],
+        output_name: &str,
+        budget: Budget,
+    ) -> RunResult {
+        if budget == Budget::Tight {
+            let mut old = config.clone();
+            old.pipeline.memory.limit = Some(OLD_TIGHT_LIMIT.to_string());
+            let (old, ample) = (
+                planned_combine_strategy(&old),
+                planned_combine_strategy(&config),
+            );
+            assert_eq!(
+                old, ample,
+                "the ample limit must plan the Combine strategy the old tight limit planned"
+            );
+        }
         let plan = config
             .compile(&CompileContext::default())
             .expect("pure-range yaml must compile");
@@ -326,9 +394,14 @@ mod pure_range {
             output_name.to_string(),
             Box::new(buf.clone()) as Box<dyn Write + Send>,
         )]);
+        let memory_test = match budget {
+            Budget::Tight => MemoryTestOverrides::default().with_ledger_capacity(TIGHT_CAPACITY),
+            Budget::Roomy => MemoryTestOverrides::default(),
+        };
         let params = PipelineRunParams {
             execution_id: "iejoin-prop".to_string(),
             batch_id: "iejoin-prop-batch".to_string(),
+            memory_test,
             ..Default::default()
         };
         let sink = dlq_sink::CollectingDlqSink::new();
@@ -348,6 +421,7 @@ mod pure_range {
             output: buf.as_string(),
             spill_bytes: report.cumulative_spill_bytes,
             combine_dlq,
+            report,
         }
     }
 
@@ -511,8 +585,8 @@ nodes:
         ];
         let expected = expected_band_rows(&oracle_band(&drivers, &builds));
 
-        let tight = run(BAND_YAML, TIGHT_LIMIT, "spill", &inputs, "out");
-        let roomy = run(BAND_YAML, ROOMY_LIMIT, "spill", &inputs, "out");
+        let tight = run(BAND_YAML, Budget::Tight, "spill", &inputs, "out");
+        let roomy = run(BAND_YAML, Budget::Roomy, "spill", &inputs, "out");
 
         assert_eq!(
             rows(&tight.output),
@@ -528,6 +602,7 @@ nodes:
             !expected.is_empty(),
             "the band workload must produce matches"
         );
+        assert_tight_engaged(&tight, &roomy);
         assert!(
             tight.spill_bytes > 0,
             "the tight budget must have spilled the block-band sides to disk"
@@ -641,8 +716,8 @@ nodes:
             ("builds", build_csv.as_str()),
         ];
 
-        let tight = run(EQUI_BAND_YAML, TIGHT_LIMIT, "spill", &inputs, "out");
-        let roomy = run(EQUI_BAND_YAML, ROOMY_LIMIT, "spill", &inputs, "out");
+        let tight = run(EQUI_BAND_YAML, Budget::Tight, "spill", &inputs, "out");
+        let roomy = run(EQUI_BAND_YAML, Budget::Roomy, "spill", &inputs, "out");
 
         assert!(
             !expected.is_empty(),
@@ -662,6 +737,7 @@ nodes:
             tight.output, roomy.output,
             "equi+range output must be byte-identical across budgets"
         );
+        assert_tight_engaged(&tight, &roomy);
         assert!(
             tight.spill_bytes > 0,
             "the tight budget must have spilled the equi+range block-band sides to disk"
@@ -722,14 +798,14 @@ nodes:
         ];
         let tight = fixture_run(
             "iejoin_three_conjunct_residual",
-            TIGHT_LIMIT,
+            Budget::Tight,
             "spill",
             &inputs,
             "tiered_out",
         );
         let roomy = fixture_run(
             "iejoin_three_conjunct_residual",
-            ROOMY_LIMIT,
+            Budget::Roomy,
             "spill",
             &inputs,
             "tiered_out",
@@ -744,6 +820,7 @@ nodes:
             expected,
             "resident three-conjunct output diverged from the oracle"
         );
+        assert_tight_engaged(&tight, &roomy);
         assert!(
             tight.spill_bytes > 0,
             "the tight budget must have spilled the three-conjunct sides"
@@ -807,14 +884,14 @@ nodes:
         ];
         let tight = fixture_run(
             "iejoin_pure_range_null_fields",
-            TIGHT_LIMIT,
+            Budget::Tight,
             "spill",
             &inputs,
             "banded_out",
         );
         let roomy = fixture_run(
             "iejoin_pure_range_null_fields",
-            ROOMY_LIMIT,
+            Budget::Roomy,
             "spill",
             &inputs,
             "banded_out",
@@ -829,6 +906,7 @@ nodes:
             expected,
             "resident null-fields output diverged from the oracle"
         );
+        assert_tight_engaged(&tight, &roomy);
         assert!(
             tight.spill_bytes > 0,
             "the tight budget must have spilled the sides and both deferred piles"
@@ -917,7 +995,7 @@ nodes:
         );
         let out = fixture_run(
             "iejoin_three_conjunct_residual",
-            ROOMY_LIMIT,
+            Budget::Roomy,
             "spill",
             &[("applicants", &applicant_csv), ("tiers", &tier_csv)],
             "tiered_out",
@@ -963,7 +1041,7 @@ nodes:
         );
         let out = fixture_run(
             "iejoin_pure_range_null_fields",
-            ROOMY_LIMIT,
+            Budget::Roomy,
             "spill",
             &[("readings", &reading_csv), ("bands", &band_csv)],
             "banded_out",
@@ -1057,14 +1135,14 @@ nodes:
         ];
         let tight = run(
             ALL_OUT_OF_RANGE_NULL_FIELDS_YAML,
-            TIGHT_LIMIT,
+            Budget::Tight,
             "spill",
             &inputs,
             "out",
         );
         let roomy = run(
             ALL_OUT_OF_RANGE_NULL_FIELDS_YAML,
-            ROOMY_LIMIT,
+            Budget::Roomy,
             "spill",
             &inputs,
             "out",
@@ -1084,6 +1162,7 @@ nodes:
             6_000,
             "every driver emits exactly one null-fields row"
         );
+        assert_tight_engaged(&tight, &roomy);
         assert!(
             tight.spill_bytes > 0,
             "the tight budget must bound the 6000-driver in-block pile to disk"
@@ -1151,14 +1230,14 @@ nodes:
         ];
         let tight = run(
             ALL_OUT_OF_RANGE_NULL_FIELDS_YAML,
-            TIGHT_LIMIT,
+            Budget::Tight,
             "spill",
             &inputs,
             "out",
         );
         let roomy = run(
             ALL_OUT_OF_RANGE_NULL_FIELDS_YAML,
-            ROOMY_LIMIT,
+            Budget::Roomy,
             "spill",
             &inputs,
             "out",
@@ -1178,6 +1257,7 @@ nodes:
             6_000,
             "every driver emits exactly one row under match: all + null_fields over disjoint bands"
         );
+        assert_tight_engaged(&tight, &roomy);
         assert!(
             tight.spill_bytes > 0,
             "the tight budget must spill both deferred piles and the sides to disk"
@@ -1278,8 +1358,8 @@ nodes:
             ("drivers", driver_csv.as_str()),
             ("builds", build_csv.as_str()),
         ];
-        let tight = run(CONTINUE_DEFER_YAML, TIGHT_LIMIT, "spill", &inputs, "out");
-        let roomy = run(CONTINUE_DEFER_YAML, ROOMY_LIMIT, "spill", &inputs, "out");
+        let tight = run(CONTINUE_DEFER_YAML, Budget::Tight, "spill", &inputs, "out");
+        let roomy = run(CONTINUE_DEFER_YAML, Budget::Roomy, "spill", &inputs, "out");
         assert_eq!(
             rows(&tight.output),
             expected,
@@ -1298,6 +1378,7 @@ nodes:
             tight.combine_dlq, roomy.combine_dlq,
             "the deferred dead-letter count must be identical across budgets"
         );
+        assert_tight_engaged(&tight, &roomy);
         assert!(
             tight.spill_bytes > 0,
             "the tight budget must have spilled the block-band sides"
@@ -1439,8 +1520,8 @@ nodes:
             "the decimal band workload must produce matches"
         );
 
-        let tight = run(DEC_BAND_YAML, TIGHT_LIMIT, "spill", &inputs, "out");
-        let roomy = run(DEC_BAND_YAML, ROOMY_LIMIT, "spill", &inputs, "out");
+        let tight = run(DEC_BAND_YAML, Budget::Tight, "spill", &inputs, "out");
+        let roomy = run(DEC_BAND_YAML, Budget::Roomy, "spill", &inputs, "out");
         assert_eq!(
             rows(&tight.output),
             expected,
@@ -1456,6 +1537,7 @@ nodes:
             rows(&roomy.output),
             "the decimal band result must be byte-identical across budgets"
         );
+        assert_tight_engaged(&tight, &roomy);
         assert!(
             tight.spill_bytes > 0,
             "the tight budget must have spilled the decimal band sides to disk"
@@ -1558,8 +1640,8 @@ nodes:
             "the mixed int/float band workload must produce matches"
         );
 
-        let tight = run(MIXED_BAND_YAML, TIGHT_LIMIT, "spill", &inputs, "out");
-        let roomy = run(MIXED_BAND_YAML, ROOMY_LIMIT, "spill", &inputs, "out");
+        let tight = run(MIXED_BAND_YAML, Budget::Tight, "spill", &inputs, "out");
+        let roomy = run(MIXED_BAND_YAML, Budget::Roomy, "spill", &inputs, "out");
         assert_eq!(
             rows(&tight.output),
             expected,
@@ -1575,6 +1657,7 @@ nodes:
             rows(&roomy.output),
             "the mixed band result must be byte-identical across budgets"
         );
+        assert_tight_engaged(&tight, &roomy);
         assert!(
             tight.spill_bytes > 0,
             "the tight budget must have spilled the mixed band sides to disk"

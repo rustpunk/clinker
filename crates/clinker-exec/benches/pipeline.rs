@@ -1,5 +1,12 @@
+//! End-to-end pipeline benchmarks.
+//!
+//! The forced-spill case holds its run to a ledger capacity, a `test-utils`
+//! lever, so this bench builds only with that feature:
+//! `cargo bench -p clinker-exec --features test-utils --bench pipeline`, and
+//! `cargo test --benches -p clinker-exec --features test-utils` in the gate.
+
 use clinker_bench_support::{CsvPayload, MEDIUM, SMALL};
-use clinker_exec::executor::{PipelineExecutor, PipelineRunParams};
+use clinker_exec::executor::{MemoryTestOverrides, PipelineExecutor, PipelineRunParams};
 use clinker_plan::config::parse_config;
 use criterion::{
     BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
@@ -55,7 +62,11 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - { name: f0, type: string }
+      - { name: f1, type: string }
+      - { name: f2, type: string }
+      - { name: f3, type: string }
+      - { name: f4, type: string }
 
 - type: transform
   name: transform
@@ -139,7 +150,11 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - { name: f0, type: string }
+      - { name: f1, type: string }
+      - { name: f2, type: string }
+      - { name: f3, type: string }
+      - { name: f4, type: string }
 
 - type: transform
   name: windowed
@@ -228,7 +243,11 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - { name: f0, type: string }
+      - { name: f1, type: string }
+      - { name: f2, type: string }
+      - { name: f3, type: string }
+      - { name: f4, type: string }
 
 - type: transform
   name: route_transform_emit
@@ -328,17 +347,17 @@ nodes:
 
 // ── Direct materialized fan-out ───────────────────────────────────
 
-fn direct_fan_out_yaml(reader_count: usize, forced_spill_limit: Option<u64>) -> String {
+/// The direct fan-out pipeline. The forced-spill variant selects the spill
+/// policy at an ample limit; its pressure comes from a ledger capacity.
+fn direct_fan_out_yaml(reader_count: usize, forced_spill: bool) -> String {
     let mut yaml = String::from(
         r#"
 pipeline:
   name: bench_direct_fan_out
 "#,
     );
-    if let Some(limit) = forced_spill_limit {
-        yaml.push_str(&format!(
-            "  memory: {{ limit: \"{limit}\", backpressure: spill }}\n"
-        ));
+    if forced_spill {
+        yaml.push_str("  memory: { limit: \"512M\", backpressure: spill }\n");
     }
     yaml.push_str(
         r#"error_handling:
@@ -351,7 +370,11 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - { name: f0, type: int }
+      - { name: f1, type: string }
+      - { name: f2, type: int }
+      - { name: f3, type: string }
+      - { name: f4, type: int }
 "#,
     );
     for reader in 1..=reader_count {
@@ -398,33 +421,35 @@ fn run_direct_fan_out_plan(
     (report, output_buffers)
 }
 
-fn calibrated_forced_spill_plan(
-    baseline_plan: &clinker_plan::plan::CompiledPlan,
+/// The ledger capacity the forced-spill case is held to, computed from the
+/// scan materialization of its fixture: one scan (half the charged peak of
+/// the same input with ample memory, which holds the shared slot and one
+/// reader's scan together) plus half a scan of headroom. It fits a scan and
+/// lies below the in-memory peak, so the shared slot must spill.
+fn forced_spill_capacity(
+    plan: &clinker_plan::plan::CompiledPlan,
     reader_count: usize,
     csv_bytes: &[u8],
     params: &PipelineRunParams,
-) -> (clinker_plan::plan::CompiledPlan, u64) {
-    let (baseline, _) = run_direct_fan_out_plan(baseline_plan, reader_count, csv_bytes, params);
-    let baseline_rss = baseline
-        .peak_rss_bytes
-        .expect("forced-spill benchmark requires RSS observation");
-    let scan_materialization = baseline.peak_consumer_usage_bytes / 2;
-    let hard_limit = baseline_rss.saturating_add(scan_materialization.saturating_mul(2));
+) -> u64 {
+    let (in_memory, _) = run_direct_fan_out_plan(plan, reader_count, csv_bytes, params);
+    let scan_materialization = in_memory.peak_consumer_usage_bytes / 2;
+    let capacity = scan_materialization + scan_materialization / 2;
     assert!(
-        hard_limit.saturating_sub(baseline_rss) > scan_materialization,
-        "observed RSS leaves insufficient forced-spill materialization headroom"
+        capacity < in_memory.peak_consumer_usage_bytes,
+        "the forced-spill capacity ({capacity} bytes) must lie below the in-memory case's \
+         charged peak ({} bytes)",
+        in_memory.peak_consumer_usage_bytes
     );
-    assert!(
-        hard_limit.saturating_mul(4) / 5 < baseline_rss,
-        "forced-spill soft threshold must stay below the observed RSS"
-    );
-    let config = parse_config(&direct_fan_out_yaml(reader_count, Some(hard_limit))).unwrap();
-    let plan = clinker_plan::config::PipelineConfig::compile(
-        &config,
-        &clinker_plan::config::CompileContext::default(),
-    )
-    .expect("compile forced-spill fan-out benchmark");
-    (plan, hard_limit)
+    capacity
+}
+
+/// [`test_params`] held to `capacity` bytes of ledger.
+fn forced_spill_params(capacity: u64) -> PipelineRunParams {
+    PipelineRunParams {
+        memory_test: MemoryTestOverrides::default().with_ledger_capacity(capacity),
+        ..test_params()
+    }
 }
 
 fn bench_e2e_direct_fan_out(c: &mut Criterion) {
@@ -432,7 +457,7 @@ fn bench_e2e_direct_fan_out(c: &mut Criterion) {
     let params = test_params();
 
     for reader_count in 1..=3 {
-        let config = parse_config(&direct_fan_out_yaml(reader_count, None)).unwrap();
+        let config = parse_config(&direct_fan_out_yaml(reader_count, false)).unwrap();
         let plan = clinker_plan::config::PipelineConfig::compile(
             &config,
             &clinker_plan::config::CompileContext::default(),
@@ -510,25 +535,22 @@ fn bench_e2e_direct_fan_out(c: &mut Criterion) {
     group.finish();
 }
 
-/// Shared-slot sequential re-scan under controlled spill pressure. A baseline
-/// preflight measures this process with the same inputs and outputs, then sets
-/// the hard limit to the observed RSS plus twice one sequential scan. That
-/// leaves explicit scan headroom while keeping the 0.8 soft threshold below
-/// the observed RSS even when allocator pages from an earlier case are later
-/// released. Calibration runs before every measured iteration so allocator
-/// growth cannot make the limit stale. The forced preflight rejects either an
-/// accidental in-memory run or insufficient materialization headroom.
+/// Shared-slot sequential re-scan under controlled spill pressure. The run is
+/// configured at an ample limit and held to a ledger capacity computed from
+/// the scan materialization of its fixture ([`forced_spill_capacity`]), so
+/// the pressure no longer depends on this process's resident memory. The
+/// forced preflight rejects an accidental in-memory run.
 fn bench_e2e_direct_fan_out_forced_spill(c: &mut Criterion) {
     let mut group = c.benchmark_group("e2e_direct_fan_out_forced_spill");
     let params = test_params();
 
     for reader_count in 2..=3 {
-        let baseline_config = parse_config(&direct_fan_out_yaml(reader_count, None)).unwrap();
-        let baseline_plan = clinker_plan::config::PipelineConfig::compile(
-            &baseline_config,
+        let config = parse_config(&direct_fan_out_yaml(reader_count, true)).unwrap();
+        let plan = clinker_plan::config::PipelineConfig::compile(
+            &config,
             &clinker_plan::config::CompileContext::default(),
         )
-        .expect("compile fan-out benchmark baseline");
+        .expect("compile forced-spill fan-out benchmark");
 
         for count in [SMALL, MEDIUM] {
             let csv_bytes = CsvPayload::generate(
@@ -537,16 +559,21 @@ fn bench_e2e_direct_fan_out_forced_spill(c: &mut Criterion) {
                 16,
                 42,
             );
-            let (plan, hard_limit) =
-                calibrated_forced_spill_plan(&baseline_plan, reader_count, &csv_bytes, &params);
-            let (preflight, _) = run_direct_fan_out_plan(&plan, reader_count, &csv_bytes, &params);
+            let capacity = forced_spill_capacity(&plan, reader_count, &csv_bytes, &params);
+            let (preflight, _) = run_direct_fan_out_plan(
+                &plan,
+                reader_count,
+                &csv_bytes,
+                &forced_spill_params(capacity),
+            );
+            let written: u64 = preflight.per_stage_spill_bytes_written.values().sum();
             assert!(
-                preflight.cumulative_spill_bytes > 0,
+                preflight.cumulative_spill_bytes > 0 && written > 0,
                 "forced-spill benchmark must exercise the shared spill path"
             );
             eprintln!(
                 "e2e_direct_fan_out_forced_spill/{reader_count}_readers/{count}: \
-                 hard_limit={hard_limit}, peak_consumer_usage_bytes={}, cumulative_spill_bytes={}",
+                 capacity={capacity}, peak_consumer_usage_bytes={}, cumulative_spill_bytes={}",
                 preflight.peak_consumer_usage_bytes, preflight.cumulative_spill_bytes
             );
 
@@ -556,18 +583,10 @@ fn bench_e2e_direct_fan_out_forced_spill(c: &mut Criterion) {
                 &count,
                 |b, _| {
                     b.iter_batched(
-                        || {
-                            calibrated_forced_spill_plan(
-                                &baseline_plan,
-                                reader_count,
-                                &csv_bytes,
-                                &params,
-                            )
-                            .0
-                        },
-                        |plan| {
+                        || forced_spill_params(capacity),
+                        |forced| {
                             let (report, output_buffers) =
-                                run_direct_fan_out_plan(&plan, reader_count, &csv_bytes, &params);
+                                run_direct_fan_out_plan(&plan, reader_count, &csv_bytes, &forced);
                             black_box(report.peak_consumer_usage_bytes);
                             black_box(report.cumulative_spill_bytes);
                             black_box(output_buffers);
@@ -599,7 +618,11 @@ nodes:
     path: input.csv
     type: csv
     schema:
-      - { name: id, type: string }
+      - { name: f0, type: string }
+      - { name: f1, type: string }
+      - { name: f2, type: string }
+      - { name: f3, type: string }
+      - { name: f4, type: string }
 
 - type: transform
   name: sorted_transform
