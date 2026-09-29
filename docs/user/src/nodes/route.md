@@ -42,6 +42,8 @@ Compile failures surface as a CXL diagnostic keyed to the failure class -- **E20
 
 The `default:` field is **required**. Records that match no condition are routed to the default branch. The default branch name must not collide with any condition key.
 
+A condition that fails to evaluate is not "no match". Under `error_handling.strategy: continue` the record is dead-lettered and takes no branch, not even one whose condition held, and not the default; under `fail_fast` the run stops. See [An evaluation error is never false](../pipelines/error-handling.md#an-evaluation-error-is-never-false).
+
 ## Routing modes
 
 ### Exclusive (default)

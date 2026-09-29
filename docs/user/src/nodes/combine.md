@@ -124,6 +124,8 @@ The `where:` predicate selects the match; the `cxl:` body is a **post-match proj
 
 > **Behavior change.** This is a change in observable output for existing pipelines whose `where:` predicate carries a range, equi+range, or single-inequality comparison — the shapes the planner runs as a sort-merge join or an IEJoin (both the pure-range block-band path and the equi+range hash-partitioned path). On any of those three strategies, a driver that matched the predicate but whose body skipped every candidate was previously routed to `on_miss` — firing `null_fields`, `skip`, or `error`. It now silently produces no row, matching the pure-equality strategies (in-memory hash and grace hash), which already behaved this way and are unchanged. A pipeline that relied on the old routing (for example, `on_miss: error` tripping on a body-skipped driver) no longer sees it.
 
+**When `where:` fails to evaluate.** A `where:` that raises an error for a candidate, such as a division by zero, has not said whether that candidate matches. It is neither a match nor a non-match. Under `match: first` the earliest candidate that is not a non-match decides. If it matched, the driver is enriched with it. If its `where:` failed, the driver is dead-lettered with that build row and writes no output row, even when a later candidate would match: taking the later one would publish a row that depends on an evaluation that failed. A candidate after the deciding one is not part of the driver's result, so its failure is never written. This holds on every join strategy.
+
 ### `match: all`
 
 Emit one output row for every matching build-side record. 1:N fan-out -- if a driver record matches three build records, three rows are emitted, in the build input's arrival order (see [`match: first`](#match-first)).
@@ -136,6 +138,8 @@ Emit one output row for every matching build-side record. 1:N fan-out -- if a dr
       emit employee_id = employees.employee_id
       emit benefit = benefits.benefit_name
 ```
+
+Each output row depends only on its own pair, so a candidate whose `where:` fails to evaluate is dead-lettered with its build row while the driver's other matches are still emitted.
 
 ### `match: collect`
 
@@ -150,11 +154,16 @@ Gather every matching build-side record into a single Array-typed field on the o
 
 A per-group entry limit of 10,000 prevents unbounded growth.
 
+A `collect` row states the complete set of a driver's matches. If any candidate's `where:` fails to evaluate, that set is unknown, so the driver writes **no** row, neither a partial array nor an empty one; each failing candidate is dead-lettered with its build row. Candidates past the 10,000-entry limit are still checked, so every failure among them is dead-lettered too.
+
 Use `collect` when you need the set of matches as a single structured value; use `all` when you need a flat row per match.
 
 ## Unmatched records (`on_miss`)
 
-`on_miss` controls what happens to driver records with **zero predicate matches** — drivers for which no build-side record satisfied `where:`. A driver that matched the predicate but whose `cxl:` body skipped the row (see [`match: first`](#match-first)) is **not** a miss and never reaches `on_miss`; it simply produces no output row. On sort-merge and IEJoin strategies this is a recent change — see the behavior-change note under [`match: first`](#match-first).
+`on_miss` controls what happens to driver records with **zero predicate matches** — drivers for which no build-side record satisfied `where:`, because every candidate evaluated it to false or null, or because there was no candidate at all. Two kinds of driver are **not** misses and never reach `on_miss`, under any `match` mode and on every join strategy:
+
+- A driver that matched the predicate but whose `cxl:` body skipped or failed the row (see [`match: first`](#match-first)). It simply produces no output row for that match, and a body failure is dead-lettered.
+- A driver any of whose candidates failed to evaluate `where:`. Each failure is dead-lettered, and whatever `on_miss` says, it does not fire: `on_miss: error` does not stop the run and `on_miss: null_fields` writes no null-filled row, because the driver was never shown to have no match.
 
 | Value | Semantics |
 |-------|-----------|
@@ -298,7 +307,7 @@ Semantics:
 - **Independent of the memory budget.** This is a result-*size* guard, not memory pressure. A runaway join can be perfectly bounded in memory (its output spills to disk) yet still produce far more rows than intended; `max_output_rows` caps the row count regardless of bytes.
 - **Covers the whole output, on every strategy.** The cap counts every emitted **output row** across all match modes and any `on_miss` rows, and is enforced identically whichever join strategy the planner picks (hash build-probe, grace-hash, sort-merge, or the IEJoin block-band).
 - **`collect` counts driver rows.** Under `match: collect` a combine emits **one output row per driver row** (each carrying an array of up to 10 000 collected matches), so `max_output_rows` bounds the driver-row count, not the number of collected array elements.
-- **Dead-lettered rows are not counted.** A matched pair whose `cxl:` body or residual raises a *recoverable* eval failure is routed to the DLQ, not the output, so it does not count toward the cap. Only that pair is dead-lettered: the driver's other matches are still evaluated and emitted, whichever join strategy runs, and a failing residual is not a match, so under `match: first` the next candidate is selected. The driver row and the matched build row are dead-lettered, each with its own Source and row number; each failure writes its own pair, so a driver that fails against several build rows is dead-lettered once per failure, and a build row that several failing drivers matched is dead-lettered once for each of them.
+- **Dead-lettered rows are not counted.** A matched pair whose `cxl:` body or residual raises a *recoverable* eval failure is routed to the DLQ, not the output, so it does not count toward the cap. Only that pair is dead-lettered: under `match: all` the driver's other matches are still evaluated and emitted, whichever join strategy runs. A failing residual is neither a match nor a miss: under `match: first` a failure on the deciding candidate is the driver's only result, and under `match: collect` it leaves the driver with no row (see [`match: first`](#match-first) and [`match: collect`](#match-collect)). The driver row and the matched build row are dead-lettered, each with its own Source and row number; each failure writes its own pair, so a driver that fails against several build rows is dead-lettered once per failure, and a build row that several failing drivers matched is dead-lettered once for each of them.
 - **N-ary combines cap the final output.** A combine whose `where:` spans three or more inputs is decomposed into a chain of binary steps; `max_output_rows` guards the **final** combined output, not the intermediate chain steps.
 
 If the large result is expected, raise the cap (or omit the field). If it is not, tighten the `where:` predicate. Run `clinker explain --code E325` for the full remediation guide.

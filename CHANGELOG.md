@@ -20,6 +20,45 @@ order of a `match: collect` array.
 - A `correlation_key` on the build Source sorts its rows by the key before
   they reach the Combine, and "first" follows that order.
 
+### Fixed — a Combine `where:` that fails to evaluate is neither a match nor a miss
+
+A Combine residual that fails to evaluate is neither a match nor a miss. Its
+pair is dead-lettered and, whatever the join strategy:
+
+- a driver with no matching candidate and at least one failing one no longer
+  reaches `on_miss`: `on_miss: error` no longer stops a `continue` run with
+  E319 (the run completes with exit code 2), and `null_fields` no longer adds
+  a null-filled row beside the failure;
+- `match: first` stops at the first candidate, in build arrival order, that
+  is not a non-match: a failing one is the driver's only result instead of a
+  later candidate being taken, and a failure of a candidate after the chosen
+  one is no longer written (the IEJoin strategies wrote it);
+- `match: collect` writes no row for a driver with a failing candidate,
+  neither a partial array nor an empty one, and a driver past the 10,000
+  entry limit still has every failure among its remaining candidates
+  written;
+- `match: all` still emits the driver's successful pairs.
+
+On range and equi+range joins, a `match: all` driver whose bodies all skip or
+fail no longer reaches `on_miss`, matching equality joins. Under `fail_fast`
+a failing residual stops the run with its evaluation error, never E319.
+
+`records_ok`, `records_written` and `max_output_rows` no longer count the
+null-filled, later-candidate or partial-array rows these drivers used to
+write; under `match: first` the dead-letter counts fall by the failures
+after each deciding candidate.
+
+A Route branch condition follows the same rule, which it already did: a
+failing condition takes no branch and not the default.
+
+### Fixed — a `where:` conjunct beside one or two range conjuncts is applied on the IEJoin strategies
+
+A Combine whose `where:` held one or two range conjuncts and a conjunct that
+is neither an equality nor a range, such as `a.lo <= b.v and a.x / b.y > 1`,
+never applied that conjunct when the planner picked an IEJoin strategy:
+every pair within the ranges matched. The conjunct is now evaluated for
+every pair, as on the other strategies.
+
 ### Changed — a correlation key writes one dead-letter row per failure
 
 A correlation key no longer removes, merges or relabels a failure row. Every
@@ -38,12 +77,11 @@ run wrote.
   one per branch, including in an overflowing group.
 - Every join strategy writes the same rows for the same failing input. The
   hash build-probe strategy used to dead-letter a driver at its first
-  failing match and drop the output of its other matches; it now evaluates
-  every matched pair like the other strategies: each failing pair is one
-  failure, and the driver's successful matches are still written. A failing
-  residual is not a match, so `match: first` goes on to the next candidate.
-  IEJoin and sort-merge failures now name the driver's row in their error
-  detail, as the hash strategies do.
+  failing match and drop the output of its other matches; under
+  `match: all` it now evaluates every matched pair like the other
+  strategies: each failing pair is one failure, and the driver's successful
+  matches are still written. IEJoin and sort-merge failures now name the
+  driver's row in their error detail, as the hash strategies do.
 - Under a key, `dlq_count`, `records_dlq` and the `dlq.max_rate` numerators
   therefore rise to the counts the same failures give without a key, plus
   the rows the failing groups condemn.

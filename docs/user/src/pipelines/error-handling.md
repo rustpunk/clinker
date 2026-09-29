@@ -75,6 +75,26 @@ replacement. This includes fields renamed by a source schema: rejection retains
 the original decoded record and its values, even when conversion failed after
 other fields had already been examined.
 
+### An evaluation error is never false
+
+A condition that fails to evaluate, such as one that divides by zero, has not
+said whether it holds. The engine never reads that failure as "false", on any
+node: the record the condition was about is dead-lettered, and no decision that
+depends on the condition being false is taken for it.
+
+- A Transform `filter` that fails dead-letters the record; it is neither kept
+  nor filtered out.
+- A Route branch condition that fails dead-letters the record, which takes no
+  branch and not the `default`.
+- A Combine `where:` that fails for a candidate build row dead-letters that
+  pair. The driver is not unmatched, so `on_miss` does not fire; under
+  `match: first` a failure on the deciding candidate is the driver's only
+  result, and under `match: collect` the driver writes no row. See
+  [Combine](../nodes/combine.md#match-first).
+
+A pipeline that wants a failing condition treated as false says so in CXL, for
+example by guarding the division or coalescing the result with `?? false`.
+
 ## DLQ configuration
 
 The DLQ is always written as CSV, regardless of the pipeline's input/output formats.
@@ -442,7 +462,7 @@ The `_cxl_dlq_error_category` column contains one of these values:
 | `document_rejected` | A non-failing record was DLQ'd as collateral because another record in its document failed under a source's `dlq_granularity: document` policy |
 | `late_record` | A record arrived at a time-windowed aggregate after its event-time window had already closed |
 | `expansion_limit_exceeded` | Per-input fan-out exceeded its authored ceiling. Transform `max_expansion` rejects before body rows emit; Source `max_output_rows_per_input` emits exactly its ceiling, then DLQs the original input on the first attempted row above it. Neither is silent truncation. |
-| `combine_output_row` | A Combine output-stage eval failed for one driver row (probe-key or `on_miss: null_fields` body) or for one matched pair (residual or matched body; the driver's other matches are still evaluated and emitted); the entry carries the contributing-build lineage and rewinds both the driver and matched build source's rollback cursor. The driver row and the matched build row each report their own Source in `_cxl_dlq_source_name` and their own row in `_cxl_dlq_source_row`, whichever join strategy ran. Routed to the DLQ under `continue` across every Combine join mode; `fail_fast` propagates the eval error |
+| `combine_output_row` | A Combine output-stage eval failed for one driver row (probe-key or `on_miss: null_fields` body) or for one matched pair (residual or matched body). A failing residual is neither a match nor a miss: `on_miss` never fires for its driver, under `match: all` the driver's other matches are still evaluated and emitted, under `match: first` a failure on the deciding candidate is the driver's only result and a failure after it is never written, and under `match: collect` the driver writes no row; the entry carries the contributing-build lineage and rewinds both the driver and matched build source's rollback cursor. The driver row and the matched build row each report their own Source in `_cxl_dlq_source_name` and their own row in `_cxl_dlq_source_row`, whichever join strategy ran. Routed to the DLQ under `continue` across every Combine join mode; `fail_fast` propagates the eval error |
 | `structural_validation` | A structural source rule failed: an envelope trailer's declared count did not match its streamed body, a multi-record body appeared after its closing trailer, or a record type discriminator was unknown. Under `dlq_granularity: document`, the root cause has `trigger: true` and every already-streamed record of that file is `document_rejected` collateral. Under record-grained `continue`, E345 instead emits only the unknown row with `_cxl_dlq_source_record`. |
 
 ## Advanced options
