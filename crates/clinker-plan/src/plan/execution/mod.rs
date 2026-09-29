@@ -244,6 +244,12 @@ pub enum PlanNode {
         /// group ordering; the rule CXL is carried separately as typed
         /// programs in `compiled_rules`.
         config: crate::config::pipeline_node::ReshapeBody,
+        /// The validated within-group ordering: `config.order_by` converted
+        /// to placement-only fields at bind time, so it can place nulls
+        /// first or last but never hold `null_order: drop`. The executor's
+        /// group sort still reads `config.order_by` and does not yet honour
+        /// the placement.
+        order_by: Vec<crate::config::OrderField>,
         /// Widened output schema: the upstream columns plus the three
         /// `$meta.*` audit columns Reshape stamps. Populated by
         /// `bind_schema`.
@@ -282,6 +288,12 @@ pub enum PlanNode {
         /// grouping key, group ordering, and `removed_to` port routing; the
         /// predicate CXL is carried separately as `compiled` + `typed`.
         config: crate::config::pipeline_node::CullBody,
+        /// The validated within-group ordering: `config.order_by` converted
+        /// to placement-only fields at bind time, so it can place nulls
+        /// first or last but never hold `null_order: drop`. The executor's
+        /// group sort still reads `config.order_by` and does not yet honour
+        /// the placement.
+        order_by: Vec<crate::config::OrderField>,
         /// Output schema, equal to the upstream schema (Cull does not
         /// widen). Both the main and `removed_to` ports carry it.
         /// Populated by `bind_schema`.

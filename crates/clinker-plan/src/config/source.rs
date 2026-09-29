@@ -210,11 +210,16 @@ pub fn sortable_event_shape(
 ///
 /// Source ordering is a promise about records *inside each physical file*.
 /// Verification may repair that file, but it may never discard records, so
-/// `null_order: drop` is deliberately not admitted here.
+/// each authored field converts through [`OrderField::from_authored`] and a
+/// `null_order: drop` is refused with its fix.
+///
+/// Returns the validated `sort_order` as placement-only fields, in authored
+/// order (empty when the source declares none); the compiled source order
+/// is built from it, so it cannot hold `drop`.
 pub fn validate_source_sort_policy(
     source: &SourceConfig,
     schema: &SourceSchema,
-) -> Result<(), crate::error::PipelineError> {
+) -> Result<Vec<OrderField>, crate::error::PipelineError> {
     let sort_order = source.sort_order.as_deref().unwrap_or_default();
     if source.on_unsorted.is_some() && sort_order.is_empty() {
         let example_field = schema
@@ -245,23 +250,23 @@ pub fn validate_source_sort_policy(
     }
     let declared_columns = schema.bound_columns();
     let mut seen = std::collections::BTreeSet::new();
+    let mut validated = Vec::with_capacity(sort_order.len());
     for spec in sort_order {
-        let field = spec.clone().into_sort_field();
+        let field = OrderField::from_authored(
+            spec.clone().into_sort_field(),
+            OrderingSite::SourceSortOrder,
+        )
+        .map_err(|refused| {
+            source_order_error(
+                source,
+                format!("source {}: {refused}", source.name.quoted_name()),
+            )
+        })?;
         if !seen.insert(field.field.clone()) {
             return Err(source_order_error(
                 source,
                 format!(
                     "source {} repeats field '{}' in `sort_order`; keep each authored key once",
-                    source.name.quoted_name(),
-                    field.field
-                ),
-            ));
-        }
-        if matches!(field.null_order, Some(NullOrder::Drop)) {
-            return Err(source_order_error(
-                source,
-                format!(
-                    "source {} uses `null_order: drop` for sort field '{}'; source verification cannot discard records, so use `null_order: first` or `null_order: last`",
                     source.name.quoted_name(),
                     field.field
                 ),
@@ -284,9 +289,10 @@ pub fn validate_source_sort_policy(
                 ),
             ));
         }
+        validated.push(field);
     }
 
-    Ok(())
+    Ok(validated)
 }
 
 fn source_order_error(source: &SourceConfig, message: String) -> crate::error::PipelineError {

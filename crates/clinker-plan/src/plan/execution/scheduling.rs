@@ -1500,10 +1500,10 @@ fn compile_source_order(
     source_name: &str,
     body: &crate::config::pipeline_node::SourceBody,
 ) -> Result<Option<CompiledSourceOrder>, PipelineError> {
-    validate_source_sort_policy(&body.source, &body.schema)?;
-    let Some(specs) = body.source.sort_order.as_ref() else {
+    let validated = validate_source_sort_policy(&body.source, &body.schema)?;
+    if body.source.sort_order.is_none() {
         return Ok(None);
-    };
+    }
     let columns = body
         .schema
         .bound_columns()
@@ -1515,9 +1515,8 @@ fn compile_source_order(
                 source_name = source_name.quoted_name()
             )],
         })?;
-    let mut fields = Vec::with_capacity(specs.len());
-    for spec in specs.iter().cloned() {
-        let field = spec.into_sort_field();
+    let mut fields = Vec::with_capacity(validated.len());
+    for field in validated {
         let (field_index, column) = columns
             .iter()
             .enumerate()
@@ -1535,7 +1534,9 @@ fn compile_source_order(
             field_index,
             value_type: column.bound_type(),
             order: field.order,
-            null_order: field.null_order.unwrap_or(NullOrder::Last),
+            // A source's placement is `first` or `last`; the validated
+            // field cannot carry `drop`.
+            null_order: field.null_order.into(),
         });
     }
     Ok(Some(CompiledSourceOrder {

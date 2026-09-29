@@ -4365,11 +4365,15 @@ pub(crate) fn lower_node_to_plan_node(
             if compiled_rules.len() != config.rules.len() {
                 return None;
             }
+            // bind_reshape stores the validated order beside the rules on a
+            // clean bind, so a missing entry is the same rejection.
+            let order_by = artifacts.group_order_by.get(&id)?.clone();
             Some(crate::plan::execution::PlanNode::Reshape {
                 name: name.to_string(),
                 id,
                 span,
                 config: config.clone(),
+                order_by,
                 output_schema: schema_from_bound(),
                 compiled_rules,
             })
@@ -4384,6 +4388,8 @@ pub(crate) fn lower_node_to_plan_node(
             // entry means bind rejected the node (E200 on a rule predicate /
             // removed_to) — skip lowering.
             let typed = artifacts.cull_decision_typed.get(&id)?.clone();
+            // bind_cull stores the validated order only on a clean bind.
+            let order_by = artifacts.group_order_by.get(&id)?.clone();
             // Extract the decision aggregate from the typed program (mirrors
             // the Aggregate arm). `typed.field_types` is keyed and ordered by
             // bind's upstream Row, so its keys are the live column layout the
@@ -4415,6 +4421,7 @@ pub(crate) fn lower_node_to_plan_node(
                 id,
                 span,
                 config: config.clone(),
+                order_by,
                 output_schema: schema_from_bound(),
                 compiled: Arc::new(compiled),
                 typed,
