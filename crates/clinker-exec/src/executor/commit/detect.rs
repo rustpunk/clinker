@@ -242,8 +242,11 @@ pub(crate) fn detect_retract_scope(
         // entries here would feed aggregate-output row numbers into
         // `retract_row` and exercise the not-found tolerance, silently
         // no-opping. Skip the raw union in that case.
+        // Only the cell's own failures are retracted. A parked collateral
+        // (a Combine build row held with its failing driver's group) did
+        // not fail, so its contributions stay.
         if has_source_ck || !had_synthetic_lookup {
-            for err in &group.error_messages {
+            for err in group.error_messages.iter().filter(|err| err.trigger) {
                 affected_rows.insert(err.row_num);
             }
         }
