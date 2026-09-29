@@ -69,7 +69,14 @@ fn run(
         dlq_sink::registry(writers, &sink),
         params,
     )?;
-    Ok((report, sink.rows()))
+    let rows = sink.rows();
+    assert_eq!(
+        report.counters.dlq_count,
+        rows.len() as u64,
+        "every counted dead letter is written as a row"
+    );
+    dlq_sink::assert_pairing_integrity(&rows);
+    Ok((report, rows))
 }
 
 /// Run parameters with a telemetry producer, and the receiver that drains it.
@@ -618,4 +625,190 @@ fn the_overflow_is_stamped_when_the_group_crosses_the_cap() {
             assert!(at(overflow) <= at(condemned));
         }
     }
+}
+
+/// An inclusive Route sends every row of group A down two branches, and each
+/// branch parses `value`: row 1 fails on both. `max_group_buffer_line` is an
+/// optional `max_group_buffer` setting.
+fn two_failing_branches_pipeline(max_group_buffer_line: &str) -> String {
+    format!(
+        r#"
+pipeline:
+  name: two_failing_branches
+error_handling:
+  strategy: continue{max_group_buffer_line}
+  dlq:
+    path: rejected.csv
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    correlation_key: employee_id
+    type: csv
+    schema:
+      - {{ name: employee_id, type: string }}
+      - {{ name: value, type: string }}
+- type: route
+  name: split
+  input: src
+  config:
+    mode: inclusive
+    conditions:
+      a: 'employee_id != ""'
+      b: 'employee_id != ""'
+    default: a
+- type: transform
+  name: parse_a
+  input: split.a
+  config:
+    cxl: |
+      emit employee_id = employee_id
+      emit val = value.to_int()
+- type: transform
+  name: parse_b
+  input: split.b
+  config:
+    cxl: |
+      emit employee_id = employee_id
+      emit val = value.to_int()
+- type: sink
+  name: out_a
+  input: parse_a
+  config:
+    name: out_a
+    path: out_a.csv
+    type: csv
+    include_unmapped: true
+- type: sink
+  name: out_b
+  input: parse_b
+  config:
+    name: out_b
+    path: out_b.csv
+    type: csv
+    include_unmapped: true
+"#
+    )
+}
+
+/// Row 1's two failures, one per branch, in parking order.
+fn two_branch_failures(rows: &[DlqRow]) -> Vec<&DlqRow> {
+    let failures: Vec<&DlqRow> = rows
+        .iter()
+        .filter(|r| r.source_row() == 1 && r.category() == Some(TYPE_COERCION))
+        .collect();
+    assert_eq!(
+        failures.len(),
+        2,
+        "row 1 failed on both branches and is written once per failure: {:?}",
+        describe(rows)
+    );
+    let mut stages: Vec<&str> = failures.iter().filter_map(|r| r.stage()).collect();
+    stages.sort_unstable();
+    assert_eq!(stages, ["transform:parse_a", "transform:parse_b"]);
+    for failure in &failures {
+        assert!(failure.trigger(), "each failure is its own trigger");
+        assert_eq!(trigger_id(failure), id(failure));
+        assert_eq!(failure.triggering_field(), Some("val"));
+        assert_eq!(failure.triggering_value(), Some("bad"));
+    }
+    assert_ne!(id(failures[0]), id(failures[1]));
+    failures
+}
+
+/// A row that fails on two branches of an inclusive Route writes one trigger
+/// row per failure, each with its own stage, as it does without a key. The
+/// group's other rows are `correlated` rows paired with its first failure.
+#[test]
+fn a_row_failing_on_two_branches_is_written_once_per_failure() {
+    let csv = "employee_id,value\nA,bad\nA,200\nB,300\n";
+    let (report, rows) = run(
+        &two_failing_branches_pipeline(""),
+        one_source("src", csv),
+        &["out_a", "out_b"],
+        &run_params(),
+    )
+    .unwrap();
+    let failures = two_branch_failures(&rows);
+    let correlated: Vec<&DlqRow> = rows
+        .iter()
+        .filter(|r| r.category() == Some(DlqErrorCategory::Correlated.as_str()))
+        .collect();
+    assert_eq!(
+        correlated.len(),
+        1,
+        "row 2 is condemned once for the group: {:?}",
+        describe(&rows)
+    );
+    for row in correlated {
+        assert_eq!(row.source_row(), 2);
+        assert_eq!(
+            trigger_id(row),
+            id(failures[0]),
+            "paired with the first failure"
+        );
+    }
+    assert_eq!(rows.len(), 3, "{:?}", describe(&rows));
+    assert_eq!(report.counters.dlq_count, 3);
+}
+
+/// The overflow variant: group A holds row 1's two failures and row 2's two
+/// Sink slots, four entries over a cap of 3. Both failures are written,
+/// then row 2 as the `group_size_exceeded` trigger.
+#[test]
+fn an_overflowing_group_writes_a_row_failing_on_two_branches_once_per_failure() {
+    let csv = "employee_id,value\nA,bad\nA,200\nB,300\n";
+    let (report, rows) = run(
+        &two_failing_branches_pipeline("\n  max_group_buffer: 3"),
+        one_source("src", csv),
+        &["out_a", "out_b"],
+        &run_params(),
+    )
+    .unwrap();
+    two_branch_failures(&rows);
+    let overflow: Vec<&DlqRow> = rows
+        .iter()
+        .filter(|r| r.category() == Some(DlqErrorCategory::GroupSizeExceeded.as_str()))
+        .collect();
+    assert_eq!(overflow.len(), 1, "{:?}", describe(&rows));
+    assert_eq!(overflow[0].source_row(), 2);
+    assert_eq!(rows.len(), 3, "{:?}", describe(&rows));
+    assert_eq!(report.counters.dlq_count, 3);
+}
+
+/// A failure held in a correlation group keeps the field its evaluation was
+/// computing and the value that failed, exactly as it is written without a
+/// key.
+#[test]
+fn a_held_failure_keeps_its_triggering_field_and_value() {
+    let csv = "employee_id,value\nA,100\nA,bad\nB,200\n";
+    let keyed = validate_pipeline(0, "");
+    let (_, keyed_rows) = run(&keyed, one_source("src", csv), &["out"], &run_params()).unwrap();
+    let keyless = keyed.replace("    correlation_key: employee_id\n", "");
+    assert_ne!(keyless, keyed, "the keyless variant drops the key");
+    let (_, keyless_rows) = run(&keyless, one_source("src", csv), &["out"], &run_params()).unwrap();
+
+    let failure = |rows: &[DlqRow]| -> (Option<String>, Option<String>) {
+        let row = rows
+            .iter()
+            .find(|r| r.category() == Some(TYPE_COERCION))
+            .unwrap_or_else(|| panic!("row 2 fails: {:?}", describe(rows)));
+        assert_eq!(row.source_row(), 2);
+        (
+            row.triggering_field().map(str::to_owned),
+            row.triggering_value().map(str::to_owned),
+        )
+    };
+    assert_eq!(
+        failure(&keyless_rows),
+        (Some("val".to_owned()), Some("bad".to_owned())),
+        "the keyless failure names its field and value"
+    );
+    assert_eq!(
+        failure(&keyed_rows),
+        failure(&keyless_rows),
+        "the held failure keeps them"
+    );
 }

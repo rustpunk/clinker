@@ -192,7 +192,27 @@ fn drivers(rows: &[(i64, &str, i64)]) -> String {
 
 /// The single build row, with correlation value `cid`.
 fn build(cid: &str) -> String {
-    format!("bid,cid,k,v,base\n1,{cid},1,5,{BASE}\n", BASE = BASE as i64)
+    builds(cid, 1)
+}
+
+/// `n` build rows, `bid` 1 to `n`, all with correlation value `cid`. Every
+/// driver matches every one of them under every strategy.
+fn builds(cid: &str, n: usize) -> String {
+    let mut csv = String::from("bid,cid,k,v,base\n");
+    for bid in 1..=n {
+        csv.push_str(&format!("{bid},{cid},1,5,{}\n", BASE as i64));
+    }
+    csv
+}
+
+/// `yaml` with every driver matching every build row it can (`match: all`).
+fn match_all(yaml: &str) -> String {
+    yaml.replacen("      match: first\n", "      match: all\n", 1)
+}
+
+/// `yaml` without its correlation keys: the same pipeline, keyless.
+fn keyless(yaml: &str) -> String {
+    yaml.replace("      correlation_key: cid\n", "")
 }
 
 fn run_params() -> PipelineRunParams {
@@ -233,19 +253,19 @@ fn run(
     build_cid: &str,
 ) -> (Vec<OutputRow>, Vec<DlqRow>) {
     let yaml = yaml(strategy);
-    let (mut out, rows) = run_yaml(&yaml, strategy, driver_rows, build_cid, &["out"]);
+    let (mut out, rows) = run_yaml(&yaml, strategy, driver_rows, &build(build_cid), &["out"]);
     (out.remove("out").unwrap_or_default(), rows)
 }
 
 /// Run `yaml`, which must select `strategy`, over the given drivers and
-/// build row. Returns each named sink's rows and the dead-letter rows in
+/// `builds_csv`. Returns each named sink's rows and the dead-letter rows in
 /// written order, after checking that every counted dead letter was
-/// written as a row.
+/// written as a row and that every pairing column names a written trigger.
 fn run_yaml(
     yaml: &str,
     strategy: &Strategy,
     driver_rows: &[(i64, &str, i64)],
-    build_cid: &str,
+    builds_csv: &str,
     sinks: &[&str],
 ) -> (HashMap<String, Vec<OutputRow>>, Vec<DlqRow>) {
     assert_strategy(yaml, strategy);
@@ -262,7 +282,7 @@ fn run_yaml(
             "src_bld".to_string(),
             SourceInput::Files(vec![FileSlot::new(
                 PathBuf::from("bld.csv"),
-                Box::new(Cursor::new(build(build_cid).into_bytes())),
+                Box::new(Cursor::new(builds_csv.as_bytes().to_vec())),
             )]),
         ),
     ]);
@@ -282,6 +302,7 @@ fn run_yaml(
         "[{}] every dead letter is written as a row",
         strategy.tag
     );
+    dlq_sink::assert_pairing_integrity(&rows);
     let out = buffers
         .into_iter()
         .map(|(sink, buf)| (sink, parse_output(&buf.as_string())))
@@ -627,7 +648,7 @@ fn build_row_held_with_a_failure_is_not_retracted_from_a_relaxed_aggregate() {
             &yaml,
             strategy,
             &[(1, group, 0)],
-            build_group,
+            &build(build_group),
             &["out", "agg_out"],
         );
         assert_eq!(
@@ -669,7 +690,7 @@ fn per_driver_build_rows_survive_the_relaxed_retraction() {
             &yaml,
             strategy,
             &[(1, group, 0), (2, group, 0)],
-            build_group,
+            &build(build_group),
             &["out", "agg_out"],
         );
         assert_eq!(
@@ -700,7 +721,7 @@ fn build_row_held_with_a_failure_is_not_a_second_group_entry() {
             &yaml,
             strategy,
             &[(1, group, 0), (2, group, 2)],
-            build_group,
+            &build(build_group),
             &["out"],
         );
         let categories: Vec<Option<&str>> = rows.iter().map(DlqRow::category).collect();
@@ -728,5 +749,174 @@ fn build_row_held_with_a_failure_is_not_a_second_group_entry() {
             id(&rows[0]),
             "[{tag}] the condemned output pairs with the failing driver"
         );
+    }
+}
+
+/// Number of build rows every driver matches in the multi-failure cases.
+const MATCHED_BUILDS: usize = 3;
+
+/// How many failures a driver that fails against every one of
+/// [`MATCHED_BUILDS`] build rows produces under `strategy`. The join kernels
+/// evaluate every matched pair and defer each failure. The hash build-probe
+/// arm dead-letters the driver at its first failing match and stops
+/// evaluating that driver, so it produces one.
+fn failures_per_driver(strategy: &Strategy) -> usize {
+    if strategy.tag == "hash_build_probe" {
+        1
+    } else {
+        MATCHED_BUILDS
+    }
+}
+
+/// Assert `rows` are `failures_per_driver` failures for each driver in
+/// `drivers`, in driver order: each a driver trigger followed by its own copy
+/// of a distinct build row it failed against, paired with that trigger.
+fn assert_one_driver_row_per_failure(strategy: &Strategy, rows: &[DlqRow], drivers: &[u64]) {
+    let tag = strategy.tag;
+    let per_driver = failures_per_driver(strategy);
+    assert_eq!(
+        rows.len(),
+        2 * drivers.len() * per_driver,
+        "[{tag}] one driver row and one build row per failure: {:?}",
+        describe(rows)
+    );
+    let mut pairs = rows.chunks(2);
+    for &did in drivers {
+        let mut seen_builds = std::collections::BTreeSet::new();
+        for _ in 0..per_driver {
+            let pair = pairs.next().expect("a pair per failure");
+            let bid = pair[1].source_row();
+            assert!(
+                (1..=MATCHED_BUILDS as u64).contains(&bid) && seen_builds.insert(bid),
+                "[{tag}] each failure of driver {did} names a distinct matched build row: {:?}",
+                describe(rows)
+            );
+            assert_driver_then_build_row(tag, &pair[0], &pair[1], did, bid);
+        }
+    }
+}
+
+/// [`assert_driver_then_build`] for build row `bid`.
+fn assert_driver_then_build_row(tag: &str, trigger: &DlqRow, build: &DlqRow, did: u64, bid: u64) {
+    assert_eq!(
+        trigger.source_name(),
+        "src_drv",
+        "[{tag}] driver row source"
+    );
+    assert_eq!(
+        trigger.source_row(),
+        did,
+        "[{tag}] the failing driver's row"
+    );
+    assert!(
+        trigger.trigger(),
+        "[{tag}] each failure writes its driver row as its trigger"
+    );
+    assert_eq!(
+        trigger_id(trigger),
+        id(trigger),
+        "[{tag}] the driver row is its own trigger"
+    );
+    assert_eq!(build.source_name(), "src_bld", "[{tag}] build row source");
+    assert_eq!(
+        build.source_row(),
+        bid,
+        "[{tag}] the build row this failure matched"
+    );
+    assert!(!build.trigger(), "[{tag}] the build row is a collateral");
+    assert_eq!(
+        trigger_id(build),
+        id(trigger),
+        "[{tag}] the build row pairs with the driver row written just before it"
+    );
+}
+
+/// A driver whose body fails against several build rows under a correlation
+/// key is written once per failure, each copy followed by the build row of
+/// that failure, as it is without a key.
+#[test]
+fn a_driver_failing_against_several_build_rows_is_written_once_per_failure() {
+    for strategy in all_strategies() {
+        let (group, build_group) = driver_and_build_groups(strategy);
+        let yaml = match_all(&yaml(strategy));
+        let (_, rows) = run_yaml(
+            &yaml,
+            strategy,
+            &[(1, group, 0)],
+            &builds(build_group, MATCHED_BUILDS),
+            &["out"],
+        );
+        assert_one_driver_row_per_failure(strategy, &rows, &[1]);
+    }
+}
+
+/// A correlation key adds rows but never removes, merges or relabels a
+/// failure row. Two failing drivers of one group, each failing against every
+/// build row, write the same rows with and without the key, in the same
+/// order, in every column but the generated id, pairing and time columns;
+/// the triggering field and value included.
+#[test]
+fn keyed_failure_rows_equal_the_keyless_rows() {
+    for strategy in all_strategies() {
+        let tag = strategy.tag;
+        let (group, build_group) = driver_and_build_groups(strategy);
+        let keyed_yaml = match_all(&yaml(strategy));
+        let drivers = [(1, group, 0), (2, group, 0)];
+        let builds_csv = builds(build_group, MATCHED_BUILDS);
+        let (_, keyed_rows) = run_yaml(&keyed_yaml, strategy, &drivers, &builds_csv, &["out"]);
+        let (_, keyless_rows) = run_yaml(
+            &keyless(&keyed_yaml),
+            strategy,
+            &drivers,
+            &builds_csv,
+            &["out"],
+        );
+        assert_one_driver_row_per_failure(strategy, &keyless_rows, &[1, 2]);
+        assert_eq!(
+            keyed_rows.len(),
+            keyless_rows.len(),
+            "[{tag}] the keyed run writes as many rows as the keyless run: {:?} vs {:?}",
+            describe(&keyed_rows),
+            describe(&keyless_rows)
+        );
+        // The keyed plan's dead-letter header also carries the correlation
+        // key's engine columns, so compare every column the keyless row has.
+        for (n, (keyed_row, keyless_row)) in keyed_rows.iter().zip(&keyless_rows).enumerate() {
+            for column in keyless_row.columns() {
+                if dlq_sink::GENERATED_COLUMNS.contains(&column.as_str()) {
+                    continue;
+                }
+                assert_eq!(
+                    keyed_row.field(column),
+                    keyless_row.field(column),
+                    "[{tag}] row {n}, column {column}: the keyed run writes the keyless value"
+                );
+            }
+        }
+        assert_eq!(
+            keyed_rows[0].triggering_field(),
+            Some("q"),
+            "[{tag}] the held failure keeps the field the body was computing"
+        );
+    }
+}
+
+/// Behind a relaxed Aggregate the commit folds each retraction iteration's
+/// held failures into an archive and back. Every failure of a driver that
+/// failed against several build rows with the same message survives it,
+/// each with its own build row.
+#[test]
+fn a_driver_failing_several_times_survives_the_relaxed_retraction() {
+    for strategy in all_strategies() {
+        let (group, build_group) = driver_and_build_groups(strategy);
+        let yaml = match_all(&yaml_with(strategy, "", BUILD_AGGREGATE));
+        let (_, rows) = run_yaml(
+            &yaml,
+            strategy,
+            &[(1, group, 0)],
+            &builds(build_group, MATCHED_BUILDS),
+            &["out", "agg_out"],
+        );
+        assert_one_driver_row_per_failure(strategy, &rows, &[1]);
     }
 }

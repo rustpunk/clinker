@@ -309,6 +309,46 @@ impl DlqRow {
     fn engine_optional(&self, column: &str) -> Option<&str> {
         Some(self.engine(column)).filter(|cell| !cell.is_empty())
     }
+
+    /// The bucket header's column names, in order.
+    #[allow(dead_code)] // Each integration target uses only the accessors it asserts on.
+    pub fn columns(&self) -> &[String] {
+        &self.header
+    }
+}
+
+/// The columns whose values are generated per run rather than derived from
+/// the data: the row id, the pairing column and the timestamp.
+#[allow(dead_code)] // Each integration target uses only the accessors it asserts on.
+pub const GENERATED_COLUMNS: [&str; 3] =
+    ["_cxl_dlq_id", "_cxl_dlq_trigger_id", "_cxl_dlq_timestamp"];
+
+/// Assert that every row's `_cxl_dlq_trigger_id` names a trigger row the run
+/// wrote: a row, in any bucket, whose `_cxl_dlq_id` equals it and whose
+/// `_cxl_dlq_trigger` is true. A trigger names itself.
+#[allow(dead_code)] // Each integration target uses only the accessors it asserts on.
+pub fn assert_pairing_integrity(rows: &[DlqRow]) {
+    let triggers: std::collections::HashSet<&str> = rows
+        .iter()
+        .filter(|row| row.trigger())
+        .map(|row| row.engine("_cxl_dlq_id"))
+        .collect();
+    for (n, row) in rows.iter().enumerate() {
+        let id = row.engine("_cxl_dlq_id");
+        let trigger_id = row.engine("_cxl_dlq_trigger_id");
+        if row.trigger() {
+            assert_eq!(trigger_id, id, "row {n}: a trigger row names itself");
+        } else {
+            assert!(
+                triggers.contains(trigger_id),
+                "row {n} ({} row {}, {:?}) names trigger {trigger_id}, which no written \
+                 trigger row carries",
+                row.source_name(),
+                row.source_row(),
+                row.category()
+            );
+        }
+    }
 }
 
 /// A registry over `writers` whose dead-letter rows go to `sink`.

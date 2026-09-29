@@ -150,6 +150,12 @@ fn run_fixture(yaml: &str, drivers: &str, builds: &str, budget: Budget) -> Vec<C
             report.per_stage_spill_bytes
         ),
     }
+    assert_eq!(
+        report.counters.dlq_count,
+        rows.len() as u64,
+        "every dead letter the {budget:?} run counted is written as a row"
+    );
+    crate::test_support::assert_pairing_integrity(&rows);
     rows
 }
 
@@ -248,6 +254,21 @@ nodes:
     type: csv
     path: out.csv
 "#
+    )
+}
+
+/// `yaml` with `drivers` keyed on `drivers_key` and `builds` on `builds_key`,
+/// so every failure is held in its driver's correlation group until commit.
+fn keyed(yaml: &str, drivers_key: &str, builds_key: &str) -> String {
+    yaml.replacen(
+        "    path: drivers.csv\n",
+        &format!("    path: drivers.csv\n    correlation_key: {drivers_key}\n"),
+        1,
+    )
+    .replacen(
+        "    path: builds.csv\n",
+        &format!("    path: builds.csv\n    correlation_key: {builds_key}\n"),
+        1,
     )
 }
 
@@ -533,4 +554,73 @@ fn grace_hash_spilled_dead_letters_match_resident_rows() {
         "grace-hash: a spilled run must write the same (trigger, build) dead-letter pairs as a \
          resident run once the generated columns are masked"
     );
+}
+
+// Under a correlation key every failure is held in its driver's group until
+// the group commits, and is still written as it is without a key: its own
+// driver row, then the build row that failure matched. A driver that fails
+// against N build rows is written N times, each copy followed by its own
+// build row, and every build row's pairing column names the driver row
+// written just before it.
+
+#[test]
+fn correlated_block_band_writes_one_driver_row_per_failure() {
+    let yaml = keyed(&iejoin_yaml("all"), "driver_id", "build_id");
+    assert!(
+        matches!(
+            compiled_combine_strategy(&yaml, COMBINE),
+            CombineStrategy::IEJoin
+        ),
+        "the keyed two-conjunct pure-range fixture must plan the IEJoin kernel"
+    );
+    for budget in Budget::BOTH {
+        let rows = run_fixture(&yaml, &range_drivers(), &range_builds(), budget);
+        assert_build_rows_attributed(
+            &rows,
+            RANGE_DRIVERS * RANGE_BUILDS,
+            &format!("keyed IEJoin, {budget:?}"),
+        );
+    }
+}
+
+#[test]
+fn correlated_sort_merge_writes_one_driver_row_per_failure() {
+    // Keyed on the range columns, so the correlation sort keeps the sort
+    // licence the sort-merge kernel needs.
+    let yaml = keyed(&sort_merge_yaml(), "v", "hi");
+    assert!(
+        matches!(
+            compiled_combine_strategy(&yaml, COMBINE),
+            CombineStrategy::SortMerge
+        ),
+        "the keyed presorted single-range fixture must plan the sort-merge kernel"
+    );
+    for budget in Budget::BOTH {
+        let rows = run_fixture(&yaml, &range_drivers(), &range_builds(), budget);
+        assert_build_rows_attributed(
+            &rows,
+            RANGE_DRIVERS * RANGE_BUILDS,
+            &format!("keyed sort-merge, {budget:?}"),
+        );
+    }
+}
+
+#[test]
+fn correlated_grace_hash_writes_one_driver_row_per_failure() {
+    let yaml = keyed(&grace_hash_yaml(), "driver_id", "build_id");
+    assert!(
+        matches!(
+            compiled_combine_strategy(&yaml, COMBINE),
+            CombineStrategy::GraceHash { .. }
+        ),
+        "the keyed grace_hash hint must plan the grace-hash kernel"
+    );
+    for budget in Budget::BOTH {
+        let rows = run_fixture(&yaml, &grace_drivers(), &grace_builds(), budget);
+        assert_build_rows_attributed(
+            &rows,
+            GRACE_DRIVERS * GRACE_BUILDS / GRACE_KEYS,
+            &format!("keyed grace-hash, {budget:?}"),
+        );
+    }
 }

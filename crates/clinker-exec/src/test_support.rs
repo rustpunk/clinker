@@ -624,3 +624,37 @@ impl CapturedDlqRow {
         (self.header.to_vec(), cells)
     }
 }
+
+/// Assert that every row's `_cxl_dlq_trigger_id` names a trigger row the run
+/// wrote: a row, in any bucket, whose `_cxl_dlq_id` equals it and whose
+/// `_cxl_dlq_trigger` is true. A trigger names itself.
+pub(crate) fn assert_pairing_integrity(rows: &[CapturedDlqRow]) {
+    let cell = |row: &CapturedDlqRow, column: &str| -> String {
+        row.field(column)
+            .unwrap_or_else(|| panic!("every dead-letter header carries {column}"))
+            .to_owned()
+    };
+    let triggers: std::collections::HashSet<String> = rows
+        .iter()
+        .filter(|row| row.trigger())
+        .map(|row| cell(row, "_cxl_dlq_id"))
+        .collect();
+    for (n, row) in rows.iter().enumerate() {
+        let trigger_id = cell(row, "_cxl_dlq_trigger_id");
+        if row.trigger() {
+            assert_eq!(
+                trigger_id,
+                cell(row, "_cxl_dlq_id"),
+                "row {n}: a trigger row names itself"
+            );
+        } else {
+            assert!(
+                triggers.contains(&trigger_id),
+                "row {n} (row {}, {:?}) names trigger {trigger_id}, which no written trigger \
+                 row carries",
+                row.source_row(),
+                row.category()
+            );
+        }
+    }
+}

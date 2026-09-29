@@ -77,6 +77,7 @@ fn run(yaml: &str, sinks: &[&str], sources: &[(&str, &[(&str, &str)])]) -> Vec<D
         report.counters.dlq_count,
         "every dead letter is written as a row"
     );
+    dlq_sink::assert_pairing_integrity(&rows);
     rows
 }
 

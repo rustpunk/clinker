@@ -128,7 +128,9 @@ fn run_doc_dlq(
     let output = buf.as_string();
     let mut body: Vec<String> = output.lines().skip(1).map(|s| s.to_string()).collect();
     body.sort();
-    (report.counters, sink.rows(), body)
+    let rows = sink.rows();
+    dlq_sink::assert_pairing_integrity(&rows);
+    (report.counters, rows, body)
 }
 
 #[test]
