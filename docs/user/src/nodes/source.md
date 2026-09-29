@@ -305,7 +305,9 @@ compared with the first key in the next file.
 ```
 
 Source ordering accepts `null_order: first` or `last`; `drop` is rejected
-because verifying order must not discard source records. Equal authored keys
+when the pipeline is planned because verifying order must not discard source
+records. To exclude records whose key is null, add a Transform after the
+Source with `filter not <field>.is_null()`. Equal authored keys
 retain arrival order within the selected execution path. Clinker does not add
 a source identity, physical filename, or canonical-row tie-breaker.
 

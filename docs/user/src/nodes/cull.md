@@ -70,7 +70,34 @@ do not assume one node's grouping matches the other's.
 
 ## `order_by`
 
-Optional. A list of sort fields (`{ field, order }`, where `order` is `asc` or `desc`) applied within each group before its predicate runs, so an order-sensitive predicate is deterministic. Nulls sort last. Arrival order breaks ties.
+Optional. A list of sort fields applied within each group before its predicate runs, so an order-sensitive predicate is deterministic. Arrival order breaks ties.
+
+Each entry is either a field name, which sorts ascending, or a map `{ field, order, null_order }`:
+
+| Key | Values | Default |
+|-----|--------|---------|
+| `field` | a column of the input | required |
+| `order` | `asc` or `desc` | `asc` |
+| `null_order` | `first` or `last` | `last` |
+
+```yaml
+order_by:
+  - txn_date                                    # same as { field: txn_date }
+  - { field: amount, order: desc, null_order: first }
+```
+
+Cull does not yet apply `null_order`: a null sorts after every value in an `asc` field and before every value in a `desc` field.
+
+`null_order: drop` is rejected when the pipeline is planned. `order_by` only arranges the rows of a group; it never removes any, and every record of a group is kept or removed together. To leave out rows whose field is null, filter them in a Transform before the Cull:
+
+```yaml
+- type: transform
+  name: dated_only
+  input: transactions
+  config:
+    cxl: |
+      filter not txn_date.is_null()
+```
 
 ## Rules
 

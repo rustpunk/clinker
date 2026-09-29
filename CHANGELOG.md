@@ -4,6 +4,32 @@ All notable changes to Clinker are tracked here.
 
 ## Unreleased
 
+### Changed — null_order: drop is accepted only on a Sink sort_order
+
+`null_order: drop` excludes records whose key is null, which only a Sink's
+`sort_order` is for. On a field that only orders records it is now refused
+when the pipeline is planned, with the reason and the filter to write
+instead:
+
+- **Cull and Reshape `order_by`.** `drop` used to be accepted and silently
+  ignored. It is now an E200 error naming the node and the field:
+
+  ```text
+  cull "dedupe": `null_order: drop` is not allowed on `order_by` for field 'txn_date': `order_by` only orders rows within a group and cannot remove them. Use `null_order: first` or `null_order: last`; to exclude rows whose 'txn_date' is null, add a Transform before this node with `filter not txn_date.is_null()`.
+  ```
+
+- **Source `sort_order`.** `drop` was already refused; the error now also
+  gives the fix, a Transform after the Source with
+  `filter not <field>.is_null()`.
+
+Cull and Reshape `order_by` also accept a bare field name, as a Sink or
+Source `sort_order` does: `order_by: [txn_date]` is
+`order_by: [{ field: txn_date }]`.
+
+For Rust callers, `validate_source_sort_policy` returns the validated fields
+(`Vec<OrderField>`) instead of `()`, and `PlanNode::Cull` and
+`PlanNode::Reshape` carry the validated `order_by: Vec<OrderField>`.
+
 ### Fixed — a rejected document's rows are dead-lettered once under `dlq_granularity: document`, and no held row is lost
 
 Under `dlq_granularity: document`, a Sink could write a document's records

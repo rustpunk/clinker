@@ -80,7 +80,34 @@ If a blank-heavy column is your partition key, expect one large null group. Norm
 
 ## `order_by`
 
-Optional. A list of sort fields (`{ field, order }`, where `order` is `asc` or `desc`) applied within each group before rules run, so order-dependent synthesis is deterministic. Nulls sort last. Arrival order breaks ties.
+Optional. A list of sort fields applied within each group before rules run, so order-dependent synthesis is deterministic. Arrival order breaks ties.
+
+Each entry is either a field name, which sorts ascending, or a map `{ field, order, null_order }`:
+
+| Key | Values | Default |
+|-----|--------|---------|
+| `field` | a column of the input | required |
+| `order` | `asc` or `desc` | `asc` |
+| `null_order` | `first` or `last` | `last` |
+
+```yaml
+order_by:
+  - plan_start                                  # same as { field: plan_start }
+  - { field: plan_end, order: desc, null_order: first }
+```
+
+Reshape does not yet apply `null_order`: a null sorts after every value in an `asc` field and before every value in a `desc` field.
+
+`null_order: drop` is rejected when the pipeline is planned. `order_by` only arranges the rows of a group; it never removes any. To leave out rows whose field is null, filter them in a Transform before the Reshape:
+
+```yaml
+- type: transform
+  name: started_only
+  input: plans
+  config:
+    cxl: |
+      filter not plan_start.is_null()
+```
 
 ## Rules
 
