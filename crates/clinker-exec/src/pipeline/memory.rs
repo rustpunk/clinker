@@ -889,6 +889,18 @@ pub trait MemoryConsumer: Send + Sync {
     /// consumer's handle charges; this figure is not summed into it.
     fn current_usage(&self) -> u64;
 
+    /// What a spill of this consumer would free now. Used only to rank
+    /// victims: a reclaim pass and the victim policies order candidates by
+    /// it, and a consumer reporting 0 is never elected, however much it has
+    /// charged. The default is [`Self::current_usage`], for a consumer whose
+    /// every charged byte a spill releases. A consumer whose charge a spill
+    /// cannot free (charged-only state, a pause-only producer, a fixed
+    /// staging floor) reports 0; one that can free only part of it reports
+    /// that part. Read every arbitration round; must be cheap.
+    fn reclaimable_bytes(&self) -> u64 {
+        self.current_usage()
+    }
+
     /// The most bytes this consumer has held charged, when it keeps an exact
     /// high-water mark. A consumer backed by a [`ConsumerHandle`] returns
     /// [`ConsumerHandle::peak_bytes`]: the ledger's mark over its handle's

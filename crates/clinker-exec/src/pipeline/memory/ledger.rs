@@ -1720,12 +1720,14 @@ mod walk_pass_tests {
 
     /// A reclaim set scripted per consumer: resident victims give up their
     /// handle charge and the grants they hold; held victims are busy and have
-    /// their spill request raised; everything else is not owned.
+    /// their spill request raised; everything else is not owned. Every
+    /// consumer a pass elects is recorded, owned or not.
     #[derive(Default)]
     struct Scripted {
         resident: HashMap<ConsumerId, (Arc<ConsumerHandle>, Vec<Grant>)>,
         held: HashMap<ConsumerId, Arc<ConsumerHandle>>,
         spilled: Vec<ConsumerId>,
+        elected: Vec<ConsumerId>,
         during_spill: Option<Box<dyn FnOnce()>>,
     }
 
@@ -1761,6 +1763,7 @@ mod walk_pass_tests {
             id: ConsumerId,
             _arbitrator: &MemoryArbitrator,
         ) -> Result<VictimOutcome, PipelineError> {
+            self.elected.push(id);
             if let Some(during) = self.during_spill.take() {
                 during();
             }
@@ -2408,5 +2411,59 @@ mod walk_pass_tests {
         assert_eq!(arbitrator.ledger_snapshot(0, governed()), snapshot);
         assert!(script.borrow().spilled.is_empty());
         assert_eq!(victim_handle.bytes(), 400 * KIB);
+    }
+
+    /// The inline hash join's build side is approved charged-only: a spill
+    /// cannot free it. A pass elects the spillable slot beside it and never
+    /// the build side, however much more the build side holds, and with the
+    /// slot gone the request is refused without the build side ever being
+    /// asked to act. Its bytes stay charged throughout.
+    #[test]
+    fn charged_only_consumers_are_never_elected() {
+        let arbitrator = run(11 * MIB, Box::new(Priority));
+        let build_handle = ConsumerHandle::new();
+        let build = arbitrator.register_node_consumer(
+            Arc::new(crate::pipeline::combine::CombineHashConsumer::new(
+                Arc::clone(&build_handle),
+            )),
+            Arc::clone(&build_handle),
+            ConsumerLabel {
+                node: "join".to_string(),
+                surface: MemorySurface::JoinBuildSide,
+            },
+        );
+        build_handle.set_bytes(10 * MIB);
+        let (slot, slot_handle) = register(&arbitrator, "slot", 0, MIB);
+        assert_eq!(arbitrator.charged_bytes(), 11 * MIB, "the ledger is full");
+
+        let set = empty_set();
+        let _walk = walk(&arbitrator, &set);
+        let script = Scripted::default().resident(slot, &slot_handle).shared();
+        let _grant = scripted(&script, || arbitrator.reserve(512 * KIB, governed()))
+            .expect("the slot's spill makes room");
+        assert_eq!(
+            script.borrow().elected,
+            vec![slot],
+            "only the slot is elected, though the build side holds ten times more"
+        );
+
+        let free = 11 * MIB - arbitrator.charged_bytes();
+        let refused = scripted(&script, || arbitrator.reserve(free + KIB, governed()))
+            .expect_err("nothing a spill can free is left");
+        assert_eq!(refused.requested, free + KIB);
+        assert_eq!(
+            script.borrow().elected,
+            vec![slot],
+            "the refusing passes elect no one"
+        );
+        assert!(
+            !build_handle.take_spill_request(),
+            "the build side is never asked to spill"
+        );
+        assert_eq!(
+            holder_bytes(&arbitrator, build),
+            10 * MIB,
+            "its bytes still count toward the ledger"
+        );
     }
 }

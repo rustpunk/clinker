@@ -1156,6 +1156,32 @@ mod memory_consumer_contract_tests {
         assert!(handle.take_spill_request());
         assert!(arbitrator.unregister_consumer(consumer_id).is_some());
     }
+
+    /// Credentials are never written to disk, so a spill frees none of the
+    /// registry's bytes: it reports nothing reclaimable, which keeps every
+    /// reclaim pass from electing it, while its whole charge still counts
+    /// toward the run's ledger.
+    #[test]
+    fn credential_registry_reclaims_nothing_and_stays_charged() {
+        let handle = ConsumerHandle::new();
+        let consumer = Arc::new(CredentialRegistryConsumer::new(Arc::clone(&handle)));
+        let arbitrator =
+            MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, MemoryArbitrator::default_policy());
+        let consumer_id = arbitrator.register_consumer(
+            consumer.clone(),
+            Arc::clone(&handle),
+            clinker_plan::runtime_error::ConsumerLabel {
+                node: "credentials".to_string(),
+                surface: clinker_plan::runtime_error::MemorySurface::CredentialRegistry,
+            },
+        );
+        handle.set_bytes(4_096);
+
+        assert_eq!(consumer.reclaimable_bytes(), 0);
+        assert_eq!(consumer.current_usage(), 4_096);
+        assert_eq!(arbitrator.charged_bytes(), 4_096);
+        assert!(arbitrator.unregister_consumer(consumer_id).is_some());
+    }
 }
 
 /// Run-local owner for every credential lease acquired during preflight.
