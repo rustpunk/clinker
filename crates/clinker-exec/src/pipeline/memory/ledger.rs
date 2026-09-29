@@ -596,8 +596,11 @@ impl MemoryArbitrator {
     /// It aims to free the larger of the shortfall and what brings the
     /// ledger down to the resume watermark with the request charged,
     /// reclaiming on demand only. Candidates are the registered consumers
-    /// that cannot be paused and hold bytes, ordered by the run's policy with
-    /// ties to the older (lower) id, the requester after all of them; a
+    /// that cannot be paused and that a spill would free bytes from now
+    /// ([`MemoryConsumer::reclaimable_bytes`] above 0), ordered by the run's
+    /// policy, which ranks them by those bytes, with ties to the older
+    /// (lower) id, the requester after all of them; a consumer whose charge
+    /// no spill can free is never a candidate, however much it holds. A
     /// forced pass's only candidate is the requester. A victim the walk does
     /// not own is skipped and never asked to act; one it owns but cannot
     /// spill now is `Busy` and frees nothing.
@@ -652,7 +655,7 @@ impl MemoryArbitrator {
             .filter(|(id, consumer)| {
                 Some(*id) != requester
                     && !consumer.can_back_pressure()
-                    && consumer.current_usage() > 0
+                    && consumer.reclaimable_bytes() > 0
             })
             .map(|(id, consumer)| (*id, consumer.as_ref()))
             .collect();
@@ -684,7 +687,7 @@ impl MemoryArbitrator {
         if let Some(requester) = requester
             && let Some((_, consumer)) = registered.iter().find(|(id, _)| *id == requester)
             && !consumer.can_back_pressure()
-            && consumer.current_usage() > 0
+            && consumer.reclaimable_bytes() > 0
         {
             order.push(requester);
         }

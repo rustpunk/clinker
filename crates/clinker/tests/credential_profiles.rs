@@ -928,7 +928,9 @@ fn cleanup_registered_spill_request_releases_at_next_checkpoint() {
         .acquire(&selected, &requirement)
         .expect("second handle");
     let retained_before = registry.retained_bytes();
-    arbitrator.spill_reclaimable(retained_before);
+    // No reclaim pass elects the registry (a spill frees none of its
+    // charge), so the request is raised on its own handle.
+    registry.memory_handle().request_spill();
     assert_eq!(registry.retained_bytes(), retained_before);
     assert_eq!(registry.live_handle_count(), 2);
     assert_eq!(arbitrator.consumer_count(), 1);

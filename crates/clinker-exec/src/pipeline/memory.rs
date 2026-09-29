@@ -1025,8 +1025,9 @@ impl ArbitrationPolicy for NoOpPolicy {
     }
 }
 
-/// Policy that elects whichever consumer is currently holding the
-/// most bytes. On a tie, the last equally-maximum entry in the
+/// Policy that elects whichever consumer a spill would free the most
+/// bytes from now ([`MemoryConsumer::reclaimable_bytes`]). On a tie, the
+/// last equally-maximum entry in the
 /// snapshot wins (per `std`'s `max_by_key` contract); the snapshot
 /// preserves registration order, so the tie-break is deterministic
 /// within a single arbitrator instance for a given `consumers`
@@ -1045,7 +1046,7 @@ impl ArbitrationPolicy for LargestFirst {
     ) -> Option<ConsumerId> {
         consumers
             .iter()
-            .max_by_key(|(_, c)| c.current_usage())
+            .max_by_key(|(_, c)| c.reclaimable_bytes())
             .map(|(id, _)| *id)
     }
 
@@ -1056,7 +1057,7 @@ impl ArbitrationPolicy for LargestFirst {
 
 /// Policy that elects the consumer with the lowest
 /// `spill_priority()` value (lower = spill first). Ties broken by
-/// `current_usage()` (largest first) so that two equally-priority
+/// `reclaimable_bytes()` (largest first) so that two equally-priority
 /// consumers still produce deterministic, headroom-maximizing
 /// selection.
 ///
@@ -1076,7 +1077,7 @@ impl ArbitrationPolicy for Priority {
             .min_by(|(_, a), (_, b)| {
                 a.spill_priority()
                     .cmp(&b.spill_priority())
-                    .then_with(|| b.current_usage().cmp(&a.current_usage()))
+                    .then_with(|| b.reclaimable_bytes().cmp(&a.reclaimable_bytes()))
             })
             .map(|(id, _)| *id)
     }
@@ -2106,8 +2107,14 @@ impl MemoryArbitrator {
         if consumers.is_empty() {
             return self.policy.select_victim(&[], pressure);
         }
+        // A consumer a spill frees nothing from is never a spill victim; a
+        // back-pressureable one stays a candidate, because electing it is
+        // how `BackPressurePreferred` chooses pausing over spilling.
         let snapshot: Vec<(ConsumerId, &dyn MemoryConsumer)> = consumers
             .iter()
+            .filter(|(_, consumer)| {
+                consumer.can_back_pressure() || consumer.reclaimable_bytes() > 0
+            })
             .map(|(id, consumer)| (*id, consumer.as_ref()))
             .collect();
         let charged_sum = self.sum_consumer_usage();

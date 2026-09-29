@@ -1098,6 +1098,13 @@ impl MemoryConsumer for CredentialRegistryConsumer {
         self.handle.bytes()
     }
 
+    /// Credentials are never written to disk, so no spill frees any of the
+    /// registry's charge: it is never elected, and its bytes still count
+    /// toward the ledger.
+    fn reclaimable_bytes(&self) -> u64 {
+        0
+    }
+
     fn peak_charged_bytes(&self) -> Option<u64> {
         Some(self.handle.peak_bytes())
     }

@@ -1014,6 +1014,11 @@ fn partial_memory_bytes(
 /// resort victim alongside hash-aggregation. `can_back_pressure = false`:
 /// an in-flight combine has no upstream channel to gate; pausing the
 /// probe loop would stall the join without releasing memory.
+///
+/// The build side is approved charged-only: the inline strategy has no
+/// spill path (grace-hash is the spillable one), so `reclaimable_bytes` is
+/// 0 and no reclaim pass or victim policy elects it, while its whole charge
+/// still counts toward the run's ledger.
 pub struct CombineHashConsumer {
     handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
 }
@@ -1027,6 +1032,10 @@ impl CombineHashConsumer {
 impl crate::pipeline::memory::MemoryConsumer for CombineHashConsumer {
     fn current_usage(&self) -> u64 {
         self.handle.bytes()
+    }
+
+    fn reclaimable_bytes(&self) -> u64 {
+        0
     }
 
     fn peak_charged_bytes(&self) -> Option<u64> {
