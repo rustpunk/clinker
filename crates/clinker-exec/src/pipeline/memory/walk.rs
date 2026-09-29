@@ -307,6 +307,43 @@ impl WalkReclaimSet {
         self.document_buckets.remove(&id);
     }
 
+    /// Spill the Output bucket registered as consumer `id`; `None` when no
+    /// bucket was entered under it. The bucket spills through its Output's
+    /// cell ([`DocumentBuckets::spill_consumer`]), which appends its resident
+    /// records as a new chunk the way the Output's own spills do
+    /// (`spill_bucket_in_place`), recorded under the Output's name.
+    ///
+    /// A borrowed cell means the Output is in one step of its own (building,
+    /// pushing to, spilling or taking a bucket): the bucket is `Busy` and its
+    /// spill request is raised, which its next push answers. A cell that is
+    /// gone, or that no longer holds a bucket for `id`, is an entry left
+    /// behind when the bucket left: it is dropped and the consumer is
+    /// `NotOwned`. A spill never reserves memory; past the spill cap it
+    /// fails with E320.
+    fn spill_document_bucket(
+        &mut self,
+        id: ConsumerId,
+        arbitrator: &MemoryArbitrator,
+    ) -> Result<Option<VictimOutcome>, PipelineError> {
+        let Some(entry) = self.document_buckets.get(&id) else {
+            return Ok(None);
+        };
+        let Some(cell) = entry.cell.upgrade() else {
+            self.document_buckets.remove(&id);
+            return Ok(Some(VictimOutcome::NotOwned));
+        };
+        let Ok(mut buckets) = cell.try_borrow_mut() else {
+            entry.handle.request_spill();
+            return Ok(Some(VictimOutcome::Busy));
+        };
+        if buckets.spill_consumer(id, arbitrator)? {
+            return Ok(Some(VictimOutcome::Spilled));
+        }
+        drop(buckets);
+        self.document_buckets.remove(&id);
+        Ok(Some(VictimOutcome::NotOwned))
+    }
+
     /// Make the run's document dead-letter state, in its own cell, a victim
     /// every pass on this walk can reach. Borrows the state's cell once, to
     /// read its consumer and handle; the set then keeps the state alive for
@@ -545,6 +582,9 @@ impl WalkReclaim for WalkReclaimSet {
             }
         }
         if let Some(outcome) = self.spill_document_dlq(id, arbitrator)? {
+            return Ok(outcome);
+        }
+        if let Some(outcome) = self.spill_document_bucket(id, arbitrator)? {
             return Ok(outcome);
         }
         Ok(VictimOutcome::NotOwned)

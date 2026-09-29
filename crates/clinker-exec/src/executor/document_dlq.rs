@@ -1670,13 +1670,23 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
         }
     }
 
-    /// Buffer one record into its file's bucket, charging and spilling the
-    /// bucket under budget pressure.
+    /// Buffer one record into its file's bucket, charging its bytes first.
+    ///
+    /// The bucket answers a spill request a reclaim pass raised while its
+    /// cell was busy before anything else. The record's own bytes (what its
+    /// run did not already charge) are then grown through the bucket's
+    /// handle with no borrow of the cell held, so on the walk the pass this
+    /// growth starts can spill sibling buckets and every other walk victim,
+    /// this bucket (the requester) last. Only if that falls short does the
+    /// bucket spill itself and retry once. Until the soft-threshold poll is
+    /// retired, a push while the threshold is tripped also spills the
+    /// bucket, as before.
     ///
     /// # Errors
     ///
-    /// Surfaces a spill-cap-exceeded [`PipelineError`] when admitting the
-    /// bucket would push cumulative spill past the configured ceiling.
+    /// E310 when the record's bytes do not fit even with this bucket on
+    /// disk; a spill-cap-exceeded [`PipelineError`] (E320) when a spill of
+    /// the bucket passes the configured ceiling.
     fn buffer_record(
         &mut self,
         key: &DocKey,
@@ -1686,15 +1696,28 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
         let column_count = record.schema().column_count();
         let reclaimable = crate::executor::node_buffer::record_byte_cost(column_count)
             .saturating_add(record.legacy_estimated_heap_size() as u64);
+        let residue = crate::executor::node_buffer::unaccounted_record_byte_cost(
+            &record,
+            &self.allocation_resources,
+        );
+        let handle = {
+            let mut buckets = self.buckets.borrow_mut();
+            let handle = Arc::clone(&buckets.bucket_for(&self.arbitrator, key)?.handle);
+            buckets.answer_spill_request(&self.arbitrator, key)?;
+            handle
+        };
+        if handle.try_grow(residue).is_err() {
+            self.buckets.borrow_mut().spill(&self.arbitrator, key)?;
+            handle
+                .try_grow(residue)
+                .map_err(|shortfall| PipelineError::MemoryBudgetExceeded {
+                    report: shortfall.into_report(&self.arbitrator),
+                })?;
+        }
         {
             let mut buckets = self.buckets.borrow_mut();
-            let bucket = buckets.bucket_for(&self.arbitrator, key)?;
+            let bucket = buckets.bucket_mut(key)?;
             bucket.buffer.push(record, source_row);
-            bucket.handle.set_bytes(
-                bucket
-                    .buffer
-                    .unaccounted_memory_bytes(&self.allocation_resources),
-            );
             // The bucket's resident tail is what its in-place spill frees.
             bucket
                 .handle
