@@ -7,6 +7,12 @@
 //! walk, on a rayon kernel worker or on some other thread, and on the walk
 //! reach the run's [`WalkReclaimSet`] through [`walk_reclaim_set`] without a
 //! `&mut` path to the executor context.
+//!
+//! The set holds one frame of node-buffer slots per dispatch scope on the
+//! walk: the top level's, and one above it for each composition body running
+//! inside it. A body reads and writes only its own frame, but a reclaim can
+//! spill a resident slot of any frame, so a body that falls short still
+//! reaches the state its callers are holding.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -57,8 +63,9 @@ pub(crate) struct SlotSpill {
 /// two comes second records the buffer's reclaimable bytes on the slot's
 /// handle, so the slot ranks as a reclaim victim by what its spill frees.
 ///
-/// A composition body walks its own scope, swapped in for the parent's, so
-/// equal body-local and parent `NodeIndex` values never collide. A slot's
+/// A composition body walks its own scope, pushed as a frame above the
+/// parent's, so equal body-local and parent `NodeIndex` values never collide.
+/// A slot's
 /// registration and its spill facts change together, through
 /// [`Self::register`], [`Self::remove_registration`] and
 /// [`Self::take_registrations`] only.
@@ -160,6 +167,49 @@ impl NodeBufferSlots {
             arbitrator.unregister_consumer(id);
         }
     }
+
+    /// Spill the slot registered here under consumer `id`, if this scope
+    /// registered it; `None` when it did not.
+    ///
+    /// A resident slot spills through the same core as the walk's
+    /// spill-request sweep (`service_pending_node_buffer_spills`). A
+    /// registered slot whose buffer is out of the scope is held by a running
+    /// arm: its spill request is raised and it is `Busy`. A slot its compiled
+    /// classification keeps in memory is `NotOwned`.
+    fn spill_registered(
+        &mut self,
+        id: ConsumerId,
+        arbitrator: &MemoryArbitrator,
+        spill_settings: &WalkSpillSettings,
+    ) -> Result<Option<VictimOutcome>, PipelineError> {
+        let Some((key, handle)) = self
+            .registrations
+            .iter()
+            .find(|(_, (registered, _))| *registered == id)
+            .map(|(key, (_, handle))| (key.clone(), Arc::clone(handle)))
+        else {
+            return Ok(None);
+        };
+        let Some(spill) = self.spill.get(&key) else {
+            return Ok(Some(VictimOutcome::NotOwned));
+        };
+        if !spill.spill_allowed {
+            return Ok(Some(VictimOutcome::NotOwned));
+        }
+        if !self.buffers.contains_key(&key) {
+            handle.request_spill();
+            return Ok(Some(VictimOutcome::Busy));
+        }
+        let node_name = spill.node_name.clone();
+        ResidentSlotSpill {
+            arbitrator,
+            spill_root: spill_settings.spill_root.as_ref(),
+            spill_compress: spill_settings.spill_compress,
+            batch_size: spill_settings.batch_size,
+        }
+        .spill_slot(&mut self.buffers, &key, &handle, &node_name)?;
+        Ok(Some(VictimOutcome::Spilled))
+    }
 }
 
 /// The run's spill settings a node-buffer spill needs, copied from the run
@@ -170,14 +220,26 @@ pub(crate) struct WalkSpillSettings {
     pub(crate) batch_size: usize,
 }
 
-/// The walk-owned state a reclaim on the walk may spill: the current dispatch
-/// scope's node-buffer slots and the settings their spill needs.
+/// The walk-owned state a reclaim on the walk may spill: a stack of frames of
+/// node-buffer slots, one per dispatch scope the walk is inside, and the
+/// settings their spill needs.
+///
+/// The top frame is the running scope's. Every slot operation
+/// ([`Self::slots`], [`Self::slots_mut`], [`Self::spill_sweep_parts`]) acts
+/// on the top frame only, so a composition body can never read, replace or
+/// remove a slot of the scope that called it. Only a reclaim
+/// ([`WalkReclaim::spill_victim`]) searches every frame: a body's shortfall
+/// may spill a resident slot its callers hold.
 ///
 /// Walk-only (`!Send`, reached through an `Rc<RefCell<_>>`). A borrow of it is
 /// short and never held across a governed allocation, a `reserve`, a channel
 /// wait or a call into another dispatch arm.
 pub(crate) struct WalkReclaimSet {
+    /// The top frame: the running dispatch scope's slots.
     slots: NodeBufferSlots,
+    /// The frames beneath the top, innermost last: each calling scope's
+    /// slots, kept while a composition body it entered runs.
+    parents: Vec<NodeBufferSlots>,
     spill_settings: WalkSpillSettings,
 }
 
@@ -186,11 +248,12 @@ impl WalkReclaimSet {
     pub(crate) fn new(spill_settings: WalkSpillSettings) -> Self {
         Self {
             slots: NodeBufferSlots::default(),
+            parents: Vec::new(),
             spill_settings,
         }
     }
 
-    /// The current dispatch scope's node-buffer slots.
+    /// The running dispatch scope's node-buffer slots: the top frame.
     pub(crate) fn slots(&self) -> &NodeBufferSlots {
         &self.slots
     }
@@ -204,13 +267,62 @@ impl WalkReclaimSet {
         std::mem::replace(&mut self.slots, slots)
     }
 
-    /// Take the current scope, leaving an empty one.
+    /// Take the top frame's slots, leaving an empty one. The run's teardown
+    /// takes the top level's slots this way once every body frame is gone.
     pub(crate) fn take_slots(&mut self) -> NodeBufferSlots {
+        debug_assert!(
+            self.parents.is_empty(),
+            "the walk's teardown runs with no composition body frame pushed"
+        );
         std::mem::take(&mut self.slots)
     }
 
-    /// The current scope's buffers, mutably, beside its registrations and
-    /// the spill settings: what the node-buffer spill sweep works on.
+    /// Make `frame` the top frame, keeping the running scope's slots beneath
+    /// it, until the returned guard pops it.
+    ///
+    /// The guard pops on every exit: [`FrameGuard::pop`] hands the body's
+    /// frame back so its caller releases it in its own order; a guard dropped
+    /// without that (an error returned early, or an unwind) restores the
+    /// caller's frame and releases the body frame's residue against
+    /// `arbitrator`. Borrows the set only while it pushes.
+    pub(crate) fn push_frame(
+        set: &Rc<RefCell<Self>>,
+        frame: NodeBufferSlots,
+        arbitrator: &Arc<MemoryArbitrator>,
+    ) -> FrameGuard {
+        let depth = {
+            let mut this = set.borrow_mut();
+            let parent = std::mem::replace(&mut this.slots, frame);
+            this.parents.push(parent);
+            this.depth()
+        };
+        FrameGuard {
+            set: Rc::clone(set),
+            arbitrator: Arc::clone(arbitrator),
+            depth,
+            pushed: true,
+        }
+    }
+
+    /// Pop the top frame, making the frame beneath it the top again. `None`
+    /// at the bottom frame, which is never popped.
+    pub(crate) fn pop_frame(&mut self) -> Option<NodeBufferSlots> {
+        let parent = self.parents.pop()?;
+        Some(std::mem::replace(&mut self.slots, parent))
+    }
+
+    /// How many frames the set holds, the running scope's included.
+    fn depth(&self) -> usize {
+        self.parents.len() + 1
+    }
+
+    #[cfg(test)]
+    pub(crate) fn frame_depth(&self) -> usize {
+        self.depth()
+    }
+
+    /// The top frame's buffers, mutably, beside its registrations and the
+    /// spill settings: what the node-buffer spill sweep works on.
     pub(crate) fn spill_sweep_parts(
         &mut self,
     ) -> (
@@ -223,6 +335,44 @@ impl WalkReclaimSet {
             &self.slots.registrations,
             &self.spill_settings,
         )
+    }
+}
+
+/// Keeps a composition body's frame on top of the walk reclaim set and pops
+/// it on every exit.
+///
+/// Holds the set by `Rc`, not through the executor context, so the body's
+/// dispatch keeps its `&mut` context while the guard lives. `!Send`.
+#[must_use = "the body's frame is popped as soon as the guard drops"]
+pub(crate) struct FrameGuard {
+    set: Rc<RefCell<WalkReclaimSet>>,
+    arbitrator: Arc<MemoryArbitrator>,
+    /// The set's depth with this guard's frame on top.
+    depth: usize,
+    /// Cleared once [`Self::pop`] popped the frame, so the drop does not.
+    pushed: bool,
+}
+
+impl FrameGuard {
+    /// Pop the body's frame, restoring the caller's as the top, and return
+    /// the body's slots for the caller to release in its own order.
+    pub(crate) fn pop(mut self) -> NodeBufferSlots {
+        self.pushed = false;
+        let mut set = self.set.borrow_mut();
+        debug_assert_eq!(
+            set.depth(),
+            self.depth,
+            "a body's frame is popped only while it is the top frame"
+        );
+        let frame = set.pop_frame();
+        debug_assert!(frame.is_some(), "a pushed frame is above the bottom");
+        frame.unwrap_or_default()
+    }
+}
+
+impl Drop for FrameGuard {
+    fn drop(&mut self) {
+        let _ = (&self.set, &self.arbitrator, self.depth, self.pushed);
     }
 }
 
@@ -263,44 +413,15 @@ pub(crate) trait WalkReclaim {
 }
 
 impl WalkReclaim for WalkReclaimSet {
-    /// A registered node-buffer slot of the current scope whose buffer is
-    /// resident spills through the same core as the walk's spill-request
-    /// sweep (`service_pending_node_buffer_spills`). A registered slot whose
-    /// buffer is out of the set is held by the running arm: its spill
-    /// request is raised and it is `Busy`. Anything else is `NotOwned`.
     fn spill_victim(
         &mut self,
         id: ConsumerId,
         arbitrator: &MemoryArbitrator,
     ) -> Result<VictimOutcome, PipelineError> {
-        let Some((key, handle)) = self
+        Ok(self
             .slots
-            .registrations
-            .iter()
-            .find(|(_, (registered, _))| *registered == id)
-            .map(|(key, (_, handle))| (key.clone(), Arc::clone(handle)))
-        else {
-            return Ok(VictimOutcome::NotOwned);
-        };
-        let Some(spill) = self.slots.spill.get(&key) else {
-            return Ok(VictimOutcome::NotOwned);
-        };
-        if !spill.spill_allowed {
-            return Ok(VictimOutcome::NotOwned);
-        }
-        if !self.slots.buffers.contains_key(&key) {
-            handle.request_spill();
-            return Ok(VictimOutcome::Busy);
-        }
-        let node_name = spill.node_name.clone();
-        ResidentSlotSpill {
-            arbitrator,
-            spill_root: self.spill_settings.spill_root.as_ref(),
-            spill_compress: self.spill_settings.spill_compress,
-            batch_size: self.spill_settings.batch_size,
-        }
-        .spill_slot(&mut self.slots.buffers, &key, &handle, &node_name)?;
-        Ok(VictimOutcome::Spilled)
+            .spill_registered(id, arbitrator, &self.spill_settings)?
+            .unwrap_or(VictimOutcome::NotOwned))
     }
 }
 
@@ -544,5 +665,213 @@ mod tests {
             .expect("rayon pool");
         assert_eq!(pool.install(|| thread_role(&run)), ThreadRole::RayonWorker);
         assert_eq!(thread_role(&run), ThreadRole::Walk);
+    }
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+    use crate::executor::node_buffer::NodeBufferConsumer;
+    use crate::pipeline::memory::Priority;
+    use crate::pipeline::memory::ledger::Requester;
+    use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface};
+    use clinker_record::owned_storage::SharedStorage;
+    use clinker_record::{Record, Schema, Value};
+    use petgraph::graph::NodeIndex;
+
+    const KIB: u64 = 1024;
+
+    fn arbitrator(limit: u64) -> Arc<MemoryArbitrator> {
+        Arc::new(MemoryArbitrator::with_policy(
+            limit,
+            0.80,
+            0.70,
+            Box::new(Priority),
+        ))
+    }
+
+    fn reclaim_set(spill_root: &Path) -> Rc<RefCell<WalkReclaimSet>> {
+        Rc::new(RefCell::new(WalkReclaimSet::new(WalkSpillSettings {
+            spill_root: Arc::from(spill_root),
+            spill_compress: CompressMode::Auto,
+            batch_size: 1024,
+        })))
+    }
+
+    /// Publish a resident slot of `rows` records at node 0 of `slots`, its
+    /// `NodeBufferConsumer` registered under `node` and charged `charge`
+    /// bytes.
+    fn publish_slot(
+        arbitrator: &MemoryArbitrator,
+        slots: &mut NodeBufferSlots,
+        node: &str,
+        rows: usize,
+        charge: u64,
+    ) -> (NodeBufferKey, ConsumerId, Arc<ConsumerHandle>) {
+        let handle = ConsumerHandle::new();
+        let id = arbitrator.register_node_consumer(
+            Arc::new(NodeBufferConsumer::new(Arc::clone(&handle))),
+            Arc::clone(&handle),
+            ConsumerLabel {
+                node: node.to_string(),
+                surface: MemorySurface::BufferedRows {
+                    from: node.to_string(),
+                    to: "next".to_string(),
+                },
+            },
+        );
+        handle.set_bytes(charge);
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
+            "id".into(),
+            "payload".into(),
+        ])));
+        let records: Vec<(Record, u64)> = (0..rows)
+            .map(|row| {
+                (
+                    Record::new(
+                        schema.clone(),
+                        vec![
+                            Value::Integer(row as i64),
+                            Value::String(format!("{node}-{row:05}").into()),
+                        ],
+                    ),
+                    row as u64,
+                )
+            })
+            .collect();
+        let key = NodeBufferKey::from(NodeIndex::new(0));
+        slots.register(
+            key.clone(),
+            (id, Arc::clone(&handle)),
+            SlotSpill {
+                spill_allowed: true,
+                node_name: Box::from(node),
+            },
+        );
+        slots.insert_buffer(key.clone(), NodeBuffer::memory_from_records(records));
+        (key, id, handle)
+    }
+
+    fn is_resident(slots: &NodeBufferSlots, key: &NodeBufferKey) -> bool {
+        matches!(slots.buffer(key), Some(NodeBuffer::Memory(_)))
+    }
+
+    fn body_failure() -> Result<(), PipelineError> {
+        Err(PipelineError::Internal {
+            op: "test",
+            node: "body".to_string(),
+            detail: "a body arm failed".to_string(),
+        })
+    }
+
+    /// A body scope that pushes a frame holding one registered slot of its
+    /// own and then leaves through `?`.
+    fn body_scope_returning_err(
+        set: &Rc<RefCell<WalkReclaimSet>>,
+        arbitrator: &Arc<MemoryArbitrator>,
+    ) -> Result<ConsumerId, PipelineError> {
+        let mut body = NodeBufferSlots::default();
+        let (_, body_id, _) = publish_slot(arbitrator, &mut body, "body_rows", 4, KIB);
+        let _frame = WalkReclaimSet::push_frame(set, body, arbitrator);
+        assert_eq!(set.borrow().frame_depth(), 2);
+        body_failure()?;
+        Ok(body_id)
+    }
+
+    #[test]
+    fn body_error_restores_the_parent_frame() {
+        let root = tempfile::tempdir().expect("spill root");
+        let arbitrator = arbitrator(64 * 1024 * KIB);
+        let set = reclaim_set(root.path());
+        let (parent_key, parent_id, parent_handle) = {
+            let mut guard = set.borrow_mut();
+            publish_slot(&arbitrator, guard.slots_mut(), "parent_rows", 8, 2 * KIB)
+        };
+        let parent_intact = |set: &Rc<RefCell<WalkReclaimSet>>| {
+            let set = set.borrow();
+            set.frame_depth() == 1
+                && is_resident(set.slots(), &parent_key)
+                && set
+                    .slots()
+                    .registrations()
+                    .get(&parent_key)
+                    .is_some_and(|(id, _)| *id == parent_id)
+        };
+
+        let consumers_before = arbitrator.consumer_count();
+        let returned = body_scope_returning_err(&set, &arbitrator);
+        assert!(returned.is_err(), "the body's error reaches its caller");
+        assert!(
+            parent_intact(&set),
+            "an error leaving the body restores the parent's frame with its slot"
+        );
+        assert_eq!(
+            arbitrator.consumer_count(),
+            consumers_before,
+            "the body frame's residue is released: its slot consumer is unregistered"
+        );
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut body = NodeBufferSlots::default();
+            publish_slot(&arbitrator, &mut body, "body_rows", 4, KIB);
+            let _frame = WalkReclaimSet::push_frame(&set, body, &arbitrator);
+            assert_eq!(set.borrow().frame_depth(), 2);
+            panic!("a body arm panicked");
+        }));
+        assert!(unwound.is_err());
+        assert!(
+            parent_intact(&set),
+            "an unwind out of the body restores the parent's frame with its slot"
+        );
+        assert_eq!(arbitrator.consumer_count(), consumers_before);
+        assert_eq!(parent_handle.bytes(), 2 * KIB, "the parent's charge stands");
+    }
+
+    /// While a body's frame is on top, the body sees none of its parent's
+    /// slots, yet a shortfall inside it spills the parent's resident slot
+    /// before it is refused.
+    #[test]
+    fn a_body_shortfall_spills_a_parent_slot_it_cannot_otherwise_reach() {
+        let root = tempfile::tempdir().expect("spill root");
+        let arbitrator = arbitrator(256 * KIB);
+        let set = reclaim_set(root.path());
+        let _walk = WalkContextGuard::install(&arbitrator, Rc::clone(&set));
+        let (parent_key, parent_id, parent_handle) = {
+            let mut guard = set.borrow_mut();
+            publish_slot(&arbitrator, guard.slots_mut(), "parent_rows", 64, 128 * KIB)
+        };
+
+        let frame = WalkReclaimSet::push_frame(&set, NodeBufferSlots::default(), &arbitrator);
+        {
+            let set = set.borrow();
+            assert!(
+                !set.slots().contains_buffer(&parent_key)
+                    && !set.slots().is_registered(&parent_key),
+                "a body's slot operations act on its own frame only"
+            );
+        }
+        let _filler = arbitrator
+            .reserve(64 * KIB, Requester::governed())
+            .expect("the filler fits beside the parent slot");
+        let grant = arbitrator
+            .reserve(128 * KIB, Requester::governed())
+            .expect("the body's request spills the parent slot and is granted");
+        assert_eq!(grant.bytes(), 128 * KIB);
+        assert_eq!(
+            parent_handle.bytes(),
+            0,
+            "the parent slot's charge left with its rows"
+        );
+        drop(frame.pop());
+
+        let set = set.borrow();
+        assert_eq!(set.frame_depth(), 1);
+        assert!(
+            matches!(set.slots().buffer(&parent_key), Some(NodeBuffer::Spilled { .. })),
+            "the parent's slot is on disk once its frame is back on top"
+        );
+        assert!(set.slots().is_registered(&parent_key));
+        assert!(arbitrator.cumulative_spill_bytes() > 0);
+        assert!(arbitrator.unregister_consumer(parent_id).is_some());
     }
 }
