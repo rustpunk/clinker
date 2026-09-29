@@ -12,9 +12,7 @@ use std::collections::HashMap;
 use std::io::Write;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_exec::executor::{
-    ExecutionReport, MemoryTestOverrides, PipelineExecutor, PipelineRunParams, SourceReaders,
-};
+use clinker_exec::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams, SourceReaders};
 use clinker_plan::config::{CompileContext, PipelineConfig};
 use clinker_plan::error::PipelineError;
 
@@ -123,24 +121,30 @@ const LOOKUP_CSV: &str = "department,budget\nHR,100\nENG,500\n";
 /// is the trigger.
 type DeadLetterFacts<'a> = (Option<&'a str>, Option<&'a str>, Option<&'a str>, bool);
 
-/// One finished run: its report, its Output's bytes and its dead-letter rows.
+/// One finished run: its report, its Outputs' bytes and its dead-letter rows.
 struct Run {
     report: ExecutionReport,
     output: String,
     dead_letters: Vec<dlq_sink::DlqRow>,
 }
 
-/// Run `yaml` over the given `(source, csv)` inputs, with the run's ledger
-/// held to `capacity` bytes when one is given.
-fn run(
+/// Run `yaml` over the given `(source, csv)` inputs, compiled against the
+/// default context and writing the one Output `out`.
+fn run(yaml: &str, sources: &[(&str, String)]) -> Result<Run, PipelineError> {
+    run_in(yaml, CompileContext::default(), sources, &["out"])
+}
+
+/// Run `yaml` compiled against `context` over the given `(source, csv)`
+/// inputs, collecting every Output in `outputs` (in that order, each under
+/// its name).
+fn run_in(
     yaml: &str,
+    context: CompileContext,
     sources: &[(&str, String)],
-    capacity: Option<u64>,
+    outputs: &[&str],
 ) -> Result<Run, PipelineError> {
     let config: PipelineConfig = clinker_plan::yaml::from_str(yaml).expect("fixture parses");
-    let plan = config
-        .compile(&CompileContext::default())
-        .expect("fixture compiles");
+    let plan = config.compile(&context).expect("fixture compiles");
     let readers: SourceReaders = sources
         .iter()
         .map(|(name, csv)| {
@@ -153,31 +157,42 @@ fn run(
             )
         })
         .collect();
-    let buffer = SharedBuffer::new();
-    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        "out".to_string(),
-        Box::new(buffer.clone()) as Box<dyn Write + Send>,
-    )]);
-    let memory_test = match capacity {
-        Some(bytes) => MemoryTestOverrides::default().with_ledger_capacity(bytes),
-        None => MemoryTestOverrides::default(),
-    };
+    let buffers: Vec<SharedBuffer> = outputs.iter().map(|_| SharedBuffer::new()).collect();
+    let writers: HashMap<String, Box<dyn Write + Send>> = outputs
+        .iter()
+        .zip(&buffers)
+        .map(|(name, buffer)| {
+            (
+                (*name).to_string(),
+                Box::new(buffer.clone()) as Box<dyn Write + Send>,
+            )
+        })
+        .collect();
     let params = PipelineRunParams {
         execution_id: "cross-region-parked-input".to_string(),
         batch_id: "batch-0".to_string(),
-        memory_test,
         ..Default::default()
     };
     let sink = dlq_sink::CollectingDlqSink::new();
-    let report = PipelineExecutor::run_plan_with_readers_writers(
+    let report = PipelineExecutor::run_plan_with_readers_writers_in_context(
         &plan,
         readers,
         dlq_sink::registry(writers, &sink),
         &params,
+        context,
     )?;
+    let output = if let [only] = buffers.as_slice() {
+        only.as_string()
+    } else {
+        outputs
+            .iter()
+            .zip(&buffers)
+            .map(|(name, buffer)| format!("== {name}\n{}", buffer.as_string()))
+            .collect()
+    };
     Ok(Run {
         report,
-        output: buffer.as_string(),
+        output,
         dead_letters: sink.rows(),
     })
 }
@@ -202,7 +217,6 @@ fn cross_region_input_survives_cascading_iterations() {
             ("orders", orders_csv(true)),
             ("dept_lookup", LOOKUP_CSV.to_string()),
         ],
-        None,
     )
     .expect("a relaxed-key commit that iterates reads the parked build side on every iteration");
     assert!(
@@ -220,7 +234,6 @@ fn cross_region_input_survives_cascading_iterations() {
             ("orders", orders_csv(false)),
             ("dept_lookup", LOOKUP_CSV.to_string()),
         ],
-        None,
     )
     .expect("the reference run completes");
     assert_eq!(reference.report.counters.retraction.iterations, 1);
@@ -260,6 +273,427 @@ fn cross_region_input_survives_cascading_iterations() {
         dead_letters,
         vec![(Some("transform:ratio"), Some("HR"), Some("100"), true)],
         "exactly one dead letter: HR's row, joined to its parked budget, failing in `ratio`"
+    );
+    assert_eq!(converged.report.counters.dlq_count, 1);
+}
+
+/// Where the deferred Combine's build side comes from: the node whose rows
+/// cross into the deferred region and are parked.
+#[derive(Clone, Copy)]
+enum BuildSide {
+    /// `dept_lookup` itself.
+    Source,
+    /// The `wanted` branch of Route `split` over `dept_lookup`.
+    RouteBranch,
+    /// The kept (main) port of Cull `trim` over `dept_lookup`.
+    CullPort,
+}
+
+impl BuildSide {
+    /// The node whose rows are parked, which their charge and spill name.
+    fn producer(self) -> &'static str {
+        match self {
+            Self::Source => "dept_lookup",
+            Self::RouteBranch => "split",
+            Self::CullPort => "trim",
+        }
+    }
+
+    /// The Outputs the pipeline writes.
+    fn outputs(self) -> &'static [&'static str] {
+        match self {
+            Self::Source => &["out"],
+            Self::RouteBranch => &["out", "unwanted_out"],
+            Self::CullPort => &["out", "removed_out"],
+        }
+    }
+}
+
+/// [`CASCADING_PIPELINE`] at `memory.limit` 512M, with a build side of
+/// `LOOKUP_FILLER_ROWS` extra departments, each carrying a
+/// `NOTE_BYTES`-character note, reached through `build`. Nothing in the
+/// output reads the notes; they make the parked rows large.
+fn parked_pipeline(build: BuildSide) -> String {
+    let (extra_nodes, build_ref) = match build {
+        BuildSide::Source => ("", "dept_lookup"),
+        BuildSide::RouteBranch => (
+            r#"- type: route
+  name: split
+  input: dept_lookup
+  config:
+    mode: exclusive
+    conditions:
+      wanted: "budget >= 0"
+    default: unwanted
+- type: sink
+  name: unwanted_out
+  input: split.unwanted
+  config:
+    name: unwanted_out
+    path: unwanted.csv
+    type: csv
+    include_unmapped: true
+"#,
+            "split.wanted",
+        ),
+        BuildSide::CullPort => (
+            r#"- type: cull
+  name: trim
+  input: dept_lookup
+  config:
+    partition_by: [department]
+    removed_to: removed
+    rules:
+      - name: negative_budget
+        drop_group_when: "sum(if budget < 0 then 1 else 0) > 0"
+- type: sink
+  name: removed_out
+  input: trim.removed
+  config:
+    name: removed_out
+    path: removed.csv
+    type: csv
+    include_unmapped: true
+"#,
+            "trim",
+        ),
+    };
+    format!(
+        r#"
+pipeline:
+  name: parked_cross_region
+  memory: {{ limit: "512M", backpressure: spill }}
+error_handling:
+  strategy: continue
+  dlq:
+    path: rejected.csv
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    path: orders.csv
+    correlation_key: order_id
+    type: csv
+    schema:
+      - {{ name: order_id, type: string }}
+      - {{ name: department, type: string }}
+      - {{ name: amount, type: int }}
+- type: aggregate
+  name: dept_totals
+  input: orders
+  config:
+    group_by: [department]
+    cxl: |
+      emit department = department
+      emit total = sum(amount)
+- type: transform
+  name: probe_xform
+  input: dept_totals
+  config:
+    cxl: |
+      emit department = department
+      emit total = total
+- type: source
+  name: dept_lookup
+  config:
+    name: dept_lookup
+    path: dept_lookup.csv
+    type: csv
+    schema:
+      - {{ name: department, type: string }}
+      - {{ name: budget, type: int }}
+      - {{ name: note, type: string }}
+{extra_nodes}- type: combine
+  name: enriched
+  input:
+    p: probe_xform
+    b: {build_ref}
+  config:
+    where: 'p.department == b.department'
+    match: first
+    on_miss: skip
+    cxl: |
+      emit department = p.department
+      emit total = p.total
+      emit budget = b.budget
+    propagate_ck: driver
+- type: transform
+  name: ratio
+  input: enriched
+  config:
+    cxl: |
+      emit department = department
+      emit total = total
+      emit budget = budget
+      emit ratio = 1 / (total - 60)
+- type: sink
+  name: out
+  input: ratio
+  config:
+    name: out
+    path: out.csv
+    type: csv
+    include_unmapped: true
+"#
+    )
+}
+
+/// Extra build-side departments, none of which any order names.
+const LOOKUP_FILLER_ROWS: usize = 1_000;
+
+/// Characters in every build-side row's note.
+const NOTE_BYTES: usize = 512;
+
+/// HR and ENG, then the filler departments; every seventh filler has a
+/// negative budget (the rows Route `split` sends to `unwanted` and Cull
+/// `trim` removes).
+fn big_lookup_csv() -> String {
+    let note = "n".repeat(NOTE_BYTES);
+    let mut csv = format!("department,budget,note\nHR,100,{note}\nENG,500,{note}\n");
+    for row in 0..LOOKUP_FILLER_ROWS {
+        let budget = if row % 7 == 0 {
+            -(row as i64) - 1
+        } else {
+            row as i64 * 10 + 1
+        };
+        csv.push_str(&format!("F{row:05},{budget},{note}\n"));
+    }
+    csv
+}
+
+/// Run the parked-rows pipeline over `build` with ample memory, with or
+/// without HR's orders (with them the commit iterates twice).
+fn run_parked(build: BuildSide, with_hr: bool) -> Run {
+    run_in(
+        &parked_pipeline(build),
+        CompileContext::default(),
+        &[
+            ("orders", orders_csv(with_hr)),
+            ("dept_lookup", big_lookup_csv()),
+        ],
+        build.outputs(),
+    )
+    .unwrap_or_else(|error| panic!("the {} build side completes: {error}", build.producer()))
+}
+
+/// Every line a run wrote, sorted, so two runs compare by content.
+fn sorted_lines(output: &str) -> Vec<&str> {
+    let mut lines: Vec<&str> = output.lines().filter(|line| !line.is_empty()).collect();
+    lines.sort_unstable();
+    lines
+}
+
+/// Build-side rows with a non-negative budget: what Route `split` sends to
+/// `wanted` and Cull `trim` keeps.
+fn kept_lookup_rows() -> u64 {
+    2 + (0..LOOKUP_FILLER_ROWS).filter(|row| row % 7 != 0).count() as u64
+}
+
+/// With ample memory, `build`'s rows are parked under its producer, charged
+/// there, read again by the commit's second iteration and never written to
+/// disk; the run converges to what a run without HR's orders writes.
+fn assert_parks_and_rereads(build: BuildSide, parked_rows: u64) {
+    let converged = run_parked(build, true);
+    let reference = run_parked(build, false);
+    assert!(
+        converged.report.counters.retraction.iterations >= 2,
+        "the commit re-reads the parked rows on a second iteration; got {}",
+        converged.report.counters.retraction.iterations
+    );
+    assert_eq!(reference.report.counters.retraction.iterations, 1);
+    assert!(
+        converged.report.per_stage_spill_bytes_written.is_empty(),
+        "ample memory writes nothing to disk: {:?}",
+        converged.report.per_stage_spill_bytes_written
+    );
+    let producer = build.producer();
+    let peak = converged
+        .report
+        .per_node_peak_charged_bytes
+        .get(producer)
+        .copied()
+        .unwrap_or(0);
+    assert!(
+        peak >= parked_rows * NOTE_BYTES as u64,
+        "`{producer}`'s parked rows are charged at their resident size, notes included \
+         ({parked_rows} rows of {NOTE_BYTES}-byte notes; peak charged {peak})"
+    );
+    assert_eq!(
+        sorted_lines(&converged.output),
+        sorted_lines(&reference.output),
+        "the converged run writes what a run without the failing group writes"
+    );
+    assert_eq!(converged.report.counters.dlq_count, 1, "HR's row, once");
+}
+
+#[test]
+fn parked_cross_region_input_stays_resident_with_ample_memory() {
+    assert_parks_and_rereads(BuildSide::Source, 2 + LOOKUP_FILLER_ROWS as u64);
+}
+
+#[test]
+fn route_branch_crossing_parks_under_the_route() {
+    assert_parks_and_rereads(BuildSide::RouteBranch, kept_lookup_rows());
+}
+
+#[test]
+fn cull_port_crossing_parks_under_the_cull() {
+    assert_parks_and_rereads(BuildSide::CullPort, kept_lookup_rows());
+}
+
+/// The relaxed-key aggregate and the Combine live in a composition body,
+/// whose `lookup` input port crosses into the body's deferred region. Its
+/// rows are parked under the body's edge namespace, and the commit's second
+/// iteration re-enters the body and reads them again.
+const BODY_COMPOSITION: &str = r#"_compose:
+  name: parked_body
+  inputs:
+    orders:
+      schema:
+        - { name: order_id, type: string }
+        - { name: department, type: string }
+        - { name: amount, type: int }
+    lookup:
+      schema:
+        - { name: department, type: string }
+        - { name: budget, type: int }
+        - { name: note, type: string }
+  outputs:
+    out: enriched
+  config_schema: {}
+
+nodes:
+  - type: aggregate
+    name: dept_totals
+    input: orders
+    config:
+      group_by: [department]
+      cxl: |
+        emit department = department
+        emit total = sum(amount)
+  - type: combine
+    name: enriched
+    input:
+      p: dept_totals
+      b: lookup
+    config:
+      where: 'p.department == b.department'
+      match: first
+      on_miss: skip
+      cxl: |
+        emit department = p.department
+        emit total = p.total
+        emit budget = b.budget
+      propagate_ck: driver
+"#;
+
+const BODY_PIPELINE: &str = r#"
+pipeline:
+  name: parked_body_crossing
+error_handling:
+  strategy: continue
+  dlq:
+    path: rejected.csv
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    path: orders.csv
+    correlation_key: order_id
+    type: csv
+    schema:
+      - { name: order_id, type: string }
+      - { name: department, type: string }
+      - { name: amount, type: int }
+- type: source
+  name: dept_lookup
+  config:
+    name: dept_lookup
+    path: dept_lookup.csv
+    type: csv
+    schema:
+      - { name: department, type: string }
+      - { name: budget, type: int }
+      - { name: note, type: string }
+- type: composition
+  name: enrich
+  input: orders
+  use: ../compositions/parked_body.comp.yaml
+  inputs:
+    orders: orders
+    lookup: dept_lookup
+- type: transform
+  name: ratio
+  input: enrich
+  config:
+    cxl: |
+      emit department = department
+      emit total = total
+      emit budget = budget
+      emit ratio = 1 / (total - 60)
+- type: sink
+  name: out
+  input: ratio
+  config:
+    name: out
+    path: out.csv
+    type: csv
+    include_unmapped: true
+"#;
+
+#[test]
+fn composition_body_crossing_parks_under_its_body_key() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let compositions = workspace.path().join("compositions");
+    std::fs::create_dir_all(&compositions).expect("compositions dir");
+    std::fs::create_dir_all(workspace.path().join("pipelines")).expect("pipelines dir");
+    std::fs::write(compositions.join("parked_body.comp.yaml"), BODY_COMPOSITION)
+        .expect("write the body");
+    let run_body = |with_hr: bool| {
+        run_in(
+            BODY_PIPELINE,
+            CompileContext::with_pipeline_dir(
+                workspace.path(),
+                std::path::PathBuf::from("pipelines"),
+            ),
+            &[
+                ("orders", orders_csv(with_hr)),
+                ("dept_lookup", big_lookup_csv()),
+            ],
+            &["out"],
+        )
+        .expect("the body crossing completes")
+    };
+    let converged = run_body(true);
+    let reference = run_body(false);
+    assert!(
+        converged.report.counters.retraction.iterations >= 2,
+        "the commit re-enters the body and re-reads its parked rows; got {}",
+        converged.report.counters.retraction.iterations
+    );
+    assert_eq!(reference.report.counters.retraction.iterations, 1);
+    assert!(converged.report.per_stage_spill_bytes_written.is_empty());
+    let parked_under_port = converged
+        .report
+        .per_node_peak_charged_bytes
+        .get("lookup")
+        .copied()
+        .unwrap_or(0);
+    assert!(
+        parked_under_port >= (2 + LOOKUP_FILLER_ROWS as u64) * NOTE_BYTES as u64,
+        "the body port's parked rows are charged under the port ({parked_under_port}): {:?}",
+        converged.report.per_node_peak_charged_bytes
+    );
+    assert_eq!(
+        sorted_lines(&converged.output),
+        sorted_lines(&reference.output)
+    );
+    assert!(
+        converged.output.contains("ENG,600,500"),
+        "{}",
+        converged.output
     );
     assert_eq!(converged.report.counters.dlq_count, 1);
 }

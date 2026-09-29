@@ -2019,6 +2019,11 @@ impl PipelineExecutor {
                 .borrow_mut()
                 .set_document_dlq(std::rc::Rc::clone(state));
         }
+        // Rows parked for a deferred consumer are victims any reclaim pass on
+        // the walk can spill.
+        ctx.walk_reclaim
+            .borrow_mut()
+            .set_parked_generations(std::rc::Rc::clone(&ctx.parked_generations));
         // This thread is the run's walk from here until the function returns,
         // by any path; the guard drops before `ctx`.
         let _walk_frame = crate::pipeline::memory::walk::WalkContextGuard::install(

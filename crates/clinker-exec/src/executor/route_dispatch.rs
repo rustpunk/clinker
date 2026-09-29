@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use clinker_record::{Record, Value};
+use clinker_record::Record;
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
@@ -346,25 +346,6 @@ where
         let records: &[(Record, crate::executor::stream_event::SourceRowId)] =
             branch_records.get(&branch).map_or(&[], |v| v.as_slice());
         if crosses_into_deferred_consumer(current_dag, node_idx, succ_idx) {
-            let row_bytes_each: u64 = records
-                .first()
-                .map(|(rec, _)| {
-                    (std::mem::size_of::<Value>() * rec.schema().column_count()
-                        + std::mem::size_of::<(Record, crate::executor::stream_event::SourceRowId)>(
-                        )) as u64
-                })
-                .unwrap_or(0);
-            for _ in records {
-                if row_bytes_each > 0 && ctx.memory_budget.should_abort() {
-                    return Err(ctx.memory_budget.backstop_refusal(
-                        name,
-                        clinker_plan::runtime_error::MemorySurface::ParkedCrossRegionRows {
-                            from: name.to_string(),
-                            to: current_dag.graph[succ_idx].name().to_string(),
-                        },
-                    ));
-                }
-            }
             park_cross_region(ctx, current_dag, node_idx, edge_id, records)?;
             continue;
         }

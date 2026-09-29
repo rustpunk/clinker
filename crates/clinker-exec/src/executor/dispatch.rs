@@ -3335,13 +3335,7 @@ pub(crate) fn admit_node_buffer(
     spill_allowed: bool,
 ) -> Result<(), PipelineError> {
     let slot_key = key.into();
-    let mut readers = planned_materialized_reader_count(ctx, current_dag, &slot_key)?;
-    // A composition body's terminal output is harvested by the scope driver,
-    // not represented by an outgoing graph edge. Count that synthetic reader
-    // at publication so body slots still obey the same strict ledger contract.
-    if readers == 0 && ctx.current_body_node_input_refs.is_some() {
-        readers = 1;
-    }
+    let readers = published_reader_count(ctx, current_dag, &slot_key)?;
     admit_node_buffer_with_readers(
         ctx,
         node_name,
@@ -3443,10 +3437,7 @@ pub(crate) fn admit_node_buffer_with_prior_owner(
     spill_allowed: bool,
 ) -> Result<(), PipelineError> {
     let key = key.into();
-    let mut readers = planned_materialized_reader_count(ctx, current_dag, &key)?;
-    if readers == 0 && ctx.current_body_node_input_refs.is_some() {
-        readers = 1;
-    }
+    let readers = published_reader_count(ctx, current_dag, &key)?;
     admit_owned_node_buffer_with_readers(ctx, node_name, key, owned, spill_allowed, readers)
 }
 
@@ -3538,10 +3529,7 @@ pub(crate) fn admit_node_buffer_transferred(
 ) -> Result<(), PipelineError> {
     let slot_key = key.into();
     let spill_allowed = node_buffer_spill_allowed(current_dag, slot_key.node);
-    let mut readers = planned_materialized_reader_count(ctx, current_dag, &slot_key)?;
-    if readers == 0 && ctx.current_body_node_input_refs.is_some() {
-        readers = 1;
-    }
+    let readers = published_reader_count(ctx, current_dag, &slot_key)?;
     if readers == 0 {
         return Ok(());
     }
@@ -3734,6 +3722,36 @@ pub(crate) fn planned_materialized_reader_counts(
         }
     }
     planned
+}
+
+/// How many reads a slot at `key` published in `current_dag` gets: its
+/// planned readers, and for an output node of the running composition body
+/// with none, the one harvest read of the scope driver, which no graph edge
+/// represents. A body node whose every edge crosses into a deferred region
+/// has no planned reader and is no output: its rows are parked for the
+/// commit, and a slot published for it would never be read.
+fn published_reader_count(
+    ctx: &ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
+    key: &NodeBufferKey,
+) -> Result<usize, PipelineError> {
+    let readers = planned_materialized_reader_count(ctx, current_dag, key)?;
+    let harvested = ctx.current_body_node_input_refs.is_some()
+        && ctx
+            .window_runtime
+            .active_stack
+            .last()
+            .and_then(|body| ctx.composition_bodies.get(body))
+            .is_some_and(|body| {
+                body.output_port_to_node_idx
+                    .values()
+                    .any(|output| *output == key.node)
+            });
+    Ok(if readers == 0 && harvested {
+        1
+    } else {
+        readers
+    })
 }
 
 /// Read the precomputed publication cardinality in O(1), while failing loudly

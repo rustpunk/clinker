@@ -630,27 +630,6 @@ fn emit_ports(
         // In-region and non-deferred edges skip the tee; their `node_buffers`
         // slot already covers them.
         if crosses_into_deferred_consumer(current_dag, node_idx, succ) {
-            let row_bytes_each: u64 = records
-                .first()
-                .map(|(rec, _)| {
-                    (std::mem::size_of::<Value>() * rec.schema().column_count()
-                        + std::mem::size_of::<(Record, crate::executor::stream_event::SourceRowId)>(
-                        )) as u64
-                })
-                .unwrap_or(0);
-            for _ in records {
-                // Fail loud if an oversized cross-region tee would blow the
-                // budget, mirroring the Route tee.
-                if row_bytes_each > 0 && ctx.memory_budget.should_abort() {
-                    return Err(ctx.memory_budget.backstop_refusal(
-                        name,
-                        MemorySurface::ParkedCrossRegionRows {
-                            from: name.to_string(),
-                            to: current_dag.graph[succ].name().to_string(),
-                        },
-                    ));
-                }
-            }
             park_cross_region(ctx, current_dag, node_idx, edge_id, records)?;
             continue;
         }

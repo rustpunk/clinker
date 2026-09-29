@@ -14,14 +14,15 @@
 //! that charge before its rows become resident, which on the walk reclaims
 //! other state first, and a park that still does not fit spills the edge's
 //! own resident segments and then, if need be, writes its rows straight to
-//! disk. A spill is recorded against the producer once, when it is written;
-//! reading it again on a later iteration charges nothing more.
+//! disk. Any reclaim pass on the walk can spill an edge the arbitrator
+//! elects. A spill is recorded against the producer once, when it is
+//! written; reading it again on a later iteration charges nothing more.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
 use clinker_plan::config::CompressMode;
 use clinker_plan::error::PipelineError;
@@ -30,14 +31,20 @@ use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface};
 use clinker_record::Record;
 use petgraph::graph::EdgeIndex;
 
-use crate::executor::node_buffer::{NodeBuffer, NodeBufferConsumer};
+use crate::executor::node_buffer::{NodeBuffer, ReReadableNodeBuffer};
 use crate::executor::stream_event::SourceRowId;
-use crate::pipeline::memory::{ConsumerHandle, ConsumerId, MemoryArbitrator};
+use crate::pipeline::memory::{ConsumerHandle, ConsumerId, ConsumerSpillError, MemoryArbitrator};
 
 /// A crossing edge: the composition body whose graph the edge belongs to
 /// (`None` at the top level, where edge ids have their own namespace), and
 /// the edge.
 pub(crate) type ParkedKey = (Option<CompositionBodyId>, EdgeIndex);
+
+/// Every parked edge's consumer, and the handle a reclaim raises its spill
+/// request on when the store is busy. Shared with the walk reclaim set, and
+/// never borrowed across a reservation, so a pass can tell which consumers
+/// are the store's without borrowing the store.
+pub(crate) type ParkedIndex = Rc<RefCell<HashMap<ConsumerId, Arc<ConsumerHandle>>>>;
 
 /// The run's parked cross-region rows, by crossing edge.
 ///
@@ -50,12 +57,15 @@ pub(crate) struct ParkedGenerations {
     spill_compress: CompressMode,
     batch_size: usize,
     forward: HashMap<ParkedKey, ParkedEdge>,
+    index: ParkedIndex,
 }
 
 /// One crossing edge's parked rows and the consumer that charges them.
 struct ParkedEdge {
     consumer: ConsumerId,
     handle: Arc<ConsumerHandle>,
+    /// What the edge's consumer ranks by, kept in step with `segments`.
+    reclaim: Arc<ParkedEdgeConsumer>,
     /// The producer's name: the edge's consumer is registered, and its spill
     /// recorded, under it.
     producer: Box<str>,
@@ -75,10 +85,99 @@ struct ParkedSegment {
 }
 
 impl ParkedEdge {
-    /// Record, on the edge's handle, what a spill of the edge would free now.
-    fn refresh_reclaimable(&self) {
-        self.handle
-            .set_reclaimable(self.segments.iter().map(|segment| segment.charged).sum());
+    /// Tell the edge's consumer which resident bytes a spill could free: every
+    /// segment still charged, each with the backing a re-read cursor may
+    /// share.
+    fn publish_reclaimable(&self) {
+        let resident = self
+            .segments
+            .iter()
+            .filter(|segment| segment.charged > 0)
+            .map(|segment| ResidentSegment {
+                bytes: segment.charged,
+                shared: match &segment.buffer {
+                    NodeBuffer::ReReadable(backing) => Some(Arc::downgrade(backing)),
+                    _ => None,
+                },
+            })
+            .collect();
+        *self
+            .reclaim
+            .resident
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = resident;
+    }
+}
+
+/// The memory consumer of one parked edge: rows held between a producer and
+/// the deferred consumer that reads them at the commit.
+///
+/// Charged through the edge's handle, which holds the resident segments'
+/// bytes. Ranks by the resident segments no open re-read cursor shares, read
+/// when the arbitrator asks, since a cursor closing frees nothing the store
+/// is told about: a shared segment cannot be freed by a spill. A reclaim pass
+/// on the walk spills the edge itself; an election anywhere else raises the
+/// edge's spill request, which its next park answers.
+///
+/// `spill_priority = 0` and `can_back_pressure = false`, as for any
+/// inter-stage buffer: the rows are parked synchronously on the walk, so
+/// there is no producer thread to pause.
+pub(crate) struct ParkedEdgeConsumer {
+    handle: Arc<ConsumerHandle>,
+    resident: Mutex<Vec<ResidentSegment>>,
+}
+
+/// A resident segment's charge, and the backing an open cursor may share.
+struct ResidentSegment {
+    bytes: u64,
+    shared: Option<Weak<ReReadableNodeBuffer>>,
+}
+
+impl crate::pipeline::memory::MemoryConsumer for ParkedEdgeConsumer {
+    fn current_usage(&self) -> u64 {
+        self.handle.bytes()
+    }
+
+    /// The resident segments no open cursor shares: the store holds the only
+    /// reference to their backing, so a spill drops them.
+    fn reclaimable_bytes(&self) -> u64 {
+        self.resident
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|segment| {
+                segment
+                    .shared
+                    .as_ref()
+                    .is_none_or(|backing| backing.strong_count() <= 1)
+            })
+            .map(|segment| segment.bytes)
+            .sum()
+    }
+
+    fn peak_charged_bytes(&self) -> Option<u64> {
+        Some(self.handle.peak_bytes())
+    }
+
+    fn spill_priority(&self) -> i32 {
+        0
+    }
+
+    fn try_spill(&self, target_bytes: u64) -> Result<u64, ConsumerSpillError> {
+        self.handle.request_spill();
+        let bytes = self.handle.bytes();
+        if bytes >= target_bytes {
+            Ok(bytes)
+        } else {
+            Err(ConsumerSpillError::BelowTarget {
+                target: target_bytes,
+                freed: bytes,
+            })
+        }
+    }
+
+    fn can_back_pressure(&self) -> bool {
+        false
     }
 }
 
@@ -96,20 +195,27 @@ impl ParkedGenerations {
             spill_compress,
             batch_size,
             forward: HashMap::new(),
+            index: Rc::new(RefCell::new(HashMap::new())),
         }
+    }
+
+    /// Every parked edge's consumer and handle, for the walk reclaim set.
+    pub(crate) fn index(&self) -> ParkedIndex {
+        Rc::clone(&self.index)
     }
 
     /// Park a copy of `rows` for the crossing edge `key`, from the node named
     /// `from` into the deferred consumer named `to`.
     ///
     /// The first park on an edge registers its consumer, even for no rows, so
-    /// the commit reads an empty input rather than a missing one. The copy's
-    /// resident size is grown on the edge's handle with no borrow of the
-    /// store held, so a reclaim that growth starts on the walk can spill any
-    /// parked edge, this one included. When it still does not fit, the edge's
-    /// own resident segments spill and the growth is retried once; if that
-    /// falls short too, the rows are written straight to disk. Parking is
-    /// never refused for memory; past the spill cap it fails with E320.
+    /// the commit reads an empty input rather than a missing one. A spill
+    /// request raised on the edge since its last park is answered first. The
+    /// copy's resident size is grown on the edge's handle with no borrow of
+    /// the store held, so a reclaim that growth starts on the walk can spill
+    /// any parked edge, this one included. When it still does not fit, the
+    /// edge's own resident segments spill and the growth is retried once; if
+    /// that falls short too, the rows are written straight to disk. Parking
+    /// is never refused for memory; past the spill cap it fails with E320.
     pub(crate) fn park(
         store: &Rc<RefCell<Self>>,
         key: ParkedKey,
@@ -120,6 +226,9 @@ impl ParkedGenerations {
         let handle = store.borrow_mut().edge_handle(key, from, to);
         if rows.is_empty() {
             return Ok(());
+        }
+        if handle.take_spill_request() {
+            store.borrow_mut().spill_edge(&key)?;
         }
         let segment = NodeBuffer::memory_from_records(
             rows.iter()
@@ -148,8 +257,12 @@ impl ParkedGenerations {
             return Arc::clone(&edge.handle);
         }
         let handle = ConsumerHandle::new();
+        let reclaim = Arc::new(ParkedEdgeConsumer {
+            handle: Arc::clone(&handle),
+            resident: Mutex::new(Vec::new()),
+        });
         let consumer = self.arbitrator.register_node_consumer(
-            Arc::new(NodeBufferConsumer::new(Arc::clone(&handle))),
+            Arc::clone(&reclaim) as Arc<dyn crate::pipeline::memory::MemoryConsumer>,
             Arc::clone(&handle),
             ConsumerLabel {
                 node: from.to_string(),
@@ -159,11 +272,15 @@ impl ParkedGenerations {
                 },
             },
         );
+        self.index
+            .borrow_mut()
+            .insert(consumer, Arc::clone(&handle));
         self.forward.insert(
             key,
             ParkedEdge {
                 consumer,
                 handle: Arc::clone(&handle),
+                reclaim,
                 producer: Box::from(from),
                 segments: Vec::new(),
             },
@@ -217,8 +334,23 @@ impl ParkedGenerations {
                 file_bytes,
             }),
         }
-        edge.refresh_reclaimable();
+        edge.publish_reclaimable();
         recorded
+    }
+
+    /// Spill the edge registered as consumer `id`, when it is one of this
+    /// store's; `None` when it is not. A reclaim pass on the walk calls it
+    /// for an elected edge.
+    pub(crate) fn spill_consumer(&mut self, id: ConsumerId) -> Result<Option<u64>, PipelineError> {
+        let Some(key) = self
+            .forward
+            .iter()
+            .find(|(_, edge)| edge.consumer == id)
+            .map(|(key, _)| *key)
+        else {
+            return Ok(None);
+        };
+        self.spill_edge(&key).map(Some)
     }
 
     /// Spill every resident segment of edge `key` that no cursor is reading,
@@ -261,7 +393,7 @@ impl ParkedGenerations {
                 }
             }
         }
-        edge.refresh_reclaimable();
+        edge.publish_reclaimable();
         let producer = edge.producer.clone();
         let recorded = self.record_spill(&producer, written);
         match failure {
@@ -309,7 +441,7 @@ impl ParkedGenerations {
         for segment in &mut edge.segments {
             parts.push(segment.buffer.reread_backing()?);
         }
-        edge.refresh_reclaimable();
+        edge.publish_reclaimable();
         Ok(Some(NodeBuffer::chained(parts)))
     }
 
@@ -328,8 +460,29 @@ impl ParkedGenerations {
     /// charge and its disk-quota bytes, and unregister its consumer.
     pub(crate) fn release_all(&mut self) {
         for (_, edge) in std::mem::take(&mut self.forward) {
-            release_edge(&self.arbitrator, edge);
+            self.release_edge(edge);
         }
+    }
+
+    /// Drop `edge`'s segments, then release what it held and unregister it.
+    fn release_edge(&self, edge: ParkedEdge) {
+        let ParkedEdge {
+            consumer,
+            handle,
+            producer,
+            segments,
+            ..
+        } = edge;
+        let file_bytes: u64 = segments.iter().map(|segment| segment.file_bytes).sum();
+        drop(segments);
+        self.arbitrator.release_spill_bytes(&producer, file_bytes);
+        handle.shrink(handle.bytes());
+        // Stale only if a pass holds the index, which it never does across a
+        // release; the pass then finds no edge for the consumer.
+        if let Ok(mut index) = self.index.try_borrow_mut() {
+            index.remove(&consumer);
+        }
+        self.arbitrator.unregister_consumer(consumer);
     }
 }
 
@@ -337,21 +490,6 @@ impl Drop for ParkedGenerations {
     fn drop(&mut self) {
         self.release_all();
     }
-}
-
-/// Drop `edge`'s segments, then release what it held and unregister it.
-fn release_edge(arbitrator: &MemoryArbitrator, edge: ParkedEdge) {
-    let ParkedEdge {
-        consumer,
-        handle,
-        producer,
-        segments,
-    } = edge;
-    let file_bytes: u64 = segments.iter().map(|segment| segment.file_bytes).sum();
-    drop(segments);
-    arbitrator.release_spill_bytes(&producer, file_bytes);
-    handle.shrink(handle.bytes());
-    arbitrator.unregister_consumer(consumer);
 }
 
 #[cold]
@@ -499,5 +637,135 @@ mod tests {
             0,
             "released files leave the quota"
         );
+    }
+
+    /// A walk over an arbitrator of `limit` bytes whose reclaim set reaches
+    /// a parked-row store spilling under `root`.
+    struct ParkedWalk {
+        arbitrator: Arc<MemoryArbitrator>,
+        store: Rc<RefCell<ParkedGenerations>>,
+        _walk: WalkContextGuard,
+    }
+
+    fn parked_walk(limit: u64, root: &Path) -> ParkedWalk {
+        let arbitrator = Arc::new(MemoryArbitrator::with_policy(
+            limit,
+            0.80,
+            0.70,
+            Box::new(Priority),
+        ));
+        let set = Rc::new(RefCell::new(WalkReclaimSet::new(WalkSpillSettings {
+            spill_root: Arc::from(root),
+            spill_compress: CompressMode::Auto,
+            batch_size: 1024,
+        })));
+        let store = Rc::new(RefCell::new(ParkedGenerations::new(
+            Arc::clone(&arbitrator),
+            Arc::from(root),
+            CompressMode::Auto,
+            1024,
+        )));
+        set.borrow_mut().set_parked_generations(Rc::clone(&store));
+        let walk = WalkContextGuard::install(&arbitrator, set);
+        ParkedWalk {
+            arbitrator,
+            store,
+            _walk: walk,
+        }
+    }
+
+    /// Four parks on one edge: three of 64 rows each, then one of 96.
+    fn chunks() -> Vec<Vec<(Record, SourceRowId)>> {
+        vec![rows(0, 64), rows(64, 64), rows(128, 64), rows(192, 96)]
+    }
+
+    /// Every row ordinal a fresh cursor over edge `key` reads, in order.
+    fn read_back(store: &Rc<RefCell<ParkedGenerations>>, key: &ParkedKey) -> Vec<u64> {
+        store
+            .borrow_mut()
+            .publish_view(key)
+            .expect("view")
+            .expect("rows")
+            .drain()
+            .map(|event| match event.expect("read") {
+                crate::executor::stream_event::StreamEvent::Record(_, row) => row.ordinal(),
+                crate::executor::stream_event::StreamEvent::Punctuation(_) => u64::MAX,
+            })
+            .collect()
+    }
+
+    /// Under a limit a third of the parked rows' size, each park that does
+    /// not fit spills the edge's resident rows through the reclaim its growth
+    /// starts on the walk, and the last park, larger than the limit on its
+    /// own, is written straight to disk. Every later read returns every row
+    /// in parking order, and a spill is recorded once, however often the
+    /// rows are read again.
+    #[test]
+    fn parked_edge_spills_under_a_low_limit_and_reads_back_whole() {
+        let root = tempfile::tempdir().expect("spill root");
+        let chunks = chunks();
+        let chunk_bytes: Vec<u64> = chunks.iter().map(|rows| resident_bytes(rows)).collect();
+        let parked_bytes: u64 = chunk_bytes.iter().sum();
+        // Each of the first three parks fits alone, two do not fit together,
+        // and the last is larger than the limit.
+        let limit = chunk_bytes[0] + chunk_bytes[0] / 4;
+        assert!(parked_bytes >= 3 * limit && chunk_bytes[3] > limit);
+        let walk = parked_walk(limit, root.path());
+        let consumers_before = walk.arbitrator.consumer_count();
+        let key: ParkedKey = (None, EdgeIndex::new(1));
+        for rows in &chunks {
+            ParkedGenerations::park(&walk.store, key, rows, "lookup", "enriched")
+                .expect("a park is never refused for memory");
+        }
+        let (_, handle) = walk.store.borrow().edge_consumer(&key).expect("edge");
+        assert_eq!(handle.bytes(), 0, "every parked row is on disk");
+        assert!(
+            handle.peak_bytes() > 0 && handle.peak_bytes() <= limit,
+            "the edge never held more than the limit charged (peak {})",
+            handle.peak_bytes()
+        );
+        let written = walk.arbitrator.per_stage_spill_bytes_written()["lookup"];
+        assert!(written > 0);
+
+        let expected: Vec<u64> = (0..288).collect();
+        assert_eq!(read_back(&walk.store, &key), expected, "first iteration");
+        assert_eq!(read_back(&walk.store, &key), expected, "second iteration");
+        assert_eq!(
+            walk.arbitrator.per_stage_spill_bytes_written()["lookup"],
+            written,
+            "reading spilled rows again writes and records nothing more"
+        );
+
+        walk.store.borrow_mut().release_all();
+        assert_eq!(walk.arbitrator.consumer_count(), consumers_before);
+        assert_eq!(walk.arbitrator.cumulative_spill_bytes(), 0);
+        assert!(
+            std::fs::read_dir(root.path())
+                .expect("spill root")
+                .next()
+                .is_none(),
+            "the released edge's spill files are gone"
+        );
+    }
+
+    /// With ample memory the same parks stay resident: nothing is written,
+    /// and the edge's charge covers every parked byte.
+    #[test]
+    fn parked_edge_stays_resident_with_ample_memory() {
+        let root = tempfile::tempdir().expect("spill root");
+        let chunks = chunks();
+        let parked_bytes: u64 = chunks.iter().map(|rows| resident_bytes(rows)).sum();
+        let walk = parked_walk(64 * 1024 * 1024, root.path());
+        let key: ParkedKey = (None, EdgeIndex::new(1));
+        for rows in &chunks {
+            ParkedGenerations::park(&walk.store, key, rows, "lookup", "enriched").expect("park");
+        }
+        let (_, handle) = walk.store.borrow().edge_consumer(&key).expect("edge");
+        assert_eq!(handle.bytes(), parked_bytes);
+        assert!(handle.peak_bytes() >= parked_bytes);
+        let expected: Vec<u64> = (0..288).collect();
+        assert_eq!(read_back(&walk.store, &key), expected);
+        assert_eq!(read_back(&walk.store, &key), expected);
+        assert!(walk.arbitrator.per_stage_spill_bytes_written().is_empty());
     }
 }

@@ -87,6 +87,11 @@ const MANIFEST: &[ManifestEntry] = &[
         table_row: "`node_buffers` slot (inter-stage buffer)",
     },
     ManifestEntry {
+        name: "ParkedEdgeConsumer",
+        class: SpillClass::Spillable,
+        table_row: "rows parked for a deferred (relaxed-key) consumer",
+    },
+    ManifestEntry {
         name: "GraceHashConsumer",
         class: SpillClass::Spillable,
         table_row: "grace-hash Combine",

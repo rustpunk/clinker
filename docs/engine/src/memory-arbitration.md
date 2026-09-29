@@ -392,6 +392,7 @@ Each registered consumer carries two parameters the active policy reads: a **spi
 | Operator class | `spill_priority` | `can_back_pressure` |
 |----------------|------------------|---------------------|
 | `node_buffers` slot (inter-stage buffer) | 0 | false |
+| rows parked for a deferred (relaxed-key) consumer | 0 | false |
 | output staging (writer resources) | 0 | false |
 | grace-hash Combine | 10 | false |
 | Reshape | 15 | false |
