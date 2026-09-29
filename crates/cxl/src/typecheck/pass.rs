@@ -3811,4 +3811,173 @@ mod tests {
             "expected a parse diagnostic for an oversized integer literal"
         );
     }
+
+    // ── decimal and float branch joins ─────────────────────────────────
+
+    const MIX: &str = "cannot mix decimal and float without an explicit cast";
+
+    /// Typecheck `src` against `amount: decimal, price: float, qty: int,
+    /// flag: bool` in `mode`.
+    fn typecheck_mixed(
+        src: &str,
+        mode: AggregateMode,
+    ) -> Result<TypedProgram, Vec<TypeDiagnostic>> {
+        let fields = ["amount", "price", "qty", "flag"];
+        let parsed = Parser::parse(src);
+        assert!(
+            parsed.errors.is_empty(),
+            "Parse errors: {:?}",
+            parsed.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        let resolved =
+            resolve_program(parsed.ast, &fields, parsed.node_count).unwrap_or_else(|d| {
+                panic!(
+                    "Resolve errors: {:?}",
+                    d.iter().map(|e| &e.message).collect::<Vec<_>>()
+                )
+            });
+        let mut cols = IndexMap::new();
+        cols.insert("amount".into(), Type::Decimal);
+        cols.insert("price".into(), Type::Float);
+        cols.insert("qty".into(), Type::Int);
+        cols.insert("flag".into(), Type::Bool);
+        let schema = Row::closed(cols, Span::new(0, 0));
+        type_check_with_mode(resolved, &schema, mode)
+    }
+
+    /// The diagnostics of a program the typechecker must reject.
+    fn mixed_err(src: &str, mode: AggregateMode) -> Vec<TypeDiagnostic> {
+        typecheck_mixed(src, mode).expect_err(&format!("expected {src} to be rejected"))
+    }
+
+    #[test]
+    fn decimal_float_branch_join_is_rejected_in_every_context() {
+        for src in [
+            "emit v = if flag then amount else price",
+            "emit v = if flag then price else amount",
+            "emit v = match { flag => amount, _ => price }",
+            "emit v = amount ?? price",
+            "emit v = price ?? amount",
+            "emit v = if flag then amount else if qty > 0 then qty else price",
+            "emit v = (if flag then amount) ?? price",
+        ] {
+            let errs = mixed_err(src, AggregateMode::Row);
+            assert!(
+                errs.iter().any(|d| d.message.starts_with(MIX)),
+                "{src}: {:?}",
+                errs.iter().map(|d| &d.message).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_of_a_decimal_float_branch_join_is_rejected() {
+        let joins = [
+            "if flag then amount else price",
+            "if flag then price else amount",
+            "match { flag => amount, _ => price }",
+            "match { flag => price, _ => amount }",
+            "amount ?? price",
+            "price ?? amount",
+        ];
+        for join in joins {
+            for call in [
+                format!("sum({join})"),
+                format!("avg({join})"),
+                format!("weighted_avg({join}, qty)"),
+            ] {
+                let src = format!("emit v = {call}");
+                let errs = mixed_err(&src, agg_mode(&[]));
+                assert_eq!(
+                    errs.len(),
+                    1,
+                    "{src}: exactly one diagnostic, got {:?}",
+                    errs.iter().map(|d| &d.message).collect::<Vec<_>>()
+                );
+                assert!(
+                    errs[0].message.starts_with(MIX),
+                    "{src}: {}",
+                    errs[0].message
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decimal_float_join_message_names_the_branches_and_the_fix() {
+        let errs = mixed_err(
+            "emit v = if flag then amount else price",
+            AggregateMode::Row,
+        );
+        assert_eq!(errs.len(), 1);
+        assert_eq!(
+            errs[0].message,
+            "cannot mix decimal and float without an explicit cast: the branches of this \
+             `if` are a decimal (`amount`) and a float (`price`); convert one branch so both \
+             have one numeric type, for example `price.to_decimal()` or `amount.to_float()`"
+        );
+        assert_eq!(errs[0].help, None, "the fix is in the message");
+
+        // A branch that is not a bare field is named by its position, and the
+        // fix names the method.
+        for (src, decimal, float) in [
+            (
+                "emit v = if flag then amount + 1 else price * 2.0",
+                "a decimal (the `then` branch)",
+                "a float (the `else` branch)",
+            ),
+            (
+                "emit v = match { flag => 1, qty > 0 => price * 2.0, _ => amount + 1 }",
+                "a decimal (arm 3)",
+                "a float (arm 2)",
+            ),
+            (
+                "emit v = (amount + 1) ?? price",
+                "a decimal (the left side)",
+                "a float (`price`)",
+            ),
+        ] {
+            let errs = mixed_err(src, AggregateMode::Row);
+            assert_eq!(errs.len(), 1, "{src}");
+            let message = &errs[0].message;
+            assert!(
+                message.contains(decimal) && message.contains(float),
+                "{src}: {message}"
+            );
+            assert!(
+                message.contains(".to_decimal()") && message.contains(".to_float()"),
+                "{src}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_joins_that_stay_exact_still_typecheck() {
+        for (src, expected) in [
+            ("emit v = if flag then amount else qty", Type::Decimal),
+            (
+                "emit v = if flag then amount else price.to_decimal()",
+                Type::Decimal,
+            ),
+            (
+                "emit v = if flag then amount.to_float() else price",
+                Type::Float,
+            ),
+        ] {
+            let typed = typecheck_mixed(src, AggregateMode::Row).unwrap_or_else(|d| {
+                panic!(
+                    "{src}: {:?}",
+                    d.iter().map(|e| &e.message).collect::<Vec<_>>()
+                )
+            });
+            assert_eq!(first_emit_expr_type(&typed), expected, "{src}");
+        }
+        // A `numeric`-typed branch may be a decimal at run time; typecheck
+        // cannot see it, and the aggregate's run-time rule is the backstop.
+        typecheck_mixed(
+            "emit v = sum(if flag then amount.clamp(0, 100) else price)",
+            agg_mode(&[]),
+        )
+        .unwrap_or_else(|d| panic!("{:?}", d.iter().map(|e| &e.message).collect::<Vec<_>>()));
+    }
 }
