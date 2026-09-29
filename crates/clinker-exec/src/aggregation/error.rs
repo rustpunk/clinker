@@ -54,9 +54,9 @@ pub enum HashAggError {
     /// A `BindingArg::Expr` failed to evaluate against the input record.
     #[error("binding expression eval failed: {0:?}")]
     EvalFailed(#[from] EvalError),
-    /// `value_to_group_key` rejected an input value (NaN, unsupported
-    /// type, etc.). Carries the field name and row number for routing
-    /// in the executor dispatch path.
+    /// `value_to_group_key` rejected an input value: an array or a map,
+    /// which cannot be a group key. Carries the field name and row number
+    /// for routing in the executor dispatch path.
     #[error("group-key extraction failed for `{field}` at row {row}: {message}")]
     GroupKey {
         field: String,

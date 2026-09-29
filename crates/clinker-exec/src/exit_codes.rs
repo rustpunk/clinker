@@ -9,8 +9,7 @@ pub const EXIT_CONFIG_ERROR: i32 = 1;
 /// Partial success — some rows routed to DLQ, pipeline completed.
 pub const EXIT_PARTIAL_DLQ: i32 = 2;
 
-/// Fatal data error — fail_fast triggered, error threshold exceeded,
-/// or NaN in group_by key.
+/// Fatal data error — fail_fast triggered or error threshold exceeded.
 pub const EXIT_FATAL_DATA: i32 = 3;
 
 /// I/O or system error — file not found, permission denied, disk full.

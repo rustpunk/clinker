@@ -152,36 +152,16 @@ pub(crate) fn detect_retract_scope(
                             continue;
                         };
                         // The aggregator stamps `state.group_index` as
-                        // `Value::Integer`, but `value_to_group_key`
-                        // widens unpinned `Value::Integer` to
-                        // `GroupByKey::Float` (the canonical numeric
-                        // group-key shape used so int/float groups
-                        // collide deterministically). Decode either
-                        // shape back to a `u32` group index. A
-                        // non-numeric key here means the cell predates
-                        // the synthetic-CK landing or the aggregator
-                        // failed to populate the slot.
+                        // `Value::Integer`, which keys as `GroupByKey::Int`
+                        // exactly. Any other key shape here breaks that
+                        // contract (the cell predates the synthetic-CK
+                        // landing or the aggregator failed to populate the
+                        // slot), so the cell is skipped rather than masked.
                         let group_idx = match key.get(key_pos) {
                             Some(GroupByKey::Int(raw)) => match u32::try_from(*raw) {
                                 Ok(idx) => idx,
                                 Err(_) => continue,
                             },
-                            Some(GroupByKey::Float(bits)) => {
-                                let f = f64::from_bits(*bits);
-                                if !f.is_finite() || f < 0.0 || f > u32::MAX as f64 {
-                                    continue;
-                                }
-                                let rounded = f as u32;
-                                if rounded as f64 != f {
-                                    // Float carrying a non-integral
-                                    // value; the aggregator never emits
-                                    // such a key for the synthetic CK
-                                    // slot, so skip rather than mask a
-                                    // contract violation.
-                                    continue;
-                                }
-                                rounded
-                            }
                             _ => continue,
                         };
                         had_synthetic_lookup = true;

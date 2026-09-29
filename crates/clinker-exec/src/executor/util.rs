@@ -438,11 +438,10 @@ pub(crate) fn format_group_key(key: &[GroupByKey]) -> String {
 /// those fixtures re-read, not just a diagnostic eyeballed.
 ///
 /// Rendering fidelity, by variant: `Str` is quoted (so an empty or
-/// space-padded key stays visible) and `Decimal` round-trips through
-/// [`GroupByKey::to_value`] at its exact scale. `Float` is not exact — and
-/// because `value_to_group_key` widens every `Value::Integer` to `f64`, an
-/// integer partition value above 2^53 renders rounded, so the printed name of
-/// such a group is not a literal copy of the author's cell.
+/// space-padded key stays visible), `Int` is exact at any magnitude, and
+/// `Decimal` round-trips through [`GroupByKey::to_value`] at its normalized
+/// scale. `Float` renders through `f64`'s shortest round-trip form, so an
+/// integral float prints without a fraction.
 fn format_group_key_part(k: &GroupByKey) -> String {
     match k {
         GroupByKey::Null => "null".to_string(),
