@@ -1959,3 +1959,242 @@ fn test_any_serde_roundtrip_preserves_refcounts() {
     roundtripped.sub(&Value::Integer(7));
     assert_eq!(roundtripped.finalize().unwrap(), Value::Integer(8));
 }
+
+// ---------- Exact decimal sums ----------
+
+/// A decimal's exact text: its digits and its scale, which `Value`'s `==`
+/// ignores.
+fn decimal_text(value: &Value) -> String {
+    match value {
+        Value::Decimal(d) => d.to_string(),
+        other => panic!("expected a decimal, got {other:?}"),
+    }
+}
+
+/// A decimal given as text, exactly.
+fn dec_text(text: &str) -> Value {
+    Value::Decimal(text.parse().expect("a decimal literal"))
+}
+
+/// Groups of 20 quotients `amount / qty` (amount below 1e6 at scale 2, qty 1
+/// to 12), the shape of `sum(amount / qty)`: most quotients carry 28
+/// significant digits, so a total rounds at almost every step of a fold.
+fn quotient_groups(groups: usize) -> Vec<Vec<Value>> {
+    let mut rng = SplitMix(0xDEC1_3A1);
+    (0..groups)
+        .map(|_| {
+            (0..20)
+                .map(|_| {
+                    let amount = rust_decimal::Decimal::new((rng.next() % 100_000_000) as i64, 2);
+                    let qty = rust_decimal::Decimal::from(1 + rng.next() % 12);
+                    Value::Decimal(amount.checked_div(qty).expect("a quotient in range"))
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// The text `make`'s accumulator gives over `values` in their order and in
+/// four seeded shuffles, each folded whole, split into two and into three
+/// partial states merged forward and backward, and split in two at a seeded
+/// point merged both ways. The first entry is the in-order fold.
+fn results_across_orders_and_splits(make: NewState, values: &[Value], seed: u64) -> Vec<String> {
+    let text = |acc: &AccumulatorEnum| decimal_text(&acc.finalize().expect("in range"));
+    let mut rng = SplitMix(seed);
+    let mut orders = vec![values.to_vec()];
+    for _ in 0..4 {
+        let mut order = values.to_vec();
+        rng.shuffle(&mut order);
+        orders.push(order);
+    }
+    let mut results = Vec::new();
+    for order in &orders {
+        results.push(text(&fold(make, order)));
+        let (a, rest) = order.split_at(7);
+        let (b, c) = rest.split_at(6);
+        for parts in [vec![a, rest], vec![rest, a], vec![a, b, c], vec![c, b, a]] {
+            let mut merged = fold(make, parts[0]);
+            for part in &parts[1..] {
+                merged.merge(&fold(make, part));
+            }
+            results.push(text(&merged));
+        }
+        let at = 1 + (rng.next() % (order.len() as u64 - 1)) as usize;
+        let (left, right) = order.split_at(at);
+        let mut ab = fold(make, left);
+        ab.merge(&fold(make, right));
+        let mut ba = fold(make, right);
+        ba.merge(&fold(make, left));
+        results.push(text(&ab));
+        results.push(text(&ba));
+    }
+    results
+}
+
+#[test]
+fn decimal_sum_does_not_depend_on_arrival_or_split() {
+    let groups = quotient_groups(2_000);
+    let mut differing = [0_usize; 2];
+    for (index, group) in groups.iter().enumerate() {
+        for (slot, make) in [sum as NewState, avg].into_iter().enumerate() {
+            let results = results_across_orders_and_splits(make, group, index as u64);
+            if results.iter().any(|r| *r != results[0]) {
+                differing[slot] += 1;
+            }
+        }
+    }
+    assert_eq!(
+        differing,
+        [0, 0],
+        "groups of 2,000 whose [sum, avg] text depends on arrival order or split"
+    );
+}
+
+#[test]
+fn decimal_sum_is_the_exact_sum_rounded_once() {
+    // The exact total is 10000000000000000000000000000.8, which needs more
+    // digits than a decimal holds; rounded once at scale 0 it is ...001. A
+    // fold that adds 0.4 to 1e28 first rounds it away twice.
+    let values = [
+        dec_text("10000000000000000000000000000"),
+        dec_text("0.4"),
+        dec_text("0.4"),
+    ];
+    for order in permutations(&values) {
+        assert_eq!(
+            decimal_text(&fold(sum, &order).finalize().unwrap()),
+            "10000000000000000000000000001",
+            "{order:?}"
+        );
+    }
+}
+
+#[test]
+fn decimal_sum_scale_is_the_largest_input_scale() {
+    // The largest scale among the addends is 2, zeros included, so the total
+    // is 2.00 in every order, whether the 2 is a decimal or an integer.
+    for two in [dec_text("2"), Value::Integer(2)] {
+        let values = [dec_text("1.00"), dec_text("-1.00"), two];
+        for order in permutations(&values) {
+            assert_eq!(
+                decimal_text(&fold(sum, &order).finalize().unwrap()),
+                "2.00",
+                "{order:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn decimal_out_of_range_is_a_function_of_the_multiset() {
+    let seven = big_dec(7, 28);
+    let values = [seven.clone(), seven.clone(), big_dec(-7, 28)];
+    for order in permutations(&values) {
+        assert_eq!(
+            decimal_text(&fold(sum, &order).finalize().unwrap()),
+            "70000000000000000000000000000",
+            "{order:?}"
+        );
+    }
+    let mut acc = fold(sum, &[seven.clone(), seven.clone()]);
+    assert_eq!(acc.finalize(), Err(AccumulatorError::DecimalOutOfRange));
+    acc.sub(&seven);
+    assert_eq!(
+        decimal_text(&acc.finalize().unwrap()),
+        "70000000000000000000000000000",
+        "retracting one addend brings the total back into range"
+    );
+}
+
+#[test]
+fn decimal_retraction_equals_the_fresh_fold() {
+    let mut acc = fold(sum, &[dec_text("1.5"), dec_text("2")]);
+    acc.sub(&dec_text("1.5"));
+    assert_eq!(acc, fold(sum, &[dec_text("2")]), "state");
+    assert_eq!(decimal_text(&acc.finalize().unwrap()), "2");
+
+    let tiny = dec_text("1.0000000000000000000000000001");
+    let mut acc = fold(sum, &[tiny.clone(), dec_text("100")]);
+    acc.sub(&dec_text("100"));
+    assert_eq!(acc, fold(sum, std::slice::from_ref(&tiny)), "state");
+    assert_eq!(
+        decimal_text(&acc.finalize().unwrap()),
+        "1.0000000000000000000000000001"
+    );
+}
+
+#[test]
+fn decimal_avg_is_sum_over_count() {
+    // `avg(x)` is `sum(x) / count(x)` with the scalar decimal division, in
+    // every order and split.
+    for (index, group) in quotient_groups(200).iter().enumerate() {
+        let sums = results_across_orders_and_splits(sum, group, index as u64);
+        let avgs = results_across_orders_and_splits(avg, group, index as u64);
+        let count = rust_decimal::Decimal::from(group.len() as u64);
+        for (s, a) in sums.iter().zip(&avgs) {
+            let s: rust_decimal::Decimal = s.parse().expect("a decimal");
+            let quotient = s.checked_div(count).expect("in range");
+            assert_eq!(*a, quotient.to_string(), "group {index}");
+        }
+    }
+}
+
+#[test]
+fn weighted_avg_integer_totals_do_not_wrap() {
+    // Three rows of (i64::MIN, i64::MIN) have products totalling 3 * 2^126,
+    // beyond an i128; the weights total -3 * 2^63, so the average is exactly
+    // -2^63. A wrapping total would give 2^63 / 3 in a release build.
+    let min = Value::Integer(i64::MIN);
+    let max = Value::Integer(i64::MAX);
+    let rows = vec![(min.clone(), min.clone()); 3];
+    assert_eq!(
+        float_bits(&weighted_fold(&rows).finalize().unwrap()),
+        (-(2.0_f64.powi(63))).to_bits()
+    );
+    // Totals that leave the i128 range part way and come back: products
+    // 2^64, weights -2, so -2^63 again, in every order and split; with a
+    // decimal row, the exact decimal quotient (2^64 + 1.5) / -1.
+    let rows = [
+        (min.clone(), min.clone()),
+        (min.clone(), min.clone()),
+        (min.clone(), max.clone()),
+        (min.clone(), max),
+    ];
+    let with_decimal: Vec<(Value, Value)> = rows
+        .iter()
+        .cloned()
+        .chain([(dec_text("1.5"), Value::Integer(1))])
+        .collect();
+    let pair = |(v, w): &(Value, Value)| {
+        Value::Array(crate::owned_storage::OwnedValues::from_vec(vec![
+            v.clone(),
+            w.clone(),
+        ]))
+    };
+    let unpair = |row: &Value| -> (Value, Value) {
+        let Value::Array(items) = row else {
+            unreachable!("rows are pairs")
+        };
+        (items[0].clone(), items[1].clone())
+    };
+    for (rows, expected) in [
+        (rows.to_vec(), Value::Float(-(2.0_f64.powi(63)))),
+        (with_decimal, dec_text("-18446744073709551617.5")),
+    ] {
+        let paired: Vec<Value> = rows.iter().map(pair).collect();
+        for order in permutations(&paired) {
+            let order: Vec<(Value, Value)> = order.iter().map(unpair).collect();
+            assert_identical(
+                &weighted_fold(&order).finalize().unwrap(),
+                &expected,
+                &format!("{order:?}"),
+            );
+            for at in 0..=order.len() {
+                let (left, right) = order.split_at(at);
+                let mut ab = weighted_fold(left);
+                ab.merge(&weighted_fold(right));
+                assert_identical(&ab.finalize().unwrap(), &expected, "split");
+            }
+        }
+    }
+}
