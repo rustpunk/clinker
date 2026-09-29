@@ -28,7 +28,7 @@ use clinker_plan::error::PipelineError;
 use super::reservation::ReservationState;
 use super::{ConsumerHandle, ConsumerId, MemoryArbitrator};
 use crate::executor::dispatch::{NodeBufferKey, NodeBufferReaderLedger, ResidentSlotSpill};
-use crate::executor::document_dlq::DocumentDlqState;
+use crate::executor::document_dlq::{DocumentBuckets, DocumentDlqState};
 use crate::executor::node_buffer::NodeBuffer;
 
 /// Where the calling thread stands relative to one run's walk.
@@ -252,6 +252,20 @@ pub(crate) struct WalkReclaimSet {
     /// The run's document dead-letter state, when a Source declares the
     /// document granularity.
     document_dlq: Option<DocumentDlqEntry>,
+    /// The per-document buckets of the Output running under the document
+    /// granularity, by each bucket's consumer. An entry is made when the
+    /// bucket is built and removed when it is taken out for its decision or
+    /// the Output ends; one left behind because the set was borrowed then is
+    /// dropped by the next pass that finds no bucket for it.
+    document_buckets: HashMap<ConsumerId, DocumentBucketEntry>,
+}
+
+/// The walk reclaim set's way to one Output bucket: the Output's cell of
+/// buckets, which a pass spills the bucket through, and the bucket's handle,
+/// on which a pass that finds the cell borrowed raises its spill request.
+struct DocumentBucketEntry {
+    cell: std::rc::Weak<RefCell<DocumentBuckets>>,
+    handle: Arc<ConsumerHandle>,
 }
 
 /// The walk reclaim set's handle to the run's document dead-letter state:
@@ -271,7 +285,26 @@ impl WalkReclaimSet {
             parents: Vec::new(),
             spill_settings,
             document_dlq: None,
+            document_buckets: HashMap::new(),
         }
+    }
+
+    /// Make the Output bucket registered as consumer `id`, held in `cell`,
+    /// a victim every pass on this walk can reach.
+    pub(crate) fn enter_document_bucket(
+        &mut self,
+        id: ConsumerId,
+        cell: std::rc::Weak<RefCell<DocumentBuckets>>,
+        handle: Arc<ConsumerHandle>,
+    ) {
+        self.document_buckets
+            .insert(id, DocumentBucketEntry { cell, handle });
+    }
+
+    /// Stop reaching the Output bucket registered as consumer `id`: it has
+    /// left its cell.
+    pub(crate) fn forget_document_bucket(&mut self, id: ConsumerId) {
+        self.document_buckets.remove(&id);
     }
 
     /// Make the run's document dead-letter state, in its own cell, a victim

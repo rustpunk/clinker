@@ -1345,6 +1345,259 @@ fn remaining_document_keys(buckets: &HashMap<DocKey, DocBucket>) -> Vec<DocKey> 
     remaining
 }
 
+/// One Output invocation's per-document buckets, in a cell of their own that
+/// the walk reclaim set reaches by each bucket's consumer id, with what a
+/// bucket's spill needs.
+///
+/// Walk-owned (`!Send`, reached through an `Rc<RefCell<_>>`). The driver
+/// borrows the cell only for one step of its own: building or finding a
+/// bucket, pushing a record, spilling a bucket, taking a bucket out at its
+/// decision. It never holds the borrow across a checked growth, a writer
+/// call or a call into the executor context, so a reclaim pass can spill a
+/// bucket whenever the driver is not in the middle of such a step; a pass
+/// that finds the cell borrowed raises the bucket's spill request, which the
+/// bucket's next push answers.
+pub(crate) struct DocumentBuckets {
+    /// Per-file spillable buckets, dropped at each file's outermost close.
+    buckets: HashMap<DocKey, DocBucket>,
+    /// This cell, which each bucket built here is entered under in the walk
+    /// reclaim set.
+    this: std::rc::Weak<std::cell::RefCell<DocumentBuckets>>,
+    /// The Output's name: each bucket's consumer is registered under it and
+    /// its spills are recorded under it.
+    output_name: String,
+    spill_root: Arc<Path>,
+    spill_compress: CompressMode,
+    batch_size: usize,
+}
+
+impl DocumentBuckets {
+    /// An empty cell of buckets for the Output `output_name`, spilling into
+    /// `spill_root`.
+    pub(crate) fn new_cell(
+        output_name: &str,
+        spill_root: Arc<Path>,
+        spill_compress: CompressMode,
+        batch_size: usize,
+    ) -> std::rc::Rc<std::cell::RefCell<Self>> {
+        std::rc::Rc::new_cyclic(|this| {
+            std::cell::RefCell::new(Self {
+                buckets: HashMap::new(),
+                this: this.clone(),
+                output_name: output_name.to_string(),
+                spill_root,
+                spill_compress,
+                batch_size,
+            })
+        })
+    }
+
+    /// Borrow (building on first sight) the bucket for file `key`. A new
+    /// bucket's consumer is registered under the Output's name and entered
+    /// in the walk reclaim set of `arbitrator`'s walk, when the calling
+    /// thread is that walk, so any reclaim pass there can spill it. A thread
+    /// with no walk frame (a unit test building buckets without a run)
+    /// enters nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`PipelineError::Internal`] when the walk reclaim set is borrowed
+    /// while the bucket is built; nothing is registered.
+    fn bucket_for(
+        &mut self,
+        arbitrator: &MemoryArbitrator,
+        key: &DocKey,
+    ) -> Result<&mut DocBucket, PipelineError> {
+        let bucket = match self.buckets.entry(Arc::clone(key)) {
+            std::collections::hash_map::Entry::Occupied(occupied) => occupied.into_mut(),
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                let walk_set = crate::pipeline::memory::walk::walk_reclaim_set(arbitrator);
+                let mut walk = match walk_set.as_ref().map(|set| set.try_borrow_mut()) {
+                    None => None,
+                    Some(Ok(set)) => Some(set),
+                    Some(Err(_)) => {
+                        return Err(PipelineError::Internal {
+                            op: "document dead-letter",
+                            node: self.output_name.clone(),
+                            detail: "a document's bucket was built while the walk reclaim set \
+                                     was borrowed"
+                                .to_string(),
+                        });
+                    }
+                };
+                let handle = ConsumerHandle::new();
+                let consumer_id = arbitrator.register_node_consumer(
+                    Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                        Arc::clone(&handle),
+                    )),
+                    Arc::clone(&handle),
+                    ConsumerLabel {
+                        node: self.output_name.clone(),
+                        surface: MemorySurface::HeldFailingRows,
+                    },
+                );
+                if let Some(set) = walk.as_mut() {
+                    set.enter_document_bucket(consumer_id, self.this.clone(), Arc::clone(&handle));
+                }
+                vacant.insert(DocBucket {
+                    buffer: NodeBuffer::Memory(Vec::new()),
+                    consumer_id,
+                    handle,
+                    depth: 0,
+                })
+            }
+        };
+        Ok(bucket)
+    }
+
+    /// The live bucket for file `key`.
+    fn bucket_mut(&mut self, key: &DocKey) -> Result<&mut DocBucket, PipelineError> {
+        let output_name = &self.output_name;
+        self.buckets
+            .get_mut(key)
+            .ok_or_else(|| PipelineError::Internal {
+                op: "document dead-letter",
+                node: output_name.clone(),
+                detail: format!("document {key:?} has no live bucket"),
+            })
+    }
+
+    /// Spill bucket `key`'s resident records to a new chunk after any it
+    /// already has, recording the file under the Output's name. A bucket
+    /// with nothing resident, or no bucket, spills nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`spill_bucket_in_place`], including E320 past the spill cap.
+    fn spill(&mut self, arbitrator: &MemoryArbitrator, key: &DocKey) -> Result<(), PipelineError> {
+        let Some(bucket) = self.buckets.get_mut(key) else {
+            return Ok(());
+        };
+        spill_resident_bucket(
+            bucket,
+            arbitrator,
+            &self.output_name,
+            &self.spill_root,
+            self.spill_compress,
+            self.batch_size,
+        )
+    }
+
+    /// Answer bucket `key`'s spill request, raised by a reclaim pass that
+    /// found this cell borrowed, by spilling the bucket now. Returns whether
+    /// a request was raised.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::spill`].
+    fn answer_spill_request(
+        &mut self,
+        arbitrator: &MemoryArbitrator,
+        key: &DocKey,
+    ) -> Result<bool, PipelineError> {
+        let requested = self
+            .buckets
+            .get(key)
+            .is_some_and(|bucket| bucket.handle.take_spill_request());
+        if requested {
+            self.spill(arbitrator, key)?;
+        }
+        Ok(requested)
+    }
+
+    /// Spill the bucket whose consumer is `id`, because a reclaim pass
+    /// elected it. Returns `false` when no bucket here has that consumer.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::spill`].
+    pub(crate) fn spill_consumer(
+        &mut self,
+        id: ConsumerId,
+        arbitrator: &MemoryArbitrator,
+    ) -> Result<bool, PipelineError> {
+        let Some(bucket) = self
+            .buckets
+            .values_mut()
+            .find(|bucket| bucket.consumer_id == id)
+        else {
+            return Ok(false);
+        };
+        spill_resident_bucket(
+            bucket,
+            arbitrator,
+            &self.output_name,
+            &self.spill_root,
+            self.spill_compress,
+            self.batch_size,
+        )?;
+        Ok(true)
+    }
+
+    /// Take bucket `key` out for its decision, removing its consumer from
+    /// the walk reclaim set. The caller releases the consumer.
+    fn take(&mut self, arbitrator: &MemoryArbitrator, key: &DocKey) -> Option<DocBucket> {
+        let bucket = self.buckets.remove(key)?;
+        forget_document_bucket(arbitrator, bucket.consumer_id);
+        Some(bucket)
+    }
+}
+
+/// Remove bucket consumer `id` from the walk reclaim set of `arbitrator`'s
+/// walk. A set that is borrowed right now keeps the entry, which the next
+/// pass to reach it finds without a bucket and drops.
+fn forget_document_bucket(arbitrator: &MemoryArbitrator, id: ConsumerId) {
+    if let Some(set) = crate::pipeline::memory::walk::walk_reclaim_set(arbitrator)
+        && let Ok(mut set) = set.try_borrow_mut()
+    {
+        set.forget_document_bucket(id);
+    }
+}
+
+/// Spill `bucket`'s resident records as [`spill_bucket_in_place`] does,
+/// resolving compression for the column count of the last record resident,
+/// which is the record the bucket's latest push added. Nothing resident
+/// spills nothing.
+fn spill_resident_bucket(
+    bucket: &mut DocBucket,
+    arbitrator: &MemoryArbitrator,
+    output_name: &str,
+    spill_root: &Path,
+    spill_compress: CompressMode,
+    batch_size: usize,
+) -> Result<(), PipelineError> {
+    let Some(column_count) = last_resident_column_count(&bucket.buffer) else {
+        return Ok(());
+    };
+    spill_bucket_in_place(
+        bucket,
+        arbitrator,
+        output_name,
+        spill_root,
+        spill_compress,
+        batch_size,
+        column_count,
+    )
+}
+
+/// The column count of the last record resident in `buffer`, `None` when no
+/// record is resident.
+fn last_resident_column_count(buffer: &NodeBuffer) -> Option<usize> {
+    let events = match buffer {
+        NodeBuffer::Memory(events) => events,
+        NodeBuffer::Mixed { mem, .. } => mem,
+        NodeBuffer::Spilled { .. }
+        | NodeBuffer::MergeSpilled { .. }
+        | NodeBuffer::ReReadable(_) => {
+            return None;
+        }
+    };
+    events.iter().rev().find_map(|event| match event {
+        StreamEvent::Record(record, _) => Some(record.schema().column_count()),
+        StreamEvent::Punctuation(_) => None,
+    })
+}
+
 /// Per-Output-invocation driver for the `document` granularity: buffers
 /// each record into its file's spillable bucket and, when the file's
 /// outermost close arrives (envelope depth back to zero) or at end-of-input,
@@ -1361,8 +1614,9 @@ pub(crate) struct DocumentDlqDriver<'cfg> {
     output_name: String,
     out_cfg: &'cfg SinkConfig,
     cxl_emit_names: Option<Vec<String>>,
-    /// Per-file spillable buckets, dropped at each file's outermost close.
-    buckets: HashMap<DocKey, DocBucket>,
+    /// Per-file spillable buckets, dropped at each file's outermost close,
+    /// in the cell a reclaim pass reaches them through.
+    buckets: std::rc::Rc<std::cell::RefCell<DocumentBuckets>>,
     /// Files already flushed clean / rejected this invocation, so a record
     /// or close arriving after a file is decided does not silently vanish:
     /// a late record for a decided-clean file writes through (it would have
@@ -1373,9 +1627,6 @@ pub(crate) struct DocumentDlqDriver<'cfg> {
     /// across this arm's document decisions. `None` until then.
     writer: Option<clinker_format::FormatWriterHandle>,
     arbitrator: Arc<crate::pipeline::memory::MemoryArbitrator>,
-    spill_root: Arc<std::path::Path>,
-    spill_compress: clinker_plan::config::CompressMode,
-    batch_size: usize,
     ok_count: u64,
     records_written: u64,
     structured_guard: StructuredOutputDocumentGuard,
@@ -1403,50 +1654,20 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
             output_name: output_name.to_string(),
             out_cfg,
             cxl_emit_names,
-            buckets: HashMap::new(),
+            buckets: DocumentBuckets::new_cell(
+                output_name,
+                Arc::clone(&ctx.spill_root_path),
+                ctx.spill_compress,
+                ctx.batch_size,
+            ),
             decided: HashSet::new(),
             writer: None,
             arbitrator: Arc::clone(&ctx.memory_budget),
-            spill_root: Arc::clone(&ctx.spill_root_path),
-            spill_compress: ctx.spill_compress,
-            batch_size: ctx.batch_size,
             ok_count: 0,
             records_written: 0,
             structured_guard: StructuredOutputDocumentGuard::new(&out_cfg.format),
             writer_boundary,
         }
-    }
-
-    /// Borrow (building on first sight) the bucket for file `key`. The
-    /// arbitrator is passed in so the caller's other `&self` fields stay
-    /// free of the `&mut self.buckets` borrow this returns. A new bucket's
-    /// consumer is registered under `output_name`, the name its spill is
-    /// recorded under.
-    fn bucket_for<'a>(
-        buckets: &'a mut HashMap<DocKey, DocBucket>,
-        arbitrator: &crate::pipeline::memory::MemoryArbitrator,
-        output_name: &str,
-        key: &DocKey,
-    ) -> &'a mut DocBucket {
-        buckets.entry(Arc::clone(key)).or_insert_with(|| {
-            let handle = crate::pipeline::memory::ConsumerHandle::new();
-            let consumer_id = arbitrator.register_node_consumer(
-                Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
-                    handle.clone(),
-                )),
-                handle.clone(),
-                ConsumerLabel {
-                    node: output_name.to_string(),
-                    surface: MemorySurface::HeldFailingRows,
-                },
-            );
-            DocBucket {
-                buffer: NodeBuffer::Memory(Vec::new()),
-                consumer_id,
-                handle,
-                depth: 0,
-            }
-        })
     }
 
     /// Buffer one record into its file's bucket, charging and spilling the
@@ -1465,27 +1686,22 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
         let column_count = record.schema().column_count();
         let reclaimable = crate::executor::node_buffer::record_byte_cost(column_count)
             .saturating_add(record.legacy_estimated_heap_size() as u64);
-        let bucket = Self::bucket_for(&mut self.buckets, &self.arbitrator, &self.output_name, key);
-        bucket.buffer.push(record, source_row);
-        bucket.handle.set_bytes(
+        {
+            let mut buckets = self.buckets.borrow_mut();
+            let bucket = buckets.bucket_for(&self.arbitrator, key)?;
+            bucket.buffer.push(record, source_row);
+            bucket.handle.set_bytes(
+                bucket
+                    .buffer
+                    .unaccounted_memory_bytes(&self.allocation_resources),
+            );
+            // The bucket's resident tail is what its in-place spill frees.
             bucket
-                .buffer
-                .unaccounted_memory_bytes(&self.allocation_resources),
-        );
-        // The bucket's resident tail is what its in-place spill frees.
-        bucket
-            .handle
-            .set_reclaimable(bucket.handle.reclaimable().saturating_add(reclaimable));
+                .handle
+                .set_reclaimable(bucket.handle.reclaimable().saturating_add(reclaimable));
+        }
         if self.arbitrator.should_spill() {
-            spill_bucket_in_place(
-                bucket,
-                &self.arbitrator,
-                &self.output_name,
-                self.spill_root.as_ref(),
-                self.spill_compress,
-                self.batch_size,
-                column_count,
-            )?;
+            self.buckets.borrow_mut().spill(&self.arbitrator, key)?;
         }
         Ok(())
     }
@@ -1506,7 +1722,7 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
         if !claim_document_decision(&mut self.decided, key) {
             return Ok(());
         }
-        let bucket = self.buckets.remove(key);
+        let bucket = self.buckets.borrow_mut().take(&self.arbitrator, key);
         let is_failed = ctx
             .document_dlq
             .as_ref()
@@ -1770,16 +1986,15 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
                             // the file. A bucket may not exist yet for a
                             // header-only file that has emitted no record;
                             // create it so the open/close balance is counted.
-                            Self::bucket_for(
-                                &mut self.buckets,
-                                &self.arbitrator,
-                                &self.output_name,
-                                &file,
-                            )
-                            .depth += 1;
+                            self.buckets
+                                .borrow_mut()
+                                .bucket_for(&self.arbitrator, &file)?
+                                .depth += 1;
                         }
                         PunctuationKind::DocumentClose => {
-                            if let Some(key) = closing_document_key(&mut self.buckets, &file) {
+                            let closing =
+                                closing_document_key(&mut self.buckets.borrow_mut().buckets, &file);
+                            if let Some(key) = closing {
                                 self.decide_document(ctx, &key)?;
                             }
                         }
@@ -1792,7 +2007,8 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
         // clean-vs-failed axis as one closed in stream — a failed one
         // rejects with its collaterals, a clean one flushes. Deterministic
         // order keeps emit / write ordering stable across runs.
-        for key in remaining_document_keys(&self.buckets) {
+        let remaining = remaining_document_keys(&self.buckets.borrow().buckets);
+        for key in remaining {
             self.decide_document(ctx, &key)?;
         }
         // Late records of failed documents are admitted to their ledgers
@@ -1823,7 +2039,14 @@ impl Drop for DocumentDlqDriver<'_> {
         // A `?`-early-return out of `run` leaves buckets live; unregister
         // every surviving consumer so an error exit cannot strand a charge
         // in the arbitrator's registry. Mirrors `RegisteredTables`' guard.
-        for (_, bucket) in self.buckets.drain() {
+        // Every borrow of the cell is a single step that ends before any
+        // return or unwind reaches here; were one still held, borrowing
+        // again inside an unwind would abort, so the buckets are left.
+        let Ok(mut buckets) = self.buckets.try_borrow_mut() else {
+            return;
+        };
+        for (_, bucket) in buckets.buckets.drain() {
+            forget_document_bucket(&self.arbitrator, bucket.consumer_id);
             self.arbitrator.unregister_consumer(bucket.consumer_id);
         }
     }
@@ -4314,5 +4537,144 @@ mod tests {
                 "a hold charges its growth, and a first failure its slot, once"
             );
         }
+    }
+
+    /// Push the records `ids` into `key`'s bucket in `cell`, building it on
+    /// first sight, and charge their bytes through the bucket's handle as a
+    /// push does. Returns the bytes charged.
+    fn fill_bucket(
+        cell: &std::rc::Rc<std::cell::RefCell<DocumentBuckets>>,
+        arbitrator: &MemoryArbitrator,
+        key: &DocKey,
+        ids: std::ops::Range<u64>,
+    ) -> u64 {
+        let s = schema();
+        let mut buckets = cell.borrow_mut();
+        let bucket = buckets.bucket_for(arbitrator, key).expect("bucket");
+        let mut charge = 0;
+        for id in ids {
+            charge += crate::executor::node_buffer::record_byte_cost(s.column_count());
+            bucket
+                .buffer
+                .push(rec(&s, id as i64, (id * 10) as i64), 1000 + id);
+        }
+        bucket
+            .handle
+            .set_reclaimable(bucket.buffer.reclaimable_bytes());
+        let handle = Arc::clone(&bucket.handle);
+        drop(buckets);
+        handle.try_grow(charge).expect("the bucket's records fit");
+        charge
+    }
+
+    /// The handle of `key`'s bucket in `cell`.
+    fn bucket_handle(
+        cell: &std::rc::Rc<std::cell::RefCell<DocumentBuckets>>,
+        key: &DocKey,
+    ) -> Arc<ConsumerHandle> {
+        Arc::clone(&cell.borrow().buckets[key].handle)
+    }
+
+    /// A request another consumer makes on the walk spills an Output's
+    /// per-document bucket when it does not fit beside it, and the bucket
+    /// drains afterwards in arrival order.
+    ///
+    /// Capacity: the bucket's 64 resident records charge `R`, the only bytes
+    /// charged, and the capacity is set to `R + FREE`. The probe asks for
+    /// `FREE + R / 2`: more than is free, less than is free once the bucket
+    /// is on disk. The bucket is the only state any pass could spill.
+    ///
+    /// While the Output's cell of buckets is borrowed the pass frees nothing
+    /// from it: the bucket is busy and its spill request is raised, which
+    /// the bucket's next push answers first. The test builds the cell
+    /// directly and never pushes through the driver, so the soft-threshold
+    /// poll after a push cannot spill the bucket for the pass.
+    #[test]
+    fn document_bucket_is_spilled_by_a_pass_another_walk_request_starts() {
+        const FREE: u64 = 1024;
+        let root = tempfile::tempdir().expect("bucket spill root");
+        let walk_root = tempfile::tempdir().expect("walk spill root");
+        let arbitrator = electing_arbitrator(1 << 30);
+        let set = walk_set(walk_root.path());
+        let _walk = WalkContextGuard::install(&arbitrator, std::rc::Rc::clone(&set));
+        let cell = DocumentBuckets::new_cell("out", Arc::from(root.path()), CompressMode::Auto, 8);
+        let key: DocKey = Arc::from("orders.csv");
+        let probe = probe(&arbitrator);
+
+        let first = fill_bucket(&cell, &arbitrator, &key, 0..64);
+        let handle = bucket_handle(&cell, &key);
+        arbitrator.set_test_capacity(arbitrator.charged_bytes() + FREE);
+        let busy = cell.borrow_mut();
+        assert!(
+            probe.try_grow(FREE + first / 2).is_err(),
+            "with the Output's buckets busy the pass frees nothing from them"
+        );
+        drop(busy);
+        assert_eq!(handle.bytes(), first, "the bucket is still charged");
+        assert!(matches!(
+            cell.borrow().buckets[&key].buffer,
+            NodeBuffer::Memory(_)
+        ));
+        assert!(
+            cell.borrow_mut()
+                .answer_spill_request(&arbitrator, &key)
+                .expect("spill"),
+            "the busy bucket's spill request is raised, and its next push answers it first"
+        );
+        assert!(matches!(
+            cell.borrow().buckets[&key].buffer,
+            NodeBuffer::Spilled { .. }
+        ));
+        assert_eq!(handle.bytes(), 0);
+
+        let second = fill_bucket(&cell, &arbitrator, &key, 64..128);
+        arbitrator.set_test_capacity(arbitrator.charged_bytes() + FREE);
+        let spilled_before = arbitrator
+            .per_stage_spill_bytes_written()
+            .get("out")
+            .copied()
+            .unwrap_or(0);
+        probe
+            .try_grow(FREE + second / 2)
+            .expect("the pass spills the bucket and the request fits");
+        assert!(
+            matches!(
+                cell.borrow().buckets[&key].buffer,
+                NodeBuffer::Spilled { .. }
+            ),
+            "every record of the bucket is on disk"
+        );
+        assert_eq!(handle.bytes(), 0, "the bucket's charge left with its rows");
+        assert!(
+            arbitrator
+                .per_stage_spill_bytes_written()
+                .get("out")
+                .is_some_and(|bytes| *bytes > spilled_before),
+            "the spill is recorded under the Output's name"
+        );
+        probe.shrink(probe.bytes());
+
+        let bucket = cell
+            .borrow_mut()
+            .take(&arbitrator, &key)
+            .expect("the bucket leaves its cell");
+        let drained: Vec<(i64, i64, u64)> = drain_records_in_arrival_order(bucket.buffer)
+            .map(|item| {
+                let (record, row) = item.expect("drain");
+                let value = |i: usize| match &record.values()[i] {
+                    Value::Integer(v) => *v,
+                    other => panic!("unexpected value: {other:?}"),
+                };
+                (value(0), value(1), row.ordinal())
+            })
+            .collect();
+        let expected: Vec<(i64, i64, u64)> = (0..128)
+            .map(|id| (id as i64, (id * 10) as i64, 1000 + id))
+            .collect();
+        assert_eq!(
+            drained, expected,
+            "the bucket drains every record and row number in arrival order"
+        );
+        arbitrator.unregister_consumer(bucket.consumer_id);
     }
 }
