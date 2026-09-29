@@ -242,6 +242,10 @@ pub struct MemoryShortfallReport {
     /// group is at fault (a Cull or Reshape group too large to hold whole);
     /// `None` otherwise.
     pub group_first_row: Option<RowPosition>,
+    /// The reading of the run's memory that was over the limit: the charged
+    /// total, or the process's own memory. The headline and the suggested
+    /// limit state only what this reading established.
+    pub reading: LimitReading,
     /// Bytes the refused request asked for.
     pub requested_bytes: u64,
     /// The limit charges are granted against: `memory.limit`, or the smaller
@@ -296,6 +300,23 @@ impl MemoryShortfallReport {
             });
         }
     }
+}
+
+/// Which reading of the run's memory a [`MemoryShortfallReport`] found over
+/// the limit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LimitReading {
+    /// The charged total: the request did not fit beside what the run had
+    /// charged. `requested_bytes` is the request.
+    Charged,
+    /// The process's memory as the operating system reports it: its highest
+    /// resident reading stood over the limit, whatever the charged total was.
+    /// `requested_bytes` is how far over the limit that reading stood, and
+    /// the suggested limit is the reading itself rounded up.
+    ProcessMemory {
+        /// The highest resident memory the engine read for the process.
+        peak_resident_bytes: u64,
+    },
 }
 
 /// Where a group of input rows begins, named the way the dead-letter output
@@ -700,6 +721,77 @@ mod tests {
         // Just under a MiB rounds to 1024.0 KiB, which is printed as MiB.
         assert_eq!(Bytes(MIB - 1).to_string(), "1.0 MiB");
         assert_eq!(Bytes(1024 * MIB).to_string(), "1.0 GiB");
+    }
+
+    /// A report whose process memory, not its charged total, stood over the
+    /// limit: 12 MiB resident against an 8 MiB limit with 3 MiB charged.
+    fn process_memory_report() -> MemoryShortfallReport {
+        MemoryShortfallReport {
+            requester: Some(ConsumerLabel {
+                node: "enrich".to_string(),
+                surface: MemorySurface::JoinBuildSide,
+            }),
+            group_first_row: None,
+            reading: LimitReading::ProcessMemory {
+                peak_resident_bytes: 12 * MIB,
+            },
+            requested_bytes: 4 * MIB,
+            limit_bytes: 8 * MIB,
+            charged_bytes: 3 * MIB,
+            private_bytes: None,
+            holders: vec![HolderReport {
+                node: "enrich".to_string(),
+                surface: MemorySurface::JoinBuildSide,
+                bytes: 3 * MIB,
+                state: HolderState::CannotSpill,
+            }],
+            other_holders_count: 0,
+            other_holders_bytes: 0,
+            unattributed_bytes: 0,
+            unspillable_bytes: 3 * MIB,
+            reclaim: None,
+            suggested_limit_bytes: 12 * MIB,
+            oversized: false,
+        }
+    }
+
+    #[test]
+    fn a_process_memory_report_states_the_process_reading_not_a_full_limit() {
+        let rendered = process_memory_report().to_string();
+        assert_eq!(
+            rendered,
+            "E310 enrich: process memory peaked at 12.0 MiB resident, over memory.limit \
+             8.0 MiB, while enrich held join build side; the run had charged 3.0 MiB\
+             \n  charged 3.0 MiB of 8.0 MiB (37%)\
+             \n  largest holders:\
+             \n    enrich  join build side  3.0 MiB  cannot spill\
+             \n  reclaim: none attempted\
+             \n  fix: raise the limit to at least 12M — process memory reached 12.0 MiB; \
+             later stages may need more\
+             \n    pipeline:\
+             \n      memory: { limit: \"12M\" }\
+             \n    or: --memory-limit 12M\
+             \n  remedy: enrich's join build side holds 3.0 MiB and cannot be spilled; see \
+             \"Join build side\" in clinker explain --code E310\
+             \n  See: clinker explain --code E310"
+        );
+        // Charged memory sits below the limit, so nothing may say the limit
+        // is full or that the charged state fills it.
+        assert!(!rendered.contains("fully held"), "{rendered}");
+        assert!(!rendered.contains("fills the limit"), "{rendered}");
+    }
+
+    #[test]
+    fn a_process_memory_report_without_a_requester_names_no_node() {
+        let mut report = process_memory_report();
+        report.requester = None;
+        let rendered = report.to_string();
+        let headline = rendered.lines().next().unwrap_or_default();
+        assert_eq!(
+            headline,
+            "E310: process memory peaked at 12.0 MiB resident, over memory.limit 8.0 MiB; \
+             the run had charged 3.0 MiB"
+        );
     }
 
     #[test]

@@ -7804,7 +7804,8 @@ mod tests {
     fn runtime_failure_classification_distinguishes_policy_from_transience() {
         use clinker_core_types::RetryAdvice;
         use clinker_plan::runtime_error::{
-            ConsumerLabel, MemoryShortfallReport, MemorySurface, SpillError, suggested_limit_floor,
+            ConsumerLabel, LimitReading, MemoryShortfallReport, MemorySurface, SpillError,
+            suggested_limit_floor,
         };
 
         let cases = [
@@ -7816,6 +7817,7 @@ mod tests {
                             surface: MemorySurface::GroupState,
                         }),
                         group_first_row: None,
+                        reading: LimitReading::Charged,
                         requested_bytes: 1,
                         limit_bytes: 1,
                         charged_bytes: 1,

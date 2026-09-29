@@ -16,8 +16,8 @@ use clinker_format::FormatError;
 use clinker_format::preparation::{ResourceError, ResourceErrorKind};
 use clinker_plan::error::PipelineError;
 use clinker_plan::runtime_error::{
-    ConsumerLabel, HolderReport, HolderState, MemoryShortfallReport, MemorySurface, ReclaimReport,
-    suggested_limit_floor,
+    ConsumerLabel, HolderReport, HolderState, LimitReading, MemoryShortfallReport, MemorySurface,
+    ReclaimReport, suggested_limit_floor,
 };
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -334,6 +334,7 @@ fn build_report(
     Box::new(MemoryShortfallReport {
         requester,
         group_first_row: None,
+        reading: LimitReading::Charged,
         requested_bytes: requested,
         limit_bytes: snapshot.limit,
         charged_bytes: snapshot.charged,
@@ -2027,6 +2028,50 @@ mod tests {
             label(node, MemorySurface::GroupState),
         );
         (handle, id)
+    }
+
+    #[test]
+    fn a_backstop_tripped_by_process_memory_reports_the_process_reading() {
+        let limit = 64 * MIB;
+        let arbitrator = arbitrator(limit);
+        let (handle, id) = register_node(&arbitrator, "enrich");
+        handle.try_grow(MIB).expect("1 MiB fits a 64 MiB limit");
+        // The process stood 32 MiB over the limit while only 1 MiB was
+        // charged: the backstop fired on the process's memory.
+        let peak = 96 * MIB;
+        arbitrator.set_peak_rss_for_test(peak);
+
+        let PipelineError::MemoryBudgetExceeded { report } =
+            arbitrator.backstop_refusal("enrich", MemorySurface::JoinBuildSide)
+        else {
+            panic!("a backstop refusal is an E310");
+        };
+        assert_eq!(
+            report.reading,
+            LimitReading::ProcessMemory {
+                peak_resident_bytes: peak
+            },
+            "{report:?}"
+        );
+        assert_eq!(report.charged_bytes, MIB);
+        assert_eq!(report.limit_bytes, limit);
+        assert_eq!(report.requested_bytes, peak - limit, "how far over the limit");
+        assert_eq!(
+            report.suggested_limit_bytes, peak,
+            "a limit at the process reading would not have tripped the backstop"
+        );
+        assert!(!report.oversized, "no single request was measured");
+        let rendered = report.to_string();
+        assert!(!rendered.contains("fully held"), "{rendered}");
+        assert!(
+            rendered.starts_with(
+                "E310 enrich: process memory peaked at 96.0 MiB resident, over memory.limit \
+                 64.0 MiB"
+            ),
+            "{rendered}"
+        );
+        handle.shrink(MIB);
+        arbitrator.unregister_consumer(id);
     }
 
     #[test]
