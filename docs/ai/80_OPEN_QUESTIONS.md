@@ -891,6 +891,34 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
   a compile-time error instead of a silent null.
 - Implementation owner: CXL and executor maintainers.
 
+## Language surface findings
+
+### 89. CXL cannot name a field whose name is not a plain identifier, so some suggested fixes do not paste
+
+- Filed: 2026-09-29.
+- Status: Open; needs a maintainer decision.
+- Priority: Medium.
+- Evidence: the CXL lexer (`crates/cxl/src/lexer.rs`, `lex_ident`) reads a
+  field reference only as `[A-Za-z_][A-Za-z0-9_]*`, and a word in its keyword
+  table (`filter`, `in`, `by`, `it`, `now`, `null`, and others) is never a
+  field reference. There is no quoted or escaped form: a quoted token is a
+  string literal, and `$record.<key>` is declared per-record state, not the
+  input row. A source schema may still declare a column such as `order id`:
+  a pipeline declaring one compiles. Every refused `null_order: drop`
+  (`DropNotAllowed` in `crates/clinker-plan/src/config/sort.rs`) suggests
+  `filter not <field>.is_null()` with the field written as-is, so for that
+  column it suggests `filter not order id.is_null()`, which does not parse;
+  the row cannot be filtered on that field from CXL at all.
+- Files/modules involved: `crates/cxl/src/lexer.rs`,
+  `crates/cxl/src/parser.rs` (`parse_atom`), the `DropNotAllowed` message in
+  `crates/clinker-plan/src/config/sort.rs`, and source schema validation.
+- Suggested way to resolve it: either add a quoted field-reference form to
+  CXL (a language surface decision, with its spelling, escapes and
+  diagnostics) and render suggested fixes through it, or reject source
+  columns that CXL cannot name. Until then a suggested fix is paste-ready only
+  for identifier-shaped field names.
+- Implementation owner: CXL language maintainers.
+
 ## Resolved Archive
 
 ### 61. Decoded allocation ownership

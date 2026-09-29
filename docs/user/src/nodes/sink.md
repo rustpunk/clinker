@@ -573,6 +573,13 @@ Sort records before writing:
 - `last` -- nulls sort after all non-null values.
 - `drop` -- records with null sort keys are excluded from output.
 
+`drop` is available only on a Sink `sort_order`, because only a Sink's
+ordering decides which records are written. A Source `sort_order`, a Cull or
+Reshape `order_by` and a Transform `analytic_window.sort_by` only order
+records, so they accept `first` and `last` and reject `drop` when the
+pipeline is planned, pointing at a `filter not <field>.is_null()` Transform
+instead.
+
 `drop` removes records, so a run using it writes fewer records than it read
 and that is not a fault. A missing column counts as a null key: a record that
 never carried the sort field is dropped the same as one carrying an explicit

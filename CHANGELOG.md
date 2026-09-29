@@ -20,7 +20,23 @@ instead:
 
 - **Source `sort_order`.** `drop` was already refused; the error now also
   gives the fix, a Transform after the Source with
-  `filter not <field>.is_null()`.
+  `filter not <field>.is_null()`, and is reported as E200 at the Source like
+  the other ordering-only fields (it used to be an E003 "node property
+  derivation failed" error with no location).
+- **Transform `analytic_window.sort_by`.** `drop` used to silently take
+  null-key rows out of the window partition, so the window functions never
+  saw them, while the Transform still wrote those rows. It is now an E200
+  error at the Transform, and `null_order` there is `first` or `last` only.
+  To leave those rows out, filter them in a Transform before the windowed
+  one; unlike the old behaviour, that also removes them from its output:
+
+  ```text
+  transform "running": `null_order: drop` is not allowed on `analytic_window.sort_by` for field 'amount': `sort_by` only orders rows within a window partition and cannot remove them. Use `null_order: first` or `null_order: last`; to exclude rows whose 'amount' is null, add a Transform before this node with `filter not amount.is_null()`.
+  ```
+
+  Two windows that differ only in `null_order` now each read partitions in
+  their own order; they used to share one index sorted by whichever came
+  first.
 
 Cull and Reshape `order_by` also accept a bare field name, as a Sink or
 Source `sort_order` does: `order_by: [txn_date]` is
@@ -28,7 +44,10 @@ Source `sort_order` does: `order_by: [txn_date]` is
 
 For Rust callers, `validate_source_sort_policy` returns the validated fields
 (`Vec<OrderField>`) instead of `()`, and `PlanNode::Cull` and
-`PlanNode::Reshape` carry the validated `order_by: Vec<OrderField>`.
+`PlanNode::Reshape` carry the validated `order_by: Vec<OrderField>`. The
+window index types (`RawIndexRequest`, `IndexSpec`, `find_index_for`) and
+`pipeline::sort::{sort_partition, is_sorted}` take `OrderField`s, and
+`sort_partition` takes the positions as `&mut [u64]`.
 
 ### Fixed — a rejected document's rows are dead-lettered once under `dlq_granularity: document`, and no held row is lost
 
