@@ -1093,10 +1093,13 @@ pub(crate) fn record_error_to_buffer_if_grouped(
 /// cell's per-source narrowing, and is never the cell's first trigger (see
 /// [`CorrelationErrorRecord::trigger`]).
 ///
-/// It counts as one held entry against `max_group_buffer` (see
-/// [`CorrelationGroupBuffer::admit_entry`]), and its row joins the cell's
-/// `error_rows` so a relaxed-key retract still reaches it. Returns `true` iff it was parked; `false` when the buffer is
-/// unconfigured, in which case the caller pushes it to the DLQ directly.
+/// It is part of the failure it is held with, which `max_group_buffer`
+/// already counted when that failure's trigger was parked, so it is not
+/// admitted as an entry of its own (see
+/// [`CorrelationGroupBuffer::admit_entry`]). Its row joins the cell's
+/// `error_rows` so a relaxed-key retract still reaches it. Returns `true`
+/// iff it was parked; `false` when the buffer is unconfigured, in which
+/// case the caller pushes it to the DLQ directly.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_collateral_to_buffer_if_grouped(
     ctx: &mut ExecutorContext<'_>,
@@ -1113,13 +1116,11 @@ pub(crate) fn record_collateral_to_buffer_if_grouped(
         return false;
     }
     let key = buffer_key_for_record(group_record, group_row);
-    let max_buf = ctx.correlation_max_group_buffer;
     let buffers = ctx
         .correlation_buffers
         .as_mut()
         .expect("checked buffers Some above");
     let entry = buffers.entry(key).or_default();
-    entry.admit_entry(max_buf);
     entry.error_rows.insert(row_num);
     entry.error_messages.push(CorrelationErrorRecord {
         row_num,

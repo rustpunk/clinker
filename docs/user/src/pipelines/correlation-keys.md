@@ -86,7 +86,7 @@ A group that goes over the cap is dead-lettered whole when the run commits it. I
 
 Every row is written once (a Combine build row once per failing driver that matched it, see [Combine interaction](#combine-interaction)) and counts toward `dlq_count` and the DLQ rate limits. The `group_size_exceeded` row's `_cxl_dlq_timestamp` is when the group went over the cap, and its error detail states the cap and how many entries the group held.
 
-The cap counts the entries a group holds, not its distinct rows: a row counts once for each Sink it reaches, and each failure counts once. A row that an inclusive Route sends to two Sinks counts twice, and so does a row that fails on one branch and reaches a Sink on another.
+The cap counts the entries a group holds, not its distinct rows: a row counts once for each Sink it reaches, and each failure counts once. A row that an inclusive Route sends to two Sinks counts twice, and so does a row that fails on one branch and reaches a Sink on another. A failing Combine match counts once, although it holds both the driver row and the matched build row.
 
 Going over the cap does not stop a group from buffering. The group keeps buffering its rows until the run commits it, so today the cap decides how a large group is dead-lettered but does not bound the memory it uses.
 

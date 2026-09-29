@@ -87,7 +87,7 @@ error_handling:
   max_group_buffer: 100000     # Default: 100,000
 ```
 
-The cap counts held entries, not distinct source rows: every Sink slot a row occupies and every parked failure is one entry (`CorrelationGroupBuffer::admit_entry`). The first admission that takes a group over the cap stamps the group's overflow (`overflowed_at`), which becomes the failure stamp of its `group_size_exceeded` row, so that row's timestamp and id record when the group crossed the cap rather than when it committed. The relaxed-CK archive and merge keep the earliest crossing.
+The cap counts held entries, not distinct source rows: every Sink slot a row occupies and every parked failure is one entry (`CorrelationGroupBuffer::admit_entry`). A Combine build row parked as a collateral beside its driver's trigger is part of that failure and is not admitted as an entry of its own. The first admission that takes a group over the cap stamps the group's overflow (`overflowed_at`), which becomes the failure stamp of its `group_size_exceeded` row, so that row's timestamp and id record when the group crossed the cap rather than when it committed. The relaxed-CK archive and merge keep the earliest crossing.
 
 Crossing the cap changes nothing at admission. Later rows are still projected and buffered at their Sinks and later failures still parked, so the group keeps buffering until commit and the cap does not bound its memory today. Bounding memory at the cap is tracked separately.
 
