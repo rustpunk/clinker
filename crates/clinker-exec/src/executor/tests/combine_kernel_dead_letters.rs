@@ -284,6 +284,20 @@ fn iejoin_yaml(match_mode: &str) -> String {
     )
 }
 
+/// Pure-range, two conjuncts, plus a residual conjunct over both inputs that
+/// divides by `builds.divisor` (0 on every build row), so every candidate's
+/// residual fails to evaluate: the IEJoin block-band kernel.
+fn iejoin_failing_residual_yaml(match_mode: &str) -> String {
+    fixture_yaml(
+        None,
+        None,
+        &format!(
+            "    where: \"drivers.v >= builds.lo and drivers.v < builds.hi and \
+             drivers.v / builds.divisor > 1\"\n    match: {match_mode}\n"
+        ),
+    )
+}
+
 /// Pure-range, one conjunct, both sides presorted on their range key: the
 /// sort-merge kernel.
 fn sort_merge_yaml() -> String {
@@ -448,6 +462,42 @@ fn block_band_build_rows_carry_their_own_source_row() {
             }
         }
     }
+}
+
+/// Under `match: first` every candidate's residual fails, so each driver's
+/// earliest candidate decides: one failure per driver, against the first
+/// build, and no failure of a later candidate. The kernel holds each
+/// driver's deciding failure until its driver block finalizes; a spilling
+/// run writes the same dead letters as a resident one.
+#[test]
+fn block_band_first_writes_only_each_drivers_deciding_residual_failure() {
+    let yaml = iejoin_failing_residual_yaml("first");
+    assert!(
+        matches!(
+            compiled_combine_strategy(&yaml, COMBINE),
+            CombineStrategy::IEJoin
+        ),
+        "the two-conjunct pure-range fixture with a residual must plan the IEJoin kernel"
+    );
+    let mut runs = Vec::new();
+    for budget in Budget::BOTH {
+        let rows = run_fixture(&yaml, &range_drivers(), &range_builds(), budget);
+        let label = format!("IEJoin match: first, failing residual, {budget:?}");
+        assert_build_rows_attributed(&rows, RANGE_DRIVERS, &label);
+        for build in rows.iter().filter(|row| !row.trigger()) {
+            assert_eq!(
+                build.field("build_id"),
+                Some("b0"),
+                "{label}: each driver's deciding candidate is the first build"
+            );
+        }
+        runs.push(rows);
+    }
+    assert!(
+        masked(&runs[0]) == masked(&runs[1]),
+        "IEJoin match: first: a spilled run must write the same dead-letter rows, in the same \
+         order, as a resident run once the generated columns are masked"
+    );
 }
 
 #[test]
