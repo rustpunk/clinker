@@ -1,9 +1,12 @@
-//! Record-level sort specifications shared by Output and Aggregate.
+//! Record-level sort specifications: the authored sort field every ordering
+//! surface parses, and the placement-only form an ordering-only field is
+//! validated into.
 
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
-/// Sort field specification for output and window partition ordering.
+/// An authored sort field, as written in YAML on every ordering surface.
+/// Ordering-only surfaces validate it into an [`OrderField`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SortField {
@@ -88,7 +91,14 @@ fn default_sort_order() -> SortOrder {
     SortOrder::Asc
 }
 
-/// Null handling in sort operations.
+/// Authored null handling on a sort field.
+///
+/// This is the vocabulary an author writes. `Drop` belongs to a Sink
+/// `sort_order`, whose job includes excluding rows. A Cull or Reshape
+/// `order_by` and a Source `sort_order` only order rows: they convert
+/// through [`OrderField::from_authored`], which refuses `Drop`, so their
+/// validated forms cannot hold it. A window `sort_by` still reads this
+/// authored form and removes null-keyed rows from its partition.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
@@ -98,6 +108,149 @@ pub enum NullOrder {
     /// Nulls sort after all non-null values (SQL convention default).
     #[default]
     Last,
-    /// Remove records with null sort keys from the partition.
+    /// Exclude records whose key is null before sorting.
     Drop,
+}
+
+/// Where nulls go among rows that a field only orders: the placement-only
+/// counterpart of [`NullOrder`], with no way to remove a row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NullPlacement {
+    /// Nulls sort before all non-null values.
+    First,
+    /// Nulls sort after all non-null values; the placement of a field whose
+    /// author wrote no `null_order`.
+    #[default]
+    Last,
+}
+
+impl From<NullPlacement> for NullOrder {
+    fn from(placement: NullPlacement) -> Self {
+        match placement {
+            NullPlacement::First => NullOrder::First,
+            NullPlacement::Last => NullOrder::Last,
+        }
+    }
+}
+
+/// A validated field of an ordering that places rows and never removes
+/// them.
+///
+/// Built by [`OrderField::from_authored`], so the placement is always
+/// resolved (an omitted `null_order` is [`NullPlacement::Last`]) and `drop`
+/// cannot be represented.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OrderField {
+    pub field: String,
+    pub order: SortOrder,
+    pub null_order: NullPlacement,
+}
+
+/// The kind of ordering-only field an authored [`SortField`] came from. It
+/// selects the reason and the fix a refused `drop` gives the author.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderingSite {
+    /// A Cull or Reshape `order_by`: orders the rows of one group.
+    GroupOrderBy,
+    /// A Source `sort_order`: the order its records are verified against.
+    SourceSortOrder,
+    /// A Transform `analytic_window.sort_by`: orders one window partition.
+    WindowSortBy,
+}
+
+/// An authored `null_order: drop` on a field that only orders rows.
+///
+/// `Display` is the author-facing message for the site: the rule, the
+/// reason, and the `filter` that removes null-keyed rows instead. Callers
+/// prefix the node (`cull "name": `, `source 'name': `) and add nothing
+/// else, so this is the one place the wording lives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropNotAllowed {
+    pub field: String,
+    pub site: OrderingSite,
+}
+
+impl std::fmt::Display for DropNotAllowed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let field = &self.field;
+        let (key, reason, filter_at) = match self.site {
+            OrderingSite::GroupOrderBy => (
+                "order_by",
+                "`order_by` only orders rows within a group and cannot remove them",
+                "before this node",
+            ),
+            OrderingSite::SourceSortOrder => (
+                "sort_order",
+                "source verification cannot discard records",
+                "after this source",
+            ),
+            OrderingSite::WindowSortBy => (
+                "analytic_window.sort_by",
+                "`sort_by` only orders rows within a window partition and cannot remove them",
+                "before this node",
+            ),
+        };
+        write!(
+            f,
+            "`null_order: drop` is not allowed on `{key}` for field '{field}': {reason}. Use \
+             `null_order: first` or `null_order: last`; to exclude rows whose '{field}' is null, \
+             add a Transform {filter_at} with `filter not {field}.is_null()`."
+        )
+    }
+}
+
+impl std::error::Error for DropNotAllowed {}
+
+impl OrderField {
+    /// Convert an authored field of the ordering-only `site` into its
+    /// placement-only form. An omitted `null_order` becomes
+    /// [`NullPlacement::Last`]; `drop` is refused with the site's message.
+    ///
+    /// Every ordering-only site converts through this one function, so the
+    /// rule and its wording cannot drift between nodes.
+    pub fn from_authored(field: SortField, site: OrderingSite) -> Result<Self, DropNotAllowed> {
+        let null_order = match field.null_order {
+            None | Some(NullOrder::Last) => NullPlacement::Last,
+            Some(NullOrder::First) => NullPlacement::First,
+            Some(NullOrder::Drop) => {
+                return Err(DropNotAllowed {
+                    field: field.field,
+                    site,
+                });
+            }
+        };
+        Ok(OrderField {
+            field: field.field,
+            order: field.order,
+            null_order,
+        })
+    }
+}
+
+impl From<&OrderField> for SortField {
+    /// The sort key form the executor's comparators take, with the
+    /// placement written out.
+    fn from(field: &OrderField) -> Self {
+        SortField {
+            field: field.field.clone(),
+            order: field.order,
+            null_order: Some(field.null_order.into()),
+        }
+    }
+}
+
+/// Deserialize a list whose entries are each a field name or a full sort
+/// field object into `Vec<SortField>`: the two spellings [`SortFieldSpec`]
+/// gives a Sink or Source `sort_order`. Used through
+/// `#[serde(deserialize_with)]` so every authored ordering list takes both.
+pub fn deserialize_sort_field_list<'de, D>(deserializer: D) -> Result<Vec<SortField>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let specs = Vec::<SortFieldSpec>::deserialize(deserializer)?;
+    Ok(specs
+        .into_iter()
+        .map(SortFieldSpec::into_sort_field)
+        .collect())
 }
