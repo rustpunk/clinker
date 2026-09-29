@@ -230,6 +230,53 @@ fn test_sum_mixed_int_float() {
 }
 
 #[test]
+fn sum_merge_keeps_an_integer_only_partial() {
+    // A spilled aggregate merges one partial per spill run. A partial that saw
+    // only the float 0.5, merged with one that saw only the integers 1, 2 and
+    // 3, holds all four addends: 6.5, which is also what one fold of them
+    // gives, whichever partial the merge starts from.
+    let float_partial = || {
+        let mut s = sum();
+        add_all(&mut s, &[Value::Float(0.5)]);
+        s
+    };
+    let integer_partial = || {
+        let mut s = sum();
+        add_all(
+            &mut s,
+            &[Value::Integer(1), Value::Integer(2), Value::Integer(3)],
+        );
+        s
+    };
+    let mut folded = sum();
+    add_all(
+        &mut folded,
+        &[
+            Value::Float(0.5),
+            Value::Integer(1),
+            Value::Integer(2),
+            Value::Integer(3),
+        ],
+    );
+    assert_eq!(folded.finalize().unwrap(), Value::Float(6.5));
+
+    let mut float_first = float_partial();
+    float_first.merge(&integer_partial());
+    assert_eq!(
+        float_first.finalize().unwrap(),
+        Value::Float(6.5),
+        "the float partial merged with the integer-only partial"
+    );
+    let mut integer_first = integer_partial();
+    integer_first.merge(&float_partial());
+    assert_eq!(
+        integer_first.finalize().unwrap(),
+        Value::Float(6.5),
+        "the integer-only partial merged with the float partial"
+    );
+}
+
+#[test]
 fn test_sum_null_skipped() {
     let mut a = sum();
     add_all(&mut a, &[Value::Integer(1), Value::Null, Value::Integer(3)]);
