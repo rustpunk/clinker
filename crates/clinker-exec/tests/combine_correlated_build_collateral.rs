@@ -752,6 +752,54 @@ fn build_row_held_with_a_failure_is_not_a_second_group_entry() {
     }
 }
 
+/// The build Source also feeds a Sink of its own.
+const BUILD_SINK: &str = r#"  - type: sink
+    name: bld_out
+    input: src_bld
+    config:
+      name: bld_out
+      type: csv
+      path: bld_out.csv
+"#;
+
+/// The build row shares the failing driver's group and also reaches a Sink
+/// of its own. It did not fail, and its Source contributed no failure to the
+/// group, so its own Sink row is spared and written, as it is without a key;
+/// the failure still writes the driver row and its copy of the build row.
+#[test]
+fn a_build_row_in_its_failing_drivers_group_still_reaches_its_own_sink() {
+    for strategy in all_strategies() {
+        let tag = strategy.tag;
+        let (group, _) = driver_and_build_groups(strategy);
+        let yaml = yaml_with(strategy, "", BUILD_SINK);
+        let (out, rows) = run_yaml(
+            &yaml,
+            strategy,
+            &[(1, group, 0)],
+            &build(group),
+            &["out", "bld_out"],
+        );
+        assert_eq!(
+            rows.len(),
+            2,
+            "[{tag}] the failing driver and its build row, and nothing condemned: {:?}",
+            describe(&rows)
+        );
+        assert_driver_then_build(tag, &rows[0], &rows[1], 1);
+        let written = &out["bld_out"];
+        assert_eq!(
+            written.len(),
+            1,
+            "[{tag}] the build row reaches its own Sink: {written:?}"
+        );
+        assert_eq!(
+            written[0].get("bid").map(String::as_str),
+            Some("1"),
+            "[{tag}] the build Sink holds the build row: {written:?}"
+        );
+    }
+}
+
 /// Number of build rows every driver matches in the multi-failure cases.
 const MATCHED_BUILDS: usize = 3;
 
