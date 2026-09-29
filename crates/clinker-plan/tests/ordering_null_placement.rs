@@ -9,6 +9,10 @@
 //! node. A Source `sort_order` refuses `drop` through the same conversion;
 //! only a Sink `sort_order` keeps it.
 
+use std::path::PathBuf;
+
+use clinker_core_types::Diagnostic;
+use clinker_core_types::span::Span;
 use clinker_plan::config::pipeline_node::PipelineNode;
 use clinker_plan::config::{
     CompileContext, NullOrder, NullPlacement, OrderField, PipelineConfig, SortField, SortOrder,
@@ -98,16 +102,41 @@ nodes:
     )
 }
 
-/// Compile `yaml`, expect failure, and return every `(code, message)`.
-fn compile_diagnostics(yaml: &str) -> Vec<(String, String)> {
+/// The span a diagnostic about the top-level node `name` points at: the
+/// line the node's entry starts on.
+fn node_span(config: &PipelineConfig, name: &str) -> Span {
+    let line = config
+        .nodes
+        .iter()
+        .find(|node| node.value.name() == name)
+        .map(|node| node.referenced.line() as u32)
+        .unwrap_or_else(|| panic!("no node named {name:?}"));
+    Span::line_only(line)
+}
+
+/// Compile `yaml`, expect failure, and assert that exactly one diagnostic
+/// is about `null_order: drop`: an E200 at node `node` reading `expected`.
+/// Every ordering-only site reports the refusal under that one code, at the
+/// offending node.
+fn assert_one_drop_diagnostic(yaml: &str, node: &str, expected: &str) {
     let config = parse_config(yaml).expect("fixture must parse as YAML");
+    let span = node_span(&config, node);
     let diags = config
         .compile(&CompileContext::default())
         .expect_err("fixture is expected to fail compilation");
-    diags
-        .into_iter()
-        .map(|d| (d.code.clone(), d.message.clone()))
-        .collect()
+    let matching: Vec<&Diagnostic> = diags
+        .iter()
+        .filter(|d| d.message.contains("null_order: drop"))
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "expected exactly one `null_order: drop` diagnostic, got {diags:?}"
+    );
+    let diag = matching[0];
+    assert_eq!(diag.code, "E200", "wrong code for {:?}", diag.message);
+    assert_eq!(diag.message, expected);
+    assert_eq!(diag.primary.span, span, "the refusal must point at {node:?}");
 }
 
 /// The group-ordering text for field `txn_date`, written out in full so a
@@ -117,33 +146,16 @@ const GROUP_DROP_TEXT: &str = "`null_order: drop` is not allowed on `order_by` f
      `null_order: first` or `null_order: last`; to exclude rows whose 'txn_date' is null, add a \
      Transform before this node with `filter not txn_date.is_null()`.";
 
-fn assert_one_drop_diagnostic(diags: &[(String, String)], expected: &str) {
-    let matching: Vec<&(String, String)> = diags
-        .iter()
-        .filter(|(_, m)| m.contains("null_order: drop"))
-        .collect();
-    assert_eq!(
-        matching.len(),
-        1,
-        "expected exactly one `null_order: drop` diagnostic, got {diags:?}"
-    );
-    let (code, message) = matching[0];
-    assert_eq!(code, "E200", "wrong code for {message:?}");
-    assert_eq!(message, expected);
-}
-
 #[test]
 fn cull_order_by_drop_is_rejected_with_the_fix() {
     let yaml = pipeline(&cull_block("[{ field: txn_date, null_order: drop }]"));
-    let diags = compile_diagnostics(&yaml);
-    assert_one_drop_diagnostic(&diags, &format!("cull \"cd\": {GROUP_DROP_TEXT}"));
+    assert_one_drop_diagnostic(&yaml, "cd", &format!("cull \"cd\": {GROUP_DROP_TEXT}"));
 }
 
 #[test]
 fn reshape_order_by_drop_is_rejected_with_the_fix() {
     let yaml = pipeline(&reshape_block("[{ field: txn_date, null_order: drop }]"));
-    let diags = compile_diagnostics(&yaml);
-    assert_one_drop_diagnostic(&diags, &format!("reshape \"rs\": {GROUP_DROP_TEXT}"));
+    assert_one_drop_diagnostic(&yaml, "rs", &format!("reshape \"rs\": {GROUP_DROP_TEXT}"));
 }
 
 /// The authored `order_by` of the named node, as parsed.
@@ -277,11 +289,92 @@ fn source_sort_order_drop_is_rejected_with_the_fix() {
     assert_eq!(transform_name, "src");
     assert_eq!(messages, vec![SOURCE_DROP_TEXT.to_string()]);
 
-    let diags = compile_diagnostics(&yaml);
-    assert!(
-        diags.iter().any(|(_, m)| m.contains(SOURCE_DROP_TEXT)),
-        "compiling must report the Source refusal, got {diags:?}"
+    // Through `compile` the same text is the one refusal, under the code
+    // every ordering-only site uses, at the Source.
+    assert_one_drop_diagnostic(&yaml, "src", SOURCE_DROP_TEXT);
+}
+
+/// A window inside a composition body is refused like a top-level one:
+/// the body's Transform is bound by the same schema pass.
+#[test]
+fn composition_body_window_sort_by_drop_is_rejected_with_the_fix() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    std::fs::create_dir_all(workspace.path().join("pipelines")).expect("pipelines dir");
+    std::fs::create_dir_all(workspace.path().join("compositions")).expect("compositions dir");
+    std::fs::write(
+        workspace.path().join("compositions/running.comp.yaml"),
+        r#"
+_compose:
+  name: running
+  inputs:
+    inp:
+      schema:
+        - { name: account, type: string }
+        - { name: amount, type: { nullable: int } }
+  outputs:
+    out: running
+  config_schema: {}
+nodes:
+  - type: transform
+    name: running
+    input: inp
+    config:
+      analytic_window:
+        group_by: [account]
+        sort_by: [{ field: amount, null_order: drop }]
+      cxl: |
+        emit account = account
+        emit total = $window.sum(amount)
+"#,
+    )
+    .expect("write the composition");
+    let yaml = r#"
+pipeline:
+  name: body_window_drop
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - { name: account, type: string }
+        - { name: amount, type: { nullable: int } }
+  - type: composition
+    name: body
+    input: src
+    use: ../compositions/running.comp.yaml
+    inputs:
+      inp: src
+  - type: sink
+    name: out
+    input: body
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config = parse_config(yaml).expect("fixture must parse as YAML");
+    let ctx = CompileContext::with_pipeline_dir(workspace.path(), PathBuf::from("pipelines"));
+    let diags = config
+        .compile(&ctx)
+        .expect_err("a body window sort_by with null_order: drop must not compile");
+    let matching: Vec<&Diagnostic> = diags
+        .iter()
+        .filter(|d| d.message.contains("null_order: drop"))
+        .collect();
+    assert_eq!(matching.len(), 1, "got {diags:?}");
+    assert_eq!(matching[0].code, "E200");
+    assert_eq!(
+        matching[0].message,
+        "transform \"running\": `null_order: drop` is not allowed on \
+         `analytic_window.sort_by` for field 'amount': `sort_by` only orders rows within a window \
+         partition and cannot remove them. Use `null_order: first` or `null_order: last`; to \
+         exclude rows whose 'amount' is null, add a Transform before this node with \
+         `filter not amount.is_null()`."
     );
+    assert_ne!(matching[0].primary.span, Span::SYNTHETIC);
 }
 
 #[test]

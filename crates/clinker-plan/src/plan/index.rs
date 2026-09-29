@@ -240,3 +240,64 @@ fn sort_fields_equal(a: &[SortField], b: &[SortField]) -> bool {
         .zip(b.iter())
         .all(|(x, y)| x.field == y.field && x.order == y.order)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{NullOrder, SortOrder};
+    use std::sync::Arc;
+
+    fn root() -> PlanIndexRoot {
+        PlanIndexRoot::Node {
+            upstream: NodeIndex::new(0),
+            anchor_schema: SharedStorage::from_arc(Arc::new(Schema::new(vec![
+                "dept".into(),
+                "amount".into(),
+            ]))),
+        }
+    }
+
+    fn amount(null_order: NullOrder) -> Vec<SortField> {
+        vec![SortField {
+            field: "amount".into(),
+            order: SortOrder::Asc,
+            null_order: Some(null_order),
+        }]
+    }
+
+    fn request(transform_index: usize, sort_by: Vec<SortField>) -> RawIndexRequest {
+        RawIndexRequest {
+            root: root(),
+            group_by: vec!["dept".into()],
+            sort_by,
+            arena_fields: vec!["amount".into(), "dept".into()],
+            already_sorted: false,
+            transform_index,
+            requires_buffer_recompute: false,
+        }
+    }
+
+    /// Two windows that differ only in where nulls go need two indices:
+    /// one shared index is sorted one way, and the other window would read
+    /// its partitions in an order its author did not write.
+    #[test]
+    fn windows_differing_only_in_null_order_get_separate_indices() {
+        let first = amount(NullOrder::First);
+        let last = amount(NullOrder::Last);
+        let indices = deduplicate_indices(vec![
+            request(0, first.clone()),
+            request(1, last.clone()),
+            request(2, last.clone()),
+        ]);
+        assert_eq!(indices.len(), 2, "got {indices:?}");
+
+        let group_by = vec!["dept".to_string()];
+        let first_index = find_index_for(&indices, &root(), &group_by, &first)
+            .expect("the nulls-first window finds an index");
+        let last_index = find_index_for(&indices, &root(), &group_by, &last)
+            .expect("the nulls-last window finds an index");
+        assert_ne!(first_index, last_index);
+        assert_eq!(indices[first_index].sort_by, first);
+        assert_eq!(indices[last_index].sort_by, last);
+    }
+}

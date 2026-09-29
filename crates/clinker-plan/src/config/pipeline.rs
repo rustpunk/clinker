@@ -6297,3 +6297,80 @@ nodes:
         );
     }
 }
+
+#[cfg(test)]
+mod window_sort_by_null_order_tests {
+    use super::*;
+    use clinker_core_types::Diagnostic;
+    use clinker_core_types::span::Span;
+
+    /// A window `sort_by` only orders the rows of one partition, so an
+    /// authored `null_order: drop` there is refused before the pipeline
+    /// runs, at the Transform, with the upstream `filter` that does remove
+    /// null-keyed rows.
+    #[test]
+    fn window_sort_by_drop_is_rejected_with_the_fix() {
+        let yaml = r#"
+pipeline:
+  name: window_sort_by_drop
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - { name: dept, type: string }
+        - { name: amount, type: { nullable: int } }
+  - type: transform
+    name: running
+    input: src
+    config:
+      analytic_window:
+        group_by: [dept]
+        sort_by:
+          - { field: amount, null_order: drop }
+      cxl: |
+        emit dept = dept
+        emit total = $window.sum(amount)
+  - type: sink
+    name: out
+    input: running
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+        let config = parse_config(yaml).expect("fixture must parse as YAML");
+        let transform_line = config
+            .nodes
+            .iter()
+            .find(|node| node.value.name() == "running")
+            .map(|node| node.referenced.line() as u32)
+            .expect("the Transform is declared");
+        let diags = config
+            .compile(&CompileContext::default())
+            .expect_err("a window sort_by with null_order: drop must not compile");
+        let drops: Vec<&Diagnostic> = diags
+            .iter()
+            .filter(|d| d.message.contains("null_order: drop"))
+            .collect();
+        assert_eq!(
+            drops.len(),
+            1,
+            "expected exactly one `null_order: drop` diagnostic, got {diags:?}"
+        );
+        let diag = drops[0];
+        assert_eq!(diag.code, "E200", "wrong code for {:?}", diag.message);
+        assert_eq!(
+            diag.message,
+            "transform \"running\": `null_order: drop` is not allowed on \
+             `analytic_window.sort_by` for field 'amount': `sort_by` only orders rows within a \
+             window partition and cannot remove them. Use `null_order: first` or \
+             `null_order: last`; to exclude rows whose 'amount' is null, add a Transform before \
+             this node with `filter not amount.is_null()`."
+        );
+        assert_eq!(diag.primary.span, Span::line_only(transform_line));
+    }
+}
