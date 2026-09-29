@@ -838,7 +838,7 @@ impl TransientNodeBufferReservation {
         }
         self.handle
             .try_grow(additional_bytes)
-            .map_err(|shortfall| node_buffer_shortfall_error(node, &shortfall))
+            .map_err(|shortfall| node_buffer_shortfall_error(node, shortfall, &self.budget))
     }
 
     /// Restate the reservation's bytes after a representation transition
@@ -852,7 +852,7 @@ impl TransientNodeBufferReservation {
         }
         self.handle
             .try_resize(bytes)
-            .map_err(|shortfall| node_buffer_shortfall_error(node, &shortfall))
+            .map_err(|shortfall| node_buffer_shortfall_error(node, shortfall, &self.budget))
     }
 
     /// Current bytes held by this reservation.
@@ -937,36 +937,22 @@ pub(crate) fn reserve_node_buffer_materialization(
     Ok(reservation)
 }
 
-/// The E310 for a node-buffer growth of `node` the arbitrator refused after
-/// reclaiming: the bytes the ledger would have held with the request
-/// granted, its limit, and the largest holders at the refusal.
+/// The E310 for a growth of a materialization the node `node` collects,
+/// refused after reclaiming: the refusal's own report, naming `node` and its
+/// rows collected for a full scan as the requester. The growth may be charged
+/// through a slot registered under another node (the producer whose buffer
+/// the reader materializes); the holder list still shows that slot.
 pub(crate) fn node_buffer_shortfall_error(
     node: &str,
-    shortfall: &crate::pipeline::memory::ledger::Shortfall,
+    shortfall: crate::pipeline::memory::ledger::Shortfall,
+    budget: &crate::pipeline::memory::MemoryArbitrator,
 ) -> PipelineError {
-    let snapshot = &shortfall.snapshot;
-    let holders: Vec<String> = snapshot
-        .holders
-        .iter()
-        .take(5)
-        .map(|holder| format!("{} {} bytes", holder.label.surface, holder.charged))
-        .collect();
-    PipelineError::MemoryBudgetExceeded {
+    let mut report = shortfall.into_report(budget);
+    report.requester = Some(clinker_plan::runtime_error::ConsumerLabel {
         node: node.to_string(),
-        used: snapshot.charged.saturating_add(shortfall.requested),
-        limit: snapshot.limit,
-        source: clinker_plan::BudgetCategory::NodeBuffer,
-        detail: Some(format!(
-            "node-buffer materialization of {} bytes did not fit beside {} charged bytes; largest holders: {}",
-            shortfall.requested,
-            snapshot.charged,
-            if holders.is_empty() {
-                "none".to_string()
-            } else {
-                holders.join(", ")
-            }
-        )),
-    }
+        surface: clinker_plan::runtime_error::MemorySurface::ScanMaterialization,
+    });
+    PipelineError::MemoryBudgetExceeded { report }
 }
 
 /// Arbitrator wrapper for a transient materialization. Unlike a resident
@@ -1885,17 +1871,19 @@ mod tests {
         let baseline_id = register_fixed(&budget, baseline_usage);
 
         match reserve_node_buffer_materialization(reserved_bytes, &budget, "clone_site") {
-            Err(PipelineError::MemoryBudgetExceeded {
-                node,
-                used,
-                limit,
-                source,
-                ..
-            }) => {
-                assert_eq!(node, "clone_site");
-                assert_eq!(used, hard_limit + 1);
-                assert_eq!(limit, hard_limit);
-                assert_eq!(source, clinker_plan::BudgetCategory::NodeBuffer);
+            Err(PipelineError::MemoryBudgetExceeded { report }) => {
+                assert_eq!(
+                    report.requester,
+                    Some(clinker_plan::runtime_error::ConsumerLabel {
+                        node: "clone_site".to_string(),
+                        surface: clinker_plan::runtime_error::MemorySurface::ScanMaterialization,
+                    })
+                );
+                assert_eq!(
+                    report.charged_bytes + report.requested_bytes,
+                    hard_limit + 1
+                );
+                assert_eq!(report.limit_bytes, hard_limit);
             }
             Ok(_) => panic!("expected pre-allocation E310 NodeBuffer; reservation succeeded"),
             Err(other) => panic!("expected pre-allocation E310 NodeBuffer; got {other:?}"),
@@ -2037,9 +2025,14 @@ mod tests {
         // Off the walk nothing is reclaimed, so a rise past the capacity is
         // refused at once.
         match reservation.resize(capacity + 1, "canonicalize") {
-            Err(PipelineError::MemoryBudgetExceeded { node, source, .. }) => {
-                assert_eq!(node, "canonicalize");
-                assert_eq!(source, clinker_plan::BudgetCategory::NodeBuffer);
+            Err(PipelineError::MemoryBudgetExceeded { report }) => {
+                assert_eq!(
+                    report.requester,
+                    Some(clinker_plan::runtime_error::ConsumerLabel {
+                        node: "canonicalize".to_string(),
+                        surface: clinker_plan::runtime_error::MemorySurface::ScanMaterialization,
+                    })
+                );
             }
             Ok(()) => panic!("a rise past the capacity must be refused with E310"),
             Err(other) => panic!("expected E310 naming the node; got {other:?}"),
@@ -2678,21 +2671,18 @@ mod tests {
                 assert!(drain.next().is_none());
                 error
             };
-            let PipelineError::MemoryBudgetExceeded {
-                node,
-                used,
-                limit,
-                source,
-                detail,
-            } = error
-            else {
+            let PipelineError::MemoryBudgetExceeded { report } = error else {
                 panic!("typed range refusal: {error:?}");
             };
-            assert_eq!(node, "banded");
-            assert_eq!(limit, 1);
-            assert!(used > limit);
-            assert_eq!(source, clinker_plan::BudgetCategory::Arena);
-            assert!(detail.unwrap().contains("range output merge frontier"));
+            assert_eq!(
+                report.requester,
+                Some(clinker_plan::runtime_error::ConsumerLabel {
+                    node: "banded".to_string(),
+                    surface: clinker_plan::runtime_error::MemorySurface::SortBuffer,
+                })
+            );
+            assert_eq!(report.limit_bytes, 1);
+            assert!(report.requested_bytes > report.limit_bytes);
             assert!(paths.iter().all(|p| !p.exists()));
             assert_eq!(arb.cumulative_spill_bytes(), 777);
         }

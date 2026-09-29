@@ -1896,17 +1896,19 @@ mod tests {
         );
 
         match reserve_node_buffer_materialization(clone_bytes, &budget, "ordinary_out") {
-            Err(PipelineError::MemoryBudgetExceeded {
-                node,
-                used,
-                limit,
-                source,
-                ..
-            }) => {
-                assert_eq!(node, "ordinary_out");
-                assert_eq!(used, hard_limit + 1);
-                assert_eq!(limit, hard_limit);
-                assert_eq!(source, clinker_plan::BudgetCategory::NodeBuffer);
+            Err(PipelineError::MemoryBudgetExceeded { report }) => {
+                assert_eq!(
+                    report.requester,
+                    Some(clinker_plan::runtime_error::ConsumerLabel {
+                        node: "ordinary_out".to_string(),
+                        surface: clinker_plan::runtime_error::MemorySurface::ScanMaterialization,
+                    })
+                );
+                assert_eq!(
+                    report.charged_bytes + report.requested_bytes,
+                    hard_limit + 1
+                );
+                assert_eq!(report.limit_bytes, hard_limit);
             }
             Ok(_) => panic!("Output materialization must be rejected before allocation"),
             Err(other) => panic!("expected Output E310 NodeBuffer; got {other:?}"),

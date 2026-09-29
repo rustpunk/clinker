@@ -85,8 +85,8 @@ pub(crate) use transform::{
 };
 use util::scheduled_pass_order;
 pub(crate) use util::{
-    GroupedNodeKind, build_arbitrator_from_config, copy_build_ck_columns, format_group_key,
-    giant_group_error, operator_memory_limit, record_with_emitted_fields, widen_record_to_schema,
+    build_arbitrator_from_config, copy_build_ck_columns, format_group_key, giant_group_error,
+    operator_memory_limit, record_with_emitted_fields, widen_record_to_schema,
 };
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1203,6 +1203,7 @@ impl PipelineExecutor {
                 let lifecycle_telemetry = params.telemetry_producer.clone();
                 let ingest_progress = params.progress.clone();
                 let ingest_source_runtime = source_runtime.clone();
+                let ingest_node = src_cfg.name.clone();
                 // One OS thread per Source. Spawned before the DAG dispatch
                 // drains so the producers fill the bounded channels while the
                 // consumer dispatch loop runs concurrently. Joined after
@@ -1211,14 +1212,21 @@ impl PipelineExecutor {
                     .name(format!("clinker-ingest-{}", src_cfg.name))
                     .spawn(move || {
                         source_activation::observe_source(lifecycle_telemetry.as_ref(), || {
-                            ingest_source(
-                                src_cfg_owned,
-                                source_input,
-                                config_clone,
-                                stream,
-                                ingest_shutdown,
-                                ingest_progress,
-                                ingest_source_runtime,
+                            // A governed allocation this Source was refused
+                            // ends its ingest here, on the thread that
+                            // recorded the refusal's report.
+                            crate::pipeline::memory::ledger::convert_governed_refusal(
+                                ingest_source(
+                                    src_cfg_owned,
+                                    source_input,
+                                    config_clone,
+                                    stream,
+                                    ingest_shutdown,
+                                    ingest_progress,
+                                    ingest_source_runtime,
+                                ),
+                                &ingest_node,
+                                clinker_plan::runtime_error::MemorySurface::RowsRead,
                             )
                         })
                     })
@@ -1271,6 +1279,11 @@ impl PipelineExecutor {
         ) {
             Ok(outcome) => outcome,
             Err(dispatch_error) => {
+                // A governed allocation the walk itself was refused names its
+                // requester through the walk's own attribution, so nothing is
+                // stamped here.
+                let dispatch_error =
+                    crate::pipeline::memory::ledger::governed_refusal_error(dispatch_error, None);
                 // `execute_dag` has already dropped or drained every receiver,
                 // so each finite source worker can now finish. Join all of
                 // them before returning the original dispatcher failure: a
@@ -1844,10 +1857,11 @@ impl PipelineExecutor {
                 allocation_resources: allocation_resources.clone(),
                 truncation_ledger: truncation_ledger.clone(),
             };
+            let writer_node = output_name.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("clinker-output-{output_name}"))
                 .spawn(move || {
-                    streaming_sink(
+                    let mut output = streaming_sink(
                         rx,
                         raw_writer,
                         spec,
@@ -1855,7 +1869,23 @@ impl PipelineExecutor {
                         telemetry_producer,
                         sink_shutdown_token,
                         sink_resources,
-                    )
+                    );
+                    // A governed allocation this writer was refused ends its
+                    // work here, on the thread that recorded the refusal's
+                    // report.
+                    output.errors = std::mem::take(&mut output.errors)
+                        .into_iter()
+                        .map(|error| {
+                            crate::pipeline::memory::ledger::governed_refusal_error(
+                                error,
+                                Some((
+                                    &writer_node,
+                                    clinker_plan::runtime_error::MemorySurface::OutputStaging,
+                                )),
+                            )
+                        })
+                        .collect();
+                    output
                 })
                 .map_err(|e| PipelineError::Internal {
                     op: "streaming-output-spawn",

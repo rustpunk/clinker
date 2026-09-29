@@ -190,8 +190,7 @@ impl<K: Eq + Hash + Clone> ExtentLog<K> {
     ///
     /// # Errors
     ///
-    /// [`PipelineError::MemoryBudgetExceeded`] with
-    /// [`clinker_plan::BudgetCategory::Arena`], naming `node` and `what`,
+    /// [`PipelineError::MemoryBudgetExceeded`] naming `node` and `surface`,
     /// when the charge does not fit even with every tail flushed; nothing is
     /// appended. A flush's errors, as [`Self::flush_all`].
     pub(crate) fn admit_charge(
@@ -201,7 +200,7 @@ impl<K: Eq + Hash + Clone> ExtentLog<K> {
         frame_len: usize,
         extra: u64,
         node: &str,
-        what: &str,
+        surface: clinker_plan::runtime_error::MemorySurface,
     ) -> Result<u64, PipelineError> {
         let hard_limit = budget.hard_limit();
         if hard_limit == 0 {
@@ -216,16 +215,7 @@ impl<K: Eq + Hash + Clone> ExtentLog<K> {
         let charged = budget.sum_consumer_usage();
         let projected = charged.saturating_add(growth);
         if projected > hard_limit {
-            return Err(PipelineError::MemoryBudgetExceeded {
-                node: node.to_string(),
-                used: projected,
-                limit: hard_limit,
-                source: clinker_plan::BudgetCategory::Arena,
-                detail: Some(format!(
-                    "{what} projected {projected} bytes from charged pressure {charged} plus \
-                     {growth} bytes for one more held row, with every held row already on disk"
-                )),
-            });
+            return Err(budget.refusal(node, surface, growth));
         }
         Ok(freed)
     }

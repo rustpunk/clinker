@@ -33,7 +33,6 @@ use crate::pipeline::combine_verdict::{
     Admit, DriverScan, DriverVerdict, MissToken, PredicateOutcome, eval_predicate,
 };
 use crate::pipeline::iejoin::RecordOrder;
-use clinker_plan::BudgetCategory;
 use clinker_plan::config::ErrorStrategy;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{
@@ -1198,13 +1197,7 @@ where
             &budget,
             estimated_rows,
         )
-        .map_err(|e| PipelineError::MemoryBudgetExceeded {
-            node: name.clone(),
-            used: budget.peak_rss().unwrap_or(0),
-            limit: budget.hard_limit(),
-            source: BudgetCategory::Arena,
-            detail: Some(format!("combine build: {e}")),
-        })?;
+        .map_err(|e| e.into_build_error(name, &budget))?;
         let build_identity_bytes = build_row_ids.capacity().saturating_mul(std::mem::size_of::<
             crate::executor::stream_event::SourceRowId,
         >());
@@ -1212,13 +1205,11 @@ where
             .memory_bytes()
             .saturating_add(build_identity_bytes);
         if budget.should_abort_local(inline_bytes as u64) {
-            return Err(PipelineError::MemoryBudgetExceeded {
-                node: name.clone(),
-                used: inline_bytes as u64,
-                limit: budget.limit(),
-                source: BudgetCategory::Arena,
-                detail: Some("combine build identities exceed memory budget".to_string()),
-            });
+            return Err(budget.refusal(
+                name,
+                clinker_plan::runtime_error::MemorySurface::JoinBuildSide,
+                inline_bytes as u64,
+            ));
         }
         let build_records_out = hash_table.len() as u64;
         // Mirror the freshly-built table's footprint into the
@@ -1358,13 +1349,10 @@ where
                     // symmetric probe-side risk where a small build × large driver
                     // fan-out can blow RSS even though the table itself is bounded.
                     if emitted_since_check >= 10_000 && budget.should_abort() {
-                        return Err(PipelineError::MemoryBudgetExceeded {
-                            node: name.clone(),
-                            used: budget.peak_rss().unwrap_or(0),
-                            limit: budget.hard_limit(),
-                            source: BudgetCategory::Arena,
-                            detail: Some("combine probe RSS abort".to_string()),
-                        });
+                        return Err(budget.backstop_refusal(
+                            name,
+                            clinker_plan::runtime_error::MemorySurface::JoinState,
+                        ));
                     }
                     if emitted_since_check >= 10_000 {
                         emitted_since_check = 0;
@@ -1617,6 +1605,7 @@ fn run_streaming_combine_probe(
     // deadlock on a dead consumer.
     let probe_result: Result<(), PipelineError> = std::thread::scope(|scope| {
         let handle = scope.spawn(|| -> Result<(), PipelineError> {
+            let mut probe = || -> Result<(), PipelineError> {
             let mut probe_keys_buf: Vec<Value> = Vec::with_capacity(kernel.probe_extractor.len());
             let mut budget_cadence: usize = 0;
             while let Ok(event) = rx.recv() {
@@ -1728,19 +1717,24 @@ fn run_streaming_combine_probe(
                 budget_cadence += output_records.len() - before + new_failures;
                 if budget_cadence >= 10_000 && budget.should_abort() {
                     drain_probe_channel(&rx, &charge_handle, &allocation_resources);
-                    return Err(PipelineError::MemoryBudgetExceeded {
-                        node: name.to_string(),
-                        used: budget.peak_rss().unwrap_or(0),
-                        limit: budget.hard_limit(),
-                        source: BudgetCategory::Arena,
-                        detail: Some("combine probe RSS abort".to_string()),
-                    });
+                    return Err(budget.backstop_refusal(
+                        name,
+                        clinker_plan::runtime_error::MemorySurface::JoinState,
+                    ));
                 }
                 if budget_cadence >= 10_000 {
                     budget_cadence = 0;
                 }
             }
             Ok(())
+            };
+            // A governed allocation this worker was refused ends the probe
+            // here, on the thread that recorded the refusal's report.
+            crate::pipeline::memory::ledger::convert_governed_refusal(
+                probe(),
+                name,
+                clinker_plan::runtime_error::MemorySurface::JoinState,
+            )
         });
 
         // Redispatch the driver producer on the main thread. Clear its

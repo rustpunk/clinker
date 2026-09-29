@@ -1285,7 +1285,6 @@ pub(crate) fn sink_collision_dlq_entry(
 use crate::executor::node_buffer::{NodeBuffer, TransientNodeBufferReservation};
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{DlqEntry, DlqFailureStamp, evaluate_single_transform, stage_metrics};
-use clinker_plan::BudgetCategory;
 use clinker_plan::plan::composition_body::CompositionBodies;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 use clinker_record::Schema;
@@ -4123,12 +4122,11 @@ pub(crate) fn finalize_node_rooted_windows(
         let arena_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::ArenaBuild);
         let arena =
             Arena::from_records(rows, &spec.arena_fields, anchor_schema, &ctx.memory_budget)
-                .map_err(|e| PipelineError::MemoryBudgetExceeded {
-                    node: current_dag.graph[upstream_idx].name().to_string(),
-                    used: ctx.memory_budget.peak_rss().unwrap_or(0),
-                    limit: ctx.memory_budget.hard_limit(),
-                    source: BudgetCategory::Arena,
-                    detail: Some(format!("node-rooted arena build: {e}")),
+                .map_err(|e| {
+                    e.into_pipeline_error(
+                        current_dag.graph[upstream_idx].name(),
+                        &ctx.memory_budget,
+                    )
                 })?;
         let arena_len = arena.record_count();
         ctx.collector

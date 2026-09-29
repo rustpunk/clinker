@@ -20,7 +20,6 @@ use crate::executor::dispatch::{
 };
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{CompiledRoute, DlqEntry, DlqFailureStamp};
-use clinker_plan::BudgetCategory;
 use clinker_plan::config::ErrorStrategy;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
@@ -358,13 +357,13 @@ where
                 .unwrap_or(0);
             for (record, rn) in records {
                 if row_bytes_each > 0 && ctx.memory_budget.should_abort() {
-                    return Err(PipelineError::MemoryBudgetExceeded {
-                        node: name.to_string(),
-                        used: ctx.memory_budget.peak_rss().unwrap_or(0),
-                        limit: ctx.memory_budget.hard_limit(),
-                        source: BudgetCategory::Arena,
-                        detail: Some("Route cross-region tee admission".to_string()),
-                    });
+                    return Err(ctx.memory_budget.backstop_refusal(
+                        name,
+                        clinker_plan::runtime_error::MemorySurface::ParkedCrossRegionRows {
+                            from: name.to_string(),
+                            to: current_dag.graph[succ_idx].name().to_string(),
+                        },
+                    ));
                 }
                 ctx.region_input_buffers
                     .entry((active_body, edge_id))

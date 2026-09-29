@@ -445,6 +445,43 @@ impl std::fmt::Display for CombineError {
     }
 }
 
+impl CombineError {
+    /// This failure of `node`'s hash build as the run's error.
+    ///
+    /// A build whose table alone outgrew the limit is the E310 refusal of the
+    /// `used` bytes the table needed for `node`'s join build side; a build
+    /// stopped because the run as a whole was past its limit is the
+    /// backstop's E310 for the same surface. Both report from `budget`'s
+    /// ledger. A build key that failed to evaluate is the same error the
+    /// probe side's key failure is; any other build failure is an internal
+    /// error naming `node`.
+    pub(crate) fn into_build_error(
+        self,
+        node: &str,
+        budget: &MemoryArbitrator,
+    ) -> clinker_plan::error::PipelineError {
+        use clinker_plan::error::PipelineError;
+        use clinker_plan::runtime_error::MemorySurface;
+        match self {
+            CombineError::MemoryLimitExceeded { used, limit } if used > limit => {
+                budget.refusal(node, MemorySurface::JoinBuildSide, used)
+            }
+            CombineError::MemoryLimitExceeded { .. } => {
+                budget.backstop_refusal(node, MemorySurface::JoinBuildSide)
+            }
+            CombineError::KeyEvalFailed { source, .. } => PipelineError::Compilation {
+                transform_name: node.to_string(),
+                messages: vec![format!("combine build key eval error: {source}")],
+            },
+            other => PipelineError::Internal {
+                op: "combine",
+                node: node.to_string(),
+                detail: other.to_string(),
+            },
+        }
+    }
+}
+
 impl std::error::Error for CombineError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {

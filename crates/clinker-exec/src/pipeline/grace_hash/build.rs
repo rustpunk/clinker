@@ -1,6 +1,5 @@
 //! Build-side primitives for the grace hash join: hash-to-partition
-//! assignment, the per-partition distinct-key sketch consulted on an
-//! E310 abort, the build-record byte estimate that drives spill-victim
+//! assignment, the build-record byte estimate that drives spill-victim
 //! selection, and the byte-bounded chunk iterator the BNL fallback
 //! feeds its build side through.
 
@@ -9,23 +8,11 @@ use clinker_record::Record;
 use super::RecordOrder;
 use crate::pipeline::combine::BuildSeq;
 
-use crate::sketch::Hll;
-
 /// Maximum partition bit width. 12 bits = 4096 partitions; beyond this,
 /// per-partition overhead (file handles, postcard headers, hashbrown
 /// allocations) outweighs further skew reduction. AsterixDB and DuckDB
 /// converge on the same cap.
 pub(super) const MAX_HASH_BITS: u8 = 12;
-
-/// Per-partition distinct-key sketch carried by the grace hash join.
-///
-/// Fixed at 64 registers (≈±13% nominal error, 64 bytes per partition):
-/// this is a diagnostic-quality estimate consulted only when an E310
-/// abort fires, so the BNL fallback can report "partition 7, ~3.2M
-/// distinct keys" instead of a bare OOM. The planner-grade statistics
-/// catalog instantiates the same [`Hll`] at ≥1024 registers; the
-/// hot-path partition sketch deliberately stays small.
-pub(crate) type GraceHll = Hll<64>;
 
 // ──────────────────────────────────────────────────────────────────────────
 // PartitionAssigner

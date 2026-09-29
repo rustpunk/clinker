@@ -12,11 +12,14 @@ use super::protocol::Refusal;
 use super::reservation::{LockedLedger, ReservationState};
 use super::walk::{self, BorrowedReclaimSet, ThreadRole, VictimOutcome, WalkReclaim};
 use super::{ConsumerId, MemoryArbitrator, MemoryConsumer, NO_WALK_REQUESTER};
+use clinker_format::FormatError;
+use clinker_format::preparation::{ResourceError, ResourceErrorKind};
 use clinker_plan::error::PipelineError;
 use clinker_plan::runtime_error::{
-    ConsumerLabel, HolderReport, HolderState, MemoryShortfallReport, ReclaimReport,
+    ConsumerLabel, HolderReport, HolderState, MemoryShortfallReport, MemorySurface, ReclaimReport,
     suggested_limit_floor,
 };
+use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -215,104 +218,135 @@ impl Shortfall {
     /// or did not run at all (the thread that asked cannot spill the walk's
     /// state).
     pub fn into_report(self, arbitrator: &MemoryArbitrator) -> Box<MemoryShortfallReport> {
-        let snapshot = self.snapshot;
-        let registered = arbitrator.consumers.load();
-        let consumer = |id: ConsumerId| {
-            registered
-                .iter()
-                .find(|(candidate, _)| *candidate == id)
-                .map(|(_, consumer)| consumer)
-        };
-        let spilled_what_it_could = |id: ConsumerId| {
-            self.round.as_ref().is_some_and(|round| {
-                round
-                    .asked
-                    .iter()
-                    .any(|victim| victim.consumer == id && !victim.busy)
-            })
-        };
-
-        let mut unspillable_bytes = snapshot.unattributed;
-        let mut holders = Vec::with_capacity(snapshot.holders.len());
-        for holder in &snapshot.holders {
-            let registered = consumer(holder.consumer);
-            let spillable = registered.is_some_and(|consumer| {
-                !consumer.can_back_pressure() && consumer.reclaimable_bytes() > 0
-            });
-            if !spillable {
-                unspillable_bytes = unspillable_bytes.saturating_add(holder.charged);
-            }
-            let state = if Some(holder.consumer) == snapshot.requester {
-                HolderState::Requester
-            } else if registered
-                .is_some_and(|consumer| consumer.can_back_pressure() && consumer.is_paused())
-            {
-                HolderState::PausedSource
-            } else if !spillable {
-                HolderState::CannotSpill
-            } else if spilled_what_it_could(holder.consumer) {
-                HolderState::AtFloor
-            } else {
-                HolderState::InUse
-            };
-            holders.push(HolderReport {
-                node: holder.label.node.clone(),
-                surface: holder.label.surface.clone(),
-                bytes: holder.charged,
-                state,
-            });
-        }
-        let others = holders.split_off(holders.len().min(MemoryShortfallReport::LISTED_HOLDERS));
-        let other_holders_bytes = others
-            .iter()
-            .fold(0u64, |sum, holder| sum.saturating_add(holder.bytes));
-
-        let reclaim = self.round.map(|round| {
-            let paused: Vec<ConsumerId> = registered
-                .iter()
-                .filter(|(_, consumer)| consumer.can_back_pressure() && consumer.is_paused())
-                .map(|(id, _)| *id)
-                .collect();
-            let sources_paused = if paused.is_empty() {
-                Vec::new()
-            } else {
-                // Labels never change for a consumer id, so this second
-                // lock reads names only, never a figure.
-                let ledger = arbitrator.admission.ledger.lock();
-                paused
-                    .iter()
-                    .filter_map(|id| ledger.label(id.0).map(|label| label.node.clone()))
-                    .collect()
-            };
-            ReclaimReport {
-                holders_asked: round
-                    .asked
-                    .into_iter()
-                    .filter_map(|victim| victim.node)
-                    .collect(),
-                bytes_freed: round.freed,
-                sources_paused,
-            }
-        });
-
-        let requested = snapshot.requested;
-        Box::new(MemoryShortfallReport {
-            requester: snapshot.requester_label.map(|label| *label),
-            requested_bytes: requested,
-            limit_bytes: snapshot.limit,
-            charged_bytes: snapshot.charged,
-            private_bytes: crate::pipeline::sysstats::private_memory_bytes(),
-            holders,
-            other_holders_count: u32::try_from(others.len()).unwrap_or(u32::MAX),
-            other_holders_bytes,
-            unattributed_bytes: snapshot.unattributed,
-            unspillable_bytes,
-            reclaim,
-            suggested_limit_bytes: suggested_limit_floor(snapshot.charged, requested),
-            oversized: self.oversized
-                || requested.saturating_add(unspillable_bytes) > snapshot.limit,
-        })
+        let mut snapshot = self.snapshot;
+        let requester = snapshot.requester_label.take().map(|label| *label);
+        build_report(
+            arbitrator,
+            snapshot,
+            requester,
+            self.round.map(|round| *round),
+            self.oversized,
+        )
     }
+}
+
+/// The E310 report for a refusal whose ledger reading is `snapshot`, naming
+/// `requester` as the node that asked, with the reclaim round that preceded
+/// it when there was one. `oversized` is the ledger's own verdict that no
+/// release could make the request fit; the report also calls a request
+/// oversized when it does not fit beside what cannot spill.
+///
+/// A holder is the requester when it is the snapshot's requesting consumer
+/// or, for a refusal made in no consumer's name, when its label is
+/// `requester`. See [`Shortfall::into_report`] for the other holder states
+/// and what is read after the snapshot.
+fn build_report(
+    arbitrator: &MemoryArbitrator,
+    snapshot: LedgerSnapshot,
+    requester: Option<ConsumerLabel>,
+    round: Option<RoundRecord>,
+    oversized: bool,
+) -> Box<MemoryShortfallReport> {
+    let registered = arbitrator.consumers.load();
+    let consumer = |id: ConsumerId| {
+        registered
+            .iter()
+            .find(|(candidate, _)| *candidate == id)
+            .map(|(_, consumer)| consumer)
+    };
+    let spilled_what_it_could = |id: ConsumerId| {
+        round.as_ref().is_some_and(|round| {
+            round
+                .asked
+                .iter()
+                .any(|victim| victim.consumer == id && !victim.busy)
+        })
+    };
+    let is_requester = |holder: &HolderSnapshot| match snapshot.requester {
+        Some(id) => holder.consumer == id,
+        None => requester.as_ref() == Some(&holder.label),
+    };
+
+    let mut unspillable_bytes = snapshot.unattributed;
+    let mut holders = Vec::with_capacity(snapshot.holders.len());
+    for holder in &snapshot.holders {
+        let registered = consumer(holder.consumer);
+        let spillable = registered.is_some_and(|consumer| {
+            !consumer.can_back_pressure() && consumer.reclaimable_bytes() > 0
+        });
+        if !spillable {
+            unspillable_bytes = unspillable_bytes.saturating_add(holder.charged);
+        }
+        let state = if is_requester(holder) {
+            HolderState::Requester
+        } else if registered
+            .is_some_and(|consumer| consumer.can_back_pressure() && consumer.is_paused())
+        {
+            HolderState::PausedSource
+        } else if !spillable {
+            HolderState::CannotSpill
+        } else if spilled_what_it_could(holder.consumer) {
+            HolderState::AtFloor
+        } else {
+            HolderState::InUse
+        };
+        holders.push(HolderReport {
+            node: holder.label.node.clone(),
+            surface: holder.label.surface.clone(),
+            bytes: holder.charged,
+            state,
+        });
+    }
+    let others = holders.split_off(holders.len().min(MemoryShortfallReport::LISTED_HOLDERS));
+    let other_holders_bytes = others
+        .iter()
+        .fold(0u64, |sum, holder| sum.saturating_add(holder.bytes));
+
+    let reclaim = round.map(|round| {
+        let paused: Vec<ConsumerId> = registered
+            .iter()
+            .filter(|(_, consumer)| consumer.can_back_pressure() && consumer.is_paused())
+            .map(|(id, _)| *id)
+            .collect();
+        let sources_paused = if paused.is_empty() {
+            Vec::new()
+        } else {
+            // Labels never change for a consumer id, so this second
+            // lock reads names only, never a figure.
+            let ledger = arbitrator.admission.ledger.lock();
+            paused
+                .iter()
+                .filter_map(|id| ledger.label(id.0).map(|label| label.node.clone()))
+                .collect()
+        };
+        ReclaimReport {
+            holders_asked: round
+                .asked
+                .into_iter()
+                .filter_map(|victim| victim.node)
+                .collect(),
+            bytes_freed: round.freed,
+            sources_paused,
+        }
+    });
+
+    let requested = snapshot.requested;
+    Box::new(MemoryShortfallReport {
+        requester,
+        group_first_row: None,
+        requested_bytes: requested,
+        limit_bytes: snapshot.limit,
+        charged_bytes: snapshot.charged,
+        private_bytes: crate::pipeline::sysstats::private_memory_bytes(),
+        holders,
+        other_holders_count: u32::try_from(others.len()).unwrap_or(u32::MAX),
+        other_holders_bytes,
+        unattributed_bytes: snapshot.unattributed,
+        unspillable_bytes,
+        reclaim,
+        suggested_limit_bytes: suggested_limit_floor(snapshot.charged, requested),
+        oversized: oversized || requested.saturating_add(unspillable_bytes) > snapshot.limit,
+    })
 }
 
 impl std::fmt::Display for Shortfall {
@@ -700,6 +734,52 @@ impl MemoryArbitrator {
     /// of `requested` bytes by `requester` would report them.
     pub fn ledger_snapshot(&self, requested: u64, requester: Requester) -> LedgerSnapshot {
         snapshot(&self.admission.ledger.lock(), requested, requester.consumer)
+    }
+
+    /// The E310 report for a refusal decided outside the ledger: `node`
+    /// needed `requested` more bytes for `surface` and the site that checked
+    /// is refusing them.
+    ///
+    /// The figures are one ledger reading taken now, as a shortfall's would
+    /// be; `requested` is the bytes the site was about to add (for a
+    /// backstop that fires after the fact, what it found over the limit).
+    /// No reclaim round preceded the refusal, so the report says none was
+    /// attempted. The request is oversized when it is larger than the limit
+    /// on its own, or than what the limit leaves beside what cannot spill.
+    pub fn refusal_report(
+        &self,
+        node: &str,
+        surface: MemorySurface,
+        requested: u64,
+    ) -> Box<MemoryShortfallReport> {
+        let snapshot = self.ledger_snapshot(requested, Requester::governed());
+        let oversized = requested > snapshot.limit;
+        build_report(
+            self,
+            snapshot,
+            Some(ConsumerLabel {
+                node: node.to_string(),
+                surface,
+            }),
+            None,
+            oversized,
+        )
+    }
+
+    /// [`Self::refusal_report`] as the run-ending E310.
+    pub fn refusal(&self, node: &str, surface: MemorySurface, requested: u64) -> PipelineError {
+        PipelineError::MemoryBudgetExceeded {
+            report: self.refusal_report(node, surface, requested),
+        }
+    }
+
+    /// The E310 for a backstop that found the run already past its limit
+    /// ([`Self::should_abort`] true) while `node` held `surface`: the request
+    /// it reports is how far past the limit the larger of peak RSS and the
+    /// charged total stands.
+    pub fn backstop_refusal(&self, node: &str, surface: MemorySurface) -> PipelineError {
+        let used = self.peak_rss().unwrap_or(0).max(self.sum_consumer_usage());
+        self.refusal(node, surface, used.saturating_sub(self.hard_limit()))
     }
 
     /// High-water mark of `id`'s handle bytes plus the bytes granted in its
@@ -1176,6 +1256,104 @@ impl MemoryArbitrator {
     }
 }
 
+/// The report of the last governed allocation the ledger refused on this
+/// thread, with the figures its admission error carried.
+struct RecordedRefusal {
+    requested: usize,
+    available: usize,
+    report: Box<MemoryShortfallReport>,
+}
+
+thread_local! {
+    /// One per thread: a refusal overwrites it and the thread's next granted
+    /// governed allocation clears it, so it never describes a refusal the
+    /// thread recovered from, and never another thread's.
+    static LAST_REFUSAL: RefCell<Option<RecordedRefusal>> = const { RefCell::new(None) };
+}
+
+/// Keep `report` as this thread's last refused governed allocation, which
+/// failed with an admission error carrying `requested` and `available`.
+pub(crate) fn record_governed_refusal(
+    requested: usize,
+    available: usize,
+    report: Box<MemoryShortfallReport>,
+) {
+    LAST_REFUSAL.with(|slot| {
+        *slot.borrow_mut() = Some(RecordedRefusal {
+            requested,
+            available,
+            report,
+        });
+    });
+}
+
+/// Forget this thread's last refused governed allocation: one was granted
+/// since, so any earlier refusal was recovered from.
+pub(crate) fn clear_governed_refusal() {
+    LAST_REFUSAL.with(|slot| {
+        if slot.borrow().is_some() {
+            *slot.borrow_mut() = None;
+        }
+    });
+}
+
+/// This thread's report for the governed refusal `error` describes, taken
+/// out of the thread's slot: returned only when the slot's figures are
+/// `error`'s own, so an admission error raised anywhere else (a different
+/// request, another thread's refusal) never borrows it.
+pub(crate) fn take_refusal_report_for(error: &ResourceError) -> Option<Box<MemoryShortfallReport>> {
+    if error.kind != ResourceErrorKind::Budget {
+        return None;
+    }
+    LAST_REFUSAL.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let matches = slot.as_ref().is_some_and(|recorded| {
+            recorded.requested == error.requested && recorded.available == error.available
+        });
+        if matches {
+            slot.take().map(|recorded| recorded.report)
+        } else {
+            None
+        }
+    })
+}
+
+/// `error` as the E310 it stands for when it is a governed allocation the
+/// ledger refused on this thread; otherwise `error` unchanged.
+///
+/// A reader, writer or worker that met the refusal propagates it as an
+/// admission error (`Format(Resource(Budget))`); this recovers the report
+/// the refusal recorded. `requester` names the node and surface of the
+/// thread's work, stamped onto a report whose refusal named none (a request
+/// made for the run as a whole); a report that already names its requester
+/// keeps it. Called on the thread that was refused, where its work returns.
+pub(crate) fn governed_refusal_error(
+    error: PipelineError,
+    requester: Option<(&str, MemorySurface)>,
+) -> PipelineError {
+    let PipelineError::Format(FormatError::Resource(resource)) = &error else {
+        return error;
+    };
+    let Some(mut report) = take_refusal_report_for(resource) else {
+        return error;
+    };
+    if let Some((node, surface)) = requester {
+        report.attribute_if_unnamed(node, surface);
+    }
+    PipelineError::MemoryBudgetExceeded { report }
+}
+
+/// [`governed_refusal_error`] over a thread's result, naming `node` and
+/// `surface` as the requester of an unnamed refusal. Every thread wrapper
+/// that runs a node's work off the walk calls it where the work returns.
+pub(crate) fn convert_governed_refusal<T>(
+    result: Result<T, PipelineError>,
+    node: &str,
+    surface: MemorySurface,
+) -> Result<T, PipelineError> {
+    result.map_err(|error| governed_refusal_error(error, Some((node, surface))))
+}
+
 /// Labelled holders placed directly on the ledger, beside governed grants,
 /// without registering a consumer.
 #[cfg(test)]
@@ -1287,6 +1465,7 @@ mod tests {
             MemorySurface::DeadLetteredRowSet,
             MemorySurface::DecisionState,
             MemorySurface::ReshapeGroups,
+            MemorySurface::CullGroups,
             MemorySurface::WindowIndex,
             MemorySurface::ScanMaterialization,
             MemorySurface::OutputStaging,
@@ -1309,6 +1488,7 @@ mod tests {
                 | MemorySurface::DeadLetteredRowSet
                 | MemorySurface::DecisionState
                 | MemorySurface::ReshapeGroups
+                | MemorySurface::CullGroups
                 | MemorySurface::WindowIndex
                 | MemorySurface::ScanMaterialization
                 | MemorySurface::OutputStaging
@@ -1318,6 +1498,83 @@ mod tests {
             }
         }
         surfaces
+    }
+
+    /// `error` as the admission error a reader or writer propagates.
+    fn admission_error(error: ResourceError) -> PipelineError {
+        PipelineError::Format(FormatError::Resource(error))
+    }
+
+    /// The report `error` converts to on this thread, if it converts.
+    fn converted(error: ResourceError) -> Option<Box<MemoryShortfallReport>> {
+        match governed_refusal_error(admission_error(error), None) {
+            PipelineError::MemoryBudgetExceeded { report } => Some(report),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn recovered_then_fatal_refusal_reports_the_fatal_one() {
+        let arbitrator = arbitrator(64 * KIB);
+        // Refused, then recovered from: a smaller retry is granted.
+        let recovered = arbitrator
+            .admit_writer_memory((100 * KIB) as usize, governed())
+            .expect_err("100 KiB does not fit a 64 KiB limit");
+        arbitrator
+            .admit_writer_memory(KIB as usize, governed())
+            .expect("the smaller retry fits");
+        // A later request of another size is refused and ends the work.
+        let fatal = arbitrator
+            .admit_writer_memory((200 * KIB) as usize, governed())
+            .expect_err("200 KiB does not fit a 64 KiB limit");
+
+        assert!(
+            converted(recovered).is_none(),
+            "a refusal the thread recovered from is never reported"
+        );
+        let report = converted(fatal).expect("the fatal refusal converts to its E310");
+        assert_eq!(report.requested_bytes, 200 * KIB);
+        assert_eq!(
+            report.charged_bytes, KIB,
+            "the report is the fatal refusal's reading"
+        );
+        assert!(
+            converted(fatal).is_none(),
+            "a report is taken once, by the wrapper the refusal ends"
+        );
+        arbitrator
+            .admission
+            .release_writer_memory(KIB as usize, None);
+    }
+
+    #[test]
+    fn refusal_on_one_thread_is_not_reported_for_another() {
+        let arbitrator = Arc::new(arbitrator(64 * KIB));
+        let refused_here = arbitrator
+            .admit_writer_memory((100 * KIB) as usize, governed())
+            .expect_err("100 KiB does not fit a 64 KiB limit");
+        // Another thread records a later refusal of its own, and cannot take
+        // this thread's report.
+        let other = Arc::clone(&arbitrator);
+        let there = std::thread::spawn(move || {
+            let refused_there = other
+                .admit_writer_memory((80 * KIB) as usize, governed())
+                .expect_err("80 KiB does not fit a 64 KiB limit");
+            let stolen = converted(refused_here).is_some();
+            let own = converted(refused_there).map(|report| report.requested_bytes);
+            (stolen, own)
+        })
+        .join()
+        .expect("the other thread finishes");
+        assert_eq!(
+            there,
+            (false, Some(80 * KIB)),
+            "the other thread reports only its own refusal"
+        );
+
+        let report =
+            converted(refused_here).expect("this thread's refusal converts with its own report");
+        assert_eq!(report.requested_bytes, 100 * KIB);
     }
 
     #[test]

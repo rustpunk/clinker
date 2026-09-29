@@ -183,8 +183,7 @@ fn relaxed_aggregate_seeds_a_deferred_region_with_downstream_members() {
 }
 
 /// Whole-process RSS over the hard limit aborts a Combine that lives in
-/// a deferred region with the `BudgetCategory::Arena` admission-failure
-/// shape.
+/// a deferred region with the E310 its join build backstop reports.
 ///
 /// Sibling to [`memory_budget_overflow_on_deferred_buffer_raises_e310`],
 /// which drives the per-arena logical charge with a tight byte budget.
@@ -348,20 +347,22 @@ nodes:
     .expect_err("peak RSS above the hard limit must abort the deferred-region Combine");
 
     match err {
-        clinker_plan::error::PipelineError::MemoryBudgetExceeded {
-            source: clinker_plan::BudgetCategory::Arena,
-            used,
-            limit,
-            ..
-        } => {
+        clinker_plan::error::PipelineError::MemoryBudgetExceeded { report } => {
+            assert_eq!(
+                report.requester.as_ref().map(|label| &label.surface),
+                Some(&clinker_plan::runtime_error::MemorySurface::JoinBuildSide),
+                "the Combine's build backstop reports its join build side"
+            );
             assert!(
-                used > limit,
-                "reported used ({used}) must exceed the hard limit ({limit}) at abort",
+                report.requested_bytes > 0,
+                "the reported overshoot ({}) must put the run past the hard limit ({}) at abort",
+                report.requested_bytes,
+                report.limit_bytes,
             );
         }
         other => panic!(
             "RSS overshoot in a deferred-region Combine must carry \
-             MemoryBudgetExceeded (BudgetCategory::Arena); got: {other:?}"
+             MemoryBudgetExceeded for its join state; got: {other:?}"
         ),
     }
 }

@@ -273,7 +273,10 @@ fn refused_shared_read_leaves_the_slot_and_its_reader_count_unchanged() {
     match shared_node_buffer_read(&set, key.clone(), READER)
         .and_then(|input| input.into_materialized_parts(&arbitrator, READER))
     {
-        Err(PipelineError::MemoryBudgetExceeded { node, .. }) => assert_eq!(node, READER),
+        Err(PipelineError::MemoryBudgetExceeded { report }) => assert_eq!(
+            report.requester.as_ref().map(|label| label.node.as_str()),
+            Some(READER)
+        ),
         Ok(_) => panic!("nothing can free the copy, so the read must be refused"),
         Err(other) => panic!("expected the reader's E310; got {other:?}"),
     }

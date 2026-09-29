@@ -341,6 +341,56 @@ run wrote.
 - Under a key, `dlq_count`, `records_dlq` and the `dlq.max_rate` numerators
   therefore rise to the counts the same failures give without a key, plus
   the rows the failing groups condemn.
+### Changed — memory-limit failures (E310) name what holds memory and a limit that works
+
+**Breaking diagnostic and Rust API change.** An E310 now reports the request
+the engine refused, read from one account of the run's charged memory at the
+refusal:
+
+```
+E310 totals: needed 2.0 MiB more for group state, but memory.limit 8.0 MiB is fully held and nothing more could be spilled
+  charged 7.3 MiB of 8.0 MiB (91%) · private memory 200.0 MiB
+  largest holders:
+    enrich  join build side  3.5 MiB  cannot spill
+    ...
+  reclaim: none attempted
+  fix: raise the limit to at least 10M — this request needed 9.3 MiB; later stages may need more
+    pipeline:
+      memory: { limit: "10M" }
+    or: --memory-limit 10M
+  remedy: enrich's join build side holds 3.5 MiB and cannot be spilled; see "Join build side" in clinker explain --code E310
+```
+
+- The headline keeps the greppable `E310 <node>:` prefix and names what the
+  memory was for in pipeline terms. A request larger than the limit on its
+  own, or than the limit leaves beside state that cannot spill, says
+  `one request ... needs N, more than memory.limit L can hold — spilling
+  cannot help`.
+- Below it: the charged total against the limit, the five largest holders
+  and why each still held its memory, what the reclaim round asked and
+  freed, the smallest limit that would have granted the request in YAML
+  and `--memory-limit` form, and a remedy keyed to the largest holder that
+  cannot spill.
+- A Reshape or Cull group too large to hold whole is identified by where its
+  first row came from (`group: the one whose first row is row 4812 of source
+  orders`, the row number the dead-letter output writes in
+  `_cxl_dlq_source_row`). The report no longer prints the group's key: it
+  names nodes, surfaces and byte counts only, never a record value.
+- A Source, writer or worker whose own allocation the memory limit refuses
+  now fails the run with this E310, naming that node, instead of an
+  I/O-shaped budget error.
+- A Combine build key that fails to evaluate now fails with the same error a
+  probe key does, not E310.
+
+`clinker explain --code E310` describes each part and has a section per kind
+of state; Cull's held group rows (`rows held for Cull groups`) now have their
+own section, apart from its per-group decisions (`decision state`).
+
+For Rust callers, `PipelineError::MemoryBudgetExceeded` now carries one
+`report: Box<MemoryShortfallReport>` in place of `node`, `used`, `limit`,
+`source` and `detail`. `clinker_plan::runtime_error::BudgetCategory` and its
+`clinker_plan::BudgetCategory` re-export are removed: match on
+`report.requester` (the node and its `MemorySurface`) instead.
 
 ### Changed — records group by exact numeric value, and NaN is one group
 

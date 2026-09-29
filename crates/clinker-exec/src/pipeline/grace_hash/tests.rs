@@ -2,10 +2,8 @@
 //! spill/reload lifecycle including the block-nested-loop fallback.
 //! Driven through both the public `execute_combine_grace_hash` entry
 //! point and a hand-built `ReloadContext` harness for the BNL-only paths.
-//! The distinct-key sketch's accuracy bounds are covered by the shared
-//! `crate::sketch` tests.
 
-use super::build::{GraceHll, MAX_HASH_BITS};
+use super::build::MAX_HASH_BITS;
 use super::spill::{
     BnlStats, PROBE_BUFFER_RESERVATION, RESULT_BATCH_SIZE, SKEW_REDUCTION_THRESHOLD, bnl_fallback,
 };
@@ -1738,8 +1736,8 @@ fn with_reload_context<R>(h: &BnlHarness, f: impl FnOnce(&ReloadContext<'_>) -> 
 }
 
 /// Spill `build_records` to a single file under partition_id 0 and
-/// `probe_records` to a sibling probe file. Populates the
-/// returned [`SpilledPartition`] and feeds the HLL.
+/// `probe_records` to a sibling probe file, and describe them as the
+/// returned [`SpilledPartition`].
 fn spill_for_bnl(
     h: &BnlHarness,
     build_records: &[Record],
@@ -1748,15 +1746,8 @@ fn spill_for_bnl(
     hash_bits: u8,
 ) -> SpilledPartition {
     let mut bw = GraceSpillWriter::new(h.spill_dir.path(), hash_bits, partition_id, true).unwrap();
-    let mut sketch = GraceHll::new();
     for (index, r) in build_records.iter().enumerate() {
         bw.write_record(r, build_row(index), fresh_seq()).unwrap();
-        // Feed the HLL via the build-side hash of the join key.
-        let stable = cxl::eval::StableEvalContext::test_default();
-        let source_file: Arc<str> = Arc::from("test.csv");
-        let ctx = EvalContext::test_with_file(&stable, &source_file, 0);
-        let keys = h.build_extractor.extract(&ctx, r).unwrap();
-        sketch.add(hash_composite_key(&keys, &h.hash_state));
     }
     let (bpath, _b_written) = bw.finish().unwrap();
     let mut probe_files = Vec::new();
@@ -1780,7 +1771,6 @@ fn spill_for_bnl(
         probe_files,
         build_count: build_records.len() as u64,
         hash_bits,
-        distinct_sketch: sketch,
     }
 }
 
@@ -2172,10 +2162,9 @@ fn test_bnl_result_batching() {
     );
 }
 
-/// Hard-gate 5: hard-limit abort surfaces E310 with the partition
-/// index AND a positive HLL distinct-key estimate. The host RSS
-/// trivially exceeds a 1-byte limit, so `should_abort` returns true
-/// on the very first poll inside BNL.
+/// Hard-gate 5: hard-limit abort surfaces E310 for the combine's join
+/// build side. The host RSS trivially exceeds a 1-byte limit, so
+/// `should_abort` returns true on the very first poll inside BNL.
 #[test]
 fn test_e310_hard_limit_abort() {
     if crate::pipeline::memory::rss_bytes().is_none() {
@@ -2228,19 +2217,16 @@ fn test_e310_hard_limit_abort() {
         .expect_err("1-byte hard limit must abort BNL")
     });
 
-    let est = sp.distinct_sketch.estimate();
-    assert!(est > 0, "HLL must report a positive distinct estimate");
     match &err {
-        PipelineError::MemoryBudgetExceeded { source, detail, .. } => {
-            assert_eq!(*source, BudgetCategory::Arena);
-            let detail = detail.as_deref().unwrap_or("");
-            assert!(
-                detail.contains("partition 7"),
-                "detail must include partition_id; got {detail:?}"
+        PipelineError::MemoryBudgetExceeded { report } => {
+            assert_eq!(
+                report.requester.as_ref().map(|label| &label.surface),
+                Some(&clinker_plan::runtime_error::MemorySurface::JoinBuildSide),
+                "the abort names the combine's join build side: {report:?}"
             );
             assert!(
-                detail.contains(&est.to_string()),
-                "detail must include approx distinct count {est}; got {detail:?}"
+                report.requested_bytes > 0,
+                "the backstop reports how far past the limit the run was: {report:?}"
             );
         }
         other => {

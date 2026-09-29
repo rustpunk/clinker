@@ -529,9 +529,8 @@ impl DocumentDlqState {
     ///
     /// # Errors
     ///
-    /// [`PipelineError::MemoryBudgetExceeded`] with
-    /// [`clinker_plan::BudgetCategory::Arena`] when the growth would pass
-    /// the hard limit with every held row on disk; a flush's spill errors,
+    /// [`PipelineError::MemoryBudgetExceeded`] when the growth would pass the
+    /// hard limit with every held row on disk; a flush's spill errors,
     /// including E320; [`PipelineError::Internal`] when `key` is not a
     /// failed document.
     fn admit_emitted(
@@ -564,21 +563,11 @@ impl DocumentDlqState {
             self.held.flush_all(&self.arbitrator, node)?;
         }
         if !fits(&self.arbitrator) {
-            use clinker_core_types::QuoteName;
-            let charged_pressure = self.arbitrator.sum_consumer_usage();
-            let projected_pressure = charged_pressure.saturating_add(growth);
-            // The document is named as every diagnostic names one. The byte
-            // figures stay raw counts, as the other E310 details write them.
-            return Err(PipelineError::MemoryBudgetExceeded {
-                node: node.to_string(),
-                used: projected_pressure,
-                limit: hard_limit,
-                source: clinker_plan::BudgetCategory::Arena,
-                detail: Some(format!(
-                    "the document dead-letter ledger of {quoted} projected {projected_pressure} bytes from charged pressure {charged_pressure} plus {growth} bytes for one more row, with every held row already on disk",
-                    quoted = key.quoted_name(),
-                )),
-            });
+            return Err(self.arbitrator.refusal(
+                node,
+                clinker_plan::runtime_error::MemorySurface::DeadLetteredRowSet,
+                growth,
+            ));
         }
         failed.emitted.record(row, &admission);
         self.handle.add_bytes(growth);
@@ -652,7 +641,7 @@ impl DocumentDlqState {
     ///
     /// # Errors
     ///
-    /// [`PipelineError::MemoryBudgetExceeded`] (E310, `Arena`) when the frame
+    /// [`PipelineError::MemoryBudgetExceeded`] (E310) when the frame
     /// does not fit even with every held row on disk; nothing is held and the
     /// document is not marked. A flush's spill errors, including E320.
     fn hold(
@@ -690,7 +679,7 @@ impl DocumentDlqState {
             frame.len(),
             extra,
             node,
-            "the held dead-letter rows of the failed documents",
+            clinker_plan::runtime_error::MemorySurface::HeldFailingRows,
         )?;
         if first {
             self.insert_failed(Arc::clone(&key), row.failed_at, node);
@@ -1242,7 +1231,7 @@ pub(crate) fn mark_structural_reject_if_present(
 /// # Errors
 ///
 /// [`PipelineError::Internal`] when the row cannot be encoded;
-/// [`PipelineError::MemoryBudgetExceeded`] (E310, `Arena`) naming `node`
+/// [`PipelineError::MemoryBudgetExceeded`] (E310) naming `node`
 /// when the held row does not fit under the hard limit even with every held
 /// row on disk; a spill error, including E320, from a flush.
 fn mark_document_failed(
@@ -2625,20 +2614,16 @@ mod tests {
             }
         }
         match refused.expect("scattered rows reach the 1 KiB hard limit") {
-            PipelineError::MemoryBudgetExceeded {
-                node,
-                limit,
-                source,
-                detail,
-                ..
-            } => {
-                assert_eq!(node, "orders_out");
-                assert_eq!(limit, 1024);
-                assert_eq!(source, clinker_plan::BudgetCategory::Arena);
-                assert!(
-                    detail.is_some_and(|d| d.contains("dead-letter ledger")),
-                    "the detail names the ledger"
+            PipelineError::MemoryBudgetExceeded { report } => {
+                assert_eq!(
+                    report.requester,
+                    Some(clinker_plan::runtime_error::ConsumerLabel {
+                        node: "orders_out".to_string(),
+                        surface: clinker_plan::runtime_error::MemorySurface::DeadLetteredRowSet,
+                    }),
+                    "the report names the node and the ledger"
                 );
+                assert_eq!(report.limit_bytes, 1024);
             }
             other => panic!("expected E310, got {other:?}"),
         }
@@ -3073,17 +3058,14 @@ mod tests {
             .set_limit(charged + FAILED_DOCUMENT_BYTES / 2)
             .expect("limit");
         match hold_row(&mut state, &second, 2) {
-            Err(PipelineError::MemoryBudgetExceeded {
-                node,
-                source,
-                detail,
-                ..
-            }) => {
-                assert_eq!(node, "validate");
-                assert_eq!(source, clinker_plan::BudgetCategory::Arena);
-                assert!(
-                    detail.is_some_and(|d| d.contains("held dead-letter rows")),
-                    "the detail names the held rows"
+            Err(PipelineError::MemoryBudgetExceeded { report }) => {
+                assert_eq!(
+                    report.requester,
+                    Some(clinker_plan::runtime_error::ConsumerLabel {
+                        node: "validate".to_string(),
+                        surface: clinker_plan::runtime_error::MemorySurface::HeldFailingRows,
+                    }),
+                    "the report names the node and the held rows"
                 );
             }
             other => panic!("expected E310, got {other:?}"),

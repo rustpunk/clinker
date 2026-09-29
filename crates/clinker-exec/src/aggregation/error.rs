@@ -154,12 +154,34 @@ pub enum HashAggError {
     },
 }
 
+impl HashAggError {
+    /// This error of the Aggregate `node` as the run's error. An oversized
+    /// buffered row is the E310 refusal of the bytes that one row needed for
+    /// the Aggregate's group state, reported from `budget`'s ledger: no spill
+    /// can hold a row larger than the limit. Every other error converts as
+    /// `From<HashAggError>` does.
+    pub(crate) fn into_pipeline_error(
+        self,
+        node: &str,
+        budget: &crate::pipeline::memory::MemoryArbitrator,
+    ) -> PipelineError {
+        match self {
+            HashAggError::OversizedRow { row_charge, .. } => budget.refusal(
+                node,
+                clinker_plan::runtime_error::MemorySurface::GroupState,
+                row_charge as u64,
+            ),
+            other => other.into(),
+        }
+    }
+}
+
 /// Map a `HashAggError` to a `PipelineError` for the executor dispatch
 /// arm. Accumulator-finalize errors get a dedicated typed variant; a
 /// mid-run spill-directory fault maps to `PipelineError::Spill` so it
 /// renders with the same `DirUnavailable` diagnostic the node-buffer and
-/// sort paths use; an oversized single buffered row maps to
-/// `PipelineError::MemoryBudgetExceeded` (E310); a spill-cap breach maps to
+/// sort paths use; an oversized single buffered row is converted by
+/// [`HashAggError::into_pipeline_error`] instead; a spill-cap breach maps to
 /// `PipelineError::SpillCapExceeded` (E320); the remaining cases are wrapped
 /// in `PipelineError::Eval` (data errors) or `PipelineError::Internal`
 /// (engine bugs / unsupported residuals).
@@ -212,22 +234,15 @@ impl From<HashAggError> for PipelineError {
                     "internal Clinker bug — LoserTree produced out-of-order keys: prev={prev_key_debug} next={next_key_debug}"
                 ),
             },
-            // A single row larger than the whole budget is a legitimate
-            // tiny-budget / oversized-record condition, not a Clinker bug, so
-            // it maps to E310 (`MemoryBudgetExceeded`) rather than `Internal`.
-            // `node` is left empty for the dispatch arm to stamp with the
-            // aggregate node name, matching the other budget-error sites.
-            HashAggError::OversizedRow { row_charge, budget } => {
-                PipelineError::MemoryBudgetExceeded {
-                    node: String::new(),
-                    used: row_charge as u64,
-                    limit: budget as u64,
-                    source: clinker_plan::BudgetCategory::Arena,
-                    detail: Some(format!(
-                        "a single buffered aggregate row's {row_charge}-byte footprint exceeds the whole {budget}-byte memory budget; raise memory.limit"
-                    )),
-                }
-            }
+            // An oversized row is an E310, whose report needs the node's
+            // name and the run's ledger: the dispatch arm converts it through
+            // `HashAggError::into_pipeline_error`. Reaching this generic
+            // conversion means a path skipped that arm.
+            oversized @ HashAggError::OversizedRow { .. } => PipelineError::Internal {
+                op: "aggregation",
+                node: String::new(),
+                detail: format!("{oversized} reached a conversion with no memory report"),
+            },
             HashAggError::SpillCapExceeded {
                 node,
                 cap,

@@ -394,6 +394,32 @@ pub enum ArenaError {
     },
 }
 
+impl ArenaError {
+    /// This failure to build the window index rooted at `node` as the run's
+    /// error. An index that outgrew the limit is the E310 refusal of the
+    /// `used` bytes it needed, reported from `budget`'s ledger; any other
+    /// failure (which building from already-read records cannot produce) is
+    /// an internal error naming `node`.
+    pub(crate) fn into_pipeline_error(
+        self,
+        node: &str,
+        budget: &MemoryArbitrator,
+    ) -> clinker_plan::error::PipelineError {
+        match self {
+            ArenaError::MemoryBudgetExceeded { used, .. } => budget.refusal(
+                node,
+                clinker_plan::runtime_error::MemorySurface::WindowIndex,
+                used as u64,
+            ),
+            other => clinker_plan::error::PipelineError::Internal {
+                op: "window index",
+                node: node.to_string(),
+                detail: other.to_string(),
+            },
+        }
+    }
+}
+
 impl std::fmt::Display for ArenaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

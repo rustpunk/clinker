@@ -1263,60 +1263,32 @@ fn reshape_giant_group_exceeds_budget_fails_loud() {
     .expect_err("a single group larger than the budget must fail loud, not OOM");
 
     match &err {
-        PipelineError::MemoryBudgetExceeded {
-            node,
-            used,
-            limit,
-            detail,
-            ..
-        } => {
+        PipelineError::MemoryBudgetExceeded { report } => {
             assert_eq!(
-                node, "backfill",
-                "the diagnostic must name the Reshape node"
+                report.requester,
+                Some(clinker_plan::runtime_error::ConsumerLabel {
+                    node: "backfill".to_string(),
+                    surface: clinker_plan::runtime_error::MemorySurface::ReshapeGroups,
+                }),
+                "the diagnostic must name the Reshape node and its held group rows"
             );
             assert!(
-                *used > *limit,
-                "the reported group footprint ({used}) must exceed the budget ({limit})"
+                report.oversized && report.requested_bytes > report.limit_bytes,
+                "the reported group footprint ({}) must exceed the budget ({})",
+                report.requested_bytes,
+                report.limit_bytes
             );
-            let detail = detail.as_deref().expect("the overrun must carry detail");
-            // The offending group is named as the author declared it, so a
-            // 200-group input points at the one group that blew the budget.
-            assert!(
-                detail.contains("Reshape correlation group [employee_id=\"employee-00000\"]"),
-                "the detail must name the offending partition_by group: {detail}"
-            );
-            assert!(
-                detail.contains("no-cascade"),
-                "the detail must explain why one group must fit the budget: {detail}"
-            );
-            assert!(
-                detail.contains("memory.limit")
-                    && detail.contains("only fix that leaves your output unchanged"),
-                "the detail must name raising the budget as the one output-preserving fix: \
-                 {detail}"
-            );
-            // The column-dropping remedy is offered, so it must carry its
-            // consequence: this node writes every input column through, so
-            // dropped columns leave the written output as well.
-            assert!(
-                detail.contains("upstream Transform"),
-                "the detail must offer the column-drop remedy: {detail}"
-            );
-            assert!(
-                detail.contains("leave the output too"),
-                "offering the column-drop remedy requires disclosing that it changes which \
-                 columns are written: {detail}"
-            );
-            // Narrowing `partition_by` redefines the group the rules evaluate
-            // against, so recommending it would clear the abort by changing
-            // the answer. The engine warns about it instead.
-            assert!(
-                !detail.contains("add a finer `partition_by`"),
-                "the remediation must not recommend narrowing partition_by: {detail}"
-            );
-            assert!(
-                detail.contains("Narrowing `partition_by`") && detail.contains("changes results"),
-                "the detail must warn that narrowing partition_by changes results: {detail}"
+            // The offending group is named by the Source and row number of its
+            // first row, the numbering the dead-letter output uses, so a
+            // 200-group input points at the one group that blew the budget
+            // without printing its key.
+            assert_eq!(
+                report.group_first_row,
+                Some(clinker_plan::runtime_error::RowPosition {
+                    source: "plans".to_string(),
+                    row: 1,
+                }),
+                "the diagnostic must identify the offending group"
             );
         }
         other => panic!(
@@ -1325,10 +1297,62 @@ fn reshape_giant_group_exceeds_budget_fails_loud() {
         ),
     }
 
+    // The remedy the report routes to explains why one group must fit and
+    // offers only fixes whose consequence it states.
+    let page = clinker_plan::plan::explain_provenance::explain_code("E310")
+        .expect("the E310 page is registered")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let remedy = &page[page
+        .find("#### Rows held for Reshape groups")
+        .expect("the page covers Reshape groups")..];
+    let remedy = &remedy[..remedy[5..].find("#### ").map_or(remedy.len(), |at| at + 5)];
+    assert!(
+        remedy.contains("every rule sees"),
+        "the remedy must explain why one group must fit the budget: {remedy}"
+    );
+    assert!(
+        remedy.contains("memory.limit")
+            && remedy.contains("only fix that leaves your output unchanged"),
+        "the remedy must name raising the budget as the one output-preserving fix: {remedy}"
+    );
+    // The column-dropping remedy is offered, so it must carry its
+    // consequence: this node writes every input column through, so dropped
+    // columns leave the written output as well.
+    assert!(
+        remedy.contains("upstream Transform") && remedy.contains("leave the output too"),
+        "offering the column-drop remedy requires disclosing that it changes which columns \
+         are written: {remedy}"
+    );
+    // Narrowing `partition_by` redefines the group the rules evaluate
+    // against, so recommending it would clear the abort by changing the
+    // answer. The engine warns about it instead.
+    assert!(
+        !remedy.contains("add a finer `partition_by`"),
+        "the remediation must not recommend narrowing partition_by: {remedy}"
+    );
+    assert!(
+        remedy.contains("Narrowing `partition_by`") && remedy.contains("changes results"),
+        "the remedy must warn that narrowing partition_by changes results: {remedy}"
+    );
+
     let rendered = err.to_string();
     assert!(
         rendered.starts_with("E310 backfill:"),
         "the rendered diagnostic must lead with the E310 code and the node: {rendered}"
+    );
+    assert!(
+        rendered.contains("\n  group: the one whose first row is row 1 of source plans\n"),
+        "the rendered diagnostic must name the group by its first row: {rendered}"
+    );
+    assert!(
+        !rendered.contains("employee-00000"),
+        "the group's key is a record value and must not be printed: {rendered}"
+    );
+    assert!(
+        rendered.contains("see \"Rows held for Reshape groups\" in clinker explain --code E310"),
+        "the diagnostic must route to the remedy for a Reshape group: {rendered}"
     );
     assert!(
         !rendered.contains("internal error"),

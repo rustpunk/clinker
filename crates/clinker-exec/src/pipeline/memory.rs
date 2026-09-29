@@ -2309,7 +2309,6 @@ pub(crate) fn assert_spill_cap_overflow(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clinker_plan::BudgetCategory;
 
     #[test]
     fn pause_signal_fast_path_when_not_paused() {
@@ -3161,12 +3160,6 @@ mod tests {
             300,
             "an over-release for one stage cannot consume another stage's live charge"
         );
-    }
-
-    #[test]
-    fn test_budget_category_display_shape() {
-        assert_eq!(BudgetCategory::Arena.to_string(), "arena");
-        assert_eq!(BudgetCategory::NodeBuffer.to_string(), "node_buffer");
     }
 
     /// A label for a test registration, naming `node`.

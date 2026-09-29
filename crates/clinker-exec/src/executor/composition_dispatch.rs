@@ -190,8 +190,8 @@ where
     // not at the body's internal output port node name.
     //
     // Boundary admit (post-body): if `admit_node_buffer` returns
-    // `MemoryBudgetExceeded` here, it surfaces bare with `node =
-    // composition_name` — not wrapped in `CompositionBodyError`.
+    // `MemoryBudgetExceeded` here, it surfaces bare, its requester the
+    // composition name — not wrapped in `CompositionBodyError`.
     // The wrapper at `execute_composition_body`'s topo walk has
     // already returned with `Ok` by the time we reach this admit;
     // only errors from inside that walk get the wrapper. The pre-body

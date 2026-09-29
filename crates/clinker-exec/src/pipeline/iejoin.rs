@@ -63,8 +63,8 @@
 //! ordered sort buffer that spills on its own byte threshold (charging resident
 //! bytes through the handle) and the dispatcher drains it incrementally, so the
 //! O(N·M) result never sits in RAM. The pre-output abort returns a typed
-//! `PipelineError::MemoryBudgetExceeded` carrying the combine node's name and
-//! `BudgetCategory::Arena`; it is a strictly LOCAL last resort — a single
+//! `PipelineError::MemoryBudgetExceeded` naming the combine node and its join
+//! state; it is a strictly LOCAL last resort — a single
 //! block-pair plus kernel aux exceeding the hard limit even alone — so a
 //! spilling, bounded-residency run never aborts merely because process RSS sits
 //! above a tight budget. Global pressure on either axis is answered by spilling,
@@ -96,7 +96,6 @@ use crate::pipeline::combine_verdict::{
 };
 use crate::pipeline::memory::{ConsumerHandle, MemoryArbitrator};
 use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
-use clinker_plan::BudgetCategory;
 use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::combine::{DecomposedPredicate, RangeKeyType, RangeOp};
@@ -1597,9 +1596,9 @@ fn emit_pairs(
                         if peak > pair_budget.budget.hard_limit() {
                             pair_budget.consumer.set_bytes(0);
                             return Err(pre_output_budget_error(
+                                pair_budget.budget,
                                 pair_budget.name,
                                 peak,
-                                pair_budget.budget.hard_limit(),
                             ));
                         }
                     }
@@ -2103,21 +2102,22 @@ fn pwmj_numeric_state_bytes(n_left: usize, n_right: usize) -> usize {
     index_arrays.saturating_add(sort_scratch)
 }
 
-/// Build the typed pre-output budget-abort error. It is a strictly LOCAL last
-/// resort — the one loaded block-pair's resident bytes plus kernel aux exceed
-/// the hard limit even alone — gated by a direct `peak > hard_limit`
-/// comparison, never by global process pressure, because the block-band path
-/// answers pressure by spilling. It surfaces `MemoryBudgetExceeded` with `BudgetCategory::Arena`,
-/// the same shape the output-buffer poll and every other budget-checked
-/// operator surface use.
-fn pre_output_budget_error(name: &str, used: u64, limit: u64) -> PipelineError {
-    PipelineError::MemoryBudgetExceeded {
-        node: name.to_string(),
-        used,
-        limit,
-        source: BudgetCategory::Arena,
-        detail: Some("iejoin pre-output state exceeded budget".to_string()),
-    }
+/// Build the typed pre-output budget-abort error, shared by both dispatch
+/// shapes. On the equi+range path it fires when the resident partition and
+/// per-group sort arrays exceed the budget (gated through the arbitrator's
+/// `should_abort_local`, since that path holds its inputs resident with no
+/// spill). On the block-band path it is a strictly LOCAL last resort — the one
+/// loaded block-pair's resident bytes plus kernel aux exceed the hard limit
+/// even alone — gated by a direct `peak > hard_limit` comparison, never by
+/// global process pressure, because that path answers pressure by spilling.
+/// Either way it is the E310 refusal of the `peak` bytes the join's state
+/// needed, reported from `budget`'s ledger as every other refusal is.
+fn pre_output_budget_error(budget: &MemoryArbitrator, name: &str, peak: u64) -> PipelineError {
+    budget.refusal(
+        name,
+        clinker_plan::runtime_error::MemorySurface::JoinState,
+        peak,
+    )
 }
 
 fn key_eval_error(name: &str, side: &'static str, err: EvalError) -> PipelineError {
@@ -2401,7 +2401,7 @@ mod tests {
             );
             if limit < actual_peak {
                 assert!(
-                    matches!(result, Err(PipelineError::MemoryBudgetExceeded { used, limit: actual_limit, source: BudgetCategory::Arena, .. }) if used == actual_peak && actual_limit == limit)
+                    matches!(&result, Err(PipelineError::MemoryBudgetExceeded { report }) if report.requested_bytes == actual_peak && report.limit_bytes == limit && report.requester.as_ref().map(|label| &label.surface) == Some(&clinker_plan::runtime_error::MemorySurface::JoinState))
                 );
             } else {
                 result.unwrap();

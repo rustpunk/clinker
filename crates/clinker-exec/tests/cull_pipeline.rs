@@ -734,22 +734,22 @@ fn cull_decision_state_fails_loud_when_group_cardinality_exceeds_budget() {
     )
     .expect_err("an O(groups) decision state above the budget must fail loud");
     match &err {
-        clinker_plan::error::PipelineError::MemoryBudgetExceeded {
-            node,
-            used,
-            limit,
-            detail,
-            ..
-        } => {
-            assert_eq!(node, "drop_big", "the error must name the Cull node");
-            assert!(
-                *used > *limit,
-                "reported use ({used}) must exceed the limit ({limit})"
-            );
+        clinker_plan::error::PipelineError::MemoryBudgetExceeded { report } => {
             assert_eq!(
-                detail.as_deref(),
-                Some("Cull drop-decision aggregate state"),
-                "the detail must name the drop-decision state, not the raw buffer",
+                report.requester,
+                Some(clinker_plan::runtime_error::ConsumerLabel {
+                    node: "drop_big".to_string(),
+                    surface: clinker_plan::runtime_error::MemorySurface::DecisionState,
+                }),
+                "the error must name the Cull node and its drop-decision state, not the raw \
+                 buffer",
+            );
+            assert!(
+                report.charged_bytes + report.requested_bytes > report.limit_bytes,
+                "reported use ({} charged + {} requested) must exceed the limit ({})",
+                report.charged_bytes,
+                report.requested_bytes,
+                report.limit_bytes
             );
         }
         other => panic!("expected MemoryBudgetExceeded for the decision state; got {other:?}"),
@@ -796,60 +796,33 @@ fn cull_giant_group_exceeds_budget_fails_loud() {
     .expect_err("a single group larger than the budget must fail loud, not OOM");
 
     match &err {
-        clinker_plan::error::PipelineError::MemoryBudgetExceeded {
-            node,
-            used,
-            limit,
-            detail,
-            ..
-        } => {
-            assert_eq!(node, "drop_big", "the diagnostic must name the Cull node");
-            assert!(
-                *used > *limit,
-                "the reported group footprint ({used}) must exceed the budget ({limit})"
-            );
-            let detail = detail.as_deref().expect("the overrun must carry detail");
-            // Names the offending group as the author declared it — and is
-            // distinguishable from the sibling decision-state overrun, which
+        clinker_plan::error::PipelineError::MemoryBudgetExceeded { report } => {
+            // Distinguishable from the sibling decision-state overrun, which
             // shares the E310 code but reports a different surface.
-            assert!(
-                detail.contains("Cull correlation group [account=\"BIG\"]"),
-                "the detail must name the offending partition_by group: {detail}"
+            assert_eq!(
+                report.requester,
+                Some(clinker_plan::runtime_error::ConsumerLabel {
+                    node: "drop_big".to_string(),
+                    surface: clinker_plan::runtime_error::MemorySurface::CullGroups,
+                }),
+                "the diagnostic must name the Cull node and its held group rows"
             );
             assert!(
-                detail.contains("drop_group_when"),
-                "the detail must explain why one group must fit the budget: {detail}"
+                report.oversized && report.requested_bytes > report.limit_bytes,
+                "the reported group footprint ({}) must exceed the budget ({})",
+                report.requested_bytes,
+                report.limit_bytes
             );
-            assert!(
-                detail.contains("memory.limit")
-                    && detail.contains("only fix that leaves your output unchanged"),
-                "the detail must name raising the budget as the one output-preserving fix: \
-                 {detail}"
-            );
-            // The column-dropping remedy is offered, so it must carry its
-            // consequence: this node writes every input column through, so
-            // dropped columns leave the written output as well.
-            assert!(
-                detail.contains("upstream Transform"),
-                "the detail must offer the column-drop remedy: {detail}"
-            );
-            assert!(
-                detail.contains("leave the output too"),
-                "offering the column-drop remedy requires disclosing that it changes which \
-                 columns are written: {detail}"
-            );
-            // This pipeline's rule is `count(*) > 100`. Splitting `account`
-            // across a finer key drops each per-group count below the
-            // threshold, so the run would succeed and stop removing accounts
-            // it should remove. The engine must never suggest that.
-            assert!(
-                !detail.contains("add a finer `partition_by`"),
-                "the remediation must not recommend narrowing partition_by: {detail}"
-            );
-            assert!(
-                detail.contains("Narrowing `partition_by`")
-                    && detail.contains("changes which rows are removed"),
-                "the detail must warn that narrowing partition_by changes the result set: {detail}"
+            // Names the offending group by the Source and row number of its
+            // first row, the numbering the dead-letter output uses, without
+            // printing its key.
+            assert_eq!(
+                report.group_first_row,
+                Some(clinker_plan::runtime_error::RowPosition {
+                    source: "events".to_string(),
+                    row: 1,
+                }),
+                "the diagnostic must identify the offending group"
             );
         }
         other => panic!(
@@ -866,6 +839,60 @@ fn cull_giant_group_exceeds_budget_fails_loud() {
     assert!(
         !rendered.contains("internal error"),
         "a configured-limit overrun must never read as an engine bug: {rendered}"
+    );
+    assert!(
+        rendered.contains("\n  group: the one whose first row is row 1 of source events\n"),
+        "the rendered diagnostic must name the group by its first row: {rendered}"
+    );
+    assert!(
+        !rendered.contains("BIG"),
+        "the group's key is a record value and must not be printed: {rendered}"
+    );
+    assert!(
+        rendered.contains("see \"Rows held for Cull groups\" in clinker explain --code E310"),
+        "the diagnostic must route to the remedy for a Cull group: {rendered}"
+    );
+
+    // The remedy the report routes to explains why one group must fit and
+    // offers only fixes whose consequence it states.
+    let page = clinker_plan::plan::explain_provenance::explain_code("E310")
+        .expect("the E310 page is registered")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let remedy = &page[page
+        .find("#### Rows held for Cull groups")
+        .expect("the page covers Cull groups")..];
+    let remedy = &remedy[..remedy[5..].find("#### ").map_or(remedy.len(), |at| at + 5)];
+    assert!(
+        remedy.contains("drop_group_when"),
+        "the remedy must explain why one group must fit the budget: {remedy}"
+    );
+    assert!(
+        remedy.contains("memory.limit")
+            && remedy.contains("only fix that leaves your output unchanged"),
+        "the remedy must name raising the budget as the one output-preserving fix: {remedy}"
+    );
+    // The column-dropping remedy is offered, so it must carry its
+    // consequence: this node writes every input column through, so dropped
+    // columns leave the written output as well.
+    assert!(
+        remedy.contains("upstream Transform") && remedy.contains("leave the output too"),
+        "offering the column-drop remedy requires disclosing that it changes which columns \
+         are written: {remedy}"
+    );
+    // This pipeline's rule is `count(*) > 100`. Splitting `account` across a
+    // finer key drops each per-group count below the threshold, so the run
+    // would succeed and stop removing accounts it should remove. The engine
+    // must never suggest that.
+    assert!(
+        !remedy.contains("add a finer `partition_by`"),
+        "the remediation must not recommend narrowing partition_by: {remedy}"
+    );
+    assert!(
+        remedy.contains("Narrowing `partition_by`")
+            && remedy.contains("changes which rows are removed"),
+        "the remedy must warn that narrowing partition_by changes the result set: {remedy}"
     );
 }
 

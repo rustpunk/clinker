@@ -7803,16 +7803,32 @@ mod tests {
     #[test]
     fn runtime_failure_classification_distinguishes_policy_from_transience() {
         use clinker_core_types::RetryAdvice;
-        use clinker_plan::runtime_error::{BudgetCategory, SpillError};
+        use clinker_plan::runtime_error::{
+            ConsumerLabel, MemoryShortfallReport, MemorySurface, SpillError, suggested_limit_floor,
+        };
 
         let cases = [
             (
                 PipelineError::MemoryBudgetExceeded {
-                    node: "aggregate".to_owned(),
-                    used: 2,
-                    limit: 1,
-                    source: BudgetCategory::Arena,
-                    detail: None,
+                    report: Box::new(MemoryShortfallReport {
+                        requester: Some(ConsumerLabel {
+                            node: "aggregate".to_owned(),
+                            surface: MemorySurface::GroupState,
+                        }),
+                        group_first_row: None,
+                        requested_bytes: 1,
+                        limit_bytes: 1,
+                        charged_bytes: 1,
+                        private_bytes: None,
+                        holders: Vec::new(),
+                        other_holders_count: 0,
+                        other_holders_bytes: 0,
+                        unattributed_bytes: 1,
+                        unspillable_bytes: 1,
+                        reclaim: None,
+                        suggested_limit_bytes: suggested_limit_floor(1, 1),
+                        oversized: false,
+                    }),
                 },
                 "runtime.resource.memory_budget_exceeded",
                 RetryAdvice::PolicyRequired,

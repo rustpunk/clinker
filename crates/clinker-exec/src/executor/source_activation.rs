@@ -166,14 +166,22 @@ impl SourceActivationController {
                 .name(format!("clinker-body-source-{source_name}"))
                 .spawn(move || {
                     observe_source(lifecycle_telemetry.as_ref(), || {
-                        let mut outcome = ingest_source_body(
-                            body,
-                            input,
-                            stream,
-                            worker_shutdown,
-                            None,
-                            source_runtime,
-                        )?;
+                        // A governed allocation this Source was refused
+                        // ends its ingest here, on the thread that recorded
+                        // the refusal's report.
+                        let mut outcome =
+                            crate::pipeline::memory::ledger::convert_governed_refusal(
+                                ingest_source_body(
+                                    body,
+                                    input,
+                                    stream,
+                                    worker_shutdown,
+                                    None,
+                                    source_runtime,
+                                ),
+                                &logical_source_name,
+                                clinker_plan::runtime_error::MemorySurface::RowsRead,
+                            )?;
                         outcome.source_name = logical_source_name;
                         Ok(outcome)
                     })

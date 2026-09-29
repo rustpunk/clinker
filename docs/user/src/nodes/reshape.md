@@ -202,10 +202,11 @@ The on-disk spill volume Reshape produces is surfaced per stage in `clinker run 
 
 Two current limitations qualify the "identical whether spilled or resident" guarantee above:
 
-- **A single correlation group must fit the memory budget at finalize.** The no-cascade contract requires the *whole* group to be resident when its rules fire, so even though cross-group and ingest-time peaks spill to disk, the finalize reload of one group needs that group to fit. Skew slicing bounds the ingest peak, but a single correlation group larger than `memory.limit` has no in-budget representation. Rather than risk an out-of-memory crash, the run **fails loud** with `E310`. The report names the Reshape node and says that one request for the rows it holds for its groups needs more than `memory.limit` can hold, so spilling cannot help. It prints byte counts and node names only, never the group's key value:
+- **A single correlation group must fit the memory budget at finalize.** The no-cascade contract requires the *whole* group to be resident when its rules fire, so even though cross-group and ingest-time peaks spill to disk, the finalize reload of one group needs that group to fit. Skew slicing bounds the ingest peak, but a single correlation group larger than `memory.limit` has no in-budget representation. Rather than risk an out-of-memory crash, the run **fails loud** with `E310`. The report names the Reshape node and says that one request for the rows it holds for its groups needs more than `memory.limit` can hold, so spilling cannot help. It names the group by the Source and row number of its first row — the row number the dead-letter output writes in `_cxl_dlq_source_row` — and prints byte counts and node names only, never the group's key value:
 
   ```
   E310 backfill: one request for rows held for Reshape groups needs 125.0 KiB, more than memory.limit 8.0 KiB can hold — spilling cannot help
+    group: the one whose first row is row 1 of source plans
     ...
     fix: raise the limit to at least 1M — this request needed 125.0 KiB; later stages may need more
       pipeline:

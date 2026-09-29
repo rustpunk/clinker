@@ -505,3 +505,129 @@ fn report_text_uses_author_vocabulary() {
     }
     insta::assert_snapshot!("e310_report", text);
 }
+
+/// A Source → Sink pipeline over one CSV input, at an ample `memory.limit`.
+#[cfg(feature = "test-utils")]
+const SOURCE_TO_SINK: &str = r#"
+pipeline:
+  name: source_refusal
+  memory: { limit: "512M" }
+nodes:
+  - type: source
+    name: accounts
+    config:
+      name: accounts
+      type: csv
+      path: accounts.csv
+      schema:
+        - { name: note, type: string }
+  - type: sink
+    name: out
+    input: accounts
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+
+/// Run [`SOURCE_TO_SINK`] over `csv` with the ledger held to `capacity`
+/// bytes (the real limit stays 512M, far above any baseline, so the startup
+/// check cannot refuse first), returning the run's error.
+#[cfg(feature = "test-utils")]
+fn run_source_to_sink_refused(csv: &str, capacity: u64) -> clinker_plan::error::PipelineError {
+    use clinker_exec::executor::{MemoryTestOverrides, PipelineExecutor, PipelineRunParams};
+    use clinker_plan::config::{CompileContext, parse_config};
+    use std::collections::HashMap;
+
+    let config = parse_config(SOURCE_TO_SINK).expect("fixture pipeline must parse");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("fixture pipeline must compile");
+    let readers = HashMap::from([(
+        "accounts".to_string(),
+        clinker_exec::executor::single_file_reader(
+            "accounts.csv",
+            Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+        ),
+    )]);
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(std::io::sink()) as Box<dyn std::io::Write + Send>,
+    )]);
+    let params = PipelineRunParams {
+        execution_id: "source-refusal".to_string(),
+        batch_id: "source-refusal".to_string(),
+        memory_test: MemoryTestOverrides::default().with_ledger_capacity(capacity),
+        ..Default::default()
+    };
+    PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+        .expect_err("a row larger than the ledger's capacity must fail the run")
+}
+
+/// A Source reading a row whose one field is larger than the ledger's
+/// capacity is refused its governed allocation, off the walk. The run fails
+/// with the E310 report of that refusal, naming the Source and the rows it
+/// reads, not with the reader's admission error.
+#[cfg(feature = "test-utils")]
+#[test]
+fn admission_refusal_is_an_e310_naming_the_source() {
+    let capacity = 64 * KIB;
+    let csv = format!("note\n{}\n", "n".repeat(256 * 1024));
+    let err = run_source_to_sink_refused(&csv, capacity);
+    let clinker_plan::error::PipelineError::MemoryBudgetExceeded { report } = &err else {
+        panic!("a Source refused its allocation must fail with E310; got {err:?}");
+    };
+    assert_eq!(
+        report.requester,
+        Some(ConsumerLabel {
+            node: "accounts".to_string(),
+            surface: MemorySurface::RowsRead,
+        }),
+        "the report names the Source and the rows it reads"
+    );
+    assert!(
+        report.oversized,
+        "one field larger than the capacity is a request no spill can make room for: {report:?}"
+    );
+    assert!(
+        report.requested_bytes > capacity,
+        "the refused request ({}) is larger than the capacity ({capacity})",
+        report.requested_bytes
+    );
+    assert_eq!(report.limit_bytes, capacity);
+    assert!(
+        err.to_string()
+            .starts_with("E310 accounts: one request for rows read from the source needs "),
+        "{err}"
+    );
+}
+
+/// The E310 a run's refusal produces names nodes, surfaces and byte counts
+/// only: a value the refused rows carry appears neither in the rendered
+/// error nor anywhere in its report.
+#[cfg(feature = "test-utils")]
+#[test]
+fn report_text_carries_no_record_values() {
+    const SENTINEL: &str = "SENTINEL-VALUE-9Q4X";
+    let mut csv = String::from("note\n");
+    for _ in 0..3 {
+        csv.push_str(SENTINEL);
+        csv.push('\n');
+    }
+    csv.push_str(&SENTINEL.repeat(256 * 1024 / SENTINEL.len()));
+    csv.push('\n');
+    let err = run_source_to_sink_refused(&csv, 64 * KIB);
+    let clinker_plan::error::PipelineError::MemoryBudgetExceeded { report } = &err else {
+        panic!("the oversized row must fail the run with E310; got {err:?}");
+    };
+    let rendered = err.to_string();
+    assert!(
+        !rendered.contains(SENTINEL),
+        "the rendered E310 must not carry a record value:\n{rendered}"
+    );
+    let payload = format!("{report:?}");
+    assert!(
+        !payload.contains(SENTINEL),
+        "the E310 report must not carry a record value: {payload}"
+    );
+}

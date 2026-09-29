@@ -54,8 +54,8 @@
 //!
 //! A single correlation group whose reloaded footprint exceeds the finalize
 //! budget fails loud with the same [`PipelineError::MemoryBudgetExceeded`]
-//! diagnostic, naming the offending `partition_by` group, rather than risking
-//! an out-of-memory crash on reload.
+//! diagnostic, naming the offending group by the Source and row number of its
+//! first row, rather than risking an out-of-memory crash on reload.
 
 use clinker_record::owned_storage::SharedStorage;
 use std::collections::HashMap;
@@ -72,19 +72,19 @@ use crate::executor::dispatch::{
     crosses_into_deferred_consumer, node_buffer_spill_allowed,
     require_single_input_node_buffer_slot, source_file_arc_of, source_name_arc_of,
 };
+use crate::executor::giant_group_error;
 use crate::executor::node_buffer::unaccounted_record_byte_cost;
-use crate::executor::{GroupedNodeKind, giant_group_error};
+use crate::executor::stream_event::SourceRowId;
 use crate::pipeline::memory::{
     ConsumerHandle, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
 };
 use crate::pipeline::sort_key::compare_authored_keys;
 use crate::pipeline::spill::{SpillFile, SpillWriter};
-use clinker_plan::BudgetCategory;
 use clinker_plan::config::SortField;
 use clinker_plan::config::pipeline_node::CullBody;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode, single_predecessor};
-use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface};
+use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface, RowPosition};
 
 /// Spill priority for the Cull group buffer: between grace-hash (`10`) and
 /// external sort (`20`), matching Reshape. A grouped record buffer is
@@ -270,7 +270,7 @@ where
         handle.clone(),
         ConsumerLabel {
             node: name.to_string(),
-            surface: MemorySurface::DecisionState,
+            surface: MemorySurface::CullGroups,
         },
     );
 
@@ -376,7 +376,7 @@ fn run_cull_grouped(
     let mut removed: Vec<(Record, crate::executor::stream_event::SourceRowId)> = Vec::new();
     let group_order = buffer.take_group_order();
     for key in group_order {
-        let mut group = buffer.take_group(name, &config.partition_by, &key, hard_limit)?;
+        let mut group = buffer.take_group(name, &key, hard_limit, &budget)?;
         handle.set_bytes(buffer.unaccounted_resident_bytes() as u64);
         if !order_fields.is_empty() {
             // The Sort node's order, so a group's rows arrive in the same
@@ -514,7 +514,7 @@ fn compute_drop_decisions(
         let live = stream.estimated_memory_bytes();
         let projected = ctx.memory_budget.sum_consumer_usage().saturating_add(live);
         if hard_limit > 0 && projected > hard_limit {
-            return Err(cull_decision_budget_error(name, projected, hard_limit));
+            return Err(cull_decision_budget_error(&ctx.memory_budget, name, live));
         }
     }
     let finalize_ctx = ctx.merged_eval_ctx();
@@ -550,7 +550,11 @@ fn compute_drop_decisions(
         .saturating_add(emitted_bytes)
         .saturating_add(decisions_bytes);
     if hard_limit > 0 && projected > hard_limit {
-        return Err(cull_decision_budget_error(name, projected, hard_limit));
+        return Err(cull_decision_budget_error(
+            &ctx.memory_budget,
+            name,
+            emitted_bytes.saturating_add(decisions_bytes),
+        ));
     }
     let mut decisions: HashMap<Vec<GroupByKey>, bool> = HashMap::with_capacity(emitted.len());
     for (record, _) in emitted {
@@ -641,13 +645,13 @@ fn emit_ports(
                 // budget, mirroring the Route tee — parking unbounded records
                 // into `region_input_buffers` must not silently overshoot.
                 if row_bytes_each > 0 && ctx.memory_budget.should_abort() {
-                    return Err(PipelineError::MemoryBudgetExceeded {
-                        node: name.to_string(),
-                        used: ctx.memory_budget.peak_rss().unwrap_or(0),
-                        limit: ctx.memory_budget.hard_limit(),
-                        source: BudgetCategory::Arena,
-                        detail: Some("Cull cross-region tee admission".to_string()),
-                    });
+                    return Err(ctx.memory_budget.backstop_refusal(
+                        name,
+                        MemorySurface::ParkedCrossRegionRows {
+                            from: name.to_string(),
+                            to: current_dag.graph[succ].name().to_string(),
+                        },
+                    ));
                 }
                 ctx.region_input_buffers
                     .entry((active_body, edge_id))
@@ -742,11 +746,15 @@ struct CullGroupState {
     unaccounted_resident_bytes: usize,
     spilled_bytes: usize,
     spilled: Vec<SpillFile<CullSpillPayload>>,
+    /// The source-row identity of the group's first record, which names the
+    /// group in a diagnostic without printing its key.
+    first_row: SourceRowId,
 }
 
 impl CullGroupState {
-    fn new() -> Self {
+    fn new(first_row: SourceRowId) -> Self {
         Self {
+            first_row,
             resident: Vec::new(),
             resident_bytes: 0,
             unaccounted_resident_bytes: 0,
@@ -774,6 +782,10 @@ struct CullGroupBuffer {
     resident_bytes: usize,
     unaccounted_resident_bytes: usize,
     next_seq: u64,
+    /// The Source name behind each Source identity a group's first record
+    /// carried, read from that record's `$source.name` stamp; one entry per
+    /// Source feeding the node.
+    source_names: Vec<(clinker_plan::plan::PlanNodeId, Arc<str>)>,
 }
 
 impl CullGroupBuffer {
@@ -791,6 +803,24 @@ impl CullGroupBuffer {
             resident_bytes: 0,
             unaccounted_resident_bytes: 0,
             next_seq: 0,
+            source_names: Vec::new(),
+        }
+    }
+
+    /// Where `row` came from, as the dead-letter output names a row: its
+    /// Source's name and its number among that Source's rows.
+    fn row_position(&self, row: SourceRowId) -> RowPosition {
+        let source = self
+            .source_names
+            .iter()
+            .find(|(source, _)| *source == row.source())
+            .map_or_else(
+                || crate::executor::dispatch::MERGED_SOURCE_NAME.to_string(),
+                |(_, name)| name.to_string(),
+            );
+        RowPosition {
+            source,
+            row: row.ordinal(),
         }
     }
 
@@ -816,9 +846,13 @@ impl CullGroupBuffer {
         let seq = self.next_seq;
         self.next_seq += 1;
         let order = &mut self.group_order;
+        let names = &mut self.source_names;
         let state = self.groups.entry(key.clone()).or_insert_with(|| {
             order.push(key);
-            CullGroupState::new()
+            if !names.iter().any(|(source, _)| *source == row_num.source()) {
+                names.push((row_num.source(), source_name_arc_of(&record)));
+            }
+            CullGroupState::new(row_num)
         });
         state.resident.push(BufferedRecord {
             record,
@@ -1011,9 +1045,9 @@ impl CullGroupBuffer {
     fn take_group(
         &mut self,
         node_name: &str,
-        partition_by: &[String],
         key: &[GroupByKey],
         hard_limit: u64,
+        arbitrator: &MemoryArbitrator,
     ) -> Result<Vec<(Record, crate::executor::stream_event::SourceRowId)>, PipelineError> {
         let state = self.groups.remove(key).expect("group key present in order");
         self.resident_bytes -= state.resident_bytes;
@@ -1022,12 +1056,11 @@ impl CullGroupBuffer {
         let group_bytes = (state.resident_bytes + state.spilled_bytes) as u64;
         if hard_limit > 0 && group_bytes > hard_limit {
             return Err(giant_group_error(
-                GroupedNodeKind::Cull,
+                arbitrator,
                 node_name,
-                partition_by,
-                key,
+                MemorySurface::CullGroups,
                 group_bytes,
-                hard_limit,
+                Some(self.row_position(state.first_row)),
             ));
         }
 
@@ -1209,16 +1242,14 @@ fn cull_predicate_error(node_name: &str, e: crate::aggregation::HashAggError) ->
 /// back-pressure. So a group cardinality whose decision state plus the other
 /// live charged memory exceeds the budget has no in-budget representation —
 /// fail loud rather than grow it uncounted toward an out-of-memory crash.
-/// `used` is the offending live or estimated footprint; `hard_limit` is the
-/// configured ceiling.
-fn cull_decision_budget_error(node_name: &str, used: u64, hard_limit: u64) -> PipelineError {
-    PipelineError::MemoryBudgetExceeded {
-        node: node_name.to_string(),
-        used,
-        limit: hard_limit,
-        source: BudgetCategory::Arena,
-        detail: Some("Cull drop-decision aggregate state".to_string()),
-    }
+/// `requested` is the decision state's live or estimated footprint, the bytes
+/// it would hold beside what is already charged.
+fn cull_decision_budget_error(
+    budget: &crate::pipeline::memory::MemoryArbitrator,
+    node_name: &str,
+    requested: u64,
+) -> PipelineError {
+    budget.refusal(node_name, MemorySurface::DecisionState, requested)
 }
 
 #[cfg(test)]
@@ -1302,7 +1333,7 @@ mod tests {
         }
         assert!(physical > relative);
         let rows = buffer
-            .take_group("mixed", &["v".into()], &key, u64::MAX)
+            .take_group("mixed", &key, u64::MAX, &arbitrator(512))
             .unwrap();
         assert_eq!(buffer.resident_bytes(), 0);
         assert_eq!(buffer.unaccounted_resident_bytes(), 0);
@@ -1378,7 +1409,7 @@ mod tests {
                 "failed write leaves a conservative published value until dispatch cleanup"
             );
             let rows = buffer
-                .take_group("failure", &["v".into()], &sibling, u64::MAX)
+                .take_group("failure", &sibling, u64::MAX, &arbitrator(512))
                 .unwrap();
             assert_eq!(rows[0].1.ordinal(), 99);
             drop(rows);
@@ -1440,7 +1471,12 @@ mod tests {
                 buffer.groups[&key].resident_bytes + buffer.groups[&key].spilled_bytes;
             assert!(physical_group >= physical);
             let rows = buffer
-                .take_group("groups", &["v".into()], &key, physical_group as u64)
+                .take_group(
+                    "groups",
+                    &key,
+                    physical_group as u64,
+                    &arbitrator(physical_group as u64),
+                )
                 .unwrap();
             assert_eq!(buffer.unaccounted_resident_bytes(), 0);
             assert_eq!(rows.len(), if partitioned { 32 } else { 33 });
@@ -1507,7 +1543,6 @@ mod tests {
         let arb = arbitrator(512);
         let handle = ConsumerHandle::new();
         let key = vec![GroupByKey::Str("g".into())];
-        let partition_by = vec!["account".to_string()];
 
         // One group, ~5 KiB across 64 records against a 512 B soft limit, so
         // part of it partition-spills — exercising the reload path the hard
@@ -1541,78 +1576,100 @@ mod tests {
             "the oversized group must have partition-spilled for this to test the reload gate"
         );
 
+        // The finalize gate and the report read the same limit in production
+        // (`budget.hard_limit()` of the run's arbitrator); here the report
+        // comes from an arbitrator held to the 256-byte limit the gate uses.
+        let limit_in_force = MemoryArbitrator::with_policy(256, 0.80, 0.70, Box::new(NoOpPolicy));
         let err = buffer
-            .take_group("cl", &partition_by, &key, 256)
+            .take_group("cl", &key, 256, &limit_in_force)
             .expect_err("a group exceeding the hard limit must be rejected at finalize");
 
-        match &err {
-            PipelineError::MemoryBudgetExceeded {
-                node,
-                used,
-                limit,
-                source,
-                detail,
-            } => {
-                assert_eq!(node, "cl", "the diagnostic must name the Cull node");
-                assert_eq!(*limit, 256, "the limit must be the hard budget in force");
-                assert!(
-                    *used > *limit,
-                    "the reported footprint ({used}) must be the overrun, above the limit ({limit})"
-                );
-                assert_eq!(*source, BudgetCategory::Arena);
-                let detail = detail.as_deref().expect("the overrun must carry detail");
-                assert!(
-                    detail.contains("Cull correlation group [account=\"g\"]"),
-                    "the detail must name the offending partition_by group: {detail}"
-                );
-                assert!(
-                    detail.contains("drop_group_when"),
-                    "the detail must explain why one group must fit the budget: {detail}"
-                );
-                assert!(
-                    detail.contains("memory.limit")
-                        && detail.contains("only fix that leaves your output unchanged"),
-                    "the detail must name raising the budget as the one output-preserving fix: \
-                     {detail}"
-                );
-                // The column-dropping remedy must be offered AND must carry its
-                // consequence: this node writes every input column through, so
-                // dropped columns leave the written output as well. Asserting
-                // the pair rather than "consequence-if-offered" keeps the check
-                // live — the implication form passes vacuously the moment the
-                // remedy is reworded, which is how the two node messages drifted
-                // apart before.
-                assert!(
-                    detail.contains("upstream Transform"),
-                    "the detail must offer the column-drop remedy: {detail}"
-                );
-                assert!(
-                    detail.contains("leave the output too"),
-                    "offering the column-drop remedy requires disclosing that it changes which \
-                     columns are written: {detail}"
-                );
-                // Narrowing `partition_by` splits the group, so a
-                // `count(*) > 100` rule can stop firing and rows that should
-                // have routed to `removed_to` land on the main port instead.
-                // The engine must warn about that, never suggest it.
-                assert!(
-                    !detail.contains("add a finer `partition_by`"),
-                    "the remediation must not recommend narrowing partition_by: {detail}"
-                );
-                assert!(
-                    detail.contains("Narrowing `partition_by`")
-                        && detail.contains("changes which rows are removed"),
-                    "the detail must warn that narrowing partition_by changes the result set: \
-                     {detail}"
-                );
-            }
-            other => panic!("a giant correlation group must surface E310; got {other:?}"),
-        }
+        let PipelineError::MemoryBudgetExceeded { report } = &err else {
+            panic!("a giant correlation group must surface E310; got {err:?}");
+        };
+        assert_eq!(
+            report.requester,
+            Some(ConsumerLabel {
+                node: "cl".to_string(),
+                surface: MemorySurface::CullGroups,
+            }),
+            "the diagnostic must name the Cull node and its held group rows"
+        );
+        assert_eq!(
+            report.limit_bytes, 256,
+            "the limit must be the hard budget in force"
+        );
+        assert!(
+            report.oversized && report.requested_bytes > report.limit_bytes,
+            "the reported request ({}) must be the group's footprint, above the limit ({})",
+            report.requested_bytes,
+            report.limit_bytes
+        );
+        // The group is named by where its first row came from, never by its
+        // key (a record value). These rows carry no Source stamp.
+        assert_eq!(
+            report.group_first_row,
+            Some(RowPosition {
+                source: crate::executor::dispatch::MERGED_SOURCE_NAME.to_string(),
+                row: 0,
+            }),
+            "the diagnostic must identify the offending group"
+        );
 
         let rendered = err.to_string();
         assert!(
             rendered.starts_with("E310 cl:"),
             "the rendered diagnostic must lead with the E310 code and the node: {rendered}"
+        );
+        assert!(
+            rendered.contains("\n  group: the one whose first row is row 0 of source"),
+            "the rendered diagnostic must name the group: {rendered}"
+        );
+        assert!(
+            !rendered.contains("\"g\""),
+            "the group's key is a record value and must not be printed: {rendered}"
+        );
+        assert!(
+            rendered.contains("see \"Rows held for Cull groups\" in clinker explain --code E310"),
+            "the diagnostic must route to the remedy for a Cull group: {rendered}"
+        );
+        assert!(
+            !rendered.contains("finer `partition_by`"),
+            "the remediation must not recommend narrowing partition_by: {rendered}"
+        );
+
+        // The remedy the report routes to explains why one group must fit and
+        // offers only fixes whose consequence it states.
+        let remedy = crate::executor::util::e310_section("Rows held for Cull groups");
+        assert!(
+            remedy.contains("drop_group_when"),
+            "the remedy must explain why one group must fit the budget: {remedy}"
+        );
+        assert!(
+            remedy.contains("memory.limit")
+                && remedy.contains("only fix that leaves your output unchanged"),
+            "the remedy must name raising the budget as the one output-preserving fix: {remedy}"
+        );
+        // The column-dropping remedy must be offered AND must carry its
+        // consequence: this node writes every input column through, so
+        // dropped columns leave the written output as well.
+        assert!(
+            remedy.contains("upstream Transform") && remedy.contains("leave the output too"),
+            "offering the column-drop remedy requires disclosing that it changes which columns \
+             are written: {remedy}"
+        );
+        // Narrowing `partition_by` splits the group, so a `count(*) > 100`
+        // rule can stop firing and rows that should have routed to
+        // `removed_to` land on the main port instead. The engine must warn
+        // about that, never suggest it.
+        assert!(
+            !remedy.contains("add a finer `partition_by`"),
+            "the remediation must not recommend narrowing partition_by: {remedy}"
+        );
+        assert!(
+            remedy.contains("Narrowing `partition_by`")
+                && remedy.contains("changes which rows are removed"),
+            "the remedy must warn that narrowing partition_by changes the result set: {remedy}"
         );
     }
 

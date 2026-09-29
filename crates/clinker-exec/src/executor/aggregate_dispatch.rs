@@ -1361,10 +1361,11 @@ fn run_streaming_aggregate_ingest(
                             return Err(e.into());
                         }
                         Err(e) => match strategy {
-                            // Stamp the aggregate node name so an `OversizedRow`
-                            // → E310 abort names the stage that overran, matching
-                            // the materialized arm's attribution.
-                            ErrorStrategy::FailFast => return Err(agg_hash_error_into(name, e)),
+                            // An `OversizedRow` becomes the E310 naming this
+                            // Aggregate, as in the materialized arm.
+                            ErrorStrategy::FailFast => {
+                                return Err(e.into_pipeline_error(name, &factory.arbitrator));
+                            }
                             ErrorStrategy::Continue => {
                                 effects.add_errors.push((
                                     record,
@@ -1395,7 +1396,13 @@ fn run_streaming_aggregate_ingest(
                 )?;
                 Ok(())
             };
-            let result = drive();
+            // A governed allocation this worker was refused ends the ingest
+            // here, on the thread that recorded the refusal's report.
+            let result = crate::pipeline::memory::ledger::convert_governed_refusal(
+                drive(),
+                name,
+                clinker_plan::runtime_error::MemorySurface::GroupState,
+            );
             if result.is_err() {
                 // Drain to disconnect before surfacing the error so a producer
                 // blocked on the bounded `send` cannot deadlock the join. The
@@ -2010,26 +2017,6 @@ fn add_to_window(
     handle_aggregate_add_error(ctx, win_ctx.name, record, row_num, e)
 }
 
-/// Convert a `HashAggError` to `PipelineError`, stamping the aggregate node
-/// name into a `MemoryBudgetExceeded` whose `node` the error taxonomy left
-/// empty.
-///
-/// The `OversizedRow → E310` mapping in `aggregation/error.rs` deliberately
-/// leaves `node` empty for the dispatch arm to fill — matching the sibling
-/// budget-error sites — so an aborting oversized-row error renders as
-/// `E310 <aggregate>: ...`, naming the stage that overran exactly as the
-/// memory docs promise. Every other `PipelineError` shape passes through
-/// unchanged (they already carry their own attribution or none is owed).
-fn agg_hash_error_into(name: &str, e: crate::aggregation::HashAggError) -> PipelineError {
-    let mut err: PipelineError = e.into();
-    if let PipelineError::MemoryBudgetExceeded { node, .. } = &mut err
-        && node.is_empty()
-    {
-        *node = name.to_string();
-    }
-    err
-}
-
 /// Shared per-record `add_record` error handler for every materialized
 /// ingest arm — the strict per-document path, the relaxed-CK path, and
 /// the tumbling/hopping/session windowed arms. `FailFast` surfaces the
@@ -2049,9 +2036,8 @@ fn handle_aggregate_add_error(
         return Err(e.into());
     }
     match ctx.config.error_handling.strategy {
-        // Stamp the aggregate node name so an `OversizedRow` → E310 abort
-        // names the stage that overran.
-        ErrorStrategy::FailFast => Err(agg_hash_error_into(name, e)),
+        // An `OversizedRow` becomes the E310 naming this Aggregate.
+        ErrorStrategy::FailFast => Err(e.into_pipeline_error(name, &ctx.memory_budget)),
         ErrorStrategy::Continue => {
             let failure = crate::executor::held_failure::HeldFailure::new(
                 row_num,

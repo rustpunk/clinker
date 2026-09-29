@@ -1,13 +1,13 @@
 //! Runtime-failure vocabulary the top-level [`PipelineError`](crate::error::PipelineError)
 //! aggregates.
 //!
-//! [`SpillError`] and [`BudgetCategory`] are leaf enums produced by the
-//! execution engine's disk-spill and memory-budget subsystems, but they are
-//! defined here, alongside the error type that names them, so the planning
-//! layer can own the unified `PipelineError` without depending upward on the
-//! executor. [`MemorySurface`] and [`ConsumerLabel`] name the holders of
-//! charged memory in author vocabulary for the same reason, and
-//! [`MemoryShortfallReport`] is the E310 report built from them.
+//! [`SpillError`] is a leaf enum produced by the execution engine's
+//! disk-spill subsystem, but it is defined here, alongside the error type
+//! that names it, so the planning layer can own the unified `PipelineError`
+//! without depending upward on the executor. [`MemorySurface`] and
+//! [`ConsumerLabel`] name the holders of charged memory in author vocabulary
+//! for the same reason, and [`MemoryShortfallReport`] is the E310 report built
+//! from them.
 
 /// Disk-spill I/O or decode failure.
 ///
@@ -132,37 +132,6 @@ impl From<lz4_flex::frame::Error> for SpillError {
     }
 }
 
-/// Diagnostic tag for a memory budget overrun.
-///
-/// All categories charge the same global limit counter; the tag classifies
-/// which allocation class tripped it, for diagnostics and downstream
-/// routing only.
-///
-/// Append-only. Removing a variant is a breaking change for any
-/// `MemoryBudgetExceeded` consumer that destructures `source`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum BudgetCategory {
-    /// Source-rooted arenas, node-rooted arenas, deferred-region
-    /// admission buffers, grace-hash build/probe accounting, and the
-    /// disk-spill quota counter. Every budget-tracked allocation that
-    /// is not `ctx.node_buffers` falls under this tag.
-    Arena,
-    /// `ctx.node_buffers` — the inter-stage handoff layer between
-    /// non-fused operators. Each slot registers a `NodeBufferConsumer`
-    /// wrapper; the arbitrator's pull-mode `current_usage` reads the
-    /// slot's live footprint at every policy poll.
-    NodeBuffer,
-}
-
-impl std::fmt::Display for BudgetCategory {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Arena => f.write_str("arena"),
-            Self::NodeBuffer => f.write_str("node_buffer"),
-        }
-    }
-}
-
 /// What a piece of charged memory holds, named in the words a pipeline author
 /// uses for their own pipeline.
 ///
@@ -190,10 +159,13 @@ pub enum MemorySurface {
     /// The run's record of rows already dead-lettered, kept so a row several
     /// Sinks hold is dead-lettered once.
     DeadLetteredRowSet,
-    /// State a routing or filtering decision keeps between records.
+    /// State a routing or filtering decision keeps between records, such as
+    /// Cull's per-group drop decisions.
     DecisionState,
     /// Rows held while Reshape groups complete.
     ReshapeGroups,
+    /// Rows held while Cull groups complete.
+    CullGroups,
     /// The index a window reads its neighbouring rows through.
     WindowIndex,
     /// Rows collected so a node can scan all of them.
@@ -223,6 +195,7 @@ impl std::fmt::Display for MemorySurface {
             Self::DeadLetteredRowSet => f.write_str("set of rows already dead-lettered"),
             Self::DecisionState => f.write_str("decision state"),
             Self::ReshapeGroups => f.write_str("rows held for Reshape groups"),
+            Self::CullGroups => f.write_str("rows held for Cull groups"),
             Self::WindowIndex => f.write_str("window index"),
             Self::ScanMaterialization => f.write_str("rows collected for a full scan"),
             Self::OutputStaging => f.write_str("output staging"),
@@ -265,6 +238,10 @@ pub struct MemoryShortfallReport {
     /// The node that asked for memory and what the memory was for; `None`
     /// when the request was made for the run as a whole and no node is known.
     pub requester: Option<ConsumerLabel>,
+    /// Where the group of input rows the request was for begins, when one
+    /// group is at fault (a Cull or Reshape group too large to hold whole);
+    /// `None` otherwise.
+    pub group_first_row: Option<RowPosition>,
     /// Bytes the refused request asked for.
     pub requested_bytes: u64,
     /// The limit charges are granted against: `memory.limit`, or the smaller
@@ -306,6 +283,31 @@ pub struct MemoryShortfallReport {
 impl MemoryShortfallReport {
     /// Holders the report lists by name; the rest are summed on one line.
     pub const LISTED_HOLDERS: usize = 5;
+
+    /// Name `node` and `surface` as the requester of a report that names
+    /// none. A report that already names its requester keeps it: the name
+    /// the ledger recorded at the refusal outranks one supplied afterwards
+    /// by the code the refusal was propagated through.
+    pub fn attribute_if_unnamed(&mut self, node: &str, surface: MemorySurface) {
+        if self.requester.is_none() {
+            self.requester = Some(ConsumerLabel {
+                node: node.to_string(),
+                surface,
+            });
+        }
+    }
+}
+
+/// Where a group of input rows begins, named the way the dead-letter output
+/// numbers rows: the Source node that read the group's first row and that
+/// row's number among the rows the Source read (counting from 1). It
+/// identifies a group without printing its key, which is a record value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RowPosition {
+    /// The author-given name of the Source node that read the row.
+    pub source: String,
+    /// The row's number among the rows that Source read, counting from 1.
+    pub row: u64,
 }
 
 /// One holder of charged memory in a [`MemoryShortfallReport`].
@@ -422,6 +424,7 @@ fn fix_section(surface: &MemorySurface) -> Option<&'static str> {
         MemorySurface::JoinBuildSide | MemorySurface::JoinState => Some("Join build side"),
         MemorySurface::GroupState => Some("Group state"),
         MemorySurface::ReshapeGroups => Some("Rows held for Reshape groups"),
+        MemorySurface::CullGroups => Some("Rows held for Cull groups"),
         MemorySurface::DecisionState => Some("Decision state"),
         MemorySurface::WindowIndex => Some("Window index"),
         MemorySurface::BufferedRows { .. }
@@ -441,6 +444,13 @@ fn fix_section(surface: &MemorySurface) -> Option<&'static str> {
 impl std::fmt::Display for MemoryShortfallReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.write_headline(f)?;
+        if let Some(first) = &self.group_first_row {
+            write!(
+                f,
+                "\n  group: the one whose first row is row {} of source {}",
+                first.row, first.source
+            )?;
+        }
 
         write!(
             f,
@@ -534,12 +544,29 @@ impl std::fmt::Display for MemoryShortfallReport {
             Bytes(self.charged_bytes.saturating_add(self.requested_bytes))
         )?;
 
-        if let Some(holder) = self.holders.iter().find(|holder| {
-            matches!(
-                holder.state,
-                HolderState::CannotSpill | HolderState::AtFloor
-            )
-        }) {
+        // An oversized request's remedy is the one for what the requester was
+        // holding. When it is larger than the whole limit it fits beside
+        // nothing, so no holder is to blame and that remedy is the only one;
+        // otherwise the largest holder that cannot spill is named first.
+        let requester_remedy =
+            self.requester
+                .as_ref()
+                .filter(|_| self.oversized)
+                .and_then(|requester| {
+                    fix_section(&requester.surface).map(|section| (requester, section))
+                });
+        let alone_too_large = self.requested_bytes > self.limit_bytes;
+        let holder_remedy = if alone_too_large && requester_remedy.is_some() {
+            None
+        } else {
+            self.holders.iter().find(|holder| {
+                matches!(
+                    holder.state,
+                    HolderState::CannotSpill | HolderState::AtFloor
+                )
+            })
+        };
+        if let Some(holder) = holder_remedy {
             write!(
                 f,
                 "\n  remedy: {}'s {} holds {} and {}",
@@ -555,6 +582,13 @@ impl std::fmt::Display for MemoryShortfallReport {
             if let Some(section) = fix_section(&holder.surface) {
                 write!(f, "; see \"{section}\" in clinker explain --code E310")?;
             }
+        } else if let Some((requester, section)) = requester_remedy {
+            write!(
+                f,
+                "\n  remedy: {}'s {} cannot fit the limit in one piece; see \"{section}\" in \
+                 clinker explain --code E310",
+                requester.node, requester.surface
+            )?;
         }
         if self.charged_bytes > 0 && self.unspillable_bytes >= self.charged_bytes {
             f.write_str(

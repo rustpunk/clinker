@@ -394,8 +394,7 @@ impl StreamingChargeHandle {
     /// records is spilled to a `SpillFile<SourceRowId>` and streamed back out from
     /// disk one at a time (relieving the producer's in-memory peak for the
     /// batch) with its spill bytes recorded against the disk quota; an
-    /// over-quota total surfaces the structured `MemoryBudgetExceeded`
-    /// shape with `detail: "spill quota exceeded"`. Punctuations are
+    /// over-quota total surfaces E320 (`SpillCapExceeded`). Punctuations are
     /// forwarded in place between the runs they separate, so the spill path
     /// emits the batch's events in the same arrival order the in-memory
     /// path does — the records-and-punctuations interleaving the producer

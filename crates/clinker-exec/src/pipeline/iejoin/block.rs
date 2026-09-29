@@ -151,7 +151,6 @@ use clinker_record::{Record, Schema};
 
 use cxl::eval::{EvalContext, ProgramEvaluator};
 
-use clinker_plan::BudgetCategory;
 use clinker_plan::config::ErrorStrategy;
 use clinker_plan::config::pipeline_node::{MatchMode, OnMiss, PropagateCkSpec};
 use clinker_plan::error::PipelineError;
@@ -321,12 +320,12 @@ fn range_key_width(op2: Option<RangeOp>) -> usize {
 /// than of copy discipline repeated at each gate.
 fn abort_over_budget(
     consumer: &Arc<ConsumerHandle>,
+    budget: &MemoryArbitrator,
     name: &str,
     peak: u64,
-    hard: u64,
 ) -> PipelineError {
     consumer.set_bytes(0);
-    pre_output_budget_error(name, peak, hard)
+    pre_output_budget_error(budget, name, peak)
 }
 
 /// Mirror this block-pair's live working set onto the consumer handle, so the
@@ -947,12 +946,7 @@ fn execute_block_band_inner(
             .saturating_add(deferred_cap)
             .saturating_add(inblock_finalize_term);
         if driver_peak > budget.hard_limit() {
-            return Err(abort_over_budget(
-                consumer,
-                name,
-                driver_peak,
-                budget.hard_limit(),
-            ));
+            return Err(abort_over_budget(consumer, budget, name, driver_peak));
         }
 
         let driver_loaded = driver_block.load("iejoin block-band driver block")?;
@@ -1085,9 +1079,9 @@ fn execute_block_band_inner(
             if pair_peak_reserved > budget.hard_limit() {
                 return Err(abort_over_budget(
                     consumer,
+                    budget,
                     name,
                     pair_peak_reserved,
-                    budget.hard_limit(),
                 ));
             }
 
@@ -1234,9 +1228,9 @@ fn execute_block_band_inner(
                         // fallback cannot rescue.
                         return Err(abort_over_budget(
                             consumer,
+                            budget,
                             name,
                             bnl_reserved.saturating_add(pair_size),
-                            budget.hard_limit(),
                         ));
                     }
                     let tile_reserve = (tile_cap as u64).saturating_mul(pair_size);
@@ -2211,15 +2205,10 @@ fn poll_finalize_backstop(
     *emitted_since_check += 1;
     if *emitted_since_check >= super::MEMORY_CHECK_INTERVAL {
         if cfg.budget.should_abort() {
-            return Err(PipelineError::MemoryBudgetExceeded {
-                node: cfg.name.to_string(),
-                used: cfg.budget.current_pressure(),
-                limit: cfg.budget.hard_limit(),
-                source: BudgetCategory::Arena,
-                detail: Some(
-                    "iejoin block-band deferred-miss finalize exceeded budget".to_string(),
-                ),
-            });
+            return Err(cfg.budget.backstop_refusal(
+                cfg.name,
+                clinker_plan::runtime_error::MemorySurface::JoinState,
+            ));
         }
         *emitted_since_check = 0;
     }
@@ -3446,7 +3435,7 @@ mod tests {
         // the budget instead, streaming candidates in bounded tiles.
         //
         // Fail-before / pass-after: before the fallback this run aborted with
-        // `MemoryBudgetExceeded { detail: "iejoin pre-output …" }`; it must now
+        // the pre-output gate's `MemoryBudgetExceeded`; it must now
         // return the full pair set and be byte-identical to a roomy run.
         let n = 200i64;
         let driver: Side = (0..n).map(|i| (Some((5, 5)), i)).collect();
@@ -3634,14 +3623,15 @@ mod tests {
         let err = run_block_on(&driver, &build, &cfg, &budget)
             .expect_err("a hot-value collect must stay bounded, aborting rather than OOMing");
         match err {
-            PipelineError::MemoryBudgetExceeded { detail, source, .. } => {
-                assert_eq!(source, clinker_plan::BudgetCategory::Arena);
+            PipelineError::MemoryBudgetExceeded { report } => {
+                assert_eq!(
+                    report.requester.as_ref().map(|label| &label.surface),
+                    Some(&clinker_plan::runtime_error::MemorySurface::JoinState),
+                    "the collect bound must abort via the strictly-local pre-output gate; got {report:?}"
+                );
                 assert!(
-                    detail
-                        .as_deref()
-                        .unwrap_or("")
-                        .contains("iejoin pre-output"),
-                    "the collect bound must abort via the strictly-local pre-output gate; got {detail:?}"
+                    report.oversized && report.requested_bytes > report.limit_bytes,
+                    "the collect bound must abort via the strictly-local pre-output gate; got {report:?}"
                 );
             }
             other => {
@@ -4392,14 +4382,15 @@ mod tests {
         )
         .expect_err("accumulated held candidates over the budget must abort");
         match err {
-            PipelineError::MemoryBudgetExceeded { detail, source, .. } => {
-                assert_eq!(source, clinker_plan::BudgetCategory::Arena);
+            PipelineError::MemoryBudgetExceeded { report } => {
+                assert_eq!(
+                    report.requester.as_ref().map(|label| &label.surface),
+                    Some(&clinker_plan::runtime_error::MemorySurface::JoinState),
+                    "abort must come from the pre-output gate; got {report:?}"
+                );
                 assert!(
-                    detail
-                        .as_deref()
-                        .unwrap_or("")
-                        .contains("iejoin pre-output"),
-                    "abort must come from the pre-output gate; got {detail:?}"
+                    report.oversized && report.requested_bytes > report.limit_bytes,
+                    "abort must come from the pre-output gate; got {report:?}"
                 );
             }
             other => {
@@ -4439,14 +4430,15 @@ mod tests {
         let err = run_block(&driver, &build, &cfg)
             .expect_err("an over-hard spilled driver block must abort at its load");
         match err {
-            PipelineError::MemoryBudgetExceeded { detail, source, .. } => {
-                assert_eq!(source, clinker_plan::BudgetCategory::Arena);
+            PipelineError::MemoryBudgetExceeded { report } => {
+                assert_eq!(
+                    report.requester.as_ref().map(|label| &label.surface),
+                    Some(&clinker_plan::runtime_error::MemorySurface::JoinState),
+                    "abort must come from the driver-load gate; got {report:?}"
+                );
                 assert!(
-                    detail
-                        .as_deref()
-                        .unwrap_or("")
-                        .contains("iejoin pre-output"),
-                    "abort must come from the driver-load gate; got {detail:?}"
+                    report.oversized && report.requested_bytes > report.limit_bytes,
+                    "abort must come from the driver-load gate; got {report:?}"
                 );
             }
             other => {
@@ -4652,18 +4644,16 @@ mod tests {
         .expect_err("the finalize backstop must abort when the ceiling is already breached");
 
         match err {
-            PipelineError::MemoryBudgetExceeded {
-                detail,
-                source,
-                limit,
-                ..
-            } => {
-                assert_eq!(source, clinker_plan::BudgetCategory::Arena);
-                assert_eq!(limit, hard);
-                assert!(
-                    detail.as_deref().unwrap_or("").contains("finalize"),
-                    "abort must come from the deferred-miss finalize backstop; got {detail:?}"
+            PipelineError::MemoryBudgetExceeded { report } => {
+                assert_eq!(
+                    report.requester,
+                    Some(clinker_plan::runtime_error::ConsumerLabel {
+                        node: "finalize_backstop".to_string(),
+                        surface: clinker_plan::runtime_error::MemorySurface::JoinState,
+                    }),
+                    "abort must come from the join's deferred-miss finalize backstop"
                 );
+                assert_eq!(report.limit_bytes, hard);
             }
             other => {
                 panic!("expected MemoryBudgetExceeded from the finalize backstop; got {other:?}")

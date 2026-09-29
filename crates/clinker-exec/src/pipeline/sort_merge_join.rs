@@ -68,7 +68,6 @@ use crate::pipeline::memory::NoOpPolicy;
 use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
 use crate::pipeline::spill::{SpillFile, SpillWriter};
 use crate::pipeline::spill_merge::{MergeBudget, SortedRunMerger};
-use clinker_plan::BudgetCategory;
 use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::combine::{DecomposedPredicate, RangeOp};
@@ -1654,13 +1653,10 @@ fn push_output_row(
     if emitted >= MEMORY_CHECK_INTERVAL {
         mspill.emitted_since_check.set(0);
         if mspill.budget.should_abort() {
-            return Err(PipelineError::MemoryBudgetExceeded {
-                node: mspill.name.to_string(),
-                used: mspill.budget.current_pressure(),
-                limit: mspill.budget.hard_limit(),
-                source: BudgetCategory::Arena,
-                detail: Some("sort-merge output-axis global memory backstop".to_string()),
-            });
+            return Err(mspill.budget.backstop_refusal(
+                mspill.name,
+                clinker_plan::runtime_error::MemorySurface::JoinState,
+            ));
         }
     } else {
         mspill.emitted_since_check.set(emitted);
@@ -3977,15 +3973,15 @@ mod tests {
         let err = run(Some(hard + 64 * 1024))
             .expect_err("a co-resident consumer over the hard limit must abort the walk");
         match err {
-            PipelineError::MemoryBudgetExceeded {
-                node,
-                limit,
-                source,
-                ..
-            } => {
-                assert_eq!(node, "sm_test");
-                assert_eq!(limit, hard);
-                assert_eq!(source, BudgetCategory::Arena);
+            PipelineError::MemoryBudgetExceeded { report } => {
+                assert_eq!(
+                    report.requester,
+                    Some(clinker_plan::runtime_error::ConsumerLabel {
+                        node: "sm_test".to_string(),
+                        surface: clinker_plan::runtime_error::MemorySurface::JoinState,
+                    })
+                );
+                assert_eq!(report.limit_bytes, hard);
             }
             other => {
                 panic!("the global backstop must surface MemoryBudgetExceeded; got {other:?}")

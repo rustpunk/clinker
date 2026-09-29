@@ -56,8 +56,9 @@ use crate::executor::dispatch::{
     require_single_input_node_buffer_slot, source_file_arc_of, source_name_arc_of,
     tee_emit_to_region_input_buffers,
 };
+use crate::executor::giant_group_error;
+use crate::executor::stream_event::SourceRowId;
 use crate::executor::{DlqEntry, DlqFailureStamp};
-use crate::executor::{GroupedNodeKind, giant_group_error};
 use crate::pipeline::memory::{
     ConsumerHandle, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
 };
@@ -73,7 +74,7 @@ use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{
     CompiledReshapeRule, ExecutionPlanDag, PlanNode, single_predecessor,
 };
-use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface};
+use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface, RowPosition};
 
 use crate::executor::NullStorage;
 
@@ -401,7 +402,7 @@ fn run_reshape_grouped(
     let mut out: Vec<(Record, crate::executor::stream_event::SourceRowId)> = Vec::new();
     let group_order = buffer.take_group_order();
     for key in group_order {
-        let mut group = buffer.take_group(name, &config.partition_by, &key, hard_limit)?;
+        let mut group = buffer.take_group(name, &key, hard_limit, &budget)?;
         handle.set_bytes(buffer.resident_bytes() as u64);
         if !order_fields.is_empty() {
             // The Sort node's order, so each group's rows reach the rules in
@@ -474,11 +475,15 @@ struct ReshapeGroupState {
     /// admission sequence) so a spilled group emits identically to a resident
     /// one.
     spilled: Vec<SpillFile<ReshapeSpillPayload>>,
+    /// The source-row identity of the group's first record, which names the
+    /// group in a diagnostic without printing its key.
+    first_row: SourceRowId,
 }
 
 impl ReshapeGroupState {
-    fn new() -> Self {
+    fn new(first_row: SourceRowId) -> Self {
         Self {
+            first_row,
             resident: Vec::new(),
             resident_bytes: 0,
             spilled_bytes: 0,
@@ -513,6 +518,10 @@ struct ReshapeGroupBuffer {
     /// record so the value stamped on each record is globally unique and
     /// monotonic in true (merged) arrival order across every source.
     next_seq: u64,
+    /// The Source name behind each Source identity a group's first record
+    /// carried, read from that record's `$source.name` stamp; one entry per
+    /// Source feeding the node.
+    source_names: Vec<(clinker_plan::plan::PlanNodeId, Arc<str>)>,
 }
 
 impl ReshapeGroupBuffer {
@@ -524,6 +533,24 @@ impl ReshapeGroupBuffer {
             groups: HashMap::new(),
             resident_bytes: 0,
             next_seq: 0,
+            source_names: Vec::new(),
+        }
+    }
+
+    /// Where `row` came from, as the dead-letter output names a row: its
+    /// Source's name and its number among that Source's rows.
+    fn row_position(&self, row: SourceRowId) -> RowPosition {
+        let source = self
+            .source_names
+            .iter()
+            .find(|(source, _)| *source == row.source())
+            .map_or_else(
+                || crate::executor::dispatch::MERGED_SOURCE_NAME.to_string(),
+                |(_, name)| name.to_string(),
+            );
+        RowPosition {
+            source,
+            row: row.ordinal(),
         }
     }
 
@@ -544,9 +571,13 @@ impl ReshapeGroupBuffer {
         let seq = self.next_seq;
         self.next_seq += 1;
         let order = &mut self.group_order;
+        let names = &mut self.source_names;
         let state = self.groups.entry(key.clone()).or_insert_with(|| {
             order.push(key);
-            ReshapeGroupState::new()
+            if !names.iter().any(|(source, _)| *source == row_num.source()) {
+                names.push((row_num.source(), source_name_arc_of(&record)));
+            }
+            ReshapeGroupState::new(row_num)
         });
         state.resident.push(BufferedRecord {
             record,
@@ -776,9 +807,9 @@ impl ReshapeGroupBuffer {
     fn take_group(
         &mut self,
         node_name: &str,
-        partition_by: &[String],
         key: &[GroupByKey],
         hard_limit: u64,
+        arbitrator: &MemoryArbitrator,
     ) -> Result<Vec<(Record, crate::executor::stream_event::SourceRowId)>, PipelineError> {
         let state = self.groups.remove(key).expect("group key present in order");
         self.resident_bytes -= state.resident_bytes;
@@ -788,12 +819,11 @@ impl ReshapeGroupBuffer {
         let group_bytes = (state.resident_bytes + state.spilled_bytes) as u64;
         if hard_limit > 0 && group_bytes > hard_limit {
             return Err(giant_group_error(
-                GroupedNodeKind::Reshape,
+                arbitrator,
                 node_name,
-                partition_by,
-                key,
+                MemorySurface::ReshapeGroups,
                 group_bytes,
-                hard_limit,
+                Some(self.row_position(state.first_row)),
             ));
         }
 
@@ -1206,7 +1236,6 @@ fn reshape_eval_error(
 mod tests {
     use super::*;
     use crate::pipeline::memory::NoOpPolicy;
-    use clinker_plan::BudgetCategory;
     use clinker_plan::plan::{EntityRef, PlanNodeId};
 
     fn schema() -> SharedStorage<Schema> {
@@ -1229,6 +1258,12 @@ mod tests {
     /// An arbitrator whose soft limit is `soft_bytes` and whose seeded peak
     /// RSS is well below it, so `should_spill_self` is driven purely by the
     /// caller's explicit spill calls rather than the live process RSS.
+    /// An arbitrator held to exactly `limit` bytes, for a report that must
+    /// name the limit a finalize gate enforced.
+    fn limit_of(limit: u64) -> MemoryArbitrator {
+        MemoryArbitrator::with_policy(limit, 0.80, 0.70, Box::new(NoOpPolicy))
+    }
+
     fn arbitrator(soft_bytes: u64) -> MemoryArbitrator {
         // soft = limit * 0.80, so limit = soft / 0.80.
         let limit = (soft_bytes as f64 / 0.80) as u64;
@@ -1296,7 +1331,7 @@ mod tests {
             !buffer.groups[&key].spilled.is_empty(),
             "the single oversized group must have partition-spilled"
         );
-        let group = buffer.take_group("rs", &partition_by(), &key, 0).unwrap();
+        let group = buffer.take_group("rs", &key, 0, &arb).unwrap();
         let row_nums: Vec<u64> = group.iter().map(|(_, rn)| rn.ordinal()).collect();
         let expected: Vec<u64> = (0..64).collect();
         assert_eq!(
@@ -1370,82 +1405,109 @@ mod tests {
         let key = single_group_key();
         let mut buffer = fill_single_group(&schema, &arb, spill_root.path(), 64);
         // A hard limit far below the group's reloaded footprint must fail loud.
+        // The finalize gate and the report read the same limit in production
+        // (`budget.hard_limit()` of the run's arbitrator); here the report
+        // comes from an arbitrator held to the 256-byte limit the gate uses.
+        let limit_in_force = limit_of(256);
         let err = buffer
-            .take_group("rs", &partition_by(), &key, 256)
+            .take_group("rs", &key, 256, &limit_in_force)
             .expect_err("a group exceeding the hard limit must be rejected at finalize");
 
         // A group that outgrew the budget is an ordinary operational limit,
         // not an engine invariant violation, so it must carry the standard
-        // memory surface — typed, not merely reworded.
-        match &err {
-            PipelineError::MemoryBudgetExceeded {
-                node,
-                used,
-                limit,
-                source,
-                detail,
-            } => {
-                assert_eq!(node, "rs", "the diagnostic must name the Reshape node");
-                assert_eq!(*limit, 256, "the limit must be the hard budget in force");
-                assert!(
-                    *used > *limit,
-                    "the reported footprint ({used}) must be the overrun, above the limit ({limit})"
-                );
-                assert_eq!(*source, BudgetCategory::Arena);
-                let detail = detail.as_deref().expect("the overrun must carry detail");
-                assert!(
-                    detail.contains("Reshape correlation group [gid=\"g\"]"),
-                    "the detail must name the offending partition_by group: {detail}"
-                );
-                assert!(
-                    detail.contains("no-cascade"),
-                    "the detail must explain why one group must fit the budget: {detail}"
-                );
-                assert!(
-                    detail.contains("memory.limit")
-                        && detail.contains("only fix that leaves your output unchanged"),
-                    "the detail must name raising the budget as the one output-preserving fix: \
-                     {detail}"
-                );
-                // The column-dropping remedy must be offered AND must carry its
-                // consequence: this node writes every input column through, so
-                // dropped columns leave the written output as well. Asserting
-                // the pair rather than "consequence-if-offered" keeps the check
-                // live — the implication form passes vacuously the moment the
-                // remedy is reworded, which is how the two node messages drifted
-                // apart before.
-                assert!(
-                    detail.contains("upstream Transform"),
-                    "the detail must offer the column-drop remedy: {detail}"
-                );
-                assert!(
-                    detail.contains("leave the output too"),
-                    "offering the column-drop remedy requires disclosing that it changes which \
-                     columns are written: {detail}"
-                );
-                // The engine must never recommend narrowing `partition_by` as a
-                // memory fix. It redefines the group the rules evaluate
-                // against, so it clears the abort by silently changing the
-                // answer — the exact failure class this milestone exists to
-                // remove. The warning must be present and the suggestion absent.
-                assert!(
-                    !detail.contains("add a finer `partition_by`"),
-                    "the remediation must not recommend narrowing partition_by: {detail}"
-                );
-                assert!(
-                    detail.contains("Narrowing `partition_by`")
-                        && detail.contains("changes results"),
-                    "the detail must warn that narrowing partition_by changes results: {detail}"
-                );
-            }
-            other => panic!("a giant correlation group must surface E310; got {other:?}"),
-        }
+        // memory report — typed, not merely reworded.
+        let PipelineError::MemoryBudgetExceeded { report } = &err else {
+            panic!("a giant correlation group must surface E310; got {err:?}");
+        };
+        assert_eq!(
+            report.requester,
+            Some(ConsumerLabel {
+                node: "rs".to_string(),
+                surface: MemorySurface::ReshapeGroups,
+            }),
+            "the diagnostic must name the Reshape node and its held group rows"
+        );
+        assert_eq!(
+            report.limit_bytes, 256,
+            "the limit must be the hard budget in force"
+        );
+        assert!(
+            report.oversized && report.requested_bytes > report.limit_bytes,
+            "the reported request ({}) must be the group's footprint, above the limit ({})",
+            report.requested_bytes,
+            report.limit_bytes
+        );
+        // The group is named by where its first row came from, never by its
+        // key (a record value). These rows carry no Source stamp.
+        assert_eq!(
+            report.group_first_row,
+            Some(RowPosition {
+                source: crate::executor::dispatch::MERGED_SOURCE_NAME.to_string(),
+                row: 0,
+            }),
+            "the diagnostic must identify the offending group"
+        );
 
-        // Rendered form: the E310 code and the budget figures reach the user.
+        // Rendered form: the E310 code, the node and the group reach the user,
+        // with a route to the remedy for a Reshape group.
         let rendered = err.to_string();
         assert!(
             rendered.starts_with("E310 rs:"),
             "the rendered diagnostic must lead with the E310 code and the node: {rendered}"
+        );
+        assert!(
+            rendered.contains("\n  group: the one whose first row is row 0 of source"),
+            "the rendered diagnostic must name the group: {rendered}"
+        );
+        assert!(
+            !rendered.contains("\"g\""),
+            "the group's key is a record value and must not be printed: {rendered}"
+        );
+        assert!(
+            rendered
+                .contains("see \"Rows held for Reshape groups\" in clinker explain --code E310"),
+            "the diagnostic must route to the remedy for a Reshape group: {rendered}"
+        );
+        assert!(
+            !rendered.contains("finer `partition_by`"),
+            "the remediation must not recommend narrowing partition_by: {rendered}"
+        );
+
+        let remedy = crate::executor::util::e310_section("Rows held for Reshape groups");
+        assert!(
+            remedy.contains("every rule sees"),
+            "the remedy must explain why one group must fit the budget: {remedy}"
+        );
+        assert!(
+            remedy.contains("memory.limit")
+                && remedy.contains("only fix")
+                && remedy.contains("leaves your output unchanged"),
+            "the remedy must name raising the budget as the one output-preserving fix: {remedy}"
+        );
+        // The column-dropping remedy must be offered AND must carry its
+        // consequence: this node writes every input column through, so
+        // dropped columns leave the written output as well. Asserting the
+        // pair rather than "consequence-if-offered" keeps the check live.
+        assert!(
+            remedy.contains("upstream Transform"),
+            "the remedy must offer the column-drop remedy: {remedy}"
+        );
+        assert!(
+            remedy.contains("leave the output too"),
+            "offering the column-drop remedy requires disclosing that it changes which \
+             columns are written: {remedy}"
+        );
+        // The engine must never recommend narrowing `partition_by` as a
+        // memory fix. It redefines the group the rules evaluate against, so
+        // it clears the abort by silently changing the answer. The warning
+        // must be present and the suggestion absent.
+        assert!(
+            !remedy.contains("add a finer `partition_by`"),
+            "the remediation must not recommend narrowing partition_by: {remedy}"
+        );
+        assert!(
+            remedy.contains("Narrowing `partition_by`") && remedy.contains("changes results"),
+            "the remedy must warn that narrowing partition_by changes results: {remedy}"
         );
     }
 
@@ -1474,36 +1536,36 @@ mod tests {
         );
 
         let err = buffer
-            .take_group("rs", &[], &[], 64)
+            .take_group("rs", &[], 64, &limit_of(64))
             .expect_err("a group exceeding the hard limit must be rejected at finalize");
-        let PipelineError::MemoryBudgetExceeded { detail, .. } = &err else {
+        let PipelineError::MemoryBudgetExceeded { report } = &err else {
             panic!("a giant correlation group must surface E310; got {err:?}");
         };
-        let detail = detail.as_deref().expect("the overrun must carry detail");
+        // The whole-input group is named by its first row, like any other
+        // group, never as an empty bracket pair that names nothing.
+        assert_eq!(
+            report.group_first_row.as_ref().map(|first| first.row),
+            Some(0),
+            "the whole-input group must be named readably: {report:?}"
+        );
+        let rendered = err.to_string();
         assert!(
-            detail.contains("correlation group [whole input]"),
-            "the whole-input group must be named readably, not as an empty bracket pair: {detail}"
+            !rendered.contains("[]"),
+            "the empty bracket pair names nothing and must not reach the author: {rendered}"
+        );
+        // With no declared fields there is nothing to narrow; the remedy the
+        // report routes to says so, and still states what declaring fields
+        // would change.
+        let remedy = crate::executor::util::e310_section("Rows held for Reshape groups");
+        assert!(
+            remedy.contains("`partition_by: []`") && remedy.contains("there is no key to narrow"),
+            "the remedy must say the whole-input group offers no key: {remedy}"
         );
         assert!(
-            !detail.contains("[]"),
-            "the empty bracket pair names nothing and must not reach the author: {detail}"
-        );
-        // With no declared fields there is nothing to narrow, so the standard
-        // narrowing warning would send the author editing a key they never
-        // wrote. The result-changing consequence still has to be stated.
-        assert!(
-            !detail.contains("Narrowing `partition_by`"),
-            "with no partition key declared there is nothing to narrow: {detail}"
-        );
-        assert!(
-            detail.contains("`partition_by` is empty here")
-                && detail.contains("there is no key to narrow"),
-            "the detail must say the group covers the whole input and offers no key: {detail}"
-        );
-        assert!(
-            detail.contains("Declaring fields in `partition_by`")
-                && detail.contains("changes results"),
-            "splitting the whole-input group changes results, and the detail must say so: {detail}"
+            remedy.contains("Declaring fields in an empty `partition_by`")
+                && remedy.contains("changes results"),
+            "splitting the whole-input group changes results, and the remedy must say so: \
+             {remedy}"
         );
     }
 
@@ -1540,20 +1602,21 @@ mod tests {
         }
 
         let err = buffer
-            .take_group("rs", &partition_by(), &key, 256)
+            .take_group("rs", &key, 256, &limit_of(256))
             .expect_err("a group exceeding the hard limit must be rejected at finalize");
-        let PipelineError::MemoryBudgetExceeded { detail, .. } = &err else {
+        let PipelineError::MemoryBudgetExceeded { report } = &err else {
             panic!("a giant correlation group must surface E310; got {err:?}");
         };
-        let detail = detail.as_deref().expect("the overrun must carry detail");
-        assert!(
-            detail.contains("[gid=null]"),
-            "the group must still be named: {detail}"
+        assert_eq!(
+            report.group_first_row.as_ref().map(|first| first.row),
+            Some(0),
+            "the group must still be named: {report:?}"
         );
         // `partition_key` funnels six distinct causes into the null group, and
         // naming only the blank case sends an author looking for blanks, finding
-        // too few to explain the size, and stopping. Every cause the code folds
-        // in must be named.
+        // too few to explain the size, and stopping. The remedy the report
+        // routes to must name every cause the code folds in.
+        let remedy = crate::executor::util::e310_section("Rows held for Reshape groups");
         for cause in [
             "missing column",
             "explicit null",
@@ -1562,8 +1625,8 @@ mod tests {
             "array- or map-valued",
         ] {
             assert!(
-                detail.contains(cause),
-                "a null-keyed group must disclose that {cause:?} lands here too: {detail}"
+                remedy.contains(cause),
+                "the remedy must disclose that {cause:?} lands in a null group too: {remedy}"
             );
         }
     }
