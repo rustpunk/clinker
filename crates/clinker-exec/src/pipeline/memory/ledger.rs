@@ -362,7 +362,7 @@ impl MemoryArbitrator {
     /// recorded nowhere: the ledger is exactly as it was. The caller falls
     /// back to the size it needs through [`Self::reserve`].
     pub fn reserve_if_free(&self, bytes: u64, requester: Requester) -> Result<Grant, Shortfall> {
-        self.reserve(bytes, requester)
+        self.reserve_now(bytes, requester)
     }
 
     /// One locked check-and-charge, with no reclaim.
