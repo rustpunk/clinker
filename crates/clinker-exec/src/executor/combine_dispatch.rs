@@ -1287,6 +1287,8 @@ where
                 // driver row. `KeyExtractor::extract_into` pushes onto the end; the
                 // kernel clears it before each call.
                 let mut probe_keys_buf: Vec<Value> = Vec::with_capacity(probe_extractor.len());
+                // One driver's failures, drained after each probe.
+                let mut probe_failures: Vec<ProbeFailure> = Vec::new();
 
                 for (probe_record, rn) in driver_buf {
                     let source_file_arc = source_file_arc_of(&probe_record);
@@ -1298,16 +1300,20 @@ where
                         rn,
                         probe_record.doc_ctx(),
                     );
-                    let step = kernel.probe_row(
+                    kernel.probe_row(
                         &eval_ctx,
                         &probe_record,
                         rn,
                         &mut probe_keys_buf,
-                        &mut probe_counters,
-                        &mut output_records,
+                        ProbeSink {
+                            rows: &mut output_records,
+                            failures: &mut probe_failures,
+                            counters: &mut probe_counters,
+                        },
                     )?;
-                    if let ProbeRowStep::Deferred(f) = step {
-                        let f = *f;
+                    // Each failing match is its own failure; the driver's
+                    // successful matches keep their output rows.
+                    for f in probe_failures.drain(..) {
                         dispatch_combine_output_error(
                             ctx,
                             node_idx,
@@ -1318,10 +1324,6 @@ where
                             f.error,
                             f.failed_at,
                         )?;
-                        // A deferred failure routes the whole driver row to the DLQ;
-                        // no output rows survive for it.
-                        output_records.truncate(before);
-                        continue;
                     }
                     emitted_since_check += output_records.len() - before;
 
@@ -1612,15 +1614,18 @@ fn run_streaming_combine_probe(
                 };
 
                 let before = output_records.len();
-                let step = match kernel.probe_row(
+                match kernel.probe_row(
                     &eval_ctx,
                     &record,
                     rn,
                     &mut probe_keys_buf,
-                    &mut counters,
-                    &mut output_records,
+                    ProbeSink {
+                        rows: &mut output_records,
+                        failures: &mut effects.failures,
+                        counters: &mut counters,
+                    },
                 ) {
-                    Ok(step) => step,
+                    Ok(()) => {}
                     Err(e) => {
                         // Fatal (FailFast surfacing, on_miss::error,
                         // planner-invariant) — drain to disconnect, then
@@ -1640,13 +1645,6 @@ fn run_streaming_combine_probe(
                         return Err(e);
                     }
                 };
-                if let ProbeRowStep::Deferred(f) = step {
-                    // The whole driver row routes to the DLQ; no output rows
-                    // survive for it.
-                    output_records.truncate(before);
-                    effects.failures.push(*f);
-                    continue;
-                }
 
                 // The opt-in `max_output_rows` cap (E325) is enforced per-row inside
                 // `kernel.probe_row`; when it trips, `probe_row` returns `Err`, which
@@ -1764,22 +1762,6 @@ fn run_streaming_combine_probe(
     })
 }
 
-/// Per-driver-row outcome the probe kernel returns to its caller. The
-/// materialized inline loop and the streaming-probe thread both drive
-/// [`CombineProbeKernel::probe_row`], which emits output rows directly into
-/// the caller's buffer and signals row-level disposition here. Fatal errors
-/// (FailFast surfacing, `on_miss: error`, planner-invariant violations,
-/// `EmitMany` fan-out) short-circuit as `Err` instead.
-enum ProbeRowStep {
-    /// The row produced zero or more output records (already pushed) and
-    /// the driver loop continues.
-    Continue,
-    /// A recoverable per-row eval failure under `Continue`. The caller
-    /// routes it through `dispatch_combine_output_error` (cursor rewind +
-    /// DLQ) — inline immediately, or after the streaming join.
-    Deferred(Box<ProbeFailure>),
-}
-
 /// A recoverable combine output-row failure deferred for DLQ routing. The
 /// streaming-probe thread cannot touch `&mut ExecutorContext`, so it
 /// accumulates these and the dispatch thread replays each via
@@ -1792,6 +1774,14 @@ struct ProbeFailure {
     error: cxl::eval::EvalError,
     /// Taken as the probe observed the failure, on whichever thread ran it.
     failed_at: DlqFailureStamp,
+}
+
+/// Where [`CombineProbeKernel::probe_row`] puts what one driver produced:
+/// its output rows, its recoverable failures, and its skip counts.
+struct ProbeSink<'a> {
+    rows: &'a mut Vec<(Record, crate::executor::stream_event::SourceRowId)>,
+    failures: &'a mut Vec<ProbeFailure>,
+    counters: &'a mut ProbeCounters,
 }
 
 /// `distinct` / `filtered` skip counts the probe kernel accumulates so the
@@ -1867,22 +1857,32 @@ impl CombineProbeKernel<'_> {
     }
 
     /// Probe one driver record against the materialized hash table, pushing
-    /// every emitted `(Record, row_num)` into `out` and accumulating
-    /// `distinct` / `filtered` skips into `counters`. Returns
-    /// [`ProbeRowStep::Continue`] on success (zero or more rows emitted) or
-    /// [`ProbeRowStep::Deferred`] for a recoverable per-row failure the
-    /// caller routes through the DLQ (or as `Err` when `self.fail_fast` is
-    /// set). The signature is `&mut ExecutorContext`-free so the streaming
-    /// probe thread can call it.
+    /// every emitted `(Record, row_num)` into `out`, every recoverable
+    /// output-stage failure into `failures`, and accumulating `distinct` /
+    /// `filtered` skips into `counters`.
+    ///
+    /// Every matched pair is evaluated, as the join kernels evaluate it: a
+    /// failing residual or body on one pair is one failure, with that pair's
+    /// build row, and the driver's other pairs still match and emit. A
+    /// failing residual does not count as a match, so under `match: first`
+    /// the next candidate is tried. A probe-key or `on_miss: null_fields`
+    /// failure is one failure with no build row. Fatal errors (`FailFast`
+    /// surfacing, `on_miss: error`, planner-invariant violations) return
+    /// `Err`. The caller routes `failures` through the DLQ; the signature is
+    /// `&mut ExecutorContext`-free so the streaming probe thread can call it.
     fn probe_row(
         &self,
         eval_ctx: &cxl::eval::EvalContext<'_>,
         probe_record: &Record,
         rn: crate::executor::stream_event::SourceRowId,
         probe_keys_buf: &mut Vec<Value>,
-        counters: &mut ProbeCounters,
-        out: &mut Vec<(Record, crate::executor::stream_event::SourceRowId)>,
-    ) -> Result<ProbeRowStep, PipelineError> {
+        sink: ProbeSink<'_>,
+    ) -> Result<(), PipelineError> {
+        let ProbeSink {
+            rows: out,
+            failures,
+            counters,
+        } = sink;
         use crate::executor::combine::CombineResolver;
         use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
 
@@ -1902,13 +1902,14 @@ impl CombineProbeKernel<'_> {
             }
             // No build candidate matched yet — the failure is on the probe
             // key itself, so only the driver source rewinds.
-            return Ok(ProbeRowStep::Deferred(Box::new(ProbeFailure {
+            failures.push(ProbeFailure {
                 probe_record: probe_record.clone(),
                 rn,
                 matched_build: None,
                 error: e,
                 failed_at: DlqFailureStamp::now(),
-            })));
+            });
+            return Ok(());
         }
 
         match self.match_mode {
@@ -1942,7 +1943,7 @@ impl CombineProbeKernel<'_> {
                                 if self.fail_fast {
                                     return Err(PipelineError::from(e));
                                 }
-                                return Ok(ProbeRowStep::Deferred(Box::new(ProbeFailure {
+                                failures.push(ProbeFailure {
                                     probe_record: probe_record.clone(),
                                     rn,
                                     matched_build: Some(MatchedBuildFailure {
@@ -1951,7 +1952,8 @@ impl CombineProbeKernel<'_> {
                                     }),
                                     error: e,
                                     failed_at: DlqFailureStamp::now(),
-                                })));
+                                });
+                                continue;
                             }
                         }
                     }
@@ -1997,7 +1999,7 @@ impl CombineProbeKernel<'_> {
                 );
                 self.check_output_cap(out.len())?;
                 out.push((rec, rn));
-                Ok(ProbeRowStep::Continue)
+                Ok(())
             }
 
             MatchMode::First | MatchMode::All => {
@@ -2034,7 +2036,7 @@ impl CombineProbeKernel<'_> {
                                     if self.fail_fast {
                                         return Err(PipelineError::from(e));
                                     }
-                                    return Ok(ProbeRowStep::Deferred(Box::new(ProbeFailure {
+                                    failures.push(ProbeFailure {
                                         probe_record: probe_record.clone(),
                                         rn,
                                         matched_build: Some(MatchedBuildFailure {
@@ -2043,7 +2045,8 @@ impl CombineProbeKernel<'_> {
                                         }),
                                         error: e,
                                         failed_at: DlqFailureStamp::now(),
-                                    })));
+                                    });
+                                    continue;
                                 }
                             }
                         }
@@ -2060,7 +2063,7 @@ impl CombineProbeKernel<'_> {
 
                 if matched_records.is_empty() {
                     match self.on_miss {
-                        OnMiss::Skip => Ok(ProbeRowStep::Continue),
+                        OnMiss::Skip => Ok(()),
                         OnMiss::Error => Err(PipelineError::CombineMissingMatch {
                             combine: name.to_string(),
                             driver_row: rn.ordinal(),
@@ -2095,15 +2098,15 @@ impl CombineProbeKernel<'_> {
                                     }
                                     self.check_output_cap(out.len())?;
                                     out.push((rec, rn));
-                                    Ok(ProbeRowStep::Continue)
+                                    Ok(())
                                 }
                                 Ok(EvalResult::Skip(SkipReason::Filtered)) => {
                                     counters.filtered += 1;
-                                    Ok(ProbeRowStep::Continue)
+                                    Ok(())
                                 }
                                 Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
                                     counters.distinct += 1;
-                                    Ok(ProbeRowStep::Continue)
+                                    Ok(())
                                 }
                                 Ok(EvalResult::EmitMany { .. }) => Err(PipelineError::Internal {
                                     op: "combine on_miss body",
@@ -2117,13 +2120,14 @@ impl CombineProbeKernel<'_> {
                                     }
                                     // on_miss path: no build row matched, so
                                     // only the driver source rewinds.
-                                    Ok(ProbeRowStep::Deferred(Box::new(ProbeFailure {
+                                    failures.push(ProbeFailure {
                                         probe_record: probe_record.clone(),
                                         rn,
                                         matched_build: None,
                                         error: e,
                                         failed_at: DlqFailureStamp::now(),
-                                    })))
+                                    });
+                                    Ok(())
                                 }
                             }
                         }
@@ -2174,17 +2178,18 @@ impl CombineProbeKernel<'_> {
                                 if self.fail_fast {
                                     return Err(PipelineError::from(e));
                                 }
-                                return Ok(ProbeRowStep::Deferred(Box::new(ProbeFailure {
+                                failures.push(ProbeFailure {
                                     probe_record: probe_record.clone(),
                                     rn,
                                     matched_build: Some(matched.clone()),
                                     error: e,
                                     failed_at: DlqFailureStamp::now(),
-                                })));
+                                });
+                                continue;
                             }
                         }
                     }
-                    Ok(ProbeRowStep::Continue)
+                    Ok(())
                 } else {
                     // Body-less synthetic step from N-ary combine
                     // decomposition: the encoded output schema concatenates
@@ -2222,7 +2227,7 @@ impl CombineProbeKernel<'_> {
                         self.check_output_cap(out.len())?;
                         out.push((rec, rn));
                     }
-                    Ok(ProbeRowStep::Continue)
+                    Ok(())
                 }
             }
         }
