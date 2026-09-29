@@ -5,7 +5,7 @@
 //! and the run still takes the reserve, shortfall, spill and E310 paths a
 //! small limit forces. An in-process run judges `memory.limit` against an
 //! injected baseline rather than the shared test process's resident memory,
-//! and a whole-unit spill-then-reload test can force exactly one shortfall.
+//! and a test can force a targeted shortfall on any charge path.
 
 #![cfg(feature = "test-utils")]
 
@@ -433,7 +433,9 @@ fn forced_shortfall_fires_on_grant_growth() {
     assert_eq!(shortfall.snapshot.charged, KIB, "nothing was charged");
     assert_eq!(grant.bytes(), KIB, "the grant is unchanged");
 
-    grant.try_grow(KIB).expect("the retry grows by the real path");
+    grant
+        .try_grow(KIB)
+        .expect("the retry grows by the real path");
     assert_eq!(grant.bytes(), 2 * KIB);
     assert_eq!(arbitrator.charged_bytes(), 2 * KIB);
 }

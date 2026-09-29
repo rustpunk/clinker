@@ -7,7 +7,7 @@
 //! consumer's handle charges.
 
 use super::ledger::Requester;
-use super::protocol::{LedgerCore, LedgerState};
+use super::protocol::{AdmissionGate, LedgerCore, LedgerState};
 use super::*;
 use clinker_format::preparation::{ResourceError, ResourceErrorKind};
 use clinker_plan::runtime_error::ConsumerLabel;
@@ -37,14 +37,34 @@ pub struct WriterResourceUsage {
 /// id to unregister. The handle charges nothing: the writer's staged bytes
 /// are governed allocations the ledger already holds.
 ///
-/// Test builds also keep an armed forced shortfall here, because `reserve`
-/// must count and fire it in the same step as its own check.
+/// Test builds also keep an armed forced shortfall here: it is the ledger's
+/// [`AdmissionGate`], so every charge counts and fires it in the same step
+/// as its own check.
 #[derive(Default)]
 pub(super) struct WriterBinding {
     pub handle: Option<Arc<ConsumerHandle>>,
     pub consumer_id: Option<ConsumerId>,
     #[cfg(any(test, feature = "test-utils"))]
     pub forced_shortfall: Option<super::ledger::ArmedShortfall>,
+}
+
+/// Outside test builds nothing can be armed, so the gate never refuses and
+/// admission skips it.
+impl AdmissionGate<ConsumerLabel> for WriterBinding {
+    #[cfg(any(test, feature = "test-utils"))]
+    const CAN_REFUSE: bool = true;
+
+    #[cfg(any(test, feature = "test-utils"))]
+    fn force_refusal(&mut self, label: &ConsumerLabel, resident: u64) -> bool {
+        let Some(armed) = self.forced_shortfall.as_mut() else {
+            return false;
+        };
+        let fired = armed.fires(label, resident);
+        if armed.spent() {
+            self.forced_shortfall = None;
+        }
+        fired
+    }
 }
 
 /// The ledger as this crate instantiates it.

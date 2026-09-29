@@ -241,12 +241,15 @@ pub(super) fn shortfall(
     requester: Option<ConsumerId>,
     refusal: Refusal,
 ) -> Shortfall {
-    let (available, oversized, closed) = match refusal {
-        Refusal::Closed => (0, false, true),
+    let (available, oversized, closed, forced) = match refusal {
+        Refusal::Closed => (0, false, true, false),
         Refusal::Short {
             available,
             oversized,
-        } => (available, oversized, false),
+        } => (available, oversized, false, false),
+        // Nothing reported available, so the caller's pass targets the
+        // whole request, as it would for a real shortage.
+        Refusal::Forced => (0, false, false, true),
     };
     Shortfall {
         requested,
@@ -254,7 +257,7 @@ pub(super) fn shortfall(
         oversized,
         snapshot: snapshot(ledger, requested, requester),
         closed,
-        forced: false,
+        forced,
     }
 }
 
@@ -271,10 +274,6 @@ impl MemoryArbitrator {
     /// for this call.
     pub fn reserve(&self, bytes: u64, requester: Requester) -> Result<Grant, Shortfall> {
         let mut ledger = self.admission.ledger.lock();
-        #[cfg(any(test, feature = "test-utils"))]
-        if let Some(forced) = take_forced_shortfall(&mut ledger, bytes, requester) {
-            return Err(forced);
-        }
         if let Err(refusal) = ledger.try_charge(bytes, requester.consumer.map(|id| id.0)) {
             return Err(shortfall(&ledger, bytes, requester.consumer, refusal));
         }
@@ -318,73 +317,78 @@ impl MemoryArbitrator {
     }
 }
 
-/// A [`crate::executor::ForcedShortfall`] armed on the ledger, with the
-/// matching requests it has counted so far. Held under the ledger lock, so
-/// counting and firing are one step with the reserve they decide.
+/// A [`crate::executor::ForcedShortfall`] armed on the ledger: the matching
+/// charges it has counted, the count its next firing is due at and the
+/// firings it has left. Held in the ledger's attachment, so counting and
+/// firing are one step with the admission they decide.
 #[cfg(any(test, feature = "test-utils"))]
 pub(super) struct ArmedShortfall {
     shortfall: crate::executor::ForcedShortfall,
     seen: u32,
+    due: u32,
+    left: u32,
 }
 
-/// Count `requester`'s reserve against the armed forced shortfall and fire it
-/// when this is the nth match: the refusal a real shortage would give, with
-/// the snapshot taken under the same lock and nothing reported available, so
-/// the caller's pass targets the whole request. Firing disarms it; nothing is
-/// charged.
-///
-/// Only a reserve that could otherwise be granted counts: a closed ledger, a
-/// zero-byte request and an oversized one take the real path. A governed
-/// request, or one for a consumer the ledger holds no label for, never
-/// matches. The matcher runs under the ledger lock, so it must be a pure
-/// predicate on the label.
 #[cfg(any(test, feature = "test-utils"))]
-fn take_forced_shortfall(
-    ledger: &mut LockedLedger,
-    bytes: u64,
-    requester: Requester,
-) -> Option<Shortfall> {
-    if ledger.closed || bytes == 0 || bytes > ledger.limit() {
-        return None;
+impl ArmedShortfall {
+    fn new(shortfall: crate::executor::ForcedShortfall) -> Self {
+        Self {
+            due: shortfall.nth(),
+            left: shortfall.firings(),
+            seen: 0,
+            shortfall,
+        }
     }
-    let consumer = requester.consumer?;
-    let accepts = match (
-        &ledger.attachment.forced_shortfall,
-        ledger.label(consumer.0),
-    ) {
-        (Some(armed), Some(label)) => armed.shortfall.accepts(label),
-        _ => false,
-    };
-    if !accepts {
-        return None;
+
+    /// Count a charge by the consumer registered under `label`, holding
+    /// `resident` bytes, and say whether it fires. Only a charge the matcher
+    /// accepts counts. A firing that is due waits for a charge whose
+    /// requester holds bytes, so the refusal always leaves it something to
+    /// free; each firing is recorded on the shared counter and sets the next
+    /// one [`crate::executor::ForcedShortfall::every`] counts later.
+    ///
+    /// The matcher runs under the ledger lock, so it must be a pure
+    /// predicate on the label.
+    pub(super) fn fires(&mut self, label: &ConsumerLabel, resident: u64) -> bool {
+        if !self.shortfall.accepts(label) {
+            return false;
+        }
+        self.seen = self.seen.saturating_add(1);
+        if self.seen < self.due || resident == 0 {
+            return false;
+        }
+        self.left -= 1;
+        self.due = self.seen.saturating_add(self.shortfall.spacing());
+        self.shortfall.record_firing();
+        true
     }
-    let armed = ledger.attachment.forced_shortfall.as_mut()?;
-    armed.seen += 1;
-    if armed.seen < armed.shortfall.nth() {
-        return None;
+
+    /// Whether every firing has happened, so the arm can be dropped.
+    pub(super) fn spent(&self) -> bool {
+        self.left == 0
     }
-    ledger.attachment.forced_shortfall = None;
-    Some(Shortfall {
-        requested: bytes,
-        available: 0,
-        oversized: false,
-        snapshot: snapshot(ledger, bytes, Some(consumer)),
-        closed: false,
-        forced: false,
-    })
 }
 
 #[cfg(any(test, feature = "test-utils"))]
 impl MemoryArbitrator {
-    /// Make the `nth` (from 1) [`Self::reserve`] whose requester's label
-    /// `matcher` accepts fall short once, as if nothing were available;
-    /// every reserve after it, including the caller's retry, takes the real
-    /// path. Arming again replaces an arm that has not fired.
+    /// Make the `nth` (from 1) charge whose requester's label `matcher`
+    /// accepts fall short once, as if nothing were available, or the first
+    /// matching charge after it at which the requester holds resident bytes.
+    /// Every other charge, including the caller's retry, takes the real
+    /// path. Arming again replaces an arm that has not fired. The charge may
+    /// be a [`Self::reserve`], a [`Grant::try_grow`] or a consumer handle's
+    /// `try_grow` / `try_resize`.
     ///
-    /// Used only by tests that spill a whole unit and then reload it, where
-    /// no capacity both forces the spill and admits the reload; each use
-    /// records that reason in its test's doc comment. `matcher` runs under
-    /// the ledger lock and must not call back into the arbitrator.
+    /// For the two kinds of test [`crate::executor::ForcedShortfall`]
+    /// permits: a test that spills a whole unit and then reloads it, where no
+    /// ledger capacity both forces the spill and admits the reload; and a
+    /// spill-path-equivalence test, run twice at the same ample limit (unarmed
+    /// with no spill bytes written, armed with the arm fired and the named
+    /// node's written spill bytes above 0). Each use records its reason in its
+    /// test's doc comment. Proving that the arbitrator spills under real
+    /// pressure stays with the two-direction pairs on a derived capacity.
+    /// `matcher` runs under the ledger lock and must not call back into the
+    /// arbitrator.
     ///
     /// # Panics
     ///
@@ -398,10 +402,13 @@ impl MemoryArbitrator {
     }
 
     /// Arm `shortfall` on the ledger, replacing any arm that has not fired
-    /// its last time.
+    /// its last time. Use it for an arm built with
+    /// [`crate::executor::ForcedShortfall::times`] or
+    /// [`crate::executor::ForcedShortfall::every`], or whose
+    /// [`crate::executor::ForcedShortfall::fired`] counter the test reads.
     pub fn arm_forced_shortfall(&self, shortfall: crate::executor::ForcedShortfall) {
         self.admission.ledger.lock().attachment.forced_shortfall =
-            Some(ArmedShortfall { shortfall, seen: 0 });
+            Some(ArmedShortfall::new(shortfall));
     }
 }
 

@@ -49,7 +49,7 @@ impl<L, A> LedgerCore<L, A> {
     }
 }
 
-/// Why a charge was refused. Nothing was charged in either case.
+/// Why a charge was refused. Nothing was charged in any case.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Refusal {
     /// The ledger no longer admits charges.
@@ -57,7 +57,35 @@ pub(crate) enum Refusal {
     /// The request does not fit. `available` is what could have been
     /// granted; `oversized` means no release could ever make it fit.
     Short { available: u64, oversized: bool },
+    /// The attachment's [`AdmissionGate`] refused a request that could
+    /// otherwise have been checked against the limit.
+    Forced,
 }
+
+/// A refusal the ledger's attachment may make at admission, before the
+/// request is checked against what is available.
+///
+/// Every charge reaches it: [`LedgerState::try_charge`] with its attribution
+/// and [`LedgerState::try_charge_handle`] with its handle's id. It is
+/// consulted only when [`Self::CAN_REFUSE`] is true, and only for a request
+/// made in a labelled consumer's name that the ledger would otherwise weigh:
+/// the ledger is open and the request is nonzero and within the limit. It
+/// runs under the ledger lock, so whatever it counts changes in the same
+/// step as the charge it decides.
+pub(crate) trait AdmissionGate<L> {
+    /// Whether this gate can ever refuse. A gate that cannot leaves it
+    /// false, and admission skips the requester lookup entirely.
+    const CAN_REFUSE: bool = false;
+
+    /// Refuse the request by the consumer registered under `label`, which
+    /// holds `resident` bytes now (its handle plus what grants made in its
+    /// name hold).
+    fn force_refusal(&mut self, _label: &L, _resident: u64) -> bool {
+        false
+    }
+}
+
+impl<L> AdmissionGate<L> for () {}
 
 /// Bytes charged in one consumer's name.
 ///
@@ -160,15 +188,16 @@ impl<L, A> LedgerState<L, A> {
     ///
     /// A closed ledger refuses everything; otherwise a zero-byte request is
     /// granted without charging. A request larger than the limit, or one the
-    /// charged total could not represent, is refused as oversized; one larger
-    /// than [`Self::available`] is refused as short. A grant raises the peak
-    /// and, when attributed, the consumer's attributed bytes and mark.
-    pub(crate) fn try_charge(
-        &mut self,
-        bytes: u64,
-        attribution: Option<u32>,
-    ) -> Result<(), Refusal> {
-        self.admit(bytes)?;
+    /// charged total could not represent, is refused as oversized; one the
+    /// attachment's [`AdmissionGate`] refuses is refused as forced; one
+    /// larger than [`Self::available`] is refused as short. A grant raises
+    /// the peak and, when attributed, the consumer's attributed bytes and
+    /// mark.
+    pub(crate) fn try_charge(&mut self, bytes: u64, attribution: Option<u32>) -> Result<(), Refusal>
+    where
+        A: AdmissionGate<L>,
+    {
+        self.admit(bytes, attribution)?;
         self.granted = self.granted.saturating_add(bytes);
         self.peak_granted = self.peak_granted.max(self.granted);
         if let Some(id) = attribution
@@ -187,8 +216,11 @@ impl<L, A> LedgerState<L, A> {
     /// Check and charge `bytes` to consumer `id`'s handle in one step, with
     /// [`Self::try_charge`]'s refusals. A grant raises the peak and the
     /// consumer's mark.
-    pub(crate) fn try_charge_handle(&mut self, id: u32, bytes: u64) -> Result<(), Refusal> {
-        self.admit(bytes)?;
+    pub(crate) fn try_charge_handle(&mut self, id: u32, bytes: u64) -> Result<(), Refusal>
+    where
+        A: AdmissionGate<L>,
+    {
+        self.admit(bytes, Some(id))?;
         let entry = self
             .consumers
             .entry(id)
@@ -199,8 +231,12 @@ impl<L, A> LedgerState<L, A> {
     }
 
     /// The check both charge kinds share: refuse, or add `bytes` to the
-    /// charged total and raise the peak.
-    fn admit(&mut self, bytes: u64) -> Result<(), Refusal> {
+    /// charged total and raise the peak. `requester` is the consumer the
+    /// charge is made in the name of, if any; only the gate reads it.
+    fn admit(&mut self, bytes: u64, requester: Option<u32>) -> Result<(), Refusal>
+    where
+        A: AdmissionGate<L>,
+    {
         if self.closed {
             return Err(Refusal::Closed);
         }
@@ -213,6 +249,13 @@ impl<L, A> LedgerState<L, A> {
                 available,
                 oversized: true,
             });
+        }
+        if A::CAN_REFUSE
+            && let Some(entry) = requester.and_then(|id| self.consumers.get(&id))
+            && let Some(label) = &entry.label
+            && self.attachment.force_refusal(label, entry.current())
+        {
+            return Err(Refusal::Forced);
         }
         if bytes > available {
             return Err(Refusal::Short {
@@ -347,13 +390,6 @@ impl<L, A> LedgerState<L, A> {
             self.discharge(entry.handle);
         }
         Some(entry.mark)
-    }
-
-    /// The label consumer `id` was registered under, if the ledger holds
-    /// one for it.
-    #[cfg(any(test, feature = "test-utils"))]
-    pub(crate) fn label(&self, id: u32) -> Option<&L> {
-        self.consumers.get(&id)?.label.as_ref()
     }
 
     /// `id`'s high-water mark of handle plus attributed bytes, or `None`
