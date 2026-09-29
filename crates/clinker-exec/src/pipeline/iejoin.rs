@@ -87,7 +87,9 @@ use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use crate::executor::combine::{CombineResolver, CombineResolverMapping};
 use crate::executor::widen_record_to_schema;
-use crate::pipeline::combine::{CombineOutputEvalFailure, KeyExtractor, canonical_key_bytes};
+use crate::pipeline::combine::{
+    CombineOutputEvalFailure, KeyExtractor, MatchedBuildFailure, canonical_key_bytes,
+};
 use crate::pipeline::memory::{ConsumerHandle, MemoryArbitrator};
 use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
 use clinker_plan::BudgetCategory;
@@ -1411,7 +1413,10 @@ fn emit_pairs(
                         CombineOutputEvalFailure {
                             probe_record: driver_record.clone(),
                             row: driver_order,
-                            matched_build: Some((build_record.clone(), build_row)),
+                            matched_build: Some(MatchedBuildFailure {
+                                record: build_record.clone(),
+                                row: build_row,
+                            }),
                             error: e,
                             failed_at: crate::executor::DlqFailureStamp::now(),
                         },
@@ -1518,7 +1523,10 @@ fn emit_match_row(
                     CombineOutputEvalFailure {
                         probe_record: driver_record.clone(),
                         row: driver_order,
-                        matched_build: Some((build_record.clone(), build_row)),
+                        matched_build: Some(MatchedBuildFailure {
+                            record: build_record.clone(),
+                            row: build_row,
+                        }),
                         error: e,
                         failed_at: crate::executor::DlqFailureStamp::now(),
                     },

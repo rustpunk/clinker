@@ -29,6 +29,7 @@ use crate::executor::schema_check::check_input_schema;
 use crate::executor::{
     DlqEntry, DlqFailureStamp, NullStorage, stage_metrics, widen_record_to_schema,
 };
+use crate::pipeline::combine::MatchedBuildFailure;
 use crate::pipeline::iejoin::RecordOrder;
 use clinker_plan::BudgetCategory;
 use clinker_plan::config::ErrorStrategy;
@@ -936,7 +937,7 @@ where
                         node_idx,
                         &f.probe_record,
                         f.row,
-                        f.matched_build.as_ref().map(|(record, row)| (record, *row)),
+                        f.matched_build.as_ref(),
                         name,
                         f.error,
                         f.failed_at,
@@ -1313,9 +1314,7 @@ where
                             node_idx,
                             &f.probe_record,
                             f.rn,
-                            f.matched_build
-                                .as_ref()
-                                .map(|matched| (&matched.record, matched.row)),
+                            f.matched_build.as_ref(),
                             name,
                             f.error,
                             f.failed_at,
@@ -1749,9 +1748,7 @@ fn run_streaming_combine_probe(
             node_idx,
             &f.probe_record,
             f.rn,
-            f.matched_build
-                .as_ref()
-                .map(|matched| (&matched.record, matched.row)),
+            f.matched_build.as_ref(),
             name,
             f.error,
             f.failed_at,
@@ -1796,15 +1793,6 @@ struct ProbeFailure {
     error: cxl::eval::EvalError,
     /// Taken as the probe observed the failure, on whichever thread ran it.
     failed_at: DlqFailureStamp,
-}
-
-/// Exact build-side contribution attached to an inline combine output-row
-/// failure. `record` supplies diagnostics and correlation lineage; `row`
-/// remains the authoritative attempt-local identity used for deduplication.
-#[derive(Clone)]
-struct MatchedBuildFailure {
-    record: Record,
-    row: crate::executor::stream_event::SourceRowId,
 }
 
 /// `distinct` / `filtered` skip counts the probe kernel accumulates so the
@@ -1859,14 +1847,7 @@ impl CombineProbeKernel<'_> {
         &self,
         index: usize,
     ) -> Result<crate::executor::stream_event::SourceRowId, PipelineError> {
-        self.build_row_ids
-            .get(index)
-            .copied()
-            .ok_or_else(|| PipelineError::Internal {
-                op: "combine",
-                node: self.name.to_string(),
-                detail: format!("matched build index {index} has no aligned source-row identity"),
-            })
+        crate::pipeline::combine::matched_build_row(self.build_row_ids, index, "combine", self.name)
     }
 
     /// Fail loud with E325 if the combine's cumulative output has already reached
@@ -2267,7 +2248,7 @@ fn dispatch_combine_output_errors(
             node_idx,
             &f.probe_record,
             f.row,
-            f.matched_build.as_ref().map(|(record, row)| (record, *row)),
+            f.matched_build.as_ref(),
             combine_name,
             f.error,
             f.failed_at,
@@ -2832,7 +2813,7 @@ fn dispatch_combine_output_error(
     node_idx: NodeIndex,
     probe_record: &Record,
     row_num: crate::executor::stream_event::SourceRowId,
-    matched_build: Option<(&Record, crate::executor::stream_event::SourceRowId)>,
+    matched_build: Option<&MatchedBuildFailure>,
     combine_name: &str,
     eval_err: cxl::eval::EvalError,
     failed_at: DlqFailureStamp,
@@ -2844,7 +2825,7 @@ fn dispatch_combine_output_error(
     let probe_source = source_name_arc_of(probe_record);
     let build_source = matched_build
         .as_ref()
-        .map(|(record, _)| source_name_arc_of(record));
+        .map(|matched| source_name_arc_of(&matched.record));
 
     // Rewind every contributing source to its captured pre-fold floor
     // before admitting any DLQ entry. The snapshot was taken at fold
@@ -2911,7 +2892,11 @@ fn dispatch_combine_output_error(
     // the contributing build lineage reaches the DLQ. The matched record and
     // its identity travel as one pair so attribution cannot silently mix a
     // build record with an unrelated row id.
-    if let Some((build_record, build_row_num)) = matched_build {
+    if let Some(MatchedBuildFailure {
+        record: build_record,
+        row: build_row_num,
+    }) = matched_build
+    {
         // One failure, two dead letters: the build side keeps the failure's
         // time and trigger id under its own id, so it pairs with the driver
         // row wherever it is held.
@@ -2927,7 +2912,7 @@ fn dispatch_combine_output_error(
                 probe_record,
                 row_num,
                 build_record,
-                build_row_num,
+                *build_row_num,
                 category,
                 message.clone(),
                 stage.clone(),
@@ -2940,7 +2925,7 @@ fn dispatch_combine_output_error(
             push_dlq(
                 ctx,
                 DlqEntry {
-                    source_row: build_row_num,
+                    source_row: *build_row_num,
                     category,
                     error_message: message,
                     original_record: build_record.clone(),

@@ -58,7 +58,7 @@ use indexmap::IndexMap;
 
 use crate::executor::combine::{CombineResolver, CombineResolverMapping};
 use crate::executor::widen_record_to_schema;
-use crate::pipeline::combine::{CombineOutputEvalFailure, KeyExtractor};
+use crate::pipeline::combine::{CombineOutputEvalFailure, KeyExtractor, MatchedBuildFailure};
 use crate::pipeline::memory::MemoryArbitrator;
 #[cfg(test)]
 use crate::pipeline::memory::NoOpPolicy;
@@ -1898,7 +1898,10 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
                             failures.push(CombineOutputEvalFailure {
                                 probe_record: driver_record.clone(),
                                 row: driver_order,
-                                matched_build: Some((inner.clone(), build_row)),
+                                matched_build: Some(MatchedBuildFailure {
+                                    record: inner.clone(),
+                                    row: build_row,
+                                }),
                                 error: e,
                                 failed_at: crate::executor::DlqFailureStamp::now(),
                             });
@@ -1980,7 +1983,10 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
                             failures.push(CombineOutputEvalFailure {
                                 probe_record: driver_record.clone(),
                                 row: driver_order,
-                                matched_build: Some((inner.clone(), build_row)),
+                                matched_build: Some(MatchedBuildFailure {
+                                    record: inner.clone(),
+                                    row: build_row,
+                                }),
                                 error: e,
                                 failed_at: crate::executor::DlqFailureStamp::now(),
                             });
@@ -2042,7 +2048,10 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
                             failures.push(CombineOutputEvalFailure {
                                 probe_record: driver_record.clone(),
                                 row: driver_order,
-                                matched_build: Some((inner.clone(), build_row)),
+                                matched_build: Some(MatchedBuildFailure {
+                                    record: inner.clone(),
+                                    row: build_row,
+                                }),
                                 error: e,
                                 failed_at: crate::executor::DlqFailureStamp::now(),
                             });

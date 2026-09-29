@@ -480,17 +480,46 @@ pub(crate) struct CombineOutputEvalFailure {
     /// The matched build record when the failure occurred on a matched pair
     /// (residual or matched body); `None` for an `on_miss: null_fields`
     /// failure where no build row contributed.
-    ///
-    /// The record travels with the row id its Source minted, as one pair, so
-    /// a dead letter can never pair a build record with another row's
-    /// identity.
-    pub matched_build: Option<(Record, crate::executor::stream_event::SourceRowId)>,
+    pub matched_build: Option<MatchedBuildFailure>,
     /// The captured eval error. `EvalError` is `Clone`, so stashing the
     /// failing error per row and replaying it from the dispatcher is sound.
     pub error: EvalError,
     /// Taken in the kernel as the failure is observed, so the dead letter
     /// the dispatcher emits after the kernel returns reports that moment.
     pub failed_at: crate::executor::DlqFailureStamp,
+}
+
+/// The build record a failing Combine output row matched, with the row id
+/// its Source minted. The two travel as one value so a dead letter can never
+/// pair a build record with another row's identity. `record` supplies
+/// diagnostics and correlation lineage; `row` is the authoritative identity.
+#[derive(Debug, Clone)]
+pub(crate) struct MatchedBuildFailure {
+    pub record: Record,
+    pub row: crate::executor::stream_event::SourceRowId,
+}
+
+/// The row id of the build candidate at `index` in `build_rows`, which a
+/// join kernel keeps aligned with its candidate indices. A candidate without
+/// one is an engine invariant violation, reported as
+/// `PipelineError::Internal` under `op` and the Combine `name`.
+pub(crate) fn matched_build_row(
+    build_rows: &[crate::executor::stream_event::SourceRowId],
+    index: usize,
+    op: &'static str,
+    name: &str,
+) -> Result<crate::executor::stream_event::SourceRowId, clinker_plan::error::PipelineError> {
+    build_rows
+        .get(index)
+        .copied()
+        .ok_or_else(|| clinker_plan::error::PipelineError::Internal {
+            op,
+            node: name.to_string(),
+            detail: format!(
+                "matched build index {index} has no aligned source-row identity; {} are held",
+                build_rows.len()
+            ),
+        })
 }
 
 /// A combine kernel's emitted rows plus any recoverable output-stage eval

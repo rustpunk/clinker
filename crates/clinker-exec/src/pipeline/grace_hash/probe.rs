@@ -14,7 +14,7 @@ use super::RecordOrder;
 use crate::executor::combine::{CombineResolver, CombineResolverMapping};
 use crate::executor::widen_record_to_schema;
 use crate::pipeline::combine::BuildSeq;
-use crate::pipeline::combine::{CombineOutputEvalFailure, ProbeIter};
+use crate::pipeline::combine::{CombineOutputEvalFailure, MatchedBuildFailure, ProbeIter};
 use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::combine::DecomposedPredicate;
@@ -210,7 +210,10 @@ pub(super) fn emit_for_probe<'a>(
                             sink.failures.push(CombineOutputEvalFailure {
                                 probe_record: probe_record.clone(),
                                 row: rn,
-                                matched_build: Some((cand.record.clone(), row)),
+                                matched_build: Some(MatchedBuildFailure {
+                                    record: cand.record.clone(),
+                                    row,
+                                }),
                                 error: e,
                                 failed_at: crate::executor::DlqFailureStamp::now(),
                             });
@@ -286,7 +289,10 @@ pub(super) fn emit_for_probe<'a>(
                                 sink.failures.push(CombineOutputEvalFailure {
                                     probe_record: probe_record.clone(),
                                     row: rn,
-                                    matched_build: Some((cand.record.clone(), row)),
+                                    matched_build: Some(MatchedBuildFailure {
+                                        record: cand.record.clone(),
+                                        row,
+                                    }),
                                     error: e,
                                     failed_at: crate::executor::DlqFailureStamp::now(),
                                 });
@@ -399,7 +405,10 @@ pub(super) fn emit_for_probe<'a>(
                             sink.failures.push(CombineOutputEvalFailure {
                                 probe_record: probe_record.clone(),
                                 row: rn,
-                                matched_build: Some((m.clone(), *build_row)),
+                                matched_build: Some(MatchedBuildFailure {
+                                    record: m.clone(),
+                                    row: *build_row,
+                                }),
                                 error: e,
                                 failed_at: crate::executor::DlqFailureStamp::now(),
                             });
