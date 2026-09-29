@@ -2236,9 +2236,9 @@ impl MemoryArbitrator {
     /// regardless — so a partial or zero spill is fine and no error is
     /// surfaced. `try_spill` flips each victim's `spill_requested` flag,
     /// which its operator reads at the next batch boundary.
-    pub fn spill_reclaimable(&self, target_bytes: u64) {
+    pub fn spill_reclaimable(&self, target_bytes: u64) -> u64 {
         if target_bytes == 0 {
-            return;
+            return 0;
         }
         let consumers = self.consumers.load();
         let mut ordered: Vec<&(ConsumerId, Arc<dyn MemoryConsumer>)> = consumers
@@ -2255,6 +2255,7 @@ impl MemoryArbitrator {
                 remaining = remaining.saturating_sub(freed);
             }
         }
+        0
     }
 }
 

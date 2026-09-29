@@ -365,6 +365,34 @@ impl MemoryArbitrator {
         self.reserve_now(bytes, requester)
     }
 
+    /// Check that `projected` bytes not yet charged would fit beside the
+    /// ledger's charges, for a hard-limit backstop whose growth is not a
+    /// consumer charge. Charges nothing.
+    pub fn reclaim_before_abort(
+        &self,
+        requester: Requester,
+        projected: u64,
+    ) -> Result<(), Shortfall> {
+        self.projection_fits(projected, requester)
+    }
+
+    /// Whether `projected` more bytes fit now, checked under the ledger lock
+    /// as a charge would be, without charging them.
+    fn projection_fits(&self, projected: u64, requester: Requester) -> Result<(), Shortfall> {
+        let ledger = self.admission.ledger.lock();
+        let refusal = if ledger.closed {
+            Refusal::Closed
+        } else if projected <= ledger.available() {
+            return Ok(());
+        } else {
+            Refusal::Short {
+                available: ledger.available(),
+                oversized: projected > ledger.limit(),
+            }
+        };
+        Err(shortfall(&ledger, projected, requester.consumer, refusal))
+    }
+
     /// One locked check-and-charge, with no reclaim.
     fn reserve_now(&self, bytes: u64, requester: Requester) -> Result<Grant, Shortfall> {
         let mut ledger = self.admission.ledger.lock();
@@ -1636,8 +1664,8 @@ mod walk_pass_tests {
     use std::rc::Rc;
     use std::sync::atomic::Ordering;
 
-    const KIB: u64 = 1024;
-    const MIB: u64 = 1024 * KIB;
+    pub(super) const KIB: u64 = 1024;
+    pub(super) const MIB: u64 = 1024 * KIB;
 
     /// A registered consumer with a fixed priority whose bytes are its
     /// handle's charge.
@@ -1665,11 +1693,11 @@ mod walk_pass_tests {
         }
     }
 
-    fn run(limit: u64, policy: Box<dyn ArbitrationPolicy>) -> Arc<MemoryArbitrator> {
+    pub(super) fn run(limit: u64, policy: Box<dyn ArbitrationPolicy>) -> Arc<MemoryArbitrator> {
         Arc::new(MemoryArbitrator::with_policy(limit, 0.80, 0.70, policy))
     }
 
-    fn empty_set() -> Rc<RefCell<WalkReclaimSet>> {
+    pub(super) fn empty_set() -> Rc<RefCell<WalkReclaimSet>> {
         Rc::new(RefCell::new(WalkReclaimSet::new(WalkSpillSettings {
             spill_root: Arc::from(std::env::temp_dir().as_path()),
             spill_compress: CompressMode::Auto,
@@ -1678,14 +1706,14 @@ mod walk_pass_tests {
     }
 
     /// Make the calling thread `arbitrator`'s walk, owning `set`.
-    fn walk(
+    pub(super) fn walk(
         arbitrator: &Arc<MemoryArbitrator>,
         set: &Rc<RefCell<WalkReclaimSet>>,
     ) -> WalkContextGuard {
         WalkContextGuard::install(arbitrator, Rc::clone(set))
     }
 
-    fn register(
+    pub(super) fn register(
         arbitrator: &MemoryArbitrator,
         node: &str,
         priority: i32,
@@ -1726,16 +1754,16 @@ mod walk_pass_tests {
     /// their spill request raised; everything else is not owned. Every
     /// consumer a pass elects is recorded, owned or not.
     #[derive(Default)]
-    struct Scripted {
+    pub(super) struct Scripted {
         resident: HashMap<ConsumerId, (Arc<ConsumerHandle>, Vec<Grant>)>,
         held: HashMap<ConsumerId, Arc<ConsumerHandle>>,
-        spilled: Vec<ConsumerId>,
+        pub(super) spilled: Vec<ConsumerId>,
         elected: Vec<ConsumerId>,
         during_spill: Option<Box<dyn FnOnce()>>,
     }
 
     impl Scripted {
-        fn resident(self, id: ConsumerId, handle: &Arc<ConsumerHandle>) -> Self {
+        pub(super) fn resident(self, id: ConsumerId, handle: &Arc<ConsumerHandle>) -> Self {
             self.resident_with(id, handle, Vec::new())
         }
         fn resident_with(
@@ -1755,7 +1783,7 @@ mod walk_pass_tests {
             self.during_spill = Some(Box::new(during));
             self
         }
-        fn shared(self) -> Rc<RefCell<Scripted>> {
+        pub(super) fn shared(self) -> Rc<RefCell<Scripted>> {
             Rc::new(RefCell::new(self))
         }
     }
@@ -1784,12 +1812,12 @@ mod walk_pass_tests {
         }
     }
 
-    fn scripted<R>(set: &Rc<RefCell<Scripted>>, body: impl FnOnce() -> R) -> R {
+    pub(super) fn scripted<R>(set: &Rc<RefCell<Scripted>>, body: impl FnOnce() -> R) -> R {
         let stand_in: Rc<RefCell<dyn WalkReclaim>> = set.clone();
         with_test_reclaim(stand_in, body)
     }
 
-    fn governed() -> Requester {
+    pub(super) fn governed() -> Requester {
         Requester::governed()
     }
 
@@ -2517,5 +2545,231 @@ mod walk_pass_tests {
             256 * KIB,
             "the queue charge stays"
         );
+    }
+}
+
+#[cfg(test)]
+mod reclaim_entry_tests {
+    use super::walk_pass_tests::{
+        KIB, MIB, Scripted, empty_set, governed, register, run, scripted, walk,
+    };
+    use super::*;
+    use crate::pipeline::memory::{ConsumerHandle, ConsumerSpillError, Priority};
+    use clinker_plan::runtime_error::MemorySurface;
+    use std::sync::Mutex;
+
+    /// A registered consumer that records every `try_spill` call and answers
+    /// it only by raising its spill request, reporting a figure that frees
+    /// nothing now.
+    struct Flagged {
+        name: &'static str,
+        handle: Arc<ConsumerHandle>,
+        priority: i32,
+        reclaimable: u64,
+        pausable: bool,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl MemoryConsumer for Flagged {
+        fn current_usage(&self) -> u64 {
+            self.handle.bytes()
+        }
+        fn reclaimable_bytes(&self) -> u64 {
+            self.reclaimable
+        }
+        fn spill_priority(&self) -> i32 {
+            self.priority
+        }
+        fn try_spill(&self, target_bytes: u64) -> Result<u64, ConsumerSpillError> {
+            self.calls.lock().expect("call log").push(self.name);
+            self.handle.request_spill();
+            // Claims the whole target: a caller that trusted this figure
+            // would stop after the first candidate.
+            Ok(target_bytes)
+        }
+        fn can_back_pressure(&self) -> bool {
+            self.pausable
+        }
+    }
+
+    fn flagged(
+        arbitrator: &MemoryArbitrator,
+        calls: &Arc<Mutex<Vec<&'static str>>>,
+        name: &'static str,
+        priority: i32,
+        (charged, reclaimable): (u64, u64),
+        pausable: bool,
+    ) -> Arc<ConsumerHandle> {
+        let handle = ConsumerHandle::new();
+        arbitrator.register_node_consumer(
+            Arc::new(Flagged {
+                name,
+                handle: Arc::clone(&handle),
+                priority,
+                reclaimable,
+                pausable,
+                calls: Arc::clone(calls),
+            }),
+            Arc::clone(&handle),
+            ConsumerLabel {
+                node: name.to_string(),
+                surface: MemorySurface::GroupState,
+            },
+        );
+        handle.set_bytes(charged);
+        handle
+    }
+
+    /// On the walk, `spill_reclaimable` is one reclaim pass aimed at its
+    /// target: it spills walk-owned victims in policy order until their own
+    /// charge decreases cover the target, and reports those decreases.
+    #[test]
+    fn spill_reclaimable_runs_a_pass() {
+        let arbitrator = run(MIB, Box::new(Priority));
+        let (a, a_handle) = register(&arbitrator, "a", 0, 300 * KIB);
+        let (b, b_handle) = register(&arbitrator, "b", 5, 200 * KIB);
+        let (c, c_handle) = register(&arbitrator, "c", 10, 100 * KIB);
+        let set = empty_set();
+        let _walk = walk(&arbitrator, &set);
+        let script = Scripted::default()
+            .resident(a, &a_handle)
+            .resident(b, &b_handle)
+            .resident(c, &c_handle)
+            .shared();
+
+        let before = arbitrator.reclaim_rounds();
+        assert_eq!(
+            scripted(&script, || arbitrator.spill_reclaimable(0)),
+            0,
+            "a zero target runs no pass"
+        );
+        assert_eq!(arbitrator.reclaim_rounds(), before);
+
+        let freed = scripted(&script, || arbitrator.spill_reclaimable(400 * KIB));
+        assert_eq!(
+            script.borrow().spilled,
+            vec![a, b],
+            "victims in policy order until the target is covered"
+        );
+        assert_eq!(freed, 500 * KIB, "the victims' own charge decreases");
+        assert_eq!(arbitrator.reclaim_rounds() - before, 1, "one pass");
+        assert_eq!(arbitrator.charged_bytes(), 100 * KIB);
+        assert_eq!(
+            c_handle.bytes(),
+            100 * KIB,
+            "the last victim stays resident"
+        );
+    }
+
+    /// A hard-limit backstop's projected growth is not charged; on the walk
+    /// it runs the same loop a charge does, retrying after a productive pass
+    /// and refusing only after a pass that freed nothing and a final pass.
+    #[test]
+    fn reclaim_before_abort_runs_the_walk_loop() {
+        let arbitrator = run(MIB, Box::new(Priority));
+        let (partial, partial_handle) = register(&arbitrator, "partial", 0, 100 * KIB);
+        let (other, other_handle) = register(&arbitrator, "other", 5, 200 * KIB);
+        let _filler = arbitrator
+            .reserve(700 * KIB, governed())
+            .expect("filler fits");
+        let before = arbitrator.reclaim_rounds();
+        arbitrator
+            .reclaim_before_abort(governed(), 24 * KIB)
+            .expect("what is free covers the projection");
+        assert_eq!(arbitrator.reclaim_rounds(), before, "no pass when it fits");
+
+        let off_walk = std::thread::scope(|threads| {
+            threads
+                .spawn(|| arbitrator.reclaim_before_abort(governed(), 200 * KIB))
+                .join()
+                .expect("off-walk requester")
+        });
+        let refused = off_walk.expect_err("off the walk the projection is checked once");
+        assert_eq!(refused.requested, 200 * KIB);
+        assert_eq!(arbitrator.reclaim_rounds(), before, "no pass off the walk");
+
+        let set = empty_set();
+        let _walk = walk(&arbitrator, &set);
+        let script = Scripted::default()
+            .resident(partial, &partial_handle)
+            .resident(other, &other_handle)
+            .shared();
+        let charged = arbitrator.charged_bytes();
+        scripted(&script, || {
+            arbitrator.reclaim_before_abort(governed(), 200 * KIB)
+        })
+        .expect("the pass makes room for the projection");
+        assert_eq!(script.borrow().spilled, vec![partial, other]);
+        assert_eq!(arbitrator.reclaim_rounds() - before, 1);
+        assert_eq!(
+            arbitrator.charged_bytes(),
+            charged - 300 * KIB,
+            "the projection itself is never charged"
+        );
+
+        let arbitrator = run(MIB, Box::new(Priority));
+        let (partial, partial_handle) = register(&arbitrator, "partial", 0, 100 * KIB);
+        let _filler = arbitrator
+            .reserve(924 * KIB, governed())
+            .expect("filler fits");
+        let set = empty_set();
+        let _walk = walk(&arbitrator, &set);
+        let script = Scripted::default()
+            .resident(partial, &partial_handle)
+            .shared();
+        let before = arbitrator.reclaim_rounds();
+        let refused = scripted(&script, || {
+            arbitrator.reclaim_before_abort(governed(), 300 * KIB)
+        })
+        .expect_err("100 KiB of a 300 KiB projection, then nothing");
+        assert_eq!(refused.requested, 300 * KIB);
+        assert_eq!(
+            arbitrator.reclaim_rounds() - before,
+            3,
+            "a pass that freed some earns a retry; then a pass that freed none and the final pass"
+        );
+        assert_eq!(script.borrow().spilled, vec![partial]);
+    }
+
+    /// With no walk frame installed a pass spills nothing itself: it raises
+    /// the spill request of spillable candidates in ranking order until their
+    /// reclaimable bytes cover the target, ignoring what `try_spill` claims,
+    /// and never touches a back-pressureable or charged-only consumer.
+    #[test]
+    fn spill_reclaimable_without_a_frame_flags_walk_candidates_in_rank_order() {
+        let arbitrator = run(MIB, Box::new(Priority));
+        let calls = Arc::default();
+        let a = flagged(&arbitrator, &calls, "a", 0, (100 * KIB, 100 * KIB), false);
+        let charged_only = flagged(
+            &arbitrator,
+            &calls,
+            "charged_only",
+            5,
+            (500 * KIB, 0),
+            false,
+        );
+        let b = flagged(&arbitrator, &calls, "b", 10, (100 * KIB, 100 * KIB), false);
+        let source = flagged(&arbitrator, &calls, "source", 0, (50 * KIB, 50 * KIB), true);
+        let c = flagged(&arbitrator, &calls, "c", 20, (100 * KIB, 100 * KIB), false);
+        let charged = arbitrator.charged_bytes();
+        let before = arbitrator.reclaim_rounds();
+
+        let freed = arbitrator.spill_reclaimable(150 * KIB);
+        assert_eq!(
+            *calls.lock().expect("call log"),
+            vec!["a", "b"],
+            "rank order, until their reclaimable bytes cover the target"
+        );
+        assert_eq!(
+            freed, 0,
+            "a raised request frees nothing until its owner acts"
+        );
+        assert!(a.take_spill_request());
+        assert!(b.take_spill_request());
+        assert!(!charged_only.take_spill_request());
+        assert!(!source.take_spill_request());
+        assert!(!c.take_spill_request());
+        assert_eq!(arbitrator.charged_bytes(), charged, "nothing spilled");
+        assert_eq!(arbitrator.reclaim_rounds() - before, 1);
     }
 }
