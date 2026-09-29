@@ -14,14 +14,21 @@
 //! so a future schema change can't silently downgrade the coverage to the
 //! inline arm.
 
+#[cfg(feature = "test-utils")]
 #[path = "common/resource_fixtures.rs"]
 mod resource_fixtures;
+
+#[cfg(feature = "test-utils")]
+#[path = "common/memory_pressure.rs"]
+mod memory_pressure;
 
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_exec::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams, SourceReaders};
+use clinker_exec::executor::{
+    ExecutionReport, MemoryTestOverrides, PipelineExecutor, PipelineRunParams, SourceReaders,
+};
 use clinker_plan::config::{CompileContext, parse_config};
 
 /// A 36-char UUID — past the 23-byte inline boundary, so it is Arc-backed.
@@ -31,9 +38,10 @@ const TICKET_UUID_3: &str = "c2b8d6a4-1f37-4a90-b5e2-8d0c4f6a9b71";
 const AGENT_UUID_EAST: &str = "9b1d7c34-2e5a-4f80-a6c9-1d3b7e2f5a88";
 const AGENT_UUID_WEST: &str = "7f2c5a18-9d3e-4061-b8a4-2c6f9e1d7a05";
 
-// Keep the fixed-width materialization at 90% of the hard limit: it fits the
+// Keep the fixed-width materialization at 90% of the capacity: it fits the
 // scan while remaining above the 80% soft-spill threshold. Use the compiled
 // schema, including engine-stamped columns, and the live carrier layouts.
+#[cfg(feature = "test-utils")]
 fn tight_scan_limit(plan: &clinker_plan::plan::CompiledPlan, rows: usize) -> usize {
     let dag = plan.dag();
     let columns = dag
@@ -78,6 +86,23 @@ fn run_pipeline(
     output_name: &str,
     id: &str,
 ) -> (ExecutionReport, String) {
+    run_pipeline_with(
+        yaml,
+        inputs,
+        output_name,
+        id,
+        MemoryTestOverrides::default(),
+    )
+}
+
+/// [`run_pipeline`] with the run's memory test levers.
+fn run_pipeline_with(
+    yaml: &str,
+    inputs: &[(&str, &str)],
+    output_name: &str,
+    id: &str,
+    memory_test: MemoryTestOverrides,
+) -> (ExecutionReport, String) {
     let config = parse_config(yaml).expect("fixture pipeline must parse");
     let plan = config
         .compile(&CompileContext::default())
@@ -102,9 +127,12 @@ fn run_pipeline(
         Box::new(sink.clone()) as Box<dyn Write + Send>,
     )]);
 
-    let report =
-        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params(id))
-            .expect("pipeline must run to completion");
+    let params = PipelineRunParams {
+        memory_test,
+        ..run_params(id)
+    };
+    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+        .expect("pipeline must run to completion");
     (report, sink.as_string())
 }
 
@@ -408,23 +436,21 @@ nodes:
 
 // ── Spill round-trip: long-field-heavy data forced over the budget ─────────
 
-/// Under a layout-sized spill budget, a long-field-heavy buffer is forced to disk
-/// and reloaded; the run still emits every row with its long values intact.
-/// This exercises the Arc-backed `SmolStr` postcard serde path through a real
-/// spill commit + reload, not just the in-memory clone path.
+/// Under a layout-sized ledger capacity, a long-field-heavy buffer is forced to
+/// disk and reloaded; the run still emits every row with its long values
+/// intact. This exercises the Arc-backed `SmolStr` postcard serde path through
+/// a real spill commit + reload, not just the in-memory clone path. The low
+/// run must write spill bytes, and the capacity must lie below the charged
+/// peak of the same input with ample memory.
+#[cfg(feature = "test-utils")]
 #[test]
 fn spill_roundtrip_preserves_long_fields() {
-    // RSS-gated spill predicate: without an RSS reading the buffer stays in
-    // memory and `cumulative_spill_bytes` never moves, so skip rather than
-    // assert a false negative — matching the existing soft-spill coverage.
-    if clinker_exec::pipeline::memory::rss_bytes().is_none() {
-        return;
-    }
+    use memory_pressure::{assert_capacity_below_ample_peak, assert_spill_engaged};
 
     let yaml = r#"
 pipeline:
   name: long_field_spill
-  memory: { limit: "1M", backpressure: spill }
+  memory: { limit: "512M", backpressure: spill }
 nodes:
   - type: source
     name: src
@@ -494,11 +520,22 @@ nodes:
             + schema.column_count() * std::mem::size_of::<clinker_record::Value>();
     let overlap =
         (ROWS + clinker_exec::executor::DEFAULT_BATCH_SIZE + 256) * row_bytes + writer_workspace;
-    let yaml = yaml.replace(
-        "\"1M\"",
-        &format!("\"{}\"", tight_scan_limit(&plan, ROWS).max(overlap)),
+    // The limit the run had before ledger capacity existed, kept verbatim as
+    // its capacity (1,780,224 bytes on 64-bit targets): above the 1.70 to
+    // 1.75 MB the run needs to complete, where the Route's input reservation
+    // and the reload are resident together, and below the 2,638,922 bytes the
+    // same input charges at its peak with ample memory.
+    let capacity = tight_scan_limit(&plan, ROWS).max(overlap) as u64;
+    let (ample, _) = run_pipeline(yaml, &[("src", &csv)], "out", "spill-long-ample");
+    let (report, output) = run_pipeline_with(
+        yaml,
+        &[("src", &csv)],
+        "out",
+        "spill-long",
+        MemoryTestOverrides::default().with_ledger_capacity(capacity),
     );
-    let (report, output) = run_pipeline(&yaml, &[("src", &csv)], "out", "spill-long");
+    assert_spill_engaged(&report);
+    assert_capacity_below_ample_peak(capacity, &ample);
     assert_eq!(report.counters.dlq_count, 0);
     assert_eq!(report.counters.total_count as usize, ROWS);
     assert!(

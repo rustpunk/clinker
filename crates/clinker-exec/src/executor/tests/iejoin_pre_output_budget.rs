@@ -28,28 +28,61 @@ use clinker_plan::plan::execution::PlanNode;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// A tight hard limit far below process RSS, but above the local footprint of a
-/// single block-pair (two 16 KiB-floored blocks plus kernel aux). This does not
-/// imply that every compressed output frontier and writer can coexist under it.
+/// A tight ledger capacity above the local footprint of a single block-pair
+/// (two 16 KiB-floored blocks plus kernel aux). This does not imply that every
+/// compressed output frontier and writer can coexist under it. It is the hard
+/// limit these tests ran under before capacity existed, kept verbatim: the
+/// spilling fixtures that complete under it charge 1,013,200 (fully pruned) and
+/// 1,070,000 bytes at their peak with ample memory.
 const TIGHT_LIMIT: u64 = 320 * 1024;
+/// The tight capacity of the dead-letter order test: 240 KiB. That fixture
+/// charges only 262,000 bytes at its peak with ample memory, below
+/// [`TIGHT_LIMIT`], and completes at 80,000 bytes, so the capacity is taken
+/// below both, with margin under the peak.
+const DLQ_TIGHT_CAPACITY: u64 = 240 * 1024;
 /// Below a single block-pair's local footprint (two 16 KiB block floors plus
 /// aux), so the first surviving pair trips the local pre-output abort.
 const ABORT_LIMIT: u64 = 8 * 1024;
-/// Comfortably above process RSS, for the resident/degenerate completion path.
+/// The configured limit of every arbitrator here, comfortably above process
+/// RSS; the resident/degenerate completion runs use it uncapped.
 const ROOMY_LIMIT: u64 = 512 * 1024 * 1024;
 const SPILL_FRAC: f64 = 0.80;
 
-/// Arbitrator with the given hard limit and `NoOpPolicy` so no victim is ever
-/// paused or asked to spill — the block-band path spills on its own byte
-/// threshold. `peak_rss` is left unseeded; the real reading would only matter
-/// on the output poll, which these fixtures keep under its 10K cadence.
+/// Arbitrator configured at [`ROOMY_LIMIT`] and held to `limit` bytes of ledger
+/// capacity, with `NoOpPolicy` so no victim is ever paused or asked to spill —
+/// the block-band path spills on its own byte threshold. `peak_rss` is left
+/// unseeded; the real reading would only matter on the output poll, which
+/// these fixtures keep under its 10K cadence.
 fn no_op_arbitrator(limit: u64) -> Arc<crate::pipeline::memory::MemoryArbitrator> {
-    Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
-        limit,
+    let arb = Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
+        ROOMY_LIMIT,
         SPILL_FRAC,
         0.70,
         Box::new(crate::pipeline::memory::NoOpPolicy),
-    ))
+    ));
+    arb.set_test_capacity(limit);
+    arb
+}
+
+/// The run held to `capacity` wrote spill bytes, and the same input with ample
+/// memory charged more than `capacity` at its peak, so the low run could not
+/// have held its state resident.
+fn assert_spilled_below_ample_peak(
+    low: &crate::pipeline::memory::MemoryArbitrator,
+    ample: &crate::pipeline::memory::MemoryArbitrator,
+    capacity: u64,
+) {
+    let written: u64 = low.per_stage_spill_bytes_written().values().sum();
+    assert!(
+        written > 0,
+        "the run held to {capacity} bytes wrote no spill bytes: {:?}",
+        low.per_stage_spill_bytes_written()
+    );
+    assert!(
+        ample.peak_charged_bytes() > capacity,
+        "the ample run's charged peak ({} bytes) is not above the capacity ({capacity} bytes)",
+        ample.peak_charged_bytes()
+    );
 }
 
 /// Assert `err` is the typed pre-output budget abort: the `banded` combine node,
@@ -508,18 +541,15 @@ fn block_band_output_is_identical_across_memory_limits() {
     // budget (fully resident) must produce byte-identical output. The tight run
     // spills and re-slices; the roomy run holds everything in RAM; the final
     // deterministic sort makes the emitted CSV the same regardless.
-    let (tight_result, tight_out) = run_pipeline(
-        orders_csv(400, 200),
-        bands_csv(400, 0, 200),
-        &no_op_arbitrator(TIGHT_LIMIT),
-    );
+    let tight = no_op_arbitrator(TIGHT_LIMIT);
+    let (tight_result, tight_out) =
+        run_pipeline(orders_csv(400, 200), bands_csv(400, 0, 200), &tight);
     tight_result.expect("tight-budget run must complete");
-    let (roomy_result, roomy_out) = run_pipeline(
-        orders_csv(400, 200),
-        bands_csv(400, 0, 200),
-        &no_op_arbitrator(ROOMY_LIMIT),
-    );
+    let roomy = no_op_arbitrator(ROOMY_LIMIT);
+    let (roomy_result, roomy_out) =
+        run_pipeline(orders_csv(400, 200), bands_csv(400, 0, 200), &roomy);
     roomy_result.expect("roomy-budget run must complete");
+    assert_spilled_below_ample_peak(&tight, &roomy, TIGHT_LIMIT);
 
     assert_eq!(
         tight_out, roomy_out,
@@ -566,6 +596,11 @@ fn block_band_completes_non_empty_with_spill_under_tight_budget() {
          per_stage_spill_bytes[banded] was {}",
         spilled_bytes(&arb)
     );
+    let ample = no_op_arbitrator(ROOMY_LIMIT);
+    run_pipeline(orders_csv(400, 200), bands_csv(400, 0, 200), &ample)
+        .0
+        .expect("the same input completes with ample memory");
+    assert_spilled_below_ample_peak(&arb, &ample, TIGHT_LIMIT);
     assert_eq!(
         arb.consumer_count(),
         0,
@@ -623,6 +658,11 @@ fn block_band_completes_while_fully_pruned_and_spilling() {
         "the wide build side must spill under the tight budget; got {}",
         spilled_bytes(&arb)
     );
+    let ample = no_op_arbitrator(ROOMY_LIMIT);
+    run_pipeline(orders_csv(500, 0), bands_csv(500, 1_000_000, 200), &ample)
+        .0
+        .expect("the same input completes with ample memory");
+    assert_spilled_below_ample_peak(&arb, &ample, TIGHT_LIMIT);
     assert_eq!(
         arb.consumer_count(),
         0,
@@ -1312,13 +1352,12 @@ fn block_band_dlq_order_is_identical_across_memory_limits() {
     // (source_row, trigger) for every CombineOutputRow entry; (preceding
     // trigger's source_row, band input index) for the collateral subset.
     type DlqSequences = (Vec<(u64, bool)>, Vec<(u64, u64)>);
-    let dlq_sequences = |limit: u64| -> DlqSequences {
-        let arb = no_op_arbitrator(limit);
+    let dlq_sequences = |arb: &Arc<crate::pipeline::memory::MemoryArbitrator>| -> DlqSequences {
         let (_report, dlq_rows) = run_pipeline_report(
             DLQ_YAML,
             dlq_orders_csv(60, 1024),
             dlq_bands_csv(N_BANDS, 1024),
-            &arb,
+            arb,
         )
         .expect("the continue-strategy run completes, routing failures to the DLQ");
         let rows: Vec<_> = dlq_rows
@@ -1356,8 +1395,11 @@ fn block_band_dlq_order_is_identical_across_memory_limits() {
         (full, builds)
     };
 
-    let (tight_full, tight) = dlq_sequences(TIGHT_LIMIT);
-    let (roomy_full, roomy) = dlq_sequences(ROOMY_LIMIT);
+    let tight_arb = no_op_arbitrator(DLQ_TIGHT_CAPACITY);
+    let roomy_arb = no_op_arbitrator(ROOMY_LIMIT);
+    let (tight_full, tight) = dlq_sequences(&tight_arb);
+    let (roomy_full, roomy) = dlq_sequences(&roomy_arb);
+    assert_spilled_below_ample_peak(&tight_arb, &roomy_arb, DLQ_TIGHT_CAPACITY);
     assert!(
         !tight.is_empty(),
         "every matched pair divides by zero and attributes its build, so the build-side \

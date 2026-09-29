@@ -44,16 +44,13 @@ use clinker_plan::error::PipelineError;
 use crate::executor::spill_purge;
 use crate::executor::{PipelineExecutor, PipelineRunParams};
 
-// A layout-derived memory budget forces the HashAggregator's dual-threshold spill:
-// with many distinct keys the group count crosses the budget-derived
+// A layout-derived ledger capacity forces the HashAggregator's dual-threshold
+// spill: with many distinct keys the group count crosses the budget-derived
 // `max_groups` well before EOF, so `add_record` calls `spill()` mid-run — the
-// open this test intercepts. The limit also admits all output rows at their
+// open this test intercepts. The capacity also admits all output rows at their
 // compiled layout after the spilled aggregate completes, plus the existing
-// fixed allowance and measured writer workspace.
-// `backpressure: spill` is required: the budget can remain below the process
-// baseline RSS, which the default `pause` policy rejects at startup (E312);
-// the spill policy never pauses a producer and so spills mid-run as this test
-// intends rather than being rejected.
+// fixed allowance and measured writer workspace. `memory.limit` itself is
+// ample.
 //
 // A fused passthrough Transform sits between the Source and the Aggregate so
 // the Aggregate streaming-ingests its input per record (a fused
@@ -66,7 +63,7 @@ use crate::executor::{PipelineExecutor, PipelineRunParams};
 const PIPELINE_YAML: &str = r#"
 pipeline:
   name: spill_dir_unavailable_midrun
-  memory: { limit: "655360", backpressure: spill }
+  memory: { limit: "512M", backpressure: spill }
 nodes:
   - type: source
     name: events
@@ -104,7 +101,9 @@ nodes:
 
 const ROWS: usize = 4_000;
 
-fn config_with_writer_headroom(root: &std::path::Path, csv: &str) -> PipelineConfig {
+/// The pipeline and the ledger capacity its runs are held to, checked against
+/// the layout-derived limit these tests ran under before capacity existed.
+fn config_with_writer_headroom(root: &std::path::Path, csv: &str) -> (PipelineConfig, u64) {
     use clinker_record::{Record, Schema, Value};
     use std::sync::Arc;
     let config: PipelineConfig = clinker_plan::yaml::from_str(PIPELINE_YAML).unwrap();
@@ -170,11 +169,31 @@ fn config_with_writer_headroom(root: &std::path::Path, csv: &str) -> PipelineCon
     );
     // One admitted empty document stays live alongside the existing writer
     // workspace and materialized output; this is measured storage, not padding.
-    clinker_plan::yaml::from_str(&PIPELINE_YAML.replace(
-        "655360",
-        &(aggregate_allowance + headroom + document_bytes).to_string(),
-    ))
-    .unwrap()
+    let old_limit = aggregate_allowance + headroom + document_bytes;
+    assert!(
+        SPILL_DIR_CAPACITY <= old_limit,
+        "the capacity ({SPILL_DIR_CAPACITY}) never exceeds the limit these tests ran under \
+         before capacity existed ({old_limit})"
+    );
+    (config, SPILL_DIR_CAPACITY)
+}
+
+/// The ledger capacity both runs are held to: 728 KiB. The unarmed run needs
+/// 731,510 to 737,280 bytes to complete (below that the CSV writer's or the
+/// Output's admission falls short), and the same input with ample memory
+/// charges 754,378 bytes at its peak. The layout-derived limit these tests ran
+/// under before capacity existed (795,422 bytes on 64-bit targets) lies above
+/// that peak, so the capacity is taken inside the window, with margin to both
+/// ends.
+const SPILL_DIR_CAPACITY: u64 = 728 * 1024;
+
+/// The memory test levers that hold a run to `capacity` bytes of ledger, when
+/// given.
+fn memory_test(capacity: Option<u64>) -> crate::executor::MemoryTestOverrides {
+    match capacity {
+        Some(bytes) => crate::executor::MemoryTestOverrides::default().with_ledger_capacity(bytes),
+        None => crate::executor::MemoryTestOverrides::default(),
+    }
 }
 
 /// Many distinct keys so the aggregate's group table outgrows the tiny budget
@@ -197,7 +216,7 @@ fn spill_dir_removed_mid_run_surfaces_dir_unavailable_without_panic_or_stall() {
     let spill_root_path = spill_root.path().to_path_buf();
 
     let csv = build_events_csv();
-    let config = config_with_writer_headroom(spill_root.path(), &csv);
+    let (config, capacity) = config_with_writer_headroom(spill_root.path(), &csv);
     let plan = config
         .compile(&CompileContext::default())
         .expect("compile pipeline");
@@ -216,6 +235,7 @@ fn spill_dir_removed_mid_run_surfaces_dir_unavailable_without_panic_or_stall() {
         execution_id: "spill-dir-unavailable-midrun".to_string(),
         batch_id: "batch-0".to_string(),
         spill_root_dir: Some(spill_root_path.clone()),
+        memory_test: memory_test(Some(capacity)),
         ..Default::default()
     };
 
@@ -299,37 +319,52 @@ fn unarmed_seam_lets_a_real_spilling_run_complete() {
     let spill_root_path = spill_root.path().to_path_buf();
 
     let csv = build_events_csv();
-    let config = config_with_writer_headroom(spill_root.path(), &csv);
+    let (config, capacity) = config_with_writer_headroom(spill_root.path(), &csv);
     let plan = config
         .compile(&CompileContext::default())
         .expect("compile pipeline");
-
-    let readers = crate::test_support::predecoded_csv_readers(
-        &config,
-        &CompileContext::default(),
-        &[("events", &csv)],
-    );
-
-    let out = SharedBuffer::new();
-    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        "out".to_string(),
-        Box::new(out.clone()) as Box<dyn Write + Send>,
-    )]);
-
-    let params = PipelineRunParams {
-        execution_id: "spill-dir-unarmed-control".to_string(),
-        batch_id: "batch-0".to_string(),
-        spill_root_dir: Some(spill_root_path),
-        ..Default::default()
-    };
 
     // No arm here. The seam is root-scoped — it fires only for an open under
     // the exact parent root a test armed — so this control run's distinct root
     // is unaffected even if the armed sibling test runs concurrently in the same
     // process. That isolation is why this test does not (and must not) touch the
     // global arm state, which would race the sibling.
-    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
-        .expect("an unarmed spilling run must complete cleanly");
+    let run = |capacity: Option<u64>| {
+        let readers = crate::test_support::predecoded_csv_readers(
+            &config,
+            &CompileContext::default(),
+            &[("events", &csv)],
+        );
+        let out = SharedBuffer::new();
+        let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+            "out".to_string(),
+            Box::new(out.clone()) as Box<dyn Write + Send>,
+        )]);
+        let params = PipelineRunParams {
+            execution_id: "spill-dir-unarmed-control".to_string(),
+            batch_id: "batch-0".to_string(),
+            spill_root_dir: Some(spill_root_path.clone()),
+            memory_test: memory_test(capacity),
+            ..Default::default()
+        };
+        let report =
+            PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+                .expect("an unarmed spilling run must complete cleanly");
+        (report, out)
+    };
+    let (report, out) = run(Some(capacity));
+    let (ample, _) = run(None);
+    let written: u64 = report.per_stage_spill_bytes_written.values().sum();
+    assert!(
+        written > 0,
+        "the run held to {capacity} bytes wrote no spill bytes: {:?}",
+        report.per_stage_spill_bytes_written
+    );
+    assert!(
+        ample.peak_consumer_usage_bytes > capacity,
+        "the ample run's charged peak ({} bytes) is not above the capacity ({capacity} bytes)",
+        ample.peak_consumer_usage_bytes
+    );
     assert_eq!(
         report.counters.total_count as usize, ROWS,
         "every input row must be ingested by the control run"

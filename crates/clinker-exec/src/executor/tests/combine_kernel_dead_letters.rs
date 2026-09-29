@@ -5,7 +5,8 @@
 //! through the `combine_output_row` path after the kernel returns. Each
 //! failure writes the driver row as its trigger and, right after it, the
 //! matched build row as a collateral. These tests pin what those rows say
-//! under a spilling and a resident arbitrator:
+//! under a spilling and a resident arbitrator (for IEJoin and sort-merge, the
+//! spilling one is the resident arbitrator held to a small ledger capacity):
 //!
 //! - a build-side row names the build record's own Source and its own row,
 //!   whichever spill path the build record took;
@@ -39,6 +40,11 @@ const GENERATED_COLUMNS: [&str; 3] = ["_cxl_dlq_id", PAIRING_COLUMN, "_cxl_dlq_t
 /// A 10 GiB hard limit with a soft limit near 10 KiB and `NoOpPolicy`:
 /// `should_spill()` holds for the whole run, so every kernel that consults it
 /// spills its build side, while `should_abort()` never fires.
+///
+/// Only the grace-hash cases still use it. Grace-hash growth reads process
+/// memory rather than the ledger, so a ledger capacity small enough to make it
+/// spill aborts the run and one large enough to admit it never spills; these
+/// cases move onto a capacity once grace-hash growth charges the arbitrator.
 fn spilling_arbitrator() -> Arc<MemoryArbitrator> {
     Arc::new(MemoryArbitrator::with_policy(
         10 * 1024 * 1024 * 1024,
@@ -59,11 +65,16 @@ fn resident_arbitrator() -> Arc<MemoryArbitrator> {
     ))
 }
 
-/// The two arbitrators every kernel shape runs under.
+/// The arbitrators a kernel shape runs under: the spilling and resident pair
+/// the grace-hash cases use, and a resident arbitrator held to a ledger
+/// capacity for the IEJoin and sort-merge cases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Budget {
     Spilling,
     Resident,
+    /// The resident arbitrator's thresholds, held to this many bytes of
+    /// ledger capacity.
+    Capacity(u64),
 }
 
 impl Budget {
@@ -73,9 +84,30 @@ impl Budget {
         match self {
             Budget::Spilling => spilling_arbitrator(),
             Budget::Resident => resident_arbitrator(),
+            Budget::Capacity(bytes) => {
+                let arb = resident_arbitrator();
+                arb.set_test_capacity(bytes);
+                arb
+            }
         }
     }
 }
+
+/// The ledger capacity the IEJoin block-band cases spill under: 160 KiB.
+/// Below it down to 81,984 bytes the runs complete (the `match: first` run
+/// needs that much pre-output state; below it the kernel's pre-output check
+/// refuses with E310), and the same fixtures with ample memory charge
+/// 173,840 (`match: all`) and 175,520 (`match: first`) bytes at their peak.
+/// The cases used to run under a 10 GiB limit with a near-zero soft
+/// threshold, which lies above both.
+const IEJOIN_CAPACITY: u64 = 160 * 1024;
+
+/// The ledger capacity the sort-merge cases spill under: 120 KiB. The runs
+/// complete at 40,000 bytes (below 27,280 the Combine's node-buffer
+/// materialization is refused with E310), and the same fixture with ample
+/// memory charges 127,840 bytes at its peak. The cases used to run under a
+/// 10 GiB limit with a near-zero soft threshold, which lies above both.
+const SORT_MERGE_CAPACITY: u64 = 120 * 1024;
 
 /// Run `yaml` with the named CSV `inputs` (Source name, CSV text) under
 /// `arb`, returning the run result, the text the sink named `out` received,
@@ -125,9 +157,20 @@ fn run_capture(
 /// the Combine spilled under the spilling arbitrator and did not under the
 /// resident one. Returns the dead-letter rows.
 fn run_fixture(yaml: &str, drivers: &str, builds: &str, budget: Budget) -> Vec<CapturedDlqRow> {
-    let arb = budget.arbitrator();
+    run_fixture_on(yaml, drivers, builds, budget, &budget.arbitrator()).0
+}
+
+/// [`run_fixture`] on an arbitrator the caller keeps, returning the report
+/// beside the dead-letter rows.
+fn run_fixture_on(
+    yaml: &str,
+    drivers: &str,
+    builds: &str,
+    budget: Budget,
+    arb: &Arc<MemoryArbitrator>,
+) -> (Vec<CapturedDlqRow>, crate::executor::ExecutionReport) {
     let (result, _output, rows) =
-        run_capture(yaml, &[("drivers", drivers), ("builds", builds)], &arb);
+        run_capture(yaml, &[("drivers", drivers), ("builds", builds)], arb);
     let report = result.unwrap_or_else(|err| {
         panic!("the continue-strategy run under the {budget:?} arbitrator must complete: {err}")
     });
@@ -137,9 +180,9 @@ fn run_fixture(yaml: &str, drivers: &str, builds: &str, budget: Budget) -> Vec<C
         .copied()
         .unwrap_or(0);
     match budget {
-        Budget::Spilling => assert!(
+        Budget::Spilling | Budget::Capacity(_) => assert!(
             spilled > 0,
-            "spill premise: `{COMBINE}` must spill under the spilling arbitrator; \
+            "spill premise: `{COMBINE}` must spill under the {budget:?} arbitrator; \
              per_stage_spill_bytes = {:?}",
             report.per_stage_spill_bytes
         ),
@@ -156,7 +199,36 @@ fn run_fixture(yaml: &str, drivers: &str, builds: &str, budget: Budget) -> Vec<C
         "every dead letter the {budget:?} run counted is written as a row"
     );
     crate::test_support::assert_pairing_integrity(&rows);
-    rows
+    (rows, report)
+}
+
+/// Run a two-source fixture held to `capacity` bytes of ledger and again with
+/// ample memory, each with its spill premise. The low run must also have
+/// written spill bytes, and the ample run must have charged more than
+/// `capacity` at its peak, so the pair cannot pass with the Combine's state
+/// resident. Returns the low run's dead-letter rows, then the ample run's.
+fn run_capacity_pair(
+    yaml: &str,
+    drivers: &str,
+    builds: &str,
+    capacity: u64,
+) -> (Vec<CapturedDlqRow>, Vec<CapturedDlqRow>) {
+    let low_budget = Budget::Capacity(capacity);
+    let (low, report) = run_fixture_on(yaml, drivers, builds, low_budget, &low_budget.arbitrator());
+    let written: u64 = report.per_stage_spill_bytes_written.values().sum();
+    assert!(
+        written > 0,
+        "the run held to {capacity} bytes wrote no spill bytes: {:?}",
+        report.per_stage_spill_bytes_written
+    );
+    let ample_arb = Budget::Resident.arbitrator();
+    let (ample, _) = run_fixture_on(yaml, drivers, builds, Budget::Resident, &ample_arb);
+    assert!(
+        ample_arb.peak_charged_bytes() > capacity,
+        "the ample run's charged peak ({} bytes) is not above the capacity ({capacity} bytes)",
+        ample_arb.peak_charged_bytes()
+    );
+    (low, ample)
 }
 
 /// `n` driver rows: `driver_id = d<i>`, `k = key(i)`, `v = i`, and a pad of
@@ -447,9 +519,10 @@ fn block_band_build_rows_carry_their_own_source_row() {
             ),
             "the two-conjunct pure-range fixture must plan the IEJoin kernel"
         );
-        for budget in Budget::BOTH {
-            let rows = run_fixture(&yaml, &range_drivers(), &range_builds(), budget);
-            let label = format!("IEJoin match: {match_mode}, {budget:?}");
+        let (low, ample) =
+            run_capacity_pair(&yaml, &range_drivers(), &range_builds(), IEJOIN_CAPACITY);
+        for (arm, rows) in [("capacity", low), ("ample", ample)] {
+            let label = format!("IEJoin match: {match_mode}, {arm}");
             assert_build_rows_attributed(&rows, failures, &label);
             if match_mode == "first" {
                 for build in rows.iter().filter(|row| !row.trigger()) {
@@ -510,12 +583,17 @@ fn sort_merge_build_rows_carry_their_own_source_row() {
         ),
         "the presorted single-range fixture must plan the sort-merge kernel"
     );
-    for budget in Budget::BOTH {
-        let rows = run_fixture(&yaml, &range_drivers(), &range_builds(), budget);
+    let (low, ample) = run_capacity_pair(
+        &yaml,
+        &range_drivers(),
+        &range_builds(),
+        SORT_MERGE_CAPACITY,
+    );
+    for (arm, rows) in [("capacity", low), ("ample", ample)] {
         assert_build_rows_attributed(
             &rows,
             RANGE_DRIVERS * RANGE_BUILDS,
-            &format!("sort-merge, {budget:?}"),
+            &format!("sort-merge, {arm}"),
         );
     }
 }
@@ -547,8 +625,8 @@ fn block_band_dead_letters_identical_across_memory_limits() {
         compiled_combine_strategy(&yaml, COMBINE),
         CombineStrategy::IEJoin
     ));
-    let spilled = run_fixture(&yaml, &range_drivers(), &range_builds(), Budget::Spilling);
-    let resident = run_fixture(&yaml, &range_drivers(), &range_builds(), Budget::Resident);
+    let (spilled, resident) =
+        run_capacity_pair(&yaml, &range_drivers(), &range_builds(), IEJOIN_CAPACITY);
     assert_eq!(spilled.len(), 2 * RANGE_DRIVERS * RANGE_BUILDS);
     assert!(
         masked(&spilled) == masked(&resident),
@@ -564,8 +642,12 @@ fn sort_merge_dead_letters_identical_across_memory_limits() {
         compiled_combine_strategy(&yaml, COMBINE),
         CombineStrategy::SortMerge
     ));
-    let spilled = run_fixture(&yaml, &range_drivers(), &range_builds(), Budget::Spilling);
-    let resident = run_fixture(&yaml, &range_drivers(), &range_builds(), Budget::Resident);
+    let (spilled, resident) = run_capacity_pair(
+        &yaml,
+        &range_drivers(),
+        &range_builds(),
+        SORT_MERGE_CAPACITY,
+    );
     assert_eq!(spilled.len(), 2 * RANGE_DRIVERS * RANGE_BUILDS);
     assert!(
         masked(&spilled) == masked(&resident),

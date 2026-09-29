@@ -49,6 +49,10 @@
 #[path = "common/pipeline_resource_fixtures.rs"]
 mod resource_fixtures;
 
+#[cfg(feature = "test-utils")]
+#[path = "common/memory_pressure.rs"]
+mod memory_pressure;
+
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
 use std::path::PathBuf;
@@ -58,10 +62,18 @@ use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, SourceReaders}
 use clinker_exec::source::multi_file::FileSlot;
 use clinker_plan::config::{CompileContext, parse_config};
 
-// Keep the fixed-width materialization at 90% of the hard limit: it fits the
-// scan while remaining above the 80% soft-spill threshold. Use the compiled
-// schema, including engine-stamped columns, and the live carrier layouts.
-fn tight_scan_limit(plan: &clinker_plan::plan::CompiledPlan, rows: usize) -> usize {
+/// The limit a tight-scan run had before ledger capacity existed: the scan's
+/// fixed-width materialization at 90% of the limit (it fits the scan while
+/// staying above the 80% soft-spill threshold), plus the CSV writer
+/// workspace `add_csv_workspace` measures. A capacity derived for the run
+/// never exceeds it. Uses the compiled schema, including engine-stamped
+/// columns, and the live carrier layouts.
+#[cfg(feature = "test-utils")]
+fn tight_scan_limit(
+    config: &clinker_plan::config::PipelineConfig,
+    plan: &clinker_plan::plan::CompiledPlan,
+    rows: usize,
+) -> u64 {
     let dag = plan.dag();
     let columns = dag
         .graph
@@ -71,8 +83,20 @@ fn tight_scan_limit(plan: &clinker_plan::plan::CompiledPlan, rows: usize) -> usi
         .unwrap();
     let per_row = std::mem::size_of::<clinker_record::Value>() * columns
         + std::mem::size_of::<(clinker_record::Record, clinker_exec::executor::SourceRowId)>();
-    (rows * per_row * 10).div_ceil(9)
+    let mut sized = config.clone();
+    sized.pipeline.memory.limit = Some((rows * per_row * 10).div_ceil(9).to_string());
+    resource_fixtures::add_csv_workspace(&mut sized, &CompileContext::default());
+    clinker_plan::config::utils::parse_memory_limit_bytes(sized.pipeline.memory.limit.as_deref())
+        .expect("parse the tight-scan limit")
 }
+
+/// The ledger capacity `streaming_arm_soft_spills_with_layout_sized_scan_budget`
+/// holds its low run to, under a 512M `memory.limit`: inside
+/// [1,223,500, 1,224,016), the bytes the run needs to complete and the
+/// charged peak of the same input with ample memory, with margin to both
+/// ends.
+#[cfg(feature = "test-utils")]
+const STREAMING_SCAN_CAPACITY: u64 = 1_223_750;
 
 fn run_params() -> PipelineRunParams {
     PipelineRunParams {
@@ -216,42 +240,41 @@ nodes:
 /// soft-threshold trip instead of materializing the whole stage. A
 /// single-branch `Route → Output` streams its records through the slot's
 /// per-batch charge handle, whose `should_spill()` poll fires per flushed
-/// batch; under the layout-sized budget the test process's own RSS crosses the
+/// batch; held to the layout-sized ledger capacity, the run crosses the
 /// 80 % soft floor, so each batch's records round-trip through a
 /// `SpillFile<u64>` (re-read and forwarded to the writer). The run
 /// completes — the streaming path never polls the hard-limit
-/// `should_abort`, so a tiny test budget spills rather than aborts, the
+/// `should_abort`, so a small capacity spills rather than aborts, the
 /// same posture the materialized `route_fanout_soft_spill` test relies on.
 ///
-/// `backpressure: spill` is required because the budget is below the
-/// process's baseline RSS: under the default `pause` policy such a budget
-/// is rejected at startup (E312, the unsatisfiable-budget guard), so a
-/// sub-baseline budget that intends to *spill* rather than *pause* must
-/// select the spill policy, which never pauses a producer and so is not
-/// rejected.
-///
 /// Asserts every record is delivered in order and
-/// `cumulative_spill_bytes > 0`. The companion `route_fanout_soft_spill`
-/// pins the blocking full-stage spill path; the unit test
+/// `cumulative_spill_bytes > 0`, that the low run wrote spill bytes, and
+/// that the capacity lies below the charged peak of the same input with
+/// ample memory. The companion `route_fanout_soft_spill` pins the blocking
+/// full-stage spill path; the unit test
 /// `batch_handoff::charge_handle_spills_a_batch_preserving_order_and_close`
 /// pins the per-batch spill round-trip in isolation.
 ///
-/// Skipped silently when `rss_bytes()` is unavailable — the spill
-/// predicate is RSS-based, so without it the path stays in memory.
+/// The capacity, [`STREAMING_SCAN_CAPACITY`], lies in a narrow window: the
+/// run needs 1,223,408 to 1,223,500 bytes to complete (below that the CSV
+/// reader's next admission falls short), and the same input with ample
+/// memory charges 1,224,016 bytes at its peak. The old layout-sized limit,
+/// 1,247,759 bytes, lies above that peak, so the capacity is taken inside
+/// the window instead.
+#[cfg(feature = "test-utils")]
 #[test]
 fn streaming_arm_soft_spills_with_layout_sized_scan_budget() {
-    if clinker_exec::pipeline::memory::rss_bytes().is_none() {
-        return;
-    }
+    use clinker_exec::executor::{ExecutionReport, MemoryTestOverrides};
+    use memory_pressure::{assert_capacity_below_ample_peak, assert_spill_engaged};
 
-    // Keep the same population and streaming batches; derive the hard limit
+    // Keep the same population and streaming batches; derive the capacity
     // from the compiled record shape while preserving soft-spill pressure.
     const ROWS: usize = 3_500;
     let yaml = r#"
 pipeline:
   name: streaming_route_soft_spill
   batch_size: 128
-  memory: { limit: "1M", backpressure: spill }
+  memory: { limit: "512M", backpressure: spill }
 nodes:
   - type: source
     name: orders
@@ -280,15 +303,14 @@ nodes:
       type: csv
       path: ./out.csv
 "#;
-    let mut config = parse_config(yaml).expect("parse_config");
-    let sizing_plan = config
-        .compile(&CompileContext::default())
-        .expect("compile sizing plan");
-    config.pipeline.memory.limit = Some(tight_scan_limit(&sizing_plan, ROWS).to_string());
-    resource_fixtures::add_csv_workspace(&mut config, &CompileContext::default());
+    let config = parse_config(yaml).expect("parse_config");
     let plan = config
         .compile(&CompileContext::default())
         .expect("compile pipeline");
+    assert!(
+        STREAMING_SCAN_CAPACITY <= tight_scan_limit(&config, &plan, ROWS),
+        "the capacity never exceeds the limit the test ran under before capacity existed"
+    );
 
     // The Route is a streaming arm (single outgoing edge to the Output).
     assert_streaming_to_output(&explain_of(&config, &plan), "route.r", "output.out");
@@ -297,19 +319,30 @@ nodes:
     for i in 1..=ROWS {
         csv.push_str(&format!("o-{i},payload_{i},{}\n", i * 10));
     }
-    let readers: SourceReaders = HashMap::from([(
-        "orders".to_string(),
-        clinker_exec::executor::SourceInput::Files(vec![fast_slot("orders", &csv)]),
-    )]);
-    let buf = SharedBuffer::new();
-    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        "out".to_string(),
-        Box::new(buf.clone()) as Box<dyn Write + Send>,
-    )]);
-
-    let report =
-        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
-            .expect("streaming soft-spill run must complete under the layout-sized budget");
+    let run = |memory_test: MemoryTestOverrides| -> (ExecutionReport, SharedBuffer) {
+        let readers: SourceReaders = HashMap::from([(
+            "orders".to_string(),
+            clinker_exec::executor::SourceInput::Files(vec![fast_slot("orders", &csv)]),
+        )]);
+        let buf = SharedBuffer::new();
+        let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+            "out".to_string(),
+            Box::new(buf.clone()) as Box<dyn Write + Send>,
+        )]);
+        let params = PipelineRunParams {
+            memory_test,
+            ..run_params()
+        };
+        let report =
+            PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+                .expect("streaming soft-spill run must complete under the layout-sized capacity");
+        (report, buf)
+    };
+    let (ample, _) = run(MemoryTestOverrides::default());
+    let (report, buf) =
+        run(MemoryTestOverrides::default().with_ledger_capacity(STREAMING_SCAN_CAPACITY));
+    assert_spill_engaged(&report);
+    assert_capacity_below_ample_peak(STREAMING_SCAN_CAPACITY, &ample);
 
     assert_eq!(
         report.counters.total_count as usize, ROWS,
