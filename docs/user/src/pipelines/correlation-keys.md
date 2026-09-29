@@ -84,7 +84,7 @@ A group that goes over the cap is dead-lettered whole when the run commits it. I
 - The group's other rows are written under one `group_size_exceeded` trigger, the first of them; the rest are `correlated` rows that carry its id as their `_cxl_dlq_trigger_id`.
 - A group whose rows all failed writes only those failures, with no `group_size_exceeded` row.
 
-Every row is written once and counts toward `dlq_count` and the DLQ rate limits. The `group_size_exceeded` row's `_cxl_dlq_timestamp` is when the group went over the cap, and its error detail states the cap and how many entries the group held.
+Every row is written once (a Combine build row once per failing driver that matched it, see [Combine interaction](#combine-interaction)) and counts toward `dlq_count` and the DLQ rate limits. The `group_size_exceeded` row's `_cxl_dlq_timestamp` is when the group went over the cap, and its error detail states the cap and how many entries the group held.
 
 The cap counts the entries a group holds, not its distinct rows: a row counts once for each Sink it reaches, and each failure counts once. A row that an inclusive Route sends to two Sinks counts twice, and so does a row that fails on one branch and reaches a Sink on another.
 
@@ -174,7 +174,7 @@ How match mode fills the propagated key:
 
 `propagate_ck` is a required field — every combine must spell out which mode it uses.
 
-**A failing match's build-side dead letter follows the driver's group.** When the combine body fails for a driver row, that driver row is the trigger of the driver's correlation group. The matched build record's dead letter is held with the same group as a collateral (`_cxl_dlq_trigger: false`, category `combine_output_row`), written right after its driver's row and carrying that driver's `_cxl_dlq_trigger_id`, and it is written or rolled back exactly when the driver's group is. It never condemns the build record's own correlation group: another driver that matched the same build record keeps its output unless its own group failed. When several drivers in different groups fail against one build record, the build record is written once with each failing driver's group.
+**A failing match's build-side dead letter follows the driver's group.** When the combine body fails for a driver row, that driver row is the trigger of the driver's correlation group. The matched build record's dead letter is held with the same group as a collateral (`_cxl_dlq_trigger: false`, category `combine_output_row`), written right after its driver's row and carrying that driver's `_cxl_dlq_trigger_id`, and it is written or rolled back exactly when the driver's group is. It never condemns the build record's own correlation group: another driver that matched the same build record keeps its output unless its own group failed. The build record is written once per failing driver: when several drivers fail against one build record, in one group or in several, each failing driver's row is followed by its own copy of the build row, carrying that driver's `_cxl_dlq_trigger_id`.
 
 ### Composition interaction
 

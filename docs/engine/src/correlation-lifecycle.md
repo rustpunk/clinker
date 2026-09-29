@@ -41,6 +41,8 @@ A record with a null value for the correlation-key field is treated as its own p
 
 A Combine output-row eval failure that the engine recovers from (under `continue`) produces entries under the `combine_output_row` category — distinct from the upstream-Transform `type_coercion_failure` because the entry carries the contributing-build lineage and rewinds both the driver and the matched build source's rollback cursor. See [Per-source rollback narrowing](#per-source-rollback-narrowing) below for the cursor-rewind detail.
 
+Under correlation buffering the failing driver row is parked as a trigger in its own group's cell, and the matched build record's entry is parked in the same cell as a collateral (`CorrelationErrorRecord::trigger == false`, via `record_collateral_to_buffer_if_grouped`) carrying the driver's trigger id. A parked collateral never makes a cell dirty, never widens its per-source narrowing, and is never the cell's first trigger, so the build record's own group is untouched. At commit, `write_held_failures` writes triggers once per source row (the first failure parked for a row wins) and parked collaterals once per `(row, trigger id)`: a build row that two failing drivers of one group matched is written after each of them, each copy paired with its own driver's failure.
+
 The `dlq_count` counter sums triggers and collaterals.
 
 ## Per-source rollback narrowing
@@ -91,7 +93,7 @@ Crossing the cap changes nothing at admission. Later rows are still projected an
 
 At commit an overflowed group is DLQ'd entirely, as the dirty path would write it and more:
 
-1. Every parked failure is written first, in parking order and once per source row, by the same code the dirty path uses: its own category, message, stage, route and failure stamp, so it stays its own trigger (or, for a second row of another failure, keeps that failure's trigger id).
+1. Every parked failure is written first, in parking order, by the same code the dirty path uses (`write_held_failures`): its own category, message, stage, route and failure stamp, so a trigger stays its own trigger and a parked collateral (a Combine build row) keeps its driver's trigger id. Triggers are written once per source row; a parked collateral once per failure it belongs to.
 2. The buffered rows not already written follow: the first becomes the `group_size_exceeded` trigger, stamped at the crossing, and the rest are `correlated` collaterals condemned by it. Overflow spares nothing, so neither per-source narrowing nor the fan-out policy applies. A row that is both a parked failure and buffered (an inclusive Route fan-out, a Combine driver failing on one match and succeeding on another) was written in step 1 and is skipped here.
 3. If no buffered row is left unwritten (a group of failures only), no `group_size_exceeded` row is written; the overflow is still counted by the `clinker.correlation.group_overflows` metric.
 

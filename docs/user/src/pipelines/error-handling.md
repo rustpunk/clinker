@@ -263,7 +263,9 @@ One failure can dead-letter several rows:
 
 - a Combine body that fails writes the driver row and its matched build row,
   each under its own Source's `_cxl_dlq_source_name` and `_cxl_dlq_source_row`,
-  whichever join strategy ran;
+  whichever join strategy ran. The build row is written once per failure, so
+  a build record that two failing drivers matched is written twice, once
+  after each driver's row;
 - a failing row in a correlation group takes the rest of its group with it as
   `correlated` rows;
 - a group larger than `max_group_buffer` writes a `group_size_exceeded` row
@@ -305,7 +307,8 @@ before the rest of the group. The group's other rows follow under one
 `group_size_exceeded` trigger, the first of them, and the remaining ones are
 `correlated` rows carrying its id. A row is written once: a row that failed
 on one Route branch and reached a Sink on another is written as its own
-failure. A group whose rows all failed writes no `group_size_exceeded` row,
+failure. The one exception is a Combine build row, which is written once per
+failing driver that matched it. A group whose rows all failed writes no `group_size_exceeded` row,
 because the overflow took nothing with it that had not already failed.
 
 The rows of one failure can land in different DLQ files: with
@@ -475,7 +478,9 @@ matched build record is held with that group as a collateral
 its driver's row with its driver's `_cxl_dlq_trigger_id`, and written or rolled
 back exactly when that group is. It never condemns the build record's own
 correlation group, so another driver that matched the same build record keeps
-its output unless its own group failed.
+its output unless its own group failed. Each failing driver gets its own copy
+of the build row, paired with its own failure, even when two failing drivers
+share a group.
 
 For the full lifecycle and per-operator semantics (route, merge, aggregate, combine), see [Correlation Keys](correlation-keys.md).
 

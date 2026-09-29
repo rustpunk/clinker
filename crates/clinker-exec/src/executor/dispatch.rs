@@ -5233,9 +5233,11 @@ pub(crate) struct CorrelationRecordSlot {
 /// of failure (e.g., the Transform input that failed evaluation).
 /// Multiple events per row are possible if a row fans out across
 /// branches and more than one branch fails — the `CorrelationCommit`
-/// arm dedupes by `row_num` for emission. Most records are the group's
+/// arm writes a trigger once per `row_num`. Most records are the group's
 /// own failures (`trigger: true`); a Combine build-side dead letter is a
-/// collateral held with its failing driver's group (`trigger: false`).
+/// collateral held with its failing driver's group (`trigger: false`),
+/// written once per failure it belongs to, so a build row two failing
+/// drivers matched is written after each of them.
 #[derive(Debug, Clone)]
 pub(crate) struct CorrelationErrorRecord {
     pub(crate) row_num: crate::executor::stream_event::SourceRowId,

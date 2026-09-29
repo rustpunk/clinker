@@ -173,9 +173,9 @@ fn commit_one_group(
     // directly so Route fan-out emits one entry per source row without
     // reconstructing identity from a diagnostic source name.
     let mut seen_rows: HashSet<crate::executor::stream_event::SourceRowId> = HashSet::new();
-    // Parked entries, in parking order: one per distinct row. A trigger is
-    // written as a trigger; a parked collateral is written as a collateral
-    // right where it was parked, after the trigger that condemned it.
+    // Parked entries, in parking order: a trigger once per distinct row, a
+    // parked collateral once per failure it belongs to, right where it was
+    // parked, after the trigger that condemned it.
     write_held_failures(ctx, &error_messages, &mut seen_rows)?;
     // Collateral entries: every other distinct row that flowed through
     // the group's Output buffers but didn't itself error. Two sparing
@@ -363,9 +363,8 @@ fn commit_overflowed_group(
     Ok(())
 }
 
-/// Write a group's held failures in parking order, one row per source row
-/// (the first failure parked for a row wins), recording each written row in
-/// `seen_rows`.
+/// Write a group's held failures in parking order, recording each written
+/// row in `seen_rows`.
 ///
 /// Each row keeps the failure's own category, message, stage, route and
 /// stamp, and is written as a trigger or as collateral by its own `trigger`
@@ -373,15 +372,31 @@ fn commit_overflowed_group(
 /// failing driver's group) keeps that driver's trigger id and is written as
 /// collateral. The dirty and the overflowed commit both write held failures
 /// here, so the two cannot diverge.
+///
+/// Triggers are written once per source row: the first failure parked for a
+/// row wins, so a row that failed on two fan-out branches is written once.
+/// A collateral is written once per failure it belongs to, keyed by its row
+/// and its trigger id, so a build row two failing drivers of one group both
+/// matched is written after each of them, and a row that is both a trigger
+/// and another failure's collateral is written as both.
 fn write_held_failures(
     ctx: &mut ExecutorContext<'_>,
     error_messages: &[CorrelationErrorRecord],
     seen_rows: &mut HashSet<crate::executor::stream_event::SourceRowId>,
 ) -> Result<(), PipelineError> {
+    let mut trigger_rows: HashSet<crate::executor::stream_event::SourceRowId> = HashSet::new();
+    let mut collaterals: HashSet<(crate::executor::stream_event::SourceRowId, uuid::Uuid)> =
+        HashSet::new();
     for err in error_messages {
-        if !seen_rows.insert(err.row_num) {
+        let first_for_its_failure = if err.trigger {
+            trigger_rows.insert(err.row_num)
+        } else {
+            collaterals.insert((err.row_num, err.failed_at.trigger_id()))
+        };
+        if !first_for_its_failure {
             continue;
         }
+        seen_rows.insert(err.row_num);
         push_dlq(
             ctx,
             DlqEntry {
