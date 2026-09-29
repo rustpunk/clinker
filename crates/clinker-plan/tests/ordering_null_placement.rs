@@ -431,3 +431,134 @@ fn sink_sort_order_keeps_drop() {
         .collect();
     assert_eq!(dropped, vec!["txn_date"]);
 }
+
+/// Column names a Source schema accepts but CXL cannot write as a bare
+/// field reference: one with a space, one that is a CXL keyword, and one a
+/// JSON or XML reader produces by flattening a nested object. The last is
+/// the dangerous one: `Address.City` parses as a CXL path, so a printed
+/// `filter not Address.City.is_null()` would compile and drop every row.
+const UNNAMEABLE_FIELDS: [&str; 3] = ["order id", "filter", "Address.City"];
+
+/// A source `src` with `account`, `amount` and a nullable column named
+/// `field`, followed by `operator`.
+fn pipeline_with_column(field: &str, operator: &str) -> String {
+    format!(
+        r#"
+pipeline:
+  name: ordering_null_placement
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - {{ name: account, type: string }}
+        - {{ name: "{field}", type: {{ nullable: string }} }}
+        - {{ name: amount, type: int }}
+{operator}"#
+    )
+}
+
+/// Compile `yaml`, expect failure, and return the message of the one
+/// `null_order: drop` diagnostic after checking it is an E200 at `node`.
+fn the_drop_message(yaml: &str, node: &str) -> String {
+    let config = parse_config(yaml).expect("fixture must parse as YAML");
+    let span = node_span(&config, node);
+    let diags = config
+        .compile(&CompileContext::default())
+        .expect_err("fixture is expected to fail compilation");
+    let matching: Vec<&Diagnostic> = diags
+        .iter()
+        .filter(|d| d.message.contains("null_order: drop"))
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "expected exactly one `null_order: drop` diagnostic, got {diags:?}"
+    );
+    let diag = matching[0];
+    assert_eq!(diag.code, "E200", "wrong code for {:?}", diag.message);
+    assert_eq!(
+        diag.primary.span, span,
+        "the refusal must point at {node:?}"
+    );
+    diag.message.clone()
+}
+
+/// The refusal for a field CXL cannot name offers no CXL to paste, and
+/// sends the author to the Source schema's `source_name` rename instead.
+fn assert_points_to_source_name(message: &str, field: &str) {
+    assert!(
+        message.contains(&format!("for field '{field}'")),
+        "the refusal must name the field: {message}"
+    );
+    assert!(
+        message.contains("Use `null_order: first` or `null_order: last`"),
+        "the refusal must still give the allowed placements: {message}"
+    );
+    assert!(
+        !message.contains("filter not"),
+        "a field CXL cannot name must not get a CXL filter to paste: {message}"
+    );
+    assert!(
+        !message.contains(".is_null()"),
+        "a field CXL cannot name must not get a CXL expression: {message}"
+    );
+    assert!(
+        message.contains("`source_name`"),
+        "the refusal must point to the Source schema's `source_name` rename: {message}"
+    );
+}
+
+#[test]
+fn source_sort_order_drop_on_a_field_cxl_cannot_name_points_to_source_name() {
+    for field in UNNAMEABLE_FIELDS {
+        let yaml = pipeline_with_column(
+            field,
+            &format!(
+                r#"      sort_order: [{{ field: "{field}", null_order: drop }}]
+  - type: sink
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#
+            ),
+        );
+        let message = the_drop_message(&yaml, "src");
+        assert!(message.starts_with("source 'src': "), "{field}: {message}");
+        assert_points_to_source_name(&message, field);
+    }
+}
+
+#[test]
+fn cull_and_reshape_order_by_drop_on_a_field_cxl_cannot_name_points_to_source_name() {
+    for field in UNNAMEABLE_FIELDS {
+        let order_by = format!(r#"[{{ field: "{field}", null_order: drop }}]"#);
+        for (block, name, prefix) in [
+            (cull_block(&order_by), "cd", "cull \"cd\": "),
+            (reshape_block(&order_by), "rs", "reshape \"rs\": "),
+        ] {
+            let message = the_drop_message(&pipeline_with_column(field, &block), name);
+            assert!(message.starts_with(prefix), "{name} {field}: {message}");
+            assert_points_to_source_name(&message, field);
+        }
+    }
+}
+
+/// The contrast case: a field CXL can write bare keeps the paste-able
+/// filter, word for word, and is not sent to a rename.
+#[test]
+fn a_field_cxl_can_name_keeps_the_paste_able_filter() {
+    let message = the_drop_message(
+        &pipeline(&cull_block("[{ field: txn_date, null_order: drop }]")),
+        "cd",
+    );
+    assert_eq!(message, format!("cull \"cd\": {GROUP_DROP_TEXT}"));
+    assert!(message.contains("`filter not txn_date.is_null()`"));
+    assert!(!message.contains("source_name"));
+}
