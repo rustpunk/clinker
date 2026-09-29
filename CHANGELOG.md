@@ -4,6 +4,65 @@ All notable changes to Clinker are tracked here.
 
 ## Unreleased
 
+### Changed — aggregates follow one numeric rule: exact decimal totals, a typed error for every failure, and no decimal–float mixing
+
+This is a breaking change. A numeric aggregate now gives the exact value of its
+definition over the group, rounded once, or fails the group with an error that
+names the rule and the fix; only a group with no non-null value gives null.
+
+- **Decimal totals are exact.** A decimal `sum`, and the sums inside `avg` and
+  `weighted_avg`, are the exact total of the group's values, rounded once (half
+  to even) only when the total needs more than 28 significant digits. Before,
+  each addition rounded as it went, so a total of quotients such as
+  `sum(amount / qty)` could change in its last digits with the order rows
+  arrived in or the way a spilled aggregation split the group. Results beyond
+  28 significant digits can change in the last digit. The result's scale is the
+  largest scale among the group's values, zeros and integers included, so the
+  sum of `1.00`, `-1.00` and `2` is now `2.00` in every order (it could be
+  `2`). A decimal total is out of range only when the whole group's exact total
+  is; a group whose running total passed outside the range and came back used
+  to fail and now succeeds.
+- **`avg` and `weighted_avg` fail instead of writing null.** A decimal total
+  or quotient outside the decimal range, a `weighted_avg` row whose
+  `value * weight` is out of range, and a `weighted_avg` whose weights total
+  exactly zero (in integer, float and decimal groups alike, as `x / 0` is an
+  error) now fail the group as `aggregate_finalize` instead of writing null.
+  `avg(x)` is `sum(x) / count(x)` and `weighted_avg(v, w)` is
+  `sum(v * w) / sum(w)`, with the same digits and scale.
+- **A group mixing decimals and floats fails.** `sum` used to return the
+  decimal total without the floats, and `avg` and `weighted_avg` wrote null.
+  The group now fails with:
+
+  ```text
+  decimal and float in one group: a decimal is never added to a float without an explicit conversion; convert the aggregate's argument to one numeric type, for example `sum(price.to_decimal())` or `sum(amount.to_float())`
+  ```
+
+- **`if`, `match` and `??` over a decimal and a float no longer compile.** They
+  used to type as `any` (or, for `??`, as the right side) and pass the mix on.
+  They are now an E200:
+
+  ```text
+  cannot mix decimal and float without an explicit cast: the branches of this `if` are a decimal (`amount`) and a float (`price`); convert one branch so both have one numeric type, for example `price.to_decimal()` or `amount.to_float()`
+  ```
+
+- **The error's message reaches the author.** The `aggregate_finalize`
+  dead-letter reason and a run that stops on an aggregate error print the
+  error's message with its fix, and name the author's `emit` instead of an
+  internal label (`aggregate by_category.total: ...`). A decimal total out of
+  range no longer says "integer sum overflow".
+- **Envelope footers.** An aggregate in an Envelope `footer:` that fails now
+  reports that aggregate error, naming the node and `<section>.<field>`,
+  instead of an internal error. It still stops the run.
+- **For Rust callers of `clinker-record`:** `AccumulatorError` gains
+  `DecimalOutOfRange`, `QuotientOutOfRange`, `ProductOverflow`,
+  `ZeroTotalWeight` and `MixedDecimalFloat`; the new `ExactDecimalSum` holds a
+  decimal total exactly; `SumState` holds its decimals in an `ExactDecimalSum`
+  (`decimal_sum`, `decimal_count` and `decimal_overflow` are gone), and
+  `WeightedAvgState` holds exact decimal sums, a count of rows whose product
+  overflowed and a count of rows mixing a decimal with a float (its decimal
+  totals, `decimal_rows` and `decimal_overflow` are gone, and its integer
+  totals are private).
+
 ### Changed — Cull and Reshape order each group like a Sink sort
 
 A Cull or Reshape `order_by` now orders the rows of each group by the same

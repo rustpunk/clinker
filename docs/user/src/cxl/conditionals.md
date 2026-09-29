@@ -34,6 +34,19 @@ $ cxl eval -e 'emit bonus = if score > 90 then score * 0.1' \
 }
 ```
 
+### Branches of one numeric type
+
+The two branches of an `if` must not be a decimal and a float, because the
+result would be a decimal on some rows and a float on others. Such an `if` does
+not compile:
+
+```text
+cannot mix decimal and float without an explicit cast: the branches of this `if` are a decimal (`amount`) and a float (`price`); convert one branch so both have one numeric type, for example `price.to_decimal()` or `amount.to_float()`
+```
+
+Convert one branch: `if flag then amount else price.to_decimal()`. An integer
+branch is fine beside either: it widens exactly into the decimal or float.
+
 ### Chained conditionals
 
 Chain multiple conditions with `else if`:
@@ -168,6 +181,13 @@ emit region = match country {
   _    => "Other"
 }
 ```
+
+### Arms of one numeric type
+
+As with `if`, the arms of a `match` must not include both a decimal and a
+float. The error names the first decimal arm and the first float arm, counted
+from 1, or the field when an arm is a bare field; convert one of them with
+`.to_decimal()` or `.to_float()`.
 
 ### Match arms are evaluated in order
 

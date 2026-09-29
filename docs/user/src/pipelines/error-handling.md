@@ -505,7 +505,7 @@ The `_cxl_dlq_error_category` column contains one of these values:
 | `nan_in_output_field` | A computation produced NaN |
 | `aggregate_type_error` | An aggregate function received an incompatible type |
 | `validation_failure` | A declarative validation check failed |
-| `aggregate_finalize` | An aggregate function failed during finalization |
+| `aggregate_finalize` | An aggregate function failed during finalization: an integer `sum` outside the 64-bit range, a decimal total or quotient outside the decimal range, a `weighted_avg` whose weights total zero or whose row product is out of range, or a group holding both decimals and floats. The reason names the Aggregate and the `emit`, and gives the fix. Under `continue` the failed group goes to the dead-letter output. An aggregate in an Envelope `footer:` stops the run under every strategy. |
 | `correlated` | A non-failing record was DLQ'd as collateral because another record in its correlation group failed |
 | `group_size_exceeded` | A correlation-key group exceeded the configured `max_group_buffer` limit |
 | `document_rejected` | A non-failing record was DLQ'd as collateral because another record in its document failed under a source's `dlq_granularity: document` policy |

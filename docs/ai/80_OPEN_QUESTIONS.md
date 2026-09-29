@@ -958,28 +958,6 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
   exists, and update the Route page's Constraints section.
 - Implementation owner: Planner maintainers.
 
-## Aggregate findings
-
-### 91. `sum` of a column that mixes decimals and floats returns the decimal total without the floats
-
-- Filed: 2026-09-29.
-- Status: Open; needs a maintainer decision.
-- Priority: Low.
-- Evidence: `SumState::finalize` in
-  `crates/clinker-record/src/accumulator/mod.rs` returns the exact decimal
-  total (decimals plus integers) whenever the group has a decimal addend, and
-  the float addends take no part in it. `avg` and `weighted_avg` return null
-  for the same mix, because a binary float cannot join an exact decimal total.
-  Typecheck keeps a `sum` column in one numeric domain, so the mix is
-  reachable only on an untyped column. The behaviour predates the exact float
-  sum and was kept unchanged by it.
-- Files/modules involved: `crates/clinker-record/src/accumulator/mod.rs`
-  (`SumState`, `AvgState`, `WeightedAvgState`).
-- Suggested way to resolve it: Decide whether `sum` should return null for
-  the mix, as `avg` and `weighted_avg` do, or surface an error; either is a
-  user-visible change with a changelog entry.
-- Implementation owner: Accumulator maintainers.
-
 ## Resolved Archive
 
 ### 61. Decoded allocation ownership
@@ -993,6 +971,23 @@ SWIFT retained trailers carry leases through actual backing destruction. Existin
 allocations remain outside that writer guarantee, and EDIFACT, X12 and HL7
 writer migration remains outstanding. AUTH-06 is still partial. See
 [physical-text ownership](../engine/src/memory-arbitration.md#physical-text-configuration-truncation-tallies-and-trailers).
+
+### 91. A group that mixes decimals and floats
+
+Resolved 2026-09-29 by maintainer decision (one numeric rule for the
+aggregates). `sum` used to return the decimal total without the floats, and
+`avg` and `weighted_avg` null. Now a `sum`, `avg` or `weighted_avg` group
+holding both a decimal and a float fails with the typed
+`AccumulatorError::MixedDecimalFloat`, whose message gives the conversion to
+paste, through the `aggregate_finalize` path. The domain comes from one
+count-derived classifier, `NumericDomain`, that the three finalizers match
+exhaustively, so a silent drop or a substitute null cannot be written
+(`crates/clinker-record/src/accumulator/mod.rs`). At compile time every `if`,
+`match` and `??` whose branches are a decimal and a float is an E200 naming
+the branches and the fix (`crates/cxl/src/typecheck/pass.rs`), so the mix
+reaches an aggregate only through a value typecheck cannot see (an untyped
+column, a `numeric` result such as `decimal.clamp(lo, hi)`), where the
+run-time error is the backstop. See `docs/user/src/cxl/aggregates.md`.
 
 Numbers are never reused. One line per entry: the answer and its evidence.
 

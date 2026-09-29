@@ -8,9 +8,9 @@ CXL provides 7 aggregate functions. These are called as free-standing function c
 
 | Function | Signature | Returns | Description |
 |----------|-----------|---------|-------------|
-| `sum(expr)` | Numeric | Numeric | Sum of values |
+| `sum(expr)` | Numeric | Int, Float or Decimal (the input's type) | Sum of values |
 | `count(*)` | -- | Int | Count of records in the group |
-| `avg(expr)` | Numeric | Float | Arithmetic mean |
+| `avg(expr)` | Numeric | Float, or Decimal for a decimal input | Arithmetic mean |
 | `min(expr)` | Any | Any | Minimum value |
 | `max(expr)` | Any | Any | Maximum value |
 | `collect(expr)` | Any | Array | All values collected into an array |
@@ -43,7 +43,7 @@ In the example above, `department` is automatically present in every output reco
 
 ## Function details
 
-### sum(expr) -> Numeric
+### sum(expr) -> Int, Float or Decimal
 
 Computes the sum of the expression across all records in the group. Null values are skipped.
 
@@ -51,6 +51,43 @@ Computes the sum of the expression across all records in the group. Null values 
 cxl: |
   emit total_revenue = sum(price * quantity)
 ```
+
+The result has the type of the values summed: integers give an integer, floats
+a float, decimals a decimal. Integers summed with floats give a float, and
+integers summed with decimals a decimal. An integer sum outside the 64-bit
+integer range is an error.
+
+A decimal sum is the exact total of the group's values, rounded once (half to
+even) only when it needs more than 28 significant digits. Its scale is the
+largest scale among the group's values, zeros and integers included, so the
+sum of `1.00`, `-1.00` and `2` is `2.00` whatever order the rows arrive in. It
+is an error only when the whole group's exact total is outside the decimal
+range, ±79,228,162,514,264,337,593,543,950,335; a group whose running total
+passes outside the range and comes back is fine. The fix the error suggests is
+to sum the argument's `.to_float()` when a binary float's range and precision
+will do.
+
+A group whose values are all null gives null. Null is never a substitute for a
+failure: a group that fails is an `aggregate_finalize` error (see [Error
+categories](../pipelines/error-handling.md#error-categories)), which under
+`strategy: continue` goes to the dead-letter output.
+
+#### Decimal and float in one group
+
+A decimal is never added to a float without an explicit conversion, in an
+aggregate as in `amount + price`. A `sum`, `avg` or `weighted_avg` whose values
+in one group include both a decimal and a float fails that group with:
+
+```text
+decimal and float in one group: a decimal is never added to a float without an explicit conversion; convert the aggregate's argument to one numeric type, for example `sum(price.to_decimal())` or `sum(amount.to_float())`
+```
+
+When the typechecker can see the mix, for example
+`sum(if flag then amount else price)`, the pipeline does not compile (E200; see
+[Conditionals](conditionals.md)). The run-time error covers what it cannot see:
+a value whose type is only known at run time, such as an untyped column or a
+`numeric` result like `amount.clamp(0, 100)`. Convert the argument to one type,
+`sum(if flag then amount else price.to_decimal())`, to keep the total exact.
 
 ### count(*) -> Int
 
@@ -61,14 +98,26 @@ cxl: |
   emit num_orders = count(*)
 ```
 
-### avg(expr) -> Float
+### avg(expr) -> Float or Decimal
 
-Computes the arithmetic mean. Null values are skipped. Returns Float.
+Computes the arithmetic mean. Null values are skipped.
 
 ```yaml
 cxl: |
   emit avg_order_value = avg(order_total)
 ```
+
+`avg(x)` is `sum(x) / count(x)`: the group's exact sum, rounded once as `sum`
+rounds it, divided by the number of non-null values. Over decimals the result
+is a decimal, the quotient at full precision, so `avg(amount)` and
+`sum(amount) / count(amount)` give the same digits and the same scale. Over
+floats, and over integers mixed with floats, the result is a float. Over
+integers alone it is a float: the exact integer total, converted once to a
+float, divided by the count.
+
+A decimal total outside the decimal range is an error, as for `sum`, and so is
+a group mixing decimals and floats. A group whose values are all null gives
+null.
 
 ### min(expr) -> Any
 
@@ -127,12 +176,31 @@ cxl: |
   emit weighted_price = weighted_avg(unit_price, quantity)
 ```
 
-Returns Float for int/float inputs. When either the value or the weight is a
-`decimal`, the result is an exact `decimal` computed entirely in the decimal
-domain (no binary float touches the running totals), at full division
-precision. A zero total weight returns null. Mixing a `decimal` with a binary
-`float` across the two arguments is a type error -- cast with `.to_decimal()`
-or `.to_float()` so both share one numeric domain.
+`weighted_avg(v, w)` is `sum(v * w) / sum(w)`, with each row's `v * w`
+computed as it is in any expression and both sums exact, rounded once as `sum`
+rounds them. When either the value or the weight is a `decimal`, the result is
+a decimal at full division precision, and it has the same digits and scale as
+`sum(v * w) / sum(w)`. Otherwise it is a float. Over integers alone the two
+exact totals are each converted once to a float and divided.
+
+These groups fail with an `aggregate_finalize` error rather than writing a
+value:
+
+- **Zero total weight.** The group's weights add up to exactly zero, so the
+  average divides by zero, as `x / 0` does in any expression. Drop zero-weight
+  rows before the Aggregate (for example `filter qty != 0`), or emit
+  `sum(value * weight)` and `sum(weight)` separately.
+- **A row's product out of range.** A row's decimal `value * weight` is outside
+  the decimal range. Retracting that row clears the error.
+- **A total or the quotient out of range.** A decimal total is outside the
+  decimal range, or the quotient is because the weights nearly cancel.
+- **Decimal and float in one group**, in one row or across rows (see
+  [above](#decimal-and-float-in-one-group)).
+
+Mixing a `decimal` with a binary `float` across the two arguments is a type
+error when the typechecker can see it: cast with `.to_decimal()` or
+`.to_float()` so both share one numeric type. A group with no row whose value
+and weight are both non-null gives null.
 
 ## Aggregates vs. windows
 

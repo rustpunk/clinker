@@ -109,6 +109,10 @@ $ cxl eval -e 'emit result = "present" ?? "default"'
 }
 ```
 
+Like the branches of an `if`, the two sides of `??` must not be a decimal and a
+float: `amount ?? price` does not compile. Convert one side, as in
+`amount ?? price.to_decimal()`.
+
 ## String concatenation
 
 Use `.concat()` to join strings in compiled pipelines. Numeric `+` is not a

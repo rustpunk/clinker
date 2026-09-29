@@ -268,6 +268,18 @@ the pipeline.
 Comparisons follow the same rule: `decimal < int` is fine, `decimal < float`
 requires a cast.
 
+The branches of a conditional follow it too. An `if`, a `match` or a `??` whose
+branches are a decimal and a float does not compile, because its result would
+be a decimal on some rows and a float on others:
+
+```text
+cannot mix decimal and float without an explicit cast: the branches of this `if` are a decimal (`amount`) and a float (`price`); convert one branch so both have one numeric type, for example `price.to_decimal()` or `amount.to_float()`
+```
+
+Convert one branch, as the message shows:
+`if flag then amount else price.to_decimal()` is a decimal, and
+`if flag then amount.to_float() else price` a float.
+
 ### Casting
 
 `x.to_decimal()` converts an int, string, or float into a decimal (`try_decimal`
@@ -295,8 +307,19 @@ JSON output renders a decimal as a scale-preserving string.)
 `sum`, `avg`, `min`, `max`, `count`, and `distinct` all work over a `decimal`
 column and stay exact — no binary float ever touches a running total:
 
-- `sum(amount)` and `avg(amount)` return a `decimal`. The sum is the exact
-  total to the cent; the average is the exact full-precision quotient.
+- `sum(amount)` returns a `decimal`: the exact total of the group's values,
+  rounded once (half to even) only when it needs more than 28 significant
+  digits, at the largest scale among the group's values. The sum of `1.00`,
+  `-1.00` and `2` is `2.00` in any order, and a total of amounts with two
+  decimal places is exact to the cent.
+- `avg(amount)` is `sum(amount) / count(amount)`, a `decimal` at full division
+  precision, and `weighted_avg(v, w)` is `sum(v * w) / sum(w)`: the same
+  digits and scale as those expressions give.
+- Only a group with no non-null value gives null. A decimal total outside the
+  decimal range, a `weighted_avg` whose weights total zero or whose row
+  product is out of range, and a group holding both decimals and floats each
+  fail the group with an `aggregate_finalize` error that names the fix (see
+  [Aggregate functions](aggregates.md#sumexpr---int-float-or-decimal)).
 - `min` / `max` return the exact extremum, and `count` returns an integer.
 - Group-by and `distinct` keys are scale-normalized: two decimals that are
   numerically equal group together regardless of scale, so `2.50` and `2.5`
@@ -313,16 +336,18 @@ required: a full-precision quotient overflows a narrow numeric field, which is a
 hard error, whereas the rounded value fits.
 
 `weighted_avg` also stays exact over decimals: a decimal value or weight (or
-both) gives an exact `sum(value * weight) / sum(weight)` at full division
-precision, and a zero total weight returns null. A decimal in one position
-mixed with a binary `float` in the other is a type error, matching the
-`decimal ⊗ float` arithmetic rule — cast with `.to_decimal()` or `.to_float()`
-so the value and weight share one numeric domain.
+both) gives `sum(value * weight) / sum(weight)` over exact totals, at full
+division precision. A zero total weight is an error, as `x / 0` is. A decimal
+in one position mixed with a binary `float` in the other is a type error,
+matching the `decimal ⊗ float` arithmetic rule — cast with `.to_decimal()` or
+`.to_float()` so the value and weight share one numeric domain.
 
 ## Type unification rules
 
 When two types meet in an expression, CXL coerces them automatically:
 
 - Numbers combine: mixing an integer and a float gives a float (`2 + 3.5` is `5.5`).
+- A decimal and a float never combine, in an operator or in the branches of an
+  `if`, `match` or `??`: convert one with `.to_decimal()` or `.to_float()`.
 - Arithmetic and ordering comparisons with `null` give `null`. `==` and `!=` never do (`null == null` is `true`), and `and`/`or` give a definite answer when the other side settles it. See [Null Handling](nulls.md).
 - Mismatched types are an error: `String + Int` fails. Convert first with `.to_int()` or `.to_string()` so both sides are the same type.
