@@ -15,7 +15,7 @@ use petgraph::graph::NodeIndex;
 use crate::executor::cull_dispatch::reads_predecessor_slot;
 use crate::executor::dispatch::{
     ExecutorContext, NodeBufferKey, admit_node_buffer, admit_node_buffer_with_readers,
-    advance_cursor, crosses_into_deferred_consumer, node_buffer_spill_allowed,
+    advance_cursor, crosses_into_deferred_consumer, node_buffer_spill_allowed, park_cross_region,
     require_node_buffer_input, source_file_arc_of, source_name_arc_of, stream_linear_producer_emit,
 };
 use crate::executor::schema_check::check_input_schema;
@@ -323,7 +323,6 @@ where
     // assignment selected. Internal-region edges and edges between two
     // non-deferred operators skip the tee — the `node_buffers` entry already
     // covers them.
-    let active_body = ctx.window_runtime.active_stack.last().copied();
     // Collect outgoing (branch, successor, edge) triples before the mutable
     // admissions below so the immutable graph borrow does not overlap them.
     let outgoing: Vec<(String, NodeIndex, petgraph::graph::EdgeIndex)> = current_dag
@@ -355,7 +354,7 @@ where
                         )) as u64
                 })
                 .unwrap_or(0);
-            for (record, rn) in records {
+            for _ in records {
                 if row_bytes_each > 0 && ctx.memory_budget.should_abort() {
                     return Err(ctx.memory_budget.backstop_refusal(
                         name,
@@ -365,11 +364,8 @@ where
                         },
                     ));
                 }
-                ctx.region_input_buffers
-                    .entry((active_body, edge_id))
-                    .or_default()
-                    .push((record.clone(), *rn));
             }
+            park_cross_region(ctx, current_dag, node_idx, edge_id, records)?;
             continue;
         }
         // Route broadcasts punctuations to every branch — each downstream

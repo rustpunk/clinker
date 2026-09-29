@@ -1933,19 +1933,20 @@ pub(crate) struct ExecutorContext<'a> {
     /// proves the short-circuit is taken on every strict workload.
     pub(crate) commit_step_path: CommitStepPath,
 
-    /// Per-edge buffer parking records that cross from a non-deferred
-    /// upstream into a deferred-region member (typically Combine's
-    /// build-side input). Populated by the upstream operator's arm at
-    /// emit time; drained by the commit-time deferred dispatcher in a
-    /// later phase. Keyed by `(active body, EdgeIndex)` because
-    /// top-level and body graphs maintain disjoint EdgeIndex namespaces
-    /// — the body id disambiguates collisions.
+    /// Rows parked on every edge that crosses into a deferred-region member
+    /// (typically a Combine's build-side input), from the producer's emit
+    /// until the commit, keyed by `(active body, EdgeIndex)` because
+    /// top-level and body graphs keep disjoint EdgeIndex namespaces.
     ///
-    /// Per-pipeline footprint flows through pull-mode attribution: the
-    /// arbitrator's `should_abort` poll at downstream batch boundaries
-    /// guards the hard limit on the cumulative cross-region buffer
-    /// payload, same envelope every other operator uses.
-    pub(crate) region_input_buffers: RegionInputBuffers,
+    /// Bounded by its charge: each edge's resident rows are charged to the
+    /// run's ledger through a consumer registered under the producer, and
+    /// spill when a reclaim elects the edge or its own park falls short.
+    /// Every retraction iteration of the commit reads them again; they are
+    /// released when the commit returns, or at the end of a walk that never
+    /// reached it. In its own cell, so a park growing its charge can let a
+    /// reclaim spill the store's other edges.
+    pub(crate) parked_generations:
+        std::rc::Rc<std::cell::RefCell<crate::executor::parked_generations::ParkedGenerations>>,
 
     /// Inverts the meaning of the per-operator deferred-region guard at
     /// the top of `dispatch_plan_node`. `false` (forward pass) makes
@@ -2105,18 +2106,6 @@ pub(crate) struct ExecutorContext<'a> {
     pub(crate) runtime_statistics:
         Arc<std::sync::Mutex<clinker_plan::plan::statistics::StatisticsCatalog>>,
 }
-
-/// Map keying (active composition body, outgoing edge id) to the rows
-/// that crossed from a non-deferred upstream into a deferred-region
-/// consumer along that edge. The body id is `None` for top-level edges;
-/// each composition body has its own EdgeIndex namespace.
-type RegionInputBuffers = HashMap<
-    (
-        Option<clinker_plan::plan::CompositionBodyId>,
-        petgraph::graph::EdgeIndex,
-    ),
-    Vec<(Record, crate::executor::stream_event::SourceRowId)>,
->;
 
 /// Which commit-step body the orchestrator selected for the current
 /// pipeline. `FastPath` short-circuits to the strict body and is the
@@ -2591,18 +2580,13 @@ pub(crate) fn project_rows_to_buffer_schema(
         .collect()
 }
 
-/// Tee `emit_rows` into `region_input_buffers` for every outgoing edge
-/// from `producer_idx` whose target is a deferred-region member or
-/// output AND whose source (`producer_idx`) is NOT in the same region.
-/// Internal-region edges are skipped — they live in `node_buffers`
-/// already. Edges leaving the region's producer toward a member are
-/// also skipped because the producer's own `node_buffers[producer_idx]`
-/// is the canonical entry point the commit-time deferred dispatcher
-/// reads from.
-///
-/// In-flight bytes flow through pull-mode attribution; the
-/// arbitrator's `should_abort` poll at downstream batch boundaries
-/// guards the pipeline-wide hard limit.
+/// Park `emit_rows` for every outgoing edge from `producer_idx` whose target
+/// is a deferred-region member or output AND whose source (`producer_idx`)
+/// is NOT in the same region ([`park_cross_region`]). Internal-region edges
+/// are skipped — they live in `node_buffers` already. Edges leaving the
+/// region's producer toward a member are also skipped because the
+/// producer's own `node_buffers[producer_idx]` is the canonical entry point
+/// the commit-time deferred dispatcher reads from.
 pub(crate) fn tee_emit_to_region_input_buffers(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
@@ -2610,7 +2594,6 @@ pub(crate) fn tee_emit_to_region_input_buffers(
     emit_rows: &[(Record, crate::executor::stream_event::SourceRowId)],
 ) -> Result<(), PipelineError> {
     use petgraph::visit::EdgeRef;
-    let active_body = ctx.window_runtime.active_stack.last().copied();
     let mut crossing_edges: Vec<petgraph::graph::EdgeIndex> = Vec::new();
     for edge_ref in current_dag
         .graph
@@ -2621,17 +2604,100 @@ pub(crate) fn tee_emit_to_region_input_buffers(
             crossing_edges.push(edge_ref.id());
         }
     }
-    if crossing_edges.is_empty() {
-        return Ok(());
-    }
     for edge_id in crossing_edges {
-        for (record, rn) in emit_rows {
-            ctx.region_input_buffers
-                .entry((active_body, edge_id))
-                .or_default()
-                .push((record.clone(), *rn));
-        }
+        park_cross_region(ctx, current_dag, producer_idx, edge_id, emit_rows)?;
     }
+    Ok(())
+}
+
+/// Park a copy of `rows` on the crossing edge `edge_id` out of
+/// `producer_idx`, in the active composition body's edge namespace, until
+/// the commit reads them ([`ParkedGenerations::park`]).
+///
+/// The rows' resident size is charged before they are kept: on the walk
+/// that growth reclaims other state first, and rows that still do not fit
+/// spill. Never refused for memory; past the spill cap it fails with E320.
+///
+/// [`ParkedGenerations::park`]: crate::executor::parked_generations::ParkedGenerations::park
+pub(crate) fn park_cross_region(
+    ctx: &mut ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
+    producer_idx: NodeIndex,
+    edge_id: petgraph::graph::EdgeIndex,
+    rows: &[(Record, crate::executor::stream_event::SourceRowId)],
+) -> Result<(), PipelineError> {
+    let active_body = ctx.window_runtime.active_stack.last().copied();
+    let Some((_, target)) = current_dag.graph.edge_endpoints(edge_id) else {
+        return Err(PipelineError::Internal {
+            op: "executor",
+            node: current_dag.graph[producer_idx].name().to_string(),
+            detail: format!(
+                "crossing edge {} is not in the current DAG",
+                edge_id.index()
+            ),
+        });
+    };
+    crate::executor::parked_generations::ParkedGenerations::park(
+        &ctx.parked_generations,
+        (active_body, edge_id),
+        rows,
+        current_dag.graph[producer_idx].name(),
+        current_dag.graph[target].name(),
+    )
+}
+
+/// Publish `view`, a cursor over rows another owner holds and charges, as
+/// the slot at `key` for `readers` readers.
+///
+/// The slot is registered like any other, under `reader`, with nothing
+/// charged: a materializing reader charges its own copy to it, as it would
+/// to a slot it took over. A spill of the slot frees nothing while the view
+/// shares its owner's backing, so it ranks with no reclaimable bytes.
+pub(crate) fn publish_node_buffer_view(
+    ctx: &mut ExecutorContext<'_>,
+    producer: &str,
+    reader: &str,
+    key: NodeBufferKey,
+    view: NodeBuffer,
+    readers: usize,
+) -> Result<(), PipelineError> {
+    let occupied = {
+        let set = ctx.walk_reclaim.borrow();
+        set.slots().contains_buffer(&key) || set.slots().is_registered(&key)
+    };
+    if occupied {
+        return Err(PipelineError::Internal {
+            op: "executor",
+            node: producer.to_string(),
+            detail: format!(
+                "node-buffer slot {key:?} was republished without first discarding the previous slot"
+            ),
+        });
+    }
+    let slot_spill = ctx
+        .planned_node_buffer_readers
+        .slot_spill(&key, true, producer)?;
+    ctx.walk_reclaim
+        .borrow_mut()
+        .slots_mut()
+        .readers_mut()
+        .publish(key.clone(), readers, producer)?;
+    let handle = crate::pipeline::memory::ConsumerHandle::new();
+    let consumer = ctx.memory_budget.register_node_consumer(
+        Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+            Arc::clone(&handle),
+        )),
+        Arc::clone(&handle),
+        clinker_plan::runtime_error::ConsumerLabel {
+            node: reader.to_string(),
+            surface: clinker_plan::runtime_error::MemorySurface::ScanMaterialization,
+        },
+    );
+    let mut set = ctx.walk_reclaim.borrow_mut();
+    let slots = set.slots_mut();
+    slots.register(key.clone(), (consumer, Arc::clone(&handle)), slot_spill);
+    slots.insert_buffer(key, view);
+    handle.set_reclaimable(0);
     Ok(())
 }
 

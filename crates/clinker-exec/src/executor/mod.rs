@@ -25,6 +25,7 @@ pub(crate) mod merge_dispatch;
 pub mod node_buffer;
 pub(crate) mod node_buffer_spill;
 mod params;
+pub(crate) mod parked_generations;
 mod registry;
 pub(crate) mod reshape_dispatch;
 mod route;
@@ -1904,6 +1905,14 @@ impl PipelineExecutor {
             .pipeline
             .batch_size
             .unwrap_or(crate::executor::batch_handoff::DEFAULT_BATCH_SIZE);
+        let parked_generations = std::rc::Rc::new(std::cell::RefCell::new(
+            parked_generations::ParkedGenerations::new(
+                Arc::clone(&memory_budget),
+                Arc::clone(&spill_root_path),
+                params.spill_compress,
+                batch_size,
+            ),
+        ));
         let mut ctx = dispatch::ExecutorContext {
             writer_resources,
             allocation_resources,
@@ -1981,7 +1990,7 @@ impl PipelineExecutor {
             relaxed_aggregator_states: HashMap::new(),
             relaxed_aggregator_degrade: Vec::new(),
             commit_step_path: dispatch::CommitStepPath::NotSelected,
-            region_input_buffers: HashMap::new(),
+            parked_generations,
             in_deferred_dispatch: false,
             transform_signal_carry: crate::log_dispatch::ParkedTransformSignals::new(
                 params.telemetry_producer.clone(),
@@ -2177,6 +2186,9 @@ impl PipelineExecutor {
         // consumed fan-out and composition inputs.
         let residue = ctx.walk_reclaim.borrow_mut().take_slots();
         residue.release_residue(&ctx.memory_budget);
+        // Rows parked for a deferred consumer are released when the commit
+        // returns; a walk that never reached the commit releases them here.
+        ctx.parked_generations.borrow_mut().release_all();
 
         // A tripped shutdown token unwinds the walk via
         // `PipelineError::Interrupted`; that is a graceful early stop, not

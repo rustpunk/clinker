@@ -9,7 +9,8 @@
 //!   they live in the `pending_puncts` sidecar.
 //! - `Mixed`: a mem tail accumulated after a partial spill.
 //! - `ReReadable`: immutable resident or spilled backing shared by sequential
-//!   fan-out consumers, each with an independent cursor.
+//!   fan-out consumers, each with an independent cursor. A backing may chain
+//!   several others, read one after another in order.
 //!
 //! Every consumer drains a slot through [`NodeBuffer::drain`], which
 //! returns an iterator that streams memory events first, then per-spill
@@ -140,7 +141,19 @@ pub(crate) enum ReReadableNodeBuffer {
         spills: Vec<(SpillFile<SourceRowId>, u64)>,
         pending_puncts: Vec<Punctuation>,
     },
+    /// Other backings read one after another, each whole before the next,
+    /// sharing them rather than copying: the segments of one parked
+    /// cross-region edge, in the order they were parked. Never nests: every
+    /// part is one of the other variants.
+    Chain(Vec<Arc<ReReadableNodeBuffer>>),
 }
+
+/// Borrowed events, from one backing or from each part of a chain in turn.
+type BorrowedEvents<'a> = Box<dyn Iterator<Item = &'a StreamEvent> + 'a>;
+
+/// Borrowed spill chunks, from one backing or from each part of a chain in
+/// turn.
+type BorrowedChunks<'a> = Box<dyn Iterator<Item = &'a (SpillFile<SourceRowId>, u64)> + 'a>;
 
 impl ReReadableNodeBuffer {
     fn len_hint(&self) -> usize {
@@ -154,28 +167,49 @@ impl ReReadableNodeBuffer {
                         .map(|(_, count)| *count as usize)
                         .sum::<usize>()
             }
+            Self::Chain(parts) => parts.iter().map(|part| part.len_hint()).sum(),
         }
     }
 
-    fn memory_events(&self) -> &[StreamEvent] {
+    /// Every resident event, a chain's parts in order.
+    fn memory_events(&self) -> BorrowedEvents<'_> {
+        match self {
+            Self::Chain(parts) => Box::new(parts.iter().flat_map(|part| part.memory_events())),
+            other => Box::new(other.leaf_memory_events().iter()),
+        }
+    }
+
+    /// Every spill chunk, a chain's parts in order.
+    fn spill_chunks(&self) -> BorrowedChunks<'_> {
+        match self {
+            Self::Chain(parts) => Box::new(parts.iter().flat_map(|part| part.spill_chunks())),
+            other => Box::new(other.leaf_spill_chunks().iter()),
+        }
+    }
+
+    /// This backing's own resident events; none for a chain, whose events
+    /// live in its parts.
+    fn leaf_memory_events(&self) -> &[StreamEvent] {
         match self {
             Self::Memory(events) => events,
             Self::Mixed { mem, .. } => mem,
-            Self::Spilled { .. } => &[],
+            Self::Spilled { .. } | Self::Chain(_) => &[],
         }
     }
 
-    fn spill_chunks(&self) -> &[(SpillFile<SourceRowId>, u64)] {
+    /// This backing's own spill chunks; none for a chain.
+    fn leaf_spill_chunks(&self) -> &[(SpillFile<SourceRowId>, u64)] {
         match self {
-            Self::Memory(_) => &[],
+            Self::Memory(_) | Self::Chain(_) => &[],
             Self::Spilled { chunks, .. } => chunks,
             Self::Mixed { spills, .. } => spills,
         }
     }
 
-    fn pending_puncts(&self) -> &[Punctuation] {
+    /// This backing's own trailing punctuations; none for a chain.
+    fn leaf_pending_puncts(&self) -> &[Punctuation] {
         match self {
-            Self::Memory(_) => &[],
+            Self::Memory(_) | Self::Chain(_) => &[],
             Self::Spilled { pending_puncts, .. } | Self::Mixed { pending_puncts, .. } => {
                 pending_puncts
             }
@@ -278,6 +312,36 @@ impl NodeBuffer {
         Ok(Self::ReReadable(backing))
     }
 
+    /// [`Self::reread`], returning the shared backing the new cursor reads
+    /// rather than the cursor, so a caller can chain it with others
+    /// ([`Self::chained`]).
+    pub(crate) fn reread_backing(&mut self) -> Result<Arc<ReReadableNodeBuffer>, PipelineError> {
+        match self.reread()? {
+            Self::ReReadable(backing) => Ok(backing),
+            _ => unreachable!("reread always returns a re-readable cursor"),
+        }
+    }
+
+    /// One cursor reading `parts` one after another, in order, each whole
+    /// before the next. Shares every part's backing (nothing is copied), so
+    /// the parts stay alive, and a spill of their owner frees nothing, until
+    /// the cursor drops. No parts is an empty slot; one part is that part's
+    /// own cursor.
+    pub(crate) fn chained(parts: Vec<Arc<ReReadableNodeBuffer>>) -> Self {
+        let mut flat: Vec<Arc<ReReadableNodeBuffer>> = Vec::with_capacity(parts.len());
+        for part in parts {
+            match part.as_ref() {
+                ReReadableNodeBuffer::Chain(inner) => flat.extend(inner.iter().cloned()),
+                _ => flat.push(part),
+            }
+        }
+        match flat.len() {
+            0 => Self::Memory(Vec::new()),
+            1 => Self::ReReadable(flat.pop().expect("one part")),
+            _ => Self::ReReadable(Arc::new(ReReadableNodeBuffer::Chain(flat))),
+        }
+    }
+
     /// Recover the ordinary owned representation for the authoritative last
     /// reader when no earlier cursor remains live. A still-shared Arc remains
     /// re-readable defensively; synchronous dispatch normally unwraps here.
@@ -303,7 +367,20 @@ impl NodeBuffer {
                 spills,
                 pending_puncts,
             },
+            // A chain has no owned form: it only ever shares its parts.
+            Ok(chain @ ReReadableNodeBuffer::Chain(_)) => Self::ReReadable(Arc::new(chain)),
             Err(backing) => Self::ReReadable(backing),
+        }
+    }
+
+    /// The slot's resident events, whatever holds them: none for a slot
+    /// whose rows are all on disk.
+    fn resident_events(&self) -> BorrowedEvents<'_> {
+        match self {
+            Self::Memory(events) => Box::new(events.iter()),
+            Self::Mixed { mem, .. } => Box::new(mem.iter()),
+            Self::Spilled { .. } | Self::MergeSpilled { .. } => Box::new(std::iter::empty()),
+            Self::ReReadable(backing) => backing.memory_events(),
         }
     }
 
@@ -389,14 +466,7 @@ impl NodeBuffer {
     /// resident rows; spill-aware pre-flight validation is part of
     /// the spill-wiring sub-issue.
     pub(crate) fn peek_mem_records(&self) -> Vec<(&Record, SourceRowId)> {
-        let mem_slice = match self {
-            Self::Memory(v) => v.as_slice(),
-            Self::Mixed { mem, .. } => mem.as_slice(),
-            Self::Spilled { .. } | Self::MergeSpilled { .. } => &[],
-            Self::ReReadable(backing) => backing.memory_events(),
-        };
-        mem_slice
-            .iter()
+        self.resident_events()
             .filter_map(|e| match e {
                 StreamEvent::Record(r, rn) => Some((r, *rn)),
                 StreamEvent::Punctuation(_) => None,
@@ -425,20 +495,15 @@ impl NodeBuffer {
                 return runs.first().map(|f| f.schema().column_count()).unwrap_or(0);
             }
             Self::ReReadable(backing) => {
-                if let Some(columns) =
-                    backing
-                        .memory_events()
-                        .iter()
-                        .find_map(|event| match event {
-                            StreamEvent::Record(record, _) => Some(record.schema().column_count()),
-                            StreamEvent::Punctuation(_) => None,
-                        })
-                {
+                if let Some(columns) = backing.memory_events().find_map(|event| match event {
+                    StreamEvent::Record(record, _) => Some(record.schema().column_count()),
+                    StreamEvent::Punctuation(_) => None,
+                }) {
                     return columns;
                 }
                 return backing
                     .spill_chunks()
-                    .first()
+                    .next()
                     .map(|(file, _)| file.schema().column_count())
                     .unwrap_or(0);
             }
@@ -462,18 +527,13 @@ impl NodeBuffer {
     /// accounted via `MemoryArbitrator::cumulative_spill_bytes` (the disk
     /// quota), not this counter, so a `Spilled` slot reports `0` here.
     pub(crate) fn estimated_memory_bytes(&self) -> u64 {
-        let events = match self {
-            Self::Memory(events) => events.as_slice(),
-            Self::Mixed { mem, .. } => mem.as_slice(),
-            Self::Spilled { .. } | Self::MergeSpilled { .. } => return 0,
-            Self::ReReadable(backing) => backing.memory_events(),
-        };
-        events.iter().fold(0u64, |bytes, event| match event {
-            StreamEvent::Record(record, _) => {
-                bytes.saturating_add(record_byte_cost(record.schema().column_count()))
-            }
-            StreamEvent::Punctuation(_) => bytes,
-        })
+        self.resident_events()
+            .fold(0u64, |bytes, event| match event {
+                StreamEvent::Record(record, _) => {
+                    bytes.saturating_add(record_byte_cost(record.schema().column_count()))
+                }
+                StreamEvent::Punctuation(_) => bytes,
+            })
     }
 
     /// Bytes a spill of this slot would free now: each resident record's
@@ -482,43 +542,33 @@ impl NodeBuffer {
     /// for it, because the spill drops it. Rows already on disk count 0.
     /// What the slot's consumer ranks by as a reclaim victim; never charged.
     pub(crate) fn reclaimable_bytes(&self) -> u64 {
-        let events = match self {
-            Self::Memory(events) => events.as_slice(),
-            Self::Mixed { mem, .. } => mem.as_slice(),
-            Self::Spilled { .. } | Self::MergeSpilled { .. } => return 0,
-            Self::ReReadable(backing) => backing.memory_events(),
-        };
-        events.iter().fold(0u64, |bytes, event| match event {
-            StreamEvent::Record(record, _) => bytes
-                .saturating_add(record_byte_cost(record.schema().column_count()))
-                .saturating_add(record.legacy_estimated_heap_size() as u64),
-            StreamEvent::Punctuation(_) => bytes,
-        })
+        self.resident_events()
+            .fold(0u64, |bytes, event| match event {
+                StreamEvent::Record(record, _) => bytes
+                    .saturating_add(record_byte_cost(record.schema().column_count()))
+                    .saturating_add(record.legacy_estimated_heap_size() as u64),
+                StreamEvent::Punctuation(_) => bytes,
+            })
     }
 
     /// Actual resident fixed-row attribution to this run, with each row's
     /// private values backing classified independently. Does not allocate.
     pub(crate) fn unaccounted_memory_bytes(&self, resources: &AllocationResources) -> u64 {
-        let events = match self {
-            Self::Memory(events) => events.as_slice(),
-            Self::Mixed { mem, .. } => mem.as_slice(),
-            Self::Spilled { .. } | Self::MergeSpilled { .. } => return 0,
-            Self::ReReadable(backing) => backing.memory_events(),
-        };
-        events.iter().fold(0u64, |bytes, event| match event {
-            StreamEvent::Record(record, _) => {
-                bytes.saturating_add(unaccounted_record_byte_cost(record, resources))
-            }
-            StreamEvent::Punctuation(_) => bytes,
-        })
+        self.resident_events()
+            .fold(0u64, |bytes, event| match event {
+                StreamEvent::Record(record, _) => {
+                    bytes.saturating_add(unaccounted_record_byte_cost(record, resources))
+                }
+                StreamEvent::Punctuation(_) => bytes,
+            })
     }
 
     /// Full logical-slot forecast for independently decoded disk rows.
     fn disk_materialized_bytes(&self) -> u64 {
-        let chunks = match self {
+        let chunks: BorrowedChunks<'_> = match self {
             Self::Memory(_) => return 0,
-            Self::Spilled { chunks, .. } => chunks.as_slice(),
-            Self::Mixed { spills, .. } => spills.as_slice(),
+            Self::Spilled { chunks, .. } => Box::new(chunks.iter()),
+            Self::Mixed { spills, .. } => Box::new(spills.iter()),
             Self::ReReadable(backing) => backing.spill_chunks(),
             Self::MergeSpilled {
                 runs, row_count, ..
@@ -528,7 +578,7 @@ impl NodeBuffer {
                 });
             }
         };
-        chunks.iter().fold(0u64, |bytes, (file, count)| {
+        chunks.fold(0u64, |bytes, (file, count)| {
             bytes.saturating_add(
                 record_byte_cost(file.schema().column_count()).saturating_mul(*count),
             )
@@ -765,6 +815,12 @@ impl NodeBuffer {
                 };
             }
             Self::ReReadable(backing) => {
+                if let ReReadableNodeBuffer::Chain(parts) = backing.as_ref() {
+                    return NodeBufferDrain::Chain {
+                        parts: parts.clone().into_iter(),
+                        current: None,
+                    };
+                }
                 return NodeBufferDrain::ReReadable {
                     current: None,
                     backing,
@@ -1057,6 +1113,12 @@ pub(crate) enum NodeBufferDrain {
         spill_index: usize,
         punctuation_index: usize,
     },
+    /// A chain of re-readable backings, each drained whole, in order,
+    /// before the next part opens.
+    Chain {
+        parts: VecIntoIter<Arc<ReReadableNodeBuffer>>,
+        current: Option<Box<NodeBufferDrain>>,
+    },
 }
 
 pub(crate) struct ActiveSpill {
@@ -1158,7 +1220,7 @@ impl Iterator for NodeBufferDrain {
                 current,
                 punctuation_index,
             } => {
-                if let Some(event) = backing.memory_events().get(*memory_index) {
+                if let Some(event) = backing.leaf_memory_events().get(*memory_index) {
                     *memory_index += 1;
                     return Some(Ok(event.clone()));
                 }
@@ -1172,7 +1234,7 @@ impl Iterator for NodeBufferDrain {
                             None => *current = None,
                         }
                     }
-                    let chunks = backing.spill_chunks();
+                    let chunks = backing.leaf_spill_chunks();
                     if let Some((file, _)) = chunks.get(*spill_index) {
                         *spill_index += 1;
                         match file.reader() {
@@ -1181,12 +1243,22 @@ impl Iterator for NodeBufferDrain {
                         }
                         continue;
                     }
-                    let puncts = backing.pending_puncts();
+                    let puncts = backing.leaf_pending_puncts();
                     let punctuation = puncts.get(*punctuation_index)?.clone();
                     *punctuation_index += 1;
                     return Some(Ok(StreamEvent::punctuation(punctuation)));
                 }
             }
+            Self::Chain { parts, current } => loop {
+                if let Some(part) = current.as_mut() {
+                    match part.next() {
+                        Some(item) => return Some(item),
+                        None => *current = None,
+                    }
+                }
+                let part = parts.next()?;
+                *current = Some(Box::new(NodeBuffer::ReReadable(part).drain()));
+            },
         }
     }
 }
@@ -2237,6 +2309,50 @@ mod tests {
         assert_eq!(rec_row_num(&drained[0]), 10);
         assert_eq!(rec_row_num(&drained[1]), 11);
         assert!(matches!(drained[2], StreamEvent::Punctuation(_)));
+    }
+
+    #[test]
+    fn a_chain_reads_each_part_whole_in_order_and_shares_its_backing() {
+        let s = schema();
+        let mut first = NodeBuffer::Memory(Vec::new());
+        first.push(rec(&s, 1, "a"), 10);
+        first.push(rec(&s, 2, "b"), 11);
+        let (mut first, _) = first
+            .spill_resident_memory(None, true)
+            .expect("resident spill ok");
+        let mut second = NodeBuffer::Memory(Vec::new());
+        second.push(rec(&s, 3, "c"), 12);
+        let mut third = NodeBuffer::Memory(Vec::new());
+        third.push(rec(&s, 4, "d"), 13);
+        third.push(rec(&s, 5, "e"), 14);
+
+        let parts = vec![
+            first.reread_backing().unwrap(),
+            second.reread_backing().unwrap(),
+            third.reread_backing().unwrap(),
+        ];
+        let view = NodeBuffer::chained(parts);
+        assert_eq!(view.len_hint(), 5);
+        assert_eq!(view.first_record_column_count(), 2);
+        // The chain copies nothing: the resident parts are shared, so a
+        // spill of their owner frees nothing while the view lives.
+        assert!(
+            matches!(&second, NodeBuffer::ReReadable(backing) if Arc::strong_count(backing) == 2)
+        );
+        let (second, freed) = second.spill_resident_memory(None, true).unwrap();
+        assert_eq!(freed, 0);
+
+        // Spilled part first, then the resident ones, each whole, in order.
+        let order: Vec<u64> = view
+            .drain()
+            .map(|event| rec_row_num(&event.unwrap()))
+            .collect();
+        assert_eq!(order, vec![10, 11, 12, 13, 14]);
+        assert!(
+            matches!(&second, NodeBuffer::ReReadable(backing) if Arc::strong_count(backing) == 1)
+        );
+        drop(first);
+        drop(third);
     }
 
     #[test]

@@ -8,7 +8,7 @@
 #[path = "common/dlq_sink.rs"]
 mod dlq_sink;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::io::Write;
 
 use clinker_bench_support::io::SharedBuffer;
@@ -30,6 +30,8 @@ pipeline:
   name: cross_region_cascade
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: orders
@@ -116,6 +118,10 @@ fn orders_csv(with_hr: bool) -> String {
 }
 
 const LOOKUP_CSV: &str = "department,budget\nHR,100\nENG,500\n";
+
+/// A dead letter's stage, `department` and `budget` cells, and whether it
+/// is the trigger.
+type DeadLetterFacts<'a> = (Option<&'a str>, Option<&'a str>, Option<&'a str>, bool);
 
 /// One finished run: its report, its Output's bytes and its dead-letter rows.
 struct Run {
@@ -235,15 +241,25 @@ fn cross_region_input_survives_cascading_iterations() {
         converged.output
     );
 
-    let dead_lettered: BTreeSet<u64> = converged
+    // The failure dead-letters the HR aggregate row that `ratio` could not
+    // divide, once: the iteration that re-read the parked rows neither lost
+    // nor repeated it.
+    let dead_letters: Vec<DeadLetterFacts<'_>> = converged
         .dead_letters
         .iter()
-        .filter(|row| row.source_name() == "orders")
-        .map(dlq_sink::DlqRow::source_row)
+        .map(|row| {
+            (
+                row.stage(),
+                row.field("department"),
+                row.field("budget"),
+                row.trigger(),
+            )
+        })
         .collect();
     assert_eq!(
-        dead_lettered,
-        (1..=HR_ORDERS as u64).collect::<BTreeSet<u64>>(),
-        "every HR order, and only HR orders, is dead-lettered"
+        dead_letters,
+        vec![(Some("transform:ratio"), Some("HR"), Some("100"), true)],
+        "exactly one dead letter: HR's row, joined to its parked budget, failing in `ratio`"
     );
+    assert_eq!(converged.report.counters.dlq_count, 1);
 }

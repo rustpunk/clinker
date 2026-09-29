@@ -69,7 +69,7 @@ use petgraph::visit::EdgeRef;
 
 use crate::executor::dispatch::{
     ExecutorContext, NodeBufferKey, admit_node_buffer, admit_node_buffer_with_readers,
-    crosses_into_deferred_consumer, node_buffer_spill_allowed,
+    crosses_into_deferred_consumer, node_buffer_spill_allowed, park_cross_region,
     require_single_input_node_buffer_slot, source_file_arc_of, source_name_arc_of,
 };
 use crate::executor::giant_group_error;
@@ -597,8 +597,6 @@ fn emit_ports(
     let removed_port = config.removed_to.as_str();
     let is_removed_port = |port: Option<&str>| matches!(port, Some(p) if p == removed_port);
 
-    let active_body = ctx.window_runtime.active_stack.last().copied();
-
     // Predecessor-slot readers (Merge / Combine) drain by incoming edge, so one
     // slot per distinct producer output port lands in this Cull's own slot
     // keyed `(node_idx, Some(port))`. Materialize each port's set once (multiple
@@ -640,10 +638,9 @@ fn emit_ports(
                         )) as u64
                 })
                 .unwrap_or(0);
-            for (record, rn) in records {
+            for _ in records {
                 // Fail loud if an oversized cross-region tee would blow the
-                // budget, mirroring the Route tee — parking unbounded records
-                // into `region_input_buffers` must not silently overshoot.
+                // budget, mirroring the Route tee.
                 if row_bytes_each > 0 && ctx.memory_budget.should_abort() {
                     return Err(ctx.memory_budget.backstop_refusal(
                         name,
@@ -653,11 +650,8 @@ fn emit_ports(
                         },
                     ));
                 }
-                ctx.region_input_buffers
-                    .entry((active_body, edge_id))
-                    .or_default()
-                    .push((record.clone(), *rn));
             }
+            park_cross_region(ctx, current_dag, node_idx, edge_id, records)?;
             continue;
         }
         if reads_predecessor_slot(&current_dag.graph[succ]) {
