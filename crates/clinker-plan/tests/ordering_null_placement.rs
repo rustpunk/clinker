@@ -4,10 +4,11 @@
 //! never removes any, so its null option is placement only: `first` or
 //! `last`. `null_order: drop` there is a plan-time error that names the node
 //! and the field, says why, and gives the upstream `filter` that does remove
-//! the rows. Both nodes also take the bare field-name shorthand a Sink or
-//! Source `sort_order` takes, and carry the validated list on their plan
-//! node. A Source `sort_order` refuses `drop` through the same conversion;
-//! only a Sink `sort_order` keeps it.
+//! the rows, or, for a field CXL cannot write as a bare name, the Source
+//! `source_name` rename that makes one. Both nodes also take the bare
+//! field-name shorthand a Sink or Source `sort_order` takes, and carry the
+//! validated list on their plan node. A Source `sort_order` refuses `drop`
+//! through the same conversion; only a Sink `sort_order` keeps it.
 
 use std::path::PathBuf;
 
@@ -512,6 +513,17 @@ fn assert_points_to_source_name(message: &str, field: &str) {
     );
 }
 
+/// The Source text for field `order id`, written out in full so a change to
+/// the rename wording is a visible change to this test.
+const SOURCE_RENAME_TEXT: &str = "source 'src': `null_order: drop` is not allowed on \
+     `sort_order` for field 'order id': source verification cannot discard records. Use \
+     `null_order: first` or `null_order: last`. CXL cannot name the field 'order id': a CXL \
+     field name is one identifier of ASCII letters, digits and `_`, not starting with a digit \
+     and not a CXL keyword. To exclude rows whose 'order id' is null, rename the column to such \
+     a name in its Source schema entry and keep reading the input column through `source_name` \
+     (for example `{ name: order_id, type: string, source_name: \"order id\" }`), then filter \
+     on the new name in a Transform after this source.";
+
 #[test]
 fn source_sort_order_drop_on_a_field_cxl_cannot_name_points_to_source_name() {
     for field in UNNAMEABLE_FIELDS {
@@ -532,6 +544,9 @@ fn source_sort_order_drop_on_a_field_cxl_cannot_name_points_to_source_name() {
         let message = the_drop_message(&yaml, "src");
         assert!(message.starts_with("source 'src': "), "{field}: {message}");
         assert_points_to_source_name(&message, field);
+        if field == "order id" {
+            assert_eq!(message, SOURCE_RENAME_TEXT);
+        }
     }
 }
 

@@ -578,7 +578,11 @@ ordering decides which records are written. A Source `sort_order`, a Cull or
 Reshape `order_by` and a Transform `analytic_window.sort_by` only order
 records, so they accept `first` and `last` and reject `drop` when the
 pipeline is planned, pointing at a `filter not <field>.is_null()` Transform
-instead.
+instead. When CXL cannot name the field as it is (a name with a space, a CXL
+keyword such as `filter`, or a flattened `Address.City`), the error prints no
+CXL and points at the Source schema's
+[`source_name`](source.md#source_name--read-a-differently-named-physical-column)
+rename, which gives the column a name the filter can use.
 
 `drop` removes records, so a run using it writes fewer records than it read
 and that is not a fault. A missing column counts as a null key: a record that

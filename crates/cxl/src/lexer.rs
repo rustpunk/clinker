@@ -413,35 +413,66 @@ impl<'src> Lexer<'src> {
             return (Token::Underscore, Span::new(start, self.pos));
         }
 
-        let tok = match text {
-            "let" => Token::Let,
-            "emit" => Token::Emit,
-            "if" => Token::If,
-            "then" => Token::Then,
-            "else" => Token::Else,
-            "and" => Token::And,
-            "or" => Token::Or,
-            "not" => Token::Not,
-            "match" => Token::Match,
-            "use" => Token::Use,
-            "as" => Token::As,
-            "fn" => Token::Fn,
-            "trace" => Token::Trace,
-            "null" => Token::Null,
-            "true" => Token::True,
-            "false" => Token::False,
-            "now" => Token::Now,
-            "it" => Token::It,
-            "filter" => Token::Filter,
-            "distinct" => Token::Distinct,
-            "by" => Token::By,
-            "for" => Token::For,
-            "in" => Token::In,
-            _ => Token::Ident(text.into()),
-        };
+        let tok = KEYWORDS
+            .iter()
+            .find(|(word, _)| *word == text)
+            .map_or_else(|| Token::Ident(text.into()), |(_, keyword)| keyword.clone());
 
         (tok, Span::new(start, self.pos))
     }
+}
+
+/// Every reserved word of CXL with the token the lexer produces for it.
+///
+/// This is the lexer's keyword table, not a copy of it: `lex_ident` looks
+/// words up here, and [`is_bare_field_name`] refuses the same words, so a
+/// keyword added here is at once reserved in source text and refused as a
+/// bare field name.
+pub const KEYWORDS: &[(&str, Token)] = &[
+    ("let", Token::Let),
+    ("emit", Token::Emit),
+    ("if", Token::If),
+    ("then", Token::Then),
+    ("else", Token::Else),
+    ("and", Token::And),
+    ("or", Token::Or),
+    ("not", Token::Not),
+    ("match", Token::Match),
+    ("use", Token::Use),
+    ("as", Token::As),
+    ("fn", Token::Fn),
+    ("trace", Token::Trace),
+    ("null", Token::Null),
+    ("true", Token::True),
+    ("false", Token::False),
+    ("now", Token::Now),
+    ("it", Token::It),
+    ("filter", Token::Filter),
+    ("distinct", Token::Distinct),
+    ("by", Token::By),
+    ("for", Token::For),
+    ("in", Token::In),
+];
+
+/// Whether a column name can be written in CXL as it is, as a bare field
+/// reference.
+///
+/// True only for one identifier the lexer reads as [`Token::Ident`]: ASCII
+/// letters, digits and `_`, not starting with a digit, not the lone `_`, and
+/// not a [`KEYWORDS`] entry. A name with a dot is refused even though CXL
+/// parses `Address.City`: that text is a path into `Address`, not the
+/// flattened column named `Address.City`, so printing it would read another
+/// value. Diagnostics use this to decide whether they may print CXL naming
+/// the column.
+pub fn is_bare_field_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let starts_like_an_identifier = bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_');
+    starts_like_an_identifier
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        && name != "_"
+        && !KEYWORDS.iter().any(|(word, _)| *word == name)
 }
 
 /// Error returned by `Lexer::new()` for invalid input.
@@ -501,6 +532,62 @@ mod tests {
         for (src, expected) in keywords {
             let tokens = Lexer::tokenize(src);
             assert_eq!(tokens[0].0, expected, "keyword '{}' failed", src);
+        }
+    }
+
+    #[test]
+    fn no_keyword_is_a_bare_field_name() {
+        assert_eq!(KEYWORDS.len(), 23);
+        for (word, _) in KEYWORDS {
+            assert!(!is_bare_field_name(word), "keyword '{word}'");
+        }
+    }
+
+    #[test]
+    fn bare_field_names_are_single_identifiers() {
+        for name in ["_x1", "txn_date", "amount", "Filter", "NULL", "x", "a1_b2"] {
+            assert!(is_bare_field_name(name), "'{name}' should be bare");
+        }
+        for name in [
+            "",
+            "_",
+            "a b",
+            "order id",
+            "a.b",
+            "a\\.b",
+            "Address.City",
+            "größe",
+            "a-b",
+            "1a",
+            " x",
+            "x ",
+            "$x",
+            "x\n",
+        ] {
+            assert!(!is_bare_field_name(name), "{name:?} should not be bare");
+        }
+    }
+
+    /// The check agrees with the lexer: a name is bare exactly when the
+    /// lexer reads it back as one identifier token carrying the same text.
+    #[test]
+    fn bare_field_name_agrees_with_the_lexer() {
+        let mut names: Vec<&str> = KEYWORDS.iter().map(|(word, _)| *word).collect();
+        names.extend([
+            "_x1", "txn_date", "Filter", "", "_", "a b", "a.b", "größe", "a-b", "1a", "x ", "x#y",
+            "$doc", "it", "__",
+        ]);
+        for name in names {
+            let tokens = Lexer::tokenize(name);
+            let lexes_as_itself = matches!(
+                tokens.as_slice(),
+                [(Token::Ident(text), _), (Token::Eof, _)] if &**text == name
+            );
+            assert_eq!(
+                is_bare_field_name(name),
+                lexes_as_itself,
+                "{name:?}: {tokens:?}"
+            );
         }
     }
 

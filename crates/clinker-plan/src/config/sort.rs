@@ -162,9 +162,17 @@ pub enum OrderingSite {
 /// An authored `null_order: drop` on a field that only orders rows.
 ///
 /// `Display` is the author-facing message for the site: the rule, the
-/// reason, and the `filter` that removes null-keyed rows instead. Callers
-/// prefix the node (`cull "name": `, `source 'name': `) and add nothing
-/// else, so this is the one place the wording lives.
+/// reason, and how to remove null-keyed rows instead. Callers prefix the
+/// node (`cull "name": `, `source 'name': `) and add nothing else, so this
+/// is the one place the wording lives.
+///
+/// The fix is a paste-able `filter` only when CXL can write the field as a
+/// bare name ([`cxl::lexer::is_bare_field_name`]). Any other name gets no
+/// CXL at all: a name with a space or a keyword would not parse, and a
+/// flattened `Address.City` would parse as a path to another value, so the
+/// pasted filter would silently drop every row. Those fields are sent to the
+/// Source schema's `source_name` rename, which exposes the column under an
+/// identifier a filter can then name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropNotAllowed {
     pub field: String,
@@ -194,9 +202,25 @@ impl std::fmt::Display for DropNotAllowed {
         write!(
             f,
             "`null_order: drop` is not allowed on `{key}` for field '{field}': {reason}. Use \
-             `null_order: first` or `null_order: last`; to exclude rows whose '{field}' is null, \
-             add a Transform {filter_at} with `filter not {field}.is_null()`."
-        )
+             `null_order: first` or `null_order: last`"
+        )?;
+        if cxl::lexer::is_bare_field_name(field) {
+            write!(
+                f,
+                "; to exclude rows whose '{field}' is null, add a Transform {filter_at} with \
+                 `filter not {field}.is_null()`."
+            )
+        } else {
+            write!(
+                f,
+                ". CXL cannot name the field '{field}': a CXL field name is one identifier of \
+                 ASCII letters, digits and `_`, not starting with a digit and not a CXL keyword. \
+                 To exclude rows whose '{field}' is null, rename the column to such a name in its \
+                 Source schema entry and keep reading the input column through `source_name` \
+                 (for example `{{ name: order_id, type: string, source_name: \"order id\" }}`), \
+                 then filter on the new name in a Transform {filter_at}."
+            )
+        }
     }
 }
 
