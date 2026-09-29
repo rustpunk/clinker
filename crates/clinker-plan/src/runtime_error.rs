@@ -6,7 +6,8 @@
 //! defined here, alongside the error type that names them, so the planning
 //! layer can own the unified `PipelineError` without depending upward on the
 //! executor. [`MemorySurface`] and [`ConsumerLabel`] name the holders of
-//! charged memory in author vocabulary for the same reason.
+//! charged memory in author vocabulary for the same reason, and
+//! [`MemoryShortfallReport`] is the E310 report built from them.
 
 /// Disk-spill I/O or decode failure.
 ///
@@ -245,6 +246,358 @@ pub struct ConsumerLabel {
     pub surface: MemorySurface,
 }
 
+/// Why a request for memory was refused, as the E310 diagnostic reports it.
+///
+/// Every byte figure comes from one reading of the run's memory ledger taken
+/// at the refusal, so `holders`, `other_holders_bytes` and
+/// `unattributed_bytes` add up to `charged_bytes` exactly and the suggested
+/// limit is derived from the same charged total. The holder states and the
+/// private-memory figure are read just after that reading (see each field).
+/// The report names nodes, surfaces and byte counts only; it never carries a
+/// record value.
+///
+/// Its [`Display`](std::fmt::Display) is the E310 text: a greppable headline,
+/// then the charged total, the largest holders, what the reclaim round did, a
+/// limit that would have granted the request in both the YAML and the CLI
+/// spelling, and a remedy keyed to the largest holder that cannot spill.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemoryShortfallReport {
+    /// The node that asked for memory and what the memory was for; `None`
+    /// when the request was made for the run as a whole and no node is known.
+    pub requester: Option<ConsumerLabel>,
+    /// Bytes the refused request asked for.
+    pub requested_bytes: u64,
+    /// The limit charges are granted against: `memory.limit`, or the smaller
+    /// test capacity a test run was held to.
+    pub limit_bytes: u64,
+    /// Bytes charged to the run when the request was refused.
+    pub charged_bytes: u64,
+    /// The process's private memory (memory no other process shares),
+    /// sampled once while the report was built; `None` where the platform
+    /// gives no reading.
+    pub private_bytes: Option<u64>,
+    /// The largest holders of charged memory, largest first, at most
+    /// [`MemoryShortfallReport::LISTED_HOLDERS`].
+    pub holders: Vec<HolderReport>,
+    /// How many holders did not fit in `holders`.
+    pub other_holders_count: u32,
+    /// Bytes the holders beyond `holders` hold together.
+    pub other_holders_bytes: u64,
+    /// Charged bytes no single node holds: memory the run holds as a whole,
+    /// such as output staging.
+    pub unattributed_bytes: u64,
+    /// Charged bytes no spill could free: what the holders that cannot spill
+    /// hold (listed or not), plus `unattributed_bytes`.
+    pub unspillable_bytes: u64,
+    /// What the reclaim round did before the refusal; `None` when the request
+    /// was refused without one (a thread that cannot spill the run's state).
+    pub reclaim: Option<ReclaimReport>,
+    /// The smallest limit that would have granted this request beside what
+    /// was charged: `charged_bytes + requested_bytes` rounded up to a whole
+    /// MiB (see [`suggested_limit_floor`]). A floor, not a recommendation:
+    /// later stages may need more.
+    pub suggested_limit_bytes: u64,
+    /// No spill could make the request fit: it is larger than the limit on
+    /// its own, or larger than what is left of it beside
+    /// `unspillable_bytes`.
+    pub oversized: bool,
+}
+
+impl MemoryShortfallReport {
+    /// Holders the report lists by name; the rest are summed on one line.
+    pub const LISTED_HOLDERS: usize = 5;
+}
+
+/// One holder of charged memory in a [`MemoryShortfallReport`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HolderReport {
+    /// The author-given name of the node that owns the memory.
+    pub node: String,
+    /// What the memory is.
+    pub surface: MemorySurface,
+    /// The bytes it holds charged: its own charge plus the memory granted in
+    /// its name, at the refusal. The current figure, not its high-water mark.
+    pub bytes: u64,
+    /// Why it still holds them.
+    pub state: HolderState,
+}
+
+/// Why a holder in a [`MemoryShortfallReport`] still held its memory when the
+/// request was refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum HolderState {
+    /// Its memory cannot be written to disk.
+    CannotSpill,
+    /// It spilled what it could and holds the least it can work with.
+    AtFloor,
+    /// A Source paused so it reads no further until memory is freed; the
+    /// rows it has already read stay in memory.
+    PausedSource,
+    /// The node that made the refused request.
+    Requester,
+    /// Its memory can spill, but it was in use while the request was made, so
+    /// the request could not spill it.
+    InUse,
+}
+
+impl std::fmt::Display for HolderState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::CannotSpill => "cannot spill",
+            Self::AtFloor => "at its floor",
+            Self::PausedSource => "paused source",
+            Self::Requester => "requester",
+            Self::InUse => "in use",
+        })
+    }
+}
+
+/// What the reclaim round that preceded a refusal did.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ReclaimReport {
+    /// The nodes whose memory the round asked to spill, in the order it asked.
+    pub holders_asked: Vec<String>,
+    /// Bytes the asked holders released while the round spilled them.
+    pub bytes_freed: u64,
+    /// The Sources paused when the request was refused.
+    pub sources_paused: Vec<String>,
+}
+
+/// The smallest limit, rounded up to a whole MiB, that grants a request of
+/// `requested` bytes beside `charged` bytes already held. Never below
+/// `charged + requested`; saturates at the largest whole MiB a `u64` holds.
+pub fn suggested_limit_floor(charged: u64, requested: u64) -> u64 {
+    charged.saturating_add(requested)
+}
+
+/// `bytes` rounded up to a whole MiB and written the way `memory.limit` and
+/// `--memory-limit` accept it: `<n>G` when the result is a whole number of
+/// GiB, else `<n>M`. The value it names is never below `bytes`.
+pub fn suggested_limit_text(bytes: u64) -> String {
+    let mebibytes = bytes / MIB;
+    if mebibytes > 0 && mebibytes.is_multiple_of(1024) {
+        format!("{}G", mebibytes / 1024)
+    } else {
+        format!("{mebibytes}M")
+    }
+}
+
+const MIB: u64 = 1024 * 1024;
+
+#[allow(dead_code)]
+fn round_up_to_mebibyte(bytes: u64) -> u64 {
+    match bytes.div_ceil(MIB).checked_mul(MIB) {
+        Some(rounded) => rounded,
+        None => u64::MAX - u64::MAX % MIB,
+    }
+}
+
+/// A byte count in binary units with one decimal (`512 B`, `1.5 KiB`,
+/// `3.0 MiB`), for the memory diagnostics.
+struct Bytes(u64);
+
+impl std::fmt::Display for Bytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const UNITS: [&str; 5] = ["KiB", "MiB", "GiB", "TiB", "PiB"];
+        if self.0 < 1024 {
+            return write!(f, "{} B", self.0);
+        }
+        let mut unit = 1024u128;
+        for (index, name) in UNITS.iter().enumerate() {
+            // Tenths of this unit, rounded to nearest; move up a unit rather
+            // than print "1024.0".
+            let tenths = (u128::from(self.0) * 10 + unit / 2) / unit;
+            if tenths < 10_240 || index == UNITS.len() - 1 {
+                return write!(f, "{}.{} {name}", tenths / 10, tenths % 10);
+            }
+            unit *= 1024;
+        }
+        unreachable!("the last unit always returns")
+    }
+}
+
+/// The section of `clinker explain --code E310` that covers state of this
+/// kind, when there is one.
+fn fix_section(surface: &MemorySurface) -> Option<&'static str> {
+    match surface {
+        MemorySurface::JoinBuildSide | MemorySurface::JoinState => Some("Join build side"),
+        MemorySurface::GroupState => Some("Group state"),
+        MemorySurface::ReshapeGroups => Some("Rows held for Reshape groups"),
+        MemorySurface::DecisionState => Some("Decision state"),
+        MemorySurface::WindowIndex => Some("Window index"),
+        MemorySurface::BufferedRows { .. }
+        | MemorySurface::ScanMaterialization
+        | MemorySurface::ParkedCrossRegionRows { .. }
+        | MemorySurface::CorrelationGroups
+        | MemorySurface::SortBuffer => Some("Rows buffered between two steps"),
+        MemorySurface::HeldFailingRows | MemorySurface::DeadLetteredRowSet => {
+            Some("Held failing rows")
+        }
+        MemorySurface::RowsRead
+        | MemorySurface::OutputStaging
+        | MemorySurface::CredentialRegistry => None,
+    }
+}
+
+impl std::fmt::Display for MemoryShortfallReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.write_headline(f)?;
+
+        write!(
+            f,
+            "\n  charged {} of {}",
+            Bytes(self.charged_bytes),
+            Bytes(self.limit_bytes)
+        )?;
+        if self.limit_bytes > 0 {
+            let percent = u128::from(self.charged_bytes) * 100 / u128::from(self.limit_bytes);
+            write!(f, " ({percent}%)")?;
+        }
+        if let Some(private) = self.private_bytes {
+            write!(f, " · private memory {}", Bytes(private))?;
+        }
+
+        if !self.holders.is_empty() || self.other_holders_count > 0 || self.unattributed_bytes > 0 {
+            f.write_str("\n  largest holders:")?;
+            for holder in &self.holders {
+                write!(
+                    f,
+                    "\n    {}  {}  {}  {}",
+                    holder.node,
+                    holder.surface,
+                    Bytes(holder.bytes),
+                    holder.state
+                )?;
+            }
+            if self.other_holders_count > 0 {
+                write!(
+                    f,
+                    "\n    +{} more {}  {}",
+                    self.other_holders_count,
+                    if self.other_holders_count == 1 {
+                        "holder"
+                    } else {
+                        "holders"
+                    },
+                    Bytes(self.other_holders_bytes)
+                )?;
+            }
+        }
+
+        match &self.reclaim {
+            None => f.write_str("\n  reclaim: none attempted")?,
+            Some(round) => {
+                write!(
+                    f,
+                    "\n  reclaim: asked {} {} to spill",
+                    round.holders_asked.len(),
+                    if round.holders_asked.len() == 1 {
+                        "holder"
+                    } else {
+                        "holders"
+                    }
+                )?;
+                if !round.holders_asked.is_empty() {
+                    write!(f, " ({})", round.holders_asked.join(", "))?;
+                }
+                write!(
+                    f,
+                    ", freed {}; paused {} {}",
+                    Bytes(round.bytes_freed),
+                    round.sources_paused.len(),
+                    if round.sources_paused.len() == 1 {
+                        "source"
+                    } else {
+                        "sources"
+                    }
+                )?;
+                if !round.sources_paused.is_empty() {
+                    write!(f, " ({})", round.sources_paused.join(", "))?;
+                }
+            }
+        }
+
+        let suggested = suggested_limit_text(self.suggested_limit_bytes);
+        write!(
+            f,
+            "\n  fix: raise the limit to at least {suggested} — this request needed {}; \
+             later stages may need more\
+             \n    pipeline:\
+             \n      memory: {{ limit: \"{suggested}\" }}\
+             \n    or: --memory-limit {suggested}",
+            Bytes(self.charged_bytes.saturating_add(self.requested_bytes))
+        )?;
+
+        if let Some(holder) = self.holders.iter().find(|holder| {
+            matches!(
+                holder.state,
+                HolderState::CannotSpill | HolderState::AtFloor
+            )
+        }) {
+            write!(
+                f,
+                "\n  remedy: {}'s {} holds {} and {}",
+                holder.node,
+                holder.surface,
+                Bytes(holder.bytes),
+                if holder.state == HolderState::CannotSpill {
+                    "cannot be spilled"
+                } else {
+                    "could not be spilled further"
+                }
+            )?;
+            if let Some(section) = fix_section(&holder.surface) {
+                write!(f, "; see \"{section}\" in clinker explain --code E310")?;
+            }
+        }
+        if self.charged_bytes > 0 && self.unspillable_bytes >= self.charged_bytes {
+            f.write_str(
+                "\n  spilling cannot help: the state that fills the limit cannot be written to disk",
+            )?;
+        }
+        f.write_str("\n  See: clinker explain --code E310")
+    }
+}
+
+impl MemoryShortfallReport {
+    fn write_headline(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("E310")?;
+        if let Some(requester) = &self.requester {
+            write!(f, " {}", requester.node)?;
+        }
+        f.write_str(": ")?;
+        if self.oversized {
+            f.write_str("one request")?;
+            if let Some(requester) = &self.requester {
+                write!(f, " for {}", requester.surface)?;
+            }
+            write!(
+                f,
+                " needs {}, more than memory.limit {} can hold",
+                Bytes(self.requested_bytes),
+                Bytes(self.limit_bytes)
+            )?;
+            if self.requested_bytes <= self.limit_bytes {
+                write!(
+                    f,
+                    " beside {} of state that cannot spill",
+                    Bytes(self.unspillable_bytes)
+                )?;
+            }
+            return f.write_str(" — spilling cannot help");
+        }
+        write!(f, "needed {} more", Bytes(self.requested_bytes))?;
+        if let Some(requester) = &self.requester {
+            write!(f, " for {}", requester.surface)?;
+        }
+        write!(
+            f,
+            ", but memory.limit {} is fully held and nothing more could be spilled",
+            Bytes(self.limit_bytes)
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,6 +648,25 @@ mod tests {
                 "{kind:?} must stay DirUnavailable"
             );
         }
+    }
+
+    #[test]
+    fn byte_figures_use_binary_units_with_one_decimal() {
+        assert_eq!(Bytes(0).to_string(), "0 B");
+        assert_eq!(Bytes(1023).to_string(), "1023 B");
+        assert_eq!(Bytes(1024).to_string(), "1.0 KiB");
+        assert_eq!(Bytes(1536).to_string(), "1.5 KiB");
+        assert_eq!(Bytes(3 * MIB).to_string(), "3.0 MiB");
+        // Just under a MiB rounds to 1024.0 KiB, which is printed as MiB.
+        assert_eq!(Bytes(MIB - 1).to_string(), "1.0 MiB");
+        assert_eq!(Bytes(1024 * MIB).to_string(), "1.0 GiB");
+    }
+
+    #[test]
+    fn suggested_floor_saturates_instead_of_wrapping() {
+        let floor = suggested_limit_floor(u64::MAX, 1);
+        assert_eq!(floor % MIB, 0);
+        assert!(floor > u64::MAX - MIB);
     }
 
     #[test]

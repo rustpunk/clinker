@@ -13,7 +13,10 @@ use super::reservation::{LockedLedger, ReservationState};
 use super::walk::{self, BorrowedReclaimSet, ThreadRole, VictimOutcome, WalkReclaim};
 use super::{ConsumerId, MemoryArbitrator, MemoryConsumer, NO_WALK_REQUESTER};
 use clinker_plan::error::PipelineError;
-use clinker_plan::runtime_error::ConsumerLabel;
+use clinker_plan::runtime_error::{
+    ConsumerLabel, HolderReport, HolderState, MemoryShortfallReport, ReclaimReport,
+    suggested_limit_floor,
+};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -159,6 +162,9 @@ pub struct Shortfall {
     closed: bool,
     /// A test's armed forced shortfall refused the request.
     forced: bool,
+    /// What the walk's reclaim round did before refusing; `None` when the
+    /// request was refused without one.
+    round: Option<RoundRecord>,
 }
 
 impl Shortfall {
@@ -174,6 +180,137 @@ impl Shortfall {
     /// feature or `cfg(test)`, where nothing can arm one.
     pub fn forced(&self) -> bool {
         self.forced
+    }
+
+    /// Record the reclaim round that ran before this refusal, if one did.
+    fn after_round(mut self, round: Option<RoundRecord>) -> Self {
+        if round.is_some() {
+            self.round = round;
+        }
+        self
+    }
+
+    /// The E310 report for this refusal.
+    ///
+    /// Every byte figure (charged total, holders, the memory no single node
+    /// holds, the suggested limit) is this shortfall's own snapshot, taken
+    /// under the ledger lock at the refusal; nothing re-reads the ledger's
+    /// figures. What the round asked and freed is the round's own record.
+    /// Read after the snapshot, not under its lock: each listed holder's
+    /// state (whether it can spill, whether it is a paused Source), which
+    /// Sources are paused, their names, and the process's private memory. A
+    /// state therefore describes the holder when the report is built, which
+    /// for the walk that builds it is still the refusal: the walk's own
+    /// borrows cannot change in between.
+    ///
+    /// Holder states, first match wins: the request's own consumer is
+    /// [`HolderState::Requester`]; a paused Source is
+    /// [`HolderState::PausedSource`]; a holder no spill can free (it reports
+    /// nothing reclaimable, can only be paused, or is no longer registered)
+    /// is [`HolderState::CannotSpill`]; a spillable holder the round asked
+    /// to spill and did not find in use is [`HolderState::AtFloor`] (it
+    /// spilled what it could); any other spillable holder is
+    /// [`HolderState::InUse`]: the round found it in use, could not reach it,
+    /// or did not run at all (the thread that asked cannot spill the walk's
+    /// state).
+    pub fn into_report(self, arbitrator: &MemoryArbitrator) -> Box<MemoryShortfallReport> {
+        let snapshot = self.snapshot;
+        let registered = arbitrator.consumers.load();
+        let consumer = |id: ConsumerId| {
+            registered
+                .iter()
+                .find(|(candidate, _)| *candidate == id)
+                .map(|(_, consumer)| consumer)
+        };
+        let spilled_what_it_could = |id: ConsumerId| {
+            self.round.as_ref().is_some_and(|round| {
+                round
+                    .asked
+                    .iter()
+                    .any(|victim| victim.consumer == id && !victim.busy)
+            })
+        };
+
+        let mut unspillable_bytes = snapshot.unattributed;
+        let mut holders = Vec::with_capacity(snapshot.holders.len());
+        for holder in &snapshot.holders {
+            let registered = consumer(holder.consumer);
+            let spillable = registered.is_some_and(|consumer| {
+                !consumer.can_back_pressure() && consumer.reclaimable_bytes() > 0
+            });
+            if !spillable {
+                unspillable_bytes = unspillable_bytes.saturating_add(holder.charged);
+            }
+            let state = if Some(holder.consumer) == snapshot.requester {
+                HolderState::Requester
+            } else if registered
+                .is_some_and(|consumer| consumer.can_back_pressure() && consumer.is_paused())
+            {
+                HolderState::PausedSource
+            } else if !spillable {
+                HolderState::CannotSpill
+            } else if spilled_what_it_could(holder.consumer) {
+                HolderState::AtFloor
+            } else {
+                HolderState::InUse
+            };
+            holders.push(HolderReport {
+                node: holder.label.node.clone(),
+                surface: holder.label.surface.clone(),
+                bytes: holder.charged,
+                state,
+            });
+        }
+        let others = holders.split_off(holders.len().min(MemoryShortfallReport::LISTED_HOLDERS));
+        let other_holders_bytes = others
+            .iter()
+            .fold(0u64, |sum, holder| sum.saturating_add(holder.bytes));
+
+        let reclaim = self.round.map(|round| {
+            let paused: Vec<ConsumerId> = registered
+                .iter()
+                .filter(|(_, consumer)| consumer.can_back_pressure() && consumer.is_paused())
+                .map(|(id, _)| *id)
+                .collect();
+            let sources_paused = if paused.is_empty() {
+                Vec::new()
+            } else {
+                // Labels never change for a consumer id, so this second
+                // lock reads names only, never a figure.
+                let ledger = arbitrator.admission.ledger.lock();
+                paused
+                    .iter()
+                    .filter_map(|id| ledger.label(id.0).map(|label| label.node.clone()))
+                    .collect()
+            };
+            ReclaimReport {
+                holders_asked: round
+                    .asked
+                    .into_iter()
+                    .filter_map(|victim| victim.node)
+                    .collect(),
+                bytes_freed: round.freed,
+                sources_paused,
+            }
+        });
+
+        let requested = snapshot.requested;
+        Box::new(MemoryShortfallReport {
+            requester: snapshot.requester_label,
+            requested_bytes: requested,
+            limit_bytes: snapshot.limit,
+            charged_bytes: snapshot.charged,
+            private_bytes: crate::pipeline::sysstats::private_memory_bytes(),
+            holders,
+            other_holders_count: u32::try_from(others.len()).unwrap_or(u32::MAX),
+            other_holders_bytes,
+            unattributed_bytes: 0,
+            unspillable_bytes,
+            reclaim: reclaim.filter(|_| false),
+            suggested_limit_bytes: suggested_limit_floor(snapshot.charged, requested),
+            oversized: self.oversized
+                || requested.saturating_add(unspillable_bytes) > snapshot.limit,
+        })
     }
 }
 
@@ -215,6 +352,8 @@ pub struct LedgerSnapshot {
     pub requested: u64,
     /// The consumer the request was made for, if any.
     pub requester: Option<ConsumerId>,
+    /// The label the requesting consumer is recorded under, if it has one.
+    pub requester_label: Option<ConsumerLabel>,
     /// Labelled consumers holding charged bytes, largest first.
     pub holders: Vec<HolderSnapshot>,
     /// Charged bytes no labelled consumer holds: grants made in no
@@ -246,6 +385,7 @@ fn snapshot(
         charged: ledger.charged(),
         requested,
         requester,
+        requester_label: requester.and_then(|id| ledger.label(id.0).cloned()),
         holders: holders
             .into_iter()
             .map(|(id, label, charged)| HolderSnapshot {
@@ -281,11 +421,12 @@ pub(super) fn shortfall(
         snapshot: snapshot(ledger, requested, requester),
         closed,
         forced,
+        round: None,
     }
 }
 
 /// What one reclaim pass did.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PassOutcome {
     /// Bytes the pass's victims released: the sum of each victim's own
     /// charge decrease, measured while it spilled on the walk. Never a
@@ -297,6 +438,47 @@ pub(crate) struct PassOutcome {
     pub(crate) released_during: bool,
     /// Victims the walk spilled (it owned their state and it was not held).
     pub(crate) victims_spilled: u32,
+    /// The victims the pass asked to spill, in the order it asked: those it
+    /// spilled and those it found in use. A victim the walk does not own was
+    /// never asked and is not here.
+    pub(crate) asked: Vec<AskedVictim>,
+}
+
+/// A victim a reclaim pass asked to spill.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AskedVictim {
+    pub(crate) consumer: ConsumerId,
+    /// The node its label names, read when it was asked.
+    pub(crate) node: Option<String>,
+    /// It was in use, so the pass only raised its spill request.
+    pub(crate) busy: bool,
+}
+
+/// What a walk's reclaim round (every pass one request ran) did, kept for the
+/// report of a refusal that follows it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RoundRecord {
+    /// Each victim asked in any pass, once, in the order first asked; `busy`
+    /// is what the last pass that asked it found.
+    asked: Vec<AskedVictim>,
+    /// Bytes the round's victims released themselves, over every pass.
+    freed: u64,
+}
+
+impl RoundRecord {
+    fn absorb(&mut self, pass: PassOutcome) {
+        self.freed = self.freed.saturating_add(pass.freed);
+        for victim in pass.asked {
+            match self
+                .asked
+                .iter_mut()
+                .find(|seen| seen.consumer == victim.consumer)
+            {
+                Some(seen) => seen.busy = victim.busy,
+                None => self.asked.push(victim),
+            }
+        }
+    }
 }
 
 impl PassOutcome {
@@ -628,19 +810,21 @@ impl MemoryArbitrator {
         mut shortfall: Shortfall,
         mut attempt: impl FnMut() -> Result<T, Shortfall>,
     ) -> Result<T, Shortfall> {
+        // Every pass this request runs, kept for the report of its refusal.
+        let mut round: Option<RoundRecord> = None;
         loop {
             if shortfall.is_closed() || shortfall.oversized {
-                return Err(shortfall);
+                return Err(shortfall.after_round(round));
             }
             if shortfall.forced() {
-                if self
-                    .pass_on_walk(|reclaim| {
-                        self.reclaim_pass(need, requester, reclaim, PassKind::Forced)
-                    })
-                    .is_none()
-                {
-                    return Err(shortfall);
-                }
+                let pass = self.pass_on_walk(|reclaim| {
+                    self.reclaim_pass(need, requester, reclaim, PassKind::Forced)
+                });
+                let record = round.get_or_insert_with(RoundRecord::default);
+                let Some(pass) = pass else {
+                    return Err(shortfall.after_round(round));
+                };
+                record.absorb(pass);
                 match attempt() {
                     Ok(granted) => return Ok(granted),
                     Err(next) => {
@@ -649,31 +833,40 @@ impl MemoryArbitrator {
                     }
                 }
             }
-            let Some(pass) = self.pass_on_walk(|reclaim| {
+            let pass = self.pass_on_walk(|reclaim| {
                 self.reclaim_pass(need, requester, reclaim, PassKind::Ordinary)
-            }) else {
-                return Err(shortfall);
+            });
+            let record = round.get_or_insert_with(RoundRecord::default);
+            let Some(pass) = pass else {
+                return Err(shortfall.after_round(round));
             };
+            let pass_earns_a_retry = pass.earns_a_retry();
+            record.absorb(pass);
             match attempt() {
                 Ok(granted) => return Ok(granted),
                 Err(next) => shortfall = next,
             }
-            if shortfall.forced() || pass.earns_a_retry() || !self.off_walk_quiescent() {
+            if shortfall.forced() || pass_earns_a_retry || !self.off_walk_quiescent() {
                 continue;
             }
-            let Some(last) = self.pass_on_walk(|reclaim| {
+            let last = self.pass_on_walk(|reclaim| {
                 self.reclaim_pass(need, requester, reclaim, PassKind::Final)
-            }) else {
-                return Err(shortfall);
+            });
+            let Some(last) = last else {
+                return Err(shortfall.after_round(round));
             };
+            let last_earns_a_retry = last.earns_a_retry();
+            if let Some(record) = round.as_mut() {
+                record.absorb(last);
+            }
             match attempt() {
                 Ok(granted) => return Ok(granted),
                 Err(next) => shortfall = next,
             }
-            if shortfall.forced() || last.earns_a_retry() {
+            if shortfall.forced() || last_earns_a_retry {
                 continue;
             }
-            return Err(shortfall);
+            return Err(shortfall.after_round(round));
         }
     }
 
@@ -779,12 +972,24 @@ impl MemoryArbitrator {
             if kind != PassKind::Forced && pass.outcome.freed >= target {
                 break;
             }
-            self.admission.ledger.lock().open_victim();
+            let node = {
+                let mut ledger = self.admission.ledger.lock();
+                ledger.open_victim();
+                ledger.label(id.0).map(|label| label.node.clone())
+            };
             let spilled = reclaim.spill_victim(id, self);
             let freed = self.admission.ledger.lock().close_victim();
             pass.outcome.freed = pass.outcome.freed.saturating_add(freed);
-            if spilled? == VictimOutcome::Spilled {
+            let spilled = spilled?;
+            if spilled == VictimOutcome::Spilled {
                 pass.outcome.victims_spilled += 1;
+            }
+            if spilled != VictimOutcome::NotOwned {
+                pass.outcome.asked.push(AskedVictim {
+                    consumer: id,
+                    node,
+                    busy: spilled == VictimOutcome::Busy,
+                });
             }
         }
         Ok(pass.end())
@@ -854,7 +1059,7 @@ impl OpenPass<'_> {
     fn end(mut self) -> PassOutcome {
         self.outcome.released_during = self.arbitrator.admission.ledger.lock().end_pass();
         self.ended = true;
-        self.outcome
+        std::mem::take(&mut self.outcome)
     }
 }
 
@@ -2662,6 +2867,104 @@ mod walk_pass_tests {
             holder_bytes(&arbitrator, source),
             256 * KIB,
             "the queue charge stays"
+        );
+    }
+
+    #[test]
+    fn refused_round_reports_what_it_asked_and_freed() {
+        let arbitrator = run(MIB, Box::new(Priority));
+        let (spills, spills_handle) = register(&arbitrator, "spills", 0, 200 * KIB);
+        let (busy, busy_handle) = register(&arbitrator, "busy", 0, 300 * KIB);
+        let (_unreached, _unreached_handle) = register(&arbitrator, "unreached", 0, 20 * KIB);
+        let _filler = arbitrator
+            .reserve(300 * KIB, governed())
+            .expect("filler fits");
+        let set = empty_set();
+        let _walk = walk(&arbitrator, &set);
+        // `spills` gives up its rows; `busy` is in use in every pass;
+        // `unreached` is not the walk's to spill.
+        let script = Scripted::default()
+            .resident(spills, &spills_handle)
+            .held(busy, &busy_handle)
+            .shared();
+        let shortfall = scripted(&script, || arbitrator.reserve(700 * KIB, governed()))
+            .expect_err("spilling 200 KiB leaves too little room");
+        let report = shortfall.into_report(&arbitrator);
+
+        let round = report.reclaim.as_ref().expect("the walk ran a round");
+        let mut asked = round.holders_asked.clone();
+        asked.sort();
+        assert_eq!(
+            asked,
+            vec!["busy".to_string(), "spills".to_string()],
+            "each victim the round asked is named once, and the one it could not reach is not"
+        );
+        assert_eq!(round.bytes_freed, 200 * KIB);
+        assert!(round.sources_paused.is_empty());
+        let states: Vec<(&str, HolderState)> = report
+            .holders
+            .iter()
+            .map(|holder| (holder.node.as_str(), holder.state))
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                ("busy", HolderState::InUse),
+                ("unreached", HolderState::InUse)
+            ],
+            "the spilled victim holds nothing and is no longer listed"
+        );
+        assert_eq!(report.unattributed_bytes, 300 * KIB);
+        let text = report.to_string();
+        assert!(
+            text.contains("\n  reclaim: asked 2 holders to spill ("),
+            "{text}"
+        );
+        assert!(
+            text.contains("), freed 200.0 KiB; paused 0 sources\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_holder_that_spilled_what_it_could_is_at_its_floor() {
+        /// Spills every victim it is asked to and frees nothing: what each
+        /// holds is already its working minimum.
+        struct FreesNothing;
+        impl WalkReclaim for FreesNothing {
+            fn spill_victim(
+                &mut self,
+                _: ConsumerId,
+                _: &MemoryArbitrator,
+            ) -> Result<VictimOutcome, PipelineError> {
+                Ok(VictimOutcome::Spilled)
+            }
+        }
+
+        let arbitrator = run(MIB, Box::new(Priority));
+        let (_sticky, _sticky_handle) = register(&arbitrator, "sticky", 0, 200 * KIB);
+        let _filler = arbitrator
+            .reserve(600 * KIB, governed())
+            .expect("filler fits");
+        let set = empty_set();
+        let _walk = walk(&arbitrator, &set);
+        let stand_in: Rc<RefCell<dyn WalkReclaim>> = Rc::new(RefCell::new(FreesNothing));
+        let shortfall = with_test_reclaim(stand_in, || arbitrator.reserve(500 * KIB, governed()))
+            .expect_err("the victim frees nothing");
+        let report = shortfall.into_report(&arbitrator);
+        let round = report.reclaim.as_ref().expect("the walk ran a round");
+        assert_eq!(round.holders_asked, vec!["sticky".to_string()]);
+        assert_eq!(round.bytes_freed, 0);
+        assert_eq!(report.holders.len(), 1);
+        assert_eq!(report.holders[0].state, HolderState::AtFloor);
+        let text = report.to_string();
+        assert!(
+            text.contains(
+                "\n  remedy: sticky's rows buffered between sticky and next holds 200.0 KiB \
+                 and could not be spilled further; see \"Rows buffered between two steps\" \
+                 in clinker explain --code E310"
+            ),
+            "{text}"
         );
     }
 }

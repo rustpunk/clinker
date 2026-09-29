@@ -499,6 +499,14 @@ impl<L, A> LedgerState<L, A> {
         Some(entry.mark)
     }
 
+    /// The label consumer `id` was recorded under, or `None` when the ledger
+    /// holds no labelled entry for it.
+    pub(crate) fn label(&self, id: u32) -> Option<&L> {
+        self.consumers
+            .get(&id)
+            .and_then(|entry| entry.label.as_ref())
+    }
+
     /// `id`'s high-water mark of handle plus attributed bytes, or `None`
     /// when the ledger holds no entry for it.
     pub(crate) fn consumer_mark(&self, id: u32) -> Option<u64> {
