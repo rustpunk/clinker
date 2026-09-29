@@ -2398,8 +2398,7 @@ fn comparator_and_stable_key_agree_on_null_direction_and_numeric_boundaries() {
                 for (a, b) in [(&left, &right), (&right, &left)] {
                     let a_record =
                         ordering_record(vec![a.clone(), Value::Null, Value::Integer(99)]);
-                    let b_record =
-                        ordering_record(vec![b.clone(), Value::Null, Value::Integer(1)]);
+                    let b_record = ordering_record(vec![b.clone(), Value::Null, Value::Integer(1)]);
                     assert_eq!(
                         stable_sort_key_for_record(&a_record, &fields)
                             .cmp(&stable_sort_key_for_record(&b_record, &fields)),

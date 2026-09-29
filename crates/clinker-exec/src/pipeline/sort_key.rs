@@ -1,26 +1,30 @@
-//! Memcomparable sort key encoding.
+//! The authored sort comparator and its memcomparable key.
 //!
-//! Encodes a record's sort fields as a byte sequence where lexicographic
-//! comparison (`memcmp`) equals semantic sort ordering. Used by the loser
-//! tree during external merge sort — the `MergeEntry` implements `Ord`
-//! via byte comparison on the encoded key.
+//! [`compare_authored_keys`] orders records by the fields, directions and null
+//! placement an author declared; [`encode_sort_key`] writes the same order as a
+//! byte sequence whose lexicographic comparison (`memcmp`) equals it. The loser
+//! tree of an external merge sort and the spilled and streaming aggregates
+//! compare the bytes; the in-memory sort, the declared-order check and the
+//! window partition sort call the comparator. Both order non-null values by
+//! the one value order, [`clinker_record::order`], so the in-memory and the
+//! spilled path of every sort agree.
 //!
-//! Encoding rules per value type:
-//! - Each field segment: `[null_sentinel: 1 byte] [encoded_value: N bytes]`
-//! - Null: sentinel only (0x00 for nulls-first, 0x02 for nulls-last)
-//! - Non-null sentinel: 0x01
-//! - Integer: sign-flipped big-endian i64 (8 bytes)
-//! - Float: IEEE-to-signed reinterpretation, big-endian (8 bytes)
-//! - String: UTF-8 bytes with escaped NULs + a two-byte terminator
-//! - Bool: 0x00 (false) or 0x01 (true)
-//! - Date: sign-flipped big-endian i32 days since Unix epoch (4 bytes)
-//! - DateTime: sign-flipped big-endian i128 nanoseconds since Unix epoch (16 bytes)
-//! - Descending: XOR encoded value bytes with 0xFF; null placement remains
+//! Key layout, per sort field:
+//! - `[null_sentinel: 1 byte] [value key: N bytes]`
+//! - Null (or an absent field): sentinel only, `0x00` for nulls-first and
+//!   `0x02` for nulls-last
+//! - Non-null: sentinel `0x01`, then [`clinker_record::order::encode`]: a rank
+//!   tag (bool < number < string < date < datetime < array < map); a number as
+//!   the orderable bits of the largest `f64` not above it, an exactness byte,
+//!   and the exact scale-28 decimal grid when it is not an `f64`, so integers,
+//!   floats and decimals compare by exact value; every NaN as one value above
+//!   `+inf`; `-0.0` as `0.0`; strings with escaped NULs and a two-byte
+//!   terminator
+//! - Descending: XOR the value key bytes with 0xFF; null placement remains
 //!   exactly as authored
 
 use std::cmp::Ordering;
 
-use chrono::{NaiveDate, NaiveDateTime};
 use clinker_record::{Record, Value};
 
 use clinker_plan::config::{NullOrder, SortField, SortOrder};
@@ -89,48 +93,15 @@ pub fn compare_authored_values_with_nulls(
     }
 }
 
-/// Compare two non-null values with the executor's authored-sort semantics.
+/// Compare two non-null values in ascending order: the one value order,
+/// [`clinker_record::order::compare`].
+///
+/// Total over every value, NaN and mixed types included, so a stable sort's
+/// output never depends on where run boundaries fall. Nulls never reach it:
+/// [`compare_authored_values_with_nulls`] places them by the authored
+/// `null_order` first.
 pub fn compare_authored_values(a: &Value, b: &Value) -> Ordering {
-    match (a, b) {
-        (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
-        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
-        (Value::Integer(x), Value::Float(y)) => compare_i64_to_f64(*x, *y),
-        (Value::Float(x), Value::Integer(y)) => compare_i64_to_f64(*y, *x).reverse(),
-        (Value::Decimal(x), Value::Decimal(y)) => x.cmp(y),
-        (Value::Decimal(x), Value::Integer(y)) => x.cmp(&rust_decimal::Decimal::from(*y)),
-        (Value::Integer(x), Value::Decimal(y)) => rust_decimal::Decimal::from(*x).cmp(y),
-        (Value::String(x), Value::String(y)) => x.cmp(y),
-        (Value::Date(x), Value::Date(y)) => x.cmp(y),
-        (Value::DateTime(x), Value::DateTime(y)) => x.cmp(y),
-        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-        // Planning resolves one type per authored field. A mismatched runtime
-        // pair is handled by the existing schema/type boundary; keep ordering
-        // stable here rather than inventing a cross-type hierarchy.
-        _ => Ordering::Equal,
-    }
-}
-
-fn compare_i64_to_f64(integer: i64, float: f64) -> Ordering {
-    if float.is_nan() {
-        return Ordering::Equal;
-    }
-    if float >= 9_223_372_036_854_775_808.0 {
-        return Ordering::Less;
-    }
-    if float < i64::MIN as f64 {
-        return Ordering::Greater;
-    }
-
-    let truncated = float.trunc() as i64;
-    match integer.cmp(&truncated) {
-        Ordering::Equal if float.fract().is_sign_positive() && float.fract() != 0.0 => {
-            Ordering::Less
-        }
-        Ordering::Equal if float.fract().is_sign_negative() && float.fract() != 0.0 => {
-            Ordering::Greater
-        }
-        ordering => ordering,
-    }
+    clinker_record::order::compare(a, b)
 }
 
 /// Encode a record's sort fields as a memcomparable byte sequence.
@@ -154,7 +125,7 @@ fn encode_sort_key_into(record: &Record, sort_by: &[SortField], key: &mut Vec<u8
             Some(value) => {
                 key.push(0x01); // non-null sentinel
                 let value_start = key.len();
-                encode_value(value, key);
+                clinker_record::order::encode(value, key);
                 if sf.order == SortOrder::Desc {
                     for byte in &mut key[value_start..] {
                         *byte ^= 0xFF;
@@ -165,186 +136,27 @@ fn encode_sort_key_into(record: &Record, sort_by: &[SortField], key: &mut Vec<u8
     }
 }
 
-fn encode_value(value: &Value, buf: &mut Vec<u8>) {
-    match value {
-        Value::Bool(b) => buf.push(if *b { 0x01 } else { 0x00 }),
-        Value::Integer(n) => {
-            let mut bytes = n.to_be_bytes();
-            bytes[0] ^= 0x80; // sign-flip
-            buf.extend_from_slice(&bytes);
-        }
-        Value::Float(f) => {
-            debug_assert!(
-                !f.is_nan(),
-                "NaN should be DLQ'd before reaching sort encoder"
-            );
-            encode_f64_order(*f, buf);
-        }
-        Value::Decimal(d) => encode_decimal_order(*d, buf),
-        Value::String(s) => {
-            // Zero-escape plus a two-byte terminator makes compound keys
-            // prefix-free even when a user string contains an embedded NUL.
-            for byte in s.bytes() {
-                if byte == 0 {
-                    buf.extend_from_slice(&[0x00, 0xFF]);
-                } else {
-                    buf.push(byte);
-                }
-            }
-            buf.extend_from_slice(&[0x00, 0x00]);
-        }
-        Value::Date(d) => {
-            let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-            let days = d.signed_duration_since(epoch).num_days() as i32;
-            let mut bytes = days.to_be_bytes();
-            bytes[0] ^= 0x80;
-            buf.extend_from_slice(&bytes);
-        }
-        Value::DateTime(dt) => {
-            // Canonical nanosecond key (16 bytes), sign-flipped so the signed
-            // i128 orders as unsigned big-endian — the same reduction the
-            // IEJoin axis and the sort-merge comparator use, so a datetime
-            // sorts identically everywhere and sub-microsecond group keys stay
-            // distinct through a spilled aggregation's byte-wise k-way merge.
-            let mut bytes = datetime_to_orderable_i128(*dt).to_be_bytes();
-            bytes[0] ^= 0x80;
-            buf.extend_from_slice(&bytes);
-        }
-        Value::Null => {}                     // handled by caller
-        Value::Array(_) | Value::Map(_) => {} // not a valid sort key; defensive no-op
-    }
-}
-
-/// Canonical fixed-point decimal order grid — finest (`N = 28`) resolution.
-///
-/// Every order-bearing decimal encoder places a `Decimal` value `v` (a 96-bit
-/// signed `mantissa` at some `scale`) on a fixed-point grid of resolution
-/// `10^-N` as the exact integer `mantissa × 10^(N − scale)`. That integer is
-/// order-preserving and value-canonical — scale-invariant, so `2.5` and `2.50`
-/// map identically — for every value representable at resolution `N`. The two
-/// decimal order consumers use ONE such grid family and therefore cannot induce
-/// different orders; they differ only in the resolution `N` their output width
-/// affords, and the coarser grid is an exact `10^-(28−18) = 10^-10` rescaling of
-/// the finer one, so wherever both accept a value they place it at the same
-/// point of one shared order:
-///
-/// * this `N = 28` grid backs the memcomparable sort/group key
-///   ([`encode_decimal_order`]). Its bytes decide GROUP IDENTITY in a spilled
-///   aggregation, so it must stay exact over the full `rust_decimal` precision
-///   (up to 28 fractional digits); the scaled magnitude reaches ≈ 2^190 and is
-///   emitted as a 256-bit big-endian magnitude, not an `i128`.
-/// * the `N = 18` grid ([`DECIMAL_RANGE_SCALE`]) backs the inequality-join range
-///   axis. It carries keys as `i128` so a full `i64` integer operand widens onto
-///   the SAME axis (`i64::MAX · 10^18 < i128::MAX`); an `i128` cannot hold the
-///   scale-28 grid over that integer range, so the axis uses the coarser grid
-///   and fails loud — never truncates — on a value with detail finer than
-///   `10^-18`.
-///
-/// The two resolutions are pinned to one order by the differential test
-/// `decimal_encoders_induce_one_total_order`, and the exact `10^10` factor
-/// between the grids by `decimal_axis_is_ten_pow_ten_rescaling_of_sort_key_grid`.
-const DECIMAL_SORT_KEY_SCALE: u32 = 28; // rust_decimal's maximum scale
-
-/// Append the EXACT, value-canonical, order-preserving memcomparable encoding
-/// of a `Decimal` (a fixed 33 bytes).
-///
-/// The decimal sort key is load-bearing for GROUP IDENTITY, not just ordering:
-/// the spilled-aggregation path ([`crate::aggregation::spill`]) compares group
-/// keys by these bytes, so the encoding must be **value-canonical** — equal
-/// values (`2.50` and `2.5`) must produce byte-identical keys, and distinct
-/// values must not collide — as well as order-preserving. A lossy `f64`
-/// projection is monotone but NOT injective, so it would silently merge two
-/// distinct high-precision decimal groups once aggregation spills; this exact
-/// encoding avoids that divergence from the in-memory `GroupByKey::Decimal`
-/// path.
-///
-/// Encoding: the value on the finest [`DECIMAL_SORT_KEY_SCALE`] grid is the
-/// integer `mantissa × 10^(28 − scale)` (identical for `2.50` and `2.5`), which
-/// fits in 256 bits over `rust_decimal`'s range. It is emitted as a sign marker
-/// (`0x00` negative sorts before `0x01` non-negative) followed by the 32-byte
-/// big-endian magnitude — bit-inverted for negatives so a larger magnitude
-/// sorts earlier. `-0` normalizes to `0`, so there is no signed-zero ambiguity.
-fn encode_decimal_order(d: rust_decimal::Decimal, buf: &mut Vec<u8>) {
-    let negative = d.is_sign_negative() && !d.is_zero();
-    let magnitude = d.mantissa().unsigned_abs();
-    // scale ≤ 28, so 28 − scale ≥ 0 and 10^(28−scale) ≤ 10^28 < u128::MAX.
-    let pow = 10u128.pow(DECIMAL_SORT_KEY_SCALE - d.scale());
-    let scaled = mul_u128_to_u256_be(magnitude, pow);
-    if negative {
-        buf.push(0x00);
-        buf.extend(scaled.iter().map(|b| !b));
-    } else {
-        buf.push(0x01);
-        buf.extend_from_slice(&scaled);
-    }
-}
-
-/// Full 256-bit product of two `u128`s as a 32-byte big-endian array, via
-/// schoolbook multiplication over four 64-bit limbs. Used to place a decimal on
-/// a fixed 10^28 grid without a bignum dependency; the operands here are bounded
-/// (`magnitude < 2^96`, `pow ≤ 10^28 < 2^94`) so the product never exceeds 2^190.
-fn mul_u128_to_u256_be(a: u128, b: u128) -> [u8; 32] {
-    const MASK: u128 = u64::MAX as u128;
-    let (a_lo, a_hi) = (a & MASK, a >> 64);
-    let (b_lo, b_hi) = (b & MASK, b >> 64);
-
-    let ll = a_lo * b_lo;
-    let lh = a_lo * b_hi;
-    let hl = a_hi * b_lo;
-    let hh = a_hi * b_hi;
-
-    let r0 = ll & MASK;
-    let mid = (ll >> 64) + (lh & MASK) + (hl & MASK);
-    let r1 = mid & MASK;
-    let hi = (mid >> 64) + (lh >> 64) + (hl >> 64) + (hh & MASK);
-    let r2 = hi & MASK;
-    let r3 = (hi >> 64) + (hh >> 64);
-
-    let mut out = [0u8; 32];
-    out[0..8].copy_from_slice(&(r3 as u64).to_be_bytes());
-    out[8..16].copy_from_slice(&(r2 as u64).to_be_bytes());
-    out[16..24].copy_from_slice(&(r1 as u64).to_be_bytes());
-    out[24..32].copy_from_slice(&(r0 as u64).to_be_bytes());
-    out
-}
-
-/// Order-preserving `f64` → `u64`: the *unsigned* ordering of the result
-/// matches IEEE-754 ordering over finite values. `-0.0` canonicalizes to
-/// `+0.0` so signed zeros compare equal, agreeing with `value_to_group_key`.
-///
-/// This is the single source of the float bit-twiddle. The memcomparable
-/// byte key ([`encode_f64_order`]) and the range-join kernels' signed
-/// [`float_to_orderable_i64`] both derive from it, so a monotone float
-/// order is guaranteed identically everywhere it matters.
-#[inline]
-fn f64_to_orderable_u64(f: f64) -> u64 {
-    let f = if f == 0.0 { 0.0 } else { f };
-    let bits = f.to_bits();
-    if bits >> 63 == 1 {
-        bits ^ u64::MAX // negative: flip all bits — larger magnitude sorts earlier
-    } else {
-        bits ^ (1 << 63) // positive/zero: flip sign bit only
-    }
-}
-
 /// Order-preserving `f64` → `i64`: signed-`i64` comparison of the result
-/// matches IEEE-754 ordering over finite values. `-0.0` encodes equal to
-/// `+0.0`.
+/// matches the value order of finite floats, `-0.0` equal to `+0.0`.
 ///
-/// The range-join kernels carry keys as `i64` and compare them directly,
-/// so they need a monotone `i64` rather than the memcomparable byte key.
-/// A raw `f.to_bits() as i64` is NOT monotone: IEEE negatives set the sign
-/// bit, so their bit patterns grow as the value shrinks, and any range
-/// predicate over a float column with negative values would match wrongly.
+/// Derived from [`clinker_record::order::f64_orderable_bits`], the one float
+/// key, so a range join orders floats exactly as a sort does. The range-join
+/// kernels carry keys as `i64` and compare them directly, so they need a
+/// monotone `i64` rather than the memcomparable byte key. They exclude
+/// non-finite keys before reaching here. A raw `f.to_bits() as i64` is NOT
+/// monotone: IEEE negatives set the sign bit, so their bit patterns grow as
+/// the value shrinks, and any range predicate over a float column with
+/// negative values would match wrongly.
 #[inline]
 pub(crate) fn float_to_orderable_i64(f: f64) -> i64 {
     // Flip the high bit to turn the unsigned-ordered u64 into a
     // two's-complement-ordered i64 (smallest u64 → i64::MIN).
-    (f64_to_orderable_u64(f) ^ (1 << 63)) as i64
+    (clinker_record::order::f64_orderable_bits(f) ^ (1 << 63)) as i64
 }
 
 /// Order-preserving `f64` → `i128`: the sign-extended widening of
-/// [`float_to_orderable_i64`].
+/// [`float_to_orderable_i64`], so it too derives from
+/// [`clinker_record::order::f64_orderable_bits`].
 ///
 /// The inequality-join range axis carries keys as `i128` so it can also hold
 /// the fixed-point decimal grid (see [`decimal_to_orderable_i128`]). Sign
@@ -357,7 +169,8 @@ pub(crate) fn float_to_orderable_i128(f: f64) -> i128 {
 }
 
 /// Canonical fixed-point decimal order grid — coarse (`N = 18`) resolution; the
-/// `i128`-axis member of the grid family documented on `DECIMAL_SORT_KEY_SCALE`.
+/// `i128`-axis member of the grid family documented on
+/// [`clinker_record::order::DECIMAL_SORT_KEY_SCALE`].
 ///
 /// Every decimal on a decimal inequality-join axis is placed on this common
 /// `10^18` fixed-point grid. 18 fractional digits are preserved exactly, and the
@@ -414,53 +227,10 @@ pub(crate) fn integer_on_decimal_grid(i: i64) -> Option<i128> {
     (i as i128).checked_mul(10i128.pow(DECIMAL_RANGE_SCALE))
 }
 
-/// Order-preserving, injective `NaiveDateTime` → `i128`: the UTC instant as a
-/// nanosecond count since the Unix epoch, assembled as
-/// `timestamp_seconds · 10^9 + subsecond_nanos`.
-///
-/// This is the SINGLE canonical datetime range / sort / join key. `Value::DateTime`
-/// (a `chrono::NaiveDateTime`), [`compare_values`](crate::pipeline::sort::compare_values),
-/// and the windowing path all carry nanosecond resolution, so every
-/// order-bearing datetime encoder — the inequality-join i128 axis, the
-/// memcomparable sort key, and the sort-merge range comparator — reduces
-/// through THIS function to induce one identical total order. The microsecond
-/// key it supersedes was monotone but NOT injective, so it both dropped
-/// sub-microsecond join matches (a lossy sole-arbiter key enumerates the wrong
-/// candidate set) and, because the spilled-aggregation k-way merge decides
-/// group identity by sort-key bytes, silently merged two distinct
-/// sub-microsecond groups once aggregation spilled.
-///
-/// Exact and injective for every non-leap-second `NaiveDateTime`, so no
-/// fail-loud arm is needed: chrono caps the year at ±262 143, bounding
-/// `|timestamp| < 8.3e12` seconds, so the nanosecond result stays under
-/// `8.3e12 · 10^9 ≈ 8.3e21` in magnitude — more than sixteen orders below
-/// `i128::MAX ≈ 1.7e38`, so the multiply cannot overflow. Assembling the value
-/// directly (rather than via `timestamp_nanos_opt`, whose `i64` result
-/// saturates outside 1677–2262) keeps pre-1677 and post-2262 datetimes exact.
-/// `timestamp()` floors toward negative infinity and `timestamp_subsec_nanos()`
-/// is the non-negative offset within that floored second, so the sum is the
-/// correct signed nanosecond count for pre-epoch instants too. Pure arithmetic
-/// on an owned value: no allocation, no I/O, streaming-safe.
-///
-/// Leap seconds are the lone exception: chrono stores them as second `:59` with
-/// a sub-second field in `[10^9, 2·10^9)`, which Unix `timestamp()` does not
-/// count, so this key places a leap instant onto the following second. That
-/// matches Unix-time convention and the `i128`-nanosecond `Value::DateTime` spill
-/// serialization (which collapses leap seconds identically), but not
-/// `NaiveDateTime::cmp`. All three encoders reduce through this function, so they
-/// still agree with EACH OTHER on leap seconds — cross-strategy join/sort/group
-/// results stay identical; only the axis-vs-`compare_values` order can differ at
-/// a leap instant, which no linear nanosecond key can represent distinctly.
-#[inline]
-pub(crate) fn datetime_to_orderable_i128(dt: NaiveDateTime) -> i128 {
-    let utc = dt.and_utc();
-    (utc.timestamp() as i128) * 1_000_000_000 + utc.timestamp_subsec_nanos() as i128
-}
-
-/// Append the order-preserving 8-byte memcomparable encoding of an `f64`.
-fn encode_f64_order(f: f64, buf: &mut Vec<u8>) {
-    buf.extend_from_slice(&f64_to_orderable_u64(f).to_be_bytes());
-}
+/// The one datetime key, defined in the value order so the memcomparable key,
+/// the inequality-join axis and the sort-merge range comparator reduce
+/// datetimes identically.
+pub(crate) use clinker_record::order::datetime_to_orderable_i128;
 
 /// Owning wrapper around a `Vec<SortField>` that encodes and compares
 /// memcomparable sort keys with zero steady-state allocation.
@@ -564,15 +334,16 @@ impl SortKeyEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::NaiveDate;
+    use chrono::{NaiveDate, NaiveDateTime};
     use clinker_record::Schema;
+    use clinker_record::order::DECIMAL_SORT_KEY_SCALE;
     use proptest::prelude::*;
     use rust_decimal::Decimal;
     use std::sync::Arc;
 
     fn dec_key(d: Decimal) -> Vec<u8> {
         let mut buf = Vec::new();
-        encode_value(&Value::Decimal(d), &mut buf);
+        clinker_record::order::encode(&Value::Decimal(d), &mut buf);
         buf
     }
 
@@ -783,7 +554,7 @@ mod tests {
     /// the two decimal order encoders — the IEJoin i128 range axis (through the
     /// real `value_to_i128` consumer) and the memcomparable sort/group-key bytes
     /// (through `encode_sort_key`) — MUST induce the identical total order as the
-    /// evaluator's own `compare_values`. The two grids run at different
+    /// Sort node's `compare_values` (the one value order). The two grids run at different
     /// resolutions (scale 28 vs 18) for hard width-budget reasons, so this pins
     /// that the split can never drift them into disagreeing on order.
     #[test]
@@ -854,9 +625,9 @@ mod tests {
         // The mixed decimal/integer axis: an `int` operand widened onto the same
         // 10^18 grid (`integer_on_decimal_grid`, via `value_to_i128`) must order
         // against the decimals exactly as `compare_values` widens int into the
-        // decimal context. The byte key is intentionally type-specific and is
-        // never asked to compare an integer's bytes against a decimal's, so only
-        // the axis leg participates here.
+        // decimal context. Only the axis leg participates here; the byte key's
+        // integer/decimal order is the value order's, which its property suite
+        // proves.
         for i in [-2i64, -1, 0, 1, 2, 3, 42, -42] {
             let iv = Value::Integer(i);
             for &d in &decimals {
@@ -976,7 +747,7 @@ mod tests {
     /// (`value_to_i128`), the memcomparable sort-key bytes (`encode_sort_key`),
     /// the sort-merge comparator (`cmp_range_keys`), and the reducer
     /// (`datetime_to_orderable_i128`) — MUST induce the identical total order as
-    /// the evaluator's own `compare_values`. Before unification the microsecond
+    /// the Sort node's `compare_values` (the one value order). Before unification the microsecond
     /// encoders disagreed with the nanosecond `compare_values` on sub-µs ties;
     /// this pins that they no longer can.
     #[test]
@@ -1232,15 +1003,24 @@ mod tests {
 
     #[test]
     fn test_encode_sort_key_cross_type_numeric() {
-        // Integer and Float should be comparable via f64 widening
-        // However, memcomparable encoding uses type-specific encoding,
-        // so cross-type comparison is not guaranteed to be correct.
-        // The in-memory comparator handles cross-type; the encoder
-        // produces type-specific bytes. This test verifies determinism.
-        let r1 = make_record(&[("x", Value::Integer(42))]);
-        let r2 = make_record(&[("x", Value::Integer(42))]);
-        let keys = &[sf("x", SortOrder::Asc)];
-        assert_eq!(encode_sort_key(&r1, keys), encode_sort_key(&r2, keys));
+        // Integers, floats and decimals share one numeric key: equal values
+        // give identical bytes whatever their type, and unequal values order
+        // by exact value, never through an `f64` widening.
+        let key = |v: Value| encode_sort_key(&make_record(&[("x", v)]), &[sf("x", SortOrder::Asc)]);
+        let integer = key(Value::Integer(42));
+        assert_eq!(integer, key(Value::Integer(42)));
+        assert_eq!(integer, key(Value::Float(42.0)));
+        assert_eq!(integer, key(Value::Decimal(Decimal::new(42, 0))));
+        assert_eq!(integer, key(Value::Decimal(Decimal::new(4200, 2))));
+
+        assert!(key(Value::Float(41.5)) < integer);
+        assert!(integer < key(Value::Decimal(Decimal::new(42_000_000_000_000_001, 15))));
+        // 2^53 + 1 is not an f64; widening it would tie it with the float 2^53.
+        let above = key(Value::Integer((1 << 53) + 1));
+        assert!(key(Value::Float(9_007_199_254_740_992.0)) < above);
+        assert!(above < key(Value::Float(9_007_199_254_740_994.0)));
+        // The float 0.1 is slightly above the decimal 0.1.
+        assert!(key(Value::Decimal(Decimal::new(1, 1))) < key(Value::Float(0.1)));
     }
 
     #[test]

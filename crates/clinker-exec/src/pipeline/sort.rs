@@ -83,7 +83,11 @@ pub fn compare_values_with_nulls(
     compare_authored_values_with_nulls(a, b, order, null_order)
 }
 
-/// Compare two non-null values using the same ordering as the evaluator.
+/// Compare two non-null values in ascending order under the one value order,
+/// [`clinker_record::order::compare`], which every sort shares.
+///
+/// This is not yet the order of CXL's comparison operators: `<` and `>` in an
+/// expression still decide NaN and mixed-type operands their own way.
 pub fn compare_values(a: &Value, b: &Value) -> Ordering {
     compare_authored_values(a, b)
 }
@@ -347,7 +351,10 @@ mod tests {
             let ordering = a.0.cmp(&b.0).then(a.1.total_cmp(&b.1));
             assert_ne!(ordering, Ordering::Greater, "out of order at {pair:?}");
             if ordering == Ordering::Equal {
-                assert!(pair[0] < pair[1], "equal values lost arrival order at {pair:?}");
+                assert!(
+                    pair[0] < pair[1],
+                    "equal values lost arrival order at {pair:?}"
+                );
             }
         }
     }
