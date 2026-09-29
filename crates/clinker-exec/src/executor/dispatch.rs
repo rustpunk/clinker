@@ -1808,10 +1808,16 @@ pub(crate) struct ExecutorContext<'a> {
     /// `None` otherwise; every record streams through per-record DLQ
     /// semantics with zero overhead.
     ///
+    /// The state lives in a cell of its own that the walk reclaim set also
+    /// holds, so a reclaim pass can flush its held rows. Every borrow of it
+    /// is one step of the state's own work, never held across a call into
+    /// another dispatch arm or the dead-letter writer.
+    ///
     /// Declared before [`Self::spill_root`]: its held log keeps a file open
     /// inside the spill directory, which must close before the directory is
     /// removed.
-    pub(crate) document_dlq: Option<crate::executor::document_dlq::DocumentDlqState>,
+    pub(crate) document_dlq:
+        Option<std::rc::Rc<std::cell::RefCell<crate::executor::document_dlq::DocumentDlqState>>>,
 
     /// Pipeline-scoped spill directory bundled with the OS advisory lock held on
     /// its `.lock` file. Allocated once at `execute_dag_branching` start; every

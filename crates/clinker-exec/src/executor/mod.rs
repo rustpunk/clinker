@@ -1637,18 +1637,20 @@ impl PipelineExecutor {
                 .filter(|s| s.dlq_granularity == clinker_plan::config::DlqGranularity::Document)
                 .map(|s| Arc::from(s.name.as_str()))
                 .collect();
-            Some(crate::executor::document_dlq::DocumentDlqState::new(
-                doc_sources,
-                Arc::clone(&memory_budget),
-                crate::executor::document_dlq::HeldLogConfig {
-                    spill_root: Arc::clone(&spill_root_path),
-                    compress: params.spill_compress,
-                    batch_size: config
-                        .pipeline
-                        .batch_size
-                        .unwrap_or(crate::executor::batch_handoff::DEFAULT_BATCH_SIZE),
-                },
-            ))
+            Some(std::rc::Rc::new(std::cell::RefCell::new(
+                crate::executor::document_dlq::DocumentDlqState::new(
+                    doc_sources,
+                    Arc::clone(&memory_budget),
+                    crate::executor::document_dlq::HeldLogConfig {
+                        spill_root: Arc::clone(&spill_root_path),
+                        compress: params.spill_compress,
+                        batch_size: config
+                            .pipeline
+                            .batch_size
+                            .unwrap_or(crate::executor::batch_handoff::DEFAULT_BATCH_SIZE),
+                    },
+                ),
+            )))
         } else {
             None
         };
@@ -2001,6 +2003,13 @@ impl PipelineExecutor {
             // supersedes one with an exec-measured figure.
             runtime_statistics: Arc::new(std::sync::Mutex::new(statistics.clone())),
         };
+        // The document dead-letter state's held rows are a victim any
+        // reclaim pass on the walk can flush.
+        if let Some(state) = &ctx.document_dlq {
+            ctx.walk_reclaim
+                .borrow_mut()
+                .set_document_dlq(std::rc::Rc::clone(state));
+        }
         // This thread is the run's walk from here until the function returns,
         // by any path; the guard drops before `ctx`.
         let _walk_frame = crate::pipeline::memory::walk::WalkContextGuard::install(

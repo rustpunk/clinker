@@ -12,7 +12,9 @@
 //! walk: the top level's, and one above it for each composition body running
 //! inside it. A body reads and writes only its own frame, but a reclaim can
 //! spill a resident slot of any frame, so a body that falls short still
-//! reaches the state its callers are holding.
+//! reaches the state its callers are holding. Outside the frames the set
+//! also reaches the run's document dead-letter state, whose held failing
+//! rows any pass can flush.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -231,6 +233,12 @@ pub(crate) struct WalkSpillSettings {
 /// ([`WalkReclaim::spill_victim`]) searches every frame: a body's shortfall
 /// may spill a resident slot its callers hold.
 ///
+/// Beside the frames, outside every scope, the set holds a handle to the
+/// run's document dead-letter state, which lives in a cell of its own: the
+/// state's borrow and the set's are independent, so a request the state
+/// makes while it holds its own cell can still spill every other victim, and
+/// a pass any other request starts can flush the state's held rows.
+///
 /// Walk-only (`!Send`, reached through an `Rc<RefCell<_>>`). A borrow of it is
 /// short and never held across a governed allocation, a `reserve`, a channel
 /// wait or a call into another dispatch arm.
@@ -241,7 +249,18 @@ pub(crate) struct WalkReclaimSet {
     /// slots, kept while a composition body it entered runs.
     parents: Vec<NodeBufferSlots>,
     spill_settings: WalkSpillSettings,
-    document_dlq: Option<Rc<RefCell<DocumentDlqState>>>,
+    /// The run's document dead-letter state, when a Source declares the
+    /// document granularity.
+    document_dlq: Option<DocumentDlqEntry>,
+}
+
+/// The walk reclaim set's handle to the run's document dead-letter state:
+/// its consumer, the handle a pass raises its spill request on while the
+/// state is busy, and the state's own cell.
+struct DocumentDlqEntry {
+    consumer: ConsumerId,
+    handle: Arc<ConsumerHandle>,
+    state: Rc<RefCell<DocumentDlqState>>,
 }
 
 impl WalkReclaimSet {
@@ -255,8 +274,48 @@ impl WalkReclaimSet {
         }
     }
 
+    /// Make the run's document dead-letter state, in its own cell, a victim
+    /// every pass on this walk can reach. Borrows the state's cell once, to
+    /// read its consumer and handle; the set then keeps the state alive for
+    /// as long as the set lives.
     pub(crate) fn set_document_dlq(&mut self, state: Rc<RefCell<DocumentDlqState>>) {
-        self.document_dlq = Some(state);
+        let (consumer, handle) = {
+            let borrowed = state.borrow();
+            (borrowed.consumer_id(), borrowed.handle())
+        };
+        self.document_dlq = Some(DocumentDlqEntry {
+            consumer,
+            handle,
+            state,
+        });
+    }
+
+    /// Flush the document dead-letter state's held rows when `id` is its
+    /// consumer; `None` when it is not.
+    ///
+    /// A borrowed cell means the state is running a step of its own; on the
+    /// walk that is only while it is itself the requester, admitting a row.
+    /// It frees nothing now: its spill request is raised, which its next
+    /// boundary answers, and the requester flushes its own tails if the
+    /// request it is making falls short.
+    fn spill_document_dlq(
+        &mut self,
+        id: ConsumerId,
+        arbitrator: &MemoryArbitrator,
+    ) -> Result<Option<VictimOutcome>, PipelineError> {
+        let Some(entry) = self
+            .document_dlq
+            .as_ref()
+            .filter(|entry| entry.consumer == id)
+        else {
+            return Ok(None);
+        };
+        let Ok(mut state) = entry.state.try_borrow_mut() else {
+            entry.handle.request_spill();
+            return Ok(Some(VictimOutcome::Busy));
+        };
+        state.spill_held_rows(arbitrator)?;
+        Ok(Some(VictimOutcome::Spilled))
     }
 
     /// The running dispatch scope's node-buffer slots: the top frame.
@@ -438,7 +497,9 @@ impl WalkReclaim for WalkReclaimSet {
     /// The frame that registered consumer `id` spills its slot. The running
     /// scope's frame is searched first, then each calling scope's outwards,
     /// so a composition body's shortfall reaches the resident slots its
-    /// callers hold. A consumer no frame registered is `NotOwned`.
+    /// callers hold. After the frames, the document dead-letter state's
+    /// consumer flushes the state's held rows. Any other consumer is
+    /// `NotOwned`.
     fn spill_victim(
         &mut self,
         id: ConsumerId,
@@ -449,6 +510,9 @@ impl WalkReclaim for WalkReclaimSet {
             if let Some(outcome) = frame.spill_registered(id, arbitrator, spill_settings)? {
                 return Ok(outcome);
             }
+        }
+        if let Some(outcome) = self.spill_document_dlq(id, arbitrator)? {
+            return Ok(outcome);
         }
         Ok(VictimOutcome::NotOwned)
     }

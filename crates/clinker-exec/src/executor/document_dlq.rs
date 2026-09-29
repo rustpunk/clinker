@@ -417,10 +417,14 @@ pub(crate) struct HeldLogConfig {
 ///
 /// The held log's resident frames and index, the failed-document slots and
 /// the ledgers are charged to the run's arbitrator through one consumer the
-/// state registers at construction and unregisters on drop. Held frames
+/// state registers at construction and unregisters on drop. The run keeps
+/// the state in a cell of its own that the walk reclaim set also holds, so a
+/// reclaim pass any other request on the walk starts can flush the held
+/// frames at once when it elects the state's consumer. Otherwise held frames
 /// leave memory only on the arbitrator's signals (see
-/// [`crate::executor::extent_log`]): the consumer's election, answered on
-/// every append, at every decision and at every ledger admission; the soft
+/// [`crate::executor::extent_log`]): the consumer's election by a pass that
+/// found the state busy or by a round without the walk, answered on every
+/// append, at every decision and at every ledger admission; the soft
 /// threshold, polled every `batch_size` appends and at every decision; and
 /// the hard-limit preflight on every append and every ledger admission,
 /// which flushes every held tail before it refuses with E310.
@@ -447,6 +451,10 @@ pub(crate) struct DocumentDlqState {
     /// Frames held so far, for the soft-threshold poll cadence.
     appends: u64,
     batch_size: u64,
+    /// The node whose failure was held last: a flush a reclaim pass asks
+    /// for has no node of its own, so it records its extents under the
+    /// node whose rows it moves.
+    last_failing_node: String,
     arbitrator: Arc<MemoryArbitrator>,
     consumer_id: ConsumerId,
     /// The bytes charged for the held log, the failed-document slots and
@@ -485,10 +493,38 @@ impl DocumentDlqState {
             frame: Vec::new(),
             appends: 0,
             batch_size: held.batch_size.max(1) as u64,
+            last_failing_node: String::new(),
             arbitrator,
             consumer_id,
             handle,
         }
+    }
+
+    /// The consumer the state is charged through.
+    pub(crate) fn consumer_id(&self) -> ConsumerId {
+        self.consumer_id
+    }
+
+    /// The handle the state is charged through, on which a reclaim pass
+    /// that finds the state busy raises its spill request.
+    pub(crate) fn handle(&self) -> Arc<ConsumerHandle> {
+        Arc::clone(&self.handle)
+    }
+
+    /// Flush every resident held tail to the held log's file because a
+    /// reclaim pass elected the state: the same extents, chaining and spill
+    /// quota as a flush the state asks for itself, with the bytes written
+    /// recorded under the node whose failure was held last. Returns the
+    /// resident bytes freed.
+    ///
+    /// # Errors
+    ///
+    /// A flush's spill errors, including E320.
+    pub(crate) fn spill_held_rows(
+        &mut self,
+        arbitrator: &MemoryArbitrator,
+    ) -> Result<u64, PipelineError> {
+        self.held.flush_all(arbitrator, &self.last_failing_node)
     }
 
     /// The document key (source file) `record` is governed by under the
@@ -611,9 +647,9 @@ impl DocumentDlqState {
     }
 
     /// Mark document `key` failed at `node` with its first failure's stamp
-    /// `cause`, charging the document's fixed map slot.
+    /// `cause`. The document's fixed map slot, [`FAILED_DOCUMENT_BYTES`], is
+    /// charged by the admission of the held frame that marks it.
     fn insert_failed(&mut self, key: DocKey, cause: DlqFailureStamp, node: &str) {
-        self.handle.add_bytes(FAILED_DOCUMENT_BYTES);
         let failing_node = self.names.failing_node(node);
         self.failed.insert(
             key,
@@ -685,6 +721,9 @@ impl DocumentDlqState {
             self.insert_failed(Arc::clone(&key), row.failed_at, node);
         }
         self.held.append(&key, frame)?;
+        if self.last_failing_node != node {
+            node.clone_into(&mut self.last_failing_node);
+        }
         debug_assert!(
             self.handle.bytes() >= self.held.resident_bytes() + self.held.index_bytes(),
             "the state's charge covers its held rows"
@@ -1108,7 +1147,7 @@ pub(crate) fn record_error_to_document_buffer_if_doc_dlq(
     let Some(state) = ctx.document_dlq.as_ref() else {
         return Ok(false);
     };
-    let Some(key) = state.governing_key(record) else {
+    let Some(key) = state.borrow().governing_key(record) else {
         return Ok(false);
     };
     let source_name = source_name_arc_of(record);
@@ -1151,7 +1190,7 @@ pub(crate) fn record_source_rejection_to_document_buffer_if_doc_dlq(
         return Ok(false);
     };
     if event.original_record.doc_ctx().id() == DocumentId::SYNTHETIC
-        || !state.doc_sources.contains(&event.source_name)
+        || !state.borrow().doc_sources.contains(&event.source_name)
         || !is_concrete_file(&event.source_file)
     {
         return Ok(false);
@@ -1240,12 +1279,13 @@ fn mark_document_failed(
     entry: DlqEntry,
     node: &str,
 ) -> Result<(), PipelineError> {
-    let Some(state) = ctx.document_dlq.as_mut() else {
+    let Some(state) = ctx.document_dlq.as_ref().map(std::rc::Rc::clone) else {
         return Ok(());
     };
-    let entry = match state.failed.get(&key) {
+    let cause = state.borrow().failed.get(&key).map(|failed| failed.cause);
+    let entry = match cause {
         None => entry,
-        Some(failed) => DlqEntry {
+        Some(cause) => DlqEntry {
             source_row: entry.source_row,
             category: clinker_core_types::dlq::DlqErrorCategory::DocumentRejected,
             error_message: format!("document {key:?} rejected: a sibling record failed"),
@@ -1256,11 +1296,13 @@ fn mark_document_failed(
             source_name: entry.source_name,
             triggering_field: None,
             triggering_value: None,
-            failed_at: DlqFailureStamp::condemned_by(&failed.cause),
+            failed_at: DlqFailureStamp::condemned_by(&cause),
         },
     };
     let bytes = ctx.dlq.encode_row(&entry)?;
-    state.hold(
+    // The state is the requester while it holds the row: the borrow spans
+    // only its own admission, flush and append.
+    state.borrow_mut().hold(
         key,
         &HeldRow {
             source_row: entry.source_row,
@@ -1482,7 +1524,7 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
         let is_failed = ctx
             .document_dlq
             .as_ref()
-            .is_some_and(|s| s.failed.contains_key(key));
+            .is_some_and(|s| s.borrow().failed.contains_key(key));
         if is_failed {
             reject_document_now(ctx, key, bucket, &self.output_name)
         } else {
@@ -1681,15 +1723,13 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
             let cause = ctx
                 .document_dlq
                 .as_ref()
-                .and_then(|s| s.failed.get(&key))
-                .map(|failed| failed.cause);
+                .and_then(|s| s.borrow().failed.get(&key).map(|failed| failed.cause));
             match cause {
                 Some(cause) => {
-                    if document_state(ctx, &self.output_name)?.admit_emitted(
-                        &key,
-                        source_row,
-                        &self.output_name,
-                    )? {
+                    let admitted = document_state(ctx, &self.output_name)?
+                        .borrow_mut()
+                        .admit_emitted(&key, source_row, &self.output_name)?;
+                    if admitted {
                         push_document_collateral(ctx, &key, record, source_row, &cause)?;
                     }
                 }
@@ -1726,7 +1766,7 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
                     let key = ctx
                         .document_dlq
                         .as_ref()
-                        .and_then(|s| s.governing_key(&record));
+                        .and_then(|s| s.borrow().governing_key(&record));
                     match key {
                         Some(key) => self.admit_governed(ctx, key, record, source_row)?,
                         None => self.write_through(ctx, record, source_row)?,
@@ -1824,7 +1864,8 @@ pub(crate) fn reject_unclosed_failed_documents(
     let Some(state) = ctx.document_dlq.as_ref() else {
         return Ok(());
     };
-    for (key, node) in state.unclosed_failed_documents() {
+    let pending = state.borrow().unclosed_failed_documents();
+    for (key, node) in pending {
         reject_document_now(ctx, &key, None, &node)?;
     }
     Ok(())
@@ -2006,13 +2047,15 @@ fn push_document_collateral(
 }
 
 /// The run's document-DLQ state, which every caller here has already
-/// established is active.
-fn document_state<'a>(
-    ctx: &'a mut ExecutorContext<'_>,
+/// established is active. The caller borrows it for one step of the state's
+/// own work at a time.
+fn document_state(
+    ctx: &ExecutorContext<'_>,
     node: &str,
-) -> Result<&'a mut DocumentDlqState, PipelineError> {
+) -> Result<std::rc::Rc<std::cell::RefCell<DocumentDlqState>>, PipelineError> {
     ctx.document_dlq
-        .as_mut()
+        .as_ref()
+        .map(std::rc::Rc::clone)
         .ok_or_else(|| PipelineError::Internal {
             op: "document dead-letter",
             node: node.to_string(),
@@ -2071,7 +2114,9 @@ fn stream_document_rejection(
     buffer: Option<NodeBuffer>,
     node: &str,
 ) -> Result<(), PipelineError> {
-    let cause = document_state(ctx, node)?
+    let state = document_state(ctx, node)?;
+    let cause = state
+        .borrow()
         .failed
         .get(key)
         .map(|failed| failed.cause)
@@ -2086,7 +2131,8 @@ fn stream_document_rejection(
             for event in buffer.drain() {
                 match event? {
                     StreamEvent::Record(record, source_row) => {
-                        if document_state(ctx, node)?.admit_emitted(key, source_row, node)? {
+                        let admitted = state.borrow_mut().admit_emitted(key, source_row, node)?;
+                        if admitted {
                             push_document_collateral(ctx, key, record, source_row, &cause)?;
                         }
                     }
@@ -2096,9 +2142,7 @@ fn stream_document_rejection(
         }
         Ok(())
     })();
-    if let Some(state) = ctx.document_dlq.as_mut() {
-        state.settle_emitted(key);
-    }
+    state.borrow_mut().settle_emitted(key);
     result
 }
 
@@ -2118,12 +2162,16 @@ fn replay_held(
     key: &DocKey,
     node: &str,
 ) -> Result<(), PipelineError> {
-    let Some(mut reader) = document_state(ctx, node)?.take_held(key, node)? else {
+    let state = document_state(ctx, node)?;
+    let Some(mut reader) = state.borrow_mut().take_held(key, node)? else {
         return Ok(());
     };
     while let Some(frame) = reader.next_frame()? {
-        let held = document_state(ctx, node)?.names.decode(frame)?;
-        if document_state(ctx, node)?.admit_emitted(key, held.source_row, node)? {
+        let held = state.borrow().names.decode(frame)?;
+        let admitted = state
+            .borrow_mut()
+            .admit_emitted(key, held.source_row, node)?;
+        if admitted {
             ctx.dlq_funnel().account_row(AccountedRow {
                 source_row: held.source_row,
                 source_name: &held.source_name,
@@ -4025,8 +4073,7 @@ mod tests {
             root.path(),
             usize::MAX,
         )));
-        set.borrow_mut()
-            .set_document_dlq(std::rc::Rc::clone(&cell));
+        set.borrow_mut().set_document_dlq(std::rc::Rc::clone(&cell));
 
         let docs: Vec<DocKey> = (0..3).map(doc_key).collect();
         let mut expected: HashMap<DocKey, Vec<SourceRowId>> = HashMap::new();
