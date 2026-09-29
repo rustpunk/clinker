@@ -72,7 +72,7 @@ cxl: |
 
 ### min(expr) -> Any
 
-Returns the minimum value in the group. Works on numeric, string, and date types.
+Returns the minimum value in the group. Works on numeric, string, and date types. Null values are skipped; a group whose values are all null gives null.
 
 ```yaml
 cxl: |
@@ -80,15 +80,29 @@ cxl: |
   emit lowest_price = min(unit_price)
 ```
 
+Values compare by the rule sorting uses (see [How values are ordered](../nodes/sink.md#how-values-are-ordered)):
+
+- Integers, floats and decimals compare by their exact value, so a column that holds both integers and floats (for example one built by an `if` whose branches return an integer and a float) is compared value by value.
+- NaN is the largest value, above `inf`.
+- Strings, dates and datetimes order as they do in a Sink sort.
+
+The result does not depend on the order rows arrive in, or on the memory limit.
+
+When several values in the group are equal under that rule, `min` returns the same one every time: an integer before a decimal before a float, the decimal with fewer fractional digits, and the float with a negative sign before one with a positive sign. So `min` of `1` and `1.0` is `1`, `min` of the decimals `1.0` and `1.00` is `1.0`, and `min` of `-0.0` and `0.0` is `-0.0`.
+
 ### max(expr) -> Any
 
-Returns the maximum value in the group. Works on numeric, string, and date types.
+Returns the maximum value in the group. Works on numeric, string, and date types. Null values are skipped; a group whose values are all null gives null.
 
 ```yaml
 cxl: |
   emit latest_order = max(order_date)
   emit highest_price = max(unit_price)
 ```
+
+Values compare as they do for [`min`](#minexpr---any): numbers by their exact value across integer, float and decimal, and NaN is the largest value, so a group that holds a NaN has NaN as its maximum. The result does not depend on the order rows arrive in, or on the memory limit.
+
+When several values in the group are equal, `max` picks in the reverse order to `min`: a float before a decimal before an integer, the decimal with more fractional digits, and the float with a positive sign. So `max` of `1` and `1.0` is `1.0`, `max` of the decimals `1.0` and `1.00` is `1.00`, and `max` of `-0.0` and `0.0` is `0.0`.
 
 ### collect(expr) -> Array
 

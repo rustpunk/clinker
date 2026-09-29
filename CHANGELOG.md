@@ -301,6 +301,28 @@ Output changes where a sort key holds:
 
 Nulls are still placed only by `null_order`.
 
+### Fixed — Aggregate min and max no longer depend on arrival order
+
+Aggregate `min` and `max` now compare values by the rule sorting uses
+([#1283](https://github.com/rustpunk/clinker/issues/1283); see
+[How values are ordered](docs/user/src/nodes/sink.md#how-values-are-ordered)).
+They used to skip a value they could not compare with the current minimum or
+maximum: in a column holding both integers and floats, a value of one type
+that arrived after a value of the other type was ignored, so
+`max` of `5, 3.5, 1, 7.5` could answer `5`. A NaN that arrived first stuck as
+the minimum, and because a group spilled to disk was folded in a different
+order, the answer could change with the memory limit.
+
+- **Numbers** compare by exact value across integer, float and decimal.
+- **NaN** is the largest value.
+- **Equal values** return a fixed representative: `min` prefers an integer,
+  then the decimal with fewer fractional digits, then the float with the
+  smaller sign, and `max` the reverse, so `min(1, 1.0)` is `1`,
+  `max(1, 1.0)` is `1.0` and `min(-0.0, 0.0)` is `-0.0`.
+
+Nulls are still skipped. The answer is now the same for every arrival order
+and every memory limit.
+
 ### Changed — terminal Output nodes are now Sinks
 
 **Breaking YAML and Rust API change.** The terminal destination node is now
