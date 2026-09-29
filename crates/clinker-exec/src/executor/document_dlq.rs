@@ -165,8 +165,8 @@ const MERGED_INTERVAL_BYTES: u64 = 8;
 const SOURCE_ENTRY_BYTES: u64 = std::mem::size_of::<(PlanNodeId, SourceEmittedRows)>() as u64;
 
 /// The most one admission can add to the ledger's charge: a merging row that
-/// opens a new Source entry, bitmap and container. Every admission
-/// preflights its own growth, which never exceeds this.
+/// opens a new Source entry, bitmap and container. Every admission is
+/// charged its own growth, which never exceeds this.
 const MAX_ADMISSION_BYTES: u64 = ROW_ADMISSION_BYTES
     + MERGED_INTERVAL_BYTES
     + NEW_CONTAINER_BYTES
@@ -204,9 +204,10 @@ const FAILED_DOCUMENT_BYTES: u64 = 3 * (std::mem::size_of::<(DocKey, FailedDocum
 ///
 /// The ledger is exact dedup state and does not spill. Its charge is an upper
 /// bound on its heap: each admission is charged its worst-case growth (at
-/// most [`MAX_ADMISSION_BYTES`]) and preflighted against the hard limit, and
-/// [`EmittedRows::settle`] replaces the accumulated admissions with the
-/// compressed structure's bound. Growth past the hard limit fails the run
+/// most [`MAX_ADMISSION_BYTES`]) through the ledger before the row is
+/// recorded, and [`EmittedRows::settle`] replaces the accumulated admissions
+/// with the compressed structure's bound. Growth that does not fit once the
+/// walk's reclaim and the state's own held-row flush have run fails the run
 /// with E310 rather than spilling.
 ///
 /// There is more than one entry only when two Sources read the same file
@@ -317,8 +318,8 @@ impl EmittedRows {
     /// compressed heap. Returns the new charge. Optimizing converts a
     /// container to runs only when that is smaller, but the new run vector
     /// may keep doubling slack, so the new charge can exceed the old one by
-    /// that slack; it is reported, and the next admission's preflight sees
-    /// it.
+    /// that slack; it is reported, and the next admission's checked charge
+    /// counts it.
     ///
     /// Merge slack larger than the treemap's own bound is shed by rebuilding
     /// the treemap as a clone, whose vectors hold exactly their length. The
@@ -423,11 +424,12 @@ pub(crate) struct HeldLogConfig {
 /// frames at once when it elects the state's consumer. Otherwise held frames
 /// leave memory only on the arbitrator's signals (see
 /// [`crate::executor::extent_log`]): the consumer's election by a pass that
-/// found the state busy or by a round without the walk, answered on every
+/// found the state busy or by a round without the walk, polled on every
 /// append, at every decision and at every ledger admission; the soft
 /// threshold, polled every `batch_size` appends and at every decision; and
-/// the hard-limit preflight on every append and every ledger admission,
-/// which flushes every held tail before it refuses with E310.
+/// the state's own growth (a held row, a ledger admission) when the walk's
+/// reclaim leaves it short, which flushes the tails and retries once before
+/// it refuses with E310. Each growth is charged once, when it is admitted.
 pub(crate) struct DocumentDlqState {
     /// Source-node names declaring `dlq_granularity: document`. A record is
     /// governed by the policy only when its originating source is in this
@@ -552,23 +554,18 @@ impl DocumentDlqState {
     /// already wrote it, so the caller writes nothing; `Ok(true)` when the
     /// caller must write it now.
     ///
-    /// Every admission first answers a spill request pending on the state's
-    /// handle by flushing every held tail, so a request the arbitrator raised
-    /// on a poll that holds no row, as the late-record path's is, is answered
-    /// here. The ledger's growth is then preflighted against the arbitrator's
-    /// hard limit before the row is recorded, as a node-buffer reservation's
-    /// is. When it does not fit, every held tail is flushed first, as a hold
-    /// does, and the growth checked again: the ledger itself cannot spill (it
-    /// is exact dedup state), so growth that still does not fit with every
-    /// held row on disk fails the run with E310, naming `node`. Any flush is
-    /// credited to `node`.
+    /// The ledger's growth is charged before the row is recorded, and that
+    /// is its only charge: on the walk the growth first reclaims from every
+    /// other walk victim, then, only if that falls short, the state flushes
+    /// its own held rows and retries once. The ledger itself cannot spill (it
+    /// is exact dedup state), so growth that still does not fit fails the
+    /// run with E310 naming `node`. Any flush is credited to `node`.
     ///
     /// # Errors
     ///
-    /// [`PipelineError::MemoryBudgetExceeded`] when the growth would pass the
-    /// hard limit with every held row on disk; a flush's spill errors,
-    /// including E320; [`PipelineError::Internal`] when `key` is not a
-    /// failed document.
+    /// [`PipelineError::MemoryBudgetExceeded`] when the growth does not fit
+    /// with every held row on disk; a flush's spill errors, including E320;
+    /// [`PipelineError::Internal`] when `key` is not a failed document.
     fn admit_emitted(
         &mut self,
         key: &DocKey,
@@ -583,30 +580,18 @@ impl DocumentDlqState {
                 node: node.to_string(),
                 detail: format!("document {key:?} is rejected but was never marked failed"),
             })?;
-        if self.handle.take_spill_request() {
-            self.held.flush_all(&self.arbitrator, node)?;
-        }
         let Some(admission) = failed.emitted.admission(row) else {
             return Ok(false);
         };
         let growth = admission.growth;
         debug_assert!(growth <= MAX_ADMISSION_BYTES);
-        let hard_limit = self.arbitrator.hard_limit();
-        let fits = |arbitrator: &MemoryArbitrator| {
-            hard_limit == 0 || arbitrator.sum_consumer_usage().saturating_add(growth) <= hard_limit
-        };
-        if !fits(&self.arbitrator) {
-            self.held.flush_all(&self.arbitrator, node)?;
-        }
-        if !fits(&self.arbitrator) {
-            return Err(self.arbitrator.refusal(
-                node,
-                clinker_plan::runtime_error::MemorySurface::DeadLetteredRowSet,
-                growth,
-            ));
-        }
+        self.held.admit_owner_charge(
+            &self.arbitrator,
+            growth,
+            node,
+            MemorySurface::DeadLetteredRowSet,
+        )?;
         failed.emitted.record(row, &admission);
-        self.handle.add_bytes(growth);
         if failed.emitted.unsettled >= SETTLE_EVERY_ADMISSIONS {
             settle_ledger(&self.handle, &mut failed.emitted);
         }
@@ -668,12 +653,12 @@ impl DocumentDlqState {
     /// Before the row is held the arbitrator's signals are polled: the
     /// consumer's election every time, the soft threshold every `batch_size`
     /// holds; either flushes every held tail. Then the frame, and on a first
-    /// failure the document's slot and index entry, are preflighted against
-    /// the hard limit, flushing every held tail first if they do not fit.
-    /// Between two polls the resident tails grow by at most one batch of
-    /// holds past the soft threshold; the hard limit is checked on every
-    /// hold. `node` is the failing node, for E310 and for the spill
-    /// attribution of any flush.
+    /// failure the document's slot and index entry, are admitted in one
+    /// growth of the state's charge, which is their only charge: on the walk
+    /// it first reclaims from every other walk victim, the state (the
+    /// requester) last, and only if that falls short does the state flush
+    /// its own held tails and retry once. `node` is the failing node, for
+    /// E310 and for the spill attribution of any flush.
     ///
     /// # Errors
     ///
@@ -1037,7 +1022,8 @@ fn held_frame_error(detail: &str) -> PipelineError {
 /// `Priority` policy elects the lowest priority first, so a state holding
 /// only ledgers is elected only when every registered consumer is equally
 /// non-reclaimable, and never shadows a node buffer that could spill. Growth
-/// that cannot be relieved is refused at the hard limit with E310.
+/// that neither the walk's reclaim nor the state's own flush makes room for
+/// is refused with E310.
 ///
 /// No producer feeds the state that the arbitrator could pause, so
 /// `can_back_pressure` is false and the consumer is never paused: there is
@@ -1271,8 +1257,8 @@ pub(crate) fn mark_structural_reject_if_present(
 ///
 /// [`PipelineError::Internal`] when the row cannot be encoded;
 /// [`PipelineError::MemoryBudgetExceeded`] (E310) naming `node`
-/// when the held row does not fit under the hard limit even with every held
-/// row on disk; a spill error, including E320, from a flush.
+/// when the held row does not fit even with every other walk victim spilled
+/// and every held row on disk; a spill error, including E320, from a flush.
 fn mark_document_failed(
     ctx: &mut ExecutorContext<'_>,
     key: DocKey,
@@ -4145,7 +4131,10 @@ mod tests {
         node: &str,
         rows: u64,
         charge: u64,
-    ) -> (crate::executor::dispatch::NodeBufferKey, Arc<ConsumerHandle>) {
+    ) -> (
+        crate::executor::dispatch::NodeBufferKey,
+        Arc<ConsumerHandle>,
+    ) {
         let handle = ConsumerHandle::new();
         let id = arbitrator.register_node_consumer(
             Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
@@ -4162,11 +4151,11 @@ mod tests {
         );
         handle.try_grow(charge).expect("the slot's charge fits");
         let s = schema();
-        let records: Vec<(Record, SourceRowId)> =
-            (0..rows).map(|n| (rec(&s, n as i64, 0), row(2, n))).collect();
-        let key = crate::executor::dispatch::NodeBufferKey::from(
-            petgraph::graph::NodeIndex::new(0),
-        );
+        let records: Vec<(Record, SourceRowId)> = (0..rows)
+            .map(|n| (rec(&s, n as i64, 0), row(2, n)))
+            .collect();
+        let key =
+            crate::executor::dispatch::NodeBufferKey::from(petgraph::graph::NodeIndex::new(0));
         let mut set = set.borrow_mut();
         set.slots_mut().register(
             key.clone(),
@@ -4206,13 +4195,16 @@ mod tests {
             root.path(),
             usize::MAX,
         )));
-        set.borrow_mut()
-            .set_document_dlq(std::rc::Rc::clone(&cell));
+        set.borrow_mut().set_document_dlq(std::rc::Rc::clone(&cell));
         let (slot_key, slot_handle) =
             publish_resident_slot(&arbitrator, &set, "upstream", 256, SLOT);
         for ordinal in 1..=12u64 {
-            hold_row(&mut cell.borrow_mut(), &doc_key((ordinal % 3) as usize), ordinal)
-                .expect("hold");
+            hold_row(
+                &mut cell.borrow_mut(),
+                &doc_key((ordinal % 3) as usize),
+                ordinal,
+            )
+            .expect("hold");
         }
         let resident = cell.borrow().held.resident_bytes();
         assert!(resident > 0);
@@ -4238,7 +4230,11 @@ mod tests {
             ),
             "the resident slot went to disk"
         );
-        assert_eq!(slot_handle.bytes(), 0, "the slot's charge left with its rows");
+        assert_eq!(
+            slot_handle.bytes(),
+            0,
+            "the slot's charge left with its rows"
+        );
         assert!(
             arbitrator
                 .per_stage_spill_bytes_written()
@@ -4267,9 +4263,8 @@ mod tests {
         let root = tempfile::tempdir().expect("held-log root");
         let arbitrator = ledger_arbitrator(1 << 30);
         let mut state = held_state(&arbitrator, root.path(), usize::MAX);
-        let grown = |state: &DocumentDlqState| {
-            state.held.resident_bytes() + state.held.index_bytes()
-        };
+        let grown =
+            |state: &DocumentDlqState| state.held.resident_bytes() + state.held.index_bytes();
 
         let key = doc_key(0);
         let frame = vec![7u8; 190];
@@ -4309,10 +4304,7 @@ mod tests {
             "the admission is the append's growth and the document's slot"
         );
 
-        for (doc, ordinal, slot) in [
-            (doc_key(0), 2, 0),
-            (doc_key(1), 3, FAILED_DOCUMENT_BYTES),
-        ] {
+        for (doc, ordinal, slot) in [(doc_key(0), 2, 0), (doc_key(1), 3, FAILED_DOCUMENT_BYTES)] {
             let before = state.charged_bytes();
             let held_before = grown(&state);
             hold_row(&mut state, &doc, ordinal).expect("hold");
