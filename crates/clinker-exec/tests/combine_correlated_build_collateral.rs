@@ -95,6 +95,12 @@ const SORT_MERGE: Strategy = Strategy {
 /// `correlation_key: cid`, the body divides the build's `base` by the
 /// driver's `div`, and the output keeps the driver's correlation key.
 fn yaml(strategy: &Strategy) -> String {
+    yaml_with(strategy, "", "")
+}
+
+/// [`yaml`] with `error_extra` appended to the `error_handling` block and
+/// `extra_nodes` appended to the node list.
+fn yaml_with(strategy: &Strategy, error_extra: &str, extra_nodes: &str) -> String {
     let hint = strategy
         .hint
         .map(|hint| format!("\n      strategy: {hint}"))
@@ -119,7 +125,7 @@ fn yaml(strategy: &Strategy) -> String {
 pipeline:
   name: combine_correlated_build_collateral
 error_handling:
-  strategy: continue
+  strategy: continue{error_extra}
   dlq:
     path: rejected.csv
 nodes:
@@ -170,7 +176,7 @@ nodes:
       name: out
       type: csv
       path: out.csv
-"#
+{extra_nodes}"#
     )
 }
 
@@ -227,8 +233,23 @@ fn run(
     build_cid: &str,
 ) -> (Vec<OutputRow>, Vec<DlqRow>) {
     let yaml = yaml(strategy);
-    assert_strategy(&yaml, strategy);
-    let config = parse_config(&yaml).expect("pipeline parses");
+    let (mut out, rows) = run_yaml(&yaml, strategy, driver_rows, build_cid, &["out"]);
+    (out.remove("out").unwrap_or_default(), rows)
+}
+
+/// Run `yaml`, which must select `strategy`, over the given drivers and
+/// build row. Returns each named sink's rows and the dead-letter rows in
+/// written order, after checking that every counted dead letter was
+/// written as a row.
+fn run_yaml(
+    yaml: &str,
+    strategy: &Strategy,
+    driver_rows: &[(i64, &str, i64)],
+    build_cid: &str,
+    sinks: &[&str],
+) -> (HashMap<String, Vec<OutputRow>>, Vec<DlqRow>) {
+    assert_strategy(yaml, strategy);
+    let config = parse_config(yaml).expect("pipeline parses");
     let readers: SourceReaders = HashMap::from([
         (
             "src_drv".to_string(),
@@ -245,9 +266,14 @@ fn run(
             )]),
         ),
     ]);
-    let buf = SharedBuffer::new();
-    let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
-        HashMap::from([("out".to_string(), Box::new(buf.clone()) as _)]);
+    let buffers: Vec<(String, SharedBuffer)> = sinks
+        .iter()
+        .map(|sink| (sink.to_string(), SharedBuffer::new()))
+        .collect();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = buffers
+        .iter()
+        .map(|(sink, buf)| (sink.clone(), Box::new(buf.clone()) as _))
+        .collect();
     let (report, rows) = dlq_sink::run_config_with_dlq(&config, readers, writers, &run_params())
         .unwrap_or_else(|error| panic!("[{}] pipeline runs: {error:?}", strategy.tag));
     assert_eq!(
@@ -256,7 +282,15 @@ fn run(
         "[{}] every dead letter is written as a row",
         strategy.tag
     );
-    let output = buf.as_string();
+    let out = buffers
+        .into_iter()
+        .map(|(sink, buf)| (sink, parse_output(&buf.as_string())))
+        .collect();
+    (out, rows)
+}
+
+/// A sink's CSV text as rows keyed by column name.
+fn parse_output(output: &str) -> Vec<OutputRow> {
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(true)
         .from_reader(output.as_bytes());
@@ -264,7 +298,7 @@ fn run(
         .headers()
         .map(|h| h.iter().map(str::to_owned).collect())
         .unwrap_or_default();
-    let out_rows = reader
+    reader
         .records()
         .map(|record| {
             let record = record.expect("output row parses");
@@ -274,8 +308,7 @@ fn run(
                 .zip(record.iter().map(str::to_owned))
                 .collect()
         })
-        .collect();
-    (out_rows, rows)
+        .collect()
 }
 
 fn id(row: &DlqRow) -> &str {
@@ -542,6 +575,68 @@ fn build_row_is_written_once_per_failing_driver_in_one_group() {
             trigger_id(&rows[3]),
             "[{tag}] the two build rows pair with different failures: {:?}",
             describe(&rows)
+        );
+    }
+}
+
+/// Every strategy under test, sort-merge included.
+fn all_strategies() -> impl Iterator<Item = &'static Strategy> {
+    STRATEGIES.iter().chain(std::iter::once(&SORT_MERGE))
+}
+
+/// A driver group and a build group whose value sorts after it, spelled for
+/// `strategy`'s `cid` type.
+fn driver_and_build_groups(strategy: &Strategy) -> (&'static str, &'static str) {
+    if strategy.sorted_on_key {
+        ("1", "2")
+    } else {
+        ("A", "B")
+    }
+}
+
+/// `max_group_buffer` counts a failure once. One failing and one succeeding
+/// driver share a group under a cap of 2: the failure and the succeeding
+/// driver's output are the group's two held entries. The build row held
+/// with the failure is part of that failure, not a third entry, so the
+/// group does not overflow and the succeeding driver's output is written as
+/// an ordinary `correlated` row, not a `group_size_exceeded` one.
+#[test]
+fn build_row_held_with_a_failure_is_not_a_second_group_entry() {
+    for strategy in all_strategies() {
+        let tag = strategy.tag;
+        let (group, build_group) = driver_and_build_groups(strategy);
+        let yaml = yaml_with(strategy, "\n  max_group_buffer: 2", "");
+        let (_, rows) = run_yaml(
+            &yaml,
+            strategy,
+            &[(1, group, 0), (2, group, 2)],
+            build_group,
+            &["out"],
+        );
+        let categories: Vec<Option<&str>> = rows.iter().map(DlqRow::category).collect();
+        assert!(
+            !categories.contains(&Some(DlqErrorCategory::GroupSizeExceeded.as_str())),
+            "[{tag}] the group holds two entries under a cap of 2 and does not overflow: {:?}",
+            describe(&rows)
+        );
+        assert_eq!(
+            rows.len(),
+            3,
+            "[{tag}] the failing driver, its build row, and the succeeding driver's \
+             condemned output: {:?}",
+            describe(&rows)
+        );
+        assert_driver_then_build(tag, &rows[0], &rows[1], 1);
+        assert_eq!(
+            rows[2].category(),
+            Some(DlqErrorCategory::Correlated.as_str()),
+            "[{tag}] the succeeding driver's output is condemned by the failure: {:?}",
+            describe(&rows)
+        );
+        assert_eq!(
+            trigger_id(&rows[2]),
+            id(&rows[0]),
+            "[{tag}] the condemned output pairs with the failing driver"
         );
     }
 }
