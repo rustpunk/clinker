@@ -160,10 +160,10 @@ envelope. Every materialized buffer can spill past the soft threshold,
 including buffers shared by several readers and Route/Cull output-port
 buffers. Readers run sequentially over the same immutable memory-or-spill
 backing; each opens one cursor, and the final reader takes the authoritative
-buffer regardless of declaration or dispatch order. A consumer that needs a
-full resident vector reserves that materialization first. If the overlap would
-exceed the hard limit, the engine fails before allocating with a structured
-`E310 MemoryBudgetExceeded` diagnostic that names the consumer.
+buffer regardless of declaration or dispatch order. A reader that needs every
+row in memory at once asks for that memory first. If it does not fit, the
+engine first spills other buffered rows; only when that frees nothing does it
+fail, before allocating, with `E310` naming the node.
 
 Use `clinker run --explain` to see which nodes will materialize
 (`buffer: materialized`) versus which will stream (`buffer: streaming`)

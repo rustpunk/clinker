@@ -22,11 +22,12 @@ against the configured RSS budget. Fused Source → Transform → Sink paths
 run streaming with no per-stage materialization; non-fused boundaries
 (Route fan-out, Merge fan-in, Composition bodies, diamond DAGs) materialize
 records into per-stage buffers that charge against the same envelope. The
-engine spills buffers to disk at 80% of the limit and fails fast with
-`E310 MemoryBudgetExceeded` at the hard limit, naming the offending
-producer. Blocking operators (Aggregate, sort, grace-hash Combine)
-accumulate state inside that same budget and **spill to disk** when soft
-and hard memory thresholds trip, rather than OOM-killing the process.
+engine spills buffers to disk at 80% of the limit. When a request would pass
+the limit it first spills and pauses what it can, and fails with `E310` only
+when nothing more can be freed, naming the node that needed the memory.
+Blocking operators (Aggregate, sort, grace-hash Combine) accumulate state
+inside that same budget and **spill to disk** when soft and hard memory
+thresholds trip, rather than OOM-killing the process.
 
 If you have used Flink, Kafka Streams, or Beam in unbounded mode: Clinker is
 not that. There are no watermarks against wall-clock time, no infinite-source

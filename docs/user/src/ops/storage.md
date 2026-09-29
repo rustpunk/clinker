@@ -602,15 +602,15 @@ side (matched source files copied to local disk before they are read).
 
 | Condition | Code | What happened | What to do |
 | --- | --- | --- | --- |
-| **Out of memory** | E310 | An operator's in-RAM state crossed the hard `memory.limit` (a true RSS overrun). | Raise `memory.limit`, reduce input, or let the operator spill. |
+| **Out of memory** | E310 | A memory request could not be granted: what the run holds filled `memory.limit`, and spilling what can spill and pausing Sources freed nothing. | Raise `memory.limit` to at least the floor the report prints, or shrink the state that cannot spill. |
 | **Spill cap exceeded** | E320 | Cumulative spill bytes crossed `storage.spill.disk_cap_bytes`. The volume may still have free space — you hit the configured budget. | Raise `disk_cap_bytes`, point `storage.spill.dir` at a larger volume, or reduce the spill footprint. |
 | **Spill volume full** | E321 | The OS reported the spill volume out of space (`ENOSPC`). The physical disk filled. | Free space on the volume, or move `storage.spill.dir` to a larger mount. |
 | **Spill directory unavailable** | (Spill) | The spill directory went bad mid-run — unmounted, remounted read-only, deleted by a cleaner, or permissions revoked. | Remount/restore the volume; stop the over-eager cleaner. |
 
 The key separations:
 
-- **E310 vs E320** — an OOM is an in-RAM overrun; a cap-exceeded is a
-  disk-budget stop. A run can hit E320 while comfortably inside its memory
+- **E310 vs E320** — E310 is a memory-limit refusal after spilling and
+  pausing freed nothing; a cap-exceeded is a disk-budget stop. A run can hit E320 while comfortably inside its memory
   envelope, so conflating the two would point you at the wrong knob.
 - **E320 vs E321** — E320 is the budget *you* set; E321 is the disk itself
   running dry. If you removed `disk_cap_bytes`, an over-large run would no

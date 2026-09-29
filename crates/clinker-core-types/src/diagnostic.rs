@@ -345,7 +345,7 @@ diagnostic_registry! {
     "E307", Error, "Combine input references undeclared upstream";
     "E308", Error, "Combine cxl body references unknown field";
     "E309", Error, "Combine output schema is empty";
-    "E310", Error, "Memory-budget surface exceeded the configured hard limit";
+    "E310", Error, "A memory request could not be granted after a reclaim round freed nothing";
     "E311", Error, "Combine `match: collect` has a non-empty `cxl:` body";
     "E312", Error, "Configured `memory.limit` is below the process baseline RSS";
     "E313", Error, "Combine `where:` has neither an equality nor a range conjunct";
