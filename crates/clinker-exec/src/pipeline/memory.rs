@@ -31,6 +31,7 @@ use arc_swap::ArcSwap;
 pub mod ledger;
 pub(crate) mod protocol;
 pub mod reservation;
+pub(crate) mod walk;
 
 /// The synchronization primitives the ledger core locks through, kept behind
 /// one path so the core can be compiled against a model checker's primitives
