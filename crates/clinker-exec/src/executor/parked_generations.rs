@@ -646,7 +646,6 @@ mod tests {
             CompressMode::Auto,
             1024,
         )));
-        set.borrow_mut().set_parked_generations(Rc::clone(&store));
         let _walk = WalkContextGuard::install(&arbitrator, Rc::clone(&set));
         let consumers_before = arbitrator.consumer_count();
 
@@ -763,7 +762,6 @@ mod tests {
             CompressMode::Auto,
             1024,
         )));
-        set.borrow_mut().set_parked_generations(Rc::clone(&store));
         let walk = WalkContextGuard::install(&arbitrator, set);
         ParkedWalk {
             arbitrator,
