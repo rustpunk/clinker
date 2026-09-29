@@ -545,10 +545,10 @@ fn recurse_into_body(
             // re-emit at the parent's call site; here we take records only.
             let (records, _puncts) = input.drain_split()?;
             if let Some(reservation) = reservation.as_ref() {
-                reservation.set_bytes(estimate_node_buffer_unaccounted_bytes(
-                    &records,
-                    &ctx.allocation_resources,
-                ));
+                reservation.resize(
+                    estimate_node_buffer_unaccounted_bytes(&records, &ctx.allocation_resources),
+                    parent_dag.graph[composition_idx].name(),
+                )?;
             }
             harvested.extend(records);
             if let Some(reservation) = reservation {
@@ -616,10 +616,10 @@ fn recurse_into_body(
                         parent_dag.graph[composition_idx].name(),
                     )?;
                 let rows = slot.drain_split()?.0;
-                reservation.set_bytes(estimate_node_buffer_unaccounted_bytes(
-                    &rows,
-                    &ctx.allocation_resources,
-                ));
+                reservation.resize(
+                    estimate_node_buffer_unaccounted_bytes(&rows, &ctx.allocation_resources),
+                    parent_dag.graph[composition_idx].name(),
+                )?;
                 harvest_reservations.push(reservation);
                 rows
             }

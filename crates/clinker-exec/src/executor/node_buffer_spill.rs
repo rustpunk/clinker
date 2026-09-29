@@ -1,9 +1,10 @@
 //! Producer-side spill helper for node-buffer slots in the walk reclaim set.
 //!
-//! When `MemoryArbitrator::should_spill()` trips at admission time, the
-//! producer flushes the in-memory `Vec<(Record, SourceRowId)>` to disk through
-//! `SpillWriter<SourceRowId>` and stores the resulting `(SpillFile<SourceRowId>, u64)`
-//! pair inside `NodeBuffer::Spilled`. Consumer-side streaming is
+//! When a slot's charge does not fit at its admission, even after a reclaim
+//! pass, or when the arbitrator's soft threshold is crossed at that
+//! admission, the producer flushes the in-memory `Vec<(Record, SourceRowId)>`
+//! to disk through `SpillWriter<SourceRowId>` and stores the resulting
+//! `(SpillFile<SourceRowId>, u64)` pair inside `NodeBuffer::Spilled`. Consumer-side streaming is
 //! already covered by [`NodeBuffer::drain`] (memory rows first, then
 //! per-spill rows via `SpillReader<SourceRowId>`), so this module exposes only
 //! the producer-side packaging.

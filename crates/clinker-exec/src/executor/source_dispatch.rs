@@ -289,10 +289,10 @@ where
                 }
             }
         }
-        reservation.set_bytes(estimate_node_buffer_unaccounted_bytes(
-            &out_records,
-            &ctx.allocation_resources,
-        ));
+        reservation.resize(
+            estimate_node_buffer_unaccounted_bytes(&out_records, &ctx.allocation_resources),
+            name.as_str(),
+        )?;
         (out_records, out_puncts, Some(reservation))
     } else if let Some(rx) = ctx.source_records.remove(name.as_str()) {
         // Live channel: consume per record so back-pressure

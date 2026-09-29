@@ -146,7 +146,7 @@ impl NodeBufferSlots {
     pub(crate) fn release_residue(mut self, arbitrator: &MemoryArbitrator) {
         drop(std::mem::take(&mut self.buffers));
         for (_, (id, handle)) in self.take_registrations() {
-            handle.set_bytes(0);
+            handle.shrink(handle.bytes());
             arbitrator.unregister_consumer(id);
         }
     }

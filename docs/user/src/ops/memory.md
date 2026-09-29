@@ -124,10 +124,10 @@ When memory use approaches the limit (the soft threshold is 80 % of `limit`), so
 
 Under `pause` (and `both`), a producer paused because memory crossed the soft threshold is **resumed automatically once memory recedes** — it is never left parked. Pause and resume use two watermarks to avoid flapping (a *hysteresis band*):
 
-- **Pause** when live memory rises above the **soft threshold**, `0.80 × limit`.
-- **Resume** when live memory falls back below the lower **resume watermark**, `resume_threshold × limit` (default `0.70 × limit`).
+- **Pause** when the memory charged to the run's state rises above the **soft threshold**, `0.80 × limit`.
+- **Resume** when it falls back below the lower **resume watermark**, `resume_threshold × limit` (default `0.70 × limit`).
 
-Between the two watermarks nothing changes, so a normal batch-to-batch swing in memory cannot make a producer flap between paused and resumed on every poll.
+Both decisions read the bytes the engine has charged for the records and buffers the run holds, not the process's total memory, so memory the process holds for other reasons never pauses a reader. Between the two watermarks nothing changes, so a normal batch-to-batch swing in memory cannot make a producer flap between paused and resumed on every poll.
 
 A paused reader also never blocks the run. When the engine reaches a stage that needs a paused reader's records, it first sheds reclaimable downstream state to disk and then resumes the reader and proceeds — so `pause` throttles producers under pressure but degrades to spill-and-continue at the point it would otherwise wait, rather than stalling.
 

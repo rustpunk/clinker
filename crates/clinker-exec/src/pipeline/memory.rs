@@ -1501,7 +1501,7 @@ impl MemoryArbitrator {
 
     /// Resume watermark in absolute bytes: the low edge of the
     /// pause/resume hysteresis band. A producer paused under memory
-    /// pressure resumes once `current_pressure()` recedes below this.
+    /// pressure resumes once the charged total recedes below this.
     /// Equals `limit * resume_threshold_pct` (default 0.70·limit).
     pub fn resume_limit(&self) -> u64 {
         (self.limit.load(Ordering::Relaxed) as f64 * self.resume_threshold_pct) as u64
@@ -2110,14 +2110,15 @@ impl MemoryArbitrator {
         }
         let victim = self.policy.select_victim(&snapshot, pressure);
         // Spill arm only. Pausing a back-pressureable producer is owned by
-        // `reconcile_backpressure` (current pressure + hysteresis), so here
+        // `reconcile_backpressure` (charged bytes + hysteresis), so here
         // the elected victim is asked to spill only when it is
         // non-back-pressureable. The policy may still elect a
         // back-pressureable consumer (`BackPressurePreferred` prefers one) —
         // in that case no one spills, preserving the pause-over-spill
         // posture the `pause`/`both` knobs mean, exactly as before this
         // split (the pause it used to issue here now happens in
-        // `reconcile_backpressure` on the sound current-pressure signal).
+        // `reconcile_backpressure` on the charged total, which falls as state
+        // is released).
         // The action routes through the shared `&` the snapshot provides;
         // every consumer mutates through atomics behind a shared handle, so
         // no exclusive access is needed.
@@ -2130,9 +2131,10 @@ impl MemoryArbitrator {
         victim
     }
 
-    /// Pause/resume back-pressureable producers against CURRENT pressure
-    /// with a hysteresis band — the resume controller. Runs on the walk
-    /// thread inside `should_spill`'s tripped branch.
+    /// Pause/resume back-pressureable producers against the bytes charged
+    /// to the ledger now, with a hysteresis band — the resume controller.
+    /// Runs on the walk thread inside `should_spill`'s tripped branch. It
+    /// only pauses and resumes; it never spills.
     ///
     /// - Above the soft limit: pause the first back-pressureable consumer
     ///   the walk is NOT currently draining. Skipping an `is_active`
@@ -2147,21 +2149,23 @@ impl MemoryArbitrator {
     ///   a single admit/discharge swing cannot cross both thresholds and
     ///   thrash pause/resume every poll.
     ///
-    /// Reads CURRENT pressure, never the monotonic `peak_rss`: `peak_rss`
-    /// only rises, so a resume keyed on it could never fire. The spill arm
-    /// (`poll_arbitration`) keeps its peak-based trip — spilling is
-    /// monotone-safe and never deadlocks. Iterates the small lock-free
-    /// consumer snapshot and mutates only shared atomics, so it stays cheap
-    /// inside the already-guarded tripped branch.
+    /// Reads the charged bytes, never a reading of the process's memory:
+    /// the charged total falls as state is released, which a resume
+    /// decision needs, and it moves only with what the run itself holds, so
+    /// memory the process holds for other reasons never pauses a Source.
+    /// The spill arm (`poll_arbitration`) keeps its peak-based trip —
+    /// spilling is monotone-safe and never deadlocks. Iterates the small
+    /// lock-free consumer snapshot and mutates only shared atomics, so it
+    /// stays cheap inside the already-guarded tripped branch.
     ///
     /// A no-op under a non-pausing policy (`spill` / bare `Priority`), so a
     /// `spill`-knob run never parks a producer — its pressure is shed
     /// entirely through `poll_arbitration`'s spill arm.
-    fn reconcile_backpressure(&self) {
+    pub(crate) fn reconcile_backpressure(&self) {
         if !self.policy.prefers_backpressure() {
             return;
         }
-        let cur = self.current_pressure();
+        let cur = self.charged_bytes();
         let soft = self.soft_limit();
         let consumers = self.consumers.load();
         if cur > soft {

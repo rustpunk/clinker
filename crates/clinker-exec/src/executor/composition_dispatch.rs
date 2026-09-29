@@ -323,12 +323,13 @@ fn collect_port_records(
             )?,
         };
         let (records, _puncts) = input.drain_split()?;
-        reservation.set_bytes(
+        reservation.resize(
             crate::executor::dispatch::estimate_node_buffer_unaccounted_bytes(
                 &records,
                 &ctx.allocation_resources,
             ),
-        );
+            composition_name,
+        )?;
         // Two parallel edges to the same port (e.g. `inputs: { p: a,
         // p: a }` — currently rejected at parse, but the runtime is
         // defensive) would overwrite; the wiring pass guarantees

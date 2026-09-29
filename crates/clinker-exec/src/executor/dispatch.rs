@@ -2670,8 +2670,8 @@ pub(crate) fn estimate_node_buffer_unaccounted_bytes(
     })
 }
 
-/// Predicate: does this materialized slot permit a soft-threshold spill at
-/// admission time?
+/// Predicate: may this materialized slot spill, at its admission or when a
+/// reclaim pass elects it?
 ///
 /// Every materialized slot is eligible. Fan-out readers use sequential
 /// re-readable cursors over immutable memory/spill backing, and producer-port
@@ -2684,26 +2684,6 @@ pub(crate) fn node_buffer_spill_allowed(
     true
 }
 
-/// Admit `rows` into a node-buffer slot of the walk reclaim set, choosing
-/// between the in-memory and on-disk variants based on the live RSS reading.
-///
-/// 1. Empty input returns `NodeBuffer::Memory(Vec::new())`.
-/// 2. The slot's byte estimate seeds a fresh `NodeBufferConsumer`
-///    handle and the arbitrator registers the wrapper. Pull-mode
-///    attribution flows through the handle; the arbitrator's
-///    `should_abort` poll guards the pipeline-wide hard limit.
-/// 3. When `spill_allowed` is `true` and `MemoryArbitrator::should_spill()`
-///    reports the RSS soft threshold tripped, the rows flush to a
-///    `SpillFile<crate::executor::stream_event::SourceRowId>` via [`node_buffer_spill::spill_node_buffer`].
-///    The in-memory charge is discharged immediately and the file size
-///    is added to `cumulative_spill_bytes`; an over-quota disk total
-///    surfaces `PipelineError::SpillCapExceeded` (E320) — a disk-cap
-///    surface deliberately distinct from the memory-budget E310 so a
-///    spilled-out volume never reads as an out-of-memory failure.
-/// 4. Otherwise rows stay in memory as `NodeBuffer::Memory(rows)`.
-///
-/// `spill_allowed` should be computed via [`node_buffer_spill_allowed`]
-/// for the slot's `NodeIndex`; all materialized slots currently qualify.
 /// Discard a `node_buffers` slot and all paired accounting state.
 ///
 /// This is a cleanup/replacement primitive, not a logical read: semantic
@@ -3248,11 +3228,17 @@ impl NodeBufferAdmission {
         drop(self.prior.take());
     }
     /// Charge `bytes` to `handle`, the slot that now owns these rows, taking
-    /// them over from the prior owner in one step when there is one.
-    fn charge_to(&mut self, handle: &crate::pipeline::memory::ConsumerHandle, bytes: u64) {
+    /// them over from the prior owner in one step when there is one. Rows
+    /// with no prior owner are new resident bytes: their charge grows the
+    /// handle through the ledger, which on the walk reclaims first, and
+    /// `false` means it still did not fit and nothing was charged.
+    fn charge_to(&mut self, handle: &crate::pipeline::memory::ConsumerHandle, bytes: u64) -> bool {
         match self.prior.take() {
-            Some(prior) => prior.hand_over(handle, bytes),
-            None => handle.add_bytes(bytes),
+            Some(prior) => {
+                prior.hand_over(handle, bytes);
+                true
+            }
+            None => handle.try_grow(bytes).is_ok(),
         }
     }
 }
@@ -3335,7 +3321,7 @@ fn admit_owned_node_buffer_with_readers(
                 slots.remove_registration(&slot_key)
             };
             if let Some((id, handle)) = registration {
-                handle.set_bytes(0);
+                handle.shrink(handle.bytes());
                 ctx.memory_budget.unregister_consumer(id);
             }
             Err(error)
@@ -3429,7 +3415,7 @@ pub(crate) fn admit_node_buffer_transferred(
                 slots.remove_registration(&slot_key)
             };
             if let Some((id, handle)) = registration {
-                handle.set_bytes(0);
+                handle.shrink(handle.bytes());
                 ctx.memory_budget.unregister_consumer(id);
             }
             Err(error)
@@ -3576,6 +3562,26 @@ fn planned_materialized_reader_count(
     Ok(ctx.planned_node_buffer_readers.count(key))
 }
 
+/// Admit `rows` into a node-buffer slot of the walk reclaim set: in memory
+/// when its charge fits and the arbitrator's soft threshold is not crossed,
+/// on disk otherwise.
+///
+/// A fresh `NodeBufferConsumer` registers for the slot (or a composition
+/// port's transferred reservation becomes one) and the slot's charge (the
+/// rows' residue; their values are charged where they were allocated) is
+/// grown through its handle. On the walk that growth first runs a reclaim
+/// pass, which may spill other resident slots; the admitted slot is the
+/// requester, so it is elected last and holds nothing yet.
+///
+/// The rows are spilled here, at their admission, when even then the charge
+/// does not fit, or while the soft threshold is crossed
+/// (`MemoryArbitrator::should_spill`, whose tripped branch also pauses and
+/// resumes Sources on the charged total). They go to one `SpillFile`
+/// through [`node_buffer_spill::spill_node_buffer`], releasing the values
+/// they hold, and the file is charged to the disk quota; an over-quota total
+/// surfaces `PipelineError::SpillCapExceeded` (E320), a disk-cap error kept
+/// distinct from the memory E310. A slot is never refused for memory: every
+/// published slot may spill.
 fn admit_node_buffer_inner(
     ctx: &mut ExecutorContext<'_>,
     node_name: &str,
@@ -3611,7 +3617,7 @@ fn admit_node_buffer_inner(
     // discharge — e.g. the post-recompute aggregate emit path)
     // unregisters first so the arbitrator's registry holds exactly
     // one wrapper per live slot.
-    let (consumer_id, handle) = if let Some(reservation) = transferred_reservation {
+    let (consumer_id, handle, admitted) = if let Some(reservation) = transferred_reservation {
         let (consumer_id, handle) = reservation.into_registration();
         let replacement = Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
             handle.clone(),
@@ -3625,7 +3631,7 @@ fn admit_node_buffer_inner(
             // the id on this invariant failure. `unregister_consumer` is safe
             // even when the missing-id result reflects a concurrently removed
             // final snapshot.
-            handle.set_bytes(0);
+            handle.shrink(handle.bytes());
             ctx.memory_budget.unregister_consumer(consumer_id);
             return Err(PipelineError::Internal {
                 op: "executor",
@@ -3634,7 +3640,8 @@ fn admit_node_buffer_inner(
                     .to_string(),
             });
         }
-        (consumer_id, handle)
+        // The reservation already holds the slot's bytes charged.
+        (consumer_id, handle, true)
     } else {
         let previous = ctx
             .walk_reclaim
@@ -3659,8 +3666,8 @@ fn admit_node_buffer_inner(
             handle.clone(),
             label,
         );
-        owned.charge_to(&handle, bytes);
-        (consumer_id, handle)
+        let admitted = owned.charge_to(&handle, bytes);
+        (consumer_id, handle, admitted)
     };
     ctx.walk_reclaim.borrow_mut().slots_mut().register(
         slot_key,
@@ -3668,14 +3675,17 @@ fn admit_node_buffer_inner(
         slot_spill,
     );
     // Establish the NodeBuffer owner first, then release any prior producer
-    // portion still held before any local pressure poll.
+    // portion still held before the pressure poll.
     owned.release_prior();
     let NodeBufferAdmission { rows, puncts, .. } = owned;
     debug_assert!(
         spill_allowed,
         "every published materialized node-buffer slot must be spill-eligible"
     );
-    if !ctx.memory_budget.should_spill() {
+    // Polled whether or not the charge fit: its tripped branch is also where
+    // Sources pause and resume on the charged total.
+    let soft_threshold_crossed = ctx.memory_budget.should_spill();
+    if admitted && !soft_threshold_crossed {
         return Ok(NodeBuffer::memory_from_records_and_puncts(rows, puncts));
     }
     // Resolve the spill compression mode against this slot's schema width and
@@ -3699,7 +3709,7 @@ fn admit_node_buffer_inner(
             // is zero. The handle reflects the operator's live state
             // for the arbitrator's pull-mode `current_usage` —
             // Velox's "reclaimable ≠ held" point.
-            handle.set_bytes(0);
+            handle.shrink(handle.bytes());
             let file_bytes = std::fs::metadata(file.path()).map(|m| m.len()).unwrap_or(0);
             if ctx.memory_budget.record_spill_bytes(node_name, file_bytes) {
                 return Err(PipelineError::spill_cap_exceeded(
@@ -5001,10 +5011,11 @@ pub(crate) fn transform_fused_consume(
 /// Service any pending node-buffer spill requests before dispatching the
 /// next node.
 ///
-/// When [`MemoryArbitrator::should_spill`] trips at an admission boundary it
-/// elects a victim and, for a non-back-pressureable consumer, calls
-/// `try_spill`, which only flips the slot's [`ConsumerHandle`] spill-request
-/// flag — it performs no I/O. This sweep is the missing servicing half: it
+/// A spill request reaches a slot when an operator's `should_spill` poll
+/// elects it (`try_spill`), when `spill_reclaimable` sheds state before a
+/// paused Source resumes, or when a reclaim pass finds the slot held by the
+/// running arm; each only flips the slot's [`ConsumerHandle`] spill-request
+/// flag and performs no I/O. This sweep is the servicing half: it
 /// reads each live slot's flag via `take_spill_request` and, for a resident
 /// resident `NodeBuffer::Memory` slot whose compiled classification permits
 /// spilling ([`node_buffer_spill_allowed`]), flushes it to
@@ -5015,8 +5026,8 @@ pub(crate) fn transform_fused_consume(
 ///
 /// Thin `ExecutorContext` adapter over [`service_pending_node_buffer_spills`],
 /// which holds the testable core (the full context is impractical to build
-/// for a unit test, and the RSS-vs-charged interplay makes the false→true
-/// `should_spill` transition non-deterministic through a live run).
+/// for a unit test, and whether a live run raises a request between two
+/// admissions depends on the other operators' polls).
 fn service_node_buffer_spill_requests(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
@@ -5086,9 +5097,8 @@ pub(crate) struct NodeBufferSpillSweep<'a> {
 /// consumer registry, the arbitrator, the run's spill settings, and the
 /// `is_spill_allowed` / `node_name` resolvers the caller derives from the live
 /// DAG. Splitting it out lets a white-box test drive the resident-slot spill
-/// path deterministically — a live pipeline run cannot, because the RSS-vs-
-/// charged arms of `should_spill` cannot be made to transition false→true
-/// between two admissions with real record footprints.
+/// path deterministically, raising the request itself rather than depending
+/// on another operator's poll to raise it between two admissions.
 pub(crate) fn service_pending_node_buffer_spills(
     node_buffers: &mut HashMap<NodeBufferKey, NodeBuffer>,
     sweep: &NodeBufferSpillSweep<'_>,

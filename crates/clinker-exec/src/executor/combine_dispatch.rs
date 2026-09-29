@@ -2941,7 +2941,6 @@ fn adopt_spilled_runs_into_node_buffer(
     // Register the slot's node-buffer consumer at zero resident bytes so its
     // later drain unregisters through the same path `admit_node_buffer` sets up.
     let handle = crate::pipeline::memory::ConsumerHandle::new();
-    handle.set_bytes(0);
     let label = ctx.planned_node_buffer_readers.slot_label(
         combine_name,
         &node_idx.into(),
@@ -2970,7 +2969,7 @@ fn adopt_spilled_runs_into_node_buffer(
             .slots_mut()
             .remove_registration(&slot_key);
         if let Some((id, handle)) = registration {
-            handle.set_bytes(0);
+            handle.shrink(handle.bytes());
             ctx.memory_budget.unregister_consumer(id);
         }
         return Err(error);

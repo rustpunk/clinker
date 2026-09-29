@@ -818,17 +818,18 @@ impl TransientNodeBufferReservation {
             .map_err(|shortfall| node_buffer_shortfall_error(node, &shortfall))
     }
 
-    /// Replace the reservation's reported bytes after a representation
-    /// transition has completed.
-    pub(crate) fn set_bytes(&self, bytes: u64) {
-        self.handle.set_bytes(bytes);
-    }
-
     /// Restate the reservation's bytes after a representation transition
-    /// has completed.
-    pub(crate) fn resize(&self, bytes: u64, _node: &str) -> Result<(), PipelineError> {
-        self.handle.set_bytes(bytes);
-        Ok(())
+    /// has completed: a fall is a release; a rise is a growth, checked (and
+    /// on the walk reclaimed for) as [`Self::reserve_additional`] checks it,
+    /// failing with E310 naming `node`.
+    pub(crate) fn resize(&self, bytes: u64, node: &str) -> Result<(), PipelineError> {
+        if self.budget.hard_limit() == 0 {
+            self.handle.set_bytes(bytes);
+            return Ok(());
+        }
+        self.handle
+            .try_resize(bytes)
+            .map_err(|shortfall| node_buffer_shortfall_error(node, &shortfall))
     }
 
     /// Current bytes held by this reservation.
@@ -838,19 +839,18 @@ impl TransientNodeBufferReservation {
 
     /// Move already-charged sibling reservations onto this registration.
     ///
-    /// No allocation happens here. The sibling handles are zeroed before this
-    /// handle grows, so the arbitrator never observes a transient duplicate
-    /// charge while several harvested vectors become one node-buffer slot.
+    /// No allocation happens here. Each sibling's bytes move onto this
+    /// handle in one ledger step, so the arbitrator never observes a
+    /// transient duplicate charge, or a gap, while several harvested vectors
+    /// become one node-buffer slot.
     pub(crate) fn absorb_charges(&self, others: Vec<Self>) {
         let charged_before = self.budget.charged_bytes();
-        let mut combined = self.bytes();
         for other in &others {
             debug_assert!(std::sync::Arc::ptr_eq(&self.budget, &other.budget));
-            combined = combined.saturating_add(other.bytes());
-            other.set_bytes(0);
+            let moved = other.bytes();
+            self.handle.take_over(&other.handle, moved, moved);
         }
         drop(others);
-        self.set_bytes(combined);
         debug_assert_eq!(
             self.budget.charged_bytes(),
             charged_before,
@@ -873,7 +873,7 @@ impl TransientNodeBufferReservation {
 impl Drop for TransientNodeBufferReservation {
     fn drop(&mut self) {
         if self.owns_registration {
-            self.handle.set_bytes(0);
+            self.handle.shrink(self.handle.bytes());
             self.budget.unregister_consumer(self.consumer_id);
         }
     }
