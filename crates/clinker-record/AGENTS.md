@@ -57,9 +57,10 @@ Current normal dependencies are intentional: `serde`, `serde_json`, `chrono`,
 `triomphe`; do not expose its raw owners or add other shared-owner operations.
 
 Current dev/bench dependencies are expected only for tests and benches:
-`criterion`, `clinker-bench-support`, `postcard`, and the exact `bitrep`
-pin, which is only the test oracle for `accumulator::ExactSum` and must never
-become a normal dependency.
+`criterion`, `clinker-bench-support`, `postcard`, the exact `bitrep` pin,
+which is only the test oracle for `accumulator::ExactSum`, and the exact
+`num-bigint` pin, which is only the test oracle for
+`accumulator::ExactDecimalSum`. Neither may ever become a normal dependency.
 
 ### Forbidden or suspicious dependencies
 
@@ -82,6 +83,7 @@ become a normal dependency.
 - `FieldMetadata` marks engine-stamped columns; default user-field iteration skips stamped columns.
 - Group keys are the value order's ties: integers key exactly (no float widening), equal numbers of different types are one key, every NaN is one key, and null is caller-controlled. `GroupByKey` equality, hashing and `encode_tie_bytes` must stay in step with `order`.
 - Accumulator finalize must surface overflow via `AccumulatorError`, not wrapping casts.
+- `sum`, `avg` and `weighted_avg` give the exact value of their definition over the group, rounded once, or a typed `AccumulatorError`; null only for a group with no non-null input. Their domain comes from the one count-derived `NumericDomain`, matched exhaustively; a decimal is never added to a float. Exact sums keep their state behind one lazily allocated pointer and report it through the `add` deltas and `heap_size`.
 - Crate-local guidance is most relevant for broad changes to `Value`, `Record`, schema, provenance, document context, storage, accumulator, or counter semantics.
 
 ## Common mistakes for AI agents to avoid

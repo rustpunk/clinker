@@ -120,6 +120,19 @@ roaring = "0.11"
 # optional dependency, so it adds exactly one package to the lock. Approved
 # by the maintainer on 2026-09-26.
 bitrep = { version = "=0.5.1", default-features = false }
+# An exact arbitrary-precision integer, used only as a test oracle:
+# clinker-record's tests check the in-repo `ExactDecimalSum` (exact decimal
+# `sum`/`avg`/`weighted_avg`) against a `BigInt` total with an independently
+# written half-even reduction, folded, split-and-merged and with an addend
+# subtracted. A dev-dependency of clinker-record and nothing else; it never
+# reaches a runtime build. Chosen over `bigdecimal` (a heavier graph, with
+# `libm` and an `autocfg` build script) and over no oracle (which would leave
+# the hand-rolled decimal accumulator checked only by its own fixed cases).
+# Maintained by the rust-num organization; MIT OR Apache-2.0, no build script;
+# `default-features = false` drops `std`, and it adds `num-bigint` and
+# `num-integer` to the lock (`num-traits` is already there). Approved by the
+# maintainer on 2026-09-29.
+num-bigint = { version = "=0.5.1", default-features = false }
 criterion = { version = "0.5", features = ["html_reports"] }
 serial_test = "3"
 petgraph = "0.8"

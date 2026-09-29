@@ -1095,6 +1095,94 @@ nodes:
     }
 
     #[test]
+    fn avg_and_weighted_avg_equal_their_scalar_spelling() {
+        // `avg(x)` is `sum(x) / count(x)` and `weighted_avg(v, w)` is
+        // `sum(v * w) / sum(w)`: each exact sum rounded once, then the scalar
+        // `/`. Over quotient-scale decimals, whose sums need rounding, and over
+        // floats, the aggregate and its spelling print the same text, decimal
+        // scale included. No row is null, and no group mixes a decimal with a
+        // float.
+        let input = make_schema(&["k", "q", "w", "f", "g"]);
+        let mut agg = build_aggregator(
+            &[
+                ("k", Type::String),
+                ("q", Type::Decimal),
+                ("w", Type::Decimal),
+                ("f", Type::Float),
+                ("g", Type::Float),
+            ],
+            &["k"],
+            "emit k = k\n\
+             emit avg_q = avg(q)\n\
+             emit spelled_avg_q = sum(q) / count(*)\n\
+             emit wavg_q = weighted_avg(q, w)\n\
+             emit spelled_wavg_q = sum(q * w) / sum(w)\n\
+             emit avg_f = avg(f)\n\
+             emit spelled_avg_f = sum(f) / count(*)\n\
+             emit wavg_f = weighted_avg(f, g)\n\
+             emit spelled_wavg_f = sum(f * g) / sum(g)",
+            "scalar_spelling",
+            64 * 1024 * 1024,
+            None,
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        // A fixed linear congruential sequence, so the fixture is the same on
+        // every run.
+        let mut seed = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            seed >> 33
+        };
+        let mut row = 0_u64;
+        for group in 0..50 {
+            for _ in 0..20 {
+                let amount = Decimal::new((next() % 100_000_000) as i64, 2);
+                let qty = Decimal::from(1 + next() % 12);
+                let q = amount.checked_div(qty).expect("a quotient in range");
+                let w = Decimal::new(1 + (next() % 500) as i64, 1);
+                let f = (next() % 1_000_000) as f64 / 7.0;
+                let g = 0.5 + (next() % 64) as f64 / 3.0;
+                let r = make_record(
+                    &input,
+                    vec![
+                        Value::String(format!("g{group}").into()),
+                        Value::Decimal(q),
+                        Value::Decimal(w),
+                        Value::Float(f),
+                        Value::Float(g),
+                    ],
+                );
+                agg.add_record(&r, row, &ctx_for(&stable, &file, row))
+                    .unwrap();
+                row += 1;
+            }
+        }
+        let ctx = ctx_for(&stable, &file, 0);
+        let mut out: Vec<crate::aggregation::SortRow> = Vec::new();
+        agg.finalize(&ctx, &mut out).expect("finalize");
+        assert_eq!(out.len(), 50, "fifty groups");
+        let text = |value: &Value| match value {
+            Value::Decimal(d) => format!("decimal {d}"),
+            Value::Float(f) => format!("float {:#x}", f.to_bits()),
+            other => panic!("expected a number, got {other:?}"),
+        };
+        for (rec, _) in &out {
+            let values = rec.values();
+            for (aggregate, spelled) in [(1, 2), (3, 4), (5, 6), (7, 8)] {
+                assert_eq!(
+                    text(&values[aggregate]),
+                    text(&values[spelled]),
+                    "group {}: column {aggregate} against its spelling",
+                    values[0]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_group_by_decimal_sum_e2e() {
         // Per-group exact decimal totals.
         let input = make_schema(&["k", "amount"]);
@@ -1176,8 +1264,9 @@ nodes:
     #[test]
     fn test_spilled_decimal_group_by_preserves_exactness_and_identity_e2e() {
         // Force a spill and confirm two things survive the spill-merge:
-        //   (1) per-group decimal sums are exact (postcard+LZ4 serde of
-        //       `decimal_sum` round-trips the 16-byte form), and
+        //   (1) per-group decimal sums are exact (postcard+LZ4 serde of the
+        //       exact decimal sum round-trips its limbs and per-scale
+        //       counts), and
         //   (2) decimal group identity is scale-normalized — `2.50` and `2.5`
         //       collapse into ONE group both in memory and through the exact,
         //       order-preserving spilled group-sort key.

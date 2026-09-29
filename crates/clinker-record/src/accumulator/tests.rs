@@ -865,11 +865,13 @@ fn integer_promotion_does_not_depend_on_where_the_first_float_arrives() {
 
 #[test]
 fn accumulator_enum_inline_size_does_not_grow() {
-    // 112 bytes before float sums were exact: the largest variant,
-    // `WeightedAvgState`, held two `i128`s, four `f64`s, two 16-byte
-    // `Decimal`s and four `bool`s (100 bytes, rounded up to the `i128`'s
-    // 16-byte alignment), and the enum's tag fits in a `bool`'s spare values.
-    // An exact float sum is one pointer inline, so no variant grew.
+    // 112 bytes before sums were exact. The largest variant is now
+    // `WeightedAvgState`, 104 bytes: two 24-byte integer totals, four exact
+    // sums of one pointer each and three `u64` counts. The enum adds its tag
+    // in an 8-byte word (no variant has a spare niche), and `SumState`'s
+    // `i128` keeps the enum 16-byte aligned: 112. The exact float and decimal
+    // sums keep their state behind that pointer, allocated at their first
+    // addend, so exactness grew no variant.
     assert!(
         std::mem::size_of::<AccumulatorEnum>() <= 112,
         "AccumulatorEnum is {} bytes",
@@ -1980,7 +1982,7 @@ fn dec_text(text: &str) -> Value {
 /// to 12), the shape of `sum(amount / qty)`: most quotients carry 28
 /// significant digits, so a total rounds at almost every step of a fold.
 fn quotient_groups(groups: usize) -> Vec<Vec<Value>> {
-    let mut rng = SplitMix(0xDEC1_3A1);
+    let mut rng = SplitMix(0x0DEC_13A1);
     (0..groups)
         .map(|_| {
             (0..20)
@@ -2196,5 +2198,113 @@ fn weighted_avg_integer_totals_do_not_wrap() {
                 assert_identical(&ab.finalize().unwrap(), &expected, "split");
             }
         }
+    }
+}
+
+#[test]
+fn exact_decimal_sum_reports_its_one_allocation() {
+    // Four limbs and 29 per-scale counts.
+    const BYTES: usize = 264;
+    let mut exact = ExactDecimalSum::new();
+    assert!(exact.is_empty());
+    assert_eq!(exact.heap_size(), 0);
+    assert_eq!(exact.add_decimal("1.5".parse().unwrap()), BYTES);
+    assert_eq!(exact.add_decimal("2.25".parse().unwrap()), 0);
+    assert_eq!(exact.heap_size(), BYTES);
+    assert_eq!(exact.count(), 2);
+    assert_eq!(exact.sub_decimal("1.5".parse().unwrap()), 0);
+    assert_eq!(
+        exact.sub_decimal("2.25".parse().unwrap()),
+        -(BYTES as isize)
+    );
+    assert!(exact.is_empty());
+    assert_eq!(exact.heap_size(), 0);
+
+    // Through the accumulators: a Sum's first decimal allocates one exact
+    // sum; a weighted_avg's first decimal row allocates two (products and
+    // weights), and its last retraction frees both.
+    let mut s = sum();
+    assert_eq!(s.add(&dec(15, 1)), BYTES);
+    assert_eq!(s.add(&dec(25, 1)), 0);
+    let base = std::mem::size_of::<AccumulatorEnum>();
+    assert_eq!(s.heap_size(), base + BYTES);
+    let mut a = avg();
+    assert_eq!(a.add(&dec(15, 1)), BYTES);
+    assert_eq!(a.sub(&dec(15, 1)), -(BYTES as isize));
+    assert_eq!(a.heap_size(), base);
+    let mut w = weighted_avg();
+    assert_eq!(w.add_weighted(&dec(15, 1), &Value::Integer(2)), 2 * BYTES);
+    assert_eq!(w.add_weighted(&dec(5, 1), &Value::Integer(1)), 0);
+    assert_eq!(w.heap_size(), base + 2 * BYTES);
+    assert_eq!(w.sub_weighted(&dec(5, 1), &Value::Integer(1)), 0);
+    assert_eq!(
+        w.sub_weighted(&dec(15, 1), &Value::Integer(2)),
+        -2 * BYTES as isize
+    );
+    assert_eq!(w, weighted_avg());
+    // A merge that gives an empty state its first decimals allocates, and
+    // shows in `heap_size`.
+    let mut merged = sum();
+    merged.merge(&s);
+    assert_eq!(merged.heap_size(), base + BYTES);
+}
+
+#[test]
+fn exact_decimal_sum_state_roundtrips_through_postcard() {
+    let mut s = sum();
+    add_all(
+        &mut s,
+        &[
+            dec_text("79228162514264337593543950335"),
+            dec_text("-0.0000000000000000000000000001"),
+            Value::Integer(-7),
+            dec_text("1.50"),
+            dec_text("0.000"),
+        ],
+    );
+    let mut w = weighted_avg();
+    w.add_weighted(&dec_text("1.25"), &Value::Integer(3));
+    w.add_weighted(&big_dec(7, 28), &Value::Integer(2));
+    w.add_weighted(&Value::Integer(i64::MIN), &Value::Integer(i64::MIN));
+    w.add_weighted(&dec_text("2.5"), &Value::Float(1.0));
+    for state in [s, w] {
+        let result = state.finalize();
+        let restored: AccumulatorEnum =
+            postcard::from_bytes(&postcard::to_stdvec(&state).unwrap()).unwrap();
+        assert_eq!(restored, state, "postcard");
+        assert_eq!(restored.finalize(), result, "postcard");
+        let restored: AccumulatorEnum =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(restored, state, "serde_json");
+        assert_eq!(restored.finalize(), result, "serde_json");
+    }
+
+    // A limb or count array of the wrong length is refused.
+    let exact = {
+        let mut exact = ExactDecimalSum::new();
+        exact.add_decimal("1.5".parse().unwrap());
+        exact
+    };
+    let json = serde_json::to_value(&exact).expect("serialize");
+    assert_eq!(
+        serde_json::from_value::<ExactDecimalSum>(json.clone()).expect("deserialize"),
+        exact
+    );
+    for field in ["limbs", "scale_counts"] {
+        let mut short = json.clone();
+        short[field].as_array_mut().expect("a sequence").pop();
+        assert!(
+            serde_json::from_value::<ExactDecimalSum>(short).is_err(),
+            "a short {field} array"
+        );
+        let mut long = json.clone();
+        long[field]
+            .as_array_mut()
+            .expect("a sequence")
+            .push(serde_json::json!(0));
+        assert!(
+            serde_json::from_value::<ExactDecimalSum>(long).is_err(),
+            "a long {field} array"
+        );
     }
 }

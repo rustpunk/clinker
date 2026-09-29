@@ -16,12 +16,16 @@
 //! This is the fixed-point exact accumulator of the exact-summation
 //! literature, implemented here because a partial sum must also serialize
 //! into a spill run and subtract exactly for retraction, which the maintained
-//! float-summation crates do not offer together. `tests/exact_sum_oracle.rs`
+//! float-summation crates do not offer together. The carry arithmetic is the
+//! shared limb primitive (`limbs`); this module adds only the base-2
+//! decomposition of a float and the one rounding. `tests/exact_sum_oracle.rs`
 //! checks it bit for bit against an independent implementation, a
 //! dev-dependency only, on fixed ill-conditioned cases and on generated
 //! sequences, folded, merged and with an addend subtracted.
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
+
+use super::limbs;
 
 /// Limbs of the fixed-point integer. Bit 0 weighs 2^-1074 and the top bit is
 /// the sign. A finite float's magnitude is below 2^1024, which is 2^2098
@@ -62,7 +66,7 @@ pub struct ExactSum {
 struct Parts {
     /// The sum of the finite addends in 2^-1074 units, two's complement,
     /// least significant limb first.
-    #[serde(with = "limbs_serde")]
+    #[serde(with = "limbs::serde_seq")]
     limbs: [u64; LIMBS],
     /// Float addends of every kind, including zeros, NaN and infinities. The
     /// allocation is freed when this returns to zero.
@@ -124,21 +128,15 @@ impl Parts {
             let (mantissa, offset) = decompose(x);
             let subtract = x.is_sign_negative() != (direction == Direction::Subtract);
             if subtract {
-                sub_shifted(&mut self.limbs, u128::from(mantissa), offset);
+                limbs::sub_shifted(&mut self.limbs, u128::from(mantissa), offset);
             } else {
-                add_shifted(&mut self.limbs, u128::from(mantissa), offset);
+                limbs::add_shifted(&mut self.limbs, u128::from(mantissa), offset);
             }
         }
     }
 
     fn merge(&mut self, other: &Parts) {
-        let mut carry = false;
-        for (ours, theirs) in self.limbs.iter_mut().zip(other.limbs.iter()) {
-            let (sum, c1) = ours.overflowing_add(*theirs);
-            let (sum, c2) = sum.overflowing_add(u64::from(carry));
-            *ours = sum;
-            carry = c1 || c2;
-        }
+        limbs::add_assign(&mut self.limbs, &other.limbs);
         self.floats += other.floats;
         self.nans += other.nans;
         self.positive_infinities += other.positive_infinities;
@@ -216,6 +214,15 @@ impl ExactSum {
     /// A nonzero exact sum never rounds to zero: every nonzero multiple of
     /// 2^-1074 is at least the smallest subnormal. Pure; copies the limbs.
     pub fn round_with(&self, int_part: i128) -> f64 {
+        self.round_with_limbs(&limbs::from_i128(int_part))
+    }
+
+    /// [`round_with`](Self::round_with) for an integer part given as `M`
+    /// two's-complement limbs, which may exceed an `i128`: at most three
+    /// limbs, so the integer part stays below 2^191, far inside the
+    /// fixed-point range. Pure; copies the limbs.
+    pub(crate) fn round_with_limbs<const M: usize>(&self, int_part: &[u64; M]) -> f64 {
+        const { assert!(M <= 3, "an integer part of at most three limbs") };
         if let Some(parts) = self.parts.as_deref() {
             if parts.nans > 0 || (parts.positive_infinities > 0 && parts.negative_infinities > 0) {
                 return f64::NAN;
@@ -227,27 +234,29 @@ impl ExactSum {
                 return f64::NEG_INFINITY;
             }
         }
-        let mut limbs = self
+        let mut total = self
             .parts
             .as_deref()
             .map_or([0; LIMBS], |parts| parts.limbs);
-        if int_part < 0 {
-            sub_shifted(&mut limbs, int_part.unsigned_abs(), UNIT_OFFSET);
-        } else {
-            add_shifted(&mut limbs, int_part.unsigned_abs(), UNIT_OFFSET);
+        let (int_negative, int_magnitude) = limbs::sign_and_magnitude(int_part);
+        for (pair, words) in int_magnitude.chunks(2).enumerate() {
+            let chunk = u128::from(words[0]) | words.get(1).map_or(0, |w| u128::from(*w) << 64);
+            let offset = UNIT_OFFSET + 128 * pair;
+            if int_negative {
+                limbs::sub_shifted(&mut total, chunk, offset);
+            } else {
+                limbs::add_shifted(&mut total, chunk, offset);
+            }
         }
-        let negative = limbs[LIMBS - 1] >> 63 == 1;
-        if negative {
-            negate(&mut limbs);
-        }
-        let Some(high) = highest_set_bit(&limbs) else {
-            return if int_part == 0 && self.all_negative_zero() {
+        let (negative, magnitude) = limbs::sign_and_magnitude(&total);
+        let Some(high) = limbs::highest_set_bit(&magnitude) else {
+            return if limbs::is_zero(int_part) && self.all_negative_zero() {
                 -0.0
             } else {
                 0.0
             };
         };
-        let magnitude = round_magnitude(&limbs, high);
+        let magnitude = round_magnitude(&magnitude, high);
         if negative { -magnitude } else { magnitude }
     }
 
@@ -293,113 +302,20 @@ fn decompose(x: f64) -> (u64, usize) {
     }
 }
 
-/// `value << offset` as limbs: at most three words starting at `offset / 64`.
-fn shifted_words(value: u128, offset: usize) -> (usize, [u64; 3]) {
-    let shift = (offset % 64) as u32;
-    let low = value as u64;
-    let high = (value >> 64) as u64;
-    let words = if shift == 0 {
-        [low, high, 0]
-    } else {
-        [
-            low << shift,
-            (high << shift) | (low >> (64 - shift)),
-            high >> (64 - shift),
-        ]
-    };
-    (offset / 64, words)
-}
-
-/// `limbs += value << offset`, carrying through the top limb (two's
-/// complement wraps there, which is how a negative total turns positive).
-fn add_shifted(limbs: &mut [u64; LIMBS], value: u128, offset: usize) {
-    let (start, words) = shifted_words(value, offset);
-    let mut carry = false;
-    for (index, limb) in limbs.iter_mut().enumerate().skip(start) {
-        let word = words.get(index - start).copied().unwrap_or(0);
-        if word == 0 && !carry && index - start >= words.len() {
-            break;
-        }
-        let (sum, c1) = limb.overflowing_add(word);
-        let (sum, c2) = sum.overflowing_add(u64::from(carry));
-        *limb = sum;
-        carry = c1 || c2;
-    }
-}
-
-/// `limbs -= value << offset`, borrowing through the top limb.
-fn sub_shifted(limbs: &mut [u64; LIMBS], value: u128, offset: usize) {
-    let (start, words) = shifted_words(value, offset);
-    let mut borrow = false;
-    for (index, limb) in limbs.iter_mut().enumerate().skip(start) {
-        let word = words.get(index - start).copied().unwrap_or(0);
-        if word == 0 && !borrow && index - start >= words.len() {
-            break;
-        }
-        let (difference, b1) = limb.overflowing_sub(word);
-        let (difference, b2) = difference.overflowing_sub(u64::from(borrow));
-        *limb = difference;
-        borrow = b1 || b2;
-    }
-}
-
-/// Two's complement negation in place.
-fn negate(limbs: &mut [u64; LIMBS]) {
-    let mut carry = true;
-    for limb in limbs.iter_mut() {
-        let (value, overflow) = (!*limb).overflowing_add(u64::from(carry));
-        *limb = value;
-        carry = overflow;
-    }
-}
-
-/// Index of the highest set bit, or `None` for zero.
-fn highest_set_bit(limbs: &[u64; LIMBS]) -> Option<usize> {
-    limbs
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, limb)| **limb != 0)
-        .map(|(index, limb)| index * 64 + 63 - limb.leading_zeros() as usize)
-}
-
-/// `count` (at most 64) bits of `limbs` starting at bit `start`.
-fn bits_at(limbs: &[u64; LIMBS], start: usize, count: u32) -> u64 {
-    let index = start / 64;
-    let shift = (start % 64) as u32;
-    let mut value = limbs[index] >> shift;
-    if shift > 0 && index + 1 < LIMBS {
-        value |= limbs[index + 1] << (64 - shift);
-    }
-    if count < 64 {
-        value & ((1 << count) - 1)
-    } else {
-        value
-    }
-}
-
-/// True when any bit below bit `end` is set.
-fn any_bit_below(limbs: &[u64; LIMBS], end: usize) -> bool {
-    let whole = end / 64;
-    let partial = (end % 64) as u32;
-    limbs[..whole].iter().any(|limb| *limb != 0)
-        || (partial > 0 && limbs[whole] & ((1 << partial) - 1) != 0)
-}
-
 /// Round a nonzero magnitude whose highest set bit is `high` to the nearest
 /// `f64`, ties to even; `+∞` when it rounds beyond `f64::MAX`.
-fn round_magnitude(limbs: &[u64; LIMBS], high: usize) -> f64 {
+fn round_magnitude(magnitude: &[u64; LIMBS], high: usize) -> f64 {
     let significant = FRACTION_BITS as usize;
     if high <= significant {
         // Below 2^53 units the value is exact, and its units are the float's
         // bits: a subnormal's fraction, or at 2^52 and above biased exponent 1
         // with the implicit bit landing in the exponent field.
-        return f64::from_bits(limbs[0]);
+        return f64::from_bits(magnitude[0]);
     }
     let shift = high - significant;
-    let mut mantissa = bits_at(limbs, shift, FRACTION_BITS + 1);
-    let guard = bits_at(limbs, shift - 1, 1) == 1;
-    let sticky = any_bit_below(limbs, shift - 1);
+    let mut mantissa = limbs::bits_at(magnitude, shift, FRACTION_BITS + 1);
+    let guard = limbs::bits_at(magnitude, shift - 1, 1) == 1;
+    let sticky = limbs::any_bit_below(magnitude, shift - 1);
     if guard && (sticky || mantissa & 1 == 1) {
         mantissa += 1;
     }
@@ -414,29 +330,6 @@ fn round_magnitude(limbs: &[u64; LIMBS], high: usize) -> f64 {
         return f64::INFINITY;
     }
     f64::from_bits((exponent << FRACTION_BITS) | (mantissa & FRACTION_MASK))
-}
-
-/// The limb array as a sequence, checked for length on the way in: serde's
-/// derive covers arrays of at most 32 elements.
-mod limbs_serde {
-    use super::{Deserialize, Deserializer, LIMBS, Serializer};
-
-    pub(super) fn serialize<S: Serializer>(
-        limbs: &[u64; LIMBS],
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        serializer.collect_seq(limbs.iter())
-    }
-
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<[u64; LIMBS], D::Error> {
-        let limbs = Vec::<u64>::deserialize(deserializer)?;
-        let len = limbs.len();
-        limbs
-            .try_into()
-            .map_err(|_| serde::de::Error::invalid_length(len, &"the exact sum's 34 limbs"))
-    }
 }
 
 #[cfg(test)]

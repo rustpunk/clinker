@@ -9,8 +9,9 @@
 //! Blocking: hash aggregation buffers one accumulator set per group.
 //!
 //! `Sum`, `Avg` and `WeightedAvg` hold their integer, float and decimal
-//! addends exactly, the floats in an [`ExactSum`] (one fixed-size allocation,
-//! made at the first float addend), and round once at finalize. Their results
+//! addends exactly, the floats in an [`ExactSum`] and the decimals in an
+//! [`ExactDecimalSum`] (each one fixed-size allocation, made at the first
+//! addend of its type), and round once at finalize. Their results
 //! therefore depend only on the multiset of inputs, not on arrival order or
 //! on how partial states were merged, and they retract exactly.
 //!
@@ -28,25 +29,22 @@
 use std::cmp::Ordering;
 
 use rust_decimal::Decimal;
-use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use serde::{Deserialize, Serialize};
 
 use crate::order;
 use crate::value::Value;
-
-/// Convert an `i128` integer accumulator to an exact `Decimal`, or `None` when
-/// it exceeds `Decimal`'s ~7.9e28 range. Used to fold an integer running sum
-/// into the exact decimal path; the `None` case is surfaced as an overflow
-/// rather than panicking (`Decimal::from_i128_with_scale` would panic).
-fn i128_to_decimal(n: i128) -> Option<Decimal> {
-    Decimal::from_i128(n)
-}
 
 pub mod error;
 pub use error::AccumulatorError;
 
 pub mod exact_sum;
 pub use exact_sum::ExactSum;
+
+pub mod exact_decimal_sum;
+pub use exact_decimal_sum::ExactDecimalSum;
+
+mod limbs;
+use limbs::WideInt;
 
 /// One row of accumulators — one entry per `AggregateBinding` in the
 /// owning `CompiledAggregate`. Cloned from a prototype on group
@@ -100,16 +98,16 @@ impl NumericDomain {
 /// exactly, in their own part.
 ///
 /// Integers add into an `i128`, floats into an [`ExactSum`], decimals into an
-/// exact `Decimal`; each part counts its addends. The result follows from the
-/// counts through [`NumericDomain`], not from the order values arrived in: a
-/// decimal group gives the decimal total plus the integer total, or
-/// [`AccumulatorError::DecimalOutOfRange`]; a float group the exact sum of the
-/// floats and the integers rounded once; an integer group an `Integer`, or
-/// [`AccumulatorError::SumOverflow`]; a group holding a decimal and a float
-/// [`AccumulatorError::MixedDecimalFloat`]; an empty group null. Adding,
-/// merging and subtracting never round, so a float sum depends only on the
-/// multiset of addends: not on arrival order and not on how spill runs split
-/// a group into partial states.
+/// [`ExactDecimalSum`]; each part counts its addends. The result follows from
+/// the counts through [`NumericDomain`], not from the order values arrived in:
+/// a decimal group gives the exact decimal and integer total rounded once at
+/// the largest input scale, or [`AccumulatorError::DecimalOutOfRange`]; a
+/// float group the exact sum of the floats and the integers rounded once; an
+/// integer group an `Integer`, or [`AccumulatorError::SumOverflow`]; a group
+/// holding a decimal and a float [`AccumulatorError::MixedDecimalFloat`]; an
+/// empty group null. Adding, merging and subtracting never round, so the
+/// result depends only on the multiset of addends: not on arrival order and
+/// not on how spill runs split a group into partial states.
 ///
 /// Finalize converts the integer total with `i64::try_from`, never `as i64`,
 /// which would silently wrap.
@@ -122,16 +120,9 @@ pub struct SumState {
     pub int_count: u64,
     /// The float addends, exactly; allocates at the first float addend.
     pub floats: ExactSum,
-    /// The decimal addends' exact total.
-    #[serde(with = "crate::decimal_serde")]
-    pub decimal_sum: Decimal,
-    /// Decimal addends held.
-    pub decimal_count: u64,
-    /// Set once a running decimal total leaves `Decimal`'s ~7.9e28 range;
-    /// finalize then surfaces [`AccumulatorError::DecimalOutOfRange`] rather
-    /// than a silently-wrong total. Sticky: subtracting a value does not undo
-    /// it.
-    pub decimal_overflow: bool,
+    /// The decimal addends, exactly, with a count per scale; allocates at the
+    /// first decimal addend.
+    pub decimals: ExactDecimalSum,
 }
 
 impl Default for SumState {
@@ -140,18 +131,16 @@ impl Default for SumState {
             int_sum: 0,
             int_count: 0,
             floats: ExactSum::new(),
-            decimal_sum: Decimal::ZERO,
-            decimal_count: 0,
-            decimal_overflow: false,
+            decimals: ExactDecimalSum::new(),
         }
     }
 }
 
 impl SumState {
-    /// Add one value. Returns the heap bytes this allocated (the float part's
-    /// state at the first float addend), else 0. Null and non-numeric values
-    /// are skipped (typecheck rejects a non-numeric `sum`; this is
-    /// defence-in-depth).
+    /// Add one value. Returns the heap bytes this allocated (the float or
+    /// decimal part's state at its first addend), else 0. Null and
+    /// non-numeric values are skipped (typecheck rejects a non-numeric `sum`;
+    /// this is defence-in-depth).
     fn add(&mut self, value: &Value) -> usize {
         match value {
             Value::Integer(n) => {
@@ -160,19 +149,15 @@ impl SumState {
                 0
             }
             Value::Float(f) => self.floats.add_f64(*f),
-            Value::Decimal(d) => {
-                self.decimal_count += 1;
-                self.decimal_add(*d);
-                0
-            }
+            Value::Decimal(d) => self.decimals.add_decimal(*d),
             _ => 0,
         }
     }
 
     /// Subtract one value this state holds: the exact inverse of
     /// [`add`](Self::add), so the state afterwards equals one that never saw
-    /// the value. Returns the heap delta (negative when the last float addend
-    /// frees the float part's state).
+    /// the value. Returns the heap delta (negative when the last float or
+    /// decimal addend frees its part's state).
     fn sub(&mut self, value: &Value) -> isize {
         match value {
             Value::Integer(n) => {
@@ -181,61 +166,47 @@ impl SumState {
                 0
             }
             Value::Float(f) => self.floats.sub_f64(*f),
-            Value::Decimal(d) => {
-                self.decimal_count = self.decimal_count.saturating_sub(1);
-                self.decimal_add(-*d);
-                if self.decimal_count == 0 {
-                    // The exact total is zero again; drop the scale it kept.
-                    self.decimal_sum = Decimal::ZERO;
-                }
-                0
-            }
+            Value::Decimal(d) => self.decimals.sub_decimal(*d),
             _ => 0,
         }
     }
 
-    fn decimal_add(&mut self, d: Decimal) {
-        match self.decimal_sum.checked_add(d) {
-            Some(sum) => self.decimal_sum = sum,
-            None => self.decimal_overflow = true,
-        }
-    }
-
     /// Add every addend of `other`, part by part. A merge that gives the float
-    /// part its first addends allocates; [`AccumulatorEnum::heap_size`]
-    /// reports it.
+    /// or decimal part its first addends allocates;
+    /// [`AccumulatorEnum::heap_size`] reports it.
     fn merge(&mut self, other: &SumState) {
         self.int_sum += other.int_sum;
         self.int_count += other.int_count;
         self.floats.merge(&other.floats);
-        if other.decimal_count > 0 {
-            self.decimal_count += other.decimal_count;
-            self.decimal_add(other.decimal_sum);
-        }
-        self.decimal_overflow |= other.decimal_overflow;
+        self.decimals.merge(&other.decimals);
     }
 
     /// Non-null numeric addends held, of every type.
     fn addend_count(&self) -> u64 {
-        self.int_count + self.floats.count() + self.decimal_count
+        self.int_count + self.floats.count() + self.decimals.count()
     }
 
     fn domain(&self) -> NumericDomain {
-        NumericDomain::of(self.int_count, self.floats.count(), self.decimal_count)
+        NumericDomain::of(self.int_count, self.floats.count(), self.decimals.count())
     }
 
-    /// The decimal total plus the integer total, exactly; `None` when either
-    /// leaves `Decimal`'s range.
-    fn exact_decimal_total(&self) -> Option<Decimal> {
-        if self.decimal_overflow {
-            return None;
-        }
-        i128_to_decimal(self.int_sum).and_then(|ints| self.decimal_sum.checked_add(ints))
+    /// The decimal total plus the integer total, rounded once; `None` when it
+    /// is outside the decimal range.
+    fn decimal_total(&self) -> Option<Decimal> {
+        self.decimals.round_with(self.int_sum)
     }
 
     /// The float result: the floats and the integer total rounded once.
     fn float_total(&self) -> f64 {
-        round_float_sum(&self.floats, self.int_sum, self.int_count)
+        round_float_sum(
+            &self.floats,
+            &limbs::from_i128(self.int_sum),
+            self.int_count,
+        )
+    }
+
+    fn heap_size(&self) -> usize {
+        self.floats.heap_size() + self.decimals.heap_size()
     }
 
     fn finalize(&self) -> Result<Value, AccumulatorError> {
@@ -246,7 +217,7 @@ impl SumState {
                 .map_err(|_| AccumulatorError::SumOverflow { field: None }),
             NumericDomain::Float => Ok(Value::Float(self.float_total())),
             NumericDomain::Decimal => self
-                .exact_decimal_total()
+                .decimal_total()
                 .map(Value::Decimal)
                 .ok_or(AccumulatorError::DecimalOutOfRange),
             NumericDomain::Mixed => Err(AccumulatorError::MixedDecimalFloat),
@@ -254,11 +225,11 @@ impl SumState {
     }
 }
 
-/// `floats` plus the integer total, rounded once. An integer addend is `+0`,
-/// so a zero sum is `-0.0` only when there was no integer addend and every
-/// float addend was `-0.0`.
-fn round_float_sum(floats: &ExactSum, int_sum: i128, int_count: u64) -> f64 {
-    let sum = floats.round_with(int_sum);
+/// `floats` plus the integer total (two's-complement limbs), rounded once. An
+/// integer addend is `+0`, so a zero sum is `-0.0` only when there was no
+/// integer addend and every float addend was `-0.0`.
+fn round_float_sum<const M: usize>(floats: &ExactSum, int_part: &[u64; M], int_count: u64) -> f64 {
+    let sum = floats.round_with_limbs(int_part);
     if int_count > 0 && sum == 0.0 {
         0.0
     } else {
@@ -366,7 +337,7 @@ impl AvgState {
             NumericDomain::Integer => Ok(Value::Float(sum.int_sum as f64 / count as f64)),
             NumericDomain::Float => Ok(Value::Float(sum.float_total() / count as f64)),
             NumericDomain::Decimal => sum
-                .exact_decimal_total()
+                .decimal_total()
                 .ok_or(AccumulatorError::DecimalOutOfRange)?
                 .checked_div(Decimal::from(count))
                 .map(Value::Decimal)
@@ -545,84 +516,83 @@ fn collect_state_sub(s: &mut CollectState, value: &Value) -> isize {
 // ----------------------------------------------------------------------------
 
 /// Weighted average state. Two-argument: value + weight. Each row's product
-/// `v·w` and its weight land in the part of the row's domain, held exactly:
+/// `v * w` and its weight land in the part of the row's domain, held exactly:
 ///
-/// - a row of two integers adds its exact product and weight to `i128`
-///   totals;
-/// - a row with a float operand (and no decimal) adds its product, rounded
-///   once for that row (`v as f64 * w as f64`, which does not depend on any
-///   other row), to an exact float sum of products, and its weight to an
-///   exact float sum of weights, or to the integer weight total when the
-///   weight is an integer;
-/// - a row with a decimal operand adds its product (the scalar decimal
-///   `v * w`) and weight to `Decimal` totals; a row whose product is outside
-///   the decimal range is counted instead, so retracting it clears the count.
+/// - a row of two integers adds its exact product and weight to integer
+///   totals wide enough for any number of `i64 × i64` products;
+/// - a row with a float operand (and no decimal) adds its product, the scalar
+///   `v * w` (one IEEE multiplication, which does not depend on any other
+///   row), to an exact float sum of products, and its weight to an exact
+///   float sum of weights, or to the integer weight total when the weight is
+///   an integer;
+/// - a row with a decimal operand (and no float) adds its product, the scalar
+///   decimal `v * w`, and its weight to exact decimal sums; a row whose
+///   product is outside the decimal range is counted instead, so retracting
+///   it clears the count;
+/// - a row holding a decimal and a float operand is counted as mixed and
+///   joins no total.
 ///
 /// The result follows from the row counts through [`NumericDomain`], not from
-/// the order rows arrived in: a decimal group gives the decimal products total
-/// divided by the decimal weights total (integer rows joined into both); a
-/// float group gives `round(products) / round(weights)`, each total rounded
-/// once; an integer group the integer totals' quotient as a float. Weights
-/// that total exactly zero are [`AccumulatorError::ZeroTotalWeight`] in every
-/// domain, as the scalar `x / 0` is an error; a group holding a decimal and a
-/// float is [`AccumulatorError::MixedDecimalFloat`]; only an empty group is
-/// null. Adding, merging and subtracting never round, so the result depends
-/// only on the multiset of rows.
+/// the order rows arrived in: a decimal group gives `round(Σ v*w) / round(Σ w)`
+/// with the scalar decimal `/`, each total the exact decimal and integer
+/// total rounded once at its largest input scale; a float group gives
+/// `round(Σ v*w) / round(Σ w)`, each total rounded once, with IEEE division;
+/// an integer group the exact integer totals, each converted once to a
+/// float, divided. So `weighted_avg(v, w)` is `sum(v * w) / sum(w)` for
+/// decimals and floats. Weights that total exactly zero are
+/// [`AccumulatorError::ZeroTotalWeight`] in every domain, as the scalar
+/// `x / 0` is an error; a group holding a decimal and a float, in one row or
+/// across rows, is [`AccumulatorError::MixedDecimalFloat`]; only an empty
+/// group is null. Adding, merging and subtracting never round, so the result
+/// depends only on the multiset of rows.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WeightedAvgState {
-    /// Σ vᵢ·wᵢ over the rows of two integers.
-    pub int_products: i128,
-    /// Σ wᵢ over every integer weight of a row without a decimal operand.
-    pub int_weights: i128,
+    /// Σ v·w over the rows of two integers, exactly.
+    int_products: WideInt,
+    /// Σ w over every integer weight of a row without a decimal operand,
+    /// exactly.
+    int_weights: WideInt,
     /// Rows of two integers.
     pub int_rows: u64,
-    /// Each float row's product, rounded once per row, summed exactly. Its
-    /// addend count is the number of float rows.
+    /// Each float row's product, summed exactly. Its addend count is the
+    /// number of float rows.
     pub float_products: ExactSum,
     /// The float rows' float weights, summed exactly.
     pub float_weights: ExactSum,
-    /// Σ vᵢ·wᵢ over the decimal rows, exactly: a `decimal·int` product widens
-    /// exactly via `Decimal::from` and `decimal·decimal` is exact.
-    #[serde(with = "crate::decimal_serde")]
-    pub decimal_products: Decimal,
-    /// Σ wᵢ over the decimal rows, exactly.
-    #[serde(with = "crate::decimal_serde")]
-    pub decimal_weights: Decimal,
-    /// Rows with a decimal operand, including a row that mixes a decimal with
-    /// a float (reachable only on an untyped column), which also counts as a
-    /// float row so that the group classifies as mixed while it is held.
-    pub decimal_rows: u64,
-    /// Decimal rows whose product `v * w` is outside the decimal range; they
-    /// add nothing to the product total, and the group fails with
-    /// [`AccumulatorError::ProductOverflow`] while any is held.
+    /// Each decimal row's in-range product, summed exactly.
+    pub decimal_products: ExactDecimalSum,
+    /// Each decimal row's weight, summed exactly. Its addend count is the
+    /// number of decimal rows.
+    pub decimal_weights: ExactDecimalSum,
+    /// Decimal rows whose product `v * w` is outside the decimal range; the
+    /// group fails with [`AccumulatorError::ProductOverflow`] while any is
+    /// held.
     pub product_overflows: u64,
-    /// Set once a running decimal total leaves `Decimal`'s ~7.9e28 range;
-    /// finalize then surfaces [`AccumulatorError::DecimalOutOfRange`] rather
-    /// than a silently-wrong weighted average. Sticky: subtracting a row does
-    /// not undo it.
-    pub decimal_overflow: bool,
+    /// Rows holding a decimal and a float operand, which join no total; the
+    /// group fails with [`AccumulatorError::MixedDecimalFloat`] while any is
+    /// held.
+    pub mixed_rows: u64,
 }
 
 impl Default for WeightedAvgState {
     fn default() -> Self {
         Self {
-            int_products: 0,
-            int_weights: 0,
+            int_products: WideInt::default(),
+            int_weights: WideInt::default(),
             int_rows: 0,
             float_products: ExactSum::new(),
             float_weights: ExactSum::new(),
-            decimal_products: Decimal::ZERO,
-            decimal_weights: Decimal::ZERO,
-            decimal_rows: 0,
+            decimal_products: ExactDecimalSum::new(),
+            decimal_weights: ExactDecimalSum::new(),
             product_overflows: 0,
-            decimal_overflow: false,
+            mixed_rows: 0,
         }
     }
 }
 
-/// A numeric operand of `weighted_avg`, kept in exact form so the decimal
-/// path never reconstructs a lossy float. Null and non-numeric values are
-/// filtered by [`Operand::numeric`] (which returns `None`) and skip the row.
+/// A numeric operand of `weighted_avg`, kept in exact form. Null and
+/// non-numeric values are filtered by [`Operand::numeric`] (which returns
+/// `None`) and skip the row.
 #[derive(Debug, Clone, Copy)]
 enum Operand {
     Int(i64),
@@ -640,34 +610,17 @@ impl Operand {
             _ => None,
         }
     }
-
-    fn is_decimal(&self) -> bool {
-        matches!(self, Operand::Decimal(_))
-    }
-
-    /// The f64 projection a float row's product is computed from. A decimal
-    /// reaches it only in a row that mixes a decimal with a float, which fails
-    /// the group.
-    fn as_f64(&self) -> f64 {
-        match self {
-            Operand::Int(n) => *n as f64,
-            Operand::Float(f) => *f,
-            Operand::Decimal(d) => d.to_f64().unwrap_or(f64::NAN),
-        }
-    }
-
-    /// The operand as an exact `Decimal`, or `None` for a float (which cannot
-    /// widen to decimal without loss).
-    fn as_decimal(&self) -> Option<Decimal> {
-        match self {
-            Operand::Int(n) => Some(Decimal::from(*n)),
-            Operand::Decimal(d) => Some(*d),
-            Operand::Float(_) => None,
-        }
-    }
 }
 
-/// Which domain a weighted row belongs to, with its exact contribution.
+/// A float row's weight: an integer weight joins the exact integer weight
+/// total, a float weight the exact float one.
+#[derive(Debug, Clone, Copy)]
+enum FloatRowWeight {
+    Int(i64),
+    Float(f64),
+}
+
+/// Which domain a weighted row belongs to, with its contribution.
 enum WeightedRow {
     Integer {
         product: i128,
@@ -675,53 +628,61 @@ enum WeightedRow {
     },
     Float {
         product: f64,
-        weight: Operand,
+        weight: FloatRowWeight,
     },
+    /// `product` is `None` when `v * w` is outside the decimal range.
     Decimal {
         product: Option<Decimal>,
         weight: Decimal,
     },
-    /// A decimal operand with a float operand: counted as a decimal row and a
-    /// float row, so the group classifies as mixed while the row is held.
-    DecimalWithFloat {
-        product: f64,
-        weight: Operand,
-    },
+    /// A decimal operand with a float operand.
+    Mixed,
 }
 
 impl WeightedRow {
     /// Classify a row, or `None` when either operand is null or non-numeric
-    /// (the row is skipped, as SQL skips nulls).
+    /// (the row is skipped, as SQL skips nulls). Products are the scalar
+    /// `v * w` of CXL: an integer widens exactly to a decimal or converts to a
+    /// float as the scalar operator does.
     fn classify(value: &Value, weight: &Value) -> Option<Self> {
-        let (v, w) = (Operand::numeric(value)?, Operand::numeric(weight)?);
-        let float_product = || v.as_f64() * w.as_f64();
-        Some(if v.is_decimal() || w.is_decimal() {
-            match (v.as_decimal(), w.as_decimal()) {
-                (Some(vd), Some(wd)) => WeightedRow::Decimal {
-                    product: vd.checked_mul(wd),
-                    weight: wd,
-                },
-                _ => WeightedRow::DecimalWithFloat {
-                    product: float_product(),
-                    weight: w,
-                },
-            }
-        } else if let (Operand::Int(vi), Operand::Int(wi)) = (v, w) {
-            WeightedRow::Integer {
-                product: i128::from(vi) * i128::from(wi),
-                weight: i128::from(wi),
-            }
-        } else {
-            WeightedRow::Float {
-                product: float_product(),
+        use Operand::{Decimal as Dec, Float, Int};
+        let row = match (Operand::numeric(value)?, Operand::numeric(weight)?) {
+            (Dec(_), Float(_)) | (Float(_), Dec(_)) => WeightedRow::Mixed,
+            (Int(v), Int(w)) => WeightedRow::Integer {
+                product: i128::from(v) * i128::from(w),
+                weight: i128::from(w),
+            },
+            (Dec(v), Dec(w)) => WeightedRow::Decimal {
+                product: v.checked_mul(w),
                 weight: w,
-            }
-        })
+            },
+            (Dec(v), Int(w)) => WeightedRow::Decimal {
+                product: v.checked_mul(Decimal::from(w)),
+                weight: Decimal::from(w),
+            },
+            (Int(v), Dec(w)) => WeightedRow::Decimal {
+                product: Decimal::from(v).checked_mul(w),
+                weight: w,
+            },
+            (Float(v), Float(w)) => WeightedRow::Float {
+                product: v * w,
+                weight: FloatRowWeight::Float(w),
+            },
+            (Float(v), Int(w)) => WeightedRow::Float {
+                product: v * w as f64,
+                weight: FloatRowWeight::Int(w),
+            },
+            (Int(v), Float(w)) => WeightedRow::Float {
+                product: v as f64 * w,
+                weight: FloatRowWeight::Float(w),
+            },
+        };
+        Some(row)
     }
 }
 
 impl WeightedAvgState {
-    /// Add one row. Returns the heap bytes this allocated (an exact float sum's
+    /// Add one row. Returns the heap bytes this allocated (an exact sum's
     /// state at its first addend), else 0.
     fn add_weighted(&mut self, value: &Value, weight: &Value) -> usize {
         let Some(row) = WeightedRow::classify(value, weight) else {
@@ -729,20 +690,30 @@ impl WeightedAvgState {
         };
         match row {
             WeightedRow::Integer { product, weight } => {
-                self.int_products += product;
-                self.int_weights += weight;
+                self.int_products.add_i128(product);
+                self.int_weights.add_i128(weight);
                 self.int_rows += 1;
                 0
             }
-            WeightedRow::Float { product, weight } => self.add_float_row(product, weight),
-            WeightedRow::Decimal { product, weight } => {
-                self.decimal_rows += 1;
-                self.decimal_add(product, weight, false);
-                0
+            WeightedRow::Float { product, weight } => {
+                let mut delta = self.float_products.add_f64(product);
+                match weight {
+                    FloatRowWeight::Int(w) => self.int_weights.add_i128(i128::from(w)),
+                    FloatRowWeight::Float(w) => delta += self.float_weights.add_f64(w),
+                }
+                delta
             }
-            WeightedRow::DecimalWithFloat { product, weight } => {
-                self.decimal_rows += 1;
-                self.add_float_row(product, weight)
+            WeightedRow::Decimal { product, weight } => {
+                let mut delta = self.decimal_weights.add_decimal(weight);
+                match product {
+                    Some(p) => delta += self.decimal_products.add_decimal(p),
+                    None => self.product_overflows += 1,
+                }
+                delta
+            }
+            WeightedRow::Mixed => {
+                self.mixed_rows += 1;
+                0
             }
         }
     }
@@ -750,116 +721,74 @@ impl WeightedAvgState {
     /// Subtract one row this state holds: the exact inverse of
     /// [`add_weighted`](Self::add_weighted) with the same operands, so the
     /// state afterwards equals one that never saw the row. Returns the heap
-    /// delta (negative when an exact float sum loses its last addend).
+    /// delta (negative when an exact sum loses its last addend).
     fn sub_weighted(&mut self, value: &Value, weight: &Value) -> isize {
         let Some(row) = WeightedRow::classify(value, weight) else {
             return 0;
         };
         match row {
             WeightedRow::Integer { product, weight } => {
-                self.int_products -= product;
-                self.int_weights -= weight;
+                self.int_products.sub_i128(product);
+                self.int_weights.sub_i128(weight);
                 self.int_rows = self.int_rows.saturating_sub(1);
                 0
             }
-            WeightedRow::Float { product, weight } => self.sub_float_row(product, weight),
+            WeightedRow::Float { product, weight } => {
+                let mut delta = self.float_products.sub_f64(product);
+                match weight {
+                    FloatRowWeight::Int(w) => self.int_weights.sub_i128(i128::from(w)),
+                    FloatRowWeight::Float(w) => delta += self.float_weights.sub_f64(w),
+                }
+                delta
+            }
             WeightedRow::Decimal { product, weight } => {
-                self.decimal_rows = self.decimal_rows.saturating_sub(1);
-                self.decimal_add(product, weight, true);
-                self.reset_empty_decimal_totals();
+                let mut delta = self.decimal_weights.sub_decimal(weight);
+                match product {
+                    Some(p) => delta += self.decimal_products.sub_decimal(p),
+                    None => {
+                        debug_assert!(self.product_overflows > 0, "retracted a row never added");
+                        self.product_overflows = self.product_overflows.saturating_sub(1);
+                    }
+                }
+                delta
+            }
+            WeightedRow::Mixed => {
+                debug_assert!(self.mixed_rows > 0, "retracted a row never added");
+                self.mixed_rows = self.mixed_rows.saturating_sub(1);
                 0
             }
-            WeightedRow::DecimalWithFloat { product, weight } => {
-                self.decimal_rows = self.decimal_rows.saturating_sub(1);
-                self.reset_empty_decimal_totals();
-                self.sub_float_row(product, weight)
-            }
-        }
-    }
-
-    fn add_float_row(&mut self, product: f64, weight: Operand) -> usize {
-        let mut delta = self.float_products.add_f64(product);
-        match weight {
-            Operand::Int(w) => self.int_weights += i128::from(w),
-            Operand::Float(w) => delta += self.float_weights.add_f64(w),
-            // A decimal weight only occurs in a row mixing it with a float,
-            // which fails the group; it joins no total.
-            Operand::Decimal(_) => {}
-        }
-        delta
-    }
-
-    fn sub_float_row(&mut self, product: f64, weight: Operand) -> isize {
-        let mut delta = self.float_products.sub_f64(product);
-        match weight {
-            Operand::Int(w) => self.int_weights -= i128::from(w),
-            Operand::Float(w) => delta += self.float_weights.sub_f64(w),
-            Operand::Decimal(_) => {}
-        }
-        delta
-    }
-
-    /// Fold one decimal row's product and weight into the decimal totals. A
-    /// row whose product overflowed (`None`) is counted in
-    /// `product_overflows`, or uncounted when `retract`; an out-of-range total
-    /// sets the overflow flag rather than panicking.
-    fn decimal_add(&mut self, product: Option<Decimal>, weight: Decimal, retract: bool) {
-        match product {
-            Some(p) => {
-                let p = if retract { -p } else { p };
-                match self.decimal_products.checked_add(p) {
-                    Some(sum) => self.decimal_products = sum,
-                    None => self.decimal_overflow = true,
-                }
-            }
-            None if retract => {
-                debug_assert!(self.product_overflows > 0, "retracted a row never added");
-                self.product_overflows = self.product_overflows.saturating_sub(1);
-            }
-            None => self.product_overflows += 1,
-        }
-        let weight = if retract { -weight } else { weight };
-        match self.decimal_weights.checked_add(weight) {
-            Some(sum) => self.decimal_weights = sum,
-            None => self.decimal_overflow = true,
-        }
-    }
-
-    /// With no decimal row left the exact totals are zero again; drop the
-    /// scale they kept, so the state equals one that never saw a decimal row.
-    fn reset_empty_decimal_totals(&mut self) {
-        if self.decimal_rows == 0 {
-            self.decimal_products = Decimal::ZERO;
-            self.decimal_weights = Decimal::ZERO;
         }
     }
 
     /// Add every row of `other`, part by part. A merge that gives an exact
-    /// float sum its first addends allocates; [`AccumulatorEnum::heap_size`]
+    /// sum its first addends allocates; [`AccumulatorEnum::heap_size`]
     /// reports it.
     fn merge(&mut self, other: &WeightedAvgState) {
-        self.int_products += other.int_products;
-        self.int_weights += other.int_weights;
+        self.int_products.add(&other.int_products);
+        self.int_weights.add(&other.int_weights);
         self.int_rows += other.int_rows;
         self.float_products.merge(&other.float_products);
         self.float_weights.merge(&other.float_weights);
-        if other.decimal_rows > 0 {
-            self.decimal_rows += other.decimal_rows;
-            self.decimal_add(Some(other.decimal_products), other.decimal_weights, false);
-        }
+        self.decimal_products.merge(&other.decimal_products);
+        self.decimal_weights.merge(&other.decimal_weights);
         self.product_overflows += other.product_overflows;
-        self.decimal_overflow |= other.decimal_overflow;
+        self.mixed_rows += other.mixed_rows;
     }
 
     fn heap_size(&self) -> usize {
-        self.float_products.heap_size() + self.float_weights.heap_size()
+        self.float_products.heap_size()
+            + self.float_weights.heap_size()
+            + self.decimal_products.heap_size()
+            + self.decimal_weights.heap_size()
     }
 
+    /// A row holding a decimal and a float counts as both, so it alone makes
+    /// the group mixed.
     fn domain(&self) -> NumericDomain {
         NumericDomain::of(
             self.int_rows,
-            self.float_products.count(),
-            self.decimal_rows,
+            self.float_products.count() + self.mixed_rows,
+            self.decimal_weights.count() + self.mixed_rows,
         )
     }
 
@@ -867,17 +796,23 @@ impl WeightedAvgState {
         match self.domain() {
             NumericDomain::Empty => Ok(Value::Null),
             NumericDomain::Integer => {
-                if self.int_weights == 0 {
+                if self.int_weights.is_zero() {
                     return Err(AccumulatorError::ZeroTotalWeight);
                 }
+                let integer = |total: &WideInt| ExactSum::new().round_with_limbs(total.limbs());
                 Ok(Value::Float(
-                    self.int_products as f64 / self.int_weights as f64,
+                    integer(&self.int_products) / integer(&self.int_weights),
                 ))
             }
             NumericDomain::Float => {
-                let products =
-                    round_float_sum(&self.float_products, self.int_products, self.int_rows);
-                let weights = self.float_weights.round_with(self.int_weights);
+                let products = round_float_sum(
+                    &self.float_products,
+                    self.int_products.limbs(),
+                    self.int_rows,
+                );
+                let weights = self
+                    .float_weights
+                    .round_with_limbs(self.int_weights.limbs());
                 // A nonzero exact total never rounds to zero, so this is the
                 // exact total being zero.
                 if weights == 0.0 {
@@ -889,14 +824,13 @@ impl WeightedAvgState {
                 if self.product_overflows > 0 {
                     return Err(AccumulatorError::ProductOverflow);
                 }
-                if self.decimal_overflow {
-                    return Err(AccumulatorError::DecimalOutOfRange);
-                }
-                let products = i128_to_decimal(self.int_products)
-                    .and_then(|ints| self.decimal_products.checked_add(ints))
+                let products = self
+                    .decimal_products
+                    .round_with_limbs(self.int_products.limbs())
                     .ok_or(AccumulatorError::DecimalOutOfRange)?;
-                let weights = i128_to_decimal(self.int_weights)
-                    .and_then(|ints| self.decimal_weights.checked_add(ints))
+                let weights = self
+                    .decimal_weights
+                    .round_with_limbs(self.int_weights.limbs())
                     .ok_or(AccumulatorError::DecimalOutOfRange)?;
                 if weights.is_zero() {
                     return Err(AccumulatorError::ZeroTotalWeight);
@@ -1115,8 +1049,8 @@ pub enum AccumulatorEnum {
 
 impl AccumulatorEnum {
     /// Incorporate one input value. Returns a heap bytes delta for memory
-    /// tracking: `Sum` and `Avg` return their exact float sum's allocation at
-    /// the first float addend; `Collect` returns the size of one `Value` slot
+    /// tracking: `Sum` and `Avg` return an exact sum's allocation at the first
+    /// float or decimal addend; `Collect` returns the size of one `Value` slot
     /// plus the value's own heap footprint; every other call returns 0.
     ///
     /// For `WeightedAvg`, this is a no-op — use `add_weighted` instead.
@@ -1170,7 +1104,7 @@ impl AccumulatorEnum {
     /// `Sum`, `Count`, `Collect`, `Any`, `Avg` and `WeightedAvg` are
     /// reversible: an inverse operation recovers a state equal to never
     /// having observed the retracted value. `Sum`, `Avg` and `WeightedAvg`
-    /// hold every part exactly (integers, an exact float sum, decimals), so
+    /// hold every part exactly (integers, exact float and decimal sums), so
     /// subtraction is exact. `Min` and `Max` are positional and need the full
     /// surviving multiset to recompute.
     pub const fn reversibility(&self) -> Reversibility {
@@ -1186,8 +1120,8 @@ impl AccumulatorEnum {
     }
 
     /// Two-argument add for `WeightedAvg`. Returns the heap bytes delta, as
-    /// [`add`](Self::add) does: the exact float sums' allocations at their
-    /// first addends, else 0. No-op returning 0 on other variants
+    /// [`add`](Self::add) does: the exact sums' allocations at their first
+    /// addends (both decimal sums at a first decimal row), else 0. No-op returning 0 on other variants
     /// (debug-asserts to catch programmer errors).
     pub fn add_weighted(&mut self, value: &Value, weight: &Value) -> usize {
         match self {
@@ -1201,8 +1135,8 @@ impl AccumulatorEnum {
 
     /// Two-argument retract for `WeightedAvg`: subtract one row previously
     /// added with [`add_weighted`](Self::add_weighted) with the same operands,
-    /// exactly. Returns the heap bytes delta (negative when an exact float sum
-    /// loses its last addend and frees its allocation). No-op returning 0 on
+    /// exactly. Returns the heap bytes delta (negative when an exact sum loses
+    /// its last addend and frees its allocation). No-op returning 0 on
     /// other variants (debug-asserts to catch programmer errors).
     pub fn sub_weighted(&mut self, value: &Value, weight: &Value) -> isize {
         match self {
@@ -1221,8 +1155,8 @@ impl AccumulatorEnum {
     /// row through [`sub_weighted`](Self::sub_weighted). Returns the
     /// heap-bytes delta for memory tracking — negative for shrink (`Collect`
     /// removing one slot, `Any` decrementing a refcount entry to zero, `Sum`
-    /// or `Avg` removing its last float addend, which frees the exact float
-    /// sum's allocation) and zero otherwise. `Min` and `Max`
+    /// or `Avg` removing its last float or decimal addend, which frees that
+    /// exact sum's allocation) and zero otherwise. `Min` and `Max`
     /// (`BufferRequired`) and `WeightedAvg` debug-assert: `Min` and `Max`
     /// retract by replaying surviving rows from a per-group buffer.
     pub fn sub(&mut self, value: &Value) -> isize {
@@ -1291,16 +1225,16 @@ impl AccumulatorEnum {
 
     /// Estimated heap size for memory tracking. Fixed-size variants return
     /// `size_of::<Self>()` (inline enum footprint, no heap); `Sum`, `Avg` and
-    /// `WeightedAvg` add their exact float sums' allocations, if they hold
-    /// any. Collect reports `Vec` capacity × `size_of::<Value>()` plus each
+    /// `WeightedAvg` add their exact float and decimal sums' allocations, if
+    /// they hold any. Collect reports `Vec` capacity × `size_of::<Value>()` plus each
     /// value's own heap.
     ///
     /// Report `Vec` capacity, not `len()` — len-based reporting has caused up
     /// to 19× undercounts in DataFusion (arrow-rs issue #13831).
     pub fn heap_size(&self) -> usize {
         match self {
-            Self::Sum(s) => std::mem::size_of::<Self>() + s.floats.heap_size(),
-            Self::Avg(s) => std::mem::size_of::<Self>() + s.sum.floats.heap_size(),
+            Self::Sum(s) => std::mem::size_of::<Self>() + s.heap_size(),
+            Self::Avg(s) => std::mem::size_of::<Self>() + s.sum.heap_size(),
             Self::WeightedAvg(s) => std::mem::size_of::<Self>() + s.heap_size(),
             Self::Collect(s) => s.heap_size(),
             Self::Any(s) => std::mem::size_of::<Self>() + s.heap_size(),
