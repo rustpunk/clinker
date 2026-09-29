@@ -655,6 +655,35 @@ fn build_row_held_with_a_failure_is_not_retracted_from_a_relaxed_aggregate() {
     }
 }
 
+/// Under the relaxed-key retraction the commit folds each iteration's held
+/// failures into an archive and back. Two failing drivers of one group
+/// that matched one build row still write their own copy of the build row
+/// each, paired with their own failure.
+#[test]
+fn per_driver_build_rows_survive_the_relaxed_retraction() {
+    for strategy in all_strategies() {
+        let tag = strategy.tag;
+        let (group, build_group) = driver_and_build_groups(strategy);
+        let yaml = yaml_with(strategy, "", BUILD_AGGREGATE);
+        let (_, rows) = run_yaml(
+            &yaml,
+            strategy,
+            &[(1, group, 0), (2, group, 0)],
+            build_group,
+            &["out", "agg_out"],
+        );
+        assert_eq!(
+            rows.len(),
+            4,
+            "[{tag}] each failing driver is followed by its own copy of the build row: {:?}",
+            describe(&rows)
+        );
+        for (pair, did) in rows.chunks(2).zip([1, 2]) {
+            assert_driver_then_build(tag, &pair[0], &pair[1], did);
+        }
+    }
+}
+
 /// `max_group_buffer` counts a failure once. One failing and one succeeding
 /// driver share a group under a cap of 2: the failure and the succeeding
 /// driver's output are the group's two held entries. The build row held
