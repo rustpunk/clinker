@@ -127,16 +127,17 @@ fn invoke(root: &Path, capture: &Path, lineage: bool) -> Output {
     if lineage {
         command.args(["--lineage-events", "lineage.ndjson"]);
     }
-    command.output().expect("run clinker")
+    command.output_within_hang_limit()
 }
 
-/// How long a delivery-fault run may take before it is treated as waiting on
-/// the fault.
+/// How long any run in this file may take before it is treated as waiting on
+/// a delivery fault.
 ///
 /// Far above anything publication I/O can add on a loaded host, and far below
 /// the faults the delivery cases hold open (forever, or `DELIVERY_FAULT_HOLD`),
 /// so a pass means no window of the run waited on the fault, whatever the disk
-/// is doing.
+/// is doing. Every child run goes through it, so a deadlock fails its test
+/// instead of stalling the suite.
 const DELIVERY_HANG_LIMIT: Duration = Duration::from_secs(60);
 
 /// A delivery fault the run must never wait out: ten times the hang limit.
@@ -159,30 +160,51 @@ const OBSERVABILITY_POLICY_FLUSH_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// A dropped exporter's drain held past [`OBSERVABILITY_POLICY_FLUSH_TIMEOUT`].
 ///
-/// Longer than the fault-matrix race hold because the witness here is the
-/// hold's own release line: the run has to have exited before the hold lets
-/// go, and the margin covers what the early return still does after the drop.
+/// The race is decided inside the run — the drop's own deadline against the
+/// hold, both on the run's clock — and reported by the drop itself, not read
+/// from how soon the process exits afterwards. The margin therefore only has
+/// to cover scheduling between two threads of one process, and a drop that
+/// waits 1.5 s or more past its deadline sees the drain finish and says so.
 const EARLY_RETURN_RACE_HOLD: Duration = Duration::from_millis(2000);
 
 // A race hold at or under its deadline would let a correct run see the fault
-// clear, so every race would pass whether or not the deadline ended the wait.
+// clear, so every race would pass whether or not the deadline ended the wait;
+// and a "permanent" fault that clears inside the hang limit is only a slow
+// race that a waiting run would survive.
 const _: () = assert!(
     DELIVERY_DEADLINE_RACE_HOLD.as_millis() > FAULT_MATRIX_OTLP_FLUSH_TIMEOUT.as_millis()
         && DELIVERY_DEADLINE_RACE_HOLD.as_millis() > FAULT_MATRIX_LINEAGE_FLUSH_TIMEOUT.as_millis()
+        // The execution-failure path stalls the lineage write before its OTLP
+        // wait, so that stall has to outlast both deadlines.
+        && DELIVERY_DEADLINE_RACE_HOLD.as_millis()
+            > FAULT_MATRIX_OTLP_FLUSH_TIMEOUT.as_millis()
+                + FAULT_MATRIX_LINEAGE_FLUSH_TIMEOUT.as_millis()
         && EARLY_RETURN_RACE_HOLD.as_millis() > OBSERVABILITY_POLICY_FLUSH_TIMEOUT.as_millis()
+        && DELIVERY_FAULT_HOLD.as_millis() > DELIVERY_HANG_LIMIT.as_millis()
 );
 
-/// Written to standard error by the debug build's flush hold when it lets go.
-/// A run that is still alive to print it waited the hold out.
-const FLUSH_HOLD_RELEASED: &str = "clinker-test: OTLP final flush released";
-
-/// Written by the flush hold when it begins.
+/// Written to standard error by the debug build's flush hold when it begins.
 const FLUSH_HOLD_STARTED: &str = "clinker-test: OTLP final flush held";
+
+/// Written by a dropped exporter under a flush hold when its drain deadline
+/// expired first.
+const DROPPED_DRAIN_ABANDONED: &str = "clinker-test: dropped OTLP exporter abandoned its drain";
+
+/// Written by a dropped exporter under a flush hold when its drain finished
+/// inside the wait.
+const DROPPED_DRAIN_FINISHED: &str = "clinker-test: dropped OTLP exporter drain finished";
 
 /// Run `command` to completion, or kill it and fail at [`DELIVERY_HANG_LIMIT`].
 fn output_within_hang_limit(command: &mut Command) -> Output {
-    use std::io::Read;
     use std::process::Stdio;
+
+    fn drain<R: std::io::Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).expect("read child output");
+            bytes
+        })
+    }
 
     let mut child = command
         .stdin(Stdio::null())
@@ -190,15 +212,10 @@ fn output_within_hang_limit(command: &mut Command) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn clinker");
-    let drain = |mut pipe: Box<dyn Read + Send>| {
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            pipe.read_to_end(&mut bytes).expect("read child output");
-            bytes
-        })
-    };
-    let stdout = drain(Box::new(child.stdout.take().expect("piped stdout")));
-    let stderr = drain(Box::new(child.stderr.take().expect("piped stderr")));
+    // Both pipes drain on their own threads, so a child that fills one while
+    // this thread polls cannot block on the write.
+    let stdout = drain(child.stdout.take().expect("piped stdout"));
+    let stderr = drain(child.stderr.take().expect("piped stderr"));
     let started = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().expect("poll clinker") {
@@ -220,6 +237,17 @@ fn output_within_hang_limit(command: &mut Command) -> Output {
         status,
         stdout: stdout.join().expect("stdout reader"),
         stderr: stderr.join().expect("stderr reader"),
+    }
+}
+
+/// Lets a builder chain end in the hang guard where it would end in `output()`.
+trait OutputWithinHangLimit {
+    fn output_within_hang_limit(&mut self) -> Output;
+}
+
+impl OutputWithinHangLimit for Command {
+    fn output_within_hang_limit(&mut self) -> Output {
+        output_within_hang_limit(self)
     }
 }
 
@@ -518,7 +546,7 @@ fn invoke_sampled(root: &Path, capture: &Path, machine: bool) -> Output {
             "telemetry-admission",
         ]);
     }
-    command.output().expect("run clinker")
+    command.output_within_hang_limit()
 }
 
 /// Telemetry lost at arena admission is reported, on both surfaces.
@@ -779,8 +807,7 @@ fn admission_counts_read_before_the_drain_finished_are_not_reported_as_final() {
             "--batch-id",
             "telemetry-bulkhead",
         ])
-        .output()
-        .expect("run clinker");
+        .output_within_hang_limit();
     assert!(
         held.status.success(),
         "an unresponsive collector never fails the run: stderr: {}",
@@ -851,8 +878,7 @@ fn a_run_that_reserved_an_arena_reports_its_admission_however_early_it_stops() {
             "--lineage-events",
             "lineage.ndjson",
         ])
-        .output()
-        .expect("run clinker");
+        .output_within_hang_limit();
 
     assert!(
         !output.status.success(),
@@ -887,29 +913,32 @@ fn a_run_that_reserved_an_arena_reports_its_admission_however_early_it_stops() {
 /// collector that does not answer must be bounded there by the same
 /// `flush_timeout_ms` rather than waited out.
 ///
-/// A dropped exporter reports nothing about its drain, so the witness is the
-/// debug build's flush hold itself: it must be reached, and the run must have
-/// exited before it lets go. A drop that waited past its deadline would still
-/// be running when the hold released, and would print that it had.
+/// A dropped exporter's drain delivers nothing a collector or the machine
+/// stream could show, so under a flush hold the debug build has the drop say
+/// which way its wait ended. Held just past the deadline, only the deadline
+/// can end it in time, and the drop must report that it abandoned the drain:
+/// a drop that waits 1.5 s or more too long sees the drain finish first and
+/// reports that instead. Held far past the hang limit, a drop that abandons on
+/// time but then waits for the worker anyway never lets the run exit.
 #[test]
 fn an_early_return_never_waits_on_an_unresponsive_collector() {
-    let root = fixture();
-    write_pipeline(root.path(), "./private/output/customers.csv");
-    write_observability_policy(
-        root.path(),
-        "https://collector.example.com",
-        "mode = \"none\"",
-    );
-    std::fs::create_dir_all(root.path().join("lineage.ndjson")).expect("blocked destination");
+    for hold in [EARLY_RETURN_RACE_HOLD, DELIVERY_FAULT_HOLD] {
+        let root = fixture();
+        write_pipeline(root.path(), "./private/output/customers.csv");
+        write_observability_policy(
+            root.path(),
+            "https://collector.example.com",
+            "mode = \"none\"",
+        );
+        std::fs::create_dir_all(root.path().join("lineage.ndjson")).expect("blocked destination");
 
-    let output = output_within_hang_limit(
-        Command::new(clinker_bin())
+        let output = Command::new(clinker_bin())
             .current_dir(root.path())
             .env("CLINKER_TEST_OTLP_OUTCOME", "success")
             .env("CLINKER_TEST_OTLP_CAPTURE", root.path().join("otlp.ndjson"))
             .env(
                 "CLINKER_TEST_OTLP_FLUSH_HOLD_MS",
-                EARLY_RETURN_RACE_HOLD.as_millis().to_string(),
+                hold.as_millis().to_string(),
             )
             .args([
                 "run",
@@ -920,29 +949,82 @@ fn an_early_return_never_waits_on_an_unresponsive_collector() {
                 "telemetry-bulkhead",
                 "--lineage-events",
                 "lineage.ndjson",
-            ]),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !output.status.success(),
-        "an unopenable lineage destination stops the run: stdout: {}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-    assert_eq!(
-        machine_events(&output).last().expect("machine terminal")["event"],
-        "failed"
-    );
-    assert!(
-        stderr.contains(FLUSH_HOLD_STARTED),
-        "the dropped exporter's drain never reached the hold, so its deadline was not \
-         exercised: {stderr}"
-    );
-    assert!(
-        !stderr.contains(FLUSH_HOLD_RELEASED),
-        "a drain held {EARLY_RETURN_RACE_HOLD:?} must be abandoned on its \
-         {OBSERVABILITY_POLICY_FLUSH_TIMEOUT:?} deadline, but the run was still waiting \
-         when it released: {stderr}"
-    );
+            ])
+            .output_within_hang_limit();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "an unopenable lineage destination stops the run: stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(
+            machine_events(&output).last().expect("machine terminal")["event"],
+            "failed"
+        );
+        assert!(
+            stderr.contains(FLUSH_HOLD_STARTED),
+            "the dropped exporter's drain never reached the hold, so its deadline was not \
+             exercised: {stderr}"
+        );
+        assert!(
+            stderr.contains(DROPPED_DRAIN_ABANDONED) && !stderr.contains(DROPPED_DRAIN_FINISHED),
+            "a drain held {hold:?} must be abandoned on its \
+             {OBSERVABILITY_POLICY_FLUSH_TIMEOUT:?} deadline: {stderr}"
+        );
+    }
+}
+
+/// A delivery-fault seam asked for with a value it cannot use stops the run
+/// through its ordinary error path. Running unheld instead would turn a
+/// deadline race into a clean run that proves nothing, and panicking would
+/// bypass the diagnostic every other admission failure produces.
+#[test]
+fn a_malformed_delivery_fault_seam_stops_the_run_with_a_diagnostic() {
+    for (variable, extra_env) in [
+        (
+            "CLINKER_TEST_LINEAGE_STALL_MS",
+            [("CLINKER_TEST_LINEAGE_SINK", "stall-after-first-write")],
+        ),
+        (
+            "CLINKER_TEST_OTLP_FLUSH_HOLD_MS",
+            [("CLINKER_TEST_OTLP_FLUSH_HOLD_MS", "one second")],
+        ),
+    ] {
+        let root = fixture();
+        write_fault_matrix_pipeline(root.path());
+        write_fault_matrix_policy(root.path(), "4KB");
+        let output = Command::new(clinker_bin())
+            .current_dir(root.path())
+            .env("CLINKER_TEST_OTLP_OUTCOME", "success")
+            .env("CLINKER_TEST_OTLP_CAPTURE", root.path().join("otlp.ndjson"))
+            .env_remove("CLINKER_TEST_LINEAGE_STALL_MS")
+            .envs(extra_env)
+            .args([
+                "run",
+                "pipeline.yaml",
+                "--machine",
+                "ndjson-v1",
+                "--batch-id",
+                "observability-fault-matrix",
+                "--lineage-events",
+                "lineage.ndjson",
+            ])
+            .output_within_hang_limit();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success() && output.status.code() != Some(101),
+            "{variable}: a malformed seam must fail the run without a panic: {stderr}"
+        );
+        assert!(
+            stderr.contains(variable) && !stderr.contains("panicked"),
+            "{variable}: the diagnostic names the variable: {stderr}"
+        );
+        assert_eq!(
+            machine_events(&output).last().expect("machine terminal")["event"],
+            "failed",
+            "{variable}"
+        );
+    }
 }
 
 /// The same authored YAML drives the sole-producer serializer test and this
@@ -993,8 +1075,7 @@ fn authored_condition_gates_the_exported_payload() {
             "--batch-id",
             "telemetry-bulkhead",
         ])
-        .output()
-        .expect("run clinker");
+        .output_within_hang_limit();
     let captured = std::fs::read_to_string(&capture);
     let published = std::fs::read_to_string(root.path().join("private/output/customers.json"));
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1260,8 +1341,7 @@ nodes:
     let seeded = Command::new(clinker_bin())
         .current_dir(root)
         .args(["run", "retained-pipeline.yaml"])
-        .output()
-        .expect("seed failed attempt");
+        .output_within_hang_limit();
     assert_eq!(
         seeded.status.code(),
         Some(4),
@@ -1730,8 +1810,7 @@ fn worker_startup_failures_are_preeffect_and_machine_terminal() {
                 "--lineage-events",
                 "lineage.ndjson",
             ])
-            .output()
-            .expect("run worker startup failure");
+            .output_within_hang_limit();
 
         assert_eq!(output.status.code(), Some(4), "{variable}");
         let events = machine_events(&output);
@@ -1850,6 +1929,7 @@ fn fault_matrix_otlp_outcomes_change_only_the_selected_signal() {
 fn fault_matrix_lineage_outcomes_leave_otlp_and_authoritative_truth_unchanged() {
     let baseline = invoke_fault_matrix(None, "success", None, false, "4KB", &[]);
     assert_collector_captured_all_signals(&baseline, "baseline");
+    let mut permanent_burst_full = None;
     for (mode, repeat, max_event, expected) in [
         (
             "permission-denied",
@@ -1887,6 +1967,9 @@ fn fault_matrix_lineage_outcomes_leave_otlp_and_authoritative_truth_unchanged() 
             "{diagnostic}"
         );
         assert!(diagnostic.contains(expected), "{diagnostic}");
+        if mode == "hang-after-first-write" && repeat {
+            permanent_burst_full = Some(lineage_delivery_count(&diagnostic, "full"));
+        }
     }
 
     // The destination takes the START at once and then holds every later
@@ -1924,6 +2007,49 @@ fn fault_matrix_lineage_outcomes_leave_otlp_and_authoritative_truth_unchanged() 
         2,
         "only the START and the stalled terminal are admitted: {diagnostic}"
     );
+
+    // The producer side of the same fault. Sixty-four copies of each event are
+    // offered in one burst against a 4KB queue whose destination takes one
+    // record and then stalls each further write for a second, so the queue is
+    // full for almost the whole burst and every refused offer must be dropped
+    // at once. A producer that waited for room instead would be handed a slot
+    // each time the stalled destination finished a write, and fewer offers
+    // would be refused as full than against a destination that never returns;
+    // it could also stay under the hang limit, which is all that bounds the
+    // permanent case. The comparison allows for the stalled destination having
+    // taken one record more than the permanently blocked one, and for the
+    // worker taking its first record before or after the burst begins.
+    const BURST_FULL_TOLERANCE: u64 = 3;
+    let permanent_burst_full =
+        permanent_burst_full.expect("the matrix ran the permanent repeated-offer case");
+    let raced_burst = invoke_fault_matrix(
+        Some("logs"),
+        "success",
+        Some("stall-after-first-write"),
+        true,
+        "4KB",
+        &[(
+            "CLINKER_TEST_LINEAGE_STALL_MS",
+            DELIVERY_DEADLINE_RACE_HOLD.as_millis().to_string(),
+        )],
+    );
+    assert_eq!(
+        raced_burst.oracle, baseline.oracle,
+        "a repeated-offer burst against a stalled destination changed authoritative truth"
+    );
+    let diagnostic = String::from_utf8_lossy(&raced_burst.output.stderr);
+    assert!(
+        diagnostic.contains("status=deadline-exceeded"),
+        "a lineage destination stalled {DELIVERY_DEADLINE_RACE_HOLD:?} per write must end on \
+         its {FAULT_MATRIX_LINEAGE_FLUSH_TIMEOUT:?} deadline: {diagnostic}"
+    );
+    let raced_burst_full = lineage_delivery_count(&diagnostic, "full");
+    assert!(
+        raced_burst_full + BURST_FULL_TOLERANCE >= permanent_burst_full,
+        "producers waited for queue room instead of dropping: {raced_burst_full} offers \
+         were refused as full against a stalled destination, {permanent_burst_full} against \
+         one that never returns: {diagnostic}"
+    );
 }
 
 /// Read one counter from the run's `clinker: lineage delivery outcome:` line.
@@ -1941,12 +2067,18 @@ fn lineage_delivery_count(stderr: &str, counter: &str) -> u64 {
 
 /// A run that fails during execution winds delivery down on its own error
 /// path, which neither the successful fault-matrix runs nor an early return
-/// reach. Both destinations race their deadlines there: the collector holds
-/// the final flush, and the lineage destination stalls the terminal write,
-/// each for longer than its `flush_timeout_ms`. Only the deadlines can end
-/// those waits in time, so the run reports both as unfinished; a wait
-/// stretched on this path would let the fault clear first and report a clean
-/// flush instead. A wait that never ends is caught by the hang limit.
+/// reach, and in its own order: it offers the lineage terminal first, then
+/// flushes OTLP, then closes the lineage sink.
+///
+/// Both destinations race their deadlines there. The collector holds the OTLP
+/// flush from the moment it is asked for it, so that race is the OTLP
+/// deadline alone against the hold. The lineage destination stalls the
+/// terminal write from the moment it is offered — before the OTLP flush — so
+/// its stall has to outlast the OTLP wait and then the lineage deadline:
+/// about 850 ms of margin rather than the full hold. A lineage outcome that
+/// comes back clean therefore means either wait on this path grew by that
+/// much, and the OTLP assertion says which. A wait that never ends is caught
+/// by the hang limit.
 ///
 /// No permanently held variant is needed here: the permanent-fault cases in the
 /// fault matrix already cover the shared flush code, and what is particular to
@@ -2005,18 +2137,22 @@ fn an_execution_failure_never_waits_on_a_delivery_fault() {
     assert_eq!(terminal["event"], "failed", "{terminal:#?}");
     assert_eq!(
         terminal["observability"]["flush_complete"], false,
-        "a flush held {DELIVERY_DEADLINE_RACE_HOLD:?} must end on its \
-         {FAULT_MATRIX_OTLP_FLUSH_TIMEOUT:?} deadline: {terminal:#?}"
+        "the OTLP wait on the execution-failure path outlasted its \
+         {FAULT_MATRIX_OTLP_FLUSH_TIMEOUT:?} deadline: a flush held \
+         {DELIVERY_DEADLINE_RACE_HOLD:?} was allowed to finish: {terminal:#?}"
     );
     assert!(
         stderr.contains("status=deadline-exceeded"),
-        "a lineage write stalled {DELIVERY_DEADLINE_RACE_HOLD:?} must end on its \
-         {FAULT_MATRIX_LINEAGE_FLUSH_TIMEOUT:?} deadline: {stderr}"
+        "the lineage terminal write, stalled {DELIVERY_DEADLINE_RACE_HOLD:?} from before the \
+         OTLP flush, cleared before the lineage close gave up: the OTLP wait \
+         ({FAULT_MATRIX_OTLP_FLUSH_TIMEOUT:?}) plus the lineage deadline \
+         ({FAULT_MATRIX_LINEAGE_FLUSH_TIMEOUT:?}) on this path grew by the ~850 ms margin: \
+         {stderr}"
     );
     assert_eq!(
         lineage_delivery_count(&stderr, "accepted"),
         2,
-        "the stall must fall on the terminal write, offered just before the flush: {stderr}"
+        "the stall must fall on the terminal write, the second one offered: {stderr}"
     );
     // Nothing reached a published path: the failure abandoned the attempt.
     assert!(

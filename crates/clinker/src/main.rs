@@ -2899,7 +2899,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
         if let Some(delivery_config) = configuration.delivery {
             let delivery = clinker_lineage::LineageDelivery::start(
                 delivery_config,
-                external_lineage_sink(path),
+                external_lineage_sink(path)?,
             )
             .map_err(lineage_worker_start_error)?;
             truncate_lineage_destination("--lineage", path)?;
@@ -3232,7 +3232,7 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             let sink = LiveLineageSink::External(
                 clinker_lineage::LineageDelivery::start(
                     delivery_config,
-                    external_lineage_sink(path),
+                    external_lineage_sink(path)?,
                 )
                 .map_err(lineage_worker_start_error)?,
             );

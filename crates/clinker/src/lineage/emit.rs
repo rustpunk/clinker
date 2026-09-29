@@ -889,7 +889,47 @@ impl std::io::Write for QualificationLineageSink {
     }
 }
 
-pub(crate) fn external_lineage_sink(path: &std::path::Path) -> Box<dyn std::io::Write + Send> {
+/// The debug-build qualification sink mode `CLINKER_TEST_LINEAGE_SINK` names,
+/// if any.
+///
+/// A stall of unknown length would quietly become the plain sink and turn a
+/// deadline race into a clean run that proves nothing, so a missing or
+/// malformed length is refused through the run's own error path.
+#[cfg(debug_assertions)]
+fn qualification_lineage_sink_mode() -> Result<Option<QualificationLineageSinkMode>, PipelineError>
+{
+    let Some(mode) = std::env::var_os("CLINKER_TEST_LINEAGE_SINK") else {
+        return Ok(None);
+    };
+    Ok(match mode.to_string_lossy().as_ref() {
+        "permission-denied" => Some(QualificationLineageSinkMode::PermissionDenied),
+        "write-failed" => Some(QualificationLineageSinkMode::WriteFailed),
+        "write-failed-after-record" => Some(QualificationLineageSinkMode::WriteFailedAfterRecord),
+        "write-failed-mid-record" => Some(QualificationLineageSinkMode::WriteFailedMidRecord),
+        "flush-failed" => Some(QualificationLineageSinkMode::FlushFailed),
+        "hang-after-first-write" => Some(QualificationLineageSinkMode::HangAfterFirstWrite),
+        "stall-after-first-write" => {
+            let millis = std::env::var("CLINKER_TEST_LINEAGE_STALL_MS")
+                .ok()
+                .and_then(|millis| millis.parse::<u64>().ok())
+                .ok_or_else(|| {
+                    observability_delivery_error(
+                        "CLINKER_TEST_LINEAGE_SINK=stall-after-first-write needs \
+                         CLINKER_TEST_LINEAGE_STALL_MS set to a whole number of milliseconds. \
+                         Correction: set it to one, or unset CLINKER_TEST_LINEAGE_SINK",
+                    )
+                })?;
+            Some(QualificationLineageSinkMode::StallAfterFirstWrite(
+                std::time::Duration::from_millis(millis),
+            ))
+        }
+        _ => None,
+    })
+}
+
+pub(crate) fn external_lineage_sink(
+    path: &std::path::Path,
+) -> Result<Box<dyn std::io::Write + Send>, PipelineError> {
     let sink: Box<dyn std::io::Write + Send> = if path.as_os_str() == std::ffi::OsStr::new("-") {
         Box::new(std::io::stdout())
     } else {
@@ -904,42 +944,15 @@ pub(crate) fn external_lineage_sink(path: &std::path::Path) -> Box<dyn std::io::
         })
     };
     #[cfg(debug_assertions)]
-    if let Some(mode) = std::env::var_os("CLINKER_TEST_LINEAGE_SINK").and_then(|mode| {
-        match mode.to_string_lossy().as_ref() {
-            "permission-denied" => Some(QualificationLineageSinkMode::PermissionDenied),
-            "write-failed" => Some(QualificationLineageSinkMode::WriteFailed),
-            "write-failed-after-record" => {
-                Some(QualificationLineageSinkMode::WriteFailedAfterRecord)
-            }
-            "write-failed-mid-record" => Some(QualificationLineageSinkMode::WriteFailedMidRecord),
-            "flush-failed" => Some(QualificationLineageSinkMode::FlushFailed),
-            "hang-after-first-write" => Some(QualificationLineageSinkMode::HangAfterFirstWrite),
-            // A stall of unknown length would quietly become the plain sink
-            // and turn a deadline race into a clean run that proves nothing,
-            // so a missing or malformed length stops the run instead.
-            "stall-after-first-write" => {
-                let millis = std::env::var("CLINKER_TEST_LINEAGE_STALL_MS")
-                    .ok()
-                    .and_then(|millis| millis.parse::<u64>().ok())
-                    .expect(
-                        "CLINKER_TEST_LINEAGE_SINK=stall-after-first-write needs \
-                         CLINKER_TEST_LINEAGE_STALL_MS set to a whole number of milliseconds",
-                    );
-                Some(QualificationLineageSinkMode::StallAfterFirstWrite(
-                    std::time::Duration::from_millis(millis),
-                ))
-            }
-            _ => None,
-        }
-    }) {
-        return Box::new(QualificationLineageSink {
+    if let Some(mode) = qualification_lineage_sink_mode()? {
+        return Ok(Box::new(QualificationLineageSink {
             inner: sink,
             mode,
             blocked: false,
             writes: 0,
-        });
+        }));
     }
-    sink
+    Ok(sink)
 }
 
 pub(crate) fn lineage_start_facts(
