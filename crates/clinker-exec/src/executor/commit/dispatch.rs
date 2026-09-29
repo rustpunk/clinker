@@ -116,20 +116,7 @@ fn dispatch_deferred_inner(
     current_dag: &ExecutionPlanDag,
     events: &mut Vec<DlqEvent>,
 ) -> Result<(), PipelineError> {
-    // Top-level region walk. `current_dag.deferred_regions` keys every
-    // participating NodeIndex (producer + members + outputs) to a
-    // shared `DeferredRegion`, so deduplicate by producer to walk each
-    // region exactly once.
-    let mut walked_producers: HashSet<NodeIndex> = HashSet::new();
-    let region_keys: Vec<NodeIndex> = current_dag.deferred_regions.keys().copied().collect();
-    for key in region_keys {
-        let producer = match current_dag.deferred_regions.get(&key) {
-            Some(r) => r.producer,
-            None => continue,
-        };
-        if !walked_producers.insert(producer) {
-            continue;
-        }
+    for producer in region_walk_order(current_dag) {
         // Clone the region metadata so the borrow on `current_dag`
         // releases before each recursive `dispatch_plan_node` call.
         let region = current_dag
@@ -181,6 +168,21 @@ fn dispatch_deferred_inner(
     }
 
     Ok(())
+}
+
+/// The producers of `current_dag`'s deferred regions, in the order the
+/// commit walks their regions, each once.
+pub(crate) fn region_walk_order(current_dag: &ExecutionPlanDag) -> Vec<NodeIndex> {
+    // `current_dag.deferred_regions` keys every participating NodeIndex
+    // (producer + members + outputs) to a shared `DeferredRegion`, so
+    // deduplicate by producer to walk each region exactly once.
+    let mut walked_producers: HashSet<NodeIndex> = HashSet::new();
+    current_dag
+        .deferred_regions
+        .values()
+        .map(|region| region.producer)
+        .filter(|producer| walked_producers.insert(*producer))
+        .collect()
 }
 
 /// Walk one region's members in topological order over a sub-graph

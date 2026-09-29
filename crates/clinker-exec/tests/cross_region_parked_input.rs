@@ -697,3 +697,115 @@ fn composition_body_crossing_parks_under_its_body_key() {
     );
     assert_eq!(converged.report.counters.dlq_count, 1);
 }
+
+/// Two relaxed-key aggregates over the same orders. `totals_x`, downstream
+/// of `dept_totals`, runs only at the commit, where it parks its rows for
+/// `joined`, which sits in `dept_peaks`'s region: a crossing raised during
+/// the commit pass itself. `ratio` fails on HR, so the commit iterates, and
+/// every iteration's `joined` must see only that iteration's `totals_x` rows:
+/// under `match: all` a leftover row from the iteration before would double
+/// a joined row.
+const TWO_REGION_PIPELINE: &str = r#"
+pipeline:
+  name: two_regions
+error_handling:
+  strategy: continue
+  dlq:
+    path: rejected.csv
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    path: orders.csv
+    correlation_key: order_id
+    type: csv
+    schema:
+      - { name: order_id, type: string }
+      - { name: department, type: string }
+      - { name: amount, type: int }
+- type: aggregate
+  name: dept_totals
+  input: orders
+  config:
+    group_by: [department]
+    cxl: |
+      emit department = department
+      emit total = sum(amount)
+- type: transform
+  name: totals_x
+  input: dept_totals
+  config:
+    cxl: |
+      emit department = department
+      emit total = total
+- type: aggregate
+  name: dept_peaks
+  input: orders
+  config:
+    group_by: [department]
+    cxl: |
+      emit department = department
+      emit peak = max(amount)
+- type: combine
+  name: joined
+  input:
+    p: dept_peaks
+    b: totals_x
+  config:
+    where: 'p.department == b.department'
+    match: all
+    on_miss: skip
+    cxl: |
+      emit department = p.department
+      emit peak = p.peak
+      emit total = b.total
+    propagate_ck: driver
+- type: transform
+  name: ratio
+  input: joined
+  config:
+    cxl: |
+      emit department = department
+      emit peak = peak
+      emit total = total
+      emit ratio = 1 / (total - 60)
+- type: sink
+  name: out
+  input: ratio
+  config:
+    name: out
+    path: out.csv
+    type: csv
+    include_unmapped: true
+"#;
+
+#[test]
+fn commit_pass_tees_do_not_leak_between_iterations() {
+    let converged = run(TWO_REGION_PIPELINE, &[("orders", orders_csv(true))])
+        .expect("a crossing raised during the commit pass is read by its consumer region");
+    let reference = run(TWO_REGION_PIPELINE, &[("orders", orders_csv(false))])
+        .expect("the reference run completes");
+    assert!(
+        converged.report.counters.retraction.iterations >= 2,
+        "the commit iterates; got {}",
+        converged.report.counters.retraction.iterations
+    );
+    assert_eq!(reference.report.counters.retraction.iterations, 1);
+    assert_eq!(
+        sorted_rows(&converged.output),
+        sorted_rows(&reference.output),
+        "each iteration joins exactly its own commit-pass rows"
+    );
+    assert_eq!(
+        sorted_rows(&converged.output).len(),
+        1,
+        "one ENG row, not one per iteration: {}",
+        converged.output
+    );
+    assert!(
+        converged.output.contains("ENG,300,600"),
+        "{}",
+        converged.output
+    );
+}

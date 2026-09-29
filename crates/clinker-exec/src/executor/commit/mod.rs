@@ -409,6 +409,33 @@ pub(crate) fn should_spare_collateral(
     }
 }
 
+/// What a relaxed-key commit left of the run's parked cross-region rows as
+/// it returned, recorded for the tests on the walk's thread.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CommitObservation {
+    /// Parked edges when the commit began.
+    pub(crate) parked_edges_before: usize,
+    /// Parked edges the store still held when the commit returned.
+    pub(crate) parked_edges_after: usize,
+    /// Consumers of the edges parked when the commit began that were still
+    /// registered when it returned.
+    pub(crate) parked_consumers_still_registered: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static COMMIT_OBSERVATION: std::cell::Cell<Option<CommitObservation>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Take what the last relaxed-key commit on this thread recorded as it
+/// returned.
+#[cfg(test)]
+pub(crate) fn take_commit_observation() -> Option<CommitObservation> {
+    COMMIT_OBSERVATION.with(std::cell::Cell::take)
+}
+
 #[cfg(test)]
 thread_local! {
     /// Per-thread override for the cascading-retraction loop cap. Set by
