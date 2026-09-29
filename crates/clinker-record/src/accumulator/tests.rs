@@ -594,6 +594,34 @@ fn test_avg_null_skipped() {
 }
 
 #[test]
+fn avg_merge_keeps_an_integer_only_partial() {
+    // A partial that saw the float 0.5 merged with one that saw the integers
+    // 1, 2 and 3 averages all four: 6.5 / 4 = 1.625 (exact in binary), in
+    // both merge orders.
+    let float_partial = || fold(avg, &[Value::Float(0.5)]);
+    let integer_partial = || {
+        fold(
+            avg,
+            &[Value::Integer(1), Value::Integer(2), Value::Integer(3)],
+        )
+    };
+    let mut float_first = float_partial();
+    float_first.merge(&integer_partial());
+    assert_eq!(
+        float_first.finalize().unwrap(),
+        Value::Float(1.625),
+        "the float partial merged with the integer-only partial"
+    );
+    let mut integer_first = integer_partial();
+    integer_first.merge(&float_partial());
+    assert_eq!(
+        integer_first.finalize().unwrap(),
+        Value::Float(1.625),
+        "the integer-only partial merged with the float partial"
+    );
+}
+
+#[test]
 fn test_avg_all_null() {
     let mut a = avg();
     add_all(&mut a, &[Value::Null]);
@@ -1002,6 +1030,38 @@ fn test_weighted_avg_merge() {
     b.add_weighted(&Value::Integer(4), &Value::Integer(1));
     a.merge(&b);
     assert_eq!(a.finalize().unwrap(), Value::Float(2.5));
+}
+
+#[test]
+fn weighted_avg_merge_keeps_an_integer_only_partial() {
+    // (0.5, 2.0) merged with (1, 1) and (3, 1): the products total
+    // 1.0 + 1 + 3 = 5 and the weights 2.0 + 1 + 1 = 4, so 5 / 4 = 1.25, in
+    // both merge orders.
+    let float_partial = || {
+        let mut s = weighted_avg();
+        s.add_weighted(&Value::Float(0.5), &Value::Float(2.0));
+        s
+    };
+    let integer_partial = || {
+        let mut s = weighted_avg();
+        s.add_weighted(&Value::Integer(1), &Value::Integer(1));
+        s.add_weighted(&Value::Integer(3), &Value::Integer(1));
+        s
+    };
+    let mut float_first = float_partial();
+    float_first.merge(&integer_partial());
+    assert_eq!(
+        float_first.finalize().unwrap(),
+        Value::Float(1.25),
+        "the float partial merged with the integer-only partial"
+    );
+    let mut integer_first = integer_partial();
+    integer_first.merge(&float_partial());
+    assert_eq!(
+        integer_first.finalize().unwrap(),
+        Value::Float(1.25),
+        "the integer-only partial merged with the float partial"
+    );
 }
 
 #[test]
