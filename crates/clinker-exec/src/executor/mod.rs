@@ -319,6 +319,9 @@ struct DagExecResources {
     /// Pipeline-scoped memory arbitrator that envelopes every spill /
     /// back-pressure decision across the run.
     memory_budget: std::sync::Arc<crate::pipeline::memory::MemoryArbitrator>,
+    /// The run's kernel pool, built before the Source threads so an order
+    /// barrier and the walk's kernels share one worker set.
+    kernel_pool: std::sync::Arc<rayon::ThreadPool>,
 }
 
 /// Helper for callers (mostly tests and benchmarks) that have a single
@@ -966,6 +969,14 @@ impl PipelineExecutor {
             }
         })?);
 
+        // Shared Rayon pool for the parallel sections of the CPU-bound kernels
+        // (the comparator sort of every sort buffer, grace-hash partition key
+        // extraction, IEJoin and sort-merge key evaluation). Sized off the
+        // run's resolved nonzero thread capacity. Built once per run, before
+        // the Source threads, because an order barrier sorts on it from the
+        // first staged row; the walk shares the same `Arc`.
+        let kernel_pool = build_kernel_pool(run_policy)?;
+
         // Pipeline-scoped MemoryArbitrator. One declared `memory.limit`
         // envelopes every node-rooted arena finalize — including the
         // arenas built at Source dispatch-arm exits. Arrives as a
@@ -1150,18 +1161,22 @@ impl PipelineExecutor {
                 );
                 let (stream, rx) = match order_config {
                     Some(order_config) => {
-                        crate::executor::source_stream::SourceIngestChannel::new_ordered(
-                            crate::executor::source_stream::SourceIngestChannel::DEFAULT_CAPACITY,
-                            source_consumer_handle.clone(),
-                            source_id,
-                            order_config,
-                            Arc::clone(&memory_budget),
-                            spill_root.path().to_path_buf(),
-                            params
-                                .spill_compress
-                                .resolve_for_schema(source_column_count, source_batch_size as u64),
-                            source_allocation,
-                        )
+                        let (mut stream, rx) =
+                            crate::executor::source_stream::SourceIngestChannel::new_ordered(
+                                crate::executor::source_stream::SourceIngestChannel::DEFAULT_CAPACITY,
+                                source_consumer_handle.clone(),
+                                source_id,
+                                order_config,
+                                Arc::clone(&memory_budget),
+                                spill_root.path().to_path_buf(),
+                                params.spill_compress.resolve_for_schema(
+                                    source_column_count,
+                                    source_batch_size as u64,
+                                ),
+                                source_allocation,
+                            );
+                        stream.set_kernel_pool(Arc::clone(&kernel_pool));
+                        (stream, rx)
                     }
                     None => crate::executor::source_stream::SourceIngestChannel::new(
                         crate::executor::source_stream::SourceIngestChannel::DEFAULT_CAPACITY,
@@ -1248,6 +1263,7 @@ impl PipelineExecutor {
                 spill_root,
                 watermarks,
                 memory_budget: memory_budget.clone(),
+                kernel_pool,
             },
             &mut collector,
             counters,
@@ -1502,6 +1518,7 @@ impl PipelineExecutor {
             spill_root,
             watermarks,
             memory_budget,
+            kernel_pool,
         } = resources;
 
         // Cache the spill-dir path as an `Arc<Path>` derived from the guard, so
@@ -1727,13 +1744,6 @@ impl PipelineExecutor {
                 &init_phase_set,
             )
         };
-
-        // Shared Rayon pool for the CPU-bound owned-input kernels (sort,
-        // grace-hash partition build, IEJoin, sort-merge). Sized off the
-        // run's resolved nonzero thread capacity. Built once per
-        // run and shared via `Arc` so every kernel `install` reuses the
-        // same worker set rather than spinning up a pool per operator.
-        let kernel_pool = build_kernel_pool(run_policy)?;
 
         // The walk's dead-letter writer, opened before any thread is spawned
         // so a refusal leaves nothing to join. Rows stream through it from the

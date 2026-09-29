@@ -142,6 +142,10 @@ pub struct SortBuffer<P> {
     spill_compress: bool,
     spill_files: Vec<SpillFile<P>>,
     schema: SharedStorage<Schema>,
+    /// The run's kernel pool the comparator sort runs on. `None` sorts
+    /// sequentially on the calling thread; the sort never reaches rayon's
+    /// global pool, whose workers the run neither sizes nor owns.
+    kernel_pool: Option<std::sync::Arc<rayon::ThreadPool>>,
 }
 
 // `P: Ord` spans the whole impl, not just the payload-ordered constructor, so
@@ -172,6 +176,7 @@ impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
             spill_compress,
             spill_files: Vec::new(),
             schema,
+            kernel_pool: None,
         }
     }
 
@@ -199,7 +204,16 @@ impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
             spill_compress,
             spill_files: Vec::new(),
             schema,
+            kernel_pool: None,
         }
+    }
+
+    /// Sort on `pool` instead of sequentially on the calling thread. Output is
+    /// identical either way; the pool only spreads the comparator sort over
+    /// the run's kernel workers.
+    pub fn with_kernel_pool(mut self, pool: std::sync::Arc<rayon::ThreadPool>) -> Self {
+        self.kernel_pool = Some(pool);
+        self
     }
 
     /// Push a `(record, payload)` pair into the buffer. The payload's own heap
@@ -224,23 +238,32 @@ impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
         self.bytes_used > 0 && self.bytes_used >= self.spill_threshold
     }
 
-    /// Stable-sort the in-memory pairs by the buffer's ordering mode. Parallel
-    /// stable sort on the shared kernel pool: `par_sort_by` preserves the
-    /// tie-break order of the sequential `slice::sort_by`, so a spilled run is
-    /// byte-identical to the sequential sort and equal keys keep input order.
+    /// Stable-sort the in-memory pairs by the buffer's ordering mode: a
+    /// parallel stable sort on the buffer's kernel pool when it has one, else
+    /// the sequential stable sort on the calling thread. `par_sort_by`
+    /// preserves the tie-break order of the sequential `slice::sort_by`, so a
+    /// spilled run is byte-identical either way and equal keys keep input
+    /// order.
     fn sort_pairs(&mut self) {
-        // Split the borrow so the comparator can read `ordering` while
-        // `par_sort_by` holds `pairs` mutably.
+        // Split the borrow so the comparator can read `ordering` while the
+        // sort holds `pairs` mutably.
         let Self {
-            pairs, ordering, ..
+            pairs,
+            ordering,
+            kernel_pool,
+            ..
         } = self;
-        match ordering {
-            SortOrdering::Fields(sort_by) => {
+        match (ordering, kernel_pool.as_deref()) {
+            (SortOrdering::Fields(sort_by), Some(pool)) => pool.install(|| {
                 pairs.par_sort_by(|(a, _), (b, _)| compare_authored_keys(a, b, sort_by));
+            }),
+            (SortOrdering::Fields(sort_by), None) => {
+                pairs.sort_by(|(a, _), (b, _)| compare_authored_keys(a, b, sort_by));
             }
-            SortOrdering::Payload => {
+            (SortOrdering::Payload, Some(pool)) => pool.install(|| {
                 pairs.par_sort_by(|(_, a), (_, b)| a.cmp(b));
-            }
+            }),
+            (SortOrdering::Payload, None) => pairs.sort_by(|(_, a), (_, b)| a.cmp(b)),
         }
     }
 

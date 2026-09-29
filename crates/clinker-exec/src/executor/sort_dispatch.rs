@@ -238,16 +238,17 @@ pub(super) fn sort_records_by_authored_fields(
         spill_compress,
         schema,
         ctx.allocation_resources.clone(),
-    );
+    )
+    .with_kernel_pool(std::sync::Arc::clone(&ctx.kernel_pool));
 
     let sort_count = input_records.len() as u64;
     let charge = crate::pipeline::spill_merge::SpillChargeGuard::new(
         std::sync::Arc::clone(&ctx.memory_budget),
         node_name,
     );
-    let sorted = ctx
-        .kernel_pool
-        .install(|| drain_into_sort_buffer(buf, input_records, node_name, &charge))?;
+    // The drain runs on the walk, so a spill it triggers runs there too; only
+    // the buffer's comparator sort goes to the kernel pool.
+    let sorted = drain_into_sort_buffer(buf, input_records, node_name, &charge)?;
     let out = match sorted {
         SortedOutput::InMemory(pairs) => pairs,
         SortedOutput::Spilled(files) => merge_sorted_runs(
@@ -317,6 +318,7 @@ where
                 record.schema().clone(),
                 ctx.allocation_resources.clone(),
             )
+            .with_kernel_pool(std::sync::Arc::clone(&ctx.kernel_pool))
         });
         buf.push(record, source_row);
         sort_count = sort_count.saturating_add(1);
@@ -380,7 +382,8 @@ where
 /// output, or [`PipelineError::SpillCapExceeded`] (E320) when a spilled run
 /// crosses the configured `storage.spill.disk_cap_bytes`.
 ///
-/// CPU-bound: the per-run sort runs on the caller's Rayon pool.
+/// Runs on the calling thread; each run's comparator sort runs wherever
+/// `buf` was told to sort (the run's kernel pool in production).
 fn drain_into_sort_buffer(
     mut buf: crate::pipeline::sort_buffer::SortBuffer<crate::executor::stream_event::SourceRowId>,
     input: Vec<(Record, crate::executor::stream_event::SourceRowId)>,

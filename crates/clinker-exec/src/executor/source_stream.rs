@@ -252,6 +252,15 @@ impl SourceIngestChannel {
         self.order_barrier.is_some()
     }
 
+    /// Give the order barrier the run's kernel pool, so its staged rows sort
+    /// there instead of sequentially on the Source thread. A channel without
+    /// a barrier sorts nothing and ignores the pool.
+    pub(crate) fn set_kernel_pool(&mut self, pool: Arc<rayon::ThreadPool>) {
+        if let Some(barrier) = self.order_barrier.as_mut() {
+            barrier.set_kernel_pool(pool);
+        }
+    }
+
     /// Create a new channel + paired receiver. The receiver is what the
     /// dispatch loop's Source arm consumes via `recv`. The
     /// `consumer_handle` is shared with the pipeline-scoped
