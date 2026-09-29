@@ -10,6 +10,8 @@
 //! endpoint admitted after the first records have been staged, is a partial
 //! run to unpick. Each check runs before anything is opened or written.
 
+#[cfg(not(feature = "rest"))]
+use clinker_core_types::QuoteName;
 use clinker_plan::error::PipelineError;
 
 /// Reject a pipeline that declares a `rest` source in a build without one.
@@ -34,7 +36,7 @@ pub(crate) fn check_pipeline(
         ) {
             return Err(PipelineError::Config(
                 clinker_plan::config::ConfigError::Validation(format!(
-                    "[E223] source '{name}' declares a `transport:` block with `kind: rest`, but \
+                    "[E223] source {quoted} declares a `transport:` block with `kind: rest`, but \
                      this build of clinker was compiled without the `rest` capability, so it has \
                      no HTTP client to pull those pages with. Either run the pipeline with a \
                      build that has it — the released binary does, and a build from source gets \
@@ -48,7 +50,8 @@ pub(crate) fn check_pipeline(
                      \x20     path: ./data/{name}.json\n\
                      \x20     schema:\n\
                      \x20       - {{ name: id, type: int }}",
-                    name = source.name
+                    name = source.name,
+                    quoted = source.name.quoted_name()
                 )),
             ));
         }
@@ -161,7 +164,7 @@ nodes:
             .to_string();
         assert!(error.contains("E223"), "{error}");
         assert!(
-            error.contains("'api'"),
+            error.contains(r#""api""#),
             "the diagnostic must name the offending source: {error}"
         );
         assert!(

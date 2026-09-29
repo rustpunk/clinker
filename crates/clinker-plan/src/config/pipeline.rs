@@ -3632,8 +3632,9 @@ fn rest_doc_access_diagnostic(
         "E349",
         format!(
             "`$doc.{section}.{field}` reads document-envelope context from the rest source \
-             '{source_name}', but a rest source pulls records page by page over HTTP and \
-             buffers no document — the access can never resolve and would silently yield null"
+             {source_name}, but a rest source pulls records page by page over HTTP and \
+             buffers no document — the access can never resolve and would silently yield null",
+            source_name = source_name.quoted_name()
         ),
         LabeledSpan::primary(primary, String::new()),
     )
@@ -5145,15 +5146,16 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
             {
                 return Err(ConfigError::Validation(format!(
                     "[E347] output {out}: `reconstruct_envelope` cannot be combined with an \
-                     upstream node ('{stripper}') that strips document lineage unless an \
+                     upstream node ({stripper}) that strips document lineage unless an \
                      `envelope` node with `strategy: concat` consolidates the merged stream \
                      first — a Combine, Aggregate, or Composition emits records with no \
                      originating document, so the per-document envelope cannot be framed around \
                      them (the framing arm would stream them unframed, e.g. producing malformed \
-                     JSON). Insert an `envelope` node with `strategy: concat` between '{stripper}' \
+                     JSON). Insert an `envelope` node with `strategy: concat` between {stripper} \
                      and this output to consolidate the merged stream into one document, or drop \
                      `reconstruct_envelope`",
-                    out = out.quoted_name()
+                    out = out.quoted_name(),
+                    stripper = stripper.quoted_name()
                 )));
             }
 
@@ -5597,9 +5599,10 @@ pub(crate) fn validate_csv_byte_option(
     match (chars.next(), chars.next()) {
         (Some(c), None) if c.is_ascii() => Ok(()),
         _ => Err(ConfigError::Validation(format!(
-            "{node_kind} '{node_name}': `{field}: {value:?}` must be exactly one ASCII byte \
+            "{node_kind} {node_name}: `{field}: {value:?}` must be exactly one ASCII byte \
              (for example `,`, `|`, or `\\t`); the CSV reader and writer take a single-byte \
-             {field}, so an empty, multi-character, or non-ASCII value cannot be applied"
+             {field}, so an empty, multi-character, or non-ASCII value cannot be applied",
+            node_name = node_name.quoted_name()
         ))),
     }
 }
@@ -5950,7 +5953,7 @@ nodes:
             .expect_err("multi-character output delimiter must be rejected");
         let msg = err.to_string();
         assert!(
-            msg.contains("output 'out'") && msg.contains("one ASCII byte"),
+            msg.contains(r#"output "out""#) && msg.contains("one ASCII byte"),
             "msg must name the output and the requirement: {msg}"
         );
     }

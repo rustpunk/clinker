@@ -1,6 +1,7 @@
 //! Scoped-variable declarations and the default-collection / registry helpers.
 
 use super::*;
+use clinker_core_types::QuoteName;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -251,9 +252,10 @@ pub(crate) fn validate_unique_scoped_declarations(
                         VarScope::Record => "record",
                     };
                     return Err(ConfigError::Validation(format!(
-                        "duplicate ${scope_label} declaration: '{name}' is declared in transforms '{prior}' and '{current}' — the {scope_label}-scope namespace is flat and shared, declare once and reference",
+                        "duplicate ${scope_label} declaration: '{name}' is declared in transforms {prior} and {current} — the {scope_label}-scope namespace is flat and shared, declare once and reference",
                         name = entry.name,
-                        current = header.name,
+                        prior = prior.quoted_name(),
+                        current = header.name.quoted_name(),
                     )));
                 }
             }

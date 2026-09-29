@@ -1598,9 +1598,10 @@ impl std::fmt::Display for PlanError {
                 write!(
                     f,
                     "E152 composition {composition} has untagged incoming edge from \
-                     '{producer}' ({scope}); every composition input edge must carry a \
+                     {producer} ({scope}); every composition input edge must carry a \
                      port name (planner-pass invariant — see PlanEdge.port)",
                     composition = composition.quoted_name(),
+                    producer = producer.quoted_name(),
                 )
             }
         }

@@ -114,7 +114,11 @@ impl fmt::Display for ProvenanceExplainError {
                         node_name = node_name.quoted_name()
                     )
                 } else {
-                    write!(f, "\n  valid params for '{node_name}':")?;
+                    write!(
+                        f,
+                        "\n  valid params for {node_name}:",
+                        node_name = node_name.quoted_name()
+                    )?;
                     for p in valid_params {
                         write!(f, "\n    - {node_name}.{p}")?;
                     }
@@ -165,7 +169,7 @@ impl fmt::Display for ProvenanceExplainError {
                 valid_columns,
             } => {
                 write!(f, "no schema provenance for '{source}.{column}'")?;
-                write!(f, "\n  columns of '{source}':")?;
+                write!(f, "\n  columns of {source}:", source = source.quoted_name())?;
                 for c in valid_columns {
                     write!(f, "\n    - {source}.{c}")?;
                 }
@@ -852,7 +856,7 @@ mod tests {
                 "# Error E110: an extraction selection names a node absent from the execution-plan DAG"
             )
         );
-        assert!(e110.contains("selected node 'clean_oder'"));
+        assert!(e110.contains(r#"selected node "clean_oder""#));
 
         let e117 = explain_code("E117").expect("E117 has a reserved-name page");
         assert_eq!(

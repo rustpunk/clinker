@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use clinker_core_types::FailureClassification;
+use clinker_core_types::{FailureClassification, QuoteName};
 use serde::Serialize;
 
 use clinker_exec::executor::PipelineExecutor;
@@ -3323,8 +3323,8 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                         };
                         clinker_plan::error::PipelineError::Config(
                             clinker_plan::config::ConfigError::Validation(format!(
-                                "[{code}] source '{}' discovery failed: {e}",
-                                source.name
+                                "[{code}] source {} discovery failed: {e}",
+                                source.name.quoted_name()
                             )),
                         )
                     })?;
@@ -5810,8 +5810,8 @@ fn compile_attempt_context(
             }
             Err(error) => {
                 return Err(AttemptCommandError::new(format!(
-                    "source '{}' discovery failed while reconstructing attempt roots: {error}",
-                    source.name
+                    "source {} discovery failed while reconstructing attempt roots: {error}",
+                    source.name.quoted_name()
                 )));
             }
         };

@@ -264,7 +264,7 @@ fn body_output_bad_csv_delimiter_rejected_at_compile() {
             )
         });
     assert!(
-        diag.message.contains("output 'body_sink'"),
+        diag.message.contains(r#"output "body_sink""#),
         "the diagnostic must name the offending body output: {:?}",
         diag.message
     );
@@ -434,7 +434,7 @@ nodes:
 
     assert!(
         err.iter().any(|d| d.code == "E115"
-            && d.message.contains("source 'body_src'")
+            && d.message.contains(r#"source "body_src""#)
             && d.message.contains("quote_char")
             && d.message.contains("one ASCII byte")),
         "expected an E115 naming the body source, quote_char, and the one-byte rule; got: {err:?}"
