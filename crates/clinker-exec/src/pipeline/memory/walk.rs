@@ -20,7 +20,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
-use std::rc::Rc;
+use std::rc::{Rc, Weak as RcWeak};
 use std::sync::{Arc, Weak};
 
 use clinker_plan::config::CompressMode;
@@ -262,6 +262,23 @@ pub(crate) struct WalkReclaimSet {
     document_buckets: HashMap<ConsumerId, DocumentBucketEntry>,
     /// The run's rows parked for a deferred consumer.
     parked: Option<ParkedEntry>,
+    /// The walk-owned cells registered through [`register_walk_owned`], by
+    /// the consumer each charges. Run-scoped, outside every frame, so a
+    /// composition body's shortfall reaches the state its callers own.
+    owned: HashMap<ConsumerId, Vec<OwnedEntry>>,
+    /// The serial the next registration's entry takes, so a registration
+    /// removes only its own entry among several under one consumer.
+    next_owned_serial: u64,
+}
+
+/// One registered walk-owned cell: a `Weak`, so a registration never keeps
+/// its state alive and a dropped owner is never reached, and the handle of
+/// the consumer it charges, on which a pass that finds the cell borrowed
+/// raises the spill request.
+struct OwnedEntry {
+    serial: u64,
+    cell: RcWeak<RefCell<dyn WalkOwnedSpill>>,
+    handle: Arc<ConsumerHandle>,
 }
 
 /// The walk reclaim set's way to the run's parked cross-region rows: the
@@ -299,7 +316,47 @@ impl WalkReclaimSet {
             document_dlq: None,
             document_buckets: HashMap::new(),
             parked: None,
+            owned: HashMap::new(),
+            next_owned_serial: 0,
         }
+    }
+
+    /// Enter `cell` under consumer `id`, dropping any entry for `id` whose
+    /// owner is gone; returns the entry's serial.
+    fn enter_owned(
+        &mut self,
+        id: ConsumerId,
+        cell: RcWeak<RefCell<dyn WalkOwnedSpill>>,
+        handle: Arc<ConsumerHandle>,
+    ) -> u64 {
+        let serial = self.next_owned_serial;
+        self.next_owned_serial += 1;
+        let entries = self.owned.entry(id).or_default();
+        entries.retain(|entry| entry.cell.strong_count() > 0);
+        entries.push(OwnedEntry {
+            serial,
+            cell,
+            handle,
+        });
+        serial
+    }
+
+    /// Remove the entry `serial` made under consumer `id`, if a pass has not
+    /// already pruned it.
+    fn leave_owned(&mut self, id: ConsumerId, serial: u64) {
+        if let Some(entries) = self.owned.get_mut(&id) {
+            entries.retain(|entry| entry.serial != serial);
+            if entries.is_empty() {
+                self.owned.remove(&id);
+            }
+        }
+    }
+
+    /// How many walk-owned cells are entered under consumer `id`, live or
+    /// not yet pruned.
+    #[cfg(test)]
+    pub(crate) fn owned_cell_count(&self, id: ConsumerId) -> usize {
+        self.owned.get(&id).map_or(0, Vec::len)
     }
 
     /// Make the run's parked cross-region rows, in their own cell, victims
@@ -645,6 +702,163 @@ impl WalkReclaim for WalkReclaimSet {
         }
         Ok(VictimOutcome::NotOwned)
     }
+}
+
+/// State the walk owns that a reclaim pass spills in place, reached through
+/// the cell [`register_walk_owned`] entered in the walk reclaim set.
+///
+/// The owner keeps its state in an `Rc<RefCell<_>>` and borrows it only for
+/// one operation of its own, never across a call that can charge another
+/// consumer (a `reserve`, a `try_grow`, a checked admission), a channel wait
+/// or a call into another dispatch arm. A pass that another consumer's
+/// request starts can then spill the state whenever the owner is between
+/// operations; one that finds the cell borrowed (the owner is mid-mutation,
+/// or is itself the requester) frees nothing from it and raises the
+/// consumer's spill request, which the owner answers through
+/// [`ConsumerHandle::take_spill_request`] at its next push, yield or batch
+/// boundary.
+pub(crate) trait WalkOwnedSpill {
+    /// Spill, now and on the walk, every resident spillable byte this owner
+    /// charges to consumer `id`, releasing that charge from the consumer's
+    /// handle and charging any spill file to `arbitrator`'s disk quota.
+    /// Runs inside a reclaim pass with the walk reclaim set borrowed.
+    ///
+    /// Returns whether this owner holds state for `id`: `true` when it does,
+    /// whether or not any of it was resident; `false` when it no longer does
+    /// (the state left the owner before its registration dropped). One cell
+    /// may serve several consumers and spills only what `id` charges.
+    ///
+    /// Never reserves memory, never blocks on another thread and never
+    /// touches the walk reclaim set; blocks only on its own spill I/O.
+    ///
+    /// # Errors
+    ///
+    /// A failed spill, including E320 past the spill cap, which ends the
+    /// pass.
+    fn spill_owned(
+        &mut self,
+        id: ConsumerId,
+        arbitrator: &MemoryArbitrator,
+    ) -> Result<bool, PipelineError>;
+}
+
+/// Keeps a walk-owned cell entered in the walk reclaim set, under the
+/// consumer it charges, until it drops.
+///
+/// Dropping it removes the entry when the set is free; when the set is
+/// borrowed right then, the entry stays with a `Weak` that the next lookup
+/// for that consumer prunes once the owner is gone, so a dropped owner is
+/// never reached either way. Inert (it entered nothing) when it was made on
+/// a thread with no walk frame for the run. Holds an `Rc` `Weak`, so it is
+/// `!Send`.
+#[must_use = "the walk-owned cell leaves the walk reclaim set as soon as its registration drops"]
+pub(crate) struct WalkOwnedRegistration {
+    entry: Option<RegisteredEntry>,
+}
+
+/// Where a registration's entry is: the walk's set, and the consumer and
+/// serial the entry was made under.
+struct RegisteredEntry {
+    set: RcWeak<RefCell<WalkReclaimSet>>,
+    id: ConsumerId,
+    serial: u64,
+}
+
+impl WalkOwnedRegistration {
+    /// A registration that entered nothing, for a test fixture that builds
+    /// an owner's state without registering it.
+    #[cfg(test)]
+    pub(crate) fn inert() -> Self {
+        Self { entry: None }
+    }
+}
+
+impl Drop for WalkOwnedRegistration {
+    fn drop(&mut self) {
+        let Some(entry) = self.entry.take() else {
+            return;
+        };
+        if let Some(set) = entry.set.upgrade()
+            && let Ok(mut set) = set.try_borrow_mut()
+        {
+            set.leave_owned(entry.id, entry.serial);
+        }
+    }
+}
+
+/// Make the walk-owned state in `cell`, charged to consumer `id` through
+/// `handle`, a victim every reclaim pass on `arbitrator`'s walk can spill,
+/// until the returned registration drops.
+///
+/// The set keeps a `Weak` to the cell, never the cell itself: the owner
+/// keeps the registration beside its state (in the same struct, or a local
+/// declared after the state), so both drop together on every exit, `?` and
+/// unwind included. Several cells may register under one consumer (a role
+/// that charges several structures); a pass spills every one it can
+/// borrow. The entry is run-scoped, outside every composition body's
+/// frame.
+///
+/// The owner's contract is [`WalkOwnedSpill`]'s: it borrows its cell only
+/// for its own operation, never across a call that can charge another
+/// consumer, a channel wait or a call into another dispatch arm, answers a
+/// raised spill request at its next push, yield or batch boundary, and its
+/// spill never reserves.
+///
+/// Call it on the walk after the run's walk frame is installed, and never
+/// from inside a pass. On a thread with no walk frame for `arbitrator` (a
+/// unit test building an operator without a run) it registers nothing and
+/// returns an inert registration; such a thread is never a rayon worker.
+///
+/// # Errors
+///
+/// [`PipelineError::Internal`] when the walk reclaim set is borrowed right
+/// now: registration takes one short borrow of it, and a borrow held here
+/// means a caller broke the rule that none is held across an owner's
+/// operation. Nothing is registered.
+pub(crate) fn register_walk_owned<S: WalkOwnedSpill + 'static>(
+    arbitrator: &MemoryArbitrator,
+    id: ConsumerId,
+    handle: &Arc<ConsumerHandle>,
+    cell: &Rc<RefCell<S>>,
+) -> Result<WalkOwnedRegistration, PipelineError> {
+    let Some(set) = walk_reclaim_set(arbitrator) else {
+        debug_assert!(
+            rayon::current_thread_index().is_none(),
+            "walk-owned state is registered on the walk, never on a rayon worker"
+        );
+        return Ok(WalkOwnedRegistration { entry: None });
+    };
+    let Ok(mut borrowed) = set.try_borrow_mut() else {
+        return Err(PipelineError::Internal {
+            op: "memory reclaim",
+            node: consumer_node(arbitrator, id),
+            detail: "walk-owned state was registered while the walk reclaim set was borrowed"
+                .to_string(),
+        });
+    };
+    let owned: RcWeak<RefCell<S>> = Rc::downgrade(cell);
+    let owned: RcWeak<RefCell<dyn WalkOwnedSpill>> = owned;
+    let serial = borrowed.enter_owned(id, owned, Arc::clone(handle));
+    drop(borrowed);
+    Ok(WalkOwnedRegistration {
+        entry: Some(RegisteredEntry {
+            set: Rc::downgrade(&set),
+            id,
+            serial,
+        }),
+    })
+}
+
+/// The node consumer `id` is registered under, for a diagnostic; empty when
+/// the ledger holds no label for it.
+fn consumer_node(arbitrator: &MemoryArbitrator, id: ConsumerId) -> String {
+    arbitrator
+        .admission
+        .ledger
+        .lock()
+        .label(id.0)
+        .map(|label| label.node.clone())
+        .unwrap_or_default()
 }
 
 /// The stand-in a pass uses when the reclaim set is already borrowed (the
@@ -1096,5 +1310,451 @@ mod frame_tests {
         assert!(set.slots().is_registered(&parent_key));
         assert!(arbitrator.cumulative_spill_bytes() > 0);
         assert!(arbitrator.unregister_consumer(parent_id).is_some());
+    }
+}
+
+/// What a per-site test needs to show that a pass another consumer starts
+/// reaches walk-owned state: a walk frame with a fresh reclaim set, a
+/// request made on the walk by a consumer that owns nothing, and a
+/// registered stand-in owner.
+#[cfg(test)]
+pub(crate) mod walk_test_support {
+    use super::*;
+    use crate::executor::node_buffer::NodeBufferConsumer;
+    use crate::pipeline::memory::ledger::{Grant, Requester, Shortfall};
+    use crate::pipeline::memory::{ConsumerSpillError, MemoryConsumer};
+    use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface};
+
+    /// Run `body` as `arbitrator`'s walk, with a fresh walk reclaim set
+    /// installed for its duration and node-buffer spills going to a
+    /// temporary directory removed afterwards.
+    pub(crate) fn with_test_walk_frame<R>(
+        arbitrator: &Arc<MemoryArbitrator>,
+        body: impl FnOnce() -> R,
+    ) -> R {
+        let spill_root = tempfile::tempdir().expect("walk spill root");
+        let set = Rc::new(RefCell::new(WalkReclaimSet::new(WalkSpillSettings {
+            spill_root: Arc::from(spill_root.path()),
+            spill_compress: CompressMode::Auto,
+            batch_size: 1024,
+        })));
+        let _walk = WalkContextGuard::install(arbitrator, set);
+        body()
+    }
+
+    /// Request `bytes` on the calling thread through `reserve` in the name
+    /// of a consumer that holds nothing a pass could spill, so a request
+    /// that does not fit runs the walk's real reserve loop and passes, and
+    /// every byte a pass frees comes from some other consumer's state.
+    ///
+    /// The probe consumer is unregistered before this returns; a granted
+    /// request's bytes stay charged until the grant drops.
+    pub(crate) fn foreign_walk_request(
+        arbitrator: &MemoryArbitrator,
+        bytes: u64,
+    ) -> Result<Grant, Shortfall> {
+        let handle = ConsumerHandle::new();
+        let probe = arbitrator.register_consumer(
+            Arc::new(ForeignProbe {
+                handle: Arc::clone(&handle),
+            }),
+            handle,
+            ConsumerLabel {
+                node: "foreign request".to_string(),
+                surface: MemorySurface::ScanMaterialization,
+            },
+        );
+        let result = arbitrator.reserve(bytes, Requester::for_consumer(probe));
+        arbitrator.unregister_consumer(probe);
+        result
+    }
+
+    /// The consumer a foreign request is made in the name of: charged only
+    /// through its grants, with nothing a spill could free.
+    struct ForeignProbe {
+        handle: Arc<ConsumerHandle>,
+    }
+
+    impl MemoryConsumer for ForeignProbe {
+        fn current_usage(&self) -> u64 {
+            self.handle.bytes()
+        }
+
+        fn reclaimable_bytes(&self) -> u64 {
+            0
+        }
+
+        fn spill_priority(&self) -> i32 {
+            i32::MAX
+        }
+
+        fn try_spill(&self, _target_bytes: u64) -> Result<u64, ConsumerSpillError> {
+            Ok(0)
+        }
+
+        fn can_back_pressure(&self) -> bool {
+            false
+        }
+    }
+
+    /// A stand-in walk-owned state: values held resident, charged a fixed
+    /// figure, that its spill moves to a stand-in disk.
+    pub(crate) struct TestOwnedState {
+        consumer: ConsumerId,
+        handle: Arc<ConsumerHandle>,
+        resident: Vec<u64>,
+        on_disk: Vec<u64>,
+        /// What the resident values charge the consumer's handle.
+        charged: u64,
+        spills: usize,
+    }
+
+    impl TestOwnedState {
+        /// A state charging `bytes` for `values` to consumer `consumer`
+        /// through `handle`, grown there now.
+        pub(crate) fn charged(
+            consumer: ConsumerId,
+            handle: &Arc<ConsumerHandle>,
+            values: Vec<u64>,
+            bytes: u64,
+        ) -> Rc<RefCell<Self>> {
+            handle
+                .try_grow(bytes)
+                .expect("a test owner's state fits when it is built");
+            handle.set_reclaimable(handle.reclaimable() + bytes);
+            Rc::new(RefCell::new(Self {
+                consumer,
+                handle: Arc::clone(handle),
+                resident: values,
+                on_disk: Vec::new(),
+                charged: bytes,
+                spills: 0,
+            }))
+        }
+
+        /// Move every resident value to the stand-in disk and release its
+        /// charge.
+        pub(crate) fn spill(&mut self) {
+            self.on_disk.append(&mut self.resident);
+            self.handle.shrink(self.charged);
+            self.handle
+                .set_reclaimable(self.handle.reclaimable().saturating_sub(self.charged));
+            self.charged = 0;
+            self.spills += 1;
+        }
+
+        /// Every value held, the spilled ones first, in the order each was
+        /// added.
+        pub(crate) fn read_back(&self) -> Vec<u64> {
+            self.on_disk.iter().chain(&self.resident).copied().collect()
+        }
+
+        pub(crate) fn is_resident(&self) -> bool {
+            self.charged > 0
+        }
+
+        /// How many spills ran.
+        pub(crate) fn spills(&self) -> usize {
+            self.spills
+        }
+    }
+
+    impl WalkOwnedSpill for TestOwnedState {
+        fn spill_owned(
+            &mut self,
+            id: ConsumerId,
+            _arbitrator: &MemoryArbitrator,
+        ) -> Result<bool, PipelineError> {
+            if id != self.consumer {
+                return Ok(false);
+            }
+            self.spill();
+            Ok(true)
+        }
+    }
+
+    /// A registered stand-in owner: a node consumer and one cell of state
+    /// charged to it, entered in the walk reclaim set.
+    pub(crate) struct TestWalkOwned {
+        pub(crate) id: ConsumerId,
+        pub(crate) handle: Arc<ConsumerHandle>,
+        pub(crate) cell: Rc<RefCell<TestOwnedState>>,
+        pub(crate) registration: WalkOwnedRegistration,
+    }
+
+    impl TestWalkOwned {
+        /// Register a node consumer named `node`, charge it `bytes` for
+        /// `values` and enter the state's cell through
+        /// [`register_walk_owned`].
+        pub(crate) fn register(
+            arbitrator: &MemoryArbitrator,
+            node: &str,
+            values: Vec<u64>,
+            bytes: u64,
+        ) -> Self {
+            let handle = ConsumerHandle::new();
+            let id = arbitrator.register_node_consumer(
+                Arc::new(NodeBufferConsumer::new(Arc::clone(&handle))),
+                Arc::clone(&handle),
+                ConsumerLabel {
+                    node: node.to_string(),
+                    surface: MemorySurface::SortBuffer,
+                },
+            );
+            let cell = TestOwnedState::charged(id, &handle, values, bytes);
+            let registration =
+                register_walk_owned(arbitrator, id, &handle, &cell).expect("registered");
+            Self {
+                id,
+                handle,
+                cell,
+                registration,
+            }
+        }
+
+        /// The owner's next boundary: answer a raised spill request by
+        /// spilling. Returns whether one was raised.
+        pub(crate) fn answer_spill_request(&self) -> bool {
+            let requested = self.handle.take_spill_request();
+            if requested {
+                self.cell.borrow_mut().spill();
+            }
+            requested
+        }
+    }
+}
+
+#[cfg(test)]
+mod walk_owned_tests {
+    use super::walk_test_support::{
+        TestOwnedState, TestWalkOwned, foreign_walk_request, with_test_walk_frame,
+    };
+    use super::*;
+    use crate::executor::node_buffer::NodeBufferConsumer;
+    use crate::pipeline::memory::Priority;
+    use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface};
+
+    const KIB: u64 = 1024;
+    /// What the stand-in owner charges.
+    const RESIDENT: u64 = 64 * KIB;
+    /// What is free beside it.
+    const FREE: u64 = 16 * KIB;
+
+    /// An arbitrator whose capacity is the owner's charge plus `FREE`.
+    fn arbitrator() -> Arc<MemoryArbitrator> {
+        Arc::new(MemoryArbitrator::with_policy(
+            RESIDENT + FREE,
+            0.80,
+            0.70,
+            Box::new(Priority),
+        ))
+    }
+
+    fn values() -> Vec<u64> {
+        (0..64).collect()
+    }
+
+    /// A node consumer named `sorted` over a fresh handle.
+    fn sort_consumer(arbitrator: &MemoryArbitrator) -> (ConsumerId, Arc<ConsumerHandle>) {
+        let handle = ConsumerHandle::new();
+        let id = arbitrator.register_node_consumer(
+            Arc::new(NodeBufferConsumer::new(Arc::clone(&handle))),
+            Arc::clone(&handle),
+            ConsumerLabel {
+                node: "sorted".to_string(),
+                surface: MemorySurface::SortBuffer,
+            },
+        );
+        (id, handle)
+    }
+
+    fn spill_victim(arbitrator: &MemoryArbitrator, id: ConsumerId) -> VictimOutcome {
+        walk_reclaim_set(arbitrator)
+            .expect("on the walk")
+            .borrow_mut()
+            .spill_victim(id, arbitrator)
+            .expect("spill")
+    }
+
+    fn owned_cells(arbitrator: &MemoryArbitrator, id: ConsumerId) -> usize {
+        walk_reclaim_set(arbitrator)
+            .expect("on the walk")
+            .borrow()
+            .owned_cell_count(id)
+    }
+
+    /// A request another consumer makes on the walk, more than is free but
+    /// less than is free once the owner's state is on disk, is granted by
+    /// spilling that state; the owner's charge falls by all of it and its
+    /// values read back whole.
+    ///
+    /// Capacity: `RESIDENT + FREE`; the request is `FREE + RESIDENT / 2`.
+    #[test]
+    fn walk_owned_state_is_spilled_by_a_pass_another_request_starts() {
+        let arbitrator = arbitrator();
+        with_test_walk_frame(&arbitrator, || {
+            let owner = TestWalkOwned::register(&arbitrator, "sorted", values(), RESIDENT);
+            assert_eq!(owner.handle.bytes(), RESIDENT);
+
+            let grant = foreign_walk_request(&arbitrator, FREE + RESIDENT / 2)
+                .expect("the pass spills the owner's state and the request fits");
+            assert_eq!(grant.bytes(), FREE + RESIDENT / 2);
+            assert_eq!(
+                owner.handle.bytes(),
+                0,
+                "the owner's charge fell by all it held"
+            );
+            assert_eq!(
+                owner.cell.borrow().spills(),
+                1,
+                "the pass spilled the state once"
+            );
+            assert!(!owner.cell.borrow().is_resident());
+            assert_eq!(
+                owner.cell.borrow().read_back(),
+                values(),
+                "the spilled values read back as they were held"
+            );
+            assert_eq!(
+                spill_victim(&arbitrator, owner.id),
+                VictimOutcome::Spilled,
+                "the owner still holds its consumer's state, now on disk"
+            );
+            drop(grant);
+            arbitrator.unregister_consumer(owner.id);
+        });
+    }
+
+    /// While the owner holds its cell (mid-mutation, or itself the
+    /// requester), the pass frees nothing from it and raises its spill
+    /// request instead, which the owner's next boundary answers.
+    #[test]
+    fn walk_owned_state_held_by_its_owner_is_busy_and_answers_at_its_next_boundary() {
+        let arbitrator = arbitrator();
+        with_test_walk_frame(&arbitrator, || {
+            let owner = TestWalkOwned::register(&arbitrator, "sorted", values(), RESIDENT);
+            let held = owner.cell.borrow_mut();
+            assert!(
+                foreign_walk_request(&arbitrator, FREE + RESIDENT / 2).is_err(),
+                "with the owner's cell held the pass frees nothing from it"
+            );
+            drop(held);
+            assert_eq!(
+                owner.handle.bytes(),
+                RESIDENT,
+                "nothing left the busy state"
+            );
+            assert!(owner.cell.borrow().is_resident());
+            assert!(
+                owner.answer_spill_request(),
+                "the busy state's spill request is raised for its next boundary"
+            );
+            assert_eq!(owner.handle.bytes(), 0, "its spill frees all it held");
+            assert_eq!(owner.cell.borrow().read_back(), values());
+            arbitrator.unregister_consumer(owner.id);
+        });
+    }
+
+    /// An owner that is gone is never reached: its entry is pruned at the
+    /// next lookup, and a dropped registration takes its entry with it.
+    #[test]
+    fn dropped_walk_owned_state_is_not_owned() {
+        let arbitrator = arbitrator();
+        with_test_walk_frame(&arbitrator, || {
+            let TestWalkOwned {
+                id,
+                handle,
+                cell,
+                registration,
+            } = TestWalkOwned::register(&arbitrator, "sorted", values(), RESIDENT);
+            assert_eq!(owned_cells(&arbitrator, id), 1);
+            drop(cell);
+            assert_eq!(spill_victim(&arbitrator, id), VictimOutcome::NotOwned);
+            assert_eq!(
+                owned_cells(&arbitrator, id),
+                0,
+                "the lookup pruned the dead owner's entry"
+            );
+            drop(registration);
+            handle.shrink(handle.bytes());
+            arbitrator.unregister_consumer(id);
+
+            let TestWalkOwned {
+                id,
+                cell,
+                registration,
+                ..
+            } = TestWalkOwned::register(&arbitrator, "sorted", values(), RESIDENT / 2);
+            assert_eq!(owned_cells(&arbitrator, id), 1);
+            drop(registration);
+            assert_eq!(
+                owned_cells(&arbitrator, id),
+                0,
+                "a dropped registration removes its entry"
+            );
+            assert_eq!(spill_victim(&arbitrator, id), VictimOutcome::NotOwned);
+            assert!(cell.borrow().is_resident(), "nothing reached the state");
+            arbitrator.unregister_consumer(id);
+        });
+    }
+
+    /// Two cells that charge one consumer both spill when a pass elects it.
+    #[test]
+    fn cells_sharing_a_consumer_id_all_spill() {
+        let arbitrator = arbitrator();
+        with_test_walk_frame(&arbitrator, || {
+            let owner = TestWalkOwned::register(&arbitrator, "sorted", values(), RESIDENT / 2);
+            let second =
+                TestOwnedState::charged(owner.id, &owner.handle, (64..96).collect(), RESIDENT / 4);
+            let _second_registration =
+                register_walk_owned(&arbitrator, owner.id, &owner.handle, &second)
+                    .expect("registered");
+            assert_eq!(owned_cells(&arbitrator, owner.id), 2);
+            assert_eq!(owner.handle.bytes(), RESIDENT / 2 + RESIDENT / 4);
+
+            assert_eq!(spill_victim(&arbitrator, owner.id), VictimOutcome::Spilled);
+            assert_eq!(owner.cell.borrow().spills(), 1);
+            assert_eq!(second.borrow().spills(), 1, "the second cell spilled too");
+            assert_eq!(owner.handle.bytes(), 0, "both cells' charges left");
+            arbitrator.unregister_consumer(owner.id);
+        });
+    }
+
+    /// With no walk frame installed the registration enters nothing, so a
+    /// frame installed later does not reach the state.
+    #[test]
+    fn registration_without_a_walk_frame_is_inert() {
+        let arbitrator = arbitrator();
+        let (id, handle) = sort_consumer(&arbitrator);
+        let cell = TestOwnedState::charged(id, &handle, values(), RESIDENT);
+        let _registration = register_walk_owned(&arbitrator, id, &handle, &cell)
+            .expect("a thread with no walk frame registers nothing and does not fail");
+        with_test_walk_frame(&arbitrator, || {
+            assert_eq!(owned_cells(&arbitrator, id), 0);
+            assert_eq!(spill_victim(&arbitrator, id), VictimOutcome::NotOwned);
+        });
+        assert!(cell.borrow().is_resident());
+        arbitrator.unregister_consumer(id);
+    }
+
+    /// Registering while the walk reclaim set is borrowed is refused, names
+    /// the consumer's node and enters nothing.
+    #[test]
+    fn registration_while_the_set_is_borrowed_is_refused() {
+        let arbitrator = arbitrator();
+        with_test_walk_frame(&arbitrator, || {
+            let (id, handle) = sort_consumer(&arbitrator);
+            let cell = TestOwnedState::charged(id, &handle, values(), RESIDENT);
+            let set = walk_reclaim_set(&arbitrator).expect("on the walk");
+            let borrowed = set.borrow_mut();
+            let refused = register_walk_owned(&arbitrator, id, &handle, &cell);
+            drop(borrowed);
+            assert!(
+                matches!(&refused, Err(PipelineError::Internal { node, .. }) if node == "sorted"),
+                "a borrowed set refuses the registration"
+            );
+            assert_eq!(owned_cells(&arbitrator, id), 0);
+            arbitrator.unregister_consumer(id);
+        });
     }
 }
