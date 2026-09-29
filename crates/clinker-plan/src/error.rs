@@ -584,11 +584,13 @@ impl fmt::Display for PipelineError {
                     .join(", ");
                 write!(
                     f,
-                    "E314 Schema mismatch at operator '{operator_name}' (kind={operator_kind}, \
-                     input from '{upstream_name}'): expected {} columns: [{exp_list}] \
+                    "E314 Schema mismatch at operator {operator_name} (kind={operator_kind}, \
+                     input from {upstream_name}): expected {} columns: [{exp_list}] \
                      record has {} columns: [{act_list}]",
                     expected.column_count(),
                     actual.column_count(),
+                    operator_name = operator_name.quoted_name(),
+                    upstream_name = upstream_name.quoted_name(),
                 )
             }
             Self::CompositionDepthExceeded {

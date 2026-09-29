@@ -18,6 +18,7 @@ use crate::executor::dispatch::{
 };
 use crate::executor::{parse_memory_limit, stage_metrics};
 use crate::pipeline::spill_merge::merge_sorted_runs;
+use clinker_core_types::QuoteName;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode, single_predecessor};
 
@@ -322,7 +323,8 @@ where
         if buf.should_spill() {
             let written = buf.sort_and_spill().map_err(|error| {
                 PipelineError::Io(std::io::Error::other(format!(
-                    "sort enforcer '{node_name}' spill failed: {error}"
+                    "sort enforcer {node_name} spill failed: {error}",
+                    node_name = node_name.quoted_name()
                 )))
             })?;
             charge_enforcer_spill(&charge, node_name, written)?;
@@ -342,7 +344,8 @@ where
     };
     let (sorted, residue) = buf.finish().map_err(|error| {
         PipelineError::Io(std::io::Error::other(format!(
-            "sort enforcer '{node_name}' finish failed: {error}"
+            "sort enforcer {node_name} finish failed: {error}",
+            node_name = node_name.quoted_name()
         )))
     })?;
     charge_enforcer_spill(&charge, node_name, residue)?;
@@ -392,7 +395,8 @@ fn drain_into_sort_buffer(
         if buf.should_spill() {
             let written = buf.sort_and_spill().map_err(|e| {
                 PipelineError::Io(std::io::Error::other(format!(
-                    "sort enforcer '{node_name}' spill failed: {e}"
+                    "sort enforcer {node_name} spill failed: {e}",
+                    node_name = node_name.quoted_name()
                 )))
             })?;
             charge_enforcer_spill(charge, node_name, written)?;
@@ -400,7 +404,8 @@ fn drain_into_sort_buffer(
     }
     let (sorted, residue) = buf.finish().map_err(|e| {
         PipelineError::Io(std::io::Error::other(format!(
-            "sort enforcer '{node_name}' finish failed: {e}"
+            "sort enforcer {node_name} finish failed: {e}",
+            node_name = node_name.quoted_name()
         )))
     })?;
     charge_enforcer_spill(charge, node_name, residue)?;
