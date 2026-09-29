@@ -867,8 +867,10 @@ impl ConsumerHandle {
 /// (read with [`ConsumerHandle::take_spill_request`] at a batch boundary),
 /// or `should_spill` / `should_spill_self` reporting the soft threshold
 /// crossed at a batch boundary, never on a byte, row or count threshold or
-/// an RSS reading of its own. [`MemoryArbitrator::spill_reclaimable`] posts
-/// the same request before a paused Source resumes. Refuse growth only
+/// an RSS reading of its own. [`MemoryArbitrator::spill_reclaimable`], which
+/// runs before a paused Source resumes, runs the reclaim round: on the walk
+/// it spills walk-owned victims now; with no walk frame it raises their
+/// spill requests. Refuse growth only
 /// through the arbitrator: a shortfall from [`MemoryArbitrator::reserve`],
 /// `try_grow` or `try_resize`, or the remaining limit checks
 /// (`should_abort`, `should_abort_local`) for bytes not yet charged, never
@@ -890,9 +892,10 @@ impl ConsumerHandle {
 /// Implementations live with their operator (Aggregate, sort,
 /// grace-hash, sort-merge join, IEJoin, inter-stage buffers). The
 /// arbitrator holds them as `Arc<dyn MemoryConsumer>` in a copy-on-write
-/// snapshot and reads `current_usage` / `spill_priority` /
-/// `can_back_pressure` on every arbitration round; `pause` / `resume` /
-/// `try_spill` fire only when a policy selects the consumer as a victim.
+/// snapshot and reads `current_usage` / `reclaimable_bytes` /
+/// `spill_priority` / `can_back_pressure` on every arbitration round;
+/// `pause` / `resume` / `try_spill` fire only when a policy selects the
+/// consumer as a victim.
 ///
 /// All methods take `&self`: the arbitrator drives them from a shared
 /// snapshot read, and every implementation routes its mutable state
@@ -903,8 +906,9 @@ impl ConsumerHandle {
 /// without compromising the existing pipeline-context concurrency
 /// posture.
 pub trait MemoryConsumer: Send + Sync {
-    /// Live bytes the consumer currently holds, as the victim policies rank
-    /// it. Read every arbitration round; must be cheap. The charged total the
+    /// Live bytes the consumer currently holds. Victims are ranked by
+    /// [`Self::reclaimable_bytes`], not by this figure. Read every
+    /// arbitration round; must be cheap. The charged total the
     /// limit is checked against is the ledger's, which a handle-backed
     /// consumer's handle charges; this figure is not summed into it.
     fn current_usage(&self) -> u64;
@@ -2221,41 +2225,6 @@ impl MemoryArbitrator {
                 }
             }
         }
-    }
-
-    /// Best-effort spill of reclaimable (non-back-pressureable) consumers in
-    /// ascending `spill_priority` order, the order of the per-operator
-    /// arbitration-parameters table in `docs/engine/src/memory-arbitration.md`,
-    /// shedding up to `target_bytes` of downstream state.
-    ///
-    /// Called at a drain arm's progress boundary, just before a Source that
-    /// a prior round paused under pressure is resumed, so the resumed
-    /// producer does not immediately re-trip the soft limit (Spark's "spill
-    /// other consumers before you proceed"). Overshoot reduction only:
-    /// liveness never depends on it — the drain arm makes progress
-    /// regardless — so a partial or zero spill is fine and no error is
-    /// surfaced. `try_spill` flips each victim's `spill_requested` flag,
-    /// which its operator reads at the next batch boundary.
-    pub fn spill_reclaimable(&self, target_bytes: u64) -> u64 {
-        if target_bytes == 0 {
-            return 0;
-        }
-        let consumers = self.consumers.load();
-        let mut ordered: Vec<&(ConsumerId, Arc<dyn MemoryConsumer>)> = consumers
-            .iter()
-            .filter(|(_, c)| !c.can_back_pressure())
-            .collect();
-        ordered.sort_by_key(|(_, c)| c.spill_priority());
-        let mut remaining = target_bytes;
-        for (_, consumer) in ordered {
-            if remaining == 0 {
-                break;
-            }
-            if let Ok(freed) = consumer.try_spill(remaining) {
-                remaining = remaining.saturating_sub(freed);
-            }
-        }
-        0
     }
 }
 

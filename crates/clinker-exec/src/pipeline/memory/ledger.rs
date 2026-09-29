@@ -307,6 +307,17 @@ impl PassOutcome {
     }
 }
 
+/// What a reclaim pass aims to free.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PassAim {
+    /// Room for a request of this many bytes: the larger of its shortfall
+    /// and what brings the ledger, with the request charged, down to the
+    /// resume watermark.
+    Request(u64),
+    /// This many bytes, whatever the ledger holds.
+    Shed(u64),
+}
+
 /// Which consumers a reclaim pass may elect.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PassKind {
@@ -365,15 +376,99 @@ impl MemoryArbitrator {
         self.reserve_now(bytes, requester)
     }
 
-    /// Check that `projected` bytes not yet charged would fit beside the
-    /// ledger's charges, for a hard-limit backstop whose growth is not a
-    /// consumer charge. Charges nothing.
+    /// Make room for `projected` bytes that are not yet a consumer charge,
+    /// for a hard-limit backstop that would otherwise abort, and charge
+    /// nothing.
+    ///
+    /// `Ok` at once when they fit beside the ledger's charges. On the run's
+    /// walk a projection that does not fit runs the same reclaim loop as
+    /// [`Self::reserve`] with `projected` as the request: passes spill
+    /// walk-owned state, the requester's own last, and the check retries
+    /// after each, refusing only when a pass freed nothing with no release
+    /// during it and a final pass then freed nothing too. Any other thread
+    /// gets the shortfall at once and never spills; an off-walk requester
+    /// that must grow takes a grant it can wait for instead.
     pub fn reclaim_before_abort(
         &self,
         requester: Requester,
         projected: u64,
     ) -> Result<(), Shortfall> {
-        self.projection_fits(projected, requester)
+        let first = match self.projection_fits(projected, requester) {
+            Ok(()) => return Ok(()),
+            Err(shortfall) => shortfall,
+        };
+        if walk::thread_role(self) != ThreadRole::Walk {
+            return Err(first);
+        }
+        self.reclaim_until_granted(projected, requester, first, || {
+            self.projection_fits(projected, requester)
+        })
+    }
+
+    /// Shed up to `target_bytes` of reclaimable state now, in one reclaim
+    /// round, and return the bytes the round's victims released themselves.
+    /// A zero target runs nothing.
+    ///
+    /// On the run's walk the round is a reclaim pass aimed at the target: it
+    /// spills walk-owned victims in the policy's order, ranked by what their
+    /// spill frees, until their own charge decreases cover it. With no walk
+    /// frame for this run on the calling thread the round is
+    /// [`Self::frameless_pass`], which only raises spill requests and frees
+    /// nothing itself. Best effort either way: a partial or zero result is
+    /// not an error, and a spill failure on the walk is kept for the walk's
+    /// next dispatch boundary.
+    pub fn spill_reclaimable(&self, target_bytes: u64) -> u64 {
+        if target_bytes == 0 {
+            return 0;
+        }
+        let requester = Requester::governed();
+        if walk::thread_role(self) != ThreadRole::Walk {
+            return self.frameless_pass(target_bytes, requester);
+        }
+        self.pass_on_walk(|reclaim| {
+            self.run_pass(
+                PassAim::Shed(target_bytes),
+                requester,
+                reclaim,
+                PassKind::Ordinary,
+            )
+        })
+        .map_or(0, |pass| pass.freed)
+    }
+
+    /// A reclaim round started where no walk frame for this run is
+    /// installed, so nothing can spill walk-owned state synchronously.
+    ///
+    /// It ranks candidates exactly as a reclaim pass does (never a
+    /// back-pressureable consumer, never one whose reclaimable bytes are 0,
+    /// the requester last) and raises the cooperative spill request on each
+    /// in that order, through the consumer's `try_spill`, until the chosen
+    /// candidates' reclaimable bytes cover `target`; the figure `try_spill`
+    /// returns is ignored. It returns the chosen candidates' own charge
+    /// decreases across their calls, which are 0 until their owners service
+    /// the requests at their next safe point. It never spills, never waits
+    /// on anyone and never fails. Only tests call the entry points without a
+    /// frame: production runs every round on the walk.
+    fn frameless_pass(&self, target: u64, requester: Requester) -> u64 {
+        self.reclaim_rounds.fetch_add(1, Ordering::Relaxed);
+        let registered = self.consumers.load();
+        let mut covered = 0u64;
+        let mut freed = 0u64;
+        for id in self.pass_candidates(requester.consumer, PassKind::Ordinary) {
+            if covered >= target {
+                break;
+            }
+            let Some((_, consumer)) = registered.iter().find(|(candidate, _)| *candidate == id)
+            else {
+                continue;
+            };
+            covered = covered.saturating_add(consumer.reclaimable_bytes());
+            let before = self.admission.ledger.lock().consumer_charged(id.0);
+            let _ = consumer.try_spill(target);
+            let after = self.admission.ledger.lock().consumer_charged(id.0);
+            freed = freed.saturating_add(before.saturating_sub(after));
+        }
+        freed
     }
 
     /// Whether `projected` more bytes fit now, checked under the ledger lock
@@ -539,7 +634,9 @@ impl MemoryArbitrator {
             }
             if shortfall.forced() {
                 if self
-                    .pass_on_walk(need, requester, PassKind::Forced)
+                    .pass_on_walk(|reclaim| {
+                        self.reclaim_pass(need, requester, reclaim, PassKind::Forced)
+                    })
                     .is_none()
                 {
                     return Err(shortfall);
@@ -552,7 +649,9 @@ impl MemoryArbitrator {
                     }
                 }
             }
-            let Some(pass) = self.pass_on_walk(need, requester, PassKind::Ordinary) else {
+            let Some(pass) = self.pass_on_walk(|reclaim| {
+                self.reclaim_pass(need, requester, reclaim, PassKind::Ordinary)
+            }) else {
                 return Err(shortfall);
             };
             match attempt() {
@@ -562,7 +661,9 @@ impl MemoryArbitrator {
             if shortfall.forced() || pass.earns_a_retry() || !self.off_walk_quiescent() {
                 continue;
             }
-            let Some(last) = self.pass_on_walk(need, requester, PassKind::Final) else {
+            let Some(last) = self.pass_on_walk(|reclaim| {
+                self.reclaim_pass(need, requester, reclaim, PassKind::Final)
+            }) else {
                 return Err(shortfall);
             };
             match attempt() {
@@ -576,24 +677,25 @@ impl MemoryArbitrator {
         }
     }
 
-    /// Run one pass of `kind` over the walk's reclaim set, or over the busy
-    /// stand-in when the set is already borrowed. `None` when the pass met a
-    /// spill failure, which is kept for the walk.
-    fn pass_on_walk(&self, need: u64, requester: Requester, kind: PassKind) -> Option<PassOutcome> {
+    /// Run `pass` over the walk's reclaim set, or over the busy stand-in when
+    /// the set is already borrowed. `None` when the pass met a spill
+    /// failure, which is kept for the walk.
+    fn pass_on_walk(
+        &self,
+        pass: impl FnOnce(&mut dyn WalkReclaim) -> Result<PassOutcome, PipelineError>,
+    ) -> Option<PassOutcome> {
         #[cfg(test)]
         if let Some(stand_in) = walk::test_reclaim() {
             let outcome = match stand_in.try_borrow_mut() {
-                Ok(mut stand_in) => self.reclaim_pass(need, requester, &mut *stand_in, kind),
-                Err(_) => self.reclaim_pass(need, requester, &mut BorrowedReclaimSet, kind),
+                Ok(mut stand_in) => pass(&mut *stand_in),
+                Err(_) => pass(&mut BorrowedReclaimSet),
             };
             return self.kept_on_failure(outcome);
         }
         let set = walk::walk_reclaim_set(self);
         let outcome = match set.as_ref().map(|set| set.try_borrow_mut()) {
-            Some(Ok(mut set)) => self.reclaim_pass(need, requester, &mut *set, kind),
-            Some(Err(_)) | None => {
-                self.reclaim_pass(need, requester, &mut BorrowedReclaimSet, kind)
-            }
+            Some(Ok(mut set)) => pass(&mut *set),
+            Some(Err(_)) | None => pass(&mut BorrowedReclaimSet),
         };
         self.kept_on_failure(outcome)
     }
@@ -639,18 +741,34 @@ impl MemoryArbitrator {
         reclaim: &mut dyn WalkReclaim,
         kind: PassKind,
     ) -> Result<PassOutcome, PipelineError> {
+        self.run_pass(PassAim::Request(need), requester, reclaim, kind)
+    }
+
+    /// [`Self::reclaim_pass`] with what it aims to free given by `aim`.
+    fn run_pass(
+        &self,
+        aim: PassAim,
+        requester: Requester,
+        reclaim: &mut dyn WalkReclaim,
+        kind: PassKind,
+    ) -> Result<PassOutcome, PipelineError> {
         self.reclaim_rounds.fetch_add(1, Ordering::Relaxed);
         let target = {
             let mut ledger = self.admission.ledger.lock();
             if let Some(walk) = super::sync::current_thread() {
                 ledger.begin_pass(walk);
             }
-            let short = need.saturating_sub(ledger.available());
-            let to_watermark = ledger
-                .charged()
-                .saturating_add(need)
-                .saturating_sub(self.resume_limit());
-            short.max(to_watermark)
+            match aim {
+                PassAim::Request(need) => {
+                    let short = need.saturating_sub(ledger.available());
+                    let to_watermark = ledger
+                        .charged()
+                        .saturating_add(need)
+                        .saturating_sub(self.resume_limit());
+                    short.max(to_watermark)
+                }
+                PassAim::Shed(target) => target,
+            }
         };
         let mut pass = OpenPass {
             arbitrator: self,

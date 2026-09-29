@@ -2429,6 +2429,18 @@ mod tests {
         ))
     }
 
+    /// A run whose policy elects spill victims, as a production run's does,
+    /// for the tests that ask the arbitrator to shed state: a reclaim round
+    /// follows the run's policy, and `ledger_arbitrator`'s elects no one.
+    fn electing_arbitrator(limit: u64) -> Arc<MemoryArbitrator> {
+        Arc::new(MemoryArbitrator::with_policy(
+            limit,
+            0.8,
+            0.6,
+            MemoryArbitrator::default_policy(),
+        ))
+    }
+
     /// A document state charged to `arbitrator` holding one failed document.
     fn ledger_state(arbitrator: &Arc<MemoryArbitrator>) -> (DocumentDlqState, DocKey) {
         let key: DocKey = Arc::from("orders.csv");
@@ -2966,7 +2978,7 @@ mod tests {
     #[test]
     fn held_rows_flush_on_a_spill_request() {
         let root = tempfile::tempdir().expect("spill root");
-        let arbitrator = ledger_arbitrator(1 << 30);
+        let arbitrator = electing_arbitrator(1 << 30);
         let mut state = held_state(&arbitrator, root.path(), 1 << 20);
         let docs: Vec<DocKey> = (0..3).map(doc_key).collect();
         let mut ordinal = 0;
@@ -3091,7 +3103,7 @@ mod tests {
     #[test]
     fn held_log_past_the_disk_cap_is_e320() {
         let root = tempfile::tempdir().expect("spill root");
-        let arbitrator = ledger_arbitrator(1 << 30);
+        let arbitrator = electing_arbitrator(1 << 30);
         arbitrator.set_max_spill_bytes(16).expect("cap");
         let mut state = held_state(&arbitrator, root.path(), usize::MAX);
         let doc = doc_key(0);
@@ -3115,7 +3127,7 @@ mod tests {
     #[test]
     fn dropping_the_state_removes_the_held_file_and_consumer() {
         let root = tempfile::tempdir().expect("spill root");
-        let arbitrator = ledger_arbitrator(1 << 30);
+        let arbitrator = electing_arbitrator(1 << 30);
         let consumers_before = arbitrator.consumer_count();
         let usage_before = arbitrator.sum_consumer_usage();
         let mut state = held_state(&arbitrator, root.path(), usize::MAX);

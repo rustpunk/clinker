@@ -116,7 +116,7 @@ When memory use approaches the limit (the soft threshold is 80 % of `limit`), so
 |-------|----------|
 | `pause` (default) | Where possible, pause an upstream reader so it stops producing until pressure eases; when a paused reader is about to be needed, first spill downstream state and then proceed, so a pause never stalls the run. |
 | `spill` | Never pause a producer — always free memory by spilling a stage to disk. |
-| `both` | Pause where possible, otherwise spill whichever stage is holding the most memory. |
+| `both` | Pause where possible, otherwise spill whichever stage a spill would free the most memory from. |
 
 `pause` is the right default for most pipelines: pausing a fast Source feeding a slow downstream stage is cheaper than writing its buffered records to disk. Reach for `spill` or `both` only when you have a specific reason to prefer a different posture — for example, `both` when one large stage dominates the budget and you want it spilled first.
 

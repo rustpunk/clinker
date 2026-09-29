@@ -482,6 +482,12 @@ impl<L, A> LedgerState<L, A> {
         self.consumers.get(&id).map_or(0, |entry| entry.handle)
     }
 
+    /// Consumer `id`'s own charge now: its handle's bytes plus the bytes
+    /// granted in its name.
+    pub(crate) fn consumer_charged(&self, id: u32) -> u64 {
+        self.consumers.get(&id).map_or(0, ConsumerEntry::current)
+    }
+
     /// Remove consumer `id`'s entry, releasing its remaining handle charge,
     /// and return its mark. Bytes still granted in its name stay charged and
     /// are unattributed from here on.

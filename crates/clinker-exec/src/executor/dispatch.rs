@@ -2455,12 +2455,16 @@ impl<'a> ExecutorContext<'a> {
     /// registered handle (already released, or a body-port seed source).
     pub(crate) fn activate_source_for_drain(&self, source_name: &str) {
         if let Some((_, handle)) = self.source_consumers.get(source_name) {
-            // Layer 3 spill-nudge: if a prior round paused this source under
-            // genuine pressure, shed reclaimable downstream state (Priority
-            // order) before resuming it, so the resumed producer does not
-            // immediately re-trip the soft limit. Overshoot reduction only —
-            // liveness does not depend on it, so an over-target of 0 (no
-            // current pressure) is a no-op.
+            // If a prior round paused this source under genuine pressure,
+            // shed reclaimable downstream state before resuming it, so the
+            // resumed producer does not immediately re-trip the soft limit.
+            // The shedding is one reclaim round (the walk spills its own
+            // state, ranked by what each spill frees), aimed at how far the
+            // larger of process memory and the charged total sits above the
+            // soft limit: until a Source can wait for memory, this eager
+            // spill is what leaves it room to resume into. Overshoot
+            // reduction only — liveness does not depend on it, so an
+            // over-target of 0 (no current pressure) is a no-op.
             if handle.is_paused() {
                 let over = self
                     .memory_budget
@@ -5128,10 +5132,11 @@ pub(crate) fn transform_fused_consume(
 /// next node.
 ///
 /// A spill request reaches a slot when an operator's `should_spill` poll
-/// elects it (`try_spill`), when `spill_reclaimable` sheds state before a
-/// paused Source resumes, or when a reclaim pass finds the slot held by the
-/// running arm; each only flips the slot's [`ConsumerHandle`] spill-request
-/// flag and performs no I/O. This sweep is the servicing half: it
+/// elects it (`try_spill`), or when a reclaim pass (a request's, or the
+/// round `spill_reclaimable` runs before a paused Source resumes) finds the
+/// slot held by the running arm; each only flips the slot's
+/// [`ConsumerHandle`] spill-request flag and performs no I/O. This sweep is
+/// the servicing half: it
 /// reads each live slot's flag via `take_spill_request` and, for a resident
 /// resident `NodeBuffer::Memory` slot whose compiled classification permits
 /// spilling ([`node_buffer_spill_allowed`]), flushes it to
