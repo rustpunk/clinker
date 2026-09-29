@@ -381,6 +381,11 @@ E310 totals: needed 2.0 MiB more for group state, but memory.limit 8.0 MiB is fu
   orders`, the row number the dead-letter output writes in
   `_cxl_dlq_source_row`). The report no longer prints the group's key: it
   names nodes, surfaces and byte counts only, never a record value.
+- A join that stops while matching a part of its build side it could not
+  split further says about how many distinct join keys that part held
+  (`join partition: about N distinct keys`), and, when it is one, that one
+  key's rows cannot be split across partitions. The count is an estimate;
+  no key is printed.
 - A Source, writer or worker whose own allocation the memory limit refuses
   now fails the run with this E310, naming that node, instead of an
   I/O-shaped budget error.

@@ -50,8 +50,8 @@
 //!
 //! ## Submodules
 //!
-//! - [`build`] — partition assignment, the build-record byte estimate, and
-//!   the byte-bounded build-chunk iterator.
+//! - [`build`] — partition assignment, the distinct-key sketch, the
+//!   build-record byte estimate, and the byte-bounded build-chunk iterator.
 //! - [`probe`] — per-probe match emission shared by every join path.
 //! - [`spill`] — spilled-partition reload, recursive repartition, and
 //!   the block-nested-loop fallback.
@@ -87,7 +87,7 @@ use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::combine::DecomposedPredicate;
 
-use build::{PartitionAssigner, estimated_build_entry_bytes};
+use build::{GraceHll, PartitionAssigner, estimated_build_entry_bytes};
 use probe::{EmitArgs, GraceEmitSink, ProbeMatches, ProbeOutcome, emit_for_probe};
 use spill::{ReloadContext, SpilledPartition, process_spilled_partition};
 
@@ -130,9 +130,13 @@ enum PartitionState {
     /// `bytes_estimated` is a running sum of
     /// [`estimated_build_entry_bytes`] used to pick a spill victim
     /// (Largest-Size policy).
+    /// `distinct_sketch` is fed on every insert; it survives the
+    /// Building → OnDisk transition so the BNL fallback can report
+    /// approximate cardinality if a partition trips E310.
     Building {
         records: Vec<(Record, RecordOrder, BuildSeq)>,
         bytes_estimated: usize,
+        distinct_sketch: GraceHll,
     },
     /// Build side spilled. `build_files` carries one file per
     /// spill flush of this partition (the initial bulk spill plus
@@ -141,6 +145,9 @@ enum PartitionState {
     /// to this partition; finalized into `probe_files` before reload.
     /// `hash_bits` records the assigner width at the time of writing —
     /// important for the reload path's recursive split.
+    /// `distinct_sketch` carries the build-side HLL across the spill
+    /// boundary so the reload path's BNL branch has a cardinality
+    /// estimate without re-scanning.
     ///
     /// `probe_writer` is boxed so the enum variants stay near the same
     /// stack footprint (the LZ4 frame encoder + buffered file handle
@@ -154,6 +161,7 @@ enum PartitionState {
         build_count: u64,
         probe_count: u64,
         hash_bits: u8,
+        distinct_sketch: GraceHll,
     },
     /// In-memory hash table built; ready for probe. `build_ids[i]` is the
     /// row id and [`BuildSeq`] of the build record the table reports at
@@ -327,6 +335,7 @@ impl GraceHashExecutor {
             partitions.push(PartitionState::Building {
                 records: Vec::new(),
                 bytes_estimated: 0,
+                distinct_sketch: GraceHll::new(),
             });
         }
         Self {
@@ -395,10 +404,12 @@ impl GraceHashExecutor {
                 if let PartitionState::Building {
                     records,
                     bytes_estimated,
+                    distinct_sketch,
                 } = &mut self.partitions[p]
                 {
                     records.push((record, row, seq));
                     *bytes_estimated += bytes;
+                    distinct_sketch.add(hash);
                     // Mirror the admitted bytes into the consumer
                     // handle so the arbitrator's policy sees this
                     // partition's contribution at poll time.
@@ -417,11 +428,13 @@ impl GraceHashExecutor {
                 if let PartitionState::OnDisk {
                     build_files,
                     build_count,
+                    distinct_sketch,
                     ..
                 } = &mut self.partitions[p]
                 {
                     build_files.push(new_path);
                     *build_count += 1;
+                    distinct_sketch.add(hash);
                 }
                 charge_grace_spill(budget, &self.name, written)?;
             }
@@ -460,7 +473,9 @@ impl GraceHashExecutor {
     }
 
     /// Drain partition `idx` from Building → OnDisk by writing every
-    /// in-memory record to a fresh spill file.
+    /// in-memory record to a fresh spill file. The HLL sketch is
+    /// preserved verbatim across the transition so the reload-phase
+    /// BNL branch can read partition cardinality without rebuilding.
     fn spill_partition(
         &mut self,
         idx: usize,
@@ -470,11 +485,12 @@ impl GraceHashExecutor {
         let hash_bits = assigner_bits;
         let partition_id = idx as u16;
         let prev = std::mem::replace(&mut self.partitions[idx], PartitionState::Done);
-        let (records, bytes_estimated) = match prev {
+        let (records, distinct_sketch, bytes_estimated) = match prev {
             PartitionState::Building {
                 records,
+                distinct_sketch,
                 bytes_estimated,
-            } => (records, bytes_estimated),
+            } => (records, distinct_sketch, bytes_estimated),
             other => {
                 // Restore and bail.
                 self.partitions[idx] = other;
@@ -499,6 +515,7 @@ impl GraceHashExecutor {
             build_count: count,
             probe_count: 0,
             hash_bits,
+            distinct_sketch,
         };
         // Building → OnDisk: in-memory bytes are now off-process.
         // Saturating-sub keeps the counter aligned with the
@@ -511,7 +528,10 @@ impl GraceHashExecutor {
 
     /// Transition every Building partition → Ready by constructing
     /// its `CombineHashTable`. After this call, only `Ready` and
-    /// `OnDisk` states remain.
+    /// `OnDisk` states remain. The Building variant's HLL is dropped
+    /// at this transition: in-memory partitions complete probing
+    /// against the live `CombineHashTable` and never reach the BNL
+    /// branch where the sketch would be consulted.
     pub(crate) fn finish_build(
         &mut self,
         extractor: &KeyExtractor,
@@ -635,7 +655,10 @@ impl GraceHashExecutor {
     }
 
     /// Iterate spilled partitions, returning their reload payloads in
-    /// partition order. Drains each as it yields.
+    /// partition order. Drains each as it yields. The HLL sketch
+    /// transfers ownership from the partition state to the
+    /// `SpilledPartition` so the reload path can put its cardinality
+    /// estimate on the BNL branch's E310 report.
     pub(crate) fn drain_spilled(&mut self) -> Vec<SpilledPartition> {
         let mut out = Vec::new();
         for (idx, state) in self.partitions.iter_mut().enumerate() {
@@ -645,6 +668,7 @@ impl GraceHashExecutor {
                 probe_files,
                 build_count,
                 hash_bits,
+                distinct_sketch,
                 ..
             } = prev
             {
@@ -654,6 +678,7 @@ impl GraceHashExecutor {
                     probe_files,
                     build_count,
                     hash_bits,
+                    distinct_sketch,
                 });
             }
         }
@@ -810,7 +835,8 @@ pub(crate) fn execute_combine_grace_hash(
     // conservatively sized — FP rate ≤ target, just possibly more bits).
     // When no plan-time estimate exists the filter is skipped rather than
     // buffered. The feed runs outside the order-sensitive `add_build_record`
-    // loop, so the partition table and spill timing are unchanged.
+    // loop, so the partition table and spill timing are unchanged; the
+    // per-partition diagnostic sketches stay at 64 registers.
     //
     // The build node's row count is normally the plan-time file-metadata
     // estimate; if the build source already drained and recorded its exact

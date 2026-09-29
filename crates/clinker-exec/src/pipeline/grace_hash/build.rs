@@ -1,5 +1,6 @@
 //! Build-side primitives for the grace hash join: hash-to-partition
-//! assignment, the build-record byte estimate that drives spill-victim
+//! assignment, the per-partition distinct-key sketch consulted on an
+//! E310 abort, the build-record byte estimate that drives spill-victim
 //! selection, and the byte-bounded chunk iterator the BNL fallback
 //! feeds its build side through.
 
@@ -8,11 +9,48 @@ use clinker_record::Record;
 use super::RecordOrder;
 use crate::pipeline::combine::BuildSeq;
 
+use crate::sketch::Hll;
+
 /// Maximum partition bit width. 12 bits = 4096 partitions; beyond this,
 /// per-partition overhead (file handles, postcard headers, hashbrown
 /// allocations) outweighs further skew reduction. AsterixDB and DuckDB
 /// converge on the same cap.
 pub(super) const MAX_HASH_BITS: u8 = 12;
+
+/// Per-partition distinct-key sketch carried by the grace hash join.
+///
+/// Fixed at 64 registers (≈±13% nominal error, 64 bytes per partition):
+/// this is a diagnostic-quality estimate consulted only when an E310
+/// abort fires, so the report can say how many distinct join keys the
+/// partition that stopped held. The planner-grade statistics catalog
+/// instantiates the same [`Hll`] at ≥1024 registers; the hot-path
+/// partition sketch deliberately stays small.
+///
+/// Every key in a partition shares the top hash bits that chose it (up to
+/// [`MAX_HASH_BITS`] of them), and [`Hll`] picks a register from the top
+/// bits too, so fed the key hash as is it would reach only `64 >> bits`
+/// registers and report about one key for any partition six or more bits
+/// deep. Each hash is rotated left by [`MAX_HASH_BITS`] first: the register
+/// then comes from bits no partition assignment reads, and distinct hashes
+/// stay distinct.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GraceHll(Hll<64>);
+
+impl GraceHll {
+    pub(crate) fn new() -> Self {
+        Self(Hll::new())
+    }
+
+    /// Count the key whose partitioning hash is `hash`.
+    pub(crate) fn add(&mut self, hash: u64) {
+        self.0.add(hash.rotate_left(u32::from(MAX_HASH_BITS)));
+    }
+
+    /// The approximate number of distinct keys counted.
+    pub(crate) fn estimate(&self) -> u64 {
+        self.0.estimate()
+    }
+}
 
 // ──────────────────────────────────────────────────────────────────────────
 // PartitionAssigner

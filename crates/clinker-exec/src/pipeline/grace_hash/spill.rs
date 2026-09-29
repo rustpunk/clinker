@@ -13,7 +13,7 @@ use clinker_record::{Record, Schema, Value};
 use cxl::eval::{EvalContext, ProgramEvaluator};
 
 use super::RecordOrder;
-use super::build::{BuildChunkIter, PartitionAssigner};
+use super::build::{BuildChunkIter, GraceHll, PartitionAssigner};
 use super::probe::{EmitArgs, GraceEmitSink, ProbeMatches, emit_for_probe};
 use crate::executor::combine::CombineResolver;
 use crate::pipeline::combine::{BuildSeq, CombineHashTable, KeyExtractor, hash_composite_key};
@@ -49,13 +49,16 @@ pub(crate) const PROBE_BUFFER_RESERVATION: usize = 4 * 1024 * 1024;
 pub(crate) const SKEW_REDUCTION_THRESHOLD: f64 = 0.20;
 
 /// One spilled partition's reload payload, drained from the executor
-/// after the probe phase.
+/// after the probe phase. The HLL sketch travels alongside so the BNL
+/// fallback path can put a cardinality estimate on the E310 report
+/// without re-walking the spill files.
 pub(crate) struct SpilledPartition {
     pub partition_id: u16,
     pub build_files: Vec<SpillFilePath>,
     pub probe_files: Vec<SpillFile<RecordOrder>>,
     pub build_count: u64,
     pub hash_bits: u8,
+    pub distinct_sketch: GraceHll,
 }
 
 /// Bundle of reload-phase context shared across recursive
@@ -172,9 +175,16 @@ pub(super) fn process_spilled_partition(
         // re-hashing under the wider assigner. The parent's partition
         // id is `sp.partition_id`; under the child assigner the parent
         // id equals `child_id >> 1`, so children are `2*p` and `2*p+1`.
+        // Each child accumulates its own HLL during this pass — the
+        // sketch is invariant under hash-bit width (the underlying
+        // keys are unchanged), but rebuilding from the rehashed
+        // stream keeps the child sketch in step with its records
+        // rather than carrying parent-level state forward.
         let parent_id = sp.partition_id as u64;
         let mut child_a: Vec<(Record, RecordOrder, BuildSeq)> = Vec::new();
         let mut child_b: Vec<(Record, RecordOrder, BuildSeq)> = Vec::new();
+        let mut child_a_sketch = GraceHll::new();
+        let mut child_b_sketch = GraceHll::new();
         for r in build_records {
             let keys =
                 build_extractor
@@ -186,8 +196,10 @@ pub(super) fn process_spilled_partition(
             let h = hash_composite_key(&keys, hash_state);
             let cp = child_assigner.partition_for(h) as u64;
             if cp == parent_id * 2 {
+                child_a_sketch.add(h);
                 child_a.push(r);
             } else {
+                child_b_sketch.add(h);
                 child_b.push(r);
             }
         }
@@ -241,9 +253,9 @@ pub(super) fn process_spilled_partition(
             }
         }
         // Re-spill each child to its own pair of files and recurse.
-        for (child_id, child_build, child_probe) in [
-            (parent_id * 2, child_a, child_a_probe),
-            (parent_id * 2 + 1, child_b, child_b_probe),
+        for (child_id, child_build, child_probe, child_sketch) in [
+            (parent_id * 2, child_a, child_a_probe, child_a_sketch),
+            (parent_id * 2 + 1, child_b, child_b_probe, child_b_sketch),
         ] {
             let bcount = child_build.len() as u64;
             let mut bw = GraceSpillWriter::new(
@@ -295,6 +307,7 @@ pub(super) fn process_spilled_partition(
                 probe_files,
                 build_count: bcount,
                 hash_bits: child_assigner.hash_bits(),
+                distinct_sketch: child_sketch,
             };
             process_spilled_partition(rc, child_sp, body_evaluator, budget, sink)?;
         }
@@ -414,7 +427,8 @@ pub(crate) struct BnlStats {
 ///
 /// On [`MemoryArbitrator::should_abort`] returning true at any tier
 /// (chunk-table construction, between batches), the function returns
-/// the E310 for the combine's join build side.
+/// the E310 for the combine's join build side, carrying the partition's
+/// approximate distinct-key count.
 pub(super) fn bnl_fallback(
     rc: &ReloadContext<'_>,
     sp: &SpilledPartition,
@@ -425,6 +439,7 @@ pub(super) fn bnl_fallback(
     stats: &mut BnlStats,
 ) -> Result<(), PipelineError> {
     let name = rc.name;
+    let approx_distinct = sp.distinct_sketch.estimate();
 
     // Per-chunk byte budget. Soft-limit minus probe reservation, then
     // halved to leave headroom for the hash table's bucket array resize
@@ -440,7 +455,11 @@ pub(super) fn bnl_fallback(
 
     // If hard limit is already breached before any work, fail fast.
     if budget.should_abort() {
-        return Err(combine_e310_partition_aborted(name, budget));
+        return Err(combine_e310_partition_aborted(
+            name,
+            approx_distinct,
+            budget,
+        ));
     }
 
     let chunks = BuildChunkIter::new(build_records, chunk_budget);
@@ -457,7 +476,9 @@ pub(super) fn bnl_fallback(
         let chunk = chunk.into_iter().map(|(record, _, _)| record);
         let table =
             CombineHashTable::build(chunk, rc.build_extractor, rc.ctx, budget, Some(chunk_len))
-                .map_err(|e| e.into_build_error(name, budget))?;
+                .map_err(|e| {
+                    with_partition_distinct_keys(e.into_build_error(name, budget), approx_distinct)
+                })?;
         stats.peak_chunk_table_bytes = stats.peak_chunk_table_bytes.max(table.memory_bytes());
 
         // Emit matches in 10 K-record batches against this chunk's
@@ -500,7 +521,11 @@ pub(super) fn bnl_fallback(
                     stats.batches_emitted += 1;
                     emitted_in_batch -= RESULT_BATCH_SIZE;
                     if budget.should_abort() {
-                        return Err(combine_e310_partition_aborted(name, budget));
+                        return Err(combine_e310_partition_aborted(
+                            name,
+                            approx_distinct,
+                            budget,
+                        ));
                     }
                 }
             }
@@ -513,7 +538,11 @@ pub(super) fn bnl_fallback(
         // cannot exceed the budget by construction (chunk_budget is
         // sized for it), but cumulative `output` growth could.
         if budget.should_abort() {
-            return Err(combine_e310_partition_aborted(name, budget));
+            return Err(combine_e310_partition_aborted(
+                name,
+                approx_distinct,
+                budget,
+            ));
         }
     }
     Ok(())
@@ -521,9 +550,27 @@ pub(super) fn bnl_fallback(
 
 /// E310 — the chunked fallback for one partition found the run past its
 /// hard limit, which spilling the partition in chunks could not prevent.
-fn combine_e310_partition_aborted(transform: &str, budget: &MemoryArbitrator) -> PipelineError {
-    budget.backstop_refusal(
+/// The report carries the partition's approximate distinct-key count, so
+/// the author can tell one hot key no repartitioning can split from a
+/// partition that holds many keys.
+fn combine_e310_partition_aborted(
+    transform: &str,
+    approx_distinct: u64,
+    budget: &MemoryArbitrator,
+) -> PipelineError {
+    let mut report = budget.backstop_report(
         transform,
         clinker_plan::runtime_error::MemorySurface::JoinBuildSide,
-    )
+    );
+    report.join_partition_distinct_keys = Some(approx_distinct);
+    PipelineError::MemoryBudgetExceeded { report }
+}
+
+/// `error` with the stopped partition's approximate distinct-key count on
+/// its report, when it is an E310; any other error unchanged.
+fn with_partition_distinct_keys(mut error: PipelineError, approx_distinct: u64) -> PipelineError {
+    if let PipelineError::MemoryBudgetExceeded { report } = &mut error {
+        report.join_partition_distinct_keys = Some(approx_distinct);
+    }
+    error
 }

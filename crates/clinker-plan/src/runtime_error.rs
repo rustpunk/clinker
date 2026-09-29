@@ -479,6 +479,17 @@ impl std::fmt::Display for MemoryShortfallReport {
                 first.row, first.source
             )?;
         }
+        match self.join_partition_distinct_keys {
+            None => {}
+            // One key's rows share every hash bit a split could use, so no
+            // repartitioning separates them; say so, because the remedy
+            // differs from a partition that holds many keys.
+            Some(1) => f.write_str(
+                "\n  join partition: about 1 distinct key; one key's rows cannot be split \
+                 across partitions, so repartitioning cannot make them fit",
+            )?,
+            Some(keys) => write!(f, "\n  join partition: about {keys} distinct keys")?,
+        }
 
         write!(
             f,
