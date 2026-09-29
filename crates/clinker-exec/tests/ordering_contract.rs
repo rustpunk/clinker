@@ -2346,6 +2346,71 @@ fn comparator_and_stable_key_agree_on_null_direction_and_numeric_boundaries() {
             "encoded and direct authored-key order drifted"
         );
     }
+
+    // Pairs where a comparator that calls a NaN or a cross-type pair equal,
+    // or a byte key that compares an integer's bytes against a float's,
+    // would part ways. Each runs under both directions and both placements.
+    let two_pow_53 = 1_i64 << 53;
+    let payload_nan = f64::from_bits(0x7FF0_0000_0000_1234);
+    let pairs = [
+        (Value::Float(f64::NAN), Value::Float(-f64::NAN)),
+        (Value::Float(payload_nan), Value::Float(-payload_nan)),
+        (Value::Float(f64::NAN), Value::Float(f64::INFINITY)),
+        (Value::Float(-f64::NAN), Value::Float(f64::MAX)),
+        (Value::Float(payload_nan), Value::Integer(i64::MAX)),
+        (Value::Float(-0.0), Value::Float(0.0)),
+        (Value::Float(-0.0), Value::Integer(0)),
+        (
+            Value::Integer(two_pow_53),
+            Value::Float(9_007_199_254_740_992.0),
+        ),
+        (
+            Value::Integer(two_pow_53 + 1),
+            Value::Float(9_007_199_254_740_992.0),
+        ),
+        (
+            Value::Integer(two_pow_53 + 1),
+            Value::Float(9_007_199_254_740_994.0),
+        ),
+        (
+            Value::Integer(42),
+            Value::Decimal(rust_decimal::Decimal::new(4200, 2)),
+        ),
+        (
+            Value::Integer(42),
+            Value::Decimal(rust_decimal::Decimal::new(42_000_000_000_000_001, 15)),
+        ),
+        (
+            Value::Float(2.5),
+            Value::Decimal(rust_decimal::Decimal::new(250, 2)),
+        ),
+        (
+            Value::Float(0.1),
+            Value::Decimal(rust_decimal::Decimal::new(1, 1)),
+        ),
+        (Value::String("1".into()), Value::Integer(1)),
+        (Value::String("".into()), Value::Float(f64::NAN)),
+    ];
+    for (left, right) in pairs {
+        for order in [SortOrder::Asc, SortOrder::Desc] {
+            for null_order in [NullOrder::First, NullOrder::Last] {
+                let fields = [sort_field("primary", order, null_order)];
+                for (a, b) in [(&left, &right), (&right, &left)] {
+                    let a_record =
+                        ordering_record(vec![a.clone(), Value::Null, Value::Integer(99)]);
+                    let b_record =
+                        ordering_record(vec![b.clone(), Value::Null, Value::Integer(1)]);
+                    assert_eq!(
+                        stable_sort_key_for_record(&a_record, &fields)
+                            .cmp(&stable_sort_key_for_record(&b_record, &fields)),
+                        compare_authored_keys(&a_record, &b_record, &fields),
+                        "encoded and direct order drifted for {a:?} vs {b:?} \
+                         ({order:?}, nulls {null_order:?})"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -2389,6 +2454,168 @@ fn comparator_compound_unicode_keys_are_framed_without_hidden_identity_ties() {
                     .cmp(&stable_sort_key_for_record(right, &fields)),
                 compare_authored_keys(left, right, &fields),
                 "compound UTF-8 key framing drifted from the authored comparator"
+            );
+        }
+    }
+}
+
+/// Arrival order of the mixed-number fixture: `id`, how the Transform builds
+/// `v`, and the text `num` it builds it from. `neg` negates the parsed float,
+/// so the second NaN carries the sign bit.
+const MIXED_NUMBER_ROWS: [(&str, &str, &str); 15] = [
+    ("a", "float", "1.5"),
+    ("b", "float", "NaN"),
+    ("d", "float", "-0.0"),
+    ("i", "int", "9007199254740993"),
+    ("f", "int", "2"),
+    ("j", "float", ""),
+    ("e", "float", "0.0"),
+    ("c", "neg", "NaN"),
+    ("k", "float", "inf"),
+    ("h", "float", "9007199254740992"),
+    ("g", "float", "2.0"),
+    ("l", "float", "-inf"),
+    ("o", "float", "-0.0"),
+    ("m", "int", "-3"),
+    ("n", "float", ""),
+];
+
+/// How the CSV writer renders each fixture row's `v`.
+fn mixed_number_text(id: &str) -> &'static str {
+    match id {
+        "a" => "1.5",
+        "b" | "c" => "NaN",
+        "d" | "o" => "-0",
+        "e" => "0",
+        "f" | "g" => "2",
+        "h" => "9007199254740992",
+        "i" => "9007199254740993",
+        "k" => "inf",
+        "l" => "-inf",
+        "m" => "-3",
+        "j" | "n" => "",
+        other => panic!("unknown fixture row {other}"),
+    }
+}
+
+fn mixed_number_yaml(order: &str, null_order: &str) -> String {
+    format!(
+        r#"
+pipeline:
+  name: mixed_number_sort
+  memory: {{ limit: "64M", backpressure: spill }}
+  concurrency: {{ threads: 4 }}
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: csv
+      path: rows.csv
+      schema:
+        - {{ name: id, type: string }}
+        - {{ name: kind, type: string }}
+        - {{ name: num, type: string }}
+  - type: transform
+    name: numbers
+    input: rows
+    config:
+      cxl: |
+        emit id = id
+        emit v = if num == "" then null else if kind == "int" then num.to_int() else if kind == "neg" then -(num.to_float()) else num.to_float()
+  - type: sink
+    name: out
+    input: numbers
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      sort_order:
+        - {{ field: v, order: {order}, null_order: {null_order} }}
+"#
+    )
+}
+
+fn run_mixed_number_sort(
+    order: &str,
+    null_order: &str,
+) -> (String, clinker_exec::executor::ExecutionReport) {
+    let mut csv = String::from("id,kind,num\n");
+    for (id, kind, num) in MIXED_NUMBER_ROWS {
+        csv.push_str(&format!("{id},{kind},{num}\n"));
+    }
+    let plan = compile_with_writer_workspace(&mixed_number_yaml(order, null_order));
+    let readers: SourceReaders = HashMap::from([(
+        "rows".to_string(),
+        SourceInput::Files(vec![FileSlot::new(
+            PathBuf::from("rows.csv"),
+            Box::new(Cursor::new(csv.into_bytes())),
+        )]),
+    )]);
+    let output = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(output.clone()) as Box<dyn Write + Send>,
+    )]);
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        writers,
+        &PipelineRunParams::default(),
+    )
+    .unwrap_or_else(|error| panic!("{order}/{null_order} mixed-number sort failed: {error}"));
+    (output.as_string(), report)
+}
+
+/// A Sink `sort_order` places NaN, signed zeros and integers mixed with
+/// floats by one rule, written out here rather than taken from a run: every
+/// NaN is one value after `+inf` ascending (so first descending), `-0.0` and
+/// `0.0` are one value, integers and floats compare by exact value (the float
+/// 2^53 sorts before the integer 2^53 + 1, which a comparison through `f64`
+/// would call equal), and equal values keep arrival order in both directions.
+/// Nulls go where `null_order` puts them and nowhere else.
+///
+/// The column is built by a Transform because a typed Source rejects `NaN`
+/// while CXL produces it, and an `if` whose branches are an integer and a
+/// float yields both kinds of number in one column.
+///
+/// This runs at one ample limit (64M plus the CSV writer workspace) only; the
+/// spilled arms join it once a test can make the Output's input slot spill.
+#[test]
+fn sort_order_places_nan_zero_and_mixed_numbers_by_one_rule() {
+    let ascending = [
+        "l", "m", "d", "e", "o", "a", "f", "g", "h", "i", "k", "b", "c",
+    ];
+    let descending = [
+        "b", "c", "k", "i", "h", "f", "g", "a", "d", "e", "o", "m", "l",
+    ];
+    let nulls = ["j", "n"];
+
+    for (order, values) in [("asc", ascending), ("desc", descending)] {
+        for null_order in ["last", "first", "drop"] {
+            let ids: Vec<&str> = match null_order {
+                "first" => nulls.iter().chain(values.iter()).copied().collect(),
+                "last" => values.iter().chain(nulls.iter()).copied().collect(),
+                _ => values.to_vec(),
+            };
+            let mut expected = String::from("id,kind,num,v\n");
+            for id in ids {
+                let (_, kind, num) = MIXED_NUMBER_ROWS
+                    .iter()
+                    .find(|(row, _, _)| *row == id)
+                    .expect("every expected id is a fixture row");
+                expected.push_str(&format!("{id},{kind},{num},{}\n", mixed_number_text(id)));
+            }
+
+            let (output, report) = run_mixed_number_sort(order, null_order);
+            assert_eq!(
+                output, expected,
+                "{order} with null_order {null_order} must follow the one value order"
+            );
+            let dropped = if null_order == "drop" { 2 } else { 0 };
+            assert_eq!(
+                report.counters.null_dropped_count, dropped,
+                "{order} with null_order {null_order} must count exactly the dropped nulls"
             );
         }
     }

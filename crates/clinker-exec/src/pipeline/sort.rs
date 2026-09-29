@@ -279,4 +279,76 @@ mod tests {
         // A first (sorted by dept asc), then within A: 300, 100 (amount desc)
         assert_eq!(positions, vec![1, 2, 0, 3]); // A/300, A/100, B/200, B/100
     }
+
+    /// A window partition holding NaN, signed zeros and integers mixed with
+    /// floats sorts in the one value order. A comparator that called a NaN
+    /// or a cross-type pair equal is not an order at all: the stable sort
+    /// then leaves values stranded on either side of a NaN, and on a long
+    /// enough slice `sort_by` is allowed to panic.
+    #[test]
+    fn window_partition_sort_is_total() {
+        // Positions:            0          1                 2             3
+        let values = vec![
+            Value::Float(1.5),
+            Value::Float(f64::NAN),
+            Value::Float(-0.0),
+            Value::Integer(2),
+            // 4                  5                   6              7
+            Value::Float(0.0),
+            Value::Float(-f64::NAN),
+            Value::Integer(-3),
+            Value::Float(2.0),
+            // 8                                   9
+            Value::Float(f64::INFINITY),
+            Value::Integer(9_007_199_254_740_993),
+            // 10
+            Value::Float(9_007_199_254_740_992.0),
+        ];
+        let storage = TestStorage::new(&["v"], values.into_iter().map(|v| vec![v]).collect());
+        let all: Vec<u64> = (0..11).collect();
+
+        let mut ascending = all.clone();
+        sort_partition(&storage, &mut ascending, &[sf("v", SortOrder::Asc, None)]);
+        // -3, -0.0 ~ 0.0 (arrival), 1.5, 2 ~ 2.0 (arrival), 2^53, 2^53 + 1,
+        // +inf, NaN ~ -NaN (arrival).
+        assert_eq!(ascending, vec![6, 2, 4, 0, 3, 7, 10, 9, 8, 1, 5]);
+
+        let mut descending = all.clone();
+        sort_partition(&storage, &mut descending, &[sf("v", SortOrder::Desc, None)]);
+        assert_eq!(descending, vec![1, 5, 8, 9, 10, 3, 7, 0, 2, 4, 6]);
+
+        // A partition long enough for the sort's run detection, cycling
+        // through the same kinds of value. The oracle ranks every NaN above
+        // every number and otherwise compares the numbers as exact f64s (all
+        // of them are), with -0.0 read as 0.0.
+        let cycle = |i: usize| match i % 7 {
+            0 => Value::Float(f64::NAN),
+            1 => Value::Integer((i % 13) as i64 - 6),
+            2 => Value::Float(-0.0),
+            3 => Value::Float((i % 11) as f64 - 5.5),
+            4 => Value::Float(-f64::NAN),
+            5 => Value::Float(0.0),
+            _ => Value::Integer((i % 5) as i64),
+        };
+        let long: Vec<Value> = (0..400).map(cycle).collect();
+        let rank = |v: &Value| -> (u8, f64) {
+            match v {
+                Value::Float(f) if f.is_nan() => (1, 0.0),
+                Value::Float(f) => (0, *f + 0.0),
+                Value::Integer(i) => (0, *i as f64),
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        let storage = TestStorage::new(&["v"], long.iter().cloned().map(|v| vec![v]).collect());
+        let mut positions: Vec<u64> = (0..400).collect();
+        sort_partition(&storage, &mut positions, &[sf("v", SortOrder::Asc, None)]);
+        for pair in positions.windows(2) {
+            let (a, b) = (rank(&long[pair[0] as usize]), rank(&long[pair[1] as usize]));
+            let ordering = a.0.cmp(&b.0).then(a.1.total_cmp(&b.1));
+            assert_ne!(ordering, Ordering::Greater, "out of order at {pair:?}");
+            if ordering == Ordering::Equal {
+                assert!(pair[0] < pair[1], "equal values lost arrival order at {pair:?}");
+            }
+        }
+    }
 }
