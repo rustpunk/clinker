@@ -426,7 +426,13 @@ impl MemoryArbitrator {
     /// charged to: the walk requester on this run's walk, and no consumer on
     /// any other thread.
     pub(crate) fn walk_requester(&self) -> Option<ConsumerId> {
-        None
+        if walk::thread_role(self) != ThreadRole::Walk {
+            return None;
+        }
+        match self.walk_requester.load(Ordering::Relaxed) {
+            NO_WALK_REQUESTER => None,
+            raw => Some(ConsumerId(raw as u32)),
+        }
     }
 
     /// Whether every thread other than the walk is passive (parked, paused,
@@ -487,8 +493,47 @@ impl MemoryArbitrator {
         mut shortfall: Shortfall,
         mut attempt: impl FnMut() -> Result<T, Shortfall>,
     ) -> Result<T, Shortfall> {
-        let _ = (need, requester, &mut attempt);
-        Err(shortfall)
+        loop {
+            if shortfall.is_closed() || shortfall.oversized {
+                return Err(shortfall);
+            }
+            if shortfall.forced() {
+                if self
+                    .pass_on_walk(need, requester, PassKind::Forced)
+                    .is_none()
+                {
+                    return Err(shortfall);
+                }
+                match attempt() {
+                    Ok(granted) => return Ok(granted),
+                    Err(next) => {
+                        shortfall = next;
+                        continue;
+                    }
+                }
+            }
+            let Some(pass) = self.pass_on_walk(need, requester, PassKind::Ordinary) else {
+                return Err(shortfall);
+            };
+            match attempt() {
+                Ok(granted) => return Ok(granted),
+                Err(next) => shortfall = next,
+            }
+            if shortfall.forced() || pass.earns_a_retry() || !self.off_walk_quiescent() {
+                continue;
+            }
+            let Some(last) = self.pass_on_walk(need, requester, PassKind::Final) else {
+                return Err(shortfall);
+            };
+            match attempt() {
+                Ok(granted) => return Ok(granted),
+                Err(next) => shortfall = next,
+            }
+            if shortfall.forced() || last.earns_a_retry() {
+                continue;
+            }
+            return Err(shortfall);
+        }
     }
 
     /// Run one pass of `kind` over the walk's reclaim set, or over the busy
@@ -551,8 +596,37 @@ impl MemoryArbitrator {
         reclaim: &mut dyn WalkReclaim,
         kind: PassKind,
     ) -> Result<PassOutcome, PipelineError> {
-        let _ = (need, requester, reclaim, kind);
-        Ok(PassOutcome::default())
+        self.reclaim_rounds.fetch_add(1, Ordering::Relaxed);
+        let target = {
+            let mut ledger = self.admission.ledger.lock();
+            if let Some(walk) = super::sync::current_thread() {
+                ledger.begin_pass(walk);
+            }
+            let short = need.saturating_sub(ledger.available());
+            let to_watermark = ledger
+                .charged()
+                .saturating_add(need)
+                .saturating_sub(self.resume_limit());
+            short.max(to_watermark)
+        };
+        let mut pass = OpenPass {
+            arbitrator: self,
+            outcome: PassOutcome::default(),
+            ended: false,
+        };
+        for id in self.pass_candidates(requester.consumer, kind) {
+            if kind != PassKind::Forced && pass.outcome.freed >= target {
+                break;
+            }
+            self.admission.ledger.lock().open_victim();
+            let spilled = reclaim.spill_victim(id, self);
+            let freed = self.admission.ledger.lock().close_victim();
+            pass.outcome.freed = pass.outcome.freed.saturating_add(freed);
+            if spilled? == VictimOutcome::Spilled {
+                pass.outcome.victims_spilled += 1;
+            }
+        }
+        Ok(pass.end())
     }
 
     /// The consumers a pass of `kind` asks to spill, in order.

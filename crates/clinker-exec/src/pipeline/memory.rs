@@ -838,20 +838,29 @@ impl ConsumerHandle {
 /// `MemoryArbitrator::register_consumer`) and unregister on every exit path,
 /// including error, cancellation and drop;
 /// report true resident bytes, collection overhead included, charging
-/// growth through the consumer's [`ConsumerHandle`] no later than the batch
-/// boundary where the operator next polls the arbitrator; spill only when
-/// the arbitrator asks, which today means the spill request `try_spill`
-/// posts (read with [`ConsumerHandle::take_spill_request`] at a batch
-/// boundary; [`MemoryArbitrator::spill_reclaimable`] posts the same request
-/// before a paused Source resumes) or `should_spill` / `should_spill_self`
-/// reporting the soft threshold crossed at a batch boundary, never on a
-/// byte, row or count threshold or an RSS reading of its own; refuse growth
-/// only through the arbitrator's limit checks (`should_abort`,
-/// `should_abort_local`), never on its own RSS reading or a limit of its
-/// own; take `spill_priority` and `can_back_pressure` from the per-operator
-/// arbitration-parameters table in `docs/engine/src/memory-arbitration.md`,
-/// adding a row there when none fits. The arbitrator does not yet ask
-/// spillable state to reclaim before a refusal. A consumer whose `try_spill`
+/// growth through the consumer's [`ConsumerHandle`] with
+/// [`ConsumerHandle::try_grow`] / [`ConsumerHandle::try_resize`] no later
+/// than the batch boundary where the operator next polls the arbitrator;
+/// spill only when the arbitrator asks, which today means a reclaim pass on
+/// the walk that elects the consumer and spills its state there, the
+/// consumer's own growth falling short, the spill request `try_spill` posts
+/// (read with [`ConsumerHandle::take_spill_request`] at a batch boundary),
+/// or `should_spill` / `should_spill_self` reporting the soft threshold
+/// crossed at a batch boundary, never on a byte, row or count threshold or
+/// an RSS reading of its own. [`MemoryArbitrator::spill_reclaimable`] posts
+/// the same request before a paused Source resumes. Refuse growth only
+/// through the arbitrator: a shortfall from [`MemoryArbitrator::reserve`],
+/// `try_grow` or `try_resize`, or the remaining limit checks
+/// (`should_abort`, `should_abort_local`) for bytes not yet charged, never
+/// on its own RSS reading or a limit of its own. A growth charged on the
+/// walk through `reserve`, `try_grow` or `try_resize` runs a reclaim pass
+/// before it is refused: the walk spills the state the pass elects, the
+/// requesting consumer last, and retries, and a refusal comes only after a
+/// pass that freed nothing with no release during it, followed by a final
+/// pass that also freed nothing. Take `spill_priority` and
+/// `can_back_pressure` from the per-operator arbitration-parameters table in
+/// `docs/engine/src/memory-arbitration.md`, adding a row there when none
+/// fits. A consumer whose `try_spill`
 /// frees nothing needs the maintainer's recorded approval and is listed as
 /// charged-only in `crates/clinker-exec/tests/memory_consumer_inventory.rs`;
 /// the existing charged-only consumers are approved exceptions, not

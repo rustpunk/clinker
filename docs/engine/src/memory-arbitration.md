@@ -73,6 +73,28 @@ governed allocation grants hold, not the consumer handle charges beside them. `s
 charged total and leaves the previous limit unchanged; the disk setter likewise
 refuses a quota below the sum of outstanding writer disk and legacy spill bytes.
 
+On the walk thread a `Shortfall` is not yet a refusal. A `reserve`, a
+`Grant::try_grow` or a `ConsumerHandle::try_grow` / `try_resize` made on the
+walk that does not fit runs a reclaim pass without holding the ledger lock:
+the registered consumers that cannot be paused and hold bytes are taken in the
+run's policy order (ties to the older consumer), the requesting consumer last,
+and each whose state the walk owns — today a node-buffer slot of the current
+dispatch scope — is spilled there and then. A consumer whose state the walk
+does not own is skipped and never asked to act; one the running dispatch arm
+holds frees nothing this pass and has its own spill request raised. A pass
+aims to bring the ledger, with the request charged, down to the resume
+watermark, not just to fit the request. The pass's progress is the sum of its
+victims' own releases, recorded by the ledger while each victim spills on the
+walk (the slot's charge and the governed allocations its records drop), so a
+concurrent release by another thread never counts as a victim's progress; it
+only marks the pass as having seen a release. The request retries after each
+pass. It is refused only when a pass freed nothing with no release during it
+and a final pass then freed nothing too; the refusal's snapshot is the one
+taken with the retry after that final pass. Every other thread's request is
+checked once and never spills. Governed allocations the walk makes while a
+dispatch arm runs are charged to that node's first registered consumer, and
+release against it however the arm has moved on.
+
 The execution report samples the arbitrator's spill totals and the ledger's
 charged peak after dispatch has finished and every Source worker has joined. Ordered
 Sources can still release staged spill charges while unwinding cancellation;
