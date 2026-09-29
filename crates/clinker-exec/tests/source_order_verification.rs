@@ -392,6 +392,27 @@ fn config_rejects_policy_without_sort_order_with_a_paste_ready_fix() {
     assert!(rendered.contains("remove `on_unsorted`"), "{rendered}");
 }
 
+/// A node name is unrestricted, so a diagnostic prints it in double quotes
+/// with Rust escaping: a name holding an apostrophe cannot be misread as
+/// ending early.
+#[test]
+fn diagnostics_quote_a_node_name_unambiguously() {
+    let yaml = source_yaml("      on_unsorted: error\n", "")
+        .replace("    name: rows\n", "    name: \"it's src\"\n")
+        .replace("      name: rows\n", "      name: \"it's src\"\n")
+        .replace("    input: rows\n", "    input: \"it's src\"\n");
+    let config = parse(&yaml);
+    let source = config.source_bodies().next().expect("source");
+    assert_eq!(source.source.name, "it's src");
+    let rendered = validate_source_sort_policy(&source.source, &source.schema)
+        .expect_err("policy without sort_order must fail")
+        .to_string();
+    assert!(
+        rendered.contains(r#"source "it's src" sets `on_unsorted`"#),
+        "{rendered}"
+    );
+}
+
 #[test]
 fn config_rejects_source_null_drop_with_a_paste_ready_fix() {
     let config = parse(&source_yaml(
