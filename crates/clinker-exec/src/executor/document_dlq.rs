@@ -75,6 +75,7 @@ use crate::executor::sink_dispatch::OrderedWriterBoundary;
 use crate::executor::stream_event::{SourceRowId, StreamEvent};
 use crate::executor::structured_output_guard::StructuredOutputDocumentGuard;
 use crate::executor::{DlqEntry, DlqFailureStamp, build_format_writer};
+use crate::pipeline::memory::walk::{WalkOwnedRegistration, WalkOwnedSpill, register_walk_owned};
 use crate::pipeline::memory::{
     ConsumerHandle, ConsumerId, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
 };
@@ -502,15 +503,28 @@ impl DocumentDlqState {
         }
     }
 
-    /// The consumer the state is charged through.
-    pub(crate) fn consumer_id(&self) -> ConsumerId {
-        self.consumer_id
-    }
-
-    /// The handle the state is charged through, on which a reclaim pass
-    /// that finds the state busy raises its spill request.
-    pub(crate) fn handle(&self) -> Arc<ConsumerHandle> {
-        Arc::clone(&self.handle)
+    /// Make the state in `state` a victim every reclaim pass on its
+    /// arbitrator's walk can flush, until the returned registration drops.
+    /// Borrows the state's cell once, to read its consumer and handle. Call
+    /// it on the walk after the walk frame is installed; with no walk frame
+    /// it registers nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`register_walk_owned`]: [`PipelineError::Internal`] when the walk
+    /// reclaim set is borrowed.
+    pub(crate) fn register_for_reclaim(
+        state: &std::rc::Rc<std::cell::RefCell<Self>>,
+    ) -> Result<WalkOwnedRegistration, PipelineError> {
+        let (arbitrator, consumer, handle) = {
+            let borrowed = state.borrow();
+            (
+                Arc::clone(&borrowed.arbitrator),
+                borrowed.consumer_id,
+                Arc::clone(&borrowed.handle),
+            )
+        };
+        register_walk_owned(&arbitrator, consumer, &handle, state)
     }
 
     /// Flush every resident held tail to the held log's file because a
@@ -750,6 +764,26 @@ fn settle_ledger(handle: &ConsumerHandle, emitted: &mut EmittedRows) {
         handle.add_bytes(after - before);
     } else {
         handle.sub_bytes(before - after);
+    }
+}
+
+impl WalkOwnedSpill for DocumentDlqState {
+    /// A pass that elects the state's consumer flushes every resident held
+    /// tail ([`DocumentDlqState::spill_held_rows`]). The state's cell is
+    /// borrowed on the walk only for one of its own steps, which is when the
+    /// state is itself the requester admitting a row; a pass then finds it
+    /// busy, and the requester flushes its own tails if its request falls
+    /// short.
+    fn spill_owned(
+        &mut self,
+        id: ConsumerId,
+        arbitrator: &MemoryArbitrator,
+    ) -> Result<bool, PipelineError> {
+        if id != self.consumer_id {
+            return Ok(false);
+        }
+        self.spill_held_rows(arbitrator)?;
+        Ok(true)
     }
 }
 
@@ -1315,6 +1349,10 @@ struct DocBucket {
     /// `DocumentClose`. The file's outermost close is the one that returns
     /// this to zero; a nested-level close leaves it positive.
     depth: i64,
+    /// The bucket's entry in the walk reclaim set, under its consumer and
+    /// against the Output's cell of buckets; it leaves the set when the
+    /// bucket drops, on every path that takes a bucket out.
+    _reclaim: WalkOwnedRegistration,
 }
 
 /// Claim the one decision slot for `key` in this Output invocation.
@@ -1393,16 +1431,19 @@ impl DocumentBuckets {
     }
 
     /// Borrow (building on first sight) the bucket for file `key`. A new
-    /// bucket's consumer is registered under the Output's name and entered
-    /// in the walk reclaim set of `arbitrator`'s walk, when the calling
-    /// thread is that walk, so any reclaim pass there can spill it. A thread
+    /// bucket's consumer is registered under the Output's name, and this
+    /// cell is registered under that consumer in the walk reclaim set of
+    /// `arbitrator`'s walk ([`register_walk_owned`]), when the calling
+    /// thread is that walk, so any reclaim pass there can spill the bucket.
+    /// The registration is kept in the bucket and drops with it. A thread
     /// with no walk frame (a unit test building buckets without a run)
-    /// enters nothing.
+    /// registers nothing there.
     ///
     /// # Errors
     ///
     /// [`PipelineError::Internal`] when the walk reclaim set is borrowed
-    /// while the bucket is built; nothing is registered.
+    /// while the bucket is built; the bucket's consumer is unregistered
+    /// again and no bucket is built.
     fn bucket_for(
         &mut self,
         arbitrator: &MemoryArbitrator,
@@ -1411,20 +1452,12 @@ impl DocumentBuckets {
         let bucket = match self.buckets.entry(Arc::clone(key)) {
             std::collections::hash_map::Entry::Occupied(occupied) => occupied.into_mut(),
             std::collections::hash_map::Entry::Vacant(vacant) => {
-                let walk_set = crate::pipeline::memory::walk::walk_reclaim_set(arbitrator);
-                let mut walk = match walk_set.as_ref().map(|set| set.try_borrow_mut()) {
-                    None => None,
-                    Some(Ok(set)) => Some(set),
-                    Some(Err(_)) => {
-                        return Err(PipelineError::Internal {
-                            op: "document dead-letter",
-                            node: self.output_name.clone(),
-                            detail: "a document's bucket was built while the walk reclaim set \
-                                     was borrowed"
-                                .to_string(),
-                        });
-                    }
-                };
+                // `self` is borrowed out of this cell, so the cell is alive.
+                let cell = self.this.upgrade().ok_or_else(|| PipelineError::Internal {
+                    op: "document dead-letter",
+                    node: self.output_name.clone(),
+                    detail: "a document's bucket was built outside its Output's cell".to_string(),
+                })?;
                 let handle = ConsumerHandle::new();
                 let consumer_id = arbitrator.register_node_consumer(
                     Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
@@ -1436,14 +1469,19 @@ impl DocumentBuckets {
                         surface: MemorySurface::HeldFailingRows,
                     },
                 );
-                if let Some(set) = walk.as_mut() {
-                    set.enter_document_bucket(consumer_id, self.this.clone(), Arc::clone(&handle));
-                }
+                let reclaim = match register_walk_owned(arbitrator, consumer_id, &handle, &cell) {
+                    Ok(reclaim) => reclaim,
+                    Err(error) => {
+                        arbitrator.unregister_consumer(consumer_id);
+                        return Err(error);
+                    }
+                };
                 vacant.insert(DocBucket {
                     buffer: NodeBuffer::Memory(Vec::new()),
                     consumer_id,
                     handle,
                     depth: 0,
+                    _reclaim: reclaim,
                 })
             }
         };
@@ -1534,23 +1572,25 @@ impl DocumentBuckets {
         Ok(true)
     }
 
-    /// Take bucket `key` out for its decision, removing its consumer from
-    /// the walk reclaim set. The caller releases the consumer.
-    fn take(&mut self, arbitrator: &MemoryArbitrator, key: &DocKey) -> Option<DocBucket> {
-        let bucket = self.buckets.remove(key)?;
-        forget_document_bucket(arbitrator, bucket.consumer_id);
-        Some(bucket)
+    /// Take bucket `key` out for its decision. Its entry in the walk reclaim
+    /// set leaves with the bucket's registration when the bucket drops;
+    /// until then a pass that reaches it finds no bucket here for its
+    /// consumer. The caller releases the consumer.
+    fn take(&mut self, key: &DocKey) -> Option<DocBucket> {
+        self.buckets.remove(key)
     }
 }
 
-/// Remove bucket consumer `id` from the walk reclaim set of `arbitrator`'s
-/// walk. A set that is borrowed right now keeps the entry, which the next
-/// pass to reach it finds without a bucket and drops.
-fn forget_document_bucket(arbitrator: &MemoryArbitrator, id: ConsumerId) {
-    if let Some(set) = crate::pipeline::memory::walk::walk_reclaim_set(arbitrator)
-        && let Ok(mut set) = set.try_borrow_mut()
-    {
-        set.forget_document_bucket(id);
+impl WalkOwnedSpill for DocumentBuckets {
+    /// A pass that elects a bucket's consumer spills that bucket
+    /// ([`DocumentBuckets::spill_consumer`]); an id whose bucket has left
+    /// this cell is not held here.
+    fn spill_owned(
+        &mut self,
+        id: ConsumerId,
+        arbitrator: &MemoryArbitrator,
+    ) -> Result<bool, PipelineError> {
+        self.spill_consumer(id, arbitrator)
     }
 }
 
@@ -1745,7 +1785,7 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
         if !claim_document_decision(&mut self.decided, key) {
             return Ok(());
         }
-        let bucket = self.buckets.borrow_mut().take(&self.arbitrator, key);
+        let bucket = self.buckets.borrow_mut().take(key);
         let is_failed = ctx
             .document_dlq
             .as_ref()
@@ -2061,7 +2101,9 @@ impl Drop for DocumentDlqDriver<'_> {
     fn drop(&mut self) {
         // A `?`-early-return out of `run` leaves buckets live; unregister
         // every surviving consumer so an error exit cannot strand a charge
-        // in the arbitrator's registry. Mirrors `RegisteredTables`' guard.
+        // in the arbitrator's registry, and each bucket's registration drops
+        // with it, taking its walk reclaim entry. Mirrors `RegisteredTables`'
+        // guard.
         // Every borrow of the cell is a single step that ends before any
         // return or unwind reaches here; were one still held, borrowing
         // again inside an unwind would abort, so the buckets are left.
@@ -2069,7 +2111,6 @@ impl Drop for DocumentDlqDriver<'_> {
             return;
         };
         for (_, bucket) in buckets.buckets.drain() {
-            forget_document_bucket(&self.arbitrator, bucket.consumer_id);
             self.arbitrator.unregister_consumer(bucket.consumer_id);
         }
     }
@@ -2538,6 +2579,7 @@ mod tests {
             consumer_id,
             handle,
             depth: 1,
+            _reclaim: WalkOwnedRegistration::inert(),
         };
         (arbitrator, state, HashMap::from([(key, bucket)]), doc)
     }
@@ -3003,6 +3045,7 @@ mod tests {
             consumer_id,
             handle,
             depth: 1,
+            _reclaim: WalkOwnedRegistration::inert(),
         };
 
         let n: u64 = 64;
@@ -3091,6 +3134,7 @@ mod tests {
             consumer_id,
             handle,
             depth: 1,
+            _reclaim: WalkOwnedRegistration::inert(),
         };
 
         for i in 0..64u64 {
@@ -3143,6 +3187,7 @@ mod tests {
             consumer_id,
             handle,
             depth: 1,
+            _reclaim: WalkOwnedRegistration::inert(),
         };
 
         // Arrival order: rows 0..32 (the head) then rows 32..40 (the tail).
@@ -4305,7 +4350,7 @@ mod tests {
             root.path(),
             usize::MAX,
         )));
-        set.borrow_mut().set_document_dlq(std::rc::Rc::clone(&cell));
+        let _reclaim = DocumentDlqState::register_for_reclaim(&cell).expect("registered");
 
         let docs: Vec<DocKey> = (0..3).map(doc_key).collect();
         let mut expected: HashMap<DocKey, Vec<SourceRowId>> = HashMap::new();
@@ -4441,7 +4486,7 @@ mod tests {
             root.path(),
             usize::MAX,
         )));
-        set.borrow_mut().set_document_dlq(std::rc::Rc::clone(&cell));
+        let _reclaim = DocumentDlqState::register_for_reclaim(&cell).expect("registered");
         let (slot_key, slot_handle) =
             publish_resident_slot(&arbitrator, &set, "upstream", 256, SLOT);
         for ordinal in 1..=12u64 {
@@ -4679,7 +4724,7 @@ mod tests {
 
         let bucket = cell
             .borrow_mut()
-            .take(&arbitrator, &key)
+            .take(&key)
             .expect("the bucket leaves its cell");
         let drained: Vec<(i64, i64, u64)> = drain_records_in_arrival_order(bucket.buffer)
             .map(|item| {

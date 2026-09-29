@@ -13,8 +13,10 @@
 //! inside it. A body reads and writes only its own frame, but a reclaim can
 //! spill a resident slot of any frame, so a body that falls short still
 //! reaches the state its callers are holding. Outside the frames the set
-//! also reaches the run's document dead-letter state, whose held failing
-//! rows any pass can flush, and the rows the run parks for a deferred
+//! also reaches every walk-owned state registered through
+//! [`register_walk_owned`] (the document dead-letter state's held rows, an
+//! Output's per-document buckets, an operator's sorts and tables), which
+//! any pass can spill in place, and the rows the run parks for a deferred
 //! consumer, whose resident segments any pass can spill.
 
 use std::cell::RefCell;
@@ -29,7 +31,6 @@ use clinker_plan::error::PipelineError;
 use super::reservation::ReservationState;
 use super::{ConsumerHandle, ConsumerId, MemoryArbitrator};
 use crate::executor::dispatch::{NodeBufferKey, NodeBufferReaderLedger, ResidentSlotSpill};
-use crate::executor::document_dlq::{DocumentBuckets, DocumentDlqState};
 use crate::executor::node_buffer::NodeBuffer;
 use crate::executor::parked_generations::{ParkedGenerations, ParkedIndex};
 
@@ -235,11 +236,11 @@ pub(crate) struct WalkSpillSettings {
 /// ([`WalkReclaim::spill_victim`]) searches every frame: a body's shortfall
 /// may spill a resident slot its callers hold.
 ///
-/// Beside the frames, outside every scope, the set holds a handle to the
-/// run's document dead-letter state, which lives in a cell of its own: the
-/// state's borrow and the set's are independent, so a request the state
+/// Beside the frames, outside every scope, the set holds a registry of the
+/// walk-owned state that lives in cells of its own ([`register_walk_owned`]):
+/// an owner's borrow and the set's are independent, so a request an owner
 /// makes while it holds its own cell can still spill every other victim, and
-/// a pass any other request starts can flush the state's held rows.
+/// a pass any other request starts can spill the owner's state.
 ///
 /// Walk-only (`!Send`, reached through an `Rc<RefCell<_>>`). A borrow of it is
 /// short and never held across a governed allocation, a `reserve`, a channel
@@ -251,15 +252,6 @@ pub(crate) struct WalkReclaimSet {
     /// slots, kept while a composition body it entered runs.
     parents: Vec<NodeBufferSlots>,
     spill_settings: WalkSpillSettings,
-    /// The run's document dead-letter state, when a Source declares the
-    /// document granularity.
-    document_dlq: Option<DocumentDlqEntry>,
-    /// The per-document buckets of the Output running under the document
-    /// granularity, by each bucket's consumer. An entry is made when the
-    /// bucket is built and removed when it is taken out for its decision or
-    /// the Output ends; one left behind because the set was borrowed then is
-    /// dropped by the next pass that finds no bucket for it.
-    document_buckets: HashMap<ConsumerId, DocumentBucketEntry>,
     /// The run's rows parked for a deferred consumer.
     parked: Option<ParkedEntry>,
     /// The walk-owned cells registered through [`register_walk_owned`], by
@@ -289,23 +281,6 @@ struct ParkedEntry {
     index: ParkedIndex,
 }
 
-/// The walk reclaim set's way to one Output bucket: the Output's cell of
-/// buckets, which a pass spills the bucket through, and the bucket's handle,
-/// on which a pass that finds the cell borrowed raises its spill request.
-struct DocumentBucketEntry {
-    cell: std::rc::Weak<RefCell<DocumentBuckets>>,
-    handle: Arc<ConsumerHandle>,
-}
-
-/// The walk reclaim set's handle to the run's document dead-letter state:
-/// its consumer, the handle a pass raises its spill request on while the
-/// state is busy, and the state's own cell.
-struct DocumentDlqEntry {
-    consumer: ConsumerId,
-    handle: Arc<ConsumerHandle>,
-    state: Rc<RefCell<DocumentDlqState>>,
-}
-
 impl WalkReclaimSet {
     /// An empty set for a walk spilling under `spill_settings`.
     pub(crate) fn new(spill_settings: WalkSpillSettings) -> Self {
@@ -313,8 +288,6 @@ impl WalkReclaimSet {
             slots: NodeBufferSlots::default(),
             parents: Vec::new(),
             spill_settings,
-            document_dlq: None,
-            document_buckets: HashMap::new(),
             parked: None,
             owned: HashMap::new(),
             next_owned_serial: 0,
@@ -398,103 +371,55 @@ impl WalkReclaimSet {
         }))
     }
 
-    /// Make the Output bucket registered as consumer `id`, held in `cell`,
-    /// a victim every pass on this walk can reach.
-    pub(crate) fn enter_document_bucket(
-        &mut self,
-        id: ConsumerId,
-        cell: std::rc::Weak<RefCell<DocumentBuckets>>,
-        handle: Arc<ConsumerHandle>,
-    ) {
-        self.document_buckets
-            .insert(id, DocumentBucketEntry { cell, handle });
-    }
-
-    /// Stop reaching the Output bucket registered as consumer `id`: it has
-    /// left its cell.
-    pub(crate) fn forget_document_bucket(&mut self, id: ConsumerId) {
-        self.document_buckets.remove(&id);
-    }
-
-    /// Spill the Output bucket registered as consumer `id`; `None` when no
-    /// bucket was entered under it. The bucket spills through its Output's
-    /// cell ([`DocumentBuckets::spill_consumer`]), which appends its resident
-    /// records as a new chunk the way the Output's own spills do
-    /// (`spill_bucket_in_place`), recorded under the Output's name.
+    /// Spill the walk-owned state registered under consumer `id`.
     ///
-    /// A borrowed cell means the Output is in one step of its own (building,
-    /// pushing to, spilling or taking a bucket): the bucket is `Busy` and its
-    /// spill request is raised, which its next push answers. A cell that is
-    /// gone, or that no longer holds a bucket for `id`, is an entry left
-    /// behind when the bucket left: it is dropped and the consumer is
+    /// Every live cell entered under `id` that is free spills what `id`
+    /// charges, synchronously ([`WalkOwnedSpill::spill_owned`]); the victim
+    /// is `Spilled` when at least one of them held state for `id`. A cell
+    /// that is borrowed (its owner is mid-mutation, or is the requester)
+    /// frees nothing now: the consumer's spill request is raised, which the
+    /// owner answers at its next boundary, and the victim is `Busy` when no
+    /// free cell held state for `id`. With no live cell, or none that still
+    /// holds state for `id`, the entry is dropped and the victim is
     /// `NotOwned`. A spill never reserves memory; past the spill cap it
     /// fails with E320.
-    fn spill_document_bucket(
+    fn spill_owned_victim(
         &mut self,
         id: ConsumerId,
         arbitrator: &MemoryArbitrator,
-    ) -> Result<Option<VictimOutcome>, PipelineError> {
-        let Some(entry) = self.document_buckets.get(&id) else {
-            return Ok(None);
+    ) -> Result<VictimOutcome, PipelineError> {
+        let Some(entries) = self.owned.get_mut(&id) else {
+            return Ok(VictimOutcome::NotOwned);
         };
-        let Some(cell) = entry.cell.upgrade() else {
-            self.document_buckets.remove(&id);
-            return Ok(Some(VictimOutcome::NotOwned));
-        };
-        let Ok(mut buckets) = cell.try_borrow_mut() else {
-            entry.handle.request_spill();
-            return Ok(Some(VictimOutcome::Busy));
-        };
-        if buckets.spill_consumer(id, arbitrator)? {
-            return Ok(Some(VictimOutcome::Spilled));
+        entries.retain(|entry| entry.cell.strong_count() > 0);
+        let live: Vec<_> = entries
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .cell
+                    .upgrade()
+                    .map(|cell| (cell, Arc::clone(&entry.handle)))
+            })
+            .collect();
+        let mut held = false;
+        let mut busy = Vec::new();
+        for (cell, handle) in &live {
+            match cell.try_borrow_mut() {
+                Ok(mut owner) => held |= owner.spill_owned(id, arbitrator)?,
+                Err(_) => busy.push(handle),
+            }
         }
-        drop(buckets);
-        self.document_buckets.remove(&id);
-        Ok(Some(VictimOutcome::NotOwned))
-    }
-
-    /// Make the run's document dead-letter state, in its own cell, a victim
-    /// every pass on this walk can reach. Borrows the state's cell once, to
-    /// read its consumer and handle; the set then keeps the state alive for
-    /// as long as the set lives.
-    pub(crate) fn set_document_dlq(&mut self, state: Rc<RefCell<DocumentDlqState>>) {
-        let (consumer, handle) = {
-            let borrowed = state.borrow();
-            (borrowed.consumer_id(), borrowed.handle())
-        };
-        self.document_dlq = Some(DocumentDlqEntry {
-            consumer,
-            handle,
-            state,
-        });
-    }
-
-    /// Flush the document dead-letter state's held rows when `id` is its
-    /// consumer; `None` when it is not.
-    ///
-    /// A borrowed cell means the state is running a step of its own; on the
-    /// walk that is only while it is itself the requester, admitting a row.
-    /// It frees nothing now: its spill request is raised, which its next
-    /// boundary answers, and the requester flushes its own tails if the
-    /// request it is making falls short.
-    fn spill_document_dlq(
-        &mut self,
-        id: ConsumerId,
-        arbitrator: &MemoryArbitrator,
-    ) -> Result<Option<VictimOutcome>, PipelineError> {
-        let Some(entry) = self
-            .document_dlq
-            .as_ref()
-            .filter(|entry| entry.consumer == id)
-        else {
-            return Ok(None);
-        };
-        let Ok(mut state) = entry.state.try_borrow_mut() else {
-            entry.handle.request_spill();
-            return Ok(Some(VictimOutcome::Busy));
-        };
-        state.spill_held_rows(arbitrator)?;
-        Ok(Some(VictimOutcome::Spilled))
+        for handle in &busy {
+            handle.request_spill();
+        }
+        if held {
+            Ok(VictimOutcome::Spilled)
+        } else if !busy.is_empty() {
+            Ok(VictimOutcome::Busy)
+        } else {
+            self.owned.remove(&id);
+            Ok(VictimOutcome::NotOwned)
+        }
     }
 
     /// The running dispatch scope's node-buffer slots: the top frame.
@@ -676,10 +601,10 @@ impl WalkReclaim for WalkReclaimSet {
     /// The frame that registered consumer `id` spills its slot. The running
     /// scope's frame is searched first, then each calling scope's outwards,
     /// so a composition body's shortfall reaches the resident slots its
-    /// callers hold. After the frames, the document dead-letter state's
-    /// consumer flushes the state's held rows, an Output bucket's consumer
-    /// spills its bucket, and a parked edge's consumer spills the edge's
-    /// resident segments. Any other consumer is `NotOwned`.
+    /// callers hold. After the frames, a parked edge's consumer spills the
+    /// edge's resident segments, and the walk-owned state registered under
+    /// `id` through [`register_walk_owned`] spills in place. Any other
+    /// consumer is `NotOwned`.
     fn spill_victim(
         &mut self,
         id: ConsumerId,
@@ -691,16 +616,10 @@ impl WalkReclaim for WalkReclaimSet {
                 return Ok(outcome);
             }
         }
-        if let Some(outcome) = self.spill_document_dlq(id, arbitrator)? {
-            return Ok(outcome);
-        }
-        if let Some(outcome) = self.spill_document_bucket(id, arbitrator)? {
-            return Ok(outcome);
-        }
         if let Some(outcome) = self.spill_parked_edge(id)? {
             return Ok(outcome);
         }
-        Ok(VictimOutcome::NotOwned)
+        self.spill_owned_victim(id, arbitrator)
     }
 }
 

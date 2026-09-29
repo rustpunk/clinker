@@ -2012,13 +2012,6 @@ impl PipelineExecutor {
             // supersedes one with an exec-measured figure.
             runtime_statistics: Arc::new(std::sync::Mutex::new(statistics.clone())),
         };
-        // The document dead-letter state's held rows are a victim any
-        // reclaim pass on the walk can flush.
-        if let Some(state) = &ctx.document_dlq {
-            ctx.walk_reclaim
-                .borrow_mut()
-                .set_document_dlq(std::rc::Rc::clone(state));
-        }
         // Rows parked for a deferred consumer are victims any reclaim pass on
         // the walk can spill.
         ctx.walk_reclaim
@@ -2030,6 +2023,15 @@ impl PipelineExecutor {
             &ctx.memory_budget,
             std::rc::Rc::clone(&ctx.walk_reclaim),
         );
+        // The document dead-letter state's held rows are a victim any
+        // reclaim pass on the walk can flush. Registered once the walk frame
+        // is installed, and declared after the guard so the registration
+        // drops first.
+        let _document_dlq_reclaim = ctx
+            .document_dlq
+            .as_ref()
+            .map(crate::executor::document_dlq::DocumentDlqState::register_for_reclaim)
+            .transpose()?;
 
         // Resolve dispatch order through the memory arbitrator rather
         // than walking `topo_order` blindly. `scheduled_pass_order` runs
