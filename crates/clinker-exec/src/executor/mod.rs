@@ -17,6 +17,7 @@ mod dlq;
 pub(crate) mod document_dlq;
 pub(crate) mod envelope;
 pub(crate) mod envelope_dispatch;
+pub(crate) mod held_failure;
 mod ingest;
 pub(crate) mod invariant;
 pub(crate) mod merge_dispatch;

@@ -15,9 +15,8 @@ use petgraph::graph::NodeIndex;
 use crate::executor::cull_dispatch::reads_predecessor_slot;
 use crate::executor::dispatch::{
     ExecutorContext, NodeBufferKey, admit_node_buffer, admit_node_buffer_with_readers,
-    advance_cursor, crosses_into_deferred_consumer, node_buffer_spill_allowed, push_dlq,
-    record_error_to_buffer_if_grouped, require_node_buffer_input, source_file_arc_of,
-    source_name_arc_of, stream_linear_producer_emit,
+    advance_cursor, crosses_into_deferred_consumer, node_buffer_spill_allowed,
+    require_node_buffer_input, source_file_arc_of, source_name_arc_of, stream_linear_producer_emit,
 };
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{CompiledRoute, DlqEntry, DlqFailureStamp};
@@ -244,56 +243,40 @@ where
                 if ctx.strategy == ErrorStrategy::FailFast {
                     return Err(route_err.into());
                 }
-                let failed_at = DlqFailureStamp::now();
-                let stage = Some(DlqEntry::stage_route_eval());
-                let routed = record_error_to_buffer_if_grouped(
-                    ctx,
-                    &record,
+                let failure = crate::executor::held_failure::HeldFailure::new(
                     rn,
+                    record,
                     clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
                     route_err.to_string(),
-                    stage.clone(),
+                    Some(DlqEntry::stage_route_eval()),
                     None,
-                    failed_at,
+                    route_err.triggering_field.clone(),
+                    route_err.triggering_value(),
+                    DlqFailureStamp::now(),
                 );
-                let triggering_field = route_err.triggering_field.clone();
-                let triggering_value = route_err.triggering_value();
-                // Under `dlq_granularity: document`, a route-eval failure
-                // condemns the whole document — mark it failed (capturing
-                // this record as the root cause) so the Output emits the
-                // trigger + collateral entries at the document's close.
-                let marked = !routed
-                    && crate::executor::document_dlq::record_error_to_document_buffer_if_doc_dlq(
-                        ctx,
-                        &record,
-                        rn,
-                        clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
-                        route_err.to_string(),
-                        stage.clone(),
-                        None,
-                        triggering_field.clone(),
-                        triggering_value.clone(),
-                        failed_at,
-                    );
-                if !routed && !marked {
-                    let source_name = source_name_arc_of(&record);
-                    push_dlq(
-                        ctx,
-                        DlqEntry {
-                            source_row: rn,
-                            category:
-                                clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
-                            error_message: route_err.to_string(),
-                            original_record: record,
-                            stage,
-                            route: None,
-                            trigger: true,
-                            source_name,
-                            triggering_field,
-                            triggering_value,
-                            failed_at,
-                        },
-                    )?;
+                if let Some(failure) =
+                    crate::executor::held_failure::hold_failure_if_grouped(ctx, failure)
+                {
+                    // Under `dlq_granularity: document`, a route-eval failure
+                    // condemns the whole document — mark it failed (capturing
+                    // this record as the root cause) so the Output emits the
+                    // trigger + collateral entries at the document's close.
+                    let marked =
+                        crate::executor::document_dlq::record_error_to_document_buffer_if_doc_dlq(
+                            ctx,
+                            &failure.original_record,
+                            failure.row_num,
+                            failure.category,
+                            failure.error_message.clone(),
+                            failure.stage.clone(),
+                            None,
+                            failure.triggering_field.clone(),
+                            failure.triggering_value.clone(),
+                            failure.failed_at,
+                        );
+                    if !marked {
+                        crate::executor::held_failure::write_failure(ctx, failure)?;
+                    }
                 }
             }
         }

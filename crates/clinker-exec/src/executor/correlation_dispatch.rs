@@ -17,9 +17,10 @@ use std::sync::Arc;
 use clinker_record::GroupByKey;
 
 use crate::executor::dispatch::{
-    CorrelationErrorRecord, CorrelationGroupBuffer, CorrelationRecordSlot, ExecutorContext,
-    MERGED_SOURCE_NAME, push_dlq, push_write_error, source_name_arc_of,
+    CorrelationGroupBuffer, CorrelationRecordSlot, ExecutorContext, MERGED_SOURCE_NAME, push_dlq,
+    push_write_error, source_name_arc_of,
 };
+use crate::executor::held_failure::{HeldFailure, write_failure};
 use crate::executor::preparation::is_explicit_cancellation;
 use crate::executor::structured_output_guard::StructuredOutputDocumentGuard;
 use crate::executor::{
@@ -116,16 +117,15 @@ fn commit_one_group(
         );
     }
 
-    // A group is dirty when it holds at least one trigger: a failure of its
-    // own. A parked collateral (a Combine build-side dead letter held with
-    // its failing driver's group) never makes a group dirty by itself; it is
-    // only ever parked beside the trigger that condemned it.
-    let Some(first_err) = error_messages.iter().find(|err| err.is_trigger()) else {
-        if !error_rows.is_empty() || !error_messages.is_empty() {
+    // A group is dirty when it holds at least one failure. A failure's
+    // contributing build row is part of that failure and never makes a
+    // group dirty by itself.
+    let Some(first_err) = error_messages.first() else {
+        if !error_rows.is_empty() {
             return Err(PipelineError::Internal {
                 op: "correlation-commit",
                 node: format_group_key(group_key),
-                detail: "a correlation group holds parked dead letters but no trigger".to_string(),
+                detail: "a correlation group records failing rows but holds no failure".to_string(),
             });
         }
         // Clean group → drop the records into the per-output queue
@@ -139,14 +139,13 @@ fn commit_one_group(
         return Ok(());
     };
 
-    // Dirty group → drop projected records, emit DLQ entries for every
-    // distinct row_num touched by the group. Parked records come from
-    // `error_messages` (triggers, and collaterals held with them);
-    // collaterals also come from `records` (rows that succeeded their leg
-    // but get rolled back because the group failed). The group's first
-    // trigger is the failure its `records` collaterals are attributed to:
-    // their detail quotes its message, and their failure id is its trigger
-    // row's id.
+    // Dirty group → drop projected records and write the DLQ: every held
+    // failure, one trigger row per failure with its contributing build row,
+    // then each distinct row of `records` (rows that succeeded their leg but
+    // get rolled back because the group failed) not already written. The
+    // group's first failure is the one its `records` collaterals are
+    // attributed to: their detail quotes its message, and their trigger id
+    // is its trigger row's id.
     let first_err_message = first_err.error_message.clone();
     let first_err_stamp = first_err.failed_at;
 
@@ -161,11 +160,10 @@ fn commit_one_group(
     // single-source pipeline by construction: every co-grouped slot
     // shares the failing source, so the wider behavior is
     // bit-identical to today's pipeline-wide collateral DLQ.
-    // Only triggers count: a parked collateral's source had no causal
-    // role in the group's failure.
+    // Only failing rows count: a contributing build row's source had no
+    // causal role in the group's failure.
     let failing_sources: HashSet<Arc<str>> = error_messages
         .iter()
-        .filter(|err| err.is_trigger())
         .map(|err| source_name_arc_of(&err.original_record))
         .collect();
 
@@ -173,9 +171,8 @@ fn commit_one_group(
     // directly so Route fan-out emits one entry per source row without
     // reconstructing identity from a diagnostic source name.
     let mut seen_rows: HashSet<crate::executor::stream_event::SourceRowId> = HashSet::new();
-    // Parked entries, in parking order: a trigger once per distinct row, a
-    // parked collateral once per failure it belongs to, right where it was
-    // parked, after the trigger that condemned it.
+    // Held failures, in parking order, one trigger row per failure, each
+    // followed by its contributing build row.
     write_held_failures(ctx, &error_messages, &mut seen_rows)?;
     // Collateral entries: every other distinct row that flowed through
     // the group's Output buffers but didn't itself error. Two sparing
@@ -276,7 +273,7 @@ fn commit_overflowed_group(
     ctx: &mut ExecutorContext<'_>,
     group_key: &[GroupByKey],
     records: &[CorrelationRecordSlot],
-    error_messages: &[CorrelationErrorRecord],
+    error_messages: &[HeldFailure],
     held_entries: u64,
     overflow_stamp: DlqFailureStamp,
 ) -> Result<(), PipelineError> {
@@ -366,53 +363,24 @@ fn commit_overflowed_group(
 /// Write a group's held failures in parking order, recording each written
 /// row in `seen_rows`.
 ///
-/// Each row keeps the failure's own category, message, stage, route and
-/// stamp, and is written as a trigger or as collateral by its own `trigger`
-/// flag: a parked collateral (a Combine build-side dead letter held with its
-/// failing driver's group) keeps that driver's trigger id and is written as
-/// collateral. The dirty and the overflowed commit both write held failures
+/// Every held failure writes one trigger row, with its own category,
+/// message, stage, route, triggering field and value, and stamp, and then
+/// its contributing build row, exactly as the failure is written without a
+/// correlation key ([`HeldFailure::into_entries`]). A row that failed twice,
+/// on two fan-out branches or against two build rows, is written once per
+/// failure. The dirty and the overflowed commit both write held failures
 /// here, so the two cannot diverge.
-///
-/// Triggers are written once per source row: the first failure parked for a
-/// row wins, so a row that failed on two fan-out branches is written once.
-/// A collateral is written once per failure it belongs to, keyed by its row
-/// and its trigger id, so a build row two failing drivers of one group both
-/// matched is written after each of them, and a row that is both a trigger
-/// and another failure's collateral is written as both.
 fn write_held_failures(
     ctx: &mut ExecutorContext<'_>,
-    error_messages: &[CorrelationErrorRecord],
+    error_messages: &[HeldFailure],
     seen_rows: &mut HashSet<crate::executor::stream_event::SourceRowId>,
 ) -> Result<(), PipelineError> {
-    let mut trigger_rows: HashSet<crate::executor::stream_event::SourceRowId> = HashSet::new();
-    let mut collaterals: HashSet<(crate::executor::stream_event::SourceRowId, uuid::Uuid)> =
-        HashSet::new();
-    for err in error_messages {
-        let first_for_its_failure = if err.is_trigger() {
-            trigger_rows.insert(err.row_num)
-        } else {
-            collaterals.insert((err.row_num, err.failed_at.trigger_id()))
-        };
-        if !first_for_its_failure {
-            continue;
+    for failure in error_messages {
+        seen_rows.insert(failure.row_num);
+        if let Some(build_row) = failure.contributing_build_row() {
+            seen_rows.insert(build_row);
         }
-        seen_rows.insert(err.row_num);
-        push_dlq(
-            ctx,
-            DlqEntry {
-                source_row: err.row_num,
-                category: err.category,
-                error_message: err.error_message.clone(),
-                original_record: err.original_record.clone(),
-                stage: err.stage.clone(),
-                route: err.route.clone(),
-                trigger: err.is_trigger(),
-                source_name: source_name_arc_of(&err.original_record),
-                triggering_field: None,
-                triggering_value: None,
-                failed_at: err.failed_at,
-            },
-        )?;
+        write_failure(ctx, failure.clone())?;
     }
     Ok(())
 }

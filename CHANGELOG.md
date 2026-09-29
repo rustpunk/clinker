@@ -20,6 +20,26 @@ order of a `match: collect` array.
 - A `correlation_key` on the build Source sorts its rows by the key before
   they reach the Combine, and "first" follows that order.
 
+### Changed — a correlation key writes one dead-letter row per failure
+
+A correlation key no longer removes, merges or relabels a failure row. Every
+failure writes its own trigger row under a key exactly as it does without
+one, triggering field and value included; the key only adds the rows a
+failing group condemns. Every `_cxl_dlq_trigger_id` names a trigger row the
+run wrote.
+
+- A Combine driver that fails against several build rows is written once per
+  failure, each copy followed by the build row of that failure. A build row
+  now reports its own Source and row number on every join strategy, and
+  under a key it is held with its failing driver's group: it never condemns
+  its own group, is not counted a second time against `max_group_buffer`,
+  and is not retracted from relaxed Aggregates.
+- A row that fails on two inclusive Route branches writes two trigger rows,
+  one per branch, including in an overflowing group.
+- Under a key, `dlq_count`, `records_dlq` and the `dlq.max_rate` numerators
+  therefore rise to the counts the same failures give without a key, plus
+  the rows the failing groups condemn.
+
 ### Changed — terminal Output nodes are now Sinks
 
 **Breaking YAML and Rust API change.** The terminal destination node is now

@@ -109,7 +109,7 @@ fn composition_body_propagates_correlation_dlq() {
     // surfaces a transform error inside the body. The dispatcher
     // re-enters via `execute_composition_body`, which calls
     // `dispatch_plan_node` for each body node — the same arm that
-    // routes Transform errors through `record_error_to_buffer_if_grouped`
+    // routes Transform errors through `hold_failure_if_grouped`
     // when `error_handling.correlation_key` is set. Group A's whole
     // 3-record stream therefore DLQs (1 trigger + 2 collaterals);
     // group B's clean record reaches the writer through the body and

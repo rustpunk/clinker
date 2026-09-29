@@ -1033,130 +1033,6 @@ pub(crate) fn buffer_key_for_record(
     key
 }
 
-/// Redirect a per-record error into the correlation buffer when
-/// correlation buffering is active.
-///
-/// Returns `true` iff the buffer is active and the error has been
-/// parked under the record's group cell — the caller must NOT also
-/// call [`push_dlq`] for it. Returns `false`
-/// when the buffer is unconfigured, signaling the caller to take the
-/// per-record DLQ path. Buffer admission counts one held entry,
-/// stamping the group's overflow once `max_group_buffer` is exceeded.
-/// Null-keyed records get a row-number-disambiguated cell so each is
-/// its own group of one. `failed_at` is the trigger stamp the caller took
-/// when it observed the failure ([`DlqFailureStamp::now`]); the parked error
-/// keeps it until the group commits.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn record_error_to_buffer_if_grouped(
-    ctx: &mut ExecutorContext<'_>,
-    record: &Record,
-    row_num: crate::executor::stream_event::SourceRowId,
-    category: clinker_core_types::dlq::DlqErrorCategory,
-    error_message: String,
-    stage: Option<String>,
-    route: Option<String>,
-    failed_at: DlqFailureStamp,
-) -> bool {
-    debug_assert!(
-        failed_at.is_trigger(),
-        "a parked failure is its own trigger"
-    );
-    park_held_failure(
-        ctx,
-        record,
-        row_num,
-        CorrelationErrorRecord {
-            row_num,
-            original_record: record.clone(),
-            category,
-            error_message,
-            stage,
-            route,
-            failed_at,
-        },
-    )
-}
-
-/// Park `held` in the correlation cell of `group_record`, returning `false`
-/// when correlation buffering is not active.
-///
-/// A trigger ([`CorrelationErrorRecord::is_trigger`]) is admitted as one held
-/// entry and joins the cell's `error_rows`. A collateral is part of the
-/// failure it is held with, which was admitted when that failure's trigger
-/// was parked, so it is neither admitted nor added to `error_rows`.
-fn park_held_failure(
-    ctx: &mut ExecutorContext<'_>,
-    group_record: &Record,
-    group_row: crate::executor::stream_event::SourceRowId,
-    held: CorrelationErrorRecord,
-) -> bool {
-    let max_buf = ctx.correlation_max_group_buffer;
-    let Some(buffers) = ctx.correlation_buffers.as_mut() else {
-        return false;
-    };
-    let entry = buffers
-        .entry(buffer_key_for_record(group_record, group_row))
-        .or_default();
-    if held.is_trigger() {
-        entry.admit_entry(max_buf);
-        entry.error_rows.insert(held.row_num);
-    }
-    entry.error_messages.push(held);
-    true
-}
-
-/// Hold a collateral dead letter with the correlation group of the failure
-/// that condemned it, when correlation buffering is active.
-///
-/// `group_record` and `group_row` identify the failing record whose trigger
-/// the caller has already parked through [`record_error_to_buffer_if_grouped`];
-/// the collateral is keyed by *their* group cell, not by `record`'s own
-/// correlation values, so it is written or rolled back exactly when that
-/// group is and never condemns a group of its own. `failed_at` is a stamp
-/// of the condemning failure ([`DlqFailureStamp::sibling`]), so the record
-/// is a collateral: it does not make the cell dirty, does not widen the
-/// cell's per-source narrowing, and is never the cell's first trigger (see
-/// [`CorrelationErrorRecord::is_trigger`]).
-///
-/// It is part of the failure it is held with, which `max_group_buffer`
-/// already counted when that failure's trigger was parked, so it is not
-/// admitted as an entry of its own (see
-/// [`CorrelationGroupBuffer::admit_entry`]). It did not fail, so its row
-/// stays out of the cell's `error_rows` and out of a relaxed-key retract
-/// scope. Returns `true` iff it was parked; `false` when the buffer is
-/// unconfigured, in which case the caller pushes it to the DLQ directly.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn record_collateral_to_buffer_if_grouped(
-    ctx: &mut ExecutorContext<'_>,
-    group_record: &Record,
-    group_row: crate::executor::stream_event::SourceRowId,
-    record: &Record,
-    row_num: crate::executor::stream_event::SourceRowId,
-    category: clinker_core_types::dlq::DlqErrorCategory,
-    error_message: String,
-    stage: Option<String>,
-    failed_at: DlqFailureStamp,
-) -> bool {
-    debug_assert!(
-        !failed_at.is_trigger(),
-        "a held collateral carries its condemning failure's trigger id"
-    );
-    park_held_failure(
-        ctx,
-        group_record,
-        group_row,
-        CorrelationErrorRecord {
-            row_num,
-            original_record: record.clone(),
-            category,
-            error_message,
-            stage,
-            route: None,
-            failed_at,
-        },
-    )
-}
-
 /// Dispatch a Transform CXL evaluation failure through the shared
 /// error path used by every Transform call site.
 ///
@@ -1189,59 +1065,40 @@ pub(crate) fn dispatch_transform_eval_error(
         }
         _ => clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
     };
-    let failed_at = DlqFailureStamp::now();
-    let stage = Some(DlqEntry::stage_transform(&transform_name));
-    let routed = record_error_to_buffer_if_grouped(
-        ctx,
-        &record,
+    let failure = crate::executor::held_failure::HeldFailure::new(
         row_num,
+        record,
         category,
         eval_err.to_string(),
-        stage.clone(),
+        Some(DlqEntry::stage_transform(&transform_name)),
         None,
-        failed_at,
+        eval_err.triggering_field.clone(),
+        eval_err.triggering_value(),
+        DlqFailureStamp::now(),
     );
-    if routed {
+    let Some(failure) = crate::executor::held_failure::hold_failure_if_grouped(ctx, failure) else {
         return Ok(());
-    }
-    let triggering_field = eval_err.triggering_field.clone();
-    let triggering_value = eval_err.triggering_value();
+    };
     // Under `dlq_granularity: document`, a failure here condemns the whole
     // document: mark it failed (capturing this record as the root cause)
     // instead of dead-lettering only the failing record. The Output arm
     // emits the trigger + collateral entries at the document's close.
     let marked = crate::executor::document_dlq::record_error_to_document_buffer_if_doc_dlq(
         ctx,
-        &record,
-        row_num,
-        category,
-        eval_err.to_string(),
-        stage.clone(),
+        &failure.original_record,
+        failure.row_num,
+        failure.category,
+        failure.error_message.clone(),
+        failure.stage.clone(),
         None,
-        triggering_field.clone(),
-        triggering_value.clone(),
-        failed_at,
+        failure.triggering_field.clone(),
+        failure.triggering_value.clone(),
+        failure.failed_at,
     );
     if marked {
         return Ok(());
     }
-    let source_name = source_name_arc_of(&record);
-    push_dlq(
-        ctx,
-        DlqEntry {
-            source_row: row_num,
-            category,
-            error_message: eval_err.to_string(),
-            original_record: record,
-            stage,
-            route: None,
-            trigger: true,
-            source_name,
-            triggering_field,
-            triggering_value,
-            failed_at,
-        },
-    )
+    crate::executor::held_failure::write_failure(ctx, failure)
 }
 
 /// Record a sink write/flush failure in `output_errors` instead of
@@ -5172,7 +5029,7 @@ pub(crate) fn dispatch_plan_node(
 /// output rows captured by the Sink arm before any writer commit, one per
 /// Sink a row reaches; `error_rows` carries the source-row IDs of records
 /// that failed somewhere in the pipeline, and `error_messages` holds each
-/// parked failure in parking order for the trigger entries.
+/// held failure ([`crate::executor::held_failure::HeldFailure`]) in parking order.
 ///
 /// `held_entries` counts held entries, not distinct source rows: every
 /// Sink slot and every parked failure is one entry, so a row an inclusive
@@ -5192,7 +5049,7 @@ pub(crate) fn dispatch_plan_node(
 pub(crate) struct CorrelationGroupBuffer {
     pub(crate) records: Vec<CorrelationRecordSlot>,
     pub(crate) error_rows: HashSet<crate::executor::stream_event::SourceRowId>,
-    pub(crate) error_messages: Vec<CorrelationErrorRecord>,
+    pub(crate) error_messages: Vec<crate::executor::held_failure::HeldFailure>,
     pub(crate) held_entries: u64,
     /// Taken when `held_entries` first passed `max_group_buffer`; `Some`
     /// exactly when the group has overflowed.
@@ -5247,101 +5104,6 @@ pub(crate) struct CorrelationRecordSlot {
     pub(crate) original_record: Record,
     pub(crate) projected: Record,
     pub(crate) output_name: String,
-}
-
-/// One dead letter held with a correlation group until the group commits.
-///
-/// Pushed by the Transform / Route / Combine / Output arms when correlation
-/// buffering is active. `original_record` is the record at the moment
-/// of failure (e.g., the Transform input that failed evaluation).
-/// Multiple events per row are possible if a row fans out across
-/// branches and more than one branch fails — the `CorrelationCommit`
-/// arm writes a trigger once per `row_num`. Most records are the group's
-/// own failures (triggers); a Combine build-side dead letter is a
-/// collateral held with its failing driver's group, written once per
-/// failure it belongs to, so a build row two failing drivers matched is
-/// written after each of them.
-#[derive(Debug, Clone)]
-pub(crate) struct CorrelationErrorRecord {
-    pub(crate) row_num: crate::executor::stream_event::SourceRowId,
-    pub(crate) original_record: Record,
-    pub(crate) category: clinker_core_types::dlq::DlqErrorCategory,
-    pub(crate) error_message: String,
-    pub(crate) stage: Option<String>,
-    pub(crate) route: Option<String>,
-    /// Taken when the failure was observed; the entry the commit emits for
-    /// this row carries it. It also decides the record's role
-    /// ([`Self::is_trigger`]).
-    pub(crate) failed_at: DlqFailureStamp,
-}
-
-impl CorrelationErrorRecord {
-    /// `true` for a failure of this group's own, whose stamp is its own
-    /// trigger. `false` marks a collateral held with the failure that
-    /// condemned it, whose stamp carries that failure's trigger id: it is
-    /// written with the group, or rolled back with it, as
-    /// `_cxl_dlq_trigger: false`. Such a record never makes its cell dirty,
-    /// never adds its source to the cell's per-source narrowing, and is
-    /// never the cell's first trigger.
-    pub(crate) fn is_trigger(&self) -> bool {
-        self.failed_at.is_trigger()
-    }
-
-    /// This record's role in its cell, given the cell's
-    /// [`held_trigger_rows`]: a trigger, or a collateral held with the
-    /// trigger of the named row. It names the trigger by row rather than by
-    /// stamp, so it is the same for a failure observed again, under fresh
-    /// stamps, on a later retraction iteration.
-    pub(crate) fn held_role(
-        &self,
-        trigger_rows: &HashMap<uuid::Uuid, crate::executor::stream_event::SourceRowId>,
-    ) -> HeldRole {
-        if self.is_trigger() {
-            HeldRole::Trigger
-        } else {
-            HeldRole::HeldWith(trigger_rows.get(&self.failed_at.trigger_id()).copied())
-        }
-    }
-}
-
-/// A held failure's role in its correlation cell (see
-/// [`CorrelationErrorRecord::held_role`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum HeldRole {
-    /// The group's own failure.
-    Trigger,
-    /// A collateral held with the trigger of this row, or `None` when that
-    /// trigger is not in the cell.
-    HeldWith(Option<crate::executor::stream_event::SourceRowId>),
-}
-
-/// The row of every trigger in `cell`, by its stamp's id.
-pub(crate) fn held_trigger_rows(
-    cell: &[CorrelationErrorRecord],
-) -> HashMap<uuid::Uuid, crate::executor::stream_event::SourceRowId> {
-    cell.iter()
-        .filter(|err| err.is_trigger())
-        .map(|err| (err.failed_at.id(), err.row_num))
-        .collect()
-}
-
-/// Whether `cell` already holds the failure `err` records, whose role in
-/// its own cell is `role`: the same row, the same message and the same
-/// role. The relaxed-key commit archives each retraction iteration's held
-/// failures and folds them back with this identity, so a failure observed
-/// again on a later iteration is held once, while each failing driver's
-/// copy of a shared build row stays distinct.
-pub(crate) fn cell_holds_failure(
-    cell: &[CorrelationErrorRecord],
-    err: &CorrelationErrorRecord,
-    role: HeldRole,
-) -> bool {
-    let trigger_rows = held_trigger_rows(cell);
-    cell.iter().any(|held| {
-        held.row_num == err.row_num
-            && held.error_message == err.error_message
-            && held.held_role(&trigger_rows) == role
-    })
 }
 
 #[cfg(test)]

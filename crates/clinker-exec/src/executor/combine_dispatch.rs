@@ -20,8 +20,7 @@ use petgraph::graph::NodeIndex;
 
 use crate::executor::dispatch::{
     ExecutorContext, NodeBufferKey, admit_node_buffer, advance_cursor, declare_node_buffer_readers,
-    drain_node_buffer_slot, finalize_node_rooted_windows, node_buffer_spill_allowed, push_dlq,
-    record_collateral_to_buffer_if_grouped, record_error_to_buffer_if_grouped,
+    drain_node_buffer_slot, finalize_node_rooted_windows, node_buffer_spill_allowed,
     require_node_buffer_input, source_file_arc_of, source_name_arc_of, stream_linear_producer_emit,
     tee_emit_to_region_input_buffers,
 };
@@ -2800,13 +2799,14 @@ fn adopt_spilled_runs_into_node_buffer(
 }
 
 /// Route one combine output-row failure to the dead-letter path: rewind the
-/// contributing sources, then park or push the probe-side trigger and, when a
-/// build row contributed, a build-side entry. `failed_at` is the stamp taken
-/// where the failure was observed, which may be a probe thread or a kernel
-/// that returned long after; the build-side entry shares its time under its
-/// own id. Under correlation buffering the build-side entry is held with the
-/// probe row's group as a collateral, so it is written or rolled back with
-/// that group and condemns nothing by itself.
+/// contributing sources, then hold or write the failure: the probe-side
+/// trigger and, when a build row contributed, the build-side row with it.
+/// `failed_at` is the stamp taken where the failure was observed, which may
+/// be a probe thread or a kernel that returned long after; the build-side row
+/// shares its time and trigger id under its own id. Under correlation
+/// buffering the failure is held with the probe row's group, so the build
+/// row is written or rolled back with that group and condemns nothing by
+/// itself.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_combine_output_error(
     ctx: &mut ExecutorContext<'_>,
@@ -2818,10 +2818,6 @@ fn dispatch_combine_output_error(
     eval_err: cxl::eval::EvalError,
     failed_at: DlqFailureStamp,
 ) -> Result<(), PipelineError> {
-    let category = clinker_core_types::dlq::DlqErrorCategory::CombineOutputRow;
-    let stage = Some(DlqEntry::stage_combine(combine_name));
-    let message = eval_err.to_string();
-
     let probe_source = source_name_arc_of(probe_record);
     let build_source = matched_build
         .as_ref()
@@ -2854,92 +2850,29 @@ fn dispatch_combine_output_error(
         }
     }
 
-    // Trigger entry on the probe row's source. Park under the
-    // correlation group cell when buffering is active so the group stays
-    // atomic; otherwise push directly to the run-scoped DLQ.
-    let triggering_field = eval_err.triggering_field.clone();
-    let triggering_value = eval_err.triggering_value();
-    let routed = record_error_to_buffer_if_grouped(
-        ctx,
-        probe_record,
+    // One failure: the probe row as its trigger and, when a build row
+    // contributed, that build row with it, held together so the build row is
+    // always written right after the trigger it names. Under correlation
+    // buffering the failure is held with the probe row's group, never under
+    // the build record's own key: the build record did not fail, so it must
+    // not condemn its own group, nor the output of any other driver that
+    // matched it and succeeded.
+    let mut failure = crate::executor::held_failure::HeldFailure::new(
         row_num,
-        category,
-        message.clone(),
-        stage.clone(),
+        probe_record.clone(),
+        clinker_core_types::dlq::DlqErrorCategory::CombineOutputRow,
+        eval_err.to_string(),
+        Some(DlqEntry::stage_combine(combine_name)),
         None,
+        eval_err.triggering_field.clone(),
+        eval_err.triggering_value(),
         failed_at,
     );
-    if !routed {
-        push_dlq(
-            ctx,
-            DlqEntry {
-                source_row: row_num,
-                category,
-                error_message: message.clone(),
-                original_record: probe_record.clone(),
-                stage: stage.clone(),
-                route: None,
-                trigger: true,
-                source_name: Arc::clone(&probe_source),
-                triggering_field,
-                triggering_value,
-                failed_at,
-            },
-        )?;
+    if let Some(matched) = matched_build {
+        failure = failure.with_contributing_build(matched.record.clone(), matched.row);
     }
-
-    // When a build row contributed, attribute a build-side entry too so
-    // the contributing build lineage reaches the DLQ. The matched record and
-    // its identity travel as one pair so attribution cannot silently mix a
-    // build record with an unrelated row id.
-    if let Some(MatchedBuildFailure {
-        record: build_record,
-        row: build_row_num,
-    }) = matched_build
-    {
-        // One failure, two dead letters: the build side keeps the failure's
-        // time and trigger id under its own id, so it pairs with the driver
-        // row wherever it is held.
-        let build_failed_at = failed_at.sibling();
-        // The build entry lives and dies with the driver's group. It is held
-        // in the driver's correlation cell as that group's collateral, never
-        // under the build record's own key: the build record did not fail,
-        // so it must not condemn its own group, nor the output of any other
-        // driver that matched it and succeeded.
-        let build_routed = routed
-            && record_collateral_to_buffer_if_grouped(
-                ctx,
-                probe_record,
-                row_num,
-                build_record,
-                *build_row_num,
-                category,
-                message.clone(),
-                stage.clone(),
-                build_failed_at,
-            );
-        if !build_routed {
-            let build_source_name = build_source
-                .clone()
-                .unwrap_or_else(|| source_name_arc_of(build_record));
-            push_dlq(
-                ctx,
-                DlqEntry {
-                    source_row: *build_row_num,
-                    category,
-                    error_message: message,
-                    original_record: build_record.clone(),
-                    stage,
-                    route: None,
-                    trigger: false,
-                    source_name: build_source_name,
-                    triggering_field: None,
-                    triggering_value: None,
-                    failed_at: build_failed_at,
-                },
-            )?;
-        }
+    if let Some(failure) = crate::executor::held_failure::hold_failure_if_grouped(ctx, failure) {
+        crate::executor::held_failure::write_failure(ctx, failure)?;
     }
-
     Ok(())
 }

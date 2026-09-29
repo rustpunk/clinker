@@ -64,9 +64,9 @@ use std::collections::HashMap;
 use clinker_record::GroupByKey;
 
 use crate::executor::dispatch::{
-    CommitStepPath, CorrelationGroupBuffer, ExecutorContext, cell_holds_failure,
-    commit_correlation_buffers, held_trigger_rows,
+    CommitStepPath, CorrelationGroupBuffer, ExecutorContext, commit_correlation_buffers,
 };
+use crate::executor::held_failure::union_held_failures;
 use clinker_plan::config::CorrelationFanoutPolicy;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::ExecutionPlanDag;
@@ -249,11 +249,10 @@ fn close_converged_transform_signals(ctx: &mut ExecutorContext<'_>) {
 }
 
 /// Capture every error_messages / error_rows entry from the live
-/// correlation buffer into the cross-iteration archive, deduplicating
-/// against entries already there by cell, row, message and role
-/// ([`cell_holds_failure`]), so the same failure observed across
-/// iterations under fresh stamps counts once while each failing driver's
-/// copy of a shared build row stays distinct. Records are NOT
+/// correlation buffer into the cross-iteration archive, per cell, through
+/// [`union_held_failures`]: a failure observed again on a later iteration,
+/// under fresh stamps, is archived once, while every distinct failure (two
+/// failures of one driver against two build rows included) is kept. Records are NOT
 /// archived — they are speculative per-iteration writes that
 /// `restore_baseline` discards.
 fn archive_iteration_errors(
@@ -266,12 +265,10 @@ fn archive_iteration_errors(
             continue;
         }
         let entry = archive.entry(key.clone()).or_default();
-        let live_triggers = held_trigger_rows(&group.error_messages);
-        for err in &group.error_messages {
-            if !cell_holds_failure(&entry.error_messages, err, err.held_role(&live_triggers)) {
-                entry.error_messages.push(err.clone());
-            }
-        }
+        union_held_failures(
+            &mut entry.error_messages,
+            group.error_messages.iter().cloned(),
+        );
         for &row in &group.error_rows {
             entry.error_rows.insert(row);
         }
@@ -291,13 +288,7 @@ fn merge_archive_into_live(
     };
     for (key, archived) in archive {
         let entry = live_map.entry(key).or_default();
-        let archived_triggers = held_trigger_rows(&archived.error_messages);
-        for err in archived.error_messages {
-            let role = err.held_role(&archived_triggers);
-            if !cell_holds_failure(&entry.error_messages, &err, role) {
-                entry.error_messages.push(err);
-            }
-        }
+        union_held_failures(&mut entry.error_messages, archived.error_messages);
         for row in archived.error_rows {
             entry.error_rows.insert(row);
         }
@@ -455,120 +446,4 @@ where
     let prev = TEST_LOOP_CAP.with(|c| c.replace(Some(cap)));
     let _guard = Guard { prev };
     body()
-}
-
-#[cfg(test)]
-mod held_failure_archive_tests {
-    use super::*;
-    use crate::executor::DlqFailureStamp;
-    use crate::executor::dispatch::CorrelationErrorRecord;
-    use crate::executor::stream_event::SourceRowId;
-    use clinker_core_types::dlq::DlqErrorCategory;
-    use clinker_plan::plan::{EntityRef, PlanNodeId};
-    use clinker_record::owned_storage::SharedStorage;
-    use clinker_record::{Record, Schema, Value};
-    use std::sync::Arc;
-
-    const MESSAGE: &str = "division by zero";
-
-    fn row(source: usize, ordinal: u64) -> SourceRowId {
-        SourceRowId::new(PlanNodeId::new(source), ordinal)
-    }
-
-    fn held(row_num: SourceRowId, failed_at: DlqFailureStamp) -> CorrelationErrorRecord {
-        CorrelationErrorRecord {
-            row_num,
-            original_record: Record::new(
-                SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into()]))),
-                vec![Value::Integer(row_num.ordinal() as i64)],
-            ),
-            category: DlqErrorCategory::CombineOutputRow,
-            error_message: MESSAGE.to_string(),
-            stage: None,
-            route: None,
-            failed_at,
-        }
-    }
-
-    /// One retraction iteration's view of a cell: drivers 1 and 2 of Source
-    /// 0 fail against build row 1 of Source 1, each failure holding its own
-    /// copy of the build row. Every call stamps the failures afresh, as a
-    /// re-dispatch does.
-    fn iteration() -> HashMap<Vec<GroupByKey>, CorrelationGroupBuffer> {
-        let first = DlqFailureStamp::now();
-        let second = DlqFailureStamp::now();
-        let group = CorrelationGroupBuffer {
-            error_messages: vec![
-                held(row(0, 1), first),
-                held(row(1, 1), first.sibling()),
-                held(row(0, 2), second),
-                held(row(1, 1), second.sibling()),
-            ],
-            error_rows: [row(0, 1), row(0, 2)].into_iter().collect(),
-            ..Default::default()
-        };
-        HashMap::from([(Vec::new(), group)])
-    }
-
-    /// The held rows of the one cell, as (row, is trigger, row of the
-    /// trigger a collateral pairs with).
-    fn shape(cell: &CorrelationGroupBuffer) -> Vec<(SourceRowId, bool, Option<SourceRowId>)> {
-        let triggers: HashMap<uuid::Uuid, SourceRowId> = cell
-            .error_messages
-            .iter()
-            .filter(|err| err.is_trigger())
-            .map(|err| (err.failed_at.id(), err.row_num))
-            .collect();
-        cell.error_messages
-            .iter()
-            .map(|err| {
-                (
-                    err.row_num,
-                    err.is_trigger(),
-                    (!err.is_trigger())
-                        .then(|| triggers.get(&err.failed_at.trigger_id()).copied())
-                        .flatten(),
-                )
-            })
-            .collect()
-    }
-
-    fn expected() -> Vec<(SourceRowId, bool, Option<SourceRowId>)> {
-        vec![
-            (row(0, 1), true, None),
-            (row(1, 1), false, Some(row(0, 1))),
-            (row(0, 2), true, None),
-            (row(1, 1), false, Some(row(0, 2))),
-        ]
-    }
-
-    /// Archiving two iterations keeps each failing driver's copy of the
-    /// shared build row, paired with its own driver, and holds a failure
-    /// observed again on the second iteration once.
-    #[test]
-    fn archive_keeps_each_drivers_build_row_across_iterations() {
-        let mut archive = HashMap::new();
-        archive_iteration_errors(&mut archive, Some(&iteration()));
-        archive_iteration_errors(&mut archive, Some(&iteration()));
-        assert_eq!(shape(&archive[&Vec::new()]), expected());
-    }
-
-    /// Folding the archive back into a live cell that saw the same failures
-    /// under fresh stamps adds nothing, and folding it into an empty live
-    /// buffer restores every held row with its pairing.
-    #[test]
-    fn merge_keeps_each_drivers_build_row() {
-        let mut archive = HashMap::new();
-        archive_iteration_errors(&mut archive, Some(&iteration()));
-
-        let mut live = Some(iteration());
-        merge_archive_into_live(&mut live, archive.clone());
-        let live = live.expect("live buffer");
-        assert_eq!(shape(&live[&Vec::new()]), expected());
-
-        let mut empty = Some(HashMap::new());
-        merge_archive_into_live(&mut empty, archive);
-        let empty = empty.expect("live buffer");
-        assert_eq!(shape(&empty[&Vec::new()]), expected());
-    }
 }

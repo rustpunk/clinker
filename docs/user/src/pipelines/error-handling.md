@@ -214,8 +214,10 @@ error_handling:
 
 - `dlq.max_rate` (E315) and `dlq.per_source.<name>.max_rate` (E316) stop the
   run when the fraction of dead-lettered rows crosses the ceiling, once
-  `min_records` rows have been read. Every dead-lettered row counts,
-  collateral rows included, whether or not it has a DLQ file to go to.
+  `min_records` rows have been read. The numerator counts dead-letter rows,
+  collateral rows included, whether or not they have a DLQ file to go to. A
+  source row counts once for each failure it took part in, so a row that
+  failed twice counts twice, with or without a correlation key.
 - [`type_error_threshold`](#type-error-threshold) (E368) stops the run when
   the fraction of declared source-type failures crosses the threshold. It
   catches a schema mismatch at the Source, before the failing rows reach
@@ -232,7 +234,7 @@ Every DLQ record includes these metadata columns:
 | Column | Description |
 |--------|-------------|
 | `_cxl_dlq_id` | UUID v7 (time-ordered unique identifier), unique to the row. It is taken together with `_cxl_dlq_timestamp`, so ids order the same way as timestamps. |
-| `_cxl_dlq_trigger_id` | The `_cxl_dlq_id` of the trigger row whose failure produced this row. A trigger row points to itself, so `_cxl_dlq_trigger` is `true` exactly when this value equals `_cxl_dlq_id`; every row one failure produced carries the same value. See [Pairing the rows one failure produced](#pairing-the-rows-one-failure-produced). |
+| `_cxl_dlq_trigger_id` | The `_cxl_dlq_id` of the trigger row whose failure produced this row. That trigger row is always written in the same run. A trigger row points to itself, so `_cxl_dlq_trigger` is `true` exactly when this value equals `_cxl_dlq_id`; every row one failure produced carries the same value. See [Pairing the rows one failure produced](#pairing-the-rows-one-failure-produced). |
 | `_cxl_dlq_timestamp` | RFC 3339 timestamp of when the failure was observed, not of when the row was written. A collateral row (`correlated`, `document_rejected`) carries the time its correlation group or document was condemned. A `group_size_exceeded` row carries the time its group went over `max_group_buffer`. |
 | `_cxl_dlq_source_file` | Input filename carried by that failing record's `$source.file` provenance (or `<merged>` when no source-file provenance exists) |
 | `_cxl_dlq_source_name` | Name of the Source the failing record came from (or `<merged>` when the record carries no Source identity) |
@@ -259,13 +261,28 @@ When `include_reason: true` is set, two additional columns appear:
 
 ### Pairing the rows one failure produced
 
+Two rules decide which rows a DLQ file holds:
+
+- **One row per failure.** Every failure writes its own trigger row, with its
+  own category, detail, triggering field and value, stage and route. A row
+  that fails twice, on two Route branches or against two Combine build rows,
+  is written twice. A Combine failure also writes the build row that
+  contributed to it, right after its trigger.
+- **Each condemned row once.** A correlation group or document that fails
+  adds each of its other rows once, as a collateral of its first failure.
+
+A correlation key never removes, merges or relabels a failure row: the same
+failures are written with and without a key, and the key only adds the rows
+a failing group condemns and decides when rows are written.
+
 One failure can dead-letter several rows:
 
 - a Combine body that fails writes the driver row and its matched build row,
   each under its own Source's `_cxl_dlq_source_name` and `_cxl_dlq_source_row`,
   whichever join strategy ran. The build row is written once per failure, so
   a build record that two failing drivers matched is written twice, once
-  after each driver's row;
+  after each driver's row, and a driver that fails against three build rows
+  is written three times, each copy followed by its own build row;
 - a failing row in a correlation group takes the rest of its group with it as
   `correlated` rows;
 - a group larger than `max_group_buffer` writes a `group_size_exceeded` row
@@ -275,7 +292,8 @@ One failure can dead-letter several rows:
   document as `document_rejected` rows.
 
 Every row carries `_cxl_dlq_trigger_id`, the `_cxl_dlq_id` of the trigger row
-whose failure produced it. A trigger row points to itself, so `_cxl_dlq_trigger`
+whose failure produced it, and that trigger row is always in the run's
+output. A trigger row points to itself, so `_cxl_dlq_trigger`
 is `true` exactly when `_cxl_dlq_trigger_id` equals `_cxl_dlq_id`. Group by
 `_cxl_dlq_trigger_id` to see everything one failure took with it.
 In this excerpt (other columns omitted), the first two rows are a Combine
@@ -305,11 +323,12 @@ A group larger than `max_group_buffer` can hold failing rows too. Each of
 them is still written as its own trigger, with its own category and id, and
 before the rest of the group. The group's other rows follow under one
 `group_size_exceeded` trigger, the first of them, and the remaining ones are
-`correlated` rows carrying its id. A row is written once: a row that failed
-on one Route branch and reached a Sink on another is written as its own
-failure. The one exception is a Combine build row, which is written once per
-failing driver that matched it. A group whose rows all failed writes no `group_size_exceeded` row,
-because the overflow took nothing with it that had not already failed.
+`correlated` rows carrying its id. Each failure is written once, as its own
+trigger; a row that failed on one Route branch and reached a Sink on another
+is written as its own failure, and never again as `correlated` or as the
+overflow trigger. A group whose rows all failed writes no
+`group_size_exceeded` row, because the overflow took nothing with it that
+had not already failed.
 
 The rows of one failure can land in different DLQ files: with
 `per_source` paths, a Combine build row goes to its own Source's file while
@@ -478,9 +497,16 @@ matched build record is held with that group as a collateral
 its driver's row with its driver's `_cxl_dlq_trigger_id`, and written or rolled
 back exactly when that group is. It never condemns the build record's own
 correlation group, so another driver that matched the same build record keeps
-its output unless its own group failed. Each failing driver gets its own copy
-of the build row, paired with its own failure, even when two failing drivers
-share a group.
+its output unless its own group failed. Each failure gets its own copy of the
+build row, paired with its own driver row: two failing drivers of one group
+each get one, and a driver that fails against several build rows is written
+once per failure, each copy followed by the build row of that failure. The
+held failure keeps its triggering field and value, as it does without a key.
+
+Because every failure is written, a correlation key does not lower
+`dlq_count`, `records_dlq` or the `max_rate` numerators: they equal the
+counts the same failures give without a key, plus the rows the failing
+groups condemn.
 
 For the full lifecycle and per-operator semantics (route, merge, aggregate, combine), see [Correlation Keys](correlation-keys.md).
 

@@ -20,9 +20,8 @@ use petgraph::graph::NodeIndex;
 use crate::executor::dispatch::{
     ExecutorContext, RetainedAggregatorState, admit_node_buffer, advance_cursor,
     finalize_node_rooted_windows, node_buffer_spill_allowed, project_rows_to_buffer_schema,
-    push_dlq, record_error_to_buffer_if_grouped, require_single_input_node_buffer_slot,
-    source_file_arc_of, source_name_arc_of, stream_linear_producer_emit,
-    tee_emit_to_region_input_buffers,
+    push_dlq, require_single_input_node_buffer_slot, source_file_arc_of, source_name_arc_of,
+    stream_linear_producer_emit, tee_emit_to_region_input_buffers,
 };
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{DlqEntry, DlqFailureStamp, parse_memory_limit, stage_metrics};
@@ -1449,35 +1448,20 @@ fn run_streaming_aggregate_ingest(
         advance_cursor(ctx, &source_name_arc, rn);
     }
     for (record, rn, message, failed_at) in std::mem::take(&mut effects.add_errors) {
-        let stage = Some(clinker_core_types::dlq::stage_aggregate(name));
-        let routed = record_error_to_buffer_if_grouped(
-            ctx,
-            &record,
+        let failure = crate::executor::held_failure::HeldFailure::new(
             rn,
+            record,
             clinker_core_types::dlq::DlqErrorCategory::AggregateFinalize,
-            message.clone(),
-            stage.clone(),
+            message,
+            Some(clinker_core_types::dlq::stage_aggregate(name)),
+            None,
+            None,
             None,
             failed_at,
         );
-        if !routed {
-            let source_name = source_name_arc_of(&record);
-            push_dlq(
-                ctx,
-                DlqEntry {
-                    source_row: rn,
-                    category: clinker_core_types::dlq::DlqErrorCategory::AggregateFinalize,
-                    error_message: message,
-                    original_record: record,
-                    stage,
-                    route: None,
-                    trigger: true,
-                    source_name,
-                    triggering_field: None,
-                    triggering_value: None,
-                    failed_at,
-                },
-            )?;
+        if let Some(failure) = crate::executor::held_failure::hold_failure_if_grouped(ctx, failure)
+        {
+            crate::executor::held_failure::write_failure(ctx, failure)?;
         }
     }
 
@@ -2054,36 +2038,21 @@ fn handle_aggregate_add_error(
         // names the stage that overran.
         ErrorStrategy::FailFast => Err(agg_hash_error_into(name, e)),
         ErrorStrategy::Continue => {
-            let failed_at = DlqFailureStamp::now();
-            let stage = Some(clinker_core_types::dlq::stage_aggregate(name));
-            let routed = record_error_to_buffer_if_grouped(
-                ctx,
-                record,
+            let failure = crate::executor::held_failure::HeldFailure::new(
                 row_num,
+                record.clone(),
                 clinker_core_types::dlq::DlqErrorCategory::AggregateFinalize,
                 format!("aggregate {name}: {e}"),
-                stage.clone(),
+                Some(clinker_core_types::dlq::stage_aggregate(name)),
                 None,
-                failed_at,
+                None,
+                None,
+                DlqFailureStamp::now(),
             );
-            if !routed {
-                let source_name = source_name_arc_of(record);
-                push_dlq(
-                    ctx,
-                    DlqEntry {
-                        source_row: row_num,
-                        category: clinker_core_types::dlq::DlqErrorCategory::AggregateFinalize,
-                        error_message: format!("aggregate {name}: {e}"),
-                        original_record: record.clone(),
-                        stage,
-                        route: None,
-                        trigger: true,
-                        source_name,
-                        triggering_field: None,
-                        triggering_value: None,
-                        failed_at,
-                    },
-                )?;
+            if let Some(failure) =
+                crate::executor::held_failure::hold_failure_if_grouped(ctx, failure)
+            {
+                crate::executor::held_failure::write_failure(ctx, failure)?;
             }
             Ok(())
         }

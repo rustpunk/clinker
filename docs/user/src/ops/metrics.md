@@ -85,7 +85,7 @@ schema bump means draining the spool first.
 | `records_total` | integer | Total records read from the primary source |
 | `records_ok` | integer | Distinct source records that reached at least one output. Under inclusive Route fan-out one input matching N branches counts once |
 | `records_written` | integer | Total writes across all sinks. Equals `records_ok` for single-output exclusive pipelines; exceeds it under inclusive Route fan-out or multiple Sinks |
-| `records_dlq` | integer | Records routed to the dead-letter queue |
+| `records_dlq` | integer | Rows written to the dead-letter queue, collateral rows included. A source row counts once for each failure it took part in, with or without a correlation key |
 | `records_null_dropped` | integer | Records excluded by a Sink `null_order: drop` sort field (see [Sort order](../nodes/sink.md#sort-order)). Counts exclusions, not distinct source records: like `records_written`, one source record dropped at two Sinks counts twice. Absent from spool files written before this counter existed, where it reads as `0` |
 | `execution_mode` | string | DAG-derived execution summary: `Streaming` (no full-stage materialization required) or `TwoPass` (a blocking stage forces an accumulation pass) |
 | `peak_rss_bytes` | integer/null | Peak resident set size in bytes, sampled across chunk boundaries on Linux, macOS, and Windows. `null` on platforms where RSS sampling is unavailable |

@@ -182,7 +182,7 @@ pub(crate) fn is_concrete_file(file: &Arc<str>) -> bool {
 /// The first failure for a document wins the trigger slot; later failures
 /// of the same document are swallowed (the document is already doomed), so
 /// the trigger always names the earliest root cause. Mirrors
-/// `record_error_to_buffer_if_grouped`, the correlation-buffer sibling.
+/// `held_failure::hold_failure_if_grouped`, the correlation-buffer sibling.
 ///
 /// This is the routable reject-document seam: `category` is parameterized,
 /// so a non-record-eval validator (an envelope / checksum check that
