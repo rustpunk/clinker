@@ -803,25 +803,13 @@ fn a_build_row_in_its_failing_drivers_group_still_reaches_its_own_sink() {
 /// Number of build rows every driver matches in the multi-failure cases.
 const MATCHED_BUILDS: usize = 3;
 
-/// How many failures a driver that fails against every one of
-/// [`MATCHED_BUILDS`] build rows produces under `strategy`. The join kernels
-/// evaluate every matched pair and defer each failure. The hash build-probe
-/// arm dead-letters the driver at its first failing match and stops
-/// evaluating that driver, so it produces one.
-fn failures_per_driver(strategy: &Strategy) -> usize {
-    if strategy.tag == "hash_build_probe" {
-        1
-    } else {
-        MATCHED_BUILDS
-    }
-}
-
-/// Assert `rows` are `failures_per_driver` failures for each driver in
+/// Assert `rows` are [`MATCHED_BUILDS`] failures for each driver in
 /// `drivers`, in driver order: each a driver trigger followed by its own copy
 /// of a distinct build row it failed against, paired with that trigger.
+/// Every strategy evaluates every matched pair and writes each failure.
 fn assert_one_driver_row_per_failure(strategy: &Strategy, rows: &[DlqRow], drivers: &[u64]) {
     let tag = strategy.tag;
-    let per_driver = failures_per_driver(strategy);
+    let per_driver = MATCHED_BUILDS;
     assert_eq!(
         rows.len(),
         2 * drivers.len() * per_driver,
@@ -966,5 +954,178 @@ fn a_driver_failing_several_times_survives_the_relaxed_retraction() {
             &["out", "agg_out"],
         );
         assert_one_driver_row_per_failure(strategy, &rows, &[1]);
+    }
+}
+
+/// `yaml` whose Combine body also divides by the build's `base`, so a build
+/// row with `base = 0` fails the body for a driver whose other matches
+/// succeed.
+fn with_build_divisor(yaml: &str, strategy: &Strategy) -> String {
+    let bq = if strategy.sorted_on_key {
+        "src_bld"
+    } else {
+        "b"
+    };
+    yaml.replacen(
+        "      propagate_ck: driver\n",
+        &format!("        emit r = 100 / {bq}.base\n      propagate_ck: driver\n"),
+        1,
+    )
+}
+
+/// Build rows `bid` 1.. with correlation value `cid` and the given `base`s.
+fn builds_with_bases(cid: &str, bases: &[i64]) -> String {
+    let mut csv = String::from("bid,cid,k,v,base\n");
+    for (n, base) in bases.iter().enumerate() {
+        csv.push_str(&format!("{},{cid},1,5,{base}\n", n + 1));
+    }
+    csv
+}
+
+/// The dead-letter columns a failure's rows are compared on across
+/// strategies and with and without a key: everything but the generated id,
+/// pairing and time columns and the data columns.
+const FAILURE_COLUMNS: [&str; 8] = [
+    "_cxl_dlq_source_name",
+    "_cxl_dlq_source_row",
+    "_cxl_dlq_error_category",
+    "_cxl_dlq_error_detail",
+    "_cxl_dlq_stage",
+    "_cxl_dlq_trigger",
+    "_cxl_dlq_triggering_field",
+    "_cxl_dlq_triggering_value",
+];
+
+/// One failure: its trigger row's compared cells, then the compared cells
+/// of each row paired with it, in written order.
+type FailureShape = (Vec<String>, Vec<Vec<String>>);
+
+/// The failures in `rows`, excluding `correlated` rows, sorted so that runs
+/// that visit matches in a different order compare equal.
+fn failure_shapes(rows: &[DlqRow]) -> Vec<FailureShape> {
+    let cells = |row: &DlqRow| -> Vec<String> {
+        FAILURE_COLUMNS
+            .iter()
+            .map(|column| row.field(column).unwrap_or_default().to_owned())
+            .collect()
+    };
+    let mut shapes: Vec<FailureShape> = rows
+        .iter()
+        .filter(|row| row.trigger())
+        .map(|trigger| {
+            let paired = rows
+                .iter()
+                .filter(|row| {
+                    !row.trigger()
+                        && trigger_id(row) == id(trigger)
+                        && row.category() != Some(DlqErrorCategory::Correlated.as_str())
+                })
+                .map(cells)
+                .collect();
+            (cells(trigger), paired)
+        })
+        .collect();
+    shapes.sort();
+    shapes
+}
+
+/// One sink's rows, sorted, as `(did, q, r)` triples.
+type OutputShape = Vec<(String, String, String)>;
+
+/// A sink's rows as sorted `(did, q, r)` triples.
+fn output_shape(rows: &[OutputRow]) -> OutputShape {
+    let mut shape: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            let cell = |name: &str| row.get(name).cloned().unwrap_or_default();
+            (cell("did"), cell("q"), cell("r"))
+        })
+        .collect();
+    shape.sort();
+    shape
+}
+
+/// Every join strategy writes the same failures and the same output for the
+/// same input, with and without a correlation key. Driver 1 matches three
+/// build rows and fails only against the one whose `base` is 0; its other
+/// two matches are written to the Sink. Driver 2 fails against all three.
+/// Each failure writes its driver row and its own build row; the successful
+/// matches of a driver that also failed are kept, as they are when the
+/// matches are evaluated one pair at a time.
+#[test]
+fn every_strategy_writes_the_same_rows_for_failing_and_succeeding_matches() {
+    let mut reference: Option<(Vec<FailureShape>, OutputShape)> = None;
+    for strategy in all_strategies() {
+        let tag = strategy.tag;
+        let (group, build_group) = driver_and_build_groups(strategy);
+        let keyed_yaml = with_build_divisor(&match_all(&yaml(strategy)), strategy);
+        let drivers = [(1, group, 2), (2, group, 0)];
+        let builds_csv = builds_with_bases(build_group, &[10, 0, 10]);
+        let (keyless_out, keyless_rows) = run_yaml(
+            &keyless(&keyed_yaml),
+            strategy,
+            &drivers,
+            &builds_csv,
+            &["out"],
+        );
+        let (keyed_out, keyed_rows) =
+            run_yaml(&keyed_yaml, strategy, &drivers, &builds_csv, &["out"]);
+
+        let failures = failure_shapes(&keyless_rows);
+        assert_eq!(
+            failures.len(),
+            4,
+            "[{tag}] driver 1 fails once and driver 2 three times: {:?}",
+            describe(&keyless_rows)
+        );
+        for (_, paired) in &failures {
+            assert_eq!(paired.len(), 1, "[{tag}] each failure writes its build row");
+        }
+        assert_eq!(
+            keyless_rows.len(),
+            8,
+            "[{tag}] one driver row and one build row per failure: {:?}",
+            describe(&keyless_rows)
+        );
+        let output = output_shape(&keyless_out["out"]);
+        assert_eq!(
+            output.len(),
+            2,
+            "[{tag}] driver 1's two successful matches are written: {output:?}"
+        );
+
+        assert_eq!(
+            failure_shapes(&keyed_rows),
+            failures,
+            "[{tag}] the keyed run writes the keyless failures"
+        );
+        assert!(
+            keyed_out["out"].is_empty(),
+            "[{tag}] the failing group is rolled back: {:?}",
+            keyed_out["out"]
+        );
+        // Driver 1's rolled-back output needs no `correlated` row: its own
+        // failure already wrote driver 1, and a condemned row is written
+        // only when no failure of the group wrote it.
+        assert_eq!(
+            keyed_rows.len(),
+            keyless_rows.len(),
+            "[{tag}] the keyed run adds no row for driver 1's rolled-back output: {:?}",
+            describe(&keyed_rows)
+        );
+
+        match &reference {
+            None => reference = Some((failures, output)),
+            Some((reference_failures, reference_output)) => {
+                assert_eq!(
+                    &failures, reference_failures,
+                    "[{tag}] the same failures as every other strategy"
+                );
+                assert_eq!(
+                    &output, reference_output,
+                    "[{tag}] the same output as every other strategy"
+                );
+            }
+        }
     }
 }
