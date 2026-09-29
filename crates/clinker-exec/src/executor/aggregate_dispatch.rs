@@ -2210,7 +2210,7 @@ fn emit_aggregate_finalize_dlq(
         DlqEntry {
             source_row: crate::executor::stream_event::SourceRowId::synthetic(),
             category: clinker_core_types::dlq::DlqErrorCategory::AggregateFinalize,
-            error_message: format!("aggregate {transform}.{binding}: {source:?}"),
+            error_message: format!("aggregate {transform}.{binding}: {source}"),
             original_record: synthetic,
             stage: Some(clinker_core_types::dlq::stage_aggregate(name)),
             route: None,

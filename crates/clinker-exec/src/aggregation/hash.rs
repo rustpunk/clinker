@@ -1430,12 +1430,14 @@ pub(crate) fn finalize_group_inner(
     key: &[GroupByKey],
     state: &AggregatorGroupState,
 ) -> Result<Record, HashAggError> {
-    let bindings = factory.bindings();
     let mut slots: Vec<Value> = Vec::with_capacity(state.row.len());
     for (i, acc) in state.row.iter().enumerate() {
+        // The failure names the author's `emit`, which a dead-letter reason
+        // and a run error show the author; the binding's own label is engine
+        // vocabulary.
         let v = acc.finalize().map_err(|e| HashAggError::Accumulator {
             transform: transform_name.to_string(),
-            binding: bindings[i].output_name.to_string(),
+            binding: factory.compiled().author_name_of_binding(i).to_string(),
             source: e,
         })?;
         slots.push(v);

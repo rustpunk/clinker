@@ -308,9 +308,9 @@ nodes:
                 transform, binding, ..
             }) => {
                 assert_eq!(transform, "overflow_agg");
-                assert!(
-                    binding.contains("sum"),
-                    "binding label includes the aggregate name; got {binding}"
+                assert_eq!(
+                    binding, "s",
+                    "the failure names the author's `emit`, not the binding's engine label"
                 );
             }
             Ok(()) => panic!("expected Accumulator overflow error"),
@@ -339,7 +339,7 @@ nodes:
                         transform, binding, ..
                     } => {
                         assert_eq!(transform, "overflow_agg");
-                        assert!(binding.contains("sum"), "got {binding}");
+                        assert_eq!(binding, "s", "the author's `emit`");
                     }
                     other => panic!("expected PipelineError::Accumulator, got {other:?}"),
                 }

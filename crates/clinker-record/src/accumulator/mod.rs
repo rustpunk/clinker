@@ -14,6 +14,14 @@
 //! therefore depend only on the multiset of inputs, not on arrival order or
 //! on how partial states were merged, and they retract exactly.
 //!
+//! One numeric rule governs their finalize: the result is the exact value of
+//! the aggregate's definition over the group's values, rounded once, or a
+//! typed [`AccumulatorError`]. The domain the result is computed in comes from
+//! one count-derived classifier, `NumericDomain`, which every one of the three
+//! finalizers matches exhaustively: a group holding a decimal and a float can
+//! only be an error, and null is only the answer for a group with no non-null
+//! input.
+//!
 //! Serde derive on `AccumulatorEnum` and all state structs enables spill
 //! serialization without manual state/restore code.
 
@@ -49,6 +57,41 @@ pub type AccumulatorRow = Vec<AccumulatorEnum>;
 #[cfg(test)]
 mod tests;
 
+/// The numeric domain a `sum`, `avg` or `weighted_avg` result is computed in,
+/// derived only from how many integer, float and decimal inputs a group holds.
+///
+/// A decimal is never added to a float without an explicit conversion, so a
+/// group with both is `Mixed`, whose only outcome is
+/// [`AccumulatorError::MixedDecimalFloat`]. Otherwise any decimal makes the
+/// group `Decimal` (integers join the exact decimal total), else any float
+/// makes it `Float` (integers join the exact float sum), else any integer
+/// makes it `Integer`, and a group with no non-null input is `Empty`, the only
+/// domain whose result is null. Counts are a function of the multiset, so the
+/// domain does not depend on arrival order, on how a group was split into
+/// partial states, or on which inputs were added and later retracted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NumericDomain {
+    Empty,
+    Integer,
+    Float,
+    Decimal,
+    Mixed,
+}
+
+impl NumericDomain {
+    /// The domain of a group holding `integers` integer, `floats` float and
+    /// `decimals` decimal inputs.
+    pub(crate) fn of(integers: u64, floats: u64, decimals: u64) -> Self {
+        match (integers > 0, floats > 0, decimals > 0) {
+            (_, true, true) => Self::Mixed,
+            (_, false, true) => Self::Decimal,
+            (_, true, false) => Self::Float,
+            (true, false, false) => Self::Integer,
+            (false, false, false) => Self::Empty,
+        }
+    }
+}
+
 // ============================================================================
 // State structs
 // ============================================================================
@@ -57,15 +100,16 @@ mod tests;
 /// exactly, in their own part.
 ///
 /// Integers add into an `i128`, floats into an [`ExactSum`], decimals into an
-/// exact `Decimal`; each part counts its addends. The result type follows from
-/// the counts, not from the order values arrived in: any decimal addend gives
-/// a `Decimal` (the decimal total plus the integer total); else any float
-/// gives a `Float`, the exact sum of the floats and the integers rounded once;
-/// else any integer gives an `Integer`; else null. Adding, merging and
-/// subtracting never round, so a float sum depends only on the multiset of
-/// addends: not on arrival order and not on how spill runs split a group into
-/// partial states. A float addend mixed with a decimal (reachable only on an
-/// untyped column) is not part of the decimal total.
+/// exact `Decimal`; each part counts its addends. The result follows from the
+/// counts through [`NumericDomain`], not from the order values arrived in: a
+/// decimal group gives the decimal total plus the integer total, or
+/// [`AccumulatorError::DecimalOutOfRange`]; a float group the exact sum of the
+/// floats and the integers rounded once; an integer group an `Integer`, or
+/// [`AccumulatorError::SumOverflow`]; a group holding a decimal and a float
+/// [`AccumulatorError::MixedDecimalFloat`]; an empty group null. Adding,
+/// merging and subtracting never round, so a float sum depends only on the
+/// multiset of addends: not on arrival order and not on how spill runs split
+/// a group into partial states.
 ///
 /// Finalize converts the integer total with `i64::try_from`, never `as i64`,
 /// which would silently wrap.
@@ -83,10 +127,10 @@ pub struct SumState {
     pub decimal_sum: Decimal,
     /// Decimal addends held.
     pub decimal_count: u64,
-    /// Set once a decimal total leaves `Decimal`'s ~7.9e28 range; finalize
-    /// then surfaces `SumOverflow` rather than a silently-wrong total. Sticky:
-    /// an overflowed sum is an error outcome, and subtracting a value does not
-    /// undo it.
+    /// Set once a running decimal total leaves `Decimal`'s ~7.9e28 range;
+    /// finalize then surfaces [`AccumulatorError::DecimalOutOfRange`] rather
+    /// than a silently-wrong total. Sticky: subtracting a value does not undo
+    /// it.
     pub decimal_overflow: bool,
 }
 
@@ -176,6 +220,10 @@ impl SumState {
         self.int_count + self.floats.count() + self.decimal_count
     }
 
+    fn domain(&self) -> NumericDomain {
+        NumericDomain::of(self.int_count, self.floats.count(), self.decimal_count)
+    }
+
     /// The decimal total plus the integer total, exactly; `None` when either
     /// leaves `Decimal`'s range.
     fn exact_decimal_total(&self) -> Option<Decimal> {
@@ -191,21 +239,18 @@ impl SumState {
     }
 
     fn finalize(&self) -> Result<Value, AccumulatorError> {
-        if self.decimal_count > 0 {
-            return self
+        match self.domain() {
+            NumericDomain::Empty => Ok(Value::Null),
+            NumericDomain::Integer => i64::try_from(self.int_sum)
+                .map(Value::Integer)
+                .map_err(|_| AccumulatorError::SumOverflow { field: None }),
+            NumericDomain::Float => Ok(Value::Float(self.float_total())),
+            NumericDomain::Decimal => self
                 .exact_decimal_total()
                 .map(Value::Decimal)
-                .ok_or(AccumulatorError::SumOverflow { field: None });
+                .ok_or(AccumulatorError::DecimalOutOfRange),
+            NumericDomain::Mixed => Err(AccumulatorError::MixedDecimalFloat),
         }
-        if !self.floats.is_empty() {
-            return Ok(Value::Float(self.float_total()));
-        }
-        if self.int_count > 0 {
-            let n = i64::try_from(self.int_sum)
-                .map_err(|_| AccumulatorError::SumOverflow { field: None })?;
-            return Ok(Value::Integer(n));
-        }
-        Ok(Value::Null)
     }
 }
 
@@ -281,12 +326,13 @@ fn count_state_sub(s: &mut CountState, value: &Value) {
 /// Average accumulator state: the addends held exactly, as a Sum holds them.
 ///
 /// The count of non-null numeric addends is derived from the parts, so it
-/// cannot disagree with them. Finalize divides once: a float average is the
-/// exact sum of the floats and the integers rounded once, divided by the
-/// count; an integer-only average is the exact integer total converted to a
-/// float and divided by the count; a decimal average is the exact decimal
-/// quotient. Adding, merging and subtracting never round, so the result
-/// depends only on the multiset of addends.
+/// cannot disagree with them. Finalize is `sum(x) / count(x)` with the exact
+/// sum, in the group's [`NumericDomain`]: a float average is the exact sum of
+/// the floats and the integers rounded once, divided by the count; an
+/// integer-only average is the exact integer total converted to a float and
+/// divided by the count; a decimal average is the decimal total divided by the
+/// count with the scalar decimal `/`. Adding, merging and subtracting never
+/// round, so the result depends only on the multiset of addends.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct AvgState {
     /// The addends, in their integer, float and decimal parts.
@@ -307,34 +353,26 @@ impl AvgState {
     }
 
     /// Avg returns Float for int/float inputs; for `decimal` inputs it returns
-    /// an exact `Value::Decimal` quotient at full division precision (rounding
-    /// to a declared `scale` happens when the value lands in a scaled decimal
-    /// column, matching intermediate `decimal / decimal` division semantics).
-    /// A decimal total out of `Decimal`'s range, or a binary float mixed with
-    /// a decimal (reachable only on an untyped column; the float cannot join
-    /// an exact decimal total), yields `Null`: avg has no error channel, and
-    /// either alternative would be a silently wrong average.
-    fn finalize(&self) -> Value {
+    /// the decimal total divided by the count at full division precision
+    /// (rounding to a declared `scale` happens when the value lands in a
+    /// scaled decimal column, matching intermediate `decimal / decimal`
+    /// division semantics). A decimal total or quotient outside the decimal
+    /// range, and a group mixing a decimal with a float, are errors.
+    fn finalize(&self) -> Result<Value, AccumulatorError> {
         let sum = &self.sum;
         let count = sum.addend_count();
-        if count == 0 {
-            return Value::Null;
-        }
-        if sum.decimal_count > 0 {
-            if !sum.floats.is_empty() {
-                return Value::Null;
-            }
-            return sum
+        match sum.domain() {
+            NumericDomain::Empty => Ok(Value::Null),
+            NumericDomain::Integer => Ok(Value::Float(sum.int_sum as f64 / count as f64)),
+            NumericDomain::Float => Ok(Value::Float(sum.float_total() / count as f64)),
+            NumericDomain::Decimal => sum
                 .exact_decimal_total()
-                .and_then(|total| total.checked_div(Decimal::from(count)))
-                .map_or(Value::Null, Value::Decimal);
+                .ok_or(AccumulatorError::DecimalOutOfRange)?
+                .checked_div(Decimal::from(count))
+                .map(Value::Decimal)
+                .ok_or(AccumulatorError::QuotientOutOfRange),
+            NumericDomain::Mixed => Err(AccumulatorError::MixedDecimalFloat),
         }
-        let total = if sum.floats.is_empty() {
-            sum.int_sum as f64
-        } else {
-            sum.float_total()
-        };
-        Value::Float(total / count as f64)
     }
 }
 
@@ -516,16 +554,20 @@ fn collect_state_sub(s: &mut CollectState, value: &Value) -> isize {
 ///   other row), to an exact float sum of products, and its weight to an
 ///   exact float sum of weights, or to the integer weight total when the
 ///   weight is an integer;
-/// - a row with a decimal operand adds its exact product and weight to
-///   `Decimal` totals.
+/// - a row with a decimal operand adds its product (the scalar decimal
+///   `v * w`) and weight to `Decimal` totals; a row whose product is outside
+///   the decimal range is counted instead, so retracting it clears the count.
 ///
-/// The result's type follows from the row counts, not from the order rows
-/// arrived in: any decimal row gives the exact decimal quotient (the decimal
-/// and integer totals combined); else any float row gives
-/// `round(products) / round(weights)`, each total rounded once; else the
-/// integer totals' quotient as a float. Zero total weight → Null (V-7-2a).
-/// Adding, merging and subtracting never round, so the result depends only on
-/// the multiset of rows.
+/// The result follows from the row counts through [`NumericDomain`], not from
+/// the order rows arrived in: a decimal group gives the decimal products total
+/// divided by the decimal weights total (integer rows joined into both); a
+/// float group gives `round(products) / round(weights)`, each total rounded
+/// once; an integer group the integer totals' quotient as a float. Weights
+/// that total exactly zero are [`AccumulatorError::ZeroTotalWeight`] in every
+/// domain, as the scalar `x / 0` is an error; a group holding a decimal and a
+/// float is [`AccumulatorError::MixedDecimalFloat`]; only an empty group is
+/// null. Adding, merging and subtracting never round, so the result depends
+/// only on the multiset of rows.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WeightedAvgState {
     /// Σ vᵢ·wᵢ over the rows of two integers.
@@ -548,12 +590,16 @@ pub struct WeightedAvgState {
     pub decimal_weights: Decimal,
     /// Rows with a decimal operand, including a row that mixes a decimal with
     /// a float (reachable only on an untyped column), which also counts as a
-    /// float row so that the result is Null while it is held.
+    /// float row so that the group classifies as mixed while it is held.
     pub decimal_rows: u64,
-    /// Set once an exact decimal total leaves `Decimal`'s ~7.9e28 range;
-    /// finalize then returns `Null` rather than a silently-wrong weighted
-    /// average (weighted_avg has no error channel). Sticky: an overflowed sum
-    /// is an error outcome, and subtracting a row does not undo it.
+    /// Decimal rows whose product `v * w` is outside the decimal range; they
+    /// add nothing to the product total, and the group fails with
+    /// [`AccumulatorError::ProductOverflow`] while any is held.
+    pub product_overflows: u64,
+    /// Set once a running decimal total leaves `Decimal`'s ~7.9e28 range;
+    /// finalize then surfaces [`AccumulatorError::DecimalOutOfRange`] rather
+    /// than a silently-wrong weighted average. Sticky: subtracting a row does
+    /// not undo it.
     pub decimal_overflow: bool,
 }
 
@@ -568,6 +614,7 @@ impl Default for WeightedAvgState {
             decimal_products: Decimal::ZERO,
             decimal_weights: Decimal::ZERO,
             decimal_rows: 0,
+            product_overflows: 0,
             decimal_overflow: false,
         }
     }
@@ -599,8 +646,8 @@ impl Operand {
     }
 
     /// The f64 projection a float row's product is computed from. A decimal
-    /// reaches it only in a row that mixes a decimal with a float, whose
-    /// result is Null.
+    /// reaches it only in a row that mixes a decimal with a float, which fails
+    /// the group.
     fn as_f64(&self) -> f64 {
         match self {
             Operand::Int(n) => *n as f64,
@@ -635,7 +682,7 @@ enum WeightedRow {
         weight: Decimal,
     },
     /// A decimal operand with a float operand: counted as a decimal row and a
-    /// float row, so the result is Null while the row is held.
+    /// float row, so the group classifies as mixed while the row is held.
     DecimalWithFloat {
         product: f64,
         weight: Operand,
@@ -690,7 +737,7 @@ impl WeightedAvgState {
             WeightedRow::Float { product, weight } => self.add_float_row(product, weight),
             WeightedRow::Decimal { product, weight } => {
                 self.decimal_rows += 1;
-                self.decimal_add(product, weight);
+                self.decimal_add(product, weight, false);
                 0
             }
             WeightedRow::DecimalWithFloat { product, weight } => {
@@ -718,7 +765,7 @@ impl WeightedAvgState {
             WeightedRow::Float { product, weight } => self.sub_float_row(product, weight),
             WeightedRow::Decimal { product, weight } => {
                 self.decimal_rows = self.decimal_rows.saturating_sub(1);
-                self.decimal_add(product.map(|p| -p), -weight);
+                self.decimal_add(product, weight, true);
                 self.reset_empty_decimal_totals();
                 0
             }
@@ -736,7 +783,7 @@ impl WeightedAvgState {
             Operand::Int(w) => self.int_weights += i128::from(w),
             Operand::Float(w) => delta += self.float_weights.add_f64(w),
             // A decimal weight only occurs in a row mixing it with a float,
-            // whose result is Null; it joins no total.
+            // which fails the group; it joins no total.
             Operand::Decimal(_) => {}
         }
         delta
@@ -752,14 +799,26 @@ impl WeightedAvgState {
         delta
     }
 
-    /// Fold one decimal row's exact product (`None` when it overflowed) and
-    /// weight into the decimal totals; an out-of-range total sets the overflow
-    /// flag rather than panicking.
-    fn decimal_add(&mut self, product: Option<Decimal>, weight: Decimal) {
-        match product.and_then(|p| self.decimal_products.checked_add(p)) {
-            Some(sum) => self.decimal_products = sum,
-            None => self.decimal_overflow = true,
+    /// Fold one decimal row's product and weight into the decimal totals. A
+    /// row whose product overflowed (`None`) is counted in
+    /// `product_overflows`, or uncounted when `retract`; an out-of-range total
+    /// sets the overflow flag rather than panicking.
+    fn decimal_add(&mut self, product: Option<Decimal>, weight: Decimal, retract: bool) {
+        match product {
+            Some(p) => {
+                let p = if retract { -p } else { p };
+                match self.decimal_products.checked_add(p) {
+                    Some(sum) => self.decimal_products = sum,
+                    None => self.decimal_overflow = true,
+                }
+            }
+            None if retract => {
+                debug_assert!(self.product_overflows > 0, "retracted a row never added");
+                self.product_overflows = self.product_overflows.saturating_sub(1);
+            }
+            None => self.product_overflows += 1,
         }
+        let weight = if retract { -weight } else { weight };
         match self.decimal_weights.checked_add(weight) {
             Some(sum) => self.decimal_weights = sum,
             None => self.decimal_overflow = true,
@@ -786,8 +845,9 @@ impl WeightedAvgState {
         self.float_weights.merge(&other.float_weights);
         if other.decimal_rows > 0 {
             self.decimal_rows += other.decimal_rows;
-            self.decimal_add(Some(other.decimal_products), other.decimal_weights);
+            self.decimal_add(Some(other.decimal_products), other.decimal_weights, false);
         }
+        self.product_overflows += other.product_overflows;
         self.decimal_overflow |= other.decimal_overflow;
     }
 
@@ -795,43 +855,59 @@ impl WeightedAvgState {
         self.float_products.heap_size() + self.float_weights.heap_size()
     }
 
-    fn finalize(&self) -> Value {
-        let float_rows = self.float_products.count();
-        if self.decimal_rows > 0 {
-            // A float row cannot join an exact decimal total, and an
-            // overflowed total has no honest value; weighted_avg has no error
-            // channel, so both give Null rather than a biased average.
-            if float_rows > 0 || self.decimal_overflow {
-                return Value::Null;
-            }
-            let products = i128_to_decimal(self.int_products)
-                .and_then(|ints| self.decimal_products.checked_add(ints));
-            let weights = i128_to_decimal(self.int_weights)
-                .and_then(|ints| self.decimal_weights.checked_add(ints));
-            return match (products, weights) {
-                // V-7-2a: zero total weight → Null (prevents a divide-by-zero).
-                (Some(p), Some(w)) if !w.is_zero() => {
-                    p.checked_div(w).map_or(Value::Null, Value::Decimal)
+    fn domain(&self) -> NumericDomain {
+        NumericDomain::of(
+            self.int_rows,
+            self.float_products.count(),
+            self.decimal_rows,
+        )
+    }
+
+    fn finalize(&self) -> Result<Value, AccumulatorError> {
+        match self.domain() {
+            NumericDomain::Empty => Ok(Value::Null),
+            NumericDomain::Integer => {
+                if self.int_weights == 0 {
+                    return Err(AccumulatorError::ZeroTotalWeight);
                 }
-                _ => Value::Null,
-            };
+                Ok(Value::Float(
+                    self.int_products as f64 / self.int_weights as f64,
+                ))
+            }
+            NumericDomain::Float => {
+                let products =
+                    round_float_sum(&self.float_products, self.int_products, self.int_rows);
+                let weights = self.float_weights.round_with(self.int_weights);
+                // A nonzero exact total never rounds to zero, so this is the
+                // exact total being zero.
+                if weights == 0.0 {
+                    return Err(AccumulatorError::ZeroTotalWeight);
+                }
+                Ok(Value::Float(products / weights))
+            }
+            NumericDomain::Decimal => {
+                if self.product_overflows > 0 {
+                    return Err(AccumulatorError::ProductOverflow);
+                }
+                if self.decimal_overflow {
+                    return Err(AccumulatorError::DecimalOutOfRange);
+                }
+                let products = i128_to_decimal(self.int_products)
+                    .and_then(|ints| self.decimal_products.checked_add(ints))
+                    .ok_or(AccumulatorError::DecimalOutOfRange)?;
+                let weights = i128_to_decimal(self.int_weights)
+                    .and_then(|ints| self.decimal_weights.checked_add(ints))
+                    .ok_or(AccumulatorError::DecimalOutOfRange)?;
+                if weights.is_zero() {
+                    return Err(AccumulatorError::ZeroTotalWeight);
+                }
+                products
+                    .checked_div(weights)
+                    .map(Value::Decimal)
+                    .ok_or(AccumulatorError::QuotientOutOfRange)
+            }
+            NumericDomain::Mixed => Err(AccumulatorError::MixedDecimalFloat),
         }
-        let (products, weights) = if float_rows > 0 {
-            (
-                round_float_sum(&self.float_products, self.int_products, self.int_rows),
-                self.float_weights.round_with(self.int_weights),
-            )
-        } else if self.int_rows > 0 {
-            (self.int_products as f64, self.int_weights as f64)
-        } else {
-            return Value::Null;
-        };
-        // V-7-2a: zero total weight → Null (prevents NaN/Infinity). An exact
-        // nonzero total never rounds to zero.
-        if weights == 0.0 {
-            return Value::Null;
-        }
-        Value::Float(products / weights)
     }
 }
 
@@ -1193,17 +1269,22 @@ impl AccumulatorEnum {
 
     /// Produce the final aggregate result.
     ///
-    /// Returns `AccumulatorError::SumOverflow` if a `Sum`, `Avg`, or
-    /// `WeightedAvg` integer result exceeds `i64` range.
+    /// `Sum`, `Avg` and `WeightedAvg` return the exact value of their
+    /// definition over the group, rounded once, or an [`AccumulatorError`]
+    /// naming the rule the group broke: an integer `sum` beyond `i64`, a
+    /// decimal total or quotient outside the decimal range, a `weighted_avg`
+    /// row product outside it, a zero total weight, or a group mixing a
+    /// decimal with a float. Null is only the result of a group with no
+    /// non-null input. Pure; allocates only what the result value holds.
     pub fn finalize(&self) -> Result<Value, AccumulatorError> {
         match self {
             Self::Sum(s) => s.finalize(),
             Self::Count(s) => Ok(s.finalize()),
-            Self::Avg(s) => Ok(s.finalize()),
+            Self::Avg(s) => s.finalize(),
             Self::Min(s) => Ok(s.finalize()),
             Self::Max(s) => Ok(s.finalize()),
             Self::Collect(s) => Ok(s.finalize()),
-            Self::WeightedAvg(s) => Ok(s.finalize()),
+            Self::WeightedAvg(s) => s.finalize(),
             Self::Any(s) => Ok(s.finalize()),
         }
     }

@@ -78,9 +78,11 @@ pub enum HashAggError {
     /// generic internal error.
     #[error("{0}")]
     SpillDir(SpillError),
-    /// An accumulator's `finalize()` failed (e.g. `SumOverflow`). Routed
-    /// to `PipelineError::Accumulator` by the 16.3.13 dispatch arm.
-    #[error("aggregate {transform}.{binding}: accumulator finalize failed: {source:?}")]
+    /// An accumulator's `finalize()` failed (e.g. `SumOverflow`). `binding`
+    /// is the author's `emit` that reads the accumulator. Routed to
+    /// `PipelineError::Accumulator` by the executor's dispatch arms; the
+    /// message renders the error's readable form, which carries its fix.
+    #[error("aggregate {transform}.{binding}: accumulator finalize failed: {source}")]
     Accumulator {
         transform: String,
         binding: String,

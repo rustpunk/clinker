@@ -554,10 +554,12 @@ fn consolidate(
 ///
 /// # Errors
 ///
-/// Returns [`PipelineError`] when a footer accumulator's finalize overflows or a
-/// header / footer residual fails to evaluate — both surface as an Internal
-/// engine error naming the node, since the expressions were typechecked and
-/// allow-list-validated at compile time.
+/// Returns [`PipelineError::Accumulator`] when a footer accumulator's finalize
+/// fails (a data error such as an overflow, naming the node and the footer's
+/// `<section>.<field>`), under every error strategy: a footer section has no
+/// dead-letter route. Returns an Internal engine error naming the node when a
+/// header / footer residual fails to evaluate, since the expressions were
+/// typechecked and allow-list-validated at compile time.
 fn synthesize_sections(
     ctx: &ExecutorContext<'_>,
     name: &str,
@@ -685,17 +687,17 @@ fn fold_footer_section(
         }
     }
 
+    // A finalize failure is a data error in one footer aggregate (an overflow,
+    // a decimal mixed with a float), so it is the typed accumulator error
+    // naming the footer field the author wrote, not an internal one.
     let slots: Vec<Value> = accs
         .iter()
         .enumerate()
         .map(|(i, acc)| {
-            acc.finalize().map_err(|e| PipelineError::Internal {
-                op: "envelope",
-                node: name.to_string(),
-                detail: format!(
-                    "footer section {:?} aggregate {} finalize failed: {e}",
-                    section.section, compiled.bindings[i].output_name
-                ),
+            acc.finalize().map_err(|source| PipelineError::Accumulator {
+                transform: name.to_string(),
+                binding: format!("{}.{}", section.section, compiled.author_name_of_binding(i)),
+                source,
             })
         })
         .collect::<Result<_, _>>()?;

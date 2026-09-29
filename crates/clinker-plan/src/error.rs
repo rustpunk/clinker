@@ -89,10 +89,12 @@ pub enum PipelineError {
         actual_kind: &'static str,
         node: String,
     },
-    /// Finalize-time accumulator failure (overflow, type mismatch, etc.).
-    /// Wraps `AccumulatorError` with the failing transform + binding for
-    /// diagnostics. Routed to the DLQ under `Continue`, propagated under
-    /// `FailFast`.
+    /// Finalize-time accumulator failure (an overflow, a zero total weight,
+    /// a decimal mixed with a float). Wraps `AccumulatorError` with the
+    /// failing node and the author's name for the failing value: the `emit`
+    /// of an Aggregate, or `<section>.<field>` of an Envelope footer. Each
+    /// Aggregate dispatch arm routes it by error strategy; an Envelope
+    /// footer's is propagated under either strategy.
     Accumulator {
         transform: String,
         binding: String,
@@ -553,7 +555,7 @@ impl fmt::Display for PipelineError {
                 source,
             } => write!(
                 f,
-                "accumulator finalize failed for {transform}.{binding}: {source:?}"
+                "accumulator finalize failed for {transform}.{binding}: {source}"
             ),
             Self::SortOrderViolation { message } => {
                 write!(f, "sort-order violation: {message}")
