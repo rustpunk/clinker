@@ -5,10 +5,18 @@
 //! `last`. `null_order: drop` there is a plan-time error that names the node
 //! and the field, says why, and gives the upstream `filter` that does remove
 //! the rows. Both nodes also take the bare field-name shorthand a Sink or
-//! Source `sort_order` takes.
+//! Source `sort_order` takes, and carry the validated list on their plan
+//! node. A Source `sort_order` refuses `drop` through the same conversion;
+//! only a Sink `sort_order` keeps it.
 
 use clinker_plan::config::pipeline_node::PipelineNode;
-use clinker_plan::config::{CompileContext, PipelineConfig, SortField, SortOrder, parse_config};
+use clinker_plan::config::{
+    CompileContext, NullOrder, NullPlacement, OrderField, PipelineConfig, SortField, SortOrder,
+    parse_config, validate_source_sort_policy,
+};
+use clinker_plan::error::PipelineError;
+use clinker_plan::plan::CompiledPlan;
+use clinker_plan::plan::execution::PlanNode;
 
 /// The operator block of a Cull named `cd` over `src`, with `order_by`
 /// spliced in as YAML text.
@@ -183,4 +191,147 @@ fn cull_and_reshape_order_by_accept_the_bare_field_name() {
                 panic!("{name} with a bare order_by field must compile: {diags:?}")
             });
     }
+}
+
+/// Compile `yaml`, panicking on any diagnostic.
+fn compile_ok(yaml: &str) -> CompiledPlan {
+    parse_config(yaml)
+        .expect("fixture must parse as YAML")
+        .compile(&CompileContext::default())
+        .unwrap_or_else(|diags| panic!("fixture must compile: {diags:?}"))
+}
+
+/// The validated `order_by` the named Cull or Reshape plan node carries.
+fn plan_node_order_by(plan: &CompiledPlan, name: &str) -> Vec<OrderField> {
+    let graph = &plan.dag().graph;
+    let idx = graph
+        .node_indices()
+        .find(|&i| graph[i].name() == name)
+        .unwrap_or_else(|| panic!("no plan node named {name:?}"));
+    match &graph[idx] {
+        PlanNode::Cull { order_by, .. } | PlanNode::Reshape { order_by, .. } => order_by.clone(),
+        other => panic!("{name:?} is a {}, not a Cull or Reshape", other.kind_name()),
+    }
+}
+
+fn order_field(field: &str, order: SortOrder, null_order: NullPlacement) -> OrderField {
+    OrderField {
+        field: field.to_string(),
+        order,
+        null_order,
+    }
+}
+
+#[test]
+fn placement_first_and_last_reach_the_plan_node() {
+    let order_by = "[{ field: txn_date, null_order: first }, \
+                    { field: amount, order: desc, null_order: last }, account]";
+    let expected = vec![
+        order_field("txn_date", SortOrder::Asc, NullPlacement::First),
+        order_field("amount", SortOrder::Desc, NullPlacement::Last),
+        order_field("account", SortOrder::Asc, NullPlacement::Last),
+    ];
+    for (block, name) in [
+        (cull_block(order_by), "cd"),
+        (reshape_block(order_by), "rs"),
+    ] {
+        let plan = compile_ok(&pipeline(&block));
+        assert_eq!(plan_node_order_by(&plan, name), expected, "{name}");
+    }
+}
+
+/// A source `src` whose `sort_order` is spliced in, feeding one Sink.
+fn sorted_source_pipeline(sort_order: &str) -> String {
+    pipeline(&format!(
+        r#"      sort_order: {sort_order}
+  - type: sink
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#
+    ))
+}
+
+const SOURCE_DROP_TEXT: &str = "source 'src': `null_order: drop` is not allowed on `sort_order` \
+     for field 'txn_date': source verification cannot discard records. Use `null_order: first` \
+     or `null_order: last`; to exclude rows whose 'txn_date' is null, add a Transform after this \
+     source with `filter not txn_date.is_null()`.";
+
+#[test]
+fn source_sort_order_drop_is_rejected_with_the_fix() {
+    let yaml = sorted_source_pipeline("[{ field: txn_date, null_order: drop }]");
+    let config = parse_config(&yaml).expect("fixture must parse as YAML");
+    let source = config.source_bodies().next().expect("one source");
+    let err = validate_source_sort_policy(&source.source, &source.schema)
+        .expect_err("a Source sort_order must refuse null_order: drop");
+    let PipelineError::Compilation {
+        transform_name,
+        messages,
+    } = err
+    else {
+        panic!("expected a compilation error, got {err:?}");
+    };
+    assert_eq!(transform_name, "src");
+    assert_eq!(messages, vec![SOURCE_DROP_TEXT.to_string()]);
+
+    let diags = compile_diagnostics(&yaml);
+    assert!(
+        diags.iter().any(|(_, m)| m.contains(SOURCE_DROP_TEXT)),
+        "compiling must report the Source refusal, got {diags:?}"
+    );
+}
+
+#[test]
+fn source_sort_order_placement_reaches_the_compiled_source_order() {
+    let plan = compile_ok(&sorted_source_pipeline(
+        "[{ field: txn_date, null_order: first }, { field: amount, null_order: last }, account]",
+    ));
+    let orders = &plan.dag().order_contract().source_orders;
+    assert_eq!(orders.len(), 1);
+    let placed: Vec<(&str, NullOrder)> = orders[0]
+        .fields
+        .iter()
+        .map(|field| (field.field.as_str(), field.null_order))
+        .collect();
+    assert_eq!(
+        placed,
+        vec![
+            ("txn_date", NullOrder::First),
+            ("amount", NullOrder::Last),
+            ("account", NullOrder::Last),
+        ]
+    );
+}
+
+#[test]
+fn sink_sort_order_keeps_drop() {
+    let plan = compile_ok(&pipeline(
+        r#"  - type: sink
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      sort_order:
+        - { field: txn_date, null_order: drop }
+        - { field: amount, null_order: last }
+"#,
+    ));
+    let boundary = plan
+        .dag()
+        .order_contract()
+        .writer_boundaries
+        .iter()
+        .find(|boundary| boundary.output_name == "out")
+        .expect("the Sink has a writer boundary");
+    let dropped: Vec<&str> = boundary
+        .pre_sort_drop_fields
+        .iter()
+        .map(|field| field.field.as_str())
+        .collect();
+    assert_eq!(dropped, vec!["txn_date"]);
 }
