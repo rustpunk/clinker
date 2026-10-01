@@ -28,7 +28,7 @@ use crate::executor::schema_check::check_input_schema;
 use crate::executor::{
     DlqEntry, DlqFailureStamp, NullStorage, stage_metrics, widen_record_to_schema,
 };
-use crate::pipeline::combine::MatchedBuildFailure;
+use crate::pipeline::combine::{MatchedBuildFailure, held_record_bytes};
 use crate::pipeline::combine_verdict::{
     Admit, DriverScan, DriverVerdict, MissToken, PredicateOutcome, eval_predicate,
 };
@@ -1265,6 +1265,7 @@ where
                     name,
                     &kernel,
                     &budget,
+                    &inline_consumer_handle,
                 )?;
                 // The driver streamed its records over the channel, so the input
                 // count comes from the probe thread rather than a pre-drained Vec.
@@ -1456,7 +1457,56 @@ struct StreamingProbeEffects {
     /// Recoverable per-row failures, replayed via [`dispatch_combine_output_error`]
     /// after join (cursor rewind + DLQ) — matching the inline arm's per-row
     /// routing in arrival order. `FailFast` surfaces eagerly instead.
+    ///
+    /// Each failure owns a clone of the driver row and of the build row it
+    /// failed on, and under `match: all` a hot key adds one per failing pair,
+    /// so the vector grows with the fan-out rather than with the driver. The
+    /// probe thread charges each one to the combine's consumer as it is
+    /// appended and the replay discharges it as it is written; see
+    /// [`Self::charge_new_failures`].
     failures: Vec<ProbeFailure>,
+    /// How many leading entries of `failures` are already charged.
+    charged_failures: usize,
+}
+
+impl StreamingProbeEffects {
+    /// Charge the failures appended since the last call to `consumer` and
+    /// return how many there were. The replay discharges each failure by the
+    /// same [`ProbeFailure::held_bytes`], so a fully replayed probe nets to
+    /// zero.
+    fn charge_new_failures(
+        &mut self,
+        consumer: &crate::pipeline::memory::ConsumerHandle,
+        resources: &clinker_record::owned_storage::AllocationResources,
+    ) -> usize {
+        let fresh = &self.failures[self.charged_failures..];
+        let bytes = fresh
+            .iter()
+            .fold(0u64, |sum, f| sum.saturating_add(f.held_bytes(resources)));
+        if bytes > 0 {
+            consumer.add_bytes(bytes);
+        }
+        self.charged_failures = self.failures.len();
+        fresh.len()
+    }
+}
+
+/// Read the streaming channel to disconnect, discharging each record's
+/// per-row cost, so the driver producer's `send` can never block on a probe
+/// thread that has stopped consuming. Every early return from the probe loop
+/// drains first.
+fn drain_probe_channel(
+    rx: &crossbeam_channel::Receiver<crate::executor::stream_event::StreamEvent>,
+    charge_handle: &crate::pipeline::memory::ConsumerHandle,
+    resources: &clinker_record::owned_storage::AllocationResources,
+) {
+    while let Ok(event) = rx.recv() {
+        if let crate::executor::stream_event::StreamEvent::Record(record, _) = event {
+            charge_handle.sub_bytes(crate::executor::node_buffer::unaccounted_record_byte_cost(
+                &record, resources,
+            ));
+        }
+    }
 }
 
 /// Drive an inline hash build-probe Combine's probe (driver) side off a
@@ -1480,6 +1530,18 @@ struct StreamingProbeEffects {
 /// sequencing match the drain-to-`Vec` path exactly. Mid-stream
 /// `$source.count` is `None` (the driver total is unknown until disconnect),
 /// the same defer-emit semantic the streaming Aggregate ingest uses.
+///
+/// The failures the thread holds until the join are charged to `held`, the
+/// combine's own consumer, as each is appended, and discharged as the replay
+/// writes it. Under `match: all` a hot key fails once per failing pair, so
+/// the held set grows with the key's fan-out, not with the driver. The thread
+/// polls the arbitrator after every driver that adds failures or rows past the
+/// same 10,000-record cadence the materialized loop uses, so the bound is one
+/// driver's failures beyond the arbitrator's limit rather than the whole
+/// stream's. The materialized loop writes each driver's failures as it goes
+/// and holds none, which this path cannot: the thread has no way to reach the
+/// dead-letter output until it joins.
+#[allow(clippy::too_many_arguments)]
 fn run_streaming_combine_probe(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
@@ -1488,6 +1550,7 @@ fn run_streaming_combine_probe(
     name: &str,
     kernel: &CombineProbeKernel<'_>,
     budget: &crate::pipeline::memory::MemoryArbitrator,
+    held: &crate::pipeline::memory::ConsumerHandle,
 ) -> Result<StreamingProbeOutput, PipelineError> {
     use crate::executor::stream_event::StreamEvent;
     use cxl::eval::EvalContext;
@@ -1517,6 +1580,7 @@ fn run_streaming_combine_probe(
         cursor_advances: Vec::new(),
         driver_sources: Vec::new(),
         failures: Vec::new(),
+        charged_failures: 0,
     };
     let mut output_records: Vec<(Record, crate::executor::stream_event::SourceRowId)> = Vec::new();
     let mut driver_puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
@@ -1573,17 +1637,7 @@ fn run_streaming_combine_probe(
                     // A schema mismatch is a fatal E314 in both paths; drain
                     // to disconnect first so the driver `send` cannot
                     // deadlock, then surface.
-                    while let Ok(event) = rx.recv() {
-                        if let crate::executor::stream_event::StreamEvent::Record(record, _) = event
-                        {
-                            charge_handle.sub_bytes(
-                                crate::executor::node_buffer::unaccounted_record_byte_cost(
-                                    &record,
-                                    &allocation_resources,
-                                ),
-                            );
-                        }
-                    }
+                    drain_probe_channel(&rx, &charge_handle, &allocation_resources);
                     return Err(err);
                 }
 
@@ -1633,18 +1687,7 @@ fn run_streaming_combine_probe(
                         // Fatal (FailFast surfacing, on_miss::error,
                         // planner-invariant) — drain to disconnect, then
                         // surface.
-                        while let Ok(event) = rx.recv() {
-                            if let crate::executor::stream_event::StreamEvent::Record(record, _) =
-                                event
-                            {
-                                charge_handle.sub_bytes(
-                                    crate::executor::node_buffer::unaccounted_record_byte_cost(
-                                        &record,
-                                        &allocation_resources,
-                                    ),
-                                );
-                            }
-                        }
+                        drain_probe_channel(&rx, &charge_handle, &allocation_resources);
                         return Err(e);
                     }
                 };
@@ -1654,21 +1697,16 @@ fn run_streaming_combine_probe(
                 // the match above already surfaces after draining the channel — so
                 // the streaming path is covered without a separate check here.
 
-                // Budget check every 10K emitted records, the same cadence
-                // and abort the materialized loop uses.
-                budget_cadence += output_records.len() - before;
+                // Charge the failures this driver added before the budget
+                // check, so the check sees them. They are held until the
+                // join, not written as the materialized loop writes its own.
+                let new_failures = effects.charge_new_failures(held, &allocation_resources);
+
+                // Budget check every 10K emitted or failed records, the same
+                // cadence and abort the materialized loop uses.
+                budget_cadence += output_records.len() - before + new_failures;
                 if budget_cadence >= 10_000 && budget.should_abort() {
-                    while let Ok(event) = rx.recv() {
-                        if let crate::executor::stream_event::StreamEvent::Record(record, _) = event
-                        {
-                            charge_handle.sub_bytes(
-                                crate::executor::node_buffer::unaccounted_record_byte_cost(
-                                    &record,
-                                    &allocation_resources,
-                                ),
-                            );
-                        }
-                    }
+                    drain_probe_channel(&rx, &charge_handle, &allocation_resources);
                     return Err(PipelineError::MemoryBudgetExceeded {
                         node: name.to_string(),
                         used: budget.peak_rss().unwrap_or(0),
@@ -1743,6 +1781,7 @@ fn run_streaming_combine_probe(
         advance_cursor(ctx, &source_name_arc, rn);
     }
     for f in std::mem::take(&mut effects.failures) {
+        let held_bytes = f.held_bytes(&allocation_resources);
         dispatch_combine_output_error(
             ctx,
             node_idx,
@@ -1753,6 +1792,9 @@ fn run_streaming_combine_probe(
             f.error,
             f.failed_at,
         )?;
+        // Written (or handed to the group that holds it): no longer this
+        // probe's to charge.
+        held.sub_bytes(held_bytes);
     }
 
     ctx.counters.filtered_count += counters.filtered;
@@ -1777,6 +1819,23 @@ struct ProbeFailure {
     error: cxl::eval::EvalError,
     /// Taken as the probe observed the failure, on whichever thread ran it.
     failed_at: DlqFailureStamp,
+}
+
+impl ProbeFailure {
+    /// Resident bytes this failure holds while it waits to be written: the
+    /// driver row and the build row it cloned, each priced by
+    /// [`held_record_bytes`], plus the failure itself. The same figure charges
+    /// the failure when it is appended and discharges it when it is written,
+    /// so the two cannot disagree.
+    fn held_bytes(&self, resources: &clinker_record::owned_storage::AllocationResources) -> u64 {
+        let build = self
+            .matched_build
+            .as_ref()
+            .map_or(0, |build| held_record_bytes(&build.record, resources));
+        held_record_bytes(&self.probe_record, resources)
+            .saturating_add(build)
+            .saturating_add(std::mem::size_of::<Self>() as u64)
+    }
 }
 
 /// Where [`CombineProbeKernel::probe_row`] puts what one driver produced:
@@ -2973,4 +3032,83 @@ fn dispatch_combine_output_error(
         crate::executor::held_failure::write_failure(ctx, failure)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod probe_failure_charge_tests {
+    use super::*;
+    use clinker_record::owned_storage::SharedStorage;
+    use clinker_record::{Schema, Value};
+
+    fn failure(schema: &SharedStorage<Schema>, text: &str, with_build: bool) -> ProbeFailure {
+        let record = Record::new(schema.clone(), vec![Value::String(text.into())]);
+        ProbeFailure {
+            probe_record: record.clone(),
+            rn: 0u64.into(),
+            matched_build: with_build.then(|| MatchedBuildFailure {
+                record,
+                row: 1u64.into(),
+            }),
+            error: cxl::eval::EvalError::division_by_zero(cxl::lexer::Span::new(0, 0)),
+            failed_at: DlqFailureStamp::now(),
+        }
+    }
+
+    #[test]
+    fn held_failures_are_charged_once_and_discharge_to_zero() {
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["v".into()])));
+        let resources = clinker_format::preparation::MemoryOnlyResources::new(
+            std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+        )
+        .resources()
+        .allocation()
+        .clone();
+        let consumer = crate::pipeline::memory::ConsumerHandle::new();
+        let mut effects = StreamingProbeEffects {
+            cursor_advances: Vec::new(),
+            driver_sources: Vec::new(),
+            failures: Vec::new(),
+            charged_failures: 0,
+        };
+
+        effects
+            .failures
+            .push(failure(&schema, &"x".repeat(1000), true));
+        assert_eq!(effects.charge_new_failures(&consumer, &resources), 1);
+        let pair = effects.failures[0].held_bytes(&resources);
+        let floor = 2 * std::mem::size_of::<Record>() + std::mem::size_of::<ProbeFailure>();
+        assert!(
+            pair >= floor as u64,
+            "a failure holding a driver row and a build row owns at least both records and \
+             itself: {pair} < {floor}"
+        );
+        assert_eq!(consumer.bytes(), pair);
+
+        assert_eq!(
+            effects.charge_new_failures(&consumer, &resources),
+            0,
+            "a failure already charged is not charged again"
+        );
+        assert_eq!(consumer.bytes(), pair);
+
+        effects.failures.push(failure(&schema, "y", false));
+        assert_eq!(effects.charge_new_failures(&consumer, &resources), 1);
+        let alone = effects.failures[1].held_bytes(&resources);
+        assert!(
+            alone < pair,
+            "a failure with no build row holds one record fewer"
+        );
+        assert_eq!(consumer.bytes(), pair + alone);
+        assert_eq!(consumer.peak_bytes(), pair + alone);
+
+        for f in std::mem::take(&mut effects.failures) {
+            consumer.sub_bytes(f.held_bytes(&resources));
+        }
+        assert_eq!(consumer.bytes(), 0, "a fully replayed probe nets to zero");
+        assert_eq!(
+            consumer.peak_bytes(),
+            pair + alone,
+            "the high-water mark keeps what the probe held"
+        );
+    }
 }

@@ -499,6 +499,20 @@ pub(crate) struct MatchedBuildFailure {
     pub row: crate::executor::stream_event::SourceRowId,
 }
 
+/// Resident bytes of one record a combine path holds beyond the call that
+/// produced it: the record struct plus the heap `resources` does not already
+/// account for.
+///
+/// Every path that holds a failure or a candidate record charges it by this
+/// one formula, so the block join's held failures and the streaming probe's
+/// are priced alike and the memory arbitrator sees comparable figures.
+pub(crate) fn held_record_bytes(
+    record: &Record,
+    resources: &clinker_record::owned_storage::AllocationResources,
+) -> u64 {
+    (std::mem::size_of::<Record>() + record.unaccounted_heap_size(resources)) as u64
+}
+
 /// The row id of the build candidate at `index` in `build_rows`, which a
 /// join kernel keeps aligned with its candidate indices. A candidate without
 /// one is an engine invariant violation, reported as

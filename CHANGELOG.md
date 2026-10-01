@@ -51,6 +51,12 @@ after each deciding candidate.
 A Route branch condition follows the same rule, which it already did: a
 failing condition takes no branch and not the default.
 
+On a hash Combine whose driver streams straight in, the failures of a
+`match: all` hot key are held until the probe finishes, and they now count
+against `pipeline.memory.limit` as they accumulate, so a key whose residual
+mostly fails ends in a memory-limit error rather than growing past the limit
+unseen.
+
 ### Fixed — a `where:` conjunct beside one or two range conjuncts is applied on the IEJoin strategies
 
 A Combine whose `where:` held one or two range conjuncts and a conjunct that

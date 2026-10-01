@@ -89,6 +89,7 @@ use crate::executor::combine::{CombineResolver, CombineResolverMapping};
 use crate::executor::widen_record_to_schema;
 use crate::pipeline::combine::{
     CombineOutputEvalFailure, KeyExtractor, MatchedBuildFailure, canonical_key_bytes,
+    held_record_bytes,
 };
 use crate::pipeline::combine_verdict::{
     Admit, Decisive, DriverScan, DriverVerdict, MissToken, PredicateOutcome, eval_predicate,
@@ -944,13 +945,6 @@ fn collect_entry_cost(entry: &CollectEntry) -> u64 {
     (std::mem::size_of::<CollectEntry>() + entry.value.heap_size()) as u64
 }
 
-fn record_unaccounted_held_cost(
-    record: &Record,
-    resources: &clinker_record::owned_storage::AllocationResources,
-) -> u64 {
-    (std::mem::size_of::<Record>() + record.unaccounted_heap_size(resources)) as u64
-}
-
 /// Resident byte cost of one held build candidate: the cloned record plus the
 /// `R` held beside it (the build row id for a `First` candidate, nothing for
 /// the collect `$ck` build).
@@ -964,7 +958,7 @@ fn candidate_unaccounted_held_cost<R>(
     record: &Record,
     resources: &clinker_record::owned_storage::AllocationResources,
 ) -> u64 {
-    record_unaccounted_held_cost(record, resources) + std::mem::size_of::<R>() as u64
+    held_record_bytes(record, resources) + std::mem::size_of::<R>() as u64
 }
 fn collect_entry_unaccounted_cost(
     entry: &CollectEntry,
@@ -1055,9 +1049,9 @@ fn decisive_unaccounted_held_cost(
         Decisive::Match((_, record, _)) => {
             candidate_unaccounted_held_cost::<RecordOrder>(record, resources)
         }
-        Decisive::Failure(tagged) => failure_held_cost(tagged, |record| {
-            record_unaccounted_held_cost(record, resources)
-        }),
+        Decisive::Failure(tagged) => {
+            failure_held_cost(tagged, |record| held_record_bytes(record, resources))
+        }
     }
 }
 
