@@ -118,13 +118,15 @@ A gate that was not run, or whose result was read from the wrong place, is a gat
 
 ## User-Facing Surface
 
+The pipeline author is not a software engineer. They have basic-to-intermediate scripting skills: they can edit a YAML file and write an expression the way they would a spreadsheet formula, and they do not know floating point, type systems, join algorithms, or memory management. Clinker does the heavy lifting inside the engine and gives this author a simple, intuitive experience. Judge every surface decision, default, and diagnostic by this reader, and state in the PR how this author would discover, use, and recover from the change.
+
 Anything a pipeline author writes by hand — a YAML key, a CXL construct, a CLI flag, an option value — is a user interface. Changing it is a design decision, not an implementation detail.
 
 - Ground surface decisions in patterns config authors have already met and that demonstrably work in tools of this shape, rather than in a spelling that only makes sense from inside the engine. Where an established convention exists, follow it; where this project departs from one, say so in the PR and give the reason.
 - One concept, one spelling. A second syntax for something the surface already expresses is a defect, not a convenience.
 - The common case is the short case; the general form stays reachable without rewriting the simple one.
 - Engine vocabulary stays out of author vocabulary — internal identifiers and namespaced machinery are not things a user should have to type.
-- Errors are part of the surface: a diagnostic names the offending input, the rule it broke, and a corrected form the author can paste.
+- Errors are part of the surface. A diagnostic opens with one plain sentence in the author's words and names the offending input and the rule it broke. It gives one recommended fix the author can paste, with a one-line reason, and puts technical detail after the fix. When the cause is authored YAML, the fix is that YAML at the line to change. It shows no Rust `Debug` output, internal type names, engine vocabulary, or raw byte counts.
 - User documentation ships in the same PR as the surface change.
 
 ## Rust Conventions
@@ -176,6 +178,7 @@ For creating, triaging, splitting, or closing GitHub issues, follow [docs/ai/GIT
 - Relevant tests/checks were run, or skipped with a clear reason.
 - `git diff --check` passes.
 - Behavior changes have matching docs and tests.
+- New or changed diagnostics follow the house style in [User-Facing Surface](#user-facing-surface).
 - Each obligation in [docs/ai/32_NODE_OBLIGATIONS.md](docs/ai/32_NODE_OBLIGATIONS.md) is met for every node type the change touches, or its exemption is stated in the PR.
 - Open questions are captured in `docs/ai/80_OPEN_QUESTIONS.md`.
 - Final response summarizes changed files, validation, and any remaining risks.
