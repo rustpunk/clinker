@@ -1539,3 +1539,187 @@ nodes:
         "the failing driver row and its matched build row both route to the DLQ"
     );
 }
+
+// A streaming-probe `match: all` Combine whose residual fails for most of the
+// build rows sharing a hot key.
+//
+// The probe thread cannot reach the dead-letter output, so it holds every
+// failing pair's failure until the probe joins. Each failure clones the driver
+// row and the build row, and a hot key makes the number of failures the
+// product of driver rows and failing build rows rather than a function of the
+// input size alone. Whatever the probe thread holds has to be charged to the
+// combine's consumer, or the memory limit cannot see it.
+const HOT_KEY_DRIVERS: usize = 60;
+const HOT_KEY_BUILD_ROWS: usize = 200;
+const HOT_KEY_FAILING_BUILD_ROWS: usize = 190;
+
+fn hot_key_probe_plan() -> (
+    clinker_plan::config::PipelineConfig,
+    clinker_plan::plan::CompiledPlan,
+) {
+    let yaml = r#"
+pipeline:
+  name: streaming_combine_probe_hot_key_failures
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: ./orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: qty, type: int }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: ./products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: divisor, type: int }
+  - type: transform
+    name: norm
+    input: orders
+    config:
+      cxl: |
+        emit order_id = order_id
+        emit product_id = product_id
+        emit qty = qty
+  - type: combine
+    name: c
+    input:
+      norm: norm
+      products: products
+    config:
+      where: "norm.product_id == products.product_id and norm.qty / products.divisor > 0"
+      match: all
+      on_miss: skip
+      drive: norm
+      cxl: |
+        emit order_id = norm.order_id
+        emit divisor = products.divisor
+      propagate_ck: driver
+  - type: sink
+    name: out
+    input: c
+    config:
+      name: out
+      type: csv
+      path: ./out.csv
+"#;
+    let config = parse_config(yaml).expect("parse_config");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("compile pipeline");
+    (config, plan)
+}
+
+/// Run the hot-key pipeline. The first `HOT_KEY_FAILING_BUILD_ROWS` build rows
+/// have a zero divisor and carry `failing_key`; the rest carry `hot`. Every
+/// driver row probes `hot`, so those build rows divide by zero in the residual
+/// when `failing_key` is `hot` and never meet a driver when it is any other key
+/// of the same length. Both shapes therefore build the same table and stream
+/// the same output rows; only the failures differ.
+fn run_hot_key_probe(
+    plan: &clinker_plan::plan::CompiledPlan,
+    failing_key: &str,
+) -> (clinker_exec::executor::ExecutionReport, Vec<String>) {
+    let mut orders = String::from("order_id,product_id,qty\n");
+    for i in 0..HOT_KEY_DRIVERS {
+        orders.push_str(&format!("o{i},hot,7\n"));
+    }
+    let mut products = String::from("product_id,divisor\n");
+    for j in 0..HOT_KEY_BUILD_ROWS {
+        if j < HOT_KEY_FAILING_BUILD_ROWS {
+            products.push_str(&format!("{failing_key},0\n"));
+        } else {
+            products.push_str("hot,1\n");
+        }
+    }
+    let readers: SourceReaders = HashMap::from([
+        (
+            "orders".to_string(),
+            clinker_exec::executor::single_file_reader(
+                "orders.csv",
+                Box::new(Cursor::new(orders.into_bytes())),
+            ),
+        ),
+        (
+            "products".to_string(),
+            clinker_exec::executor::single_file_reader(
+                "products.csv",
+                Box::new(Cursor::new(products.into_bytes())),
+            ),
+        ),
+    ]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn Write + Send>,
+    )]);
+    let report =
+        PipelineExecutor::run_plan_with_readers_writers(plan, readers, writers, &run_params())
+            .expect("a hot-key streaming probe completes under the continue strategy");
+    (report, body_lines(&buf))
+}
+
+/// The failures a streaming probe holds until it joins are charged to the
+/// combine's consumer, so a hot key whose residual mostly fails shows up in
+/// the node's charged peak and is subject to the memory limit.
+///
+/// The two runs share the build table and every driver row; only the number
+/// of build rows that fail in the residual differs, so the difference between
+/// their charged peaks is what the probe thread held for the failures.
+#[test]
+fn streaming_combine_probe_charges_the_failures_it_holds() {
+    let (config, plan) = hot_key_probe_plan();
+    assert_streaming_to_output(&explain_of(&config, &plan), "transform.norm", "combine.c");
+
+    let true_pairs = HOT_KEY_DRIVERS * (HOT_KEY_BUILD_ROWS - HOT_KEY_FAILING_BUILD_ROWS);
+
+    let (clean, clean_lines) = run_hot_key_probe(&plan, "hit");
+    assert_eq!(
+        clean_lines.len(),
+        true_pairs,
+        "the build rows under another key never meet a driver, so only the pairs on `hot` write"
+    );
+    assert_eq!(clean.counters.dlq_count, 0);
+
+    let (failing, failing_lines) = run_hot_key_probe(&plan, "hot");
+    let failures = HOT_KEY_DRIVERS * HOT_KEY_FAILING_BUILD_ROWS;
+    assert_eq!(
+        failing_lines.len(),
+        true_pairs,
+        "the pairs whose residual is true keep their rows"
+    );
+    assert_eq!(
+        failing.counters.dlq_count as usize,
+        2 * failures,
+        "each failing pair writes its driver row and its build row"
+    );
+
+    let clean_peak = clean
+        .per_node_peak_charged_bytes
+        .get("c")
+        .copied()
+        .expect("the combine's hash table is charged under its name");
+    let failing_peak = failing
+        .per_node_peak_charged_bytes
+        .get("c")
+        .copied()
+        .expect("the combine's hash table is charged under its name");
+    let held = failing_peak.saturating_sub(clean_peak);
+    // Each held failure owns a clone of the driver row at the least.
+    let at_least = (failures * std::mem::size_of::<clinker_record::Record>()) as u64;
+    assert!(
+        held >= at_least,
+        "{failures} failures were held until the probe joined, so the combine's charged peak \
+         must grow by at least {at_least} bytes over the run with none; it grew by {held} \
+         ({clean_peak} -> {failing_peak})"
+    );
+}
