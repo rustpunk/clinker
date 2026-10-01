@@ -1535,10 +1535,11 @@ fn drain_probe_channel(
 /// combine's own consumer, as each is appended, and discharged as the replay
 /// writes it. Under `match: all` a hot key fails once per failing pair, so
 /// the held set grows with the key's fan-out, not with the driver. The thread
-/// polls the arbitrator after every driver that adds failures or rows past the
-/// same 10,000-record cadence the materialized loop uses, so the bound is one
-/// driver's failures beyond the arbitrator's limit rather than the whole
-/// stream's. The materialized loop writes each driver's failures as it goes
+/// polls the arbitrator once 10,000 rows and failures have accrued, the
+/// cadence the materialized loop uses, and only between drivers. The overshoot
+/// past the arbitrator's limit is therefore one cadence window plus the
+/// failures of the driver in flight, not the whole stream's. The materialized
+/// loop writes each driver's failures as it goes
 /// and holds none, which this path cannot: the thread has no way to reach the
 /// dead-letter output until it joins.
 #[allow(clippy::too_many_arguments)]
