@@ -1144,11 +1144,11 @@ mod tests {
     //
     // The two flags are exact complements under relaxed-CK. Lineage is the
     // Reversible-path optimization for retraction: it lets an O(1) sub()
-    // on Sum/Count/Collect/Any target only the rows a downstream rollback
-    // names. Buffer-mode replays contributions from a separate per-group
-    // buffer for BufferRequired bindings (Min/Max/Avg/WeightedAvg) where
-    // an inverse op would either drift (Avg, WeightedAvg) or be impossible
-    // without the surviving multiset (Min, Max). A single BufferRequired
+    // on Sum/Count/Avg/WeightedAvg/Collect/Any target only the rows a
+    // downstream rollback names; the sums are exact, so the subtraction
+    // does not drift. Buffer-mode replays contributions from a separate
+    // per-group buffer for BufferRequired bindings (Min/Max), where an
+    // inverse op is impossible without the surviving multiset. A single BufferRequired
     // binding flips the whole aggregate to buffer-mode — splitting
     // strategies per slot would defeat the point.
 

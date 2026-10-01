@@ -631,11 +631,12 @@ impl AggregatorGroupState {
 ///
 /// Parallel to `AggregatorGroupState` but carries raw per-row contributions
 /// instead of folded accumulator state. Used when a relaxed-correlation-key
-/// aggregate has at least one `BufferRequired` accumulator binding (`Min`,
-/// `Max`, `Avg`, `WeightedAvg`) — the rollback step needs to recompute
-/// affected groups from `contributions − retracted_rows` because those
-/// accumulators do not admit an O(1) inverse op without precision loss
-/// (`Avg`, `WeightedAvg`) or without the surviving multiset (`Min`, `Max`).
+/// aggregate has at least one `BufferRequired` accumulator binding (`Min` or
+/// `Max`) — the rollback step needs to recompute affected groups from
+/// `contributions − retracted_rows` because those accumulators have no
+/// inverse op without the surviving multiset. `Sum`, `Avg` and `WeightedAvg`
+/// hold exact sums, which subtract exactly, so they retract on the lineage
+/// path and only reach buffer mode beside a `Min` or `Max` binding.
 ///
 /// Storage shape: `contributions[i]` is the per-binding evaluated value
 /// vector for the i-th input row folded into this group, stored in
@@ -861,8 +862,10 @@ pub(super) fn dispatch_binding(
         CompiledBindingArg::Pair(a, b) => {
             let va = eval_binding_arg_value(a, record, ctx)?;
             let vb = eval_binding_arg_value(b, record, ctx)?;
-            acc.add_weighted(&va, &vb);
-            Ok(0)
+            // A weighted accumulator allocates its exact-sum states on the
+            // first float pair; the caller charges what this returns, so an
+            // uncounted pair would leave a held group looking free.
+            Ok(acc.add_weighted(&va, &vb))
         }
     }
 }
@@ -1074,6 +1077,10 @@ pub(super) fn fold_buffered_state(
 ) -> Result<AggregatorGroupState, HashAggError> {
     let bindings = factory.compiled().bindings.clone();
     let mut row = factory.create_accumulators();
+    // The heap deltas `add` and `add_weighted` return are dropped on purpose:
+    // this row is transient finalize state, consumed by the finalize that
+    // follows, and the buffered contributions it is folded from are what the
+    // aggregator charges.
     for contrib in &buffered.contributions {
         let mut cursor = 0usize;
         for (binding, acc) in bindings.iter().zip(row.iter_mut()) {

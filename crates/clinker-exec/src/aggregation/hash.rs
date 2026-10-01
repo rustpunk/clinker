@@ -867,15 +867,16 @@ impl HashAggregator {
     /// (buffer-mode), then walks back the row's contribution:
     ///
     /// * **Lineage / fold path** — for each binding's accumulator in the
-    ///   group, calls `acc.sub(&stored_value)` against the corresponding
-    ///   slot in `AggregatorGroupState.retract_values`. Reversible-only
+    ///   group, calls `acc.sub(&stored_value)` (`sub_weighted` for a
+    ///   `weighted_avg` pair) against the corresponding slot in
+    ///   `AggregatorGroupState.retract_values`. Reversible-only
     ///   bindings are guaranteed by `set_retraction_flags`.
     /// * **Buffer path** — removes the matching entry from
     ///   `BufferedGroupState.contributions`/`input_rows`. The next
     ///   `finalize` call re-folds the surviving contributions through a
-    ///   fresh accumulator row, so `BufferRequired` bindings (`Min`,
-    ///   `Max`, `Avg`, `WeightedAvg`) recompute byte-identically to a
-    ///   feed-from-scratch over the surviving rows.
+    ///   fresh accumulator row, so `BufferRequired` bindings (`Min` and
+    ///   `Max`) recompute byte-identically to a feed-from-scratch over the
+    ///   surviving rows.
     ///
     /// Both paths return [`HashAggError::Spill`] when the row id is not
     /// found in any in-memory group; spilled groups cannot be retracted
@@ -2109,7 +2110,7 @@ mod spill_trigger_tests {
     //
     // The buffer-mode path is the complement of the lineage path under
     // relaxed-correlation-key semantics: when at least one binding is
-    // BufferRequired (Min/Max/Avg/WeightedAvg), the aggregator holds
+    // BufferRequired (Min/Max), the aggregator holds
     // raw per-row contributions instead of folded accumulator state so
     // the rollback step can recompute affected groups from
     // `contributions − retracted_rows`. The fold-mode path stays the

@@ -100,8 +100,8 @@ pub struct CompiledAggregate {
     /// retract individual contributions without rerunning the whole
     /// stream. Derived from whether the aggregate's `group_by` omits
     /// any correlation-key field plus the reversibility of every
-    /// binding's accumulator — any `BufferRequired` binding
-    /// short-circuits this back to `false` because that path will
+    /// binding's accumulator — any `BufferRequired` binding (`min` or
+    /// `max`) short-circuits this back to `false` because that path will
     /// replay surviving rows from a separate per-group buffer instead
     /// of running the lineage-driven retract. Strict aggregates
     /// (`group_by ⊇ correlation_key`, or no correlation key) always set
@@ -112,10 +112,11 @@ pub struct CompiledAggregate {
     /// aggregate's `group_by` omits any correlation-key field plus the
     /// reversibility of every binding's accumulator — exactly the
     /// complement of the lineage gate: at least one `BufferRequired`
-    /// binding (`Min`, `Max`, `Avg`, `WeightedAvg`) flips this on so the
-    /// rollback step can recompute affected groups from
-    /// `contributions − retracted_rows` rather than rely on an O(1)
-    /// inverse op the accumulator does not admit. Strict aggregates
+    /// binding (`Min` or `Max`) flips this on so the rollback step can
+    /// recompute affected groups from `contributions − retracted_rows`
+    /// rather than rely on an inverse op those accumulators do not admit
+    /// (`Sum`, `Avg` and `WeightedAvg` hold exact sums, which subtract
+    /// exactly, so they stay on the lineage path). Strict aggregates
     /// (`group_by ⊇ correlation_key`, or no correlation key) always set
     /// this `false`.
     pub requires_buffer_mode: bool,

@@ -122,8 +122,8 @@ pub enum HashAggError {
     },
     /// A single input record's buffered contributions alone exceed the entire
     /// memory budget. Buffer-mode aggregation must hold every raw
-    /// contribution resident to recompute `BufferRequired` bindings (`min`,
-    /// `max`, `avg`) after a retraction, so a row larger than the whole
+    /// contribution resident to recompute `BufferRequired` bindings (`min`
+    /// and `max`) after a retraction, so a row larger than the whole
     /// budget has no in-budget representation and spilling cannot rescue it —
     /// the next add of the same shape repeats the overflow. Routed by the
     /// executor dispatch arm by error strategy: `FailFast` surfaces `E310
