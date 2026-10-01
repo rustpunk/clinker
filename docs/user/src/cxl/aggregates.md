@@ -57,6 +57,17 @@ a float, decimals a decimal. Integers summed with floats give a float, and
 integers summed with decimals a decimal. An integer sum outside the 64-bit
 integer range is an error.
 
+A float sum is the exact total of the group's values, rounded once to the
+nearest float. It does not depend on the order rows arrive in or on
+`memory.limit`: the same group gives the same bytes whether the Aggregate holds
+every group in memory or spills and merges partial sums. A group that holds
+`1e16`, `1.0` and `-1e16` sums to `1`, in any order, where adding the floats
+left to right gives `0` or `1` depending on the order. Integers mixed with floats
+are added exactly too, so an integer larger than 2^53 is not rounded before it
+is added. A NaN in the group makes the sum NaN, and `+inf` with `-inf` makes it
+NaN. Results can differ in the last bit from a version that rounded after each
+addition.
+
 A decimal sum is the exact total of the group's values, rounded once (half to
 even) only when it needs more than 28 significant digits. Its scale is the
 largest scale among the group's values, zeros and integers included, so the
@@ -108,7 +119,9 @@ cxl: |
 ```
 
 `avg(x)` is `sum(x) / count(x)`: the group's exact sum, rounded once as `sum`
-rounds it, divided by the number of non-null values. Over decimals the result
+rounds it, divided by the number of non-null values, so it is exact over floats
+and decimals alike and does not depend on row order or `memory.limit`. Over
+decimals the result
 is a decimal, the quotient at full precision, so `avg(amount)` and
 `sum(amount) / count(amount)` give the same digits and the same scale. Over
 floats, and over integers mixed with floats, the result is a float. Over
@@ -180,8 +193,11 @@ cxl: |
 computed as it is in any expression and both sums exact, rounded once as `sum`
 rounds them. When either the value or the weight is a `decimal`, the result is
 a decimal at full division precision, and it has the same digits and scale as
-`sum(v * w) / sum(w)`. Otherwise it is a float. Over integers alone the two
-exact totals are each converted once to a float and divided.
+`sum(v * w) / sum(w)`. Otherwise it is a float. Over floats each row's
+`v * w` is a float product, and the products and the weights are summed
+exactly, so the average does not depend on row order or `memory.limit`. Over
+integers alone the two exact totals are each converted once to a float and
+divided.
 
 These groups fail with an `aggregate_finalize` error rather than writing a
 value:
@@ -210,6 +226,12 @@ and weight are both non-null gives null.
 | Syntax | `sum(field)` (free-standing) | `$window.sum(field)` (namespace) |
 | Configuration | `type: aggregate` + `group_by:` | `type: transform` + `analytic_window:` |
 | Use case | Summarize groups | Enrich records with group context |
+
+An Aggregate's `sum`, `avg` and `weighted_avg` are exact (see
+[`sum`](#sumexpr---int-float-or-decimal)). A window function's `$window.sum` and
+`$window.avg` are not: they still add in the order the rows of the partition
+are held, so a window sum over floats can differ in its last bits from the
+Aggregate's sum of the same values.
 
 ## Combining aggregates with expressions
 

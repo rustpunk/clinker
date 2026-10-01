@@ -52,9 +52,9 @@ The reason is structural: streaming aggregates emit at group-boundary close, bef
 
 The cost of refinalizing a group depends on whether the accumulator can be run in reverse:
 
-- **Reversible accumulators** (`sum`, `count`, `collect`, `any`) carry a per-row lineage map `(input_row_id → group_index)` alongside accumulator state. A retract is O(retracted_rows) reverse-op calls plus one `finalize_in_place`. The lineage map costs ~8 bytes/row plus the per-group `input_rows` Vec inline cost.
+- **Reversible accumulators** (`sum`, `count`, `avg`, `weighted_avg`, `collect`, `any`) carry a per-row lineage map `(input_row_id → group_index)` alongside accumulator state. A retract is O(retracted_rows) reverse-op calls plus one `finalize_in_place`. The lineage map costs ~8 bytes/row plus the per-group `input_rows` Vec inline cost. `sum`, `avg` and `weighted_avg` hold exact sums, which subtract exactly, so a retracted group finalizes to the bytes of a fresh fold over the surviving rows, at any memory limit. A `sum` whose every contribution is retracted has no value left and finalizes to null, as a group with no rows does.
 
-- **BufferRequired accumulators** (`min`, `max`, `avg`, `weighted_avg`) cannot be unwound by a reverse op — removing the current max, for instance, requires knowing the second-largest value, which the running accumulator never retained. They hold per-group raw contributions until commit and recompute affected groups from `contributions − retracted_rows`.
+- **BufferRequired accumulators** (`min`, `max`) cannot be unwound by a reverse op — removing the current max, for instance, requires knowing the second-largest value, which the running accumulator never retained. They hold per-group raw contributions until commit and recompute affected groups from `contributions − retracted_rows`.
 
 The full per-accumulator memory formulas live in [Operator Retraction Cost Reference](retraction-cost-reference.md).
 

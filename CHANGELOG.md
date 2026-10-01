@@ -63,6 +63,38 @@ names the rule and the fix; only a group with no non-null value gives null.
   totals, `decimal_rows` and `decimal_overflow` are gone, and its integer
   totals are private).
 
+### Fixed — float sum, avg and weighted_avg are exact and no longer depend on memory or row order
+
+An Aggregate's float `sum`, `avg` and `weighted_avg` now give the exact total
+of the group's values, rounded once to the nearest float (#1289). They used to
+round after every addition, so the answer could change in its last digits with
+the order rows arrived in or with `memory.limit`, and a group whose rows were
+spread over several spill runs could lose integers: when a run held only
+integers and the group's floats were in an earlier run, merging the partial
+states dropped the integers from the total.
+
+- **One answer at every memory limit and arrival order.** The same group gives
+  the same bytes whether the Aggregate holds every group in memory, spills and
+  merges partial sums, streams over sorted input or runs as a time window.
+  Integers mixed with floats are added exactly, so an integer larger than 2^53
+  is no longer rounded before it is added. A NaN in the group makes the total
+  NaN, and `+inf` with `-inf` makes it NaN. Decimal totals follow the same rule
+  and are covered by the same checks.
+- **Results can differ in the last bits from before.** A float group whose
+  values cancel or span many magnitudes, such as `1e16`, `1.0` and `-1e16`
+  (now `1`), gives the exact total where it used to give the left-to-right
+  one. Window functions are unchanged: `$window.sum` and `$window.avg` still add
+  in partition order.
+- **A relaxed correlation-key Aggregate retracts `avg` and `weighted_avg`
+  without holding rows.** They subtract exactly, like `sum`, so only `min` and
+  `max` still make the Aggregate hold each group's raw rows until commit. An
+  Aggregate of `sum`, `count`, `avg`, `weighted_avg`, `collect` and `any` now
+  keeps a small per-row lineage map instead, and a retracted group equals a
+  rerun over the surviving rows.
+- **A fully retracted `sum` gives null, not 0.** When a retraction removes every
+  contribution to a group's `sum`, the group has no value left, as a group with
+  no rows has none, so the `sum` is null where it used to be 0.
+
 ### Changed — Cull and Reshape order each group like a Sink sort
 
 A Cull or Reshape `order_by` now orders the rows of each group by the same
