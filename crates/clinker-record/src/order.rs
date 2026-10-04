@@ -5,8 +5,9 @@
 //! disagree about which of two values comes first or whether two values fall in
 //! the same group. [`compare`] is a total order over every [`Value`]; [`encode`]
 //! writes a memcomparable key whose unsigned byte order is exactly [`compare`];
-//! [`ties`] and [`hash_tie_class`] give group keys the comparator's equality and
-//! a hash that agrees with it.
+//! [`ties`] is the comparator's equality and [`hash_tie_class`] a hash that
+//! agrees with it. Group keys carry their own equality, hash and tie bytes on
+//! `GroupByKey`, which a property test proves agree with [`ties`].
 //!
 //! The order:
 //!

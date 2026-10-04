@@ -205,8 +205,11 @@ permanent stability.
   `encode_*` functions, `ties`, `NumericTieClass` and `hash_tie_class`.
 - **Use:** Every comparison that sorts, groups, merges sorted runs or checks a
   declared order goes through `clinker_record::order`: `compare` in memory,
-  `encode` for byte keys that are spilled or merged, `ties` and
-  `hash_tie_class` for group-key equality and hashing. They define one total
+  `encode` for byte keys that are spilled or merged, and `ties` and
+  `hash_tie_class` for the order's tie and a hash that agrees with it. Group
+  keys carry their own `PartialEq`, `Hash` and `encode_tie_bytes` on
+  `GroupByKey`, which `group_key_equality_is_the_order_tie` in
+  `value_order_properties.rs` proves agree with `ties`. They define one total
   order (numbers by exact value across integer, float and decimal; every NaN
   one value above infinity; `-0.0` tied to `0.0`; a fixed rank across domains),
   so an in-memory path and a spilled path cannot disagree. Nulls are placed by

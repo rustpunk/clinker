@@ -285,7 +285,9 @@ impl From<&OrderField> for SortField {
 /// Deserialize a list whose entries are each a field name or a full sort
 /// field object into `Vec<SortField>`: the two spellings [`SortFieldSpec`]
 /// gives a Sink or Source `sort_order`. Used through
-/// `#[serde(deserialize_with)]` so every authored ordering list takes both.
+/// `#[serde(deserialize_with)]` by a Cull or Reshape `order_by`, so those
+/// lists take both spellings too. A window's `sort_by` does not use it and
+/// takes the full sort field form only.
 pub fn deserialize_sort_field_list<'de, D>(deserializer: D) -> Result<Vec<SortField>, D::Error>
 where
     D: Deserializer<'de>,
