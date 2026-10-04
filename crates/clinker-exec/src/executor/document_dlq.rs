@@ -556,15 +556,19 @@ impl DocumentDlqState {
             self.held.flush_all(&self.arbitrator, node)?;
         }
         if !fits(&self.arbitrator) {
+            use clinker_core_types::QuoteName;
             let charged_pressure = self.arbitrator.sum_consumer_usage();
             let projected_pressure = charged_pressure.saturating_add(growth);
+            // The document is named as every diagnostic names one. The byte
+            // figures stay raw counts, as the other E310 details write them.
             return Err(PipelineError::MemoryBudgetExceeded {
                 node: node.to_string(),
                 used: projected_pressure,
                 limit: hard_limit,
                 source: clinker_plan::BudgetCategory::Arena,
                 detail: Some(format!(
-                    "the document dead-letter ledger of {key:?} projected {projected_pressure} bytes from charged pressure {charged_pressure} plus {growth} bytes for one more row, with every held row already on disk"
+                    "the document dead-letter ledger of {quoted} projected {projected_pressure} bytes from charged pressure {charged_pressure} plus {growth} bytes for one more row, with every held row already on disk",
+                    quoted = key.quoted_name(),
                 )),
             });
         }
@@ -3610,7 +3614,13 @@ mod tests {
             "the figures the user documentation states"
         );
         // Row `i` of a pass that alternates between containers 0 and 1.
-        let alternating = |i: u64| if i % 2 == 0 { i / 2 } else { 65_536 + i / 2 };
+        let alternating = |i: u64| {
+            if i.is_multiple_of(2) {
+                i / 2
+            } else {
+                65_536 + i / 2
+            }
+        };
 
         // No earlier settle, so nothing merges: every row after the first
         // hops to the other container.
@@ -3721,10 +3731,10 @@ mod tests {
         );
         let boundary = 1_u64 << 32;
         let (mut state, key) = ledger_state(&arbitrator);
-        let rows = 2_048;
+        let rows: u64 = 2_048;
         let charges: Vec<u64> = (0..rows)
             .map(|i| {
-                let ordinal = if i % 2 == 0 {
+                let ordinal = if i.is_multiple_of(2) {
                     boundary - 1 - i / 2
                 } else {
                     boundary + i / 2
