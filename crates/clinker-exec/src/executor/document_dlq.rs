@@ -582,6 +582,24 @@ impl DocumentDlqState {
         self.arbitrator.sample_peak_consumer_usage();
     }
 
+    /// Settle every ledger that took admissions since its last settle. A
+    /// Sink's pass ends here, so the per-admission charges its late records
+    /// made, which no rejection pass settles, do not outlive the pass.
+    fn settle_unsettled_ledgers(&mut self) {}
+
+    /// The failed documents whose held rows no rejection has taken, in key
+    /// order, each with the node the end-of-run sweep rejects it under.
+    fn unclosed_failed_documents(&self) -> Vec<(DocKey, Arc<str>)> {
+        let mut pending: Vec<(DocKey, Arc<str>)> = self
+            .failed
+            .keys()
+            .filter(|key| self.held.contains(key))
+            .map(|key| (Arc::clone(key), Arc::from("document_dlq")))
+            .collect();
+        pending.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        pending
+    }
+
     /// Mark document `key` failed with its first failure's stamp `cause`,
     /// charging the document's fixed map slot.
     fn insert_failed(&mut self, key: DocKey, cause: DlqFailureStamp) {
@@ -1645,6 +1663,11 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
         for key in remaining_document_keys(&self.buckets) {
             self.decide_document(ctx, &key)?;
         }
+        // A late record of a failed document is admitted to its ledger
+        // outside any rejection pass, so this Sink's pass settles them.
+        if let Some(state) = ctx.document_dlq.as_mut() {
+            state.settle_unsettled_ledgers();
+        }
 
         if let Some(mut writer) = self.writer.take() {
             let flush_result = {
@@ -1692,15 +1715,8 @@ pub(crate) fn reject_unclosed_failed_documents(
     let Some(state) = ctx.document_dlq.as_ref() else {
         return Ok(());
     };
-    let mut pending: Vec<DocKey> = state
-        .failed
-        .keys()
-        .filter(|key| state.held.contains(key))
-        .cloned()
-        .collect();
-    pending.sort_unstable();
-    for key in pending {
-        reject_document_now(ctx, &key, None, "document_dlq")?;
+    for (key, node) in state.unclosed_failed_documents() {
+        reject_document_now(ctx, &key, None, &node)?;
     }
     Ok(())
 }
@@ -3013,6 +3029,11 @@ mod tests {
 
         // The request is answered on the next hold, which flushes.
         hold_row(&mut state, &doc_key(0), 101).expect("hold");
+        assert!(
+            arbitrator.cumulative_spill_bytes() > 0,
+            "the hold answered the request with a flush"
+        );
+        assert_eq!(files_in(root.path()), 1, "the held rows moved to one file");
         state
             .held
             .flush_all(&arbitrator, "validate")
@@ -3181,6 +3202,286 @@ mod tests {
             take_held_rows(&mut state, &flushed),
             rows_of([4, 5, 8, 9]),
             "the flushed document's rows replay later, in hold order"
+        );
+    }
+
+    /// Hold row `ordinal` of document `doc` as a failure at `node`.
+    fn hold_row_at(
+        state: &mut DocumentDlqState,
+        doc: &DocKey,
+        ordinal: u64,
+        node: &str,
+    ) -> Result<(), PipelineError> {
+        let source_name: Arc<str> = Arc::from("orders");
+        let bytes = format!("{doc},{ordinal},{}\n", "x".repeat(160)).into_bytes();
+        state.hold(
+            Arc::clone(doc),
+            &HeldRow {
+                source_row: row(1, ordinal),
+                source_name: &source_name,
+                stage: Some("transform:check"),
+                category: clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
+                failed_at: DlqFailureStamp::now(),
+            },
+            Some(&bytes),
+            node,
+        )
+    }
+
+    /// The end-of-run sweep rejects a document no Sink decided under the
+    /// node that first failed it, so its flushes and its E310 name a node of
+    /// the plan.
+    #[test]
+    fn an_unclosed_failed_document_is_swept_under_the_node_that_failed_it() {
+        let root = tempfile::tempdir().expect("spill root");
+        let arbitrator = ledger_arbitrator(1 << 30);
+        let mut state = held_state(&arbitrator, root.path(), usize::MAX);
+        let (decided, unclosed, other) = (doc_key(0), doc_key(1), doc_key(2));
+        hold_row_at(&mut state, &decided, 1, "validate").expect("hold");
+        hold_row_at(&mut state, &unclosed, 2, "route_x").expect("hold");
+        hold_row_at(&mut state, &unclosed, 3, "validate").expect("hold");
+        assert_eq!(
+            take_held_rows(&mut state, &decided),
+            rows_of([1]),
+            "a decision at the Sink takes the first document's rows"
+        );
+
+        let swept = state.unclosed_failed_documents();
+        assert_eq!(
+            swept,
+            vec![(Arc::clone(&unclosed), Arc::<str>::from("route_x"))],
+            "only the undecided document is swept, under the node that first failed it"
+        );
+
+        hold_row_at(&mut state, &other, 4, "validate").expect("hold");
+        arbitrator.spill_reclaimable(1);
+        let (key, node) = &swept[0];
+        let mut reader = state
+            .take_held(key, node)
+            .expect("take")
+            .expect("a held chain");
+        let mut rows = Vec::new();
+        while let Some(frame) = reader.next_frame().expect("frame") {
+            let source_row = state.names.decode(frame).expect("decode").source_row;
+            assert!(
+                state
+                    .admit_emitted(key, source_row, node)
+                    .expect("admission")
+            );
+            rows.push(source_row);
+        }
+        drop(reader);
+        assert_eq!(rows, rows_of([2, 3]));
+        let spilled = arbitrator.per_stage_spill_bytes();
+        assert!(arbitrator.cumulative_spill_bytes() > 0);
+        assert_eq!(
+            spilled.get("route_x").copied(),
+            Some(arbitrator.cumulative_spill_bytes()),
+            "the sweep's flush is credited to the node that failed the document"
+        );
+        assert!(
+            spilled
+                .keys()
+                .all(|stage| ["validate", "route_x", "out"].contains(&stage.as_str())),
+            "every spill entry names a node of the plan: {spilled:?}"
+        );
+
+        assert_eq!(state.held.resident_bytes(), 0, "nothing is left to flush");
+        arbitrator.set_limit(1).expect("limit");
+        match state.admit_emitted(key, row(1, 99), node) {
+            Err(PipelineError::MemoryBudgetExceeded { node, detail, .. }) => {
+                assert_eq!(node, "route_x");
+                assert!(
+                    detail.is_some_and(|d| d.contains("dead-letter ledger")),
+                    "the detail names the ledger"
+                );
+            }
+            other => panic!("expected E310, got {other:?}"),
+        }
+    }
+
+    /// Late records admit rows to a failed document's ledger outside any
+    /// rejection pass; the end of the Sink's pass settles them as a
+    /// rejection pass would.
+    #[test]
+    fn late_ledger_admissions_settle_when_the_sink_finishes() {
+        let arbitrator = ledger_arbitrator(1 << 30);
+        let (mut state, key) = ledger_state(&arbitrator);
+        let (mut twin, twin_key) = ledger_state(&arbitrator);
+        let settled_key: DocKey = Arc::from("settled.csv");
+        state.insert_failed(Arc::clone(&settled_key), DlqFailureStamp::now());
+        for ordinal in 1..=50 {
+            assert!(
+                state
+                    .admit_emitted(&settled_key, row(1, ordinal), "out")
+                    .expect("admission")
+            );
+        }
+        state.settle_emitted(&settled_key);
+        let settled_charge = state.failed[&settled_key].emitted.charged;
+        let baseline = state.charged_bytes();
+
+        let mut growths = 0;
+        for ordinal in (1..=3_000).step_by(3) {
+            let late = row(1, ordinal);
+            growths += state.failed[&key]
+                .emitted
+                .admission(late)
+                .expect("a row not yet recorded")
+                .growth;
+            assert!(state.admit_emitted(&key, late, "out").expect("admission"));
+            assert!(
+                twin.admit_emitted(&twin_key, late, "out")
+                    .expect("admission")
+            );
+        }
+        assert!(state.failed[&key].emitted.unsettled > 0);
+        assert_eq!(state.failed[&key].emitted.charged, growths);
+        assert_eq!(state.charged_bytes() - baseline, growths);
+
+        twin.settle_emitted(&twin_key);
+        let expected = twin.failed[&twin_key].emitted.charged;
+        state.settle_unsettled_ledgers();
+        assert_eq!(state.failed[&key].emitted.unsettled, 0);
+        assert_eq!(
+            state.failed[&key].emitted.charged, expected,
+            "the end-of-pass settle charges what a rejection pass's settle does"
+        );
+        assert_eq!(state.charged_bytes() - baseline, expected);
+        assert_eq!(
+            state.failed[&settled_key].emitted.charged, settled_charge,
+            "a ledger with nothing unsettled keeps its charge"
+        );
+
+        let charged = state.charged_bytes();
+        state.settle_unsettled_ledgers();
+        assert_eq!(
+            state.charged_bytes(),
+            charged,
+            "a second settle changes nothing"
+        );
+    }
+
+    /// The ledger charge figures the user documentation states.
+    ///
+    /// During a rejection pass each admitted row is charged
+    /// `ROW_ADMISSION_BYTES`, plus `MERGED_INTERVAL_BYTES` when it joins two
+    /// runs an earlier settle left: at most 16 bytes a row. A pass also
+    /// charges `NEW_CONTAINER_BYTES` for each 65,536-ordinal container it
+    /// opens and, on a document's first row of a Source, `NEW_HIGH_KEY_BYTES`
+    /// and four Source-entry slots.
+    ///
+    /// Once settled, `treemap_heap_bound` charges each recorded row at most
+    /// 4 bytes: an array container 4 bytes a value; a bitmap container its
+    /// 8 KiB only past 4,096 values, under 2 bytes a value; a run container 8
+    /// bytes an interval, kept only when its serialized size (2 + 4 per
+    /// interval) is below the array's (2 per value), so under 4 bytes a value.
+    /// What does not grow with the rows is fixed: four Source-entry slots, one
+    /// map node per upper-32-bit key, `max(2c, 4)` container slots for `c`
+    /// containers, and at most 16 bytes of container header each. A document
+    /// of `r` rows spans at most `r / 65,536 + 2` containers.
+    #[test]
+    fn the_ledger_charge_stays_within_its_documented_per_row_bounds() {
+        let fixed = |containers: u64| {
+            4 * SOURCE_ENTRY_BYTES
+                + BTREE_NODE_BYTES
+                + CONTAINER_BYTES * (2 * containers).max(4)
+                + 16 * containers
+        };
+        let arbitrator = ledger_arbitrator(1 << 30);
+        let charge = |state: &DocumentDlqState, key: &DocKey| state.failed[key].emitted.charged;
+
+        // One pass over contiguous rows, crossing one container boundary,
+        // short of the in-pass settle.
+        let (mut state, key) = ledger_state(&arbitrator);
+        let rows = SETTLE_EVERY_ADMISSIONS - 1;
+        for ordinal in 60_000..60_000 + rows {
+            assert!(
+                state
+                    .admit_emitted(&key, row(1, ordinal), "out")
+                    .expect("admission")
+            );
+        }
+        assert_eq!(state.failed[&key].emitted.unsettled, rows);
+        let openings = 2 * NEW_CONTAINER_BYTES + NEW_HIGH_KEY_BYTES + 4 * SOURCE_ENTRY_BYTES;
+        assert!(
+            charge(&state, &key) <= rows * (ROW_ADMISSION_BYTES + MERGED_INTERVAL_BYTES) + openings,
+            "a contiguous pass charges at most 16 bytes a row plus its openings, charged {}",
+            charge(&state, &key)
+        );
+
+        // A later pass that fills the one-row gaps between runs merges two
+        // runs with each row, at the full 16 bytes a row.
+        let (mut state, key) = ledger_state(&arbitrator);
+        for ordinal in (0..48_000).filter(|ordinal| ordinal % 32 != 31) {
+            assert!(
+                state
+                    .admit_emitted(&key, row(1, ordinal), "out")
+                    .expect("admission")
+            );
+        }
+        state.settle_emitted(&key);
+        assert!(state.failed[&key].emitted.sources[0].1.has_runs);
+        let before = charge(&state, &key);
+        let gaps: Vec<u64> = (0..48_000).filter(|ordinal| ordinal % 32 == 31).collect();
+        for &ordinal in &gaps {
+            assert!(
+                state
+                    .admit_emitted(&key, row(1, ordinal), "out")
+                    .expect("admission")
+            );
+        }
+        let pass = charge(&state, &key) - before;
+        let gaps = gaps.len() as u64;
+        assert!(
+            pass <= gaps * (ROW_ADMISSION_BYTES + MERGED_INTERVAL_BYTES),
+            "a filling pass charges at most 16 bytes a row, charged {pass} for {gaps} rows"
+        );
+        assert!(
+            pass > gaps * (ROW_ADMISSION_BYTES + MERGED_INTERVAL_BYTES) - 16,
+            "every filled gap but the last merges two runs, charged {pass} for {gaps} rows"
+        );
+
+        // Sparse rows settle to at most 4 bytes a recorded row plus the fixed
+        // figure: every other ordinal (bitmap containers) and every 16th
+        // (full array containers, the costliest per row).
+        for stride in [2, 16] {
+            let (mut state, key) = ledger_state(&arbitrator);
+            let ordinals: Vec<u64> = (0..2 * 65_536).step_by(stride).collect();
+            for &ordinal in &ordinals {
+                assert!(
+                    state
+                        .admit_emitted(&key, row(1, ordinal), "out")
+                        .expect("admission")
+                );
+            }
+            state.settle_emitted(&key);
+            let recorded = ordinals.len() as u64;
+            assert!(
+                charge(&state, &key) <= 4 * recorded + fixed(2),
+                "every {stride} ordinals settles to at most 4 bytes a row plus {}, charged {} for {recorded} rows",
+                fixed(2),
+                charge(&state, &key)
+            );
+        }
+
+        // A contiguous document of a million rows settles to a few runs.
+        let (mut state, key) = ledger_state(&arbitrator);
+        for ordinal in 0..1_000_000 {
+            assert!(
+                state
+                    .admit_emitted(&key, row(1, ordinal), "out")
+                    .expect("admission")
+            );
+        }
+        state.settle_emitted(&key);
+        // Sixteen containers, each one run of one interval.
+        let containers = 1_000_000_u64.div_ceil(65_536);
+        let contiguous = fixed(containers) + 8 * containers;
+        assert!(
+            charge(&state, &key) <= contiguous,
+            "a million contiguous rows settle to at most {contiguous}, charged {}",
+            charge(&state, &key)
         );
     }
 }
