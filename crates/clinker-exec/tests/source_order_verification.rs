@@ -514,8 +514,14 @@ fn config_rejects_source_null_drop_with_a_paste_ready_fix() {
     let rendered = err.to_string();
     assert!(rendered.contains(r#"source "rows""#), "{rendered}");
     assert!(rendered.contains("null_order: drop"), "{rendered}");
-    assert!(rendered.contains("null_order: first"), "{rendered}");
-    assert!(rendered.contains("null_order: last"), "{rendered}");
+    assert!(
+        rendered.contains("placing nulls `first` or `last`"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(r#"`config: { cxl: "filter not key.is_null()" }`"#),
+        "{rendered}"
+    );
 }
 
 #[test]
