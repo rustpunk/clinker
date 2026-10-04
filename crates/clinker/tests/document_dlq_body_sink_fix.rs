@@ -1309,3 +1309,214 @@ fn applying_the_e378_fix_writes_only_the_columns_the_body_sink_wrote() {
         "every Sink writes what the reference writes"
     );
 }
+
+/// A composition `projected` over `projected_source`'s four columns, whose
+/// port `out` reads `port_node` from the body nodes `body` and whose body
+/// Sink `audit` reads the same node, writing only the columns that node
+/// emits, less `flag`.
+fn projecting_comp(body: &str, port_node: &str) -> String {
+    format!(
+        r#"_compose:
+  name: projected
+  inputs:
+    inp:
+      schema:
+        - {{ name: id, type: string }}
+        - {{ name: value, type: string }}
+        - {{ name: extra, type: string }}
+        - {{ name: flag, type: string }}
+  outputs:
+    out: {port_node}
+  config_schema: {{}}
+
+nodes:
+{body}  - type: sink
+    name: audit
+    input: {port_node}
+    config:
+      name: audit
+      type: csv
+      path: audit.csv
+      include_unmapped: false
+      exclude: [flag]
+"#
+    )
+}
+
+/// Every E378 help the compiler gives for the workspace, as [`e378_helps`]
+/// returns them, where the diagnostics may also hold the codes in
+/// `tolerated` and nothing else.
+fn e378_helps_beside(root: &Path, tolerated: &[&str]) -> Vec<String> {
+    let diags = compile(root).expect_err("a body Sink under document granularity is refused");
+    assert!(
+        diags
+            .iter()
+            .all(|d| d.code == "E378" || tolerated.iter().any(|code| d.code == *code)),
+        "only E378 and {tolerated:?} are expected, got {:#?}",
+        describe(&diags)
+    );
+    diags
+        .iter()
+        .filter(|d| d.code == "E378")
+        .map(|d| d.help.clone().expect("E378 carries a help text"))
+        .collect()
+}
+
+/// Apply E378's help to a pipeline that calls `projecting_comp(body,
+/// port_node)`, and require every Sink to write, byte for byte, what the
+/// same work written inline writes: `inline_body` (the body's nodes reading
+/// `events`) at pipeline level on record granularity, with `audit` keeping
+/// the body Sink's configuration. The inline `audit.csv` must read
+/// `audit_lines`, and the help must name no engine-stamped column. The
+/// compile may also report the codes in `tolerated`, before and after the
+/// help is applied.
+fn assert_projecting_move_matches(
+    body: &str,
+    inline_body: &str,
+    port_node: &str,
+    audit_lines: &[&str],
+    tolerated: &[&str],
+) {
+    let pipeline = format!(
+        r#"{head}{source}  - type: composition
+    name: enrich
+    input: events
+    use: ../compositions/projected.comp.yaml
+    inputs:
+      inp: events
+  - type: sink
+    name: enrich_out
+    input: enrich
+    config:
+      name: enrich_out
+      type: csv
+      path: enrich_out.csv
+"#,
+        head = pipeline_head("document_dlq_body_sink_projected"),
+        source = projected_source("document"),
+    );
+    let reference = format!(
+        r#"{head}{source}{inline_body}  - type: sink
+    name: enrich_out
+    input: {port_node}
+    config:
+      name: enrich_out
+      type: csv
+      path: enrich_out.csv
+  - type: sink
+    name: audit
+    input: {port_node}
+    config:
+      name: audit
+      type: csv
+      path: audit.csv
+      include_unmapped: false
+      exclude: [flag]
+"#,
+        head = pipeline_head("document_dlq_body_sink_projected_reference"),
+        source = projected_source("record"),
+    );
+    let comp = projecting_comp(body, port_node);
+    let files = [
+        ("compositions/projected.comp.yaml", comp.as_str()),
+        (PIPELINE, pipeline.as_str()),
+    ];
+    let inputs = [("a.csv", "id,value,extra,flag\n1,10,x,p\n2,20,y,q\n")];
+    let fixed = workspace(&files, &inputs);
+    let helps = e378_helps_beside(fixed.path(), tolerated);
+    assert_eq!(helps.len(), 1, "E378 helps: {helps:#?}");
+    assert!(
+        helps.iter().all(|help| !help.contains('$')),
+        "the help names no engine-stamped column: {helps:#?}"
+    );
+    apply_help(fixed.path(), &helps[0]);
+    if let Err(diags) = compile(fixed.path()) {
+        assert!(
+            diags
+                .iter()
+                .all(|d| tolerated.iter().any(|code| d.code == *code)),
+            "the pipeline with the E378 fix applied compiles, got {:#?}\nhelps: {helps:#?}",
+            describe(&diags)
+        );
+    }
+    let fixed_run = run(fixed.path());
+    assert_eq!(fixed_run.status.code(), Some(0), "{}", stderr(&fixed_run));
+    let reference = workspace(&[(PIPELINE, reference.as_str())], &inputs);
+    let reference_run = run(reference.path());
+    assert_eq!(
+        reference_run.status.code(),
+        Some(0),
+        "{}",
+        stderr(&reference_run)
+    );
+
+    let written = outputs(fixed.path());
+    let expected = outputs(reference.path());
+    assert_eq!(
+        String::from_utf8_lossy(&expected["audit.csv"])
+            .lines()
+            .collect::<Vec<_>>(),
+        audit_lines,
+        "the reference writes the Sink's columns and no engine column"
+    );
+    assert_eq!(
+        written.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["audit.csv", "enrich_out.csv"],
+        "both Sinks write, and nothing is dead-lettered"
+    );
+    assert_eq!(
+        written, expected,
+        "every Sink writes what the reference writes\nhelps: {helps:#?}"
+    );
+}
+
+#[test]
+fn applying_the_e378_fix_writes_what_a_body_sink_after_a_merge_of_the_input_port_wrote() {
+    let merge = |input: &str| {
+        format!(
+            r#"  - type: merge
+    name: joined
+    inputs:
+      - {input}
+    config: {{}}
+"#
+        )
+    };
+    assert_projecting_move_matches(
+        &merge("inp"),
+        &merge("events"),
+        "joined",
+        &["id,value,extra", "1,10,x", "2,20,y"],
+        &[],
+    );
+}
+
+#[test]
+fn applying_the_e378_fix_writes_what_a_body_sink_after_a_reshape_wrote() {
+    let reshape = |input: &str| {
+        format!(
+            r#"  - type: reshape
+    name: classify
+    input: {input}
+    config:
+      partition_by: [id]
+      rules:
+        - name: mark
+          when: "flag == 'p'"
+          mutate:
+            set:
+              extra: "'seen'"
+"#
+        )
+    };
+    assert_projecting_move_matches(
+        &reshape("inp"),
+        &reshape("events"),
+        "classify",
+        &["id,value,extra", "1,10,seen", "2,20,y"],
+        // A Reshape in a composition body draws W101 for the `$meta.*`
+        // columns it stamps, before and after the move. That warning is
+        // its own defect; this case is about the columns the move writes.
+        &["W101"],
+    );
+}
