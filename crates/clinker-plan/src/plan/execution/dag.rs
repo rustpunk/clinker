@@ -485,6 +485,7 @@ pub(crate) fn diagnose_document_dlq_body_sinks(
     artifacts: &crate::plan::bind_schema::CompileArtifacts,
     source: &str,
 ) -> Vec<clinker_core_types::Diagnostic> {
+    use clinker_core_types::QuoteName;
     use clinker_core_types::{Diagnostic, LabeledSpan};
     use petgraph::Direction;
 
@@ -554,16 +555,20 @@ pub(crate) fn diagnose_document_dlq_body_sinks(
                 .unwrap_or_else(|| "<the node the Sink reads>".to_owned());
             let call = call_site.name;
             let message = format!(
-                "composition '{call}' declares Sink '{sink}' in its body, but source \
-                 '{source}' declares `dlq_granularity: document`, which needs every Sink \
-                 declared at pipeline level"
+                "composition {quoted_call} declares Sink {quoted_sink} in its body, but \
+                 source {quoted_source} declares `dlq_granularity: document`, which needs \
+                 every Sink declared at pipeline level",
+                quoted_call = call.quoted_name(),
+                quoted_sink = sink.quoted_name(),
+                quoted_source = source.quoted_name(),
             );
             let mut help = format!(
                 "move the Sink to the pipeline: in the composition file, under \
-                 `_compose.outputs:`, add `{sink}: {feeding}` and remove Sink '{sink}' from \
-                 its `nodes:`; then under the pipeline's `nodes:` add\n  - type: sink\n    \
-                 name: {sink}\n    input: {call}.{sink}\n    config: <the body Sink's \
-                 `config:`, unchanged>"
+                 `_compose.outputs:`, add `{sink}: {feeding}` and remove Sink \
+                 {quoted_sink} from its `nodes:`; then under the pipeline's `nodes:` \
+                 add\n  - type: sink\n    name: {sink}\n    input: {call}.{sink}\n    \
+                 config: <the body Sink's `config:`, unchanged>",
+                quoted_sink = sink.quoted_name(),
             );
             if let [(only_port, _)] = body
                 .output_port_to_node_idx
@@ -578,14 +583,16 @@ pub(crate) fn diagnose_document_dlq_body_sinks(
             }
             if !call_site.top_level {
                 help.push_str(&format!(
-                    "\n'{call}' is itself called inside a composition body, so also surface \
-                     the new port through each enclosing composition's `_compose.outputs:` \
-                     up to the pipeline"
+                    "\n{quoted_call} is itself called inside a composition body, so also \
+                     surface the new port through each enclosing composition's \
+                     `_compose.outputs:` up to the pipeline",
+                    quoted_call = call.quoted_name(),
                 ));
             }
             help.push_str(&format!(
-                "\nor set `dlq_granularity: record` on source '{source}'\nSinks inside \
-                 composition bodies are tracked in issue #1242"
+                "\nor set `dlq_granularity: record` on source {quoted_source}\nSinks inside \
+                 composition bodies are tracked in issue #1242",
+                quoted_source = source.quoted_name(),
             ));
             out.push(
                 Diagnostic::error(

@@ -581,8 +581,8 @@ impl<'a> DlqWalkState<'a> {
                 op: "dead-letter",
                 node: row.stage.unwrap_or_default().to_string(),
                 detail: format!(
-                    "an encoded dead-letter row of source {:?} has no bucket",
-                    row.source_name
+                    "an encoded dead-letter row of source {} has no bucket",
+                    row.source_name.quoted_name()
                 ),
             });
         };

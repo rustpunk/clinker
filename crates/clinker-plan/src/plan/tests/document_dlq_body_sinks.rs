@@ -109,9 +109,9 @@ fn document_granularity_rejects_a_composition_body_sink() {
     let diag = e378[0];
 
     for fragment in [
-        "composition 'enrich'",
-        "Sink 'audit'",
-        "source 'events'",
+        "composition \"enrich\"",
+        "Sink \"audit\"",
+        "source \"events\"",
         "`dlq_granularity: document`",
         "pipeline level",
     ] {
