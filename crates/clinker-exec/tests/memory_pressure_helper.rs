@@ -345,12 +345,16 @@ fn a_sort_that_deleted_its_runs_still_reads_as_spilled() {
         .unwrap_or(0);
     assert!(
         written > 0,
-        "the repair spilled under 40K: {:?}",
+        "the repair spilled under its ledger capacity: {:?}",
         report.per_stage_spill_bytes_written
     );
     // The run enforces its ledger capacity, more than the authored 40K; the
     // helper would refuse 40 * 1024 here, so the test states the limit the
     // run's report says it enforced.
+    assert_eq!(
+        report.memory_limit_bytes, CAPACITY,
+        "the low run enforces the ledger capacity it was held to"
+    );
     let low_limit = report.memory_limit_bytes;
     assert!(low_limit > 40 * 1024);
     let low = PressureRun::from_report(&report, REPAIR, low_limit, low_output.clone());
