@@ -967,6 +967,151 @@ fn e378_proposes_a_port_no_declared_output_uses() {
     );
 }
 
+/// `shape` and `doubled` from `shared_node_comp`, reading `events`.
+const SHARED_BODY_AT_PIPELINE: &str = r#"  - type: transform
+    name: shape
+    input: events
+    config:
+      cxl: |
+        emit id = id
+        emit value = value.to_int()
+  - type: transform
+    name: doubled
+    input: shape
+    config:
+      cxl: |
+        emit id = id
+        emit value = value * 2
+"#;
+
+/// The explain page's rewrite, applied by hand to the call `enrich` of
+/// `shared_node_comp("doubled")`, where the help gives the next step because
+/// the body Sink reads `shape` and the first port reads `doubled`. The
+/// composition's nodes replace the call:
+///
+/// 1. no pipeline node uses `shape`, `doubled` or `audit`, so nothing is
+///    renamed;
+/// 2. `shape` read the input port `inp`, which `events` fed, so it reads
+///    `events`;
+/// 3. the composition takes no `$config` value;
+/// 4. the Sink `audit` is declared at pipeline level with its own
+///    `config:`, reading `shape` as it did in the body;
+/// 5. `enrich_out` read the call's only port, `out`, behind which is
+///    `doubled`, so it reads `doubled`.
+///
+/// The Source keeps `dlq_granularity: document`.
+fn shared_node_rewritten() -> String {
+    let reference = inline_reference(SHARED_BODY_AT_PIPELINE, "shape", "doubled");
+    reference
+        .replace("dlq_granularity: record", "dlq_granularity: document")
+        .replace(
+            "document_dlq_body_sink_inline_reference",
+            "document_dlq_body_sink_inline",
+        )
+}
+
+#[test]
+fn the_explain_pages_rewrite_runs_under_document_granularity() {
+    // The shape gets the next step, not the move.
+    let comp = shared_node_comp("doubled");
+    let original = calls_pipeline(&[("enrich", "shared.comp.yaml")]);
+    let authored = workspace(
+        &[
+            ("compositions/shared.comp.yaml", comp.as_str()),
+            (PIPELINE, original.as_str()),
+        ],
+        &[("a.csv", CLEAN_DOCUMENT)],
+    );
+    for help in e378_helps(authored.path()) {
+        assert!(
+            help.starts_with("run `clinker explain --code E378` and follow its steps"),
+            "the help is the next step: {help}"
+        );
+    }
+
+    // The steps the rewrite follows are the page's.
+    let explain = Command::new(env!("CARGO_BIN_EXE_clinker"))
+        .args(["explain", "--code", "E378"])
+        .output()
+        .expect("spawn clinker");
+    assert!(explain.status.success(), "{}", stderr(&explain));
+    let page = String::from_utf8_lossy(&explain.stdout);
+    for step in [
+        "1. Rename the nodes if a pipeline node already uses the name.",
+        "2. Point the nodes that read an input port at the node that fed that port.",
+        "3. Replace any `$config` value with the value the call passed.",
+        "4. Declare the Sink at pipeline level with its own `config:`, reading the node",
+        "5. Point the nodes that read the call at the node behind the port they read.",
+    ] {
+        assert!(
+            page.contains(step),
+            "the page carries step {step:?}:\n{page}"
+        );
+    }
+
+    let rewritten = shared_node_rewritten();
+    let reference_pipeline = inline_reference(SHARED_BODY_AT_PIPELINE, "shape", "doubled");
+
+    // A clean document: the rewrite compiles with no diagnostic, runs, and
+    // writes what the reference writes.
+    let inputs = [("a.csv", CLEAN_DOCUMENT)];
+    let fixed = workspace(&[(PIPELINE, rewritten.as_str())], &inputs);
+    if let Err(diags) = compile(fixed.path()) {
+        panic!("the rewrite compiles cleanly, got {:#?}", describe(&diags));
+    }
+    let fixed_run = run(fixed.path());
+    assert_eq!(fixed_run.status.code(), Some(0), "{}", stderr(&fixed_run));
+    let reference = workspace(&[(PIPELINE, reference_pipeline.as_str())], &inputs);
+    let reference_run = run(reference.path());
+    assert_eq!(
+        reference_run.status.code(),
+        Some(0),
+        "{}",
+        stderr(&reference_run)
+    );
+    let written = outputs(fixed.path());
+    assert_eq!(
+        written.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["audit.csv", "enrich_out.csv"],
+        "both Sinks write, and nothing is dead-lettered"
+    );
+    assert_eq!(
+        written,
+        outputs(reference.path()),
+        "every Sink writes what the reference writes"
+    );
+
+    // A rejected document reaches neither Sink, and each of its rows is
+    // dead-lettered once.
+    let inputs = [
+        ("a.csv", CLEAN_DOCUMENT),
+        ("b.csv", "id,value\n3,30\n4,x\n"),
+    ];
+    let rejecting = workspace(&[(PIPELINE, rewritten.as_str())], &inputs);
+    let rejecting_run = run(rejecting.path());
+    assert_eq!(
+        rejecting_run.status.code(),
+        Some(2),
+        "{}",
+        stderr(&rejecting_run)
+    );
+    let written = outputs(rejecting.path());
+    for (sink, rows) in [
+        ("audit.csv", ["id,value", "1,10", "2,20"]),
+        ("enrich_out.csv", ["id,value", "1,20", "2,40"]),
+    ] {
+        let text = String::from_utf8_lossy(&written[sink]).into_owned();
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            rows,
+            "{sink} holds the clean document only"
+        );
+    }
+    let mut ids = dead_letter_ids(&rejecting.path().join("rejected.csv"));
+    ids.sort_unstable();
+    assert_eq!(ids, ["3", "4"], "each row of the rejected document once");
+}
+
 /// A composition whose first output port aliases its input port, and whose
 /// only node is a Sink reading that input port. Moving the Sink would leave
 /// the body with no node, which does not compile (E111), so the help must be
