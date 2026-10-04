@@ -94,8 +94,7 @@ fn e200_messages(yaml: &str) -> Vec<String> {
     let config = parse_config(yaml).expect("fixture parses");
     let diagnostics = config
         .compile(&CompileContext::default())
-        .err()
-        .expect("the pipeline must fail to compile");
+        .expect_err("the pipeline must fail to compile");
     let messages: Vec<String> = diagnostics
         .iter()
         .filter(|d| d.code == "E200")
