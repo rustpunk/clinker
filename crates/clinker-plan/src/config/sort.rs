@@ -163,7 +163,7 @@ pub enum OrderingSite {
 ///
 /// `Display` is the author-facing message for the site: the rule, the
 /// reason, and how to remove null-keyed rows instead. Callers prefix the
-/// node (`cull "name": `, `source 'name': `) and add nothing else, so this
+/// node (`cull "name": `, `source "name": `) and add nothing else, so this
 /// is the one place the wording lives.
 ///
 /// The fix is a paste-able `filter` only when CXL can write the field as a

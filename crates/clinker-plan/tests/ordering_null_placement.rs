@@ -271,7 +271,7 @@ fn sorted_source_pipeline(sort_order: &str) -> String {
     ))
 }
 
-const SOURCE_DROP_TEXT: &str = "source 'src': `null_order: drop` is not allowed on `sort_order` \
+const SOURCE_DROP_TEXT: &str = "source \"src\": `null_order: drop` is not allowed on `sort_order` \
      for field 'txn_date': source verification cannot discard records. Use `null_order: first` \
      or `null_order: last`; to exclude rows whose 'txn_date' is null, add a Transform after this \
      source with `filter not txn_date.is_null()`.";
@@ -515,7 +515,7 @@ fn assert_points_to_source_name(message: &str, field: &str) {
 
 /// The Source text for field `order id`, written out in full so a change to
 /// the rename wording is a visible change to this test.
-const SOURCE_RENAME_TEXT: &str = "source 'src': `null_order: drop` is not allowed on \
+const SOURCE_RENAME_TEXT: &str = "source \"src\": `null_order: drop` is not allowed on \
      `sort_order` for field 'order id': source verification cannot discard records. Use \
      `null_order: first` or `null_order: last`. CXL cannot name the field 'order id': a CXL \
      field name is one identifier of ASCII letters, digits and `_`, not starting with a digit \
@@ -542,7 +542,10 @@ fn source_sort_order_drop_on_a_field_cxl_cannot_name_points_to_source_name() {
             ),
         );
         let message = the_drop_message(&yaml, "src");
-        assert!(message.starts_with("source 'src': "), "{field}: {message}");
+        assert!(
+            message.starts_with("source \"src\": "),
+            "{field}: {message}"
+        );
         assert_points_to_source_name(&message, field);
         if field == "order id" {
             assert_eq!(message, SOURCE_RENAME_TEXT);

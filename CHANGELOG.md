@@ -47,7 +47,7 @@ to rename the column with `source_name` in its Source schema entry and filter
 on the new name instead:
 
 ```text
-source 'orders': `null_order: drop` is not allowed on `sort_order` for field 'order id': source verification cannot discard records. Use `null_order: first` or `null_order: last`. CXL cannot name the field 'order id': a CXL field name is one identifier of ASCII letters, digits and `_`, not starting with a digit and not a CXL keyword. To exclude rows whose 'order id' is null, rename the column to such a name in its Source schema entry and keep reading the input column through `source_name` (for example `{ name: order_id, type: string, source_name: "order id" }`), then filter on the new name in a Transform after this source.
+source "orders": `null_order: drop` is not allowed on `sort_order` for field 'order id': source verification cannot discard records. Use `null_order: first` or `null_order: last`. CXL cannot name the field 'order id': a CXL field name is one identifier of ASCII letters, digits and `_`, not starting with a digit and not a CXL keyword. To exclude rows whose 'order id' is null, rename the column to such a name in its Source schema entry and keep reading the input column through `source_name` (for example `{ name: order_id, type: string, source_name: "order id" }`), then filter on the new name in a Transform after this source.
 ```
 
 Cull and Reshape `order_by` also accept a bare field name, as a Sink or
