@@ -6,8 +6,11 @@
 //! measures its own baseline: the in-process harness default that feature
 //! unification enables for the executor under `cargo test` never reaches it.
 
+#[cfg(debug_assertions)]
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Command;
+#[cfg(debug_assertions)]
+use std::process::Output;
 
 fn clinker_bin() -> &'static str {
     env!("CARGO_BIN_EXE_clinker")
@@ -20,6 +23,7 @@ const IN_PROCESS_BASELINE_BYTES: u64 = 16 << 20;
 /// Source → Route(a, b, c) → three Outputs. Every row is admitted to the
 /// Source's own node buffer, which spills once a 1 MiB limit's soft
 /// threshold is crossed.
+#[cfg(debug_assertions)]
 const ROUTE_FANOUT: &str = r#"pipeline:
   name: ledger_capacity_env
   memory:
@@ -69,8 +73,10 @@ nodes:
       path: out_c.csv
 "#;
 
+#[cfg(debug_assertions)]
 const SPILL_REPORT: &str = "=== Spill Volume (actual, per stage) ===";
 
+#[cfg(debug_assertions)]
 fn events_csv() -> String {
     let mut csv = String::from("id,region,payload,value,ts\n");
     let mut id = 0u64;
@@ -86,6 +92,7 @@ fn events_csv() -> String {
 /// Run the route fan-out in a fresh directory at `--memory-limit 512M`,
 /// with `capacity` set on the child when given. Returns the process output
 /// and the three written files.
+#[cfg(debug_assertions)]
 fn run_route_fanout(capacity: Option<&str>) -> (Output, [Vec<u8>; 3]) {
     let dir = tempfile::tempdir().expect("create tempdir");
     std::fs::write(dir.path().join("events.csv"), events_csv()).expect("write input");
@@ -104,6 +111,7 @@ fn run_route_fanout(capacity: Option<&str>) -> (Output, [Vec<u8>; 3]) {
     (output, files)
 }
 
+#[cfg(debug_assertions)]
 fn read_output(dir: &Path, name: &str, output: &Output) -> Vec<u8> {
     std::fs::read(dir.join(name)).unwrap_or_else(|error| {
         panic!(
@@ -113,6 +121,9 @@ fn read_output(dir: &Path, name: &str, output: &Output) -> Vec<u8> {
     })
 }
 
+/// Only a debug binary reads the capacity variable, so a release-profile test
+/// run would see the ample and held runs behave identically.
+#[cfg(debug_assertions)]
 #[test]
 fn env_capacity_forces_spill_in_the_debug_binary() {
     let (ample, ample_files) = run_route_fanout(None);
