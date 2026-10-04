@@ -540,3 +540,37 @@ fn e378_names_the_moved_sink_so_no_pipeline_node_already_uses_it() {
         );
     }
 }
+
+#[test]
+fn e378_gives_the_next_step_when_the_first_port_reads_a_route_branch() {
+    // The port and the Sink read the same Route, so the Sink reads the node
+    // behind the first port, but that node has ports of its own.
+    let comp = composition(
+        "audited",
+        "    out: split.high",
+        r#"  - type: route
+    name: split
+    input: shape
+    config:
+      conditions:
+        high: value == "x"
+      default: low
+  - type: sink
+    name: audit
+    input: split.high
+    config:
+      name: audit
+      type: csv
+      path: audit.csv
+"#,
+    );
+    let diags = e378_for(&[("compositions/audited.comp.yaml", &comp)], ENRICH_CALL);
+    assert_eq!(diags.len(), 1, "one E378 for the one body Sink");
+    assert_next_step(
+        help_for(&diags, "audit"),
+        "audit",
+        "the first output port of composition \"enrich\", `out`, reads \"split\", which \
+         sends rows to output ports of its own, and a composition output port cannot yet \
+         carry rows from one of those",
+    );
+}
