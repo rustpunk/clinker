@@ -21,6 +21,9 @@ mod resource_fixtures;
 #[path = "common/memory_pressure.rs"]
 mod memory_pressure;
 
+#[path = "common/dlq_sink.rs"]
+mod dlq_sink;
+
 use std::collections::HashMap;
 
 use clinker_bench_support::io::SharedBuffer;
@@ -29,10 +32,11 @@ use clinker_exec::executor::{
 };
 use clinker_plan::config::{CompileContext, parse_config};
 
-/// One run's report and its CSV Sink's bytes.
+/// One run's report, its CSV Sink's bytes and every dead-letter row it wrote.
 struct Run {
     report: ExecutionReport,
     csv: String,
+    dlq: Vec<dlq_sink::DlqRow>,
 }
 
 /// Run a one-Source pipeline over `csv` fed to the Source `src`, capturing
@@ -47,10 +51,21 @@ fn run(yaml: &str, csv: &str, capacity: Option<u64>) -> Run {
         resource_fixtures::predecoded_csv_source(&config, &context, "src", &[("in.csv", csv)]),
     )]);
     let buffer = SharedBuffer::new();
-    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
-        "csv".to_string(),
-        Box::new(buffer.clone()) as Box<dyn std::io::Write + Send>,
-    )]);
+    // Every Sink other than `csv` writes into a buffer the test never reads.
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = config
+        .sink_configs()
+        .map(|sink| {
+            let target = if sink.name == "csv" {
+                buffer.clone()
+            } else {
+                SharedBuffer::new()
+            };
+            (
+                sink.name.clone(),
+                Box::new(target) as Box<dyn std::io::Write + Send>,
+            )
+        })
+        .collect();
     let memory_test = match capacity {
         Some(bytes) => MemoryTestOverrides::default().with_ledger_capacity(bytes),
         None => MemoryTestOverrides::default(),
@@ -61,11 +76,18 @@ fn run(yaml: &str, csv: &str, capacity: Option<u64>) -> Run {
         memory_test,
         ..Default::default()
     };
-    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
-        .expect("the pipeline runs to completion");
+    let sink = dlq_sink::CollectingDlqSink::new();
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        dlq_sink::registry(writers, &sink),
+        &params,
+    )
+    .expect("the pipeline runs to completion");
     Run {
         report,
         csv: buffer.as_string(),
+        dlq: sink.rows(),
     }
 }
 
@@ -183,5 +205,134 @@ fn mixed_integer_float_sum_survives_a_spill_with_an_integer_only_run() {
             .is_some_and(|bytes| *bytes > 0),
         "the Aggregate itself must spill at {TWO_PASS_SPILL_CAPACITY} bytes: {:?}",
         spilled.report.per_stage_spill_bytes_written
+    );
+}
+
+/// One Source with `correlation_key: order_id` feeding two branches. `prep`
+/// converts the price and weight columns to floats for a relaxed hash
+/// Aggregate (its `group_by` omits the correlation key) emitting the two
+/// bindings that retract by subtraction, `avg` and `weighted_avg`. `check`
+/// converts the quantity column to an integer and writes it to a second Sink,
+/// so a line with a bad quantity fails after its price and weight have
+/// already entered the Aggregate.
+const RETRACT_YAML: &str = r#"
+pipeline:
+  name: float_avg_retract
+  memory: { limit: "512M", backpressure: spill }
+error_handling:
+  strategy: continue
+  dlq:
+    path: rejected.csv
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      correlation_key: order_id
+      schema:
+        - { name: order_id, type: string }
+        - { name: department, type: string }
+        - { name: price, type: string }
+        - { name: weight, type: string }
+        - { name: qty, type: string }
+  - type: transform
+    name: prep
+    input: src
+    config:
+      cxl: |
+        emit department = department
+        emit p = price.to_float()
+        emit w = weight.to_float()
+  - type: aggregate
+    name: grouped
+    input: prep
+    config:
+      group_by: [department]
+      cxl: |
+        emit department = department
+        emit mean = avg(p)
+        emit weighted = weighted_avg(p, w)
+  - type: sink
+    name: csv
+    input: grouped
+    config:
+      name: csv
+      type: csv
+      path: out.csv
+      include_unmapped: true
+  - type: transform
+    name: check
+    input: src
+    config:
+      cxl: |
+        emit order_id = order_id
+        emit n = qty.to_int()
+  - type: sink
+    name: checked
+    input: check
+    config:
+      name: checked
+      type: csv
+      path: checked.csv
+      include_unmapped: true
+"#;
+
+/// Two lines carry a bad quantity, `O2,HR` and `O3,ENG`: one failure in each
+/// department, in the middle of the arrival order. The prices and weights are not exactly representable, so a
+/// subtraction that rounded at each step would differ from a fresh fold in
+/// the last digits.
+const RETRACT_ROWS: &str = "\
+order_id,department,price,weight,qty
+O1,HR,0.1,0.3,3
+O2,HR,0.2,0.7,BAD
+O3,HR,0.7,1.1,7
+O4,ENG,1.1,2.3,2
+O5,ENG,2.2,0.9,4
+O3,ENG,3.3,1.9,BAD
+O6,HR,0.3,0.1,11
+O7,ENG,0.6,3.7,6
+";
+
+/// `RETRACT_ROWS` without the two lines whose quantity is bad. A failed line
+/// is retracted on its own: its order's other lines stay in the Aggregate.
+const RETRACT_BASELINE_ROWS: &str = "\
+order_id,department,price,weight,qty
+O1,HR,0.1,0.3,3
+O3,HR,0.7,1.1,7
+O4,ENG,1.1,2.3,2
+O5,ENG,2.2,0.9,4
+O6,HR,0.3,0.1,11
+O7,ENG,0.6,3.7,6
+";
+
+/// A relaxed Aggregate of float `avg` and `weighted_avg` retracts a line that
+/// failed on another branch, after its price and weight were folded in, to the
+/// bytes of a rerun over the input without that line.
+#[test]
+fn relaxed_avg_and_weighted_avg_retract_like_a_baseline_rerun() {
+    let failed = run(RETRACT_YAML, RETRACT_ROWS, None);
+    let baseline = run(RETRACT_YAML, RETRACT_BASELINE_ROWS, None);
+
+    assert!(baseline.dlq.is_empty(), "the baseline has no failure");
+    let rows: Vec<_> = failed
+        .dlq
+        .iter()
+        .map(|row| (row.source_file(), row.error_detail()))
+        .collect();
+    assert_eq!(
+        failed.dlq.iter().filter(|row| row.trigger()).count(),
+        2,
+        "exactly the two lines that failed to convert trigger: {rows:?}"
+    );
+
+    assert_eq!(
+        sorted_lines(&failed.csv),
+        sorted_lines(&baseline.csv),
+        "the retract-corrected output must equal the baseline rerun's:\n\
+         got:\n{}\nbaseline:\n{}",
+        failed.csv,
+        baseline.csv
     );
 }

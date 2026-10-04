@@ -2571,8 +2571,10 @@ mod spill_trigger_tests {
 
     // ----------------------------------------------------------------
     // Buffer-mode retract round-trip — feed N, retract M, finalize_in_place
-    // equals feed-(N-M)-from-scratch byte-identically. One test per
-    // BufferRequired variant: Min, Max, Avg, WeightedAvg.
+    // equals feed-(N-M)-from-scratch byte-identically. Buffer mode is
+    // selected by the BufferRequired variants, Min and Max; avg and
+    // weighted_avg retract by subtraction on the lineage path, and run in
+    // buffer mode here only because they sit beside a `min` binding.
     // ----------------------------------------------------------------
 
     fn run_with_retract<F>(
@@ -2730,7 +2732,7 @@ mod spill_trigger_tests {
             (vec![Value::String("g".into()), Value::Float(3.0)], 2),
         ];
         let (after, baseline) = run_with_retract(
-            "emit k = k\nemit a = avg(v)",
+            "emit k = k\nemit lo = min(v)\nemit a = avg(v)",
             &[("k", Type::String), ("v", Type::Float)],
             &["k"],
             &rows,
@@ -2740,6 +2742,130 @@ mod spill_trigger_tests {
         assert!(
             record_set_eq(&after, &baseline),
             "Avg retract: {after:?} != {baseline:?}"
+        );
+    }
+
+    /// Whether two finalized outputs are identical to the last bit, floats
+    /// included: the lineage path subtracts exactly, so a retracted run must
+    /// not differ from a fresh fold by even one ulp.
+    fn records_bit_identical(a: &[Record], b: &[Record]) -> bool {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(ra, rb)| {
+                ra.values().len() == rb.values().len()
+                    && ra
+                        .values()
+                        .iter()
+                        .zip(rb.values().iter())
+                        .all(|(x, y)| match (x, y) {
+                            (Value::Float(fx), Value::Float(fy)) => fx.to_bits() == fy.to_bits(),
+                            (Value::Integer(ix), Value::Integer(iy)) => ix == iy,
+                            (Value::String(sx), Value::String(sy)) => sx == sy,
+                            (Value::Null, Value::Null) => true,
+                            _ => false,
+                        })
+            })
+    }
+
+    #[test]
+    fn test_lineage_retract_avg_matches_refold() {
+        let rows = vec![
+            (vec![Value::String("g".into()), Value::Float(0.1)], 0),
+            (vec![Value::String("g".into()), Value::Float(0.2)], 1),
+            (vec![Value::String("g".into()), Value::Float(0.7)], 2),
+            (vec![Value::String("g".into()), Value::Float(1e17)], 3),
+        ];
+        let (after, baseline) = run_with_retract(
+            "emit k = k\nemit a = avg(v)",
+            &[("k", Type::String), ("v", Type::Float)],
+            &["k"],
+            &rows,
+            &[3],
+            |all| all.iter().filter(|(_, rn)| *rn != 3).cloned().collect(),
+        );
+        assert!(
+            records_bit_identical(&after, &baseline),
+            "lineage avg retract: {after:?} != {baseline:?}"
+        );
+    }
+
+    #[test]
+    fn test_lineage_retract_weighted_avg_matches_refold() {
+        let rows = vec![
+            (
+                vec![
+                    Value::String("g".into()),
+                    Value::Float(0.1),
+                    Value::Float(0.3),
+                ],
+                0,
+            ),
+            (
+                vec![
+                    Value::String("g".into()),
+                    Value::Float(0.2),
+                    Value::Float(0.7),
+                ],
+                1,
+            ),
+            (
+                vec![
+                    Value::String("g".into()),
+                    Value::Float(1e17),
+                    Value::Float(3.0),
+                ],
+                2,
+            ),
+        ];
+        let (after, baseline) = run_with_retract(
+            "emit k = k\nemit wa = weighted_avg(v, w)",
+            &[("k", Type::String), ("v", Type::Float), ("w", Type::Float)],
+            &["k"],
+            &rows,
+            &[2],
+            |all| all.iter().filter(|(_, rn)| *rn != 2).cloned().collect(),
+        );
+        assert!(
+            records_bit_identical(&after, &baseline),
+            "lineage weighted_avg retract: {after:?} != {baseline:?}"
+        );
+    }
+
+    /// A strict (not relaxed) aggregator folds a `weighted_avg` through
+    /// `dispatch_binding`, and its two exact-sum states are charged: a group
+    /// held for the table's whole life must not look free to the arbitrator.
+    #[test]
+    fn test_strict_weighted_avg_charges_both_exact_sum_states() {
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        let input = make_schema(&["k", "v", "w"]);
+        let mut agg = build_test_aggregator_relaxed(
+            &[("k", Type::String), ("v", Type::Float), ("w", Type::Float)],
+            &["k"],
+            "emit k = k\nemit wa = weighted_avg(v, w)",
+            10 * 1024 * 1024,
+            None,
+            false,
+        );
+        let before = agg.value_heap_bytes();
+        agg.add_record(
+            &make_record(
+                &input,
+                vec![
+                    Value::String("g".into()),
+                    Value::Float(1.0),
+                    Value::Float(2.0),
+                ],
+            ),
+            0,
+            &ctx_for(&stable, &file, 0),
+        )
+        .expect("add_record");
+        let one_state = clinker_record::accumulator::ExactSum::new().add_f64(1.0);
+        assert!(
+            agg.value_heap_bytes() - before >= 2 * one_state,
+            "weighted_avg holds a value state and a weight state; charged {} bytes, \
+             each exact sum is {one_state}",
+            agg.value_heap_bytes() - before
         );
     }
 
@@ -2772,7 +2898,7 @@ mod spill_trigger_tests {
             ),
         ];
         let (after, baseline) = run_with_retract(
-            "emit k = k\nemit wa = weighted_avg(v, w)",
+            "emit k = k\nemit lo = min(v)\nemit wa = weighted_avg(v, w)",
             &[("k", Type::String), ("v", Type::Float), ("w", Type::Float)],
             &["k"],
             &rows,
