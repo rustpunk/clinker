@@ -414,10 +414,11 @@ pub(crate) struct HeldLogConfig {
 /// the ledgers are charged to the run's arbitrator through one consumer the
 /// state registers at construction and unregisters on drop. Held frames
 /// leave memory only on the arbitrator's signals (see
-/// [`crate::executor::extent_log`]): the consumer's election, polled on
-/// every append and at every decision; the soft threshold, polled every
-/// `batch_size` appends and at every decision; and the hard-limit preflight
-/// on every append, which flushes before it refuses with E310.
+/// [`crate::executor::extent_log`]): the consumer's election, answered on
+/// every append, at every decision and at every ledger admission; the soft
+/// threshold, polled every `batch_size` appends and at every decision; and
+/// the hard-limit preflight on every append and every ledger admission,
+/// which flushes every held tail before it refuses with E310.
 pub(crate) struct DocumentDlqState {
     /// Source-node names declaring `dlq_granularity: document`. A record is
     /// governed by the policy only when its originating source is in this
@@ -503,17 +504,24 @@ impl DocumentDlqState {
     /// already wrote it, so the caller writes nothing; `Ok(true)` when the
     /// caller must write it now.
     ///
-    /// The ledger's growth is preflighted against the arbitrator's hard limit
-    /// before the row is recorded, as a node-buffer reservation's is: the
-    /// ledger cannot spill (it is exact dedup state), so growth that would
-    /// pass the limit fails the run with E310 instead, naming `node`.
+    /// Every admission first answers a spill request pending on the state's
+    /// handle by flushing every held tail, so a request the arbitrator raised
+    /// on a poll that holds no row, as the late-record path's is, is answered
+    /// here. The ledger's growth is then preflighted against the arbitrator's
+    /// hard limit before the row is recorded, as a node-buffer reservation's
+    /// is. When it does not fit, every held tail is flushed first, as a hold
+    /// does, and the growth checked again: the ledger itself cannot spill (it
+    /// is exact dedup state), so growth that still does not fit with every
+    /// held row on disk fails the run with E310, naming `node`. Any flush is
+    /// credited to `node`.
     ///
     /// # Errors
     ///
     /// [`PipelineError::MemoryBudgetExceeded`] with
     /// [`clinker_plan::BudgetCategory::Arena`] when the growth would pass
-    /// the hard limit; [`PipelineError::Internal`] when `key` is not a failed
-    /// document.
+    /// the hard limit with every held row on disk; a flush's spill errors,
+    /// including E320; [`PipelineError::Internal`] when `key` is not a
+    /// failed document.
     fn admit_emitted(
         &mut self,
         key: &DocKey,
@@ -528,22 +536,31 @@ impl DocumentDlqState {
                 node: node.to_string(),
                 detail: format!("document {key:?} is rejected but was never marked failed"),
             })?;
+        if self.handle.take_spill_request() {
+            self.held.flush_all(&self.arbitrator, node)?;
+        }
         let Some(admission) = failed.emitted.admission(row) else {
             return Ok(false);
         };
         let growth = admission.growth;
         debug_assert!(growth <= MAX_ADMISSION_BYTES);
-        let charged_pressure = self.arbitrator.sum_consumer_usage();
-        let projected_pressure = charged_pressure.saturating_add(growth);
         let hard_limit = self.arbitrator.hard_limit();
-        if hard_limit != 0 && projected_pressure > hard_limit {
+        let fits = |arbitrator: &MemoryArbitrator| {
+            hard_limit == 0 || arbitrator.sum_consumer_usage().saturating_add(growth) <= hard_limit
+        };
+        if !fits(&self.arbitrator) {
+            self.held.flush_all(&self.arbitrator, node)?;
+        }
+        if !fits(&self.arbitrator) {
+            let charged_pressure = self.arbitrator.sum_consumer_usage();
+            let projected_pressure = charged_pressure.saturating_add(growth);
             return Err(PipelineError::MemoryBudgetExceeded {
                 node: node.to_string(),
                 used: projected_pressure,
                 limit: hard_limit,
                 source: clinker_plan::BudgetCategory::Arena,
                 detail: Some(format!(
-                    "the document dead-letter ledger of {key:?} projected {projected_pressure} bytes from charged pressure {charged_pressure} plus {growth} bytes for one more row"
+                    "the document dead-letter ledger of {key:?} projected {projected_pressure} bytes from charged pressure {charged_pressure} plus {growth} bytes for one more row, with every held row already on disk"
                 )),
             });
         }
@@ -862,8 +879,9 @@ fn held_frame_error(detail: &str) -> PipelineError {
 /// consumer reports `spill_priority` 0, alongside the node buffers: the held
 /// log spills them with one sequential write per document, as cheap as a
 /// node buffer's spill. `try_spill` then raises the handle's spill request,
-/// which the state answers on its next append or decision by flushing every
-/// held tail, and reports the resident frame bytes as what it frees
+/// which the state answers on its next append, ledger admission or decision
+/// by flushing every held tail, and reports the resident frame bytes as what
+/// it frees
 /// (`BelowTarget` when fewer than asked).
 ///
 /// With no frame resident the rest is exact state that cannot spill, so the
