@@ -4,6 +4,8 @@ A correlation key declares a set of records from a single source as an atomic gr
 
 This page describes how to declare a correlation key and how it behaves through each node that can fan out, fan in, group, or join records.
 
+*Interactive companion: the [correlation keys explainer](correlation-keys-explainer.html) lets you make lines fail and see what reaches the output and the DLQ, with and without an Aggregate.*
+
 ## Declaration
 
 Correlation keys are declared per source. Each source's `config:` block carries an optional `correlation_key:` field naming the column (or list of columns) whose value identifies a record's correlation group within that source.

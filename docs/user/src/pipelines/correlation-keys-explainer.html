@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clinker · Correlation keys, visually</title>
+<style>
+:root{
+  --iron:#14110f; --iron2:#1d1915; --iron3:#29231d; --seam:#3a3129;
+  --ash:#b9ab98; --bone:#ece2d0; --dim:#7d705f;
+  --rust:#d0581f; --rust-d:#8f3a13; --brass:#e0a93e; --verd:#4fb0a0;
+  --blood:#e0362c; --steel:#7f97ad; --plum:#b07ac0; --moss:#9bc76b;
+  --disp:"Rajdhani", "Bahnschrift Condensed", "Roboto Condensed", "Arial Narrow", sans-serif;
+  --mono:"Share Tech Mono", "Source Code Pro", Consolas, "Ubuntu Mono", monospace;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--iron);color:var(--bone);font:15px/1.6 var(--mono);
+  background-image:
+   radial-gradient(1100px 560px at 90% -10%, rgba(176,122,192,.14), transparent 60%),
+   radial-gradient(900px 500px at -10% 40%, rgba(208,88,31,.09), transparent 60%),
+   repeating-linear-gradient(0deg, rgba(255,255,255,.012) 0 1px, transparent 1px 4px);}
+a{color:var(--brass)}
+code{font-family:var(--mono);background:var(--iron3);padding:0 .35em;border:1px solid var(--seam);color:var(--brass);font-size:.92em;overflow-wrap:anywhere}
+pre{background:var(--iron);border:1px solid var(--seam);padding:12px 14px;overflow-x:auto;font-size:13px;line-height:1.5;color:var(--ash);max-width:100%}
+pre b{color:var(--brass);font-weight:400}
+header.hero{padding:64px 6vw 36px;border-bottom:2px solid var(--seam);position:relative;overflow:hidden}
+header.hero::after{content:"";position:absolute;right:-70px;top:-70px;width:380px;height:380px;border-radius:50%;
+  border:26px solid rgba(176,122,192,.07);box-shadow:inset 0 0 0 2px rgba(176,122,192,.12);pointer-events:none}
+.kicker{font:700 12px/1.4 var(--mono);letter-spacing:.24em;text-transform:uppercase;color:var(--plum)}
+.kicker a{color:inherit}
+h1{font:700 clamp(46px,9vw,118px)/.88 var(--disp);margin:14px 0 18px;text-transform:uppercase;letter-spacing:-.01em}
+h1 em{font-style:normal;color:var(--rust)}
+h1 .thin{font-weight:400;color:var(--ash)}
+.lede{max-width:760px;color:var(--ash);font-size:16px}
+nav.toc{display:flex;flex-wrap:wrap;margin-top:26px;border:1px solid var(--seam);width:fit-content;max-width:100%}
+nav.toc a{padding:10px 14px;text-decoration:none;color:var(--ash);border-right:1px solid var(--seam);font-size:12px;letter-spacing:.12em;text-transform:uppercase}
+nav.toc a:last-child{border-right:0}
+nav.toc b{color:var(--brass);margin-right:6px}
+@media (hover:hover){nav.toc a:hover{background:var(--plum);color:var(--iron)}}
+section{padding:56px 6vw;border-bottom:1px solid var(--seam)}
+section:nth-of-type(even){background:rgba(0,0,0,.18)}
+.sechead{display:grid;grid-template-columns:110px 1fr;gap:22px;align-items:end;margin-bottom:24px}
+.num{font:700 110px/.8 var(--disp);color:transparent;-webkit-text-stroke:2px var(--rust-d)}
+h2{font:700 clamp(32px,4.6vw,60px)/.95 var(--disp);text-transform:uppercase;margin:0}
+h2 small{display:block;font:400 14px/1.4 var(--mono);text-transform:none;color:var(--dim);margin-top:10px}
+h3{font:700 22px/1.1 var(--disp);text-transform:uppercase;letter-spacing:.04em;color:var(--brass);margin:0 0 10px}
+p{max-width:820px}
+.cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.25fr);gap:32px}
+.cols>*{min-width:0}
+.panel{background:var(--iron2);border:1px solid var(--seam);padding:20px;position:relative;min-width:0}
+.callout{border-left:4px solid var(--rust);background:rgba(208,88,31,.07);padding:12px 16px;margin:16px 0;max-width:820px}
+.callout.v{border-color:var(--verd);background:rgba(79,176,160,.07)}
+.callout.b{border-color:var(--brass);background:rgba(224,169,62,.06)}
+.callout.p{border-color:var(--plum);background:rgba(176,122,192,.08)}
+.aside{font-size:13px;color:var(--ash)}
+.src{font-size:11px;color:var(--dim);letter-spacing:.04em;margin-top:10px}
+
+/* controls */
+.ctlrow{display:flex;flex-wrap:wrap;gap:10px 18px;align-items:center;margin:4px 0 14px}
+.ctlhead{font-size:12px;color:var(--ash);margin-right:2px}
+.seg{display:inline-flex;border:2px solid var(--seam);flex-wrap:wrap}
+.seg button{font:700 12px/1 var(--mono);letter-spacing:.06em;padding:9px 12px;border:0;border-right:1px solid var(--seam);background:transparent;color:var(--ash);cursor:pointer}
+.seg button:last-child{border-right:0}
+.seg button[aria-pressed=true]{background:var(--plum);color:var(--iron)}
+.toggle{display:inline-flex;align-items:center;gap:8px;font-size:13px;color:var(--ash);cursor:pointer}
+.toggle input{accent-color:var(--plum);width:18px;height:18px}
+button.plain{font:700 12px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;padding:9px 12px;border:2px solid var(--brass);background:transparent;color:var(--brass);cursor:pointer}
+@media (hover:hover){button.plain:hover{background:var(--brass);color:var(--iron)}}
+
+/* the order board */
+.board{display:flex;flex-wrap:wrap;gap:10px}
+.order{border:2px solid var(--seam);background:var(--iron);padding:8px;flex:1 1 200px;min-width:0;position:relative;transition:border-color .2s, box-shadow .2s}
+.order h4{margin:0 0 6px;font:700 18px/1 var(--disp);letter-spacing:.06em;text-transform:uppercase;display:flex;justify-content:space-between;gap:8px;align-items:baseline}
+.order h4 span{font:400 11px var(--mono);letter-spacing:.08em;color:var(--dim);text-transform:none}
+.order.dirty{border-color:var(--blood);box-shadow:0 0 0 1px rgba(224,54,44,.3),0 0 22px rgba(224,54,44,.12)}
+.order.dirty h4 span{color:var(--blood)}
+.order.null{border-style:dashed}
+.line{display:grid;grid-template-columns:auto 1fr auto;gap:10px;align-items:center;width:100%;text-align:left;
+  font:13px/1.2 var(--mono);color:var(--bone);background:var(--iron2);border:1px solid var(--seam);padding:8px 10px;margin:4px 0;cursor:pointer;transition:background .15s,border-color .15s}
+.line .r{color:var(--dim);font-size:11px}
+.line .amt{color:var(--brass)}
+.line .st{font-size:10px;letter-spacing:.1em;text-transform:uppercase;padding:2px 5px;border:1px solid var(--seam);color:var(--dim);white-space:nowrap}
+.line[aria-pressed=true]{background:rgba(224,54,44,.16);border-color:var(--blood)}
+.line[aria-pressed=true] .st{color:var(--blood);border-color:var(--blood)}
+.line.coll{background:rgba(176,122,192,.12);border-color:var(--plum)}
+.line.coll .st{color:var(--plum);border-color:var(--plum)}
+@media (hover:hover){.line:hover{border-color:var(--brass)}}
+
+/* results */
+.results{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));gap:14px;margin-top:16px}
+.out{border:1px solid var(--seam);background:var(--iron);padding:12px;min-width:0}
+.out h5{margin:0 0 8px;font:700 16px/1 var(--disp);letter-spacing:.1em;text-transform:uppercase;display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.out h5 span{font:400 11px var(--mono);color:var(--dim);letter-spacing:.04em;text-transform:none}
+.row{font-size:13px;padding:6px 8px;border-bottom:1px dotted #2d2620;display:flex;flex-wrap:wrap;gap:4px 12px;align-items:baseline}
+.row:last-child{border-bottom:0}
+.row .k{color:var(--dim)}
+.row.empty{color:var(--dim);font-style:italic}
+.row.warn{background:rgba(224,169,62,.10);box-shadow:inset 3px 0 var(--brass)}
+.dlq{width:100%;text-align:left;font:13px/1.35 var(--mono);color:var(--bone);background:transparent;border:0;border-bottom:1px dotted #2d2620;padding:8px;display:grid;grid-template-columns:14px 1fr;gap:4px 10px;cursor:pointer}
+.dlq:last-child{border-bottom:0}
+.dlq .sw{width:14px;height:14px;margin-top:2px;border-radius:2px}
+.dlq .meta{grid-column:2;display:flex;flex-wrap:wrap;gap:4px 6px;font-size:11px}
+.pill{font-size:10px;letter-spacing:.08em;padding:1px 6px;border:1px solid currentColor;text-transform:none;white-space:nowrap}
+.pill.t{color:var(--blood)} .pill.c{color:var(--plum)} .pill.s{color:var(--dim)} .pill.m{color:var(--steel)}
+.dlq.dim{opacity:.28}
+.dlq.hl{background:rgba(224,169,62,.08)}
+.counts{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.counts div{border:1px solid var(--seam);padding:6px 10px;background:var(--iron);min-width:110px}
+.counts b{display:block;font:700 22px/1 var(--disp)}
+.counts span{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim)}
+.mode{font:700 22px/1.1 var(--disp);text-transform:uppercase;letter-spacing:.04em;margin:4px 0 8px}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{font:12px var(--mono);padding:2px 7px;border:1px solid var(--seam);color:var(--ash)}
+.chip.x{color:var(--blood);border-color:var(--blood);text-decoration:line-through}
+.tblwrap{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--seam);vertical-align:top}
+th{font:700 13px var(--disp);letter-spacing:.12em;text-transform:uppercase;color:var(--dim)}
+
+/* cards for the static section */
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));gap:0;border:2px solid var(--seam)}
+.card{padding:16px 18px;border-right:1px solid var(--seam);border-bottom:1px solid var(--seam);min-width:0}
+.card h4{margin:0 0 6px;font:700 22px/1 var(--disp);text-transform:uppercase;color:var(--bone)}
+.card p{font-size:13px;color:var(--ash);margin:0 0 8px}
+.flow{display:flex;flex-wrap:wrap;align-items:stretch;gap:0;margin:14px 0}
+.flow .st{border:2px solid var(--seam);background:var(--iron);padding:10px 12px;min-width:0;flex:1 1 150px}
+.flow .st b{display:block;font:700 15px/1.1 var(--disp);letter-spacing:.08em;text-transform:uppercase;color:var(--brass)}
+.flow .st span{font-size:12px;color:var(--ash);overflow-wrap:anywhere}
+.flow .ar{align-self:center;color:var(--dim);padding:0 6px}
+footer{padding:36px 6vw;color:var(--dim);font-size:12px}
+
+@media (max-width:980px){.cols{grid-template-columns:1fr}}
+@media (max-width:720px){
+  .sechead{grid-template-columns:1fr;gap:6px}.num{font-size:64px}
+  h2{font-size:clamp(28px,10vw,36px)}
+  section{padding:44px 5vw}
+  header.hero{padding:44px 5vw 28px}
+}
+@media (max-width:720px),(pointer:coarse){
+  .aside,.row,.dlq,.line,table,.card p,.flow .st span,footer,.toggle,.ctlhead{font-size:14px}
+}
+/* 44px targets on touch screens, and on any narrow screen in case the pointer is misreported */
+@media (pointer:coarse),(max-width:720px){
+  .seg button,button.plain,.line,.dlq{min-height:44px}
+  .toggle{min-height:44px;padding-right:8px}
+  .toggle input{width:24px;height:24px;margin:10px}
+  nav.toc a{display:flex;align-items:center;min-height:44px}
+  .kicker a{display:inline-block;line-height:44px}
+}
+@media (prefers-reduced-motion: reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="kicker">Clinker user guide · <a href="correlation-keys.html">← back to Correlation Keys</a></div>
+  <h1>One bad line,<br><em>the whole order</em><span class="thin"> goes</span></h1>
+  <p class="lede">A correlation key ties records together, so that when one of them fails, the rest of its group is turned away too. This page lets you break records and watch what reaches your output and what lands in the dead-letter file (the DLQ). It covers a plain pipeline, a pipeline with an Aggregate, and the case where the engine keeps part of a group instead of throwing it all away.</p>
+  <nav class="toc">
+    <a href="#group"><b>01</b>The group</a>
+    <a href="#identity"><b>02</b>Identity &amp; order</a>
+    <a href="#aggregate"><b>03</b>Through an Aggregate</a>
+    <a href="#elsewhere"><b>04</b>Other nodes</a>
+  </nav>
+</header>
+
+<!-- ============================ 01 ============================ -->
+<section id="group">
+  <div class="sechead"><div class="num">01</div><h2>The group<small>Tap any line to make it fail</small></h2></div>
+  <div class="cols">
+    <div>
+      <p>An orders file has one row per order <i>line</i>. Order A has three lines, B has two and C has one, and the last two lines have no order id. The pipeline reads the file and checks each line's quantity; a quantity that isn't a whole number fails the check.</p>
+<pre>- type: source
+  name: orders
+  config:
+    <b>correlation_key: order_id</b>
+    …
+- type: transform
+  name: validate
+  input: orders
+  config:
+    cxl: |
+      emit q = qty.to_int()   # "BAD" fails here</pre>
+      <p>With <code>correlation_key: order_id</code>, a failing line takes the rest of its order with it:</p>
+      <ul>
+        <li>The failing line is written to the DLQ as a <span class="pill t">trigger</span>, with the real error category.</li>
+        <li>The order's other lines are written as <span class="pill c">correlated</span>. They did nothing wrong; they were condemned by their order.</li>
+        <li>Other orders are not affected.</li>
+        <li>A line with an <b>empty key</b> is a group of one. It never takes another line with it.</li>
+      </ul>
+      <div class="callout b">Turn the key off to compare. Without it, only the failing line is dead-lettered, and the rest of order A reaches the output on its own.</div>
+    </div>
+    <div class="panel">
+      <div class="ctlrow">
+        <span class="ctlhead">correlation_key</span>
+        <div class="seg" data-bind="key"><button data-v="on" aria-pressed="true">order_id</button><button data-v="off" aria-pressed="false">none</button></div>
+        <button class="plain" data-reset>Reset lines</button>
+      </div>
+      <div class="board" data-board></div>
+      <div class="results">
+        <div class="out"><h5>Output file <span data-outnote></span></h5><div data-rawout></div></div>
+        <div class="out"><h5>DLQ <span>tap a row to see what one failure took with it</span></h5><div data-dlq="1"></div></div>
+      </div>
+      <div class="counts" data-counts="1"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ 02 ============================ -->
+<section id="identity">
+  <div class="sechead"><div class="num">02</div><h2>Identity &amp; order<small>Two things a key changes before anything fails</small></h2></div>
+  <div class="cols">
+    <div>
+      <h3>The group is fixed when the row is read</h3>
+      <p>The engine copies the key value into a hidden column as soon as the Source reads the row. Later steps can rename, rewrite or anonymise <code>order_id</code> and the row stays in its original group.</p>
+      <div class="flow">
+        <div class="st"><b>Read</b><span>order_id = "A"<br>group = A</span></div><div class="ar">→</div>
+        <div class="st"><b>Transform</b><span>order_id = "anon-7"<br>group = A</span></div><div class="ar">→</div>
+        <div class="st"><b>Fails?</b><span>all of group A is turned away</span></div>
+      </div>
+      <p class="aside">The hidden columns never appear in your output. To see them while debugging, set <code>include_correlation_keys: true</code> on a Sink. They show up as <code>$ck.order_id</code>.</p>
+    </div>
+    <div>
+      <h3>Rows arrive sorted by the key</h3>
+      <p>To keep each group's rows together, the engine sorts the Source's rows by the key (empty keys first), keeping file order within a key. If the Source already declares a <code>sort_order</code> that starts with the key, nothing is re-sorted.</p>
+      <p>You can see this in section 01: with the key on, the output lists the empty-key line first, then B, then C. With the key off, it follows the file.</p>
+      <div class="callout">This sort happens <b>even when nothing fails</b>. Adding a key to a working pipeline can change the order of rows in your output, which value an Aggregate sees first, and which row a Combine's <code>match: first</code> picks.</div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ 03 ============================ -->
+<section id="aggregate">
+  <div class="sechead"><div class="num">03</div><h2>Through an Aggregate<small>The engine picks strict or retraction from your group_by</small></h2></div>
+  <div class="cols">
+    <div>
+      <p>An Aggregate turns many lines into one total, so “turn the whole group away” needs a rule. The engine looks at your <code>group_by</code>. You never choose this setting yourself:</p>
+      <h3>group_by includes the key → strict</h3>
+      <p>Each total belongs to exactly one order. If any line of the order fails, the order's total is dead-lettered as <span class="pill c">correlated</span>, even though the engine did compute it from the clean lines.</p>
+      <h3>group_by leaves the key out → retraction</h3>
+      <p>Now one order spreads across several totals: order A has lines in both ENG and HR. Throwing away every total an order touched would void whole departments over one bad line. Instead the engine takes out only the failing line and recomputes the totals from the lines that remain, so <b>the clean lines of a failed order still count</b>.</p>
+      <p>A check <i>after</i> the Aggregate can also fail a total. Under retraction, that total is dead-lettered as a trigger and drops out of the output. The lines that fed it are not dead-lettered, and their orders are untouched.</p>
+      <div class="callout v">Retraction doesn't work with <code>strategy: streaming</code>, because a streaming Aggregate writes each total before the run knows whether any line failed. That combination is rejected when the pipeline is checked (<code>E15Y</code>).</div>
+    </div>
+    <div class="panel">
+      <div class="ctlrow">
+        <span class="ctlhead">group_by</span>
+        <div class="seg" data-bind="agg"><button data-v="order" aria-pressed="false">[order_id]</button><button data-v="dept" aria-pressed="true">[dept]</button></div>
+      </div>
+      <div class="ctlrow">
+        <label class="toggle"><input type="checkbox" data-bind="raw"> also write the lines to a second Sink</label>
+      </div>
+      <div class="ctlrow" data-checkrow>
+        <span class="ctlhead">check after the Aggregate fails for</span>
+        <div class="seg" data-bind="check"><button data-v="ENG" aria-pressed="false">ENG</button><button data-v="HR" aria-pressed="false">HR</button></div>
+      </div>
+      <div class="mode" data-mode></div>
+      <div class="board" data-board></div>
+      <div class="results">
+        <div class="out"><h5>Totals <span data-totnote></span></h5><div data-totals></div></div>
+        <div class="out" data-rawbox><h5>Lines Sink</h5><div data-rawout></div></div>
+        <div class="out"><h5>DLQ <span>tap a row to group by its failure</span></h5><div data-dlq="3"></div></div>
+      </div>
+      <div class="counts" data-counts="3"></div>
+      <div data-mismatch></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ 04 ============================ -->
+<section id="elsewhere">
+  <div class="sechead"><div class="num">04</div><h2>Other nodes<small>Where a group can travel, and what happens there</small></h2></div>
+  <div class="cards">
+    <div class="card"><h4>Route</h4><p>A group can be split across branches. If any of its rows fails on any branch, the group is turned away from every branch.</p><p>With an <code>inclusive</code> Route, a row that reaches two branches but fails once is dead-lettered once.</p></div>
+    <div class="card"><h4>Merge</h4><p>Rows keep their group through a Merge, so rows from two Sources with the same key value end up in one group.</p><p>A failure only condemns rows <b>from the Source that failed</b>. If a row from <code>src_b</code> fails, the <code>src_a</code> row with the same id still reaches the output.</p></div>
+    <div class="card"><h4>Combine</h4><p>Every Combine must say which keys its output carries: <code>propagate_ck: driver</code>, <code>all</code>, or <code>{ named: [...] }</code>.</p><p>If the Combine body fails for a driver row, the build row it matched is written next to it in the DLQ. The build row's own group is not condemned.</p></div>
+    <div class="card"><h4>Very large groups</h4><p><code>error_handling.max_group_buffer</code> (default 100,000) caps how many entries a group may hold. A group over the cap is dead-lettered whole, under one <code>group_size_exceeded</code> row, and the run continues.</p><p>The cap does not limit the memory the group uses today (<a href="https://github.com/rustpunk/clinker/issues/1259">#1259</a>).</p></div>
+    <div class="card"><h4>Compositions</h4><p>Groups flow into a composition and back out unchanged. A composition can't declare its own key; keys belong to Sources.</p></div>
+    <div class="card"><h4>Diagnostics</h4><p><code>E153</code>: the key names a column that isn't in the Source's schema.</p><p><code>E15Y</code>: a retraction Aggregate set to <code>strategy: streaming</code>.</p><p>Run <code>clinker explain --code &lt;code&gt;</code> for the full text.</p></div>
+  </div>
+  <h3 style="margin-top:30px">Reading the DLQ</h3>
+  <div class="tblwrap"><table>
+    <tr><th>column</th><th>what it tells you</th></tr>
+    <tr><td><code>_cxl_dlq_trigger</code></td><td><code>true</code> when the row's own failure sent it there; <code>false</code> when another row's failure took it along.</td></tr>
+    <tr><td><code>_cxl_dlq_trigger_id</code></td><td>The id of the trigger row behind this one. Group by it to see everything one failure took with it. A trigger points to itself. When an order has several failing lines, its correlated rows point to the first.</td></tr>
+    <tr><td><code>_cxl_dlq_error_category</code></td><td>The real failure on a trigger (for example <code>type_coercion_failure</code>), or <code>correlated</code> on a row condemned by its group. Needs <code>include_reason: true</code>.</td></tr>
+    <tr><td><code>_cxl_dlq_stage</code></td><td>Where it happened: <code>transform:validate</code> for the failing line, <code>correlation_commit</code> for the rows its group condemned.</td></tr>
+  </table></div>
+</section>
+
+<footer>Every outcome on this page was checked by running Clinker on the pipelines shown, with the same eight lines. The page reproduces that behavior; it does not run the engine. Full reference: <a href="correlation-keys.html">Correlation Keys</a> and <a href="error-handling.html">Error Handling &amp; DLQ</a>.</footer>
+
+<script>
+"use strict";
+const LINES=[
+  {row:1,order:"A",dept:"ENG",amount:10},
+  {row:2,order:"A",dept:"HR",amount:20},
+  {row:3,order:"A",dept:"ENG",amount:30},
+  {row:4,order:"B",dept:"ENG",amount:100},
+  {row:5,order:"B",dept:"HR",amount:200},
+  {row:6,order:"C",dept:"ENG",amount:1000},
+  {row:7,order:null,dept:"HR",amount:5},
+  {row:8,order:null,dept:"HR",amount:7},
+];
+const DEFAULT_FAILS=[3,7];
+const S={fails:new Set(DEFAULT_FAILS),key:"on",agg:"dept",raw:false,check:new Set(),focus:{1:null,3:null}};
+const SW=["#e0362c","#e0a93e","#4fb0a0","#b07ac0","#7f97ad","#9bc76b","#d0581f","#ece2d0"];
+const keyLabel=o=>o===null?"(empty)":o;
+const lineTxt=l=>`row ${l.row} · ${keyLabel(l.order)} · ${l.dept} · ${l.amount}`;
+
+/* The behavior model. Each rule was confirmed by running clinker on the same rows. */
+function run(withAgg){
+  const key=S.key==="on", dlq=[];
+  let n=0; const newId=()=>++n;
+  // 1. every failing line is its own trigger
+  const failing=LINES.filter(l=>S.fails.has(l.row));
+  const trig=new Map();
+  for(const l of failing){ const id=newId(); trig.set(l.row,id);
+    dlq.push({id,tid:id,trigger:true,cat:"type_coercion_failure",stage:"transform:validate",src:"orders",txt:lineTxt(l)+" · qty BAD"}); }
+  // 2. groups: a line with an empty key is a group of one; dirty groups remember their first failing line
+  const gk=l=>l.order===null?"#row"+l.row:l.order;
+  const dirty=new Map();
+  if(key) for(const l of failing) if(!dirty.has(gk(l))) dirty.set(gk(l),trig.get(l.row));
+  const survivors=LINES.filter(l=>!S.fails.has(l.row));
+  // 3. a Sink holding the lines: rows of a dirty group become correlated collaterals
+  const rawOn=!withAgg||S.raw; let rawOut=[]; const collRows=new Set();
+  if(rawOn){
+    for(const l of survivors){
+      if(key&&dirty.has(gk(l))){ collRows.add(l.row);
+        dlq.push({id:newId(),tid:dirty.get(gk(l)),trigger:false,cat:"correlated",stage:"correlation_commit",src:"orders",txt:lineTxt(l)}); }
+      else rawOut.push(l);
+    }
+    if(key) rawOut=[...rawOut].sort((a,b)=>(a.order===null?-1:0)-(b.order===null?-1:0)||String(a.order).localeCompare(String(b.order))||a.row-b.row);
+  }
+  // 4. the Aggregate
+  let totals=[], mode="";
+  if(withAgg){
+    const by=S.agg==="order"?(l=>keyLabel(l.order)):(l=>l.dept);
+    const groups=new Map();
+    for(const l of survivors){ const k=by(l); if(!groups.has(k)) groups.set(k,[]); groups.get(k).push(l); }
+    const strict=key&&S.agg==="order";
+    mode=!key?"no correlation key: an ordinary Aggregate":strict?"strict: group_by includes the key":"retraction: group_by leaves the key out";
+    for(const [k,rows] of [...groups].sort((a,b)=>a[0].localeCompare(b[0]))){
+      const t={k,rows,total:rows.reduce((a,l)=>a+l.amount,0),n:rows.length};
+      if(strict){ const bad=rows.find(l=>dirty.has(gk(l)));
+        if(bad){ dlq.push({id:newId(),tid:dirty.get(gk(bad)),trigger:false,cat:"correlated",stage:"correlation_commit",src:"<merged>",txt:`total for order ${k} = ${t.total} (${t.n} lines)`}); continue; } }
+      if(S.agg==="dept"&&S.check.has(k)){ const id=newId();
+        dlq.push({id,tid:id,trigger:true,cat:"type_coercion_failure",stage:"transform:check",src:"<merged>",txt:`total for ${k} = ${t.total} (${t.n} lines)`}); continue; }
+      totals.push(t);
+    }
+  }
+  // DLQ rows grouped by the failure that produced them
+  const order=new Map(); dlq.forEach(e=>{ if(!order.has(e.tid)) order.set(e.tid,order.size); });
+  dlq.sort((a,b)=>order.get(a.tid)-order.get(b.tid)||(b.trigger-a.trigger)||a.id-b.id);
+  return {dlq,rawOut,rawOn,totals,mode,dirty,gk,collRows,key};
+}
+
+/* rendering */
+function renderBoard(el,res){
+  const groups=[]; const seen=new Map();
+  for(const l of LINES){ const k=l.order===null?"#row"+l.row:l.order; if(!seen.has(k)){ seen.set(k,groups.length); groups.push({k,order:l.order,lines:[]}); } groups[seen.get(k)].lines.push(l); }
+  el.innerHTML=groups.map(g=>{
+    const dirty=res.key&&res.dirty.has(g.k);
+    const title=g.order===null?"No key":"Order "+g.order;
+    const note=g.order===null?"a group of one":dirty?"group condemned":res.key?"clean":"no key";
+    return `<div class="order${dirty?" dirty":""}${g.order===null?" null":""}"><h4>${title}<span>${note}</span></h4>`+
+      g.lines.map(l=>{ const f=S.fails.has(l.row), c=res.collRows.has(l.row);
+        return `<button class="line${c?" coll":""}" data-row="${l.row}" aria-pressed="${f}"><span class="r">#${l.row}</span><span>${l.dept} <span class="amt">${l.amount}</span></span><span class="st">${f?"fails":c?"taken along":"ok"}</span></button>`; }).join("")+`</div>`;
+  }).join("");
+}
+function renderDlq(el,res,slot){
+  if(!res.dlq.length){ el.innerHTML=`<div class="row empty">empty</div>`; return; }
+  const ids=[...new Set(res.dlq.map(e=>e.tid))]; const col=t=>SW[ids.indexOf(t)%SW.length];
+  const f=S.focus[slot];
+  el.innerHTML=res.dlq.map(e=>`<button class="dlq${f!=null?(e.tid===f?" hl":" dim"):""}" data-tid="${e.tid}">
+    <span class="sw" style="background:${col(e.tid)}"></span><span>${e.txt}</span>
+    <span class="meta"><span class="pill ${e.trigger?"t":"c"}">trigger: ${e.trigger}</span><span class="pill ${e.trigger?"t":"c"}">${e.cat}</span><span class="pill s">${e.stage}</span>${e.src==="<merged>"?'<span class="pill m">source: &lt;merged&gt;</span>':""}</span></button>`).join("");
+}
+function rawRows(res,warn){
+  if(!res.rawOut.length) return `<div class="row empty">no rows</div>`;
+  return res.rawOut.map(l=>`<div class="row${warn&&warn.has(l.row)?" warn":""}"><span>${keyLabel(l.order)}</span><span class="k">${l.dept}</span><span>${l.amount}</span><span class="k">row ${l.row}</span></div>`).join("");
+}
+function counts(el,res){
+  const trig=res.dlq.filter(e=>e.trigger).length, coll=res.dlq.length-trig;
+  const written=(res.rawOn?res.rawOut.length:0)+res.totals.length;
+  el.innerHTML=[["rows written",written],["dlq triggers",trig],["dlq correlated",coll],["dlq_count",res.dlq.length]].map(([a,b])=>`<div><span>${a}</span><b>${b}</b></div>`).join("");
+}
+
+const sec1=document.getElementById("group"), sec3=document.getElementById("aggregate");
+function render(){
+  // section 01
+  const r1=run(false);
+  renderBoard(sec1.querySelector("[data-board]"),r1);
+  sec1.querySelector("[data-rawout]").innerHTML=rawRows(r1);
+  sec1.querySelector("[data-outnote]").textContent=r1.key?"sorted by order_id":"file order";
+  renderDlq(sec1.querySelector('[data-dlq="1"]'),r1,1);
+  counts(sec1.querySelector('[data-counts="1"]'),r1);
+  // section 03
+  const r3=run(true);
+  renderBoard(sec3.querySelector("[data-board]"),r3);
+  sec3.querySelector("[data-mode]").textContent=r3.mode;
+  sec3.querySelector("[data-mode]").style.color=!r3.key?"var(--dim)":S.agg==="order"?"var(--brass)":"var(--verd)";
+  sec3.querySelector("[data-checkrow]").style.display=S.agg==="dept"?"":"none";
+  sec3.querySelector("[data-totnote]").textContent=(S.agg==="order"?"one per order":"one per department")+", sorted here; the file's order may differ";
+  // lines that are dead-lettered from the Lines Sink yet still counted in a total
+  const counted=new Set(r3.totals.flatMap(t=>t.rows.map(l=>l.row)));
+  const both=[...r3.collRows].filter(r=>counted.has(r));
+  sec3.querySelector("[data-totals]").innerHTML=r3.totals.length?r3.totals.map(t=>`<div class="row"><span>${S.agg==="order"?"order ":""}${t.k}</span><span>total <b>${t.total}</b></span><span class="k">${t.n} line${t.n===1?"":"s"}</span>
+      <span class="chips">${t.rows.map(l=>`<span class="chip"${both.includes(l.row)?' style="border-color:var(--brass);color:var(--brass)"':""}>#${l.row}</span>`).join("")}</span></div>`).join(""):`<div class="row empty">no totals</div>`;
+  const box=sec3.querySelector("[data-rawbox]"); box.style.display=S.raw?"":"none";
+  if(S.raw) box.querySelector("[data-rawout]").innerHTML=rawRows(r3);
+  renderDlq(sec3.querySelector('[data-dlq="3"]'),r3,3);
+  counts(sec3.querySelector('[data-counts="3"]'),r3);
+  const mm=sec3.querySelector("[data-mismatch]");
+  mm.innerHTML=both.length?`<div class="callout p"><b>The two outputs disagree.</b> ${both.map(r=>"Line #"+r).join(", ")} ${both.length===1?"is":"are"} in the DLQ as <i>correlated</i> from the Lines Sink, yet still counted in the totals (highlighted chips). This is how the engine behaves today: retraction removes only the failing lines from the Aggregate, while the Sink turns away the whole order. Whether the totals should drop those lines too is an open question.</div>`:"";
+  // control states
+  document.querySelectorAll('[data-bind="key"] button').forEach(b=>b.setAttribute("aria-pressed",String(b.dataset.v===S.key)));
+  document.querySelectorAll('[data-bind="agg"] button').forEach(b=>b.setAttribute("aria-pressed",String(b.dataset.v===S.agg)));
+  document.querySelectorAll('[data-bind="check"] button').forEach(b=>b.setAttribute("aria-pressed",String(S.check.has(b.dataset.v))));
+  document.querySelector('[data-bind="raw"]').checked=S.raw;
+}
+
+document.addEventListener("click",e=>{
+  const line=e.target.closest(".line");
+  if(line){ const r=+line.dataset.row; S.fails.has(r)?S.fails.delete(r):S.fails.add(r); S.focus={1:null,3:null}; render(); return; }
+  const d=e.target.closest(".dlq");
+  if(d){ const slot=d.parentElement.dataset.dlq, t=+d.dataset.tid; S.focus[slot]=S.focus[slot]===t?null:t; render(); return; }
+  const b=e.target.closest("[data-bind] button");
+  if(b){ const k=b.parentElement.dataset.bind;
+    if(k==="check"){ S.check.has(b.dataset.v)?S.check.delete(b.dataset.v):S.check.add(b.dataset.v); } else S[k]=b.dataset.v;
+    S.focus={1:null,3:null}; render(); return; }
+  if(e.target.closest("[data-reset]")){ S.fails=new Set(DEFAULT_FAILS); S.focus={1:null,3:null}; render(); }
+});
+document.querySelector('[data-bind="raw"]').addEventListener("change",e=>{ S.raw=e.target.checked; render(); });
+render();
+</script>
+</body>
+</html>

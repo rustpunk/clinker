@@ -830,6 +830,34 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
   `(0.0, 1.0]`.
 - Implementation owner: Planner maintainers.
 
+### 68. A relaxed Aggregate keeps a condemned group's clean rows that a Sink on the same input dead-letters
+
+- Filed: 2026-10-04.
+- Status: Open.
+- Priority: Medium.
+- Evidence: An `orders` Source with `correlation_key: order_id` feeds a
+  validating Transform, which feeds both a Sink and an Aggregate with
+  `group_by: [dept]`. When one line of order A fails, the Sink's copies of
+  A's other lines are dead-lettered as `correlated` at `correlation_commit`,
+  but the Aggregate's department totals still include those same lines: the
+  retraction path removes only the failing line's contribution. The run's
+  two outputs then disagree on whether order A's clean lines were accepted.
+  With the Aggregate alone, nothing is inconsistent, because only the
+  failing line reaches the DLQ. Reproduced on the main branch at 51935988a
+  with an eight-row CSV; the interactive explainer
+  `docs/user/src/pipelines/correlation-keys-explainer.html` shows the case.
+- Files/modules involved: `crates/clinker-exec/src/executor/commit/detect.rs`
+  (`detect_retract_scope` takes the cell's `error_rows` only),
+  `crates/clinker-exec/src/executor/commit/recompute_agg.rs`,
+  `crates/clinker-exec/src/executor/commit/flush.rs`.
+- Suggested way to resolve it: Decide whether a group condemned at commit
+  also retracts its clean rows from relaxed Aggregates, so every output
+  agrees, or whether keeping them is the intended contract. If keeping them
+  is intended, say so in the user guide's Aggregate interaction section;
+  otherwise widen the retract scope to the condemned group's rows and add
+  a test with a Sink and a relaxed Aggregate on the same input.
+- Implementation owner: Executor maintainers.
+
 ## Resolved Archive
 
 ### 61. Decoded allocation ownership

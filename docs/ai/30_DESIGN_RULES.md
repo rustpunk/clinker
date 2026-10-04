@@ -217,9 +217,9 @@ to [open questions](80_OPEN_QUESTIONS.md) rather than promoting it here.
   shell is limited to the CI, release, and maintenance scripts under
   `scripts/`, C to the no-C gate's probe fixture under
   `tools/no-c-gate-fixture/`, and the only committed JavaScript is the vendored mdBook theme under
-  `docs/theme/` and the inline script of the static explainer page
-  `docs/engine/src/memory-explainer.html`, which mdBook copies verbatim
-  and which runs only in a reader's browser.
+  `docs/theme/` and the inline scripts of the static explainer pages
+  (`docs/*/src/**/*-explainer.html`), which mdBook copies verbatim and
+  which run only in a reader's browser.
 - Repeated adversarial repair of a hand-written substitute is evidence that the
   dependency decision was wrong, not a reason to keep patching. Reopen the
   approval question instead of growing the substitute.
