@@ -495,3 +495,243 @@ fn dead_letter_ids(path: &Path) -> Vec<String> {
     }
     ids
 }
+
+/// A single-port composition with two body Sinks: `out`, named like the
+/// existing port, and `audit`.
+const TWO_SINK_COMP: &str = r#"_compose:
+  name: two_sinks
+  inputs:
+    inp:
+      schema:
+        - { name: id, type: string }
+        - { name: value, type: string }
+  outputs:
+    out: shape
+  config_schema: {}
+
+nodes:
+  - type: transform
+    name: shape
+    input: inp
+    config:
+      cxl: |
+        emit id = id
+        emit value = value.to_int()
+  - type: sink
+    name: out
+    input: shape
+    config:
+      name: out
+      type: csv
+      path: out_copy.csv
+  - type: sink
+    name: audit
+    input: shape
+    config:
+      name: audit
+      type: csv
+      path: audit.csv
+"#;
+
+/// The composition called inside `OUTER_COMP`, with one body Sink.
+const INNER_COMP: &str = r#"_compose:
+  name: inner
+  inputs:
+    inp:
+      schema:
+        - { name: id, type: string }
+        - { name: value, type: string }
+  outputs:
+    out: shape
+  config_schema: {}
+
+nodes:
+  - type: transform
+    name: shape
+    input: inp
+    config:
+      cxl: |
+        emit id = id
+        emit value = value.to_int()
+  - type: sink
+    name: inner_audit
+    input: shape
+    config:
+      name: inner_audit
+      type: csv
+      path: inner_audit.csv
+"#;
+
+/// A single-port composition that calls `INNER_COMP` and reads it by its
+/// bare name.
+const OUTER_COMP: &str = r#"_compose:
+  name: outer
+  inputs:
+    inp:
+      schema:
+        - { name: id, type: string }
+        - { name: value, type: string }
+  outputs:
+    out: stamp
+  config_schema: {}
+
+nodes:
+  - type: composition
+    name: inner
+    input: inp
+    use: ./inner.comp.yaml
+    inputs:
+      inp: inp
+  - type: transform
+    name: stamp
+    input: inner
+    config:
+      cxl: |
+        emit id = id
+        emit value = value * 2
+"#;
+
+/// Both compositions called from the pipeline, each read by its bare name.
+fn two_sinks_and_nested_pipeline() -> String {
+    format!(
+        "{head}{source}{rest}",
+        head = pipeline_head("document_dlq_body_sinks_nested"),
+        source = source_node("document"),
+        rest = r#"  - type: composition
+    name: enrich
+    input: events
+    use: ../compositions/two_sinks.comp.yaml
+    inputs:
+      inp: events
+  - type: composition
+    name: wrap
+    input: events
+    use: ../compositions/outer.comp.yaml
+    inputs:
+      inp: events
+  - type: sink
+    name: primary
+    input: enrich
+    config:
+      name: primary
+      type: csv
+      path: primary.csv
+  - type: sink
+    name: wrapped
+    input: wrap
+    config:
+      name: wrapped
+      type: csv
+      path: wrapped.csv
+"#,
+    )
+}
+
+/// The same work without compositions, on record granularity: each body
+/// Transform at pipeline level and each Sink reading the node it read.
+fn two_sinks_and_nested_reference() -> String {
+    format!(
+        "{head}{source}{rest}",
+        head = pipeline_head("document_dlq_body_sinks_nested_reference"),
+        source = source_node("record"),
+        rest = r#"  - type: transform
+    name: shape
+    input: events
+    config:
+      cxl: |
+        emit id = id
+        emit value = value.to_int()
+  - type: transform
+    name: inner_shape
+    input: events
+    config:
+      cxl: |
+        emit id = id
+        emit value = value.to_int()
+  - type: transform
+    name: stamp
+    input: inner_shape
+    config:
+      cxl: |
+        emit id = id
+        emit value = value * 2
+  - type: sink
+    name: primary
+    input: shape
+    config:
+      name: primary
+      type: csv
+      path: primary.csv
+  - type: sink
+    name: out
+    input: shape
+    config:
+      name: out
+      type: csv
+      path: out_copy.csv
+  - type: sink
+    name: audit
+    input: shape
+    config:
+      name: audit
+      type: csv
+      path: audit.csv
+  - type: sink
+    name: inner_audit
+    input: inner_shape
+    config:
+      name: inner_audit
+      type: csv
+      path: inner_audit.csv
+  - type: sink
+    name: wrapped
+    input: stamp
+    config:
+      name: wrapped
+      type: csv
+      path: wrapped.csv
+"#,
+    )
+}
+
+#[test]
+fn applying_every_e378_fix_for_two_body_sinks_and_a_nested_call() {
+    let pipeline = two_sinks_and_nested_pipeline();
+    let files = [
+        ("compositions/two_sinks.comp.yaml", TWO_SINK_COMP),
+        ("compositions/inner.comp.yaml", INNER_COMP),
+        ("compositions/outer.comp.yaml", OUTER_COMP),
+        (PIPELINE, pipeline.as_str()),
+    ];
+    let inputs = [("a.csv", CLEAN_DOCUMENT)];
+    let fixed = workspace(&files, &inputs);
+    apply_every_help_and_run(fixed.path(), 3, 0);
+
+    let reference_pipeline = two_sinks_and_nested_reference();
+    let reference = workspace(&[(PIPELINE, reference_pipeline.as_str())], &inputs);
+    let reference_run = run(reference.path());
+    assert_eq!(
+        reference_run.status.code(),
+        Some(0),
+        "{}",
+        stderr(&reference_run)
+    );
+
+    let written = outputs(fixed.path());
+    assert_eq!(
+        written.keys().collect::<Vec<_>>(),
+        [
+            "audit.csv",
+            "inner_audit.csv",
+            "out_copy.csv",
+            "primary.csv",
+            "wrapped.csv"
+        ],
+        "every Sink writes, and nothing is dead-lettered"
+    );
+    assert_eq!(
+        written,
+        outputs(reference.path()),
+        "every Sink writes what the reference writes"
+    );
+}
