@@ -385,10 +385,10 @@ fn avg_and_weighted_avg_decimal_out_of_range_is_an_error() {
 
 #[test]
 fn every_accumulator_error_names_its_rule_and_a_fix() {
-    // Every error but the integer overflow, whose message predates the rule
-    // and is kept as it is, carries a backticked CXL form the author can
-    // paste, in author vocabulary.
+    // Every error carries a backticked form the author can paste, in author
+    // vocabulary.
     for error in [
+        AccumulatorError::SumOverflow { field: None },
         AccumulatorError::DecimalOutOfRange,
         AccumulatorError::QuotientOutOfRange,
         AccumulatorError::ProductOverflow,
@@ -414,9 +414,40 @@ fn every_accumulator_error_names_its_rule_and_a_fix() {
         fold(sum, &[seven_e28.clone(), seven_e28]).finalize(),
         Err(AccumulatorError::DecimalOutOfRange)
     );
-    assert_eq!(
-        AccumulatorError::SumOverflow { field: None }.to_string(),
-        "integer sum overflow (i64 range exceeded)"
+    let overflow = AccumulatorError::SumOverflow { field: None }.to_string();
+    assert!(
+        overflow.starts_with("integer sum overflow (i64 range exceeded)")
+            && overflow.contains("`sum(amount.to_decimal())`"),
+        "the integer overflow keeps its prefix and prints the decimal sum: {overflow}"
+    );
+}
+
+#[test]
+fn accumulator_messages_offer_one_fix() {
+    for error in [
+        AccumulatorError::SumOverflow { field: None },
+        AccumulatorError::SumOverflow {
+            field: Some("amount".to_string()),
+        },
+        AccumulatorError::DecimalOutOfRange,
+        AccumulatorError::QuotientOutOfRange,
+        AccumulatorError::ProductOverflow,
+        AccumulatorError::ZeroTotalWeight,
+        AccumulatorError::MixedDecimalFloat,
+    ] {
+        let message = error.to_string();
+        let (_, fix) = message
+            .split_once("; ")
+            .unwrap_or_else(|| panic!("{error:?} gives no fix: {message}"));
+        assert!(
+            !fix.contains(" or "),
+            "{error:?} offers more than one fix: {message}"
+        );
+    }
+    let mixed = AccumulatorError::MixedDecimalFloat.to_string();
+    assert!(
+        mixed.contains("`type: decimal`") && !mixed.contains(".to_decimal()"),
+        "the mixed group's fix is the schema type, never a float's conversion: {mixed}"
     );
 }
 

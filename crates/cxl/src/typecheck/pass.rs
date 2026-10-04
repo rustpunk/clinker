@@ -3944,6 +3944,15 @@ mod tests {
         src: &str,
         mode: AggregateMode,
     ) -> Result<TypedProgram, Vec<TypeDiagnostic>> {
+        typecheck_mixed_with_price(src, mode, Type::Float)
+    }
+
+    /// [`typecheck_mixed`] with `price` declared `price`.
+    fn typecheck_mixed_with_price(
+        src: &str,
+        mode: AggregateMode,
+        price: Type,
+    ) -> Result<TypedProgram, Vec<TypeDiagnostic>> {
         let fields = ["amount", "price", "qty", "flag"];
         let parsed = Parser::parse(src);
         assert!(
@@ -3960,7 +3969,7 @@ mod tests {
             });
         let mut cols = IndexMap::new();
         cols.insert("amount".into(), Type::Decimal);
-        cols.insert("price".into(), Type::Float);
+        cols.insert("price".into(), price);
         cols.insert("qty".into(), Type::Int);
         cols.insert("flag".into(), Type::Bool);
         let schema = Row::closed(cols, Span::new(0, 0));
@@ -4035,28 +4044,34 @@ mod tests {
         assert_eq!(
             errs[0].message,
             "cannot mix decimal and float without an explicit cast: the branches of this \
-             `if` are a decimal (`amount`) and a float (`price`); convert one branch so both \
-             have one numeric type, for example `price.to_decimal()` or `amount.to_float()`"
+             `if` are a decimal (`amount`) and a float (`price`); declare `price` a decimal \
+             in its Source schema, `type: decimal` in place of `type: float`, so the \
+             branches have one numeric type"
         );
         assert_eq!(errs[0].help, None, "the fix is in the message");
 
-        // A branch that is not a bare field is named by its position, and the
-        // fix names the method.
-        for (src, decimal, float) in [
+        // A branch that is not a bare field is named by its position. A float
+        // input column gets the schema change; any other float, the
+        // conversion of the decimal side.
+        for (src, decimal, float, fix) in [
             (
                 "emit v = if flag then amount + 1 else price * 2.0",
                 "a decimal (the `then` branch)",
                 "a float (the `else` branch)",
+                "convert the decimal branch with `.to_float()`,",
             ),
             (
                 "emit v = match { flag => 1, qty > 0 => price * 2.0, _ => amount + 1 }",
                 "a decimal (arm 3)",
                 "a float (arm 2)",
+                "convert the decimal arm with `.to_float()`,",
             ),
             (
                 "emit v = (amount + 1) ?? price",
                 "a decimal (the left side)",
                 "a float (`price`)",
+                "declare `price` a decimal in its Source schema, `type: decimal` in place of \
+                 `type: float`,",
             ),
         ] {
             let errs = mixed_err(src, AggregateMode::Row);
@@ -4066,10 +4081,92 @@ mod tests {
                 message.contains(decimal) && message.contains(float),
                 "{src}: {message}"
             );
+            assert!(message.contains(fix), "{src}: {message}");
+        }
+    }
+
+    #[test]
+    fn decimal_float_join_on_a_nullable_float_column_prints_the_nullable_schema_type() {
+        let typed = typecheck_mixed_with_price(
+            "emit v = if flag then amount else price",
+            AggregateMode::Row,
+            Type::nullable(Type::Float),
+        );
+        let errs = typed.expect_err("a nullable float column still mixes with a decimal");
+        assert_eq!(errs.len(), 1);
+        assert!(
+            errs[0].message.contains(
+                "declare `price` a decimal in its Source schema, \
+                 `type: { nullable: decimal }` in place of `type: { nullable: float }`,"
+            ),
+            "{}",
+            errs[0].message
+        );
+    }
+
+    #[test]
+    fn decimal_float_join_on_a_float_that_is_not_an_input_column_converts_the_decimal_side() {
+        for src in [
+            "let p = price * 2.0\nemit v = if flag then amount else p",
+            "emit v = if flag then amount else 0.5",
+            "emit v = if flag then amount else price * 2.0",
+        ] {
+            let errs = mixed_err(src, AggregateMode::Row);
+            assert_eq!(errs.len(), 1, "{src}");
+            let message = &errs[0].message;
             assert!(
-                message.contains(".to_decimal()") && message.contains(".to_float()"),
+                message.contains("convert the decimal branch with `amount.to_float()`,"),
                 "{src}: {message}"
             );
+            assert!(
+                !message.contains("Source schema") && !message.contains("type:"),
+                "{src}: a float that is not an input column has no schema to change: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_decimal_float_join_message_converts_a_float_to_a_decimal() {
+        let programs = [
+            "emit v = if flag then amount else price",
+            "emit v = if flag then price else amount",
+            "emit v = match { flag => amount, _ => price }",
+            "emit v = amount ?? price",
+            "emit v = price ?? amount",
+            "emit v = if flag then amount else if qty > 0 then qty else price",
+            "emit v = (if flag then amount) ?? price",
+            "emit v = if flag then amount + 1 else price * 2.0",
+            "emit v = match { flag => 1, qty > 0 => price * 2.0, _ => amount + 1 }",
+            "emit v = (amount + 1) ?? price",
+            "let p = price * 2.0\nemit v = if flag then amount else p",
+            "emit v = if flag then amount else 0.5",
+        ];
+        for src in programs {
+            for errs in [
+                mixed_err(src, AggregateMode::Row),
+                typecheck_mixed_with_price(
+                    src,
+                    AggregateMode::Row,
+                    Type::nullable(Type::Float),
+                )
+                .expect_err(src),
+            ] {
+                for d in &errs {
+                    assert!(!d.message.contains("to_decimal"), "{src}: {}", d.message);
+                }
+            }
+        }
+        for join in ["if flag then amount else price", "price ?? amount"] {
+            for call in [
+                format!("sum({join})"),
+                format!("avg({join})"),
+                format!("weighted_avg({join}, qty)"),
+            ] {
+                let src = format!("emit v = {call}");
+                for d in mixed_err(&src, agg_mode(&[])) {
+                    assert!(!d.message.contains("to_decimal"), "{src}: {}", d.message);
+                }
+            }
         }
     }
 

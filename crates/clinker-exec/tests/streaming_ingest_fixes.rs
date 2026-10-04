@@ -802,7 +802,9 @@ fn mixed_decimal_float_group_is_dead_lettered_materialized() {
         .error_detail()
         .expect("include_reason defaults to true");
     assert!(
-        detail.contains("decimal and float in one group") && detail.contains(".to_decimal()"),
+        detail.contains("decimal and float in one group")
+            && detail.contains("`type: decimal`")
+            && !detail.contains(".to_decimal()"),
         "the reason is the typed error's message with its fix, got: {detail}"
     );
     assert!(
