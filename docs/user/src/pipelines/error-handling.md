@@ -609,9 +609,10 @@ to keep correlation rejection.
 **Composition restriction.** A composition body may not declare a Sink when any
 Source uses `dlq_granularity: document` (E378): a body Sink runs inside its
 composition, where it cannot be held back until every document's verdict is
-final. Move the Sink to the pipeline and feed it through a composition output
-port, or use `dlq_granularity: record`. Run `clinker explain --code E378` for
-the step-by-step fix.
+final. Declare the Sink at pipeline level instead. Where moving it through a
+new composition output port works today, the diagnostic prints that move ready
+to paste. Otherwise it names `clinker explain --code E378`, which shows how to
+declare the Sink's work at pipeline level.
 
 **Not covered.** A row failure inside an Aggregate, Combine or Reshape
 dead-letters only that row and does not reject its document. A document is

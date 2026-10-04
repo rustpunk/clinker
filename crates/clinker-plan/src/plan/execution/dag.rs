@@ -473,26 +473,28 @@ pub(crate) fn diagnose_untagged_composition_edges(
 /// later operator condemns. The combination is refused rather than
 /// guaranteed for some Sinks only.
 ///
-/// The help is one fix, the move: each edit is a fragment the author can
-/// paste, and the pipeline Sink block carries the body Sink's compiled
-/// configuration rendered back to YAML. The explain page, not the help,
-/// keeps the record-granularity alternative and the issue that tracks body
-/// Sinks.
+/// The help gives one fix. Where moving the Sink to the pipeline through a
+/// new composition output port runs on the engine as it is, the help is
+/// that move as numbered fragments the author can paste, the pipeline Sink
+/// block carrying the body Sink's compiled configuration rendered back to
+/// YAML. A call carries only the rows of its composition's first declared
+/// output port, and only when nothing else in the body reads that port's
+/// node (#1315), so the move is offered only for a pipeline-level call,
+/// made once, whose body Sink reads the plain node behind that first port
+/// and shares it with no other body node. Everywhere else the help is one
+/// next step, the explain page, with the reason.
 ///
-/// Every help is written as if every body Sink moves, so applying all of
-/// them gives one consistent pipeline: each composition the Sinks pass
-/// through names their ports by one rule (the Sink's name, or that name with
-/// the first free `_2`, `_3`, ... when an existing output or an earlier
-/// Sink's port already uses it), and a port count is the count after every
-/// move. A Sink in a nested body surfaces through one new port on each
-/// enclosing composition up to the pipeline.
+/// Every help is written as if every movable Sink moves, so applying them
+/// all gives one consistent pipeline: new ports and pipeline Sink names take
+/// the Sink's name, or that name with the first free `_2`, `_3`, ... when
+/// it is already used (by an existing output or pipeline node, or by an
+/// earlier move), and a port count is the count after every move.
 ///
 /// The caller runs this only when a Source declares document granularity;
 /// `source` names the first such Source in declaration order. The walk
 /// starts at the pipeline's composition calls and descends through each
-/// body's nested calls, so a Sink at any depth is reached through the chain
-/// of calls that owns it. Returns one diagnostic per body Sink, in that
-/// walk's order.
+/// body's nested calls, so a Sink at any depth is reached through the call
+/// that owns it. Returns one diagnostic per body Sink, in that walk's order.
 pub(crate) fn diagnose_document_dlq_body_sinks(
     dag: &ExecutionPlanDag,
     artifacts: &crate::plan::bind_schema::CompileArtifacts,
@@ -512,6 +514,14 @@ pub(crate) fn diagnose_document_dlq_body_sinks(
         name: &'a str,
         span: clinker_core_types::Span,
         parent: Option<BodyId>,
+    }
+
+    /// A movable Sink's names: its new port, the node that port reads, and
+    /// its name at pipeline level.
+    struct Move<'a> {
+        port: String,
+        port_node: &'a str,
+        pipeline_name: String,
     }
 
     fn collect_calls<'a>(
@@ -536,10 +546,10 @@ pub(crate) fn diagnose_document_dlq_body_sinks(
         }
     }
 
-    /// Every Sink that surfaces through `body_id` once moved: its own Sinks
-    /// and those of the compositions it calls, in body node order, a nested
-    /// call's Sinks at the call's position.
-    fn surfaced(
+    /// Every Sink under `body_id`: its own Sinks and those of the
+    /// compositions it calls, in body node order, a nested call's Sinks at
+    /// the call's position.
+    fn body_sinks(
         artifacts: &crate::plan::bind_schema::CompileArtifacts,
         body_id: BodyId,
         out: &mut Vec<BodySink>,
@@ -550,40 +560,23 @@ pub(crate) fn diagnose_document_dlq_body_sinks(
         for idx in body.graph.node_indices() {
             match &body.graph[idx] {
                 PlanNode::Sink { .. } => out.push((body_id, idx)),
-                PlanNode::Composition { body: nested, .. } => surfaced(artifacts, *nested, out),
+                PlanNode::Composition { body: nested, .. } => body_sinks(artifacts, *nested, out),
                 _ => {}
             }
         }
     }
 
-    /// One composition's new ports: the port each surfacing Sink gets, and
-    /// the output count once every one of them has moved.
-    struct Ports {
-        by_sink: HashMap<BodySink, String>,
-        count_after: usize,
-    }
-
-    fn ports_of(artifacts: &crate::plan::bind_schema::CompileArtifacts, body_id: BodyId) -> Ports {
-        let body = &artifacts.composition_bodies[&body_id];
-        let mut sinks = Vec::new();
-        surfaced(artifacts, body_id, &mut sinks);
-        let mut taken: HashSet<String> = body.output_port_to_node_idx.keys().cloned().collect();
-        let mut by_sink = HashMap::new();
-        for (sink_body, idx) in &sinks {
-            let name = artifacts.composition_bodies[sink_body].graph[*idx].name();
-            let mut port = name.to_owned();
-            let mut suffix = 1;
-            while taken.contains(&port) {
-                suffix += 1;
-                port = format!("{name}_{suffix}");
-            }
-            taken.insert(port.clone());
-            by_sink.insert((*sink_body, *idx), port);
+    /// `name`, or `name` with the first free numeric suffix, recorded as
+    /// taken. One rule for ports and pipeline Sink names.
+    fn free_name(name: &str, taken: &mut HashSet<String>) -> String {
+        let mut candidate = name.to_owned();
+        let mut suffix = 1;
+        while taken.contains(&candidate) {
+            suffix += 1;
+            candidate = format!("{name}_{suffix}");
         }
-        Ports {
-            by_sink,
-            count_after: body.output_port_to_node_idx.len() + sinks.len(),
-        }
+        taken.insert(candidate.clone());
+        candidate
     }
 
     let mut calls = HashMap::new();
@@ -596,14 +589,119 @@ pub(crate) fn diagnose_document_dlq_body_sinks(
     let mut sinks = Vec::new();
     for node in dag.graph.node_weights() {
         if let PlanNode::Composition { body, .. } = node {
-            surfaced(artifacts, *body, &mut sinks);
+            body_sinks(artifacts, *body, &mut sinks);
         }
     }
 
-    let mut ports: HashMap<BodyId, Ports> = HashMap::new();
+    // How many calls bind each composition file.
+    let mut uses: HashMap<&std::path::Path, usize> = HashMap::new();
+    for (body_id, body) in &artifacts.composition_bodies {
+        if calls.contains_key(body_id) {
+            *uses.entry(body.signature_path.as_path()).or_default() += 1;
+        }
+    }
+
+    // Why a body Sink cannot be moved through a port today: the node behind
+    // the first port when it can, the reason when it cannot.
+    let movable = |(body_id, idx): BodySink| -> Result<&str, String> {
+        let body = &artifacts.composition_bodies[&body_id];
+        let call = &calls[&body_id];
+        let quoted_call = call.name.quoted_name();
+        if call.parent.is_some() {
+            return Err(format!(
+                "composition {quoted_call} is called inside another composition"
+            ));
+        }
+        let count = uses
+            .get(body.signature_path.as_path())
+            .copied()
+            .unwrap_or(0);
+        if count > 1 {
+            return Err(format!(
+                "`{file}` is used by {count} composition calls, so the moved Sink would be \
+                 declared once per call, each writing the same output",
+                file = composition_file_label(&body.signature_path),
+            ));
+        }
+        let Some((port, &port_node)) = body.output_port_to_node_idx.first() else {
+            return Err(format!(
+                "composition {quoted_call} declares no output port to carry the Sink's rows"
+            ));
+        };
+        let port_node_name = body.graph[port_node].name();
+        let reads = body
+            .graph
+            .neighbors_directed(idx, Direction::Incoming)
+            .next();
+        if reads != Some(port_node) {
+            let reads = reads.map_or("", |pred| body.graph[pred].name());
+            return Err(format!(
+                "Sink {quoted_sink} reads {quoted_reads}, and only the first output port of \
+                 composition {quoted_call}, `{port}` from {quoted_port_node}, carries rows to \
+                 the pipeline",
+                quoted_sink = body.graph[idx].name().quoted_name(),
+                quoted_reads = reads.quoted_name(),
+                quoted_port_node = port_node_name.quoted_name(),
+            ));
+        }
+        if matches!(body.graph[port_node], PlanNode::Composition { .. })
+            || body.graph[port_node].output_ports().is_some()
+        {
+            return Err(format!(
+                "the first output port of composition {quoted_call}, `{port}`, reads \
+                 {quoted_port_node}, which sends rows to output ports of its own, and a \
+                 composition output port cannot yet carry rows from one of those",
+                quoted_port_node = port_node_name.quoted_name(),
+            ));
+        }
+        if let Some(reader) = body
+            .graph
+            .neighbors_directed(port_node, Direction::Outgoing)
+            .find(|reader| !matches!(body.graph[*reader], PlanNode::Sink { .. }))
+        {
+            return Err(format!(
+                "{quoted_port_node} also feeds {quoted_reader} inside composition \
+                 {quoted_call}, and a composition output port cannot yet carry rows from a \
+                 node that another node in the composition reads",
+                quoted_port_node = port_node_name.quoted_name(),
+                quoted_reader = body.graph[reader].name().quoted_name(),
+            ));
+        }
+        Ok(port_node_name)
+    };
+
+    // Names for every move, in walk order: a port per composition and a
+    // pipeline Sink name, each free of what is already there and of earlier
+    // moves.
+    let mut port_taken: HashMap<BodyId, HashSet<String>> = HashMap::new();
+    let mut moved_per_body: HashMap<BodyId, usize> = HashMap::new();
+    let mut sink_taken: HashSet<String> = dag
+        .graph
+        .node_weights()
+        .map(|node| node.name().to_owned())
+        .collect();
+    let mut decisions: Vec<(BodySink, Result<Move<'_>, String>)> = Vec::new();
+    for (body_id, idx) in sinks {
+        let decision = movable((body_id, idx)).map(|port_node| {
+            let body = &artifacts.composition_bodies[&body_id];
+            let sink = body.graph[idx].name();
+            let ports = port_taken
+                .entry(body_id)
+                .or_insert_with(|| body.output_port_to_node_idx.keys().cloned().collect());
+            *moved_per_body.entry(body_id).or_default() += 1;
+            Move {
+                port: free_name(sink, ports),
+                port_node,
+                pipeline_name: free_name(sink, &mut sink_taken),
+            }
+        });
+        decisions.push(((body_id, idx), decision));
+    }
+
     let mut out = Vec::new();
-    for (sink_body, idx) in sinks {
-        let body = &artifacts.composition_bodies[&sink_body];
+    for ((body_id, idx), decision) in decisions {
+        let body = &artifacts.composition_bodies[&body_id];
+        let call = &calls[&body_id];
         let PlanNode::Sink {
             name: sink,
             span: sink_span,
@@ -613,109 +711,78 @@ pub(crate) fn diagnose_document_dlq_body_sinks(
         else {
             continue;
         };
-        // The composition calls from the Sink's own body out to the
-        // pipeline, innermost first.
-        let mut chain = Vec::new();
-        let mut level = Some(sink_body);
-        while let Some(body_id) = level {
-            let Some(call) = calls.get(&body_id) else {
-                break;
-            };
-            ports
-                .entry(body_id)
-                .or_insert_with(|| ports_of(artifacts, body_id));
-            chain.push((body_id, call));
-            level = call.parent;
-        }
-        let (Some(&(_, innermost)), Some(&(outer_body, outermost))) = (chain.first(), chain.last())
-        else {
-            continue;
-        };
-        // The reference the Sink reads, as authored (`route.branch` for a
-        // Route branch); the graph predecessor stands in when the body
-        // recorded none.
-        let feeding = body
-            .node_input_refs
-            .get(sink)
-            .and_then(|refs| refs.first().cloned())
-            .or_else(|| {
-                body.graph
-                    .neighbors_directed(idx, Direction::Incoming)
-                    .next()
-                    .map(|pred| body.graph[pred].name().to_owned())
-            })
-            .unwrap_or_else(|| "<the node the Sink reads>".to_owned());
-        let port_at = |body_id: BodyId| ports[&body_id].by_sink[&(sink_body, idx)].as_str();
-
-        let mut steps = Vec::new();
-        let mut reads = feeding;
-        for &(body_id, call) in &chain {
-            let level_body = &artifacts.composition_bodies[&body_id];
-            let file = composition_file_label(&level_body.signature_path);
-            let port = port_at(body_id);
-            steps.push(format!(
-                "in `{file}`, under `_compose.outputs:`, add:\n    {port}: {reads}"
-            ));
-            if body_id == sink_body {
+        let quoted_sink = sink.quoted_name();
+        let quoted_call = call.name.quoted_name();
+        let help = match decision {
+            Err(reason) => format!(
+                "run `clinker explain --code E378` and follow its steps for declaring Sink \
+                 {quoted_sink} at pipeline level: moving it through a composition output port \
+                 does not work here, because {reason}"
+            ),
+            Ok(Move {
+                port,
+                port_node,
+                pipeline_name,
+            }) => {
+                let file = composition_file_label(&body.signature_path);
+                // The reference as authored; the port node is the same node.
+                let feeding = body
+                    .node_input_refs
+                    .get(sink)
+                    .and_then(|refs| refs.first().map(String::as_str))
+                    .unwrap_or(port_node);
+                let mut steps = vec![
+                    format!("in `{file}`, under `_compose.outputs:`, add:\n    {port}: {feeding}"),
+                    format!("in `{file}`, remove Sink {quoted_sink} from `nodes:`"),
+                ];
+                if let [only_port] = body
+                    .output_port_to_node_idx
+                    .keys()
+                    .collect::<Vec<_>>()
+                    .as_slice()
+                {
+                    steps.push(format!(
+                        "composition {quoted_call} then has {count} output ports, so read \
+                         `{call}.{only_port}` wherever the pipeline reads `{call}` without a port",
+                        count = 1 + moved_per_body.get(&body_id).copied().unwrap_or(0),
+                        call = call.name,
+                    ));
+                }
+                // The Sink's own configuration, under its pipeline name.
+                let config = resolved.as_deref().map(|payload| {
+                    let mut config = payload.sink.clone();
+                    config.name.clone_from(&pipeline_name);
+                    config
+                });
                 steps.push(format!(
-                    "in `{file}`, remove Sink {quoted_sink} from `nodes:`",
-                    quoted_sink = sink.quoted_name()
-                ));
-            }
-            if let [only_port] = level_body
-                .output_port_to_node_idx
-                .keys()
-                .collect::<Vec<_>>()
-                .as_slice()
-            {
-                let caller = match call.parent {
-                    None => "the pipeline".to_owned(),
-                    Some(parent) => format!(
-                        "`{}`",
-                        composition_file_label(
-                            &artifacts.composition_bodies[&parent].signature_path
-                        )
-                    ),
-                };
-                steps.push(format!(
-                    "composition {quoted_call} then has {count} output ports, so read \
-                     `{call}.{only_port}` wherever {caller} reads `{call}` without a port",
-                    quoted_call = call.name.quoted_name(),
-                    count = ports[&body_id].count_after,
+                    "under the pipeline's `nodes:`, add:\n  - type: sink\n    name: \
+                     {pipeline_name}\n    input: {call}.{port}\n{config}",
                     call = call.name,
+                    config = render_sink_config(config.as_ref(), sink),
                 ));
+                let renamed = if pipeline_name == *sink {
+                    String::new()
+                } else {
+                    format!(
+                        ", as Sink {quoted} because {quoted_sink} is taken there,",
+                        quoted = pipeline_name.quoted_name()
+                    )
+                };
+                let mut help = format!(
+                    "move Sink {quoted_sink} to the pipeline{renamed} and feed it through a new \
+                     output port of composition {quoted_call}, so it writes only after every \
+                     document's verdict is final",
+                );
+                for (number, step) in steps.iter().enumerate() {
+                    help.push_str(&format!("\n{}. {step}", number + 1));
+                }
+                help
             }
-            reads = format!("{}.{port}", call.name);
-        }
-        steps.push(format!(
-            "under the pipeline's `nodes:`, add:\n  - type: sink\n    name: {sink}\n    \
-             input: {outer_call}.{outer_port}\n{config}",
-            outer_call = outermost.name,
-            outer_port = port_at(outer_body),
-            config = render_sink_config(resolved.as_deref().map(|p| &p.sink), sink),
-        ));
-
-        let through = if chain.len() == 1 {
-            String::new()
-        } else {
-            " and of each composition that calls it".to_owned()
         };
-        let mut help = format!(
-            "move Sink {quoted_sink} to the pipeline and feed it through a new output port \
-             of composition {quoted_call}{through}, so it writes only after every \
-             document's verdict is final",
-            quoted_sink = sink.quoted_name(),
-            quoted_call = innermost.name.quoted_name(),
-        );
-        for (number, step) in steps.iter().enumerate() {
-            help.push_str(&format!("\n{}. {step}", number + 1));
-        }
         let message = format!(
             "composition {quoted_call} declares Sink {quoted_sink} in its body, but \
              source {quoted_source} declares `dlq_granularity: document`, which needs \
              every Sink declared at pipeline level",
-            quoted_call = innermost.name.quoted_name(),
-            quoted_sink = sink.quoted_name(),
             quoted_source = source.quoted_name(),
         );
         out.push(
@@ -724,10 +791,7 @@ pub(crate) fn diagnose_document_dlq_body_sinks(
                 message,
                 LabeledSpan::primary(*sink_span, "Sink declared inside a composition body"),
             )
-            .with_secondary(LabeledSpan::primary(
-                innermost.span,
-                "composition invoked here",
-            ))
+            .with_secondary(LabeledSpan::primary(call.span, "composition invoked here"))
             .with_help(help),
         );
     }
