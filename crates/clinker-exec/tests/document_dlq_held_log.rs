@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clinker_bench_support::io::SharedBuffer;
 use clinker_exec::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams};
@@ -95,13 +96,24 @@ fn row_id(file: usize, row: usize) -> String {
 
 /// The input files, in order: every row's `value` is non-numeric.
 fn input_files() -> Vec<(String, String)> {
+    input_files_with(|row| format!("not-a-number-{row}"))
+}
+
+/// The same files with a numeric `value` in every row, so no record fails
+/// and the document dead-letter state holds nothing.
+fn passing_input_files() -> Vec<(String, String)> {
+    input_files_with(|row| row.to_string())
+}
+
+/// The input files, in order, with `value(row)` in each row's `value` cell.
+fn input_files_with(value: impl Fn(usize) -> String) -> Vec<(String, String)> {
     (0..FILES)
         .map(|file| {
             let mut body = String::from("id,value,pad\n");
             for row in 0..ROWS_PER_FILE {
                 let pad: String =
                     std::iter::repeat_n(char::from(b'a' + (row % 26) as u8), PAD_BYTES).collect();
-                body.push_str(&format!("{},not-a-number-{row},{pad}\n", row_id(file, row)));
+                body.push_str(&format!("{},{},{pad}\n", row_id(file, row), value(row)));
             }
             (format!("d{file:02}.csv"), body)
         })
@@ -120,12 +132,32 @@ struct HeldLogRun {
 }
 
 fn run_held_log(memory_limit: &str) -> HeldLogRun {
+    let (report, sink, body) = run_files(memory_limit, input_files());
+    let rows = sink.rows();
+    let header = rows
+        .first()
+        .and_then(|row| sink.header_for(row.bucket_path()))
+        .expect("the run dead-letters rows");
+    HeldLogRun {
+        report,
+        rows,
+        header,
+        body,
+    }
+}
+
+/// One run of the pipeline over `files` under `memory_limit`: the report,
+/// the dead-letter sink, and the Sink's body lines.
+fn run_files(
+    memory_limit: &str,
+    files: Vec<(String, String)>,
+) -> (ExecutionReport, Arc<CollectingDlqSink>, Vec<String>) {
     let yaml = held_log_yaml(memory_limit);
     let config = parse_config(&yaml).expect("parse held-log pipeline");
     let plan = config
         .compile(&CompileContext::default())
         .expect("compile held-log pipeline");
-    let slots: Vec<FileSlot> = input_files()
+    let slots: Vec<FileSlot> = files
         .into_iter()
         .map(|(name, body)| {
             FileSlot::new(
@@ -160,17 +192,7 @@ fn run_held_log(memory_limit: &str) -> HeldLogRun {
     .expect("run held-log pipeline");
     let output = buf.as_string();
     let body: Vec<String> = output.lines().skip(1).map(str::to_string).collect();
-    let rows = sink.rows();
-    let header = rows
-        .first()
-        .and_then(|row| sink.header_for(row.bucket_path()))
-        .expect("the run dead-letters rows");
-    HeldLogRun {
-        report,
-        rows,
-        header,
-        body,
-    }
+    (report, sink, body)
 }
 
 /// A lower bound on the bytes the dead-letter rows occupy in their file
@@ -299,9 +321,9 @@ fn held_failing_rows_stay_in_memory_with_ample_memory() {
         report.per_stage_spill_bytes
     );
     assert!(
-        report.peak_consumer_usage_bytes >= held,
+        held_rows_charge(&report) >= held,
         "the held rows are charged: peak {} against {held} held bytes",
-        report.peak_consumer_usage_bytes
+        held_rows_charge(&report)
     );
     assert_rejection_order(&rows);
     assert_eq!(report.counters.dlq_count, low.report.counters.dlq_count);
@@ -310,5 +332,41 @@ fn held_failing_rows_stay_in_memory_with_ample_memory() {
         masked(&rows, &header),
         masked(&low.rows, &low.header),
         "the rows do not depend on whether they spilled"
+    );
+}
+
+/// The charged peak the ample-memory check compares with the held rows'
+/// bytes.
+fn held_rows_charge(report: &ExecutionReport) -> u64 {
+    report.peak_consumer_usage_bytes
+}
+
+/// The ample-memory check must read the document dead-letter state's own
+/// charge. With every record passing, the state holds nothing, while the
+/// Transform's buffer and the Sink's per-document buckets still hold every
+/// row: a run-wide figure covers the failing run's held bytes anyway, so a
+/// check on it would pass however little the held rows were charged.
+#[test]
+fn the_held_rows_charge_is_the_dead_letter_states_own() {
+    let failing = run_held_log("100G");
+    let held = held_bytes(&failing.rows, &failing.header);
+
+    let (report, sink, body) = run_files("100G", passing_input_files());
+    assert!(sink.rows().is_empty(), "no record fails");
+    assert_eq!(
+        body.len(),
+        FILES * ROWS_PER_FILE,
+        "every record reaches the Sink"
+    );
+    assert!(
+        report.peak_consumer_usage_bytes >= held,
+        "the run-wide peak {} covers the failing run's {held} held bytes with nothing held",
+        report.peak_consumer_usage_bytes
+    );
+    assert!(
+        held_rows_charge(&report) < held,
+        "with nothing held, the held rows' charge {} stays below the failing run's {held} held bytes; per-node peaks = {:?}",
+        held_rows_charge(&report),
+        report.per_node_peak_charged_bytes
     );
 }
