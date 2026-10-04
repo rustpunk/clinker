@@ -50,7 +50,7 @@ use crate::plan::{EntityRef, PlanNodeId};
 use crate::resources::WorkspaceCatalog;
 use crate::yaml::Spanned;
 use clinker_core_types::span::{FileId, Span};
-use clinker_core_types::{Diagnostic, LabeledSpan};
+use clinker_core_types::{Diagnostic, LabeledSpan, QuoteName};
 use clinker_format::{Column, SourceSchema};
 
 /// Maximum composition nesting depth.
@@ -1930,7 +1930,7 @@ fn bind_reshape(
             Err(refused) => {
                 diags.push(Diagnostic::error(
                     "E200",
-                    format!("reshape {name:?}: {refused}"),
+                    format!("reshape {}: {refused}", name.quoted_name()),
                     LabeledSpan::primary(span, String::new()),
                 ));
                 ok = false;
@@ -2302,7 +2302,7 @@ fn bind_cull(
             Err(refused) => {
                 diags.push(Diagnostic::error(
                     "E200",
-                    format!("cull {name:?}: {refused}"),
+                    format!("cull {}: {refused}", name.quoted_name()),
                     LabeledSpan::primary(span, String::new()),
                 ));
                 ok = false;
@@ -2804,7 +2804,7 @@ fn bind_schema_inner(
                             Err(refused) => {
                                 diags.push(Diagnostic::error(
                                     "E200",
-                                    format!("transform {name:?}: {refused}"),
+                                    format!("transform {}: {refused}", name.quoted_name()),
                                     LabeledSpan::primary(span, String::new()),
                                 ));
                                 refused_any = true;

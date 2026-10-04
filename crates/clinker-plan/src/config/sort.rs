@@ -2,6 +2,7 @@
 //! surface parses, and the placement-only form an ordering-only field is
 //! validated into.
 
+use clinker_core_types::QuoteName;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -163,21 +164,25 @@ pub enum OrderingSite {
 /// An authored `null_order: drop` on a field that only orders rows.
 ///
 /// `Display` is the author-facing message for the site: the rule, the
-/// reason, and how to remove null-keyed rows instead. Callers prefix the
-/// node (`cull "name": `, `source "name": `) and add nothing else, so this
-/// is the one place the wording lives.
+/// reason, and one fix. Callers prefix the node through the shared quoting
+/// helper (`cull "name": `, `source "name": `) and add nothing else, so this
+/// is the one place the wording lives. The field name prints through the
+/// same helper.
 ///
-/// The `first` and `last` the message offers are applied by the group sort
-/// that refused `drop`, so either one is a working replacement that keeps
-/// every row.
+/// The fix is the upstream filter: delete `null_order: drop` and add a
+/// Transform holding the printed `config:` line before the node, or after a
+/// Source. That removes the null-keyed rows, which is what `drop` asked for.
+/// `first` and `last` appear only in the reason, to explain that the field
+/// places nulls rather than removing them; they are not offered as fixes.
 ///
-/// The fix is a paste-able `filter` only when CXL can write the field as a
-/// bare name ([`cxl::lexer::is_bare_field_name`]). Any other name gets no
-/// CXL at all: a name with a space or a keyword would not parse, and a
-/// flattened `Address.City` would parse as a path to another value, so the
-/// pasted filter would silently drop every row. Those fields are sent to the
-/// Source schema's `source_name` rename, which exposes the column under an
-/// identifier a filter can then name.
+/// The filter is printed only when CXL can write the field as a bare name
+/// ([`cxl::lexer::is_bare_field_name`]). Any other name gets no CXL at all:
+/// a name with a space or a keyword would not parse, and a flattened
+/// `Address.City` would parse as a path to another value, so the pasted
+/// filter would silently drop every row. For such a field the one next step
+/// is the Source schema's `source_name` rename, printed as a
+/// `source_name:` line built from the field itself; planning again after the
+/// rename prints the filter on the new name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropNotAllowed {
     pub field: String,
@@ -187,43 +192,51 @@ pub struct DropNotAllowed {
 impl std::fmt::Display for DropNotAllowed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let field = &self.field;
+        let quoted = field.quoted_name();
         let (key, reason, filter_at) = match self.site {
             OrderingSite::GroupOrderBy => (
                 "order_by",
-                "`order_by` only orders rows within a group and cannot remove them",
+                "`order_by` only orders the rows of a group, placing nulls `first` or `last`, \
+                 and cannot remove a row",
                 "before this node",
             ),
             OrderingSite::SourceSortOrder => (
                 "sort_order",
-                "source verification cannot discard records",
+                "a Source `sort_order` only states the order its records arrive in, placing \
+                 nulls `first` or `last`, and verifying it cannot discard a record",
                 "after this source",
             ),
             OrderingSite::WindowSortBy => (
                 "analytic_window.sort_by",
-                "`sort_by` only orders rows within a window partition and cannot remove them",
+                "`sort_by` only orders the rows of a window partition, placing nulls `first` or \
+                 `last`, and cannot remove a row",
                 "before this node",
             ),
         };
         write!(
             f,
-            "`null_order: drop` is not allowed on `{key}` for field '{field}': {reason}. Use \
-             `null_order: first` or `null_order: last`"
+            "`null_order: drop` is not allowed on `{key}` for field {quoted}: {reason}. To \
+             remove the rows whose {quoted} is null, "
         )?;
         if cxl::lexer::is_bare_field_name(field) {
+            // A bare name is identifier-shaped, so it needs no escaping
+            // inside the double-quoted `cxl` string.
             write!(
                 f,
-                "; to exclude rows whose '{field}' is null, add a Transform {filter_at} with \
-                 `filter not {field}.is_null()`."
+                "delete `null_order: drop` and add a Transform {filter_at} with \
+                 `config: {{ cxl: \"filter not {field}.is_null()\" }}`."
             )
         } else {
+            // A JSON string is a valid YAML double-quoted scalar for every
+            // name, so the printed line pastes back as exactly this column.
+            let source_name = serde_json::to_string(field).map_err(|_| std::fmt::Error)?;
             write!(
                 f,
-                ". CXL cannot name the field '{field}': a CXL field name is one identifier of \
-                 ASCII letters, digits and `_`, not starting with a digit and not a CXL keyword. \
-                 To exclude rows whose '{field}' is null, rename the column to such a name in its \
-                 Source schema entry and keep reading the input column through `source_name` \
-                 (for example `{{ name: order_id, type: string, source_name: \"order id\" }}`), \
-                 then filter on the new name in a Transform {filter_at}."
+                "first give the column a name CXL can write: in its Source schema entry, set \
+                 `name` to a new identifier and add `source_name: {source_name}`, then use the \
+                 new name wherever the pipeline names this column; planning again prints the \
+                 filter to add. A CXL name is one identifier of ASCII letters, digits and `_`, \
+                 not starting with a digit and not a CXL keyword."
             )
         }
     }

@@ -6383,10 +6383,10 @@ nodes:
         assert_eq!(
             diag.message,
             "transform \"running\": `null_order: drop` is not allowed on \
-             `analytic_window.sort_by` for field 'amount': `sort_by` only orders rows within a \
-             window partition and cannot remove them. Use `null_order: first` or \
-             `null_order: last`; to exclude rows whose 'amount' is null, add a Transform before \
-             this node with `filter not amount.is_null()`."
+             `analytic_window.sort_by` for field \"amount\": `sort_by` only orders the rows of a \
+             window partition, placing nulls `first` or `last`, and cannot remove a row. To \
+             remove the rows whose \"amount\" is null, delete `null_order: drop` and add a \
+             Transform before this node with `config: { cxl: \"filter not amount.is_null()\" }`."
         );
         assert_eq!(diag.primary.span, Span::line_only(transform_line));
     }

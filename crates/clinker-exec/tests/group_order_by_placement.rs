@@ -7,10 +7,13 @@
 //! `last` is the default for `asc` and `desc` alike. The expected id
 //! sequences below are written from that rule, not recorded from a run.
 //!
-//! The refusal of `null_order: drop` on these fields offers an author two
-//! replacements and an upstream filter; each one is applied here and its
-//! result checked, so the message cannot promise something the engine does
-//! not do.
+//! The refusal of `null_order: drop` on an ordering-only field gives one
+//! fix: delete the setting and add a Transform holding the `config:` line it
+//! prints, before the node or after a Source. For a field CXL cannot name,
+//! its one next step is the `source_name:` line it prints. The tests here
+//! take each printed line from the diagnostic itself, paste it, run the
+//! pipeline and check the rows, at every site that refuses `drop`, so the
+//! message cannot promise something the engine does not do.
 
 #![cfg(feature = "test-utils")]
 
@@ -350,9 +353,9 @@ fn reshape_order_by_follows_the_value_order() {
 /// The group-ordering refusal for field `k`, written out in full so a change
 /// to the wording is a visible change to this test.
 const GROUP_DROP_TEXT: &str = "`null_order: drop` is not allowed on `order_by` for field \
-     'k': `order_by` only orders rows within a group and cannot remove them. Use \
-     `null_order: first` or `null_order: last`; to exclude rows whose 'k' is null, add a \
-     Transform before this node with `filter not k.is_null()`.";
+     \"k\": `order_by` only orders the rows of a group, placing nulls `first` or `last`, and \
+     cannot remove a row. To remove the rows whose \"k\" is null, delete `null_order: drop` and \
+     add a Transform before this node with `config: { cxl: \"filter not k.is_null()\" }`.";
 
 /// The one `null_order: drop` diagnostic a fixture raises.
 fn drop_message(yaml: &str) -> String {

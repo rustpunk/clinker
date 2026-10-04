@@ -3,17 +3,20 @@
 //! A Cull or Reshape `order_by` arranges the rows of a correlation group and
 //! never removes any, so its null option is placement only: `first` or
 //! `last`. `null_order: drop` there is a plan-time error that names the node
-//! and the field, says why, and gives the upstream `filter` that does remove
-//! the rows, or, for a field CXL cannot write as a bare name, the Source
-//! `source_name` rename that makes one. Both nodes also take the bare
-//! field-name shorthand a Sink or Source `sort_order` takes, and carry the
-//! validated list on their plan node. A Source `sort_order` refuses `drop`
-//! through the same conversion; only a Sink `sort_order` keeps it.
+//! and the field through the shared quoting helper, says why, and gives one
+//! fix: the upstream filter that does remove the rows, printed as a
+//! `config:` line to paste, or, for a field CXL cannot write as a bare name,
+//! the Source `source_name:` line, built from the field, that makes one.
+//! Both nodes also take the bare field-name shorthand a Sink or Source
+//! `sort_order` takes, and carry the validated list on their plan node. A
+//! Source `sort_order` refuses `drop` through the same conversion; only a
+//! Sink `sort_order` keeps it. The executor's tests paste the printed lines
+//! and run them.
 
 use std::path::PathBuf;
 
-use clinker_core_types::Diagnostic;
 use clinker_core_types::span::Span;
+use clinker_core_types::{Diagnostic, QuoteName};
 use clinker_plan::config::pipeline_node::PipelineNode;
 use clinker_plan::config::{
     CompileContext, NullOrder, NullPlacement, OrderField, PipelineConfig, SortField, SortOrder,
@@ -146,9 +149,10 @@ fn assert_one_drop_diagnostic(yaml: &str, node: &str, expected: &str) {
 /// The group-ordering text for field `txn_date`, written out in full so a
 /// change to the wording is a visible change to this test.
 const GROUP_DROP_TEXT: &str = "`null_order: drop` is not allowed on `order_by` for field \
-     'txn_date': `order_by` only orders rows within a group and cannot remove them. Use \
-     `null_order: first` or `null_order: last`; to exclude rows whose 'txn_date' is null, add a \
-     Transform before this node with `filter not txn_date.is_null()`.";
+     \"txn_date\": `order_by` only orders the rows of a group, placing nulls `first` or `last`, \
+     and cannot remove a row. To remove the rows whose \"txn_date\" is null, delete \
+     `null_order: drop` and add a Transform before this node with \
+     `config: { cxl: \"filter not txn_date.is_null()\" }`.";
 
 #[test]
 fn cull_order_by_drop_is_rejected_with_the_fix() {
@@ -272,9 +276,10 @@ fn sorted_source_pipeline(sort_order: &str) -> String {
 }
 
 const SOURCE_DROP_TEXT: &str = "source \"src\": `null_order: drop` is not allowed on `sort_order` \
-     for field 'txn_date': source verification cannot discard records. Use `null_order: first` \
-     or `null_order: last`; to exclude rows whose 'txn_date' is null, add a Transform after this \
-     source with `filter not txn_date.is_null()`.";
+     for field \"txn_date\": a Source `sort_order` only states the order its records arrive in, \
+     placing nulls `first` or `last`, and verifying it cannot discard a record. To remove the \
+     rows whose \"txn_date\" is null, delete `null_order: drop` and add a Transform after this \
+     source with `config: { cxl: \"filter not txn_date.is_null()\" }`.";
 
 #[test]
 fn source_sort_order_drop_is_rejected_with_the_fix() {
@@ -373,10 +378,10 @@ nodes:
     assert_eq!(
         matching[0].message,
         "transform \"running\": `null_order: drop` is not allowed on \
-         `analytic_window.sort_by` for field 'amount': `sort_by` only orders rows within a window \
-         partition and cannot remove them. Use `null_order: first` or `null_order: last`; to \
-         exclude rows whose 'amount' is null, add a Transform before this node with \
-         `filter not amount.is_null()`."
+         `analytic_window.sort_by` for field \"amount\": `sort_by` only orders the rows of a \
+         window partition, placing nulls `first` or `last`, and cannot remove a row. To remove \
+         the rows whose \"amount\" is null, delete `null_order: drop` and add a Transform before \
+         this node with `config: { cxl: \"filter not amount.is_null()\" }`."
     );
     assert_ne!(matching[0].primary.span, Span::SYNTHETIC);
 }
@@ -492,12 +497,12 @@ fn the_drop_message(yaml: &str, node: &str) -> String {
 /// sends the author to the Source schema's `source_name` rename instead.
 fn assert_points_to_source_name(message: &str, field: &str) {
     assert!(
-        message.contains(&format!("for field '{field}'")),
+        message.contains(&format!("for field {}:", field.quoted_name())),
         "the refusal must name the field: {message}"
     );
     assert!(
-        message.contains("Use `null_order: first` or `null_order: last`"),
-        "the refusal must still give the allowed placements: {message}"
+        message.contains("placing nulls `first` or `last`"),
+        "the refusal must still explain the allowed placements: {message}"
     );
     assert!(
         !message.contains("filter not"),
@@ -507,22 +512,23 @@ fn assert_points_to_source_name(message: &str, field: &str) {
         !message.contains(".is_null()"),
         "a field CXL cannot name must not get a CXL expression: {message}"
     );
+    let source_name = serde_json::to_string(field).expect("a field name serializes");
     assert!(
-        message.contains("`source_name`"),
-        "the refusal must point to the Source schema's `source_name` rename: {message}"
+        message.contains(&format!("`source_name: {source_name}`")),
+        "the refusal must print the Source schema's `source_name` line for the field: {message}"
     );
 }
 
 /// The Source text for field `order id`, written out in full so a change to
 /// the rename wording is a visible change to this test.
 const SOURCE_RENAME_TEXT: &str = "source \"src\": `null_order: drop` is not allowed on \
-     `sort_order` for field 'order id': source verification cannot discard records. Use \
-     `null_order: first` or `null_order: last`. CXL cannot name the field 'order id': a CXL \
-     field name is one identifier of ASCII letters, digits and `_`, not starting with a digit \
-     and not a CXL keyword. To exclude rows whose 'order id' is null, rename the column to such \
-     a name in its Source schema entry and keep reading the input column through `source_name` \
-     (for example `{ name: order_id, type: string, source_name: \"order id\" }`), then filter \
-     on the new name in a Transform after this source.";
+     `sort_order` for field \"order id\": a Source `sort_order` only states the order its \
+     records arrive in, placing nulls `first` or `last`, and verifying it cannot discard a \
+     record. To remove the rows whose \"order id\" is null, first give the column a name CXL \
+     can write: in its Source schema entry, set `name` to a new identifier and add \
+     `source_name: \"order id\"`, then use the new name wherever the pipeline names this \
+     column; planning again prints the filter to add. A CXL name is one identifier of ASCII \
+     letters, digits and `_`, not starting with a digit and not a CXL keyword.";
 
 #[test]
 fn source_sort_order_drop_on_a_field_cxl_cannot_name_points_to_source_name() {
@@ -577,7 +583,7 @@ fn a_field_cxl_can_name_keeps_the_paste_able_filter() {
         "cd",
     );
     assert_eq!(message, format!("cull \"cd\": {GROUP_DROP_TEXT}"));
-    assert!(message.contains("`filter not txn_date.is_null()`"));
+    assert!(message.contains("`config: { cxl: \"filter not txn_date.is_null()\" }`"));
     assert!(!message.contains("source_name"));
 }
 
