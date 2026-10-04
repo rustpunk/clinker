@@ -43,6 +43,8 @@ aggregation.dept_totals:
 
 `buffer: streaming` marks a stage that holds only a small in-flight slice; `buffer: materialized` marks one that holds a whole stage's output and may spill it. The annotation comes from the same classifier the executor uses at runtime, so what `--explain` reports is exactly what happens. See [Explain Plans](explain.md) and [Memory Tuning](memory.md).
 
+Under [`dlq_granularity: document`](../pipelines/error-handling.md#document-level-dlq), as under a correlation key, streaming handoffs are off for the whole pipeline: no Transform, Merge, Route, Aggregate or Combine hands its output to a streaming consumer, so none of them reports `buffer: streaming`. Each Sink reports `buffer: materialized`, because it holds every open document's records until the document's verdict is final. A Source read by a single Transform still hands its records straight to that Transform, and keeps `buffer: streaming`.
+
 ## Tuning the batch size
 
 The number of records a streaming stage hands downstream at a time is set by [`pipeline.batch_size`](memory.md#streaming-batch-size-batch_size) (default 2048), with an optional [per-transform override](../nodes/transform.md#batch-size-batch_size). Smaller batches lower in-flight memory at the cost of more per-batch overhead; larger batches do the reverse. The batch size changes only the memory *profile* of streaming handoffs — never their output, and never the behavior of blocking stages.

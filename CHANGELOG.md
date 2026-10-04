@@ -4,6 +4,57 @@ All notable changes to Clinker are tracked here.
 
 ## Unreleased
 
+### Fixed — a rejected document's rows are dead-lettered once under `dlq_granularity: document`, and no held row is lost
+
+Under `dlq_granularity: document`, a Sink could write a document's records
+before a node on another branch rejected the document, a row that only a
+later Sink held was lost from the dead-letter output, and a failed document's
+failing rows had to fit in memory.
+
+- Every Sink now runs after every other node, so each document's verdict is
+  final before any Sink writes one of its records. `--explain` lists the
+  Sinks last, and dead-letter rows that other nodes write come before the
+  rows a Sink writes.
+- Each source row of a rejected document is dead-lettered once, however many
+  Sinks held it. Rows that only a later Sink held are no longer lost, and
+  `dlq_count` counts each row once.
+- A failed document's failing rows are held, charged to the memory budget,
+  until the document is rejected, and move to one file in the spill
+  directory when the budget needs the memory. Past
+  `storage.spill.disk_cap_bytes` the run fails with E320; it fails with E310
+  only when one more row does not fit with every held row already on disk.
+- The record of which rows a rejected document has already written is
+  charged to the memory budget too. It never spills, so it ends in E310 if
+  it would pass the limit once every held row is on disk.
+- A row failure inside an Aggregate, a Combine or a Reshape still
+  dead-letters only that record and does not reject its document
+  ([#1232](https://github.com/rustpunk/clinker/issues/1232)). The rows those
+  nodes write are not yet held back by their document's verdict. See "Not
+  covered" under "Document-level DLQ" in the error-handling reference.
+
+### Changed — a Sink inside a composition body no longer compiles under `dlq_granularity: document`
+
+**Breaking change.** A pipeline whose Source declares
+`dlq_granularity: document` and whose composition body declares a Sink is
+now refused at compile time with E378. A body Sink runs inside its
+composition, where it cannot be held back until every document's verdict is
+final.
+
+Where moving the Sink to the pipeline through a new composition output port
+runs today, the error's help prints that move ready to paste, including the
+Sink's own configuration. Otherwise the help names
+`clinker explain --code E378`, which shows how to declare the Sink's work at
+pipeline level.
+
+### Fixed — `--explain` reports what a `dlq_granularity: document` run streams
+
+Under `dlq_granularity: document`, `--explain` reported every Sink, and any
+stage that would hand its output to a streaming consumer, as
+`buffer: streaming`, though the run streams none of them. Every
+Sink now reports `buffer: materialized`, since it holds each open document's
+records until the document's verdict, and no Transform, Merge, Route,
+Aggregate or Combine reports `buffer: streaming`.
+
 ### Changed — a Combine's `match: first`, `all` and `collect` follow the build input's arrival order on every join strategy
 
 `match: first` now picks the earliest matching build record in the build

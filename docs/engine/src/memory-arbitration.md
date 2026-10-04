@@ -434,7 +434,7 @@ enforced; exceeding `max_spill_bytes` returns `E320 SpillCapExceeded` and
 removes both replacement and input registrations/files. Later readers reopen
 the folded file and do not repeat the fold.
 
-Use `clinker run --explain` to predict which stages will dominate the budget before runtime — each node carries a `buffer: streaming | materialized` annotation. Materialized nodes charge `pipeline.memory.limit` as one full-stage slot and spill the whole stage; streaming nodes charge per in-flight batch and, on a single-consumer edge, spill those batches one at a time. Both classes count against the limit and can spill — the annotation tells you the *granularity* (whole-stage vs. per-batch), not whether a stage is exempt from the budget.
+Use `clinker run --explain` to predict which stages will dominate the budget before runtime — each node carries a `buffer: streaming | materialized` annotation. Materialized nodes charge `pipeline.memory.limit` as one full-stage slot and spill the whole stage; streaming nodes charge per in-flight batch and, on a single-consumer edge, spill those batches one at a time. Both classes count against the limit and can spill — the annotation tells you the *granularity* (whole-stage vs. per-batch), not whether a stage is exempt from the budget. Under `dlq_granularity: document` every Sink reports `materialized`: it holds a charged, spillable `NodeBuffer` bucket per open document, registered under the Sink, until the document's verdict.
 
 ## Reading `--explain` arbitration output
 

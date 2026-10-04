@@ -212,8 +212,28 @@ finishes, and are written then: `join_values` collisions at a Sink that writes
 on its own thread, Aggregate `add_record` failures found on the Aggregate's
 input thread, and Combine output-row failures found on the Combine's driver
 thread or inside a grace-hash, sort-merge or IEJoin join. Records a correlation key
-or `dlq_granularity: document` holds until their group or document is decided
-are that feature's own state, not DLQ output.
+holds until their group is decided are that feature's own state, not DLQ
+output.
+
+Under `dlq_granularity: document` three things are held, all charged to the
+memory budget:
+
+- Each Sink holds every open document's records in a buffer that spills to
+  disk when the budget needs the memory, until the document's verdict is
+  final.
+- A failed document's failing records are held as their dead-letter rows
+  until the document is rejected. They move to one file in the spill
+  directory when the budget needs the memory, and count toward
+  `storage.spill.disk_cap_bytes` (E320). If one more held row would not fit
+  even with every held row on disk, the run fails with E310.
+- For each rejected document, a compressed record of the rows already
+  written, so a row several Sinks held is written once. It never spills; if
+  it would pass the limit once every held row is on disk, the run fails with
+  E310.
+
+See [Document-level DLQ](../pipelines/error-handling.md#document-level-dlq)
+and, for what each of these costs,
+[How DLQ output is written](../pipelines/error-handling.md#how-dlq-output-is-written).
 
 ## Sizing guidelines
 
