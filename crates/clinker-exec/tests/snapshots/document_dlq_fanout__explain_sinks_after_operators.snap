@@ -55,7 +55,7 @@ sink.out1:
   ordering_provenance: NoOrdering
   partitioning: FilePartitioned { keys: ["$source.file"] }
   partitioning_provenance: IntroducedByMultiFileSource { source_name: "events" }
-  buffer: streaming
+  buffer: materialized
   arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
 sink.out2:
@@ -63,7 +63,7 @@ sink.out2:
   ordering_provenance: NoOrdering
   partitioning: FilePartitioned { keys: ["$source.file"] }
   partitioning_provenance: IntroducedByMultiFileSource { source_name: "events" }
-  buffer: streaming
+  buffer: materialized
   arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
 === Buffer Edges ===

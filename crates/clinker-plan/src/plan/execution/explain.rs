@@ -502,14 +502,20 @@ fn describe_build_role(
 enum BufferClass {
     /// No `ctx.node_buffers` slot is admitted for this stage's output —
     /// no `MemoryArbitrator` charge for this stage, no spill eligibility.
-    /// Today this covers fused Sources (their receiver is consumed
-    /// directly by the downstream fused arm) and every Output (sinks
-    /// write to their configured writer and never admit a buffer).
+    /// This covers fused Sources (their receiver is consumed directly by
+    /// the downstream fused arm), producers that hand their batches to a
+    /// streaming consumer, and Outputs that write each record to their
+    /// configured writer as it arrives — every Output except under
+    /// `dlq_granularity: document`.
     Streaming,
-    /// Records pass through a `ctx.node_buffers` slot between dispatch
-    /// arms. Each admission registers a `NodeBufferConsumer` whose
-    /// pull-mode `current_usage` reflects the slot's live footprint;
-    /// a soft-threshold trip spills the slot to disk.
+    /// Records are held in a charged, spill-eligible buffer. Between
+    /// dispatch arms that is a `ctx.node_buffers` slot: each admission
+    /// registers a `NodeBufferConsumer` whose pull-mode `current_usage`
+    /// reflects the slot's live footprint, and a soft-threshold trip
+    /// spills the slot to disk. Under `dlq_granularity: document` every
+    /// Output is materialized too: it holds each open document's records
+    /// in a per-document bucket of the same kind until the document's
+    /// verdict.
     Materialized,
 }
 

@@ -192,12 +192,20 @@ pub fn compute_transform_fused_sources(
 /// Per-node inter-stage materialization class.
 ///
 /// A `Streaming` stage's output bypasses a `ctx.node_buffers` slot: a
-/// sink (`Output`) that never admits a buffer, a fused `Source` whose
-/// receiver the downstream consumer takes directly, or a fused
-/// `Transform` that hands each bounded batch to a streaming Output thread
-/// over a back-pressured channel without admitting a slot. A
+/// sink (`Output`) that writes each record as it arrives, a fused
+/// `Source` whose receiver the downstream consumer takes directly, or a
+/// fused `Transform` that hands each bounded batch to a streaming Output
+/// thread over a back-pressured channel without admitting a slot. A
 /// `Materialized` stage's output crosses a `node_buffers` slot that
-/// registers a `NodeBufferConsumer` and is spill-eligible.
+/// registers a `NodeBufferConsumer` and is spill-eligible; under
+/// `dlq_granularity: document` a Sink is `Materialized` too, because it
+/// holds each open document's records in a charged, spillable bucket
+/// until the document's verdict.
+///
+/// Two pipeline-wide settings turn streaming off for every producer: a
+/// `correlation_key:` on any Source, and `dlq_granularity: document` on
+/// any Source. Under either one no Output, Aggregate ingest or Combine
+/// probe streams, so no producer is `Streaming`.
 ///
 /// The non-trivial verdict — whether a fused Transform streams — is
 /// decided by [`certify_streaming_edge`], the one predicate both
@@ -219,8 +227,9 @@ pub enum StreamClass {
 ///
 /// Streaming nodes:
 ///
-/// - **Outputs**, unconditionally — sinks that write to their writer and
-///   never admit a `node_buffers` slot.
+/// - **Outputs**, except under `dlq_granularity: document`, where each
+///   Sink holds every open document's records in a charged, spillable
+///   bucket until the document's verdict and so is `Materialized`.
 /// - **Sources** whose name lands in either fused-source set
 ///   (Merge.interleave fusion or single-Transform fusion). The Source
 ///   dispatch arm returns without admitting a buffer; the downstream
@@ -237,12 +246,20 @@ pub enum StreamClass {
 ///
 /// Everything else materializes.
 ///
-/// Both `--explain` (plan-only, no live consumers) and the runtime
-/// dispatch call this — the dispatcher reads the same `Streaming` verdict
-/// for a fused Transform to decide whether to install a streaming sender,
-/// so the explain annotation can never disagree with the dispatcher. The
-/// returned map covers every `node_indices()` slot so callers can index
-/// it by `NodeIndex` directly.
+/// A `correlation_key:` or `dlq_granularity: document` on any Source turns
+/// streaming off pipeline-wide: no producer is reported `Streaming`, as
+/// the runtime installs no streaming Output, Aggregate ingest or Combine
+/// probe under either. Fused Sources keep their class, because the
+/// runtime still hands their receivers to the downstream consumer.
+/// `reconstruct_envelope: true` on a Sink also turns streaming Output off
+/// at runtime; this classifier does not mirror that gate yet.
+///
+/// `--explain` (plan-only, no live consumers) calls this. The runtime
+/// reaches the same verdicts through the same pieces —
+/// [`certify_streaming_edge`] and the fused-source sets — behind the same
+/// pipeline-wide gates, so the explain annotation agrees with the
+/// dispatcher. The returned map covers every `node_indices()` slot so
+/// callers can index it by `NodeIndex` directly.
 pub fn classify_stream_nodes(
     plan: &ExecutionPlanDag,
     config: &PipelineConfig,
@@ -254,17 +271,20 @@ pub fn classify_stream_nodes(
     fused_sources.extend(extra_fused_sources);
 
     // Pipeline-wide correlation buffering routes every write through the
-    // CorrelationCommit terminal, so no Output streams. Mirrors the same
-    // short-circuit in the runtime spec computation so the explain
-    // annotation matches.
-    let correlation_active = config.any_source_has_correlation_key();
+    // CorrelationCommit terminal, and document granularity holds each
+    // document's records at its Sinks until the document's verdict, so
+    // under either one no Output, Aggregate ingest or Combine probe
+    // streams. Mirrors the runtime's streaming-Output, ingest and probe
+    // gates so the explain annotation matches what the run does.
+    let document_dlq_active = config.any_source_has_document_dlq();
+    let streaming_off = config.any_source_has_correlation_key() || document_dlq_active;
 
     // A producer streams iff some streaming-eligible consumer (Output,
     // Aggregate ingest, or Combine probe) certifies it as its producer.
     // `certify_streaming_edge` returns the producer index for every
     // certified consumer kind, so collecting it across all node indices
     // yields every streaming producer in one pass.
-    let streaming_producers: HashSet<petgraph::graph::NodeIndex> = if correlation_active {
+    let streaming_producers: HashSet<petgraph::graph::NodeIndex> = if streaming_off {
         HashSet::new()
     } else {
         plan.graph
@@ -279,6 +299,10 @@ pub fn classify_stream_nodes(
         .node_indices()
         .map(|idx| {
             let class = match &plan.graph[idx] {
+                // A document-granularity Sink holds each open document's
+                // records in a charged, spillable bucket until the
+                // document's verdict, so it materializes.
+                PlanNode::Sink { .. } if document_dlq_active => StreamClass::Materialized,
                 PlanNode::Sink { .. } => StreamClass::Streaming,
                 PlanNode::Source { name, .. } if fused_sources.contains(name.as_str()) => {
                     StreamClass::Streaming
