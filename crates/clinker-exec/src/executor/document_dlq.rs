@@ -100,6 +100,10 @@ struct FailedDocument {
     /// The stamp of the document's first failure. Every collateral of the
     /// document, at any Sink and at any time, is condemned by it.
     cause: DlqFailureStamp,
+    /// The node of the document's first failure, shared with the state's
+    /// interned names. The end-of-run sweep rejects a document no Sink
+    /// decided under it, so the sweep's flushes and E310 name a plan node.
+    failing_node: Arc<str>,
     /// The rows of this document already written to the dead-letter output,
     /// so each is written once however many Sinks hold it.
     emitted: EmittedRows,
@@ -585,29 +589,39 @@ impl DocumentDlqState {
     /// Settle every ledger that took admissions since its last settle. A
     /// Sink's pass ends here, so the per-admission charges its late records
     /// made, which no rejection pass settles, do not outlive the pass.
-    fn settle_unsettled_ledgers(&mut self) {}
+    fn settle_unsettled_ledgers(&mut self) {
+        for failed in self.failed.values_mut() {
+            if failed.emitted.unsettled > 0 {
+                settle_ledger(&self.handle, &mut failed.emitted);
+            }
+        }
+        self.arbitrator.sample_peak_consumer_usage();
+    }
 
     /// The failed documents whose held rows no rejection has taken, in key
-    /// order, each with the node the end-of-run sweep rejects it under.
+    /// order, each with the node that first failed it, which the end-of-run
+    /// sweep rejects it under.
     fn unclosed_failed_documents(&self) -> Vec<(DocKey, Arc<str>)> {
         let mut pending: Vec<(DocKey, Arc<str>)> = self
             .failed
-            .keys()
-            .filter(|key| self.held.contains(key))
-            .map(|key| (Arc::clone(key), Arc::from("document_dlq")))
+            .iter()
+            .filter(|(key, _)| self.held.contains(key))
+            .map(|(key, failed)| (Arc::clone(key), Arc::clone(&failed.failing_node)))
             .collect();
         pending.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         pending
     }
 
-    /// Mark document `key` failed with its first failure's stamp `cause`,
-    /// charging the document's fixed map slot.
-    fn insert_failed(&mut self, key: DocKey, cause: DlqFailureStamp) {
+    /// Mark document `key` failed at `node` with its first failure's stamp
+    /// `cause`, charging the document's fixed map slot.
+    fn insert_failed(&mut self, key: DocKey, cause: DlqFailureStamp, node: &str) {
         self.handle.add_bytes(FAILED_DOCUMENT_BYTES);
+        let failing_node = self.names.failing_node(node);
         self.failed.insert(
             key,
             FailedDocument {
                 cause,
+                failing_node,
                 emitted: EmittedRows::new(),
             },
         );
@@ -670,7 +684,7 @@ impl DocumentDlqState {
             "the held dead-letter rows of the failed documents",
         )?;
         if first {
-            self.insert_failed(Arc::clone(&key), row.failed_at);
+            self.insert_failed(Arc::clone(&key), row.failed_at, node);
         }
         self.held.append(&key, frame)?;
         debug_assert!(
@@ -754,9 +768,9 @@ const HELD_FRAME_HEADER_BYTES: usize = 4 + 8 + 4 + 4 + 2 + 1;
 /// The stage index of a held row that names no stage.
 const NO_STAGE: u32 = u32::MAX;
 
-/// The source names, stages and categories held frames refer to by index.
-/// Each is bounded by the compiled plan: its Sources, its nodes, and the
-/// category enum.
+/// The source names, stages and categories held frames refer to by index,
+/// and the names of the nodes that failed documents. Each is bounded by the
+/// compiled plan: its Sources, its nodes, and the category enum.
 #[derive(Default)]
 struct HeldNames {
     source_names: Vec<Arc<str>>,
@@ -764,9 +778,21 @@ struct HeldNames {
     stages: Vec<Arc<str>>,
     stage_index: HashMap<Arc<str>, u32>,
     categories: Vec<DlqErrorCategory>,
+    failing_nodes: HashSet<Arc<str>>,
 }
 
 impl HeldNames {
+    /// The shared name of failing node `node`, interned on first sight, so a
+    /// failed document records its node without allocating.
+    fn failing_node(&mut self, node: &str) -> Arc<str> {
+        if let Some(name) = self.failing_nodes.get(node) {
+            return Arc::clone(name);
+        }
+        let name: Arc<str> = Arc::from(node);
+        self.failing_nodes.insert(Arc::clone(&name));
+        name
+    }
+
     /// Encode `row`'s header and `bytes` into `frame`, interning its names.
     fn encode(
         &mut self,
@@ -1663,8 +1689,9 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
         for key in remaining_document_keys(&self.buckets) {
             self.decide_document(ctx, &key)?;
         }
-        // A late record of a failed document is admitted to its ledger
-        // outside any rejection pass, so this Sink's pass settles them.
+        // Late records of failed documents are admitted to their ledgers
+        // outside any rejection pass, so this Sink's pass settles those
+        // ledgers before it ends.
         if let Some(state) = ctx.document_dlq.as_mut() {
             state.settle_unsettled_ledgers();
         }
@@ -1702,7 +1729,9 @@ impl Drop for DocumentDlqDriver<'_> {
 /// Output-arm bucket carried them). Writes the document's held rows (its
 /// trigger and its other failing records), once each. Runs once after every
 /// Output arm; a document whose records DID reach an Output was rejected
-/// there, which took its held rows, so it is skipped. A no-op when the
+/// there, which took its held rows, so it is skipped. Each document is
+/// rejected under the node that first failed it, so any flush, E310 or E320
+/// the sweep produces names a node of the plan. A no-op when the
 /// document-DLQ buffer is inactive.
 ///
 /// # Errors
@@ -2295,6 +2324,7 @@ mod tests {
             Arc::clone(&key),
             FailedDocument {
                 cause: DlqFailureStamp::now(),
+                failing_node: Arc::from("validate"),
                 emitted: EmittedRows::new(),
             },
         );
@@ -3071,7 +3101,7 @@ mod tests {
         for ordinal in 1..=8 {
             hold_row(&mut state, &holding, ordinal).expect("hold");
         }
-        state.insert_failed(Arc::clone(&rejected), DlqFailureStamp::now());
+        state.insert_failed(Arc::clone(&rejected), DlqFailureStamp::now(), "validate");
         let resident = state.held.resident_bytes();
         assert!(resident > 0, "the other document's rows are resident");
         let next = row(1, 100);
@@ -3113,7 +3143,7 @@ mod tests {
         for ordinal in 1..=8 {
             hold_row(&mut state, &holding, ordinal).expect("hold");
         }
-        state.insert_failed(Arc::clone(&rejected), DlqFailureStamp::now());
+        state.insert_failed(Arc::clone(&rejected), DlqFailureStamp::now(), "validate");
         assert!(state.held.resident_bytes() > 0);
 
         arbitrator.spill_reclaimable(1);
@@ -3309,7 +3339,7 @@ mod tests {
         let (mut state, key) = ledger_state(&arbitrator);
         let (mut twin, twin_key) = ledger_state(&arbitrator);
         let settled_key: DocKey = Arc::from("settled.csv");
-        state.insert_failed(Arc::clone(&settled_key), DlqFailureStamp::now());
+        state.insert_failed(Arc::clone(&settled_key), DlqFailureStamp::now(), "validate");
         for ordinal in 1..=50 {
             assert!(
                 state
