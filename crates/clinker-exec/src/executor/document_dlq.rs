@@ -3011,4 +3011,158 @@ mod tests {
             "with no resident rows it raises no request"
         );
     }
+
+    /// Rows `ordinals` of Source node 1, in the order given.
+    fn rows_of(ordinals: impl IntoIterator<Item = u64>) -> Vec<SourceRowId> {
+        ordinals
+            .into_iter()
+            .map(|ordinal| row(1, ordinal))
+            .collect()
+    }
+
+    /// A ledger admission that would pass the hard limit first moves the
+    /// state's own resident held rows to disk, as a hold does, and refuses
+    /// only when the row still does not fit.
+    #[test]
+    fn a_ledger_admission_flushes_the_held_rows_before_it_refuses() {
+        let root = tempfile::tempdir().expect("spill root");
+        let arbitrator = ledger_arbitrator(1 << 30);
+        let mut state = held_state(&arbitrator, root.path(), usize::MAX);
+        let (rejected, holding) = (doc_key(0), doc_key(1));
+        for ordinal in 1..=8 {
+            hold_row(&mut state, &holding, ordinal).expect("hold");
+        }
+        state.insert_failed(Arc::clone(&rejected), DlqFailureStamp::now());
+        let resident = state.held.resident_bytes();
+        assert!(resident > 0, "the other document's rows are resident");
+        let next = row(1, 100);
+        let growth = state.failed[&rejected]
+            .emitted
+            .admission(next)
+            .expect("a row not yet recorded")
+            .growth;
+        // The row fits once the resident rows are on disk, and not before.
+        arbitrator
+            .set_limit(arbitrator.sum_consumer_usage() + growth - 1)
+            .expect("limit");
+
+        let admitted = state.admit_emitted(&rejected, next, "out");
+        assert!(
+            matches!(admitted, Ok(true)),
+            "the row is admitted once the held rows are on disk: {admitted:?}"
+        );
+        assert_eq!(files_in(root.path()), 1, "the held rows moved to one file");
+        assert_eq!(state.held.resident_bytes(), 0);
+        assert!(arbitrator.cumulative_spill_bytes() > 0);
+        assert_eq!(
+            arbitrator.per_stage_spill_bytes().get("out").copied(),
+            Some(arbitrator.cumulative_spill_bytes()),
+            "the flush is credited to the admitting node"
+        );
+        assert_eq!(take_held_rows(&mut state, &holding), rows_of(1..=8));
+    }
+
+    /// A spill request the arbitrator raised on a poll that holds no row,
+    /// as the late-record path's is, is answered by the next ledger
+    /// admission.
+    #[test]
+    fn a_ledger_admission_answers_a_pending_spill_request() {
+        let root = tempfile::tempdir().expect("spill root");
+        let arbitrator = ledger_arbitrator(1 << 30);
+        let mut state = held_state(&arbitrator, root.path(), usize::MAX);
+        let (rejected, holding) = (doc_key(0), doc_key(1));
+        for ordinal in 1..=8 {
+            hold_row(&mut state, &holding, ordinal).expect("hold");
+        }
+        state.insert_failed(Arc::clone(&rejected), DlqFailureStamp::now());
+        assert!(state.held.resident_bytes() > 0);
+
+        arbitrator.spill_reclaimable(1);
+        assert!(
+            state
+                .admit_emitted(&rejected, row(1, 100), "out")
+                .expect("admission"),
+            "the row is new"
+        );
+        assert_eq!(files_in(root.path()), 1, "the held rows moved to one file");
+        assert_eq!(state.held.resident_bytes(), 0);
+        assert!(
+            !state.handle.take_spill_request(),
+            "the admission consumed the request"
+        );
+        assert_eq!(take_held_rows(&mut state, &holding), rows_of(1..=8));
+    }
+
+    /// A flush during a rejection's replay appends another document's tail
+    /// past the replayed chain's end and links it into that document's own
+    /// chain only, so both chains read back whole and in hold order.
+    #[test]
+    fn held_rows_flushed_during_a_rejection_replay_keep_both_chains_whole() {
+        let root = tempfile::tempdir().expect("spill root");
+        let arbitrator = ledger_arbitrator(1 << 30);
+        let mut state = held_state(&arbitrator, root.path(), usize::MAX);
+        let (replayed, flushed) = (doc_key(0), doc_key(1));
+        // Each document gets one extent on disk, then a resident tail.
+        for ordinal in 1..=3 {
+            hold_row(&mut state, &replayed, ordinal).expect("hold");
+        }
+        for ordinal in 4..=5 {
+            hold_row(&mut state, &flushed, ordinal).expect("hold");
+        }
+        state
+            .held
+            .flush_all(&arbitrator, "validate")
+            .expect("flush");
+        for ordinal in 6..=7 {
+            hold_row(&mut state, &replayed, ordinal).expect("hold");
+        }
+        for ordinal in 8..=9 {
+            hold_row(&mut state, &flushed, ordinal).expect("hold");
+        }
+        assert_eq!(files_in(root.path()), 1);
+
+        let mut reader = state
+            .take_held(&replayed, "out")
+            .expect("take")
+            .expect("a held chain");
+        let first = state
+            .names
+            .decode(reader.next_frame().expect("frame").expect("a first frame"))
+            .expect("decode")
+            .source_row;
+        arbitrator.spill_reclaimable(1);
+        assert!(
+            state
+                .admit_emitted(&replayed, first, "out")
+                .expect("admission")
+        );
+        assert_eq!(files_in(root.path()), 1);
+        assert_eq!(
+            state.held.resident_bytes(),
+            0,
+            "the other document's tail was flushed during the replay"
+        );
+
+        let mut replayed_rows = vec![first];
+        while let Some(frame) = reader.next_frame().expect("frame") {
+            let source_row = state.names.decode(frame).expect("decode").source_row;
+            assert!(
+                state
+                    .admit_emitted(&replayed, source_row, "out")
+                    .expect("admission")
+            );
+            replayed_rows.push(source_row);
+        }
+        drop(reader);
+        assert_eq!(
+            replayed_rows,
+            rows_of([1, 2, 3, 6, 7]),
+            "the replayed document's rows come back once each, in hold order"
+        );
+        assert_eq!(
+            take_held_rows(&mut state, &flushed),
+            rows_of([4, 5, 8, 9]),
+            "the flushed document's rows replay later, in hold order"
+        );
+    }
 }
