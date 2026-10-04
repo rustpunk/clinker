@@ -1,16 +1,18 @@
 //! End-to-end pipeline benchmarks.
 //!
-//! The forced-spill case holds its run to a ledger capacity, a `test-utils`
-//! lever, so this bench builds only with that feature:
-//! `cargo bench -p clinker-exec --features test-utils --bench pipeline`, and
-//! `cargo test --benches -p clinker-exec --features test-utils` in the gate.
+//! A default `cargo bench -p clinker-exec --bench pipeline` measures every
+//! case except the forced-spill group, in the product build. That group holds
+//! its run to a ledger capacity, a `test-utils` lever, so it builds only with
+//! `--features test-utils`. With the feature on, the test admission gate is
+//! compiled into the executor, so the figures of that build are not product
+//! figures.
 
 use clinker_bench_support::{CsvPayload, MEDIUM, SMALL};
 use clinker_exec::executor::{MemoryTestOverrides, PipelineExecutor, PipelineRunParams};
 use clinker_plan::config::parse_config;
-use criterion::{
-    BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
-};
+#[cfg(feature = "test-utils")]
+use criterion::BatchSize;
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
@@ -41,6 +43,8 @@ fn test_params() -> PipelineRunParams {
         batch_id: "bench-batch".to_string(),
         pipeline_vars: IndexMap::new(),
         shutdown_token: None,
+        // A bench measures the product build: real process readings.
+        memory_test: MemoryTestOverrides::process(),
         ..Default::default()
     }
 }
@@ -393,6 +397,7 @@ nodes:
     yaml
 }
 
+#[cfg(feature = "test-utils")]
 fn run_direct_fan_out_plan(
     plan: &clinker_plan::plan::CompiledPlan,
     reader_count: usize,
@@ -426,6 +431,7 @@ fn run_direct_fan_out_plan(
 /// the same input with ample memory, which holds the shared slot and one
 /// reader's scan together) plus half a scan of headroom. It fits a scan and
 /// lies below the in-memory peak, so the shared slot must spill.
+#[cfg(feature = "test-utils")]
 fn forced_spill_capacity(
     plan: &clinker_plan::plan::CompiledPlan,
     reader_count: usize,
@@ -445,6 +451,7 @@ fn forced_spill_capacity(
 }
 
 /// [`test_params`] held to `capacity` bytes of ledger.
+#[cfg(feature = "test-utils")]
 fn forced_spill_params(capacity: u64) -> PipelineRunParams {
     PipelineRunParams {
         memory_test: MemoryTestOverrides::default().with_ledger_capacity(capacity),
@@ -540,6 +547,7 @@ fn bench_e2e_direct_fan_out(c: &mut Criterion) {
 /// the scan materialization of its fixture ([`forced_spill_capacity`]), so
 /// the pressure no longer depends on this process's resident memory. The
 /// forced preflight rejects an accidental in-memory run.
+#[cfg(feature = "test-utils")]
 fn bench_e2e_direct_fan_out_forced_spill(c: &mut Criterion) {
     let mut group = c.benchmark_group("e2e_direct_fan_out_forced_spill");
     let params = test_params();
@@ -693,6 +701,7 @@ nodes:
     group.finish();
 }
 
+#[cfg(feature = "test-utils")]
 criterion_group!(
     benches,
     bench_e2e_streaming,
@@ -700,6 +709,15 @@ criterion_group!(
     bench_e2e_multi_output,
     bench_e2e_direct_fan_out,
     bench_e2e_direct_fan_out_forced_spill,
+    bench_e2e_with_sort,
+);
+#[cfg(not(feature = "test-utils"))]
+criterion_group!(
+    benches,
+    bench_e2e_streaming,
+    bench_e2e_two_pass,
+    bench_e2e_multi_output,
+    bench_e2e_direct_fan_out,
     bench_e2e_with_sort,
 );
 criterion_main!(benches);

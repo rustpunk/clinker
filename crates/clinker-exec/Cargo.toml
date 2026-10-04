@@ -95,7 +95,6 @@ harness = false
 [[bench]]
 name = "pipeline"
 harness = false
-required-features = ["test-utils"]
 
 [[bench]]
 name = "parallel"
