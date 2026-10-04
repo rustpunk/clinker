@@ -2,6 +2,8 @@
 
 Route nodes split a stream of records into named branches based on CXL boolean conditions. Each branch becomes an independent output port that downstream nodes can wire to using port syntax.
 
+*Interactive companion: the [Route and Merge explainer](route-merge-explainer.html) shows, record by record, which conditions are checked and where each record goes, and how a Merge rejoins the branches.*
+
 ## Basic structure
 
 ```yaml
@@ -40,9 +42,9 @@ Compile failures surface as a CXL diagnostic keyed to the failure class -- **E20
 
 ## Default branch
 
-The `default:` field is **required**. Records that match no condition are routed to the default branch. The default branch name must not collide with any condition key.
+The `default:` field is **required**. Records for which no condition is true are routed to the default branch. A condition whose result is null counts as not true.
 
-A condition that fails to evaluate is not "no match". Under `error_handling.strategy: continue` the record is dead-lettered and takes no branch, not even one whose condition held, and not the default; under `fail_fast` the run stops. See [An evaluation error is never false](../pipelines/error-handling.md#an-evaluation-error-is-never-false).
+A condition that fails to evaluate is not "no match". Under `error_handling.strategy: continue` the record is dead-lettered and takes no branch, not even one whose condition held, and not the default; under `fail_fast` the run stops. In `exclusive` mode the conditions after the first true one are never evaluated, so a condition further down cannot fail for that record. See [An evaluation error is never false](../pipelines/error-handling.md#an-evaluation-error-is-never-false).
 
 ## Routing modes
 
@@ -59,7 +61,7 @@ In `exclusive` mode, conditions are evaluated in declaration order and the **fir
     default: standard
 ```
 
-A customer with `lifetime_value = 50000` matches both `vip` and `high`, but because `exclusive` stops at first match, they go to `high` only if `vip` was checked first -- and they do, because `vip` comes first. Actually, 50000 is not > 100000, so they match `high`.
+A customer with `lifetime_value = 50000` is not over 100000, so `vip` is not true; `high` is the first true condition and wins. A customer with `lifetime_value = 150000` is true for all three conditions, but goes to `vip` alone, because `vip` is checked first. Listing `medium` first would send both customers to `medium`.
 
 ### Inclusive
 
@@ -78,7 +80,9 @@ A flagged international order over 10000 would appear in `needs_review`, `flagge
 
 ## Downstream wiring
 
-Downstream nodes reference route branches using **port syntax**: `route_name.branch_name`.
+Downstream nodes reference route branches using **port syntax**: `route_name.branch_name`. The default branch is reached the same way, by its name. Several nodes can read the same branch; each receives every record on it.
+
+A node whose own name equals a branch name can also reference the Route by its bare name and receives that branch: a Sink named `high` with `input: classify` reads `classify.high`.
 
 ```yaml
 - type: route
@@ -119,10 +123,9 @@ Downstream nodes reference route branches using **port syntax**: `route_name.bra
 
 ## Constraints
 
-- At least 1 condition is required.
-- Maximum 256 branches (conditions + default).
-- Branch names must be unique.
-- The `default` name must not collide with any condition key.
+- Give every condition a distinct name; each name is a separate port.
+- Give `default` a name that no condition uses. This is not currently checked when the pipeline is planned: a `default` with the same name as a condition is folded into that condition's branch, so its records cannot be told apart from the matches.
+- Declare at least one condition. A Route with none is not rejected today; every record takes the default branch.
 
 ## Complete example
 

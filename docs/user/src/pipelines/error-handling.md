@@ -85,7 +85,8 @@ depends on the condition being false is taken for it.
 - A Transform `filter` that fails dead-letters the record; it is neither kept
   nor filtered out.
 - A Route branch condition that fails dead-letters the record, which takes no
-  branch and not the `default`.
+  branch and not the `default`. In `exclusive` mode only the conditions up to
+  the first true one are evaluated, so a later condition cannot fail.
 - A Combine `where:` that fails for a candidate build row dead-letters that
   pair. The driver is not unmatched, so `on_miss` does not fire; under
   `match: first` a failure on the deciding candidate is the driver's only

@@ -931,6 +931,33 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
 - Implementation owner: Phase 4 (authoring surface) or an inserted 04.x
   phase; CXL language maintainers.
 
+### 90. Should a Route reject a `default` that repeats a condition name, or no conditions?
+
+- Filed: 2026-10-04.
+- Status: Open.
+- Priority: Low.
+- Evidence: The user guide's Route page listed four constraints: at least one
+  condition, at most 256 branches, unique branch names, and a `default` that
+  does not collide with a condition key. The checks exist only in the legacy
+  `RouteConfig::validate` (`crates/clinker-plan/src/config/route.rs`), which
+  only tests construct. The live node shape `RouteBody`
+  (`crates/clinker-plan/src/config/pipeline_node.rs`) and its lowering apply
+  none of them, and `PlanNode::output_ports`
+  (`crates/clinker-plan/src/plan/execution/mod.rs`) deduplicates a `default`
+  that equals a branch name, so its records join that branch's port without
+  an error. The Route page now describes this behaviour instead of the
+  unenforced rules. Whether a duplicate condition key is rejected depends on
+  the YAML parser's duplicate-key handling, which was not verified.
+- Files/modules involved: `crates/clinker-plan/src/config/route.rs`,
+  `crates/clinker-plan/src/config/pipeline_node.rs` (`RouteBody`),
+  `crates/clinker-plan/src/plan/execution/mod.rs` (`output_ports`).
+- Suggested way to resolve it: Decide whether `RouteBody` lowering should
+  reject an empty `conditions:` map and a `default` equal to a condition key,
+  with an author-facing diagnostic, and whether a branch cap is still wanted;
+  then delete or wire the legacy `RouteConfig` validation so one rule set
+  exists, and update the Route page's Constraints section.
+- Implementation owner: Planner maintainers.
+
 ## Resolved Archive
 
 ### 61. Decoded allocation ownership

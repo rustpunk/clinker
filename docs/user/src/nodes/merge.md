@@ -4,6 +4,8 @@ Merge nodes concatenate multiple upstream branches into a single stream. They ar
 
 Merge is for streamwise concatenation of inputs that share a schema. For record-level joining across inputs that have different schemas, see [Combine Nodes](combine.md).
 
+*Interactive companion: the [Route and Merge explainer](route-merge-explainer.html) shows how each mode mixes its inputs, and what an inclusive Route's copies look like after a Merge.*
+
 ## Basic structure
 
 ```yaml
@@ -169,6 +171,8 @@ The most common pattern is routing records through different processing paths an
     type: csv
     path: "./output/all_orders.csv"
 ```
+
+A Merge passes on every record from every input and does not remove duplicates. Branches of an `inclusive` Route can carry the same record, and rejoining them puts that record in the output once per branch it took. Use an `exclusive` Route when each record should come out once.
 
 ### Unioning multiple sources
 

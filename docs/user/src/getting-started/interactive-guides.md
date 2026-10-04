@@ -24,6 +24,12 @@ Where `$doc.*` values come from, how each file becomes its own document with
 its own Aggregate roll-up, and what `dlq_granularity: document` rejects.
 Reference: [Document Envelope Context](../pipelines/envelope-and-doc-context.md).
 
+## [Route and Merge](../nodes/route-merge-explainer.html)
+
+Where each record goes when a Route's conditions are true, not true, or fail,
+in exclusive and inclusive mode, and how a Merge rejoins the branches. Reference:
+[Route Nodes](../nodes/route.md) and [Merge Nodes](../nodes/merge.md).
+
 ## [Combine playground](../nodes/combine-explainer.html)
 
 Which build rows `where:` matches for each driver row, and what `match:`,

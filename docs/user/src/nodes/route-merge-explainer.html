@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clinker · Route and Merge, visually</title>
+<style>
+:root{
+  --iron:#14110f; --iron2:#1d1915; --iron3:#29231d; --seam:#3a3129;
+  --ash:#b9ab98; --bone:#ece2d0; --dim:#7d705f;
+  --rust:#d0581f; --rust-d:#8f3a13; --brass:#e0a93e; --verd:#4fb0a0;
+  --blood:#e0362c; --steel:#7f97ad; --plum:#b07ac0; --moss:#9bc76b;
+  --disp:"Rajdhani", "Bahnschrift Condensed", "Roboto Condensed", "Arial Narrow", sans-serif;
+  --mono:"Share Tech Mono", "Source Code Pro", Consolas, "Ubuntu Mono", monospace;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--iron);color:var(--bone);font:15px/1.6 var(--mono);
+  background-image:
+   radial-gradient(1100px 560px at 88% -10%, rgba(208,88,31,.12), transparent 60%),
+   radial-gradient(900px 500px at -10% 45%, rgba(79,176,160,.08), transparent 60%),
+   repeating-linear-gradient(0deg, rgba(255,255,255,.012) 0 1px, transparent 1px 4px);}
+a{color:var(--brass)}
+code{font-family:var(--mono);background:var(--iron3);padding:0 .35em;border:1px solid var(--seam);color:var(--brass);font-size:.92em;overflow-wrap:anywhere}
+pre{background:var(--iron);border:1px solid var(--seam);padding:12px 14px;overflow-x:auto;font-size:13px;line-height:1.5;color:var(--ash);max-width:100%;margin:10px 0}
+pre b{color:var(--brass);font-weight:400}
+header.hero{padding:64px 6vw 36px;border-bottom:2px solid var(--seam);position:relative;overflow:hidden}
+header.hero::after{content:"";position:absolute;right:-60px;top:-60px;width:360px;height:360px;border-radius:50%;
+  border:26px solid rgba(208,88,31,.07);box-shadow:inset 0 0 0 2px rgba(208,88,31,.12);pointer-events:none}
+.rm-kicker{font:700 12px/1.4 var(--mono);letter-spacing:.24em;text-transform:uppercase;color:var(--rust)}
+.rm-kicker a{color:inherit}
+h1{font:700 clamp(46px,9vw,118px)/.88 var(--disp);margin:14px 0 18px;text-transform:uppercase;letter-spacing:-.01em}
+h1 em{font-style:normal;color:var(--rust)}
+h1 .rm-thin{font-weight:400;color:var(--ash)}
+.rm-lede{max-width:760px;color:var(--ash);font-size:16px}
+nav.rm-toc{display:flex;flex-wrap:wrap;margin-top:26px;border:1px solid var(--seam);width:fit-content;max-width:100%}
+nav.rm-toc a{padding:10px 14px;text-decoration:none;color:var(--ash);border-right:1px solid var(--seam);font-size:12px;letter-spacing:.12em;text-transform:uppercase}
+nav.rm-toc a:last-child{border-right:0}
+nav.rm-toc b{color:var(--brass);margin-right:6px}
+@media (hover:hover){nav.rm-toc a:hover{background:var(--rust);color:var(--iron)}}
+section{padding:56px 6vw;border-bottom:1px solid var(--seam)}
+section:nth-of-type(even){background:rgba(0,0,0,.18)}
+.rm-sechead{display:grid;grid-template-columns:110px 1fr;gap:22px;align-items:end;margin-bottom:24px}
+.rm-num{font:700 110px/.8 var(--disp);color:transparent;-webkit-text-stroke:2px var(--rust-d)}
+h2{font:700 clamp(32px,4.6vw,60px)/.95 var(--disp);text-transform:uppercase;margin:0}
+h2 small{display:block;font:400 14px/1.4 var(--mono);text-transform:none;color:var(--dim);margin-top:10px}
+h3{font:700 22px/1.1 var(--disp);text-transform:uppercase;letter-spacing:.04em;color:var(--brass);margin:0 0 10px}
+p{max-width:820px}
+.rm-cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.3fr);gap:32px}
+.rm-cols>*{min-width:0}
+.rm-panel{background:var(--iron2);border:1px solid var(--seam);padding:20px;min-width:0}
+.rm-callout{border-left:4px solid var(--rust);background:rgba(208,88,31,.07);padding:12px 16px;margin:16px 0;max-width:820px}
+.rm-callout--green{border-color:var(--verd);background:rgba(79,176,160,.07)}
+.rm-callout--brass{border-color:var(--brass);background:rgba(224,169,62,.06)}
+.rm-aside{font-size:13px;color:var(--ash)}
+
+.rm-ctlrow{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;margin:4px 0 12px}
+.rm-ctlhead{font-size:12px;color:var(--ash);min-width:70px}
+.rm-seg{display:inline-flex;border:2px solid var(--seam);flex-wrap:wrap}
+.rm-seg button{font:700 12px/1 var(--mono);letter-spacing:.04em;padding:9px 11px;border:0;border-right:1px solid var(--seam);background:transparent;color:var(--ash);cursor:pointer}
+.rm-seg button:last-child{border-right:0}
+.rm-seg button[aria-pressed=true]{background:var(--rust);color:var(--iron)}
+
+/* conditions list with reorder */
+.rm-conds{display:flex;flex-direction:column;gap:6px;margin:4px 0 12px}
+.rm-cond{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;gap:8px;align-items:center;border:1px solid var(--seam);background:var(--iron);padding:6px 8px;font-size:13px}
+.rm-cond .rm-idx{color:var(--dim);font-size:11px}
+.rm-cond code{background:none;border:0;padding:0}
+.rm-cond b{color:var(--bone);font-weight:400}
+.rm-mv{font:700 14px/1 var(--mono);width:36px;height:32px;border:1px solid var(--seam);background:var(--iron2);color:var(--ash);cursor:pointer}
+.rm-mv:disabled{opacity:.3;cursor:default}
+.rm-default{font-size:13px;color:var(--ash);padding:4px 8px;border:1px dashed var(--seam)}
+
+/* records with their evaluation */
+.rm-recs{display:flex;flex-direction:column;gap:8px}
+.rm-rec{border:2px solid var(--seam);background:var(--iron);padding:8px 10px;min-width:0}
+.rm-rec.rm-dlq{border-color:var(--blood)}
+.rm-rec header{display:flex;flex-wrap:wrap;justify-content:space-between;gap:4px 10px;align-items:baseline}
+.rm-rec header b{font:700 17px/1 var(--disp);letter-spacing:.06em}
+.rm-rec header .rm-fields{font-size:12px;color:var(--dim)}
+.rm-steps{margin:6px 0 0;padding:0;list-style:none}
+.rm-steps li{font-size:12px;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;padding:3px 0 3px 8px;border-left:3px solid var(--seam);margin:2px 0}
+.rm-steps li.rm-true{border-color:var(--moss)} .rm-steps li.rm-fail{border-color:var(--blood)} .rm-steps li.rm-skip{opacity:.45}
+.rm-steps li .rm-out{white-space:nowrap}
+.rm-out-true{color:var(--moss)} .rm-out-not{color:var(--steel)} .rm-out-fail{color:var(--blood)} .rm-out-skip{color:var(--dim)}
+.rm-goes{font-size:12px;margin-top:4px;color:var(--ash)}
+.rm-goes .rm-tag{display:inline-block;padding:1px 6px;border:1px solid var(--brass);color:var(--brass);margin:2px 4px 0 0}
+.rm-goes .rm-tag.rm-tag--dlq{border-color:var(--blood);color:var(--blood)}
+
+/* ports */
+.rm-ports{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,140px),1fr));gap:8px;margin-top:12px}
+.rm-port{border:1px solid var(--seam);background:var(--iron);padding:8px}
+.rm-port h5{margin:0 0 4px;font:700 14px/1 var(--disp);letter-spacing:.08em;text-transform:uppercase;color:var(--brass);overflow-wrap:anywhere}
+.rm-port.rm-port--dlq h5{color:var(--blood)}
+.rm-port.rm-port--def h5{color:var(--steel)}
+.rm-port span{display:inline-block;font-size:12px;border:1px solid var(--seam);padding:1px 6px;margin:2px 3px 0 0}
+.rm-banner{display:none;font:700 20px/1.2 var(--disp);text-transform:uppercase;padding:10px 14px;margin-top:10px;background:var(--blood);color:var(--iron)}
+.rm-banner.rm-on{display:block}
+
+/* merge */
+.rm-merge{display:flex;flex-direction:column;gap:6px}
+.rm-mout{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.rm-mout span{font-size:13px;padding:4px 8px;border:1px solid var(--seam);background:var(--iron)}
+.rm-mout span.rm-dup{border-color:var(--plum);color:var(--plum)}
+.rm-inputs{display:flex;flex-direction:column;gap:6px}
+.rm-input{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;gap:8px;align-items:center;border:1px solid var(--seam);background:var(--iron);padding:6px 8px;font-size:13px}
+button.rm-plain{font:700 12px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;padding:9px 12px;border:2px solid var(--brass);background:transparent;color:var(--brass);cursor:pointer}
+@media (hover:hover){button.rm-plain:hover{background:var(--brass);color:var(--iron)}}
+
+.rm-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));border:2px solid var(--seam)}
+.rm-card{padding:16px 18px;border-right:1px solid var(--seam);border-bottom:1px solid var(--seam);min-width:0}
+.rm-card h4{margin:0 0 6px;font:700 22px/1 var(--disp);text-transform:uppercase}
+.rm-card p{font-size:13px;color:var(--ash);margin:0 0 8px}
+footer{padding:36px 6vw;color:var(--dim);font-size:12px}
+
+@media (max-width:980px){.rm-cols{grid-template-columns:1fr}}
+@media (max-width:720px){
+  .rm-sechead{grid-template-columns:1fr;gap:6px}.rm-num{font-size:64px}
+  h2{font-size:clamp(28px,10vw,36px)}
+  section{padding:44px 5vw}
+  header.hero{padding:44px 5vw 28px}
+}
+@media (max-width:720px),(pointer:coarse){
+  .rm-aside,.rm-card p,footer,.rm-ctlhead,.rm-cond,.rm-steps li,.rm-goes,.rm-input,.rm-mout span{font-size:14px}
+}
+/* 44px targets on touch screens, and on any narrow screen in case the pointer is misreported */
+@media (pointer:coarse),(max-width:720px){
+  .rm-seg button,button.rm-plain{min-height:44px}
+  .rm-mv{width:44px;height:44px}
+  nav.rm-toc a{display:flex;align-items:center;min-height:44px}
+  .rm-kicker a{display:inline-block;line-height:44px}
+}
+@media (prefers-reduced-motion: reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="rm-kicker">Clinker user guide · <a href="route.html">← Route Nodes</a> · <a href="merge.html">Merge Nodes →</a></div>
+  <h1>Split<br><em>and rejoin</em><span class="rm-thin"> with Route and Merge</span></h1>
+  <p class="rm-lede">A Route sends each record down one or more named branches. A Merge joins branches, or Sources, back into one stream. Reorder the conditions, switch the mode, and watch where each order goes, including the ones whose condition can't be worked out.</p>
+  <nav class="rm-toc">
+    <a href="#route"><b>01</b>Route</a>
+    <a href="#merge"><b>02</b>Merge</a>
+    <a href="#wiring"><b>03</b>Wiring</a>
+  </nav>
+</header>
+
+<!-- ============================ 01 ============================ -->
+<section id="route">
+  <div class="rm-sechead"><div class="rm-num">01</div><h2>Route<small>Order matters, and a condition can be true, not true, or fail</small></h2></div>
+  <div class="rm-cols">
+    <div>
+<pre>- type: route
+  name: classify
+  input: orders
+  config:
+    mode: <b data-rm-y="mode"></b>
+    conditions:
+<span data-rm-y="conds"></span>    default: standard</pre>
+      <ul class="rm-aside">
+        <li><b>exclusive</b> (default): conditions are checked top to bottom, and the <b>first true one wins</b>. The conditions after it are never checked, so an error further down never happens.</li>
+        <li><b>inclusive</b>: the conditions are checked in order, all of them unless one fails, and the record goes down <b>every</b> branch whose condition is true, as a separate copy.</li>
+        <li>A condition that comes out <b>null</b> is "not true": the record moves on to the next one. If nothing is true, it takes the <code>default</code> branch.</li>
+        <li>A condition that <b>fails</b> (here, dividing by a quantity of 0) is neither true nor false. Under <code>strategy: continue</code> the record is dead-lettered and takes no branch at all, not even one already matched and not the default. Under <code>fail_fast</code> the run stops.</li>
+      </ul>
+      <div class="rm-callout rm-callout--brass">Watch order O5: its country is empty, and <code>country != "US"</code> is <b>true</b> for an empty country, because <code>!=</code> never gives null. See <a href="../cxl/nulls-explainer.html">where does a null go?</a></div>
+    </div>
+    <div class="rm-panel">
+      <div class="rm-ctlrow"><span class="rm-ctlhead">mode</span><div class="rm-seg" data-rm-bind="mode"><button data-v="exclusive">exclusive</button><button data-v="inclusive">inclusive</button></div></div>
+      <div class="rm-ctlrow"><span class="rm-ctlhead">strategy</span><div class="rm-seg" data-rm-bind="strategy"><button data-v="continue">continue</button><button data-v="fail_fast">fail_fast</button></div></div>
+      <div class="rm-ctlhead">conditions, in order (use the arrows to reorder)</div>
+      <div class="rm-conds" data-rm-conds></div>
+      <div class="rm-default">default: <b>standard</b></div>
+      <div class="rm-banner" data-rm-banner></div>
+      <div class="rm-ports" data-rm-ports></div>
+      <h3 style="margin-top:16px">Each order</h3>
+      <div class="rm-recs" data-rm-recs></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ 02 ============================ -->
+<section id="merge">
+  <div class="rm-sechead"><div class="rm-num">02</div><h2>Merge<small>Joining the branches back into one stream</small></h2></div>
+  <div class="rm-cols">
+    <div>
+      <p>A Merge brings the branches back together, here straight from the Route's ports (in a real pipeline there is usually a Transform on each branch first). It doesn't match records up: it passes along everything from every input. How the inputs are mixed depends on <code>mode</code>:</p>
+      <ul class="rm-aside">
+        <li><b>concat</b> (default): all of the first input, then all of the second, in the order of <code>inputs:</code>. The same every run.</li>
+        <li><b>interleave</b>: records pass on as they arrive from any input. Each input keeps its own order, but how the inputs mix can change from run to run.</li>
+        <li><b>interleave</b> with <code>interleave_seed</code>: a mix that is the same every run, at the cost of reading every input into memory first. Meant for tests.</li>
+      </ul>
+      <div class="rm-callout rm-callout--green"><b>Inclusive routes make copies.</b> A record that went down two branches comes out of the Merge twice. That is often what you want (a review queue and a flag list), but if the branches are rejoined for one output, use <code>exclusive</code>, or remove the copies afterwards.</div>
+      <p class="rm-aside">All inputs must have the same columns; the Merge's columns come from its first input. A Merge never sorts: two sorted inputs concatenated are not one sorted stream. Put a <code>sort_order</code> on the Sink for that.</p>
+    </div>
+    <div class="rm-panel">
+<pre>- type: merge
+  name: rejoin
+  inputs: <b data-rm-y="inputs"></b>
+  config:
+    mode: <b data-rm-y="mmode"></b><span data-rm-y="seed"></span></pre>
+      <div class="rm-ctlrow"><span class="rm-ctlhead">mode</span><div class="rm-seg" data-rm-bind="mmode"><button data-v="concat">concat</button><button data-v="interleave">interleave</button><button data-v="seeded">interleave + seed</button></div></div>
+      <div class="rm-ctlhead">inputs, in order (the branches from section 01)</div>
+      <div class="rm-inputs" data-rm-inputs></div>
+      <div class="rm-ctlrow" style="margin-top:10px"><button class="rm-plain" data-rm-rerun>Run again</button><span class="rm-aside" data-rm-runnote></span></div>
+      <div class="rm-mout" data-rm-mout></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ 03 ============================ -->
+<section id="wiring">
+  <div class="rm-sechead"><div class="rm-num">03</div><h2>Wiring<small>How the next node picks a branch</small></h2></div>
+  <div class="rm-cards">
+    <div class="rm-card"><h4>Port syntax</h4><p>A node reads one branch with <code>input: classify.big</code>, and the default branch the same way: <code>input: classify.standard</code>. A Merge lists branches in <code>inputs:</code>.</p></div>
+    <div class="rm-card"><h4>The name shortcut</h4><p>A node whose own name matches a branch can write <code>input: classify</code>, and it receives that branch. A Sink named <code>big</code> reading <code>classify</code> gets the <code>big</code> branch.</p></div>
+    <div class="rm-card"><h4>One branch, two readers</h4><p>Several nodes can read the same branch; each gets every record on it.</p></div>
+    <div class="rm-card"><h4>Branch names</h4><p>Use names that differ from each other and from <code>default</code>. Today a <code>default</code> with the same name as a condition is folded into that condition's branch without an error, so its records can't be told apart.</p></div>
+  </div>
+</section>
+
+<footer>The routing rules follow Clinker's Route evaluator (<code>crates/clinker-exec/src/executor/route.rs</code>) and the Route Nodes and Merge Nodes pages. The page reproduces them in your browser; it does not run the engine. The seeded interleave order shown is an example of a fixed mix, not the engine's exact sequence.</footer>
+
+<script>
+"use strict";
+const ORDERS=[
+  {id:"O1",amount:1500,qty:10,country:"US"},
+  {id:"O2",amount:200,qty:2,country:"UK"},
+  {id:"O3",amount:null,qty:1,country:"US"},
+  {id:"O4",amount:600,qty:0,country:"DE"},
+  {id:"O5",amount:50,qty:1,country:null},
+];
+const CONDS={
+  big:{src:'amount > 1000',ev:o=>o.amount===null?null:o.amount>1000},
+  per_unit:{src:'amount / qty > 50',ev:o=>{ if(o.amount===null) return null; if(o.qty===0) return "FAIL"; return o.amount/o.qty>50; }},
+  intl:{src:'country != "US"',ev:o=>o.country!=="US"},   // != never gives null
+};
+const S={mode:"exclusive",strategy:"continue",order:["big","per_unit","intl"],mmode:"concat",inputs:null,run:0};
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const $=(s,r=document)=>r.querySelector(s);
+const fmt=v=>v===null?"null":v;
+
+/* Mirrors CompiledRoute::evaluate: exclusive returns at the first true or failed
+   branch; inclusive collects every true branch but a failure dead-letters. */
+function route(o){
+  const steps=[]; let result=null;
+  if(S.mode==="exclusive"){
+    for(const k of S.order){
+      if(result){ steps.push({k,out:"skip"}); continue; }
+      const v=CONDS[k].ev(o);
+      if(v==="FAIL"){ steps.push({k,out:"fail"}); result={dlq:true}; }
+      else if(v===true){ steps.push({k,out:"true"}); result={ports:[k]}; }
+      else steps.push({k,out:v===null?"null":"false"});
+    }
+    if(!result) result={ports:["standard"],def:true};
+  } else {
+    const matched=[]; let failed=false;
+    for(const k of S.order){
+      if(failed){ steps.push({k,out:"skip"}); continue; }
+      const v=CONDS[k].ev(o);
+      if(v==="FAIL"){ steps.push({k,out:"fail"}); failed=true; }
+      else if(v===true){ steps.push({k,out:"true"}); matched.push(k); }
+      else steps.push({k,out:v===null?"null":"false"});
+    }
+    result=failed?{dlq:true,discarded:matched}:(matched.length?{ports:matched}:{ports:["standard"],def:true});
+  }
+  return {steps,result};
+}
+function runRoute(){
+  const res=[]; let stopped=null;
+  for(const o of ORDERS){
+    if(stopped){ res.push({o,notReached:true}); continue; }
+    const r=route(o); res.push({o,...r});
+    if(r.result.dlq&&S.strategy==="fail_fast") stopped=o;
+  }
+  return {res,stopped};
+}
+function render(){
+  document.querySelectorAll("[data-rm-bind] button").forEach(b=>b.setAttribute("aria-pressed",String(S[b.parentElement.dataset.rmBind]===b.dataset.v)));
+  $('[data-rm-y="mode"]').textContent=S.mode;
+  $('[data-rm-y="conds"]').innerHTML=S.order.map(k=>`      ${k}: "${esc(CONDS[k].src.replace(/"/g,'\\"'))}"\n`).join("");
+  $("[data-rm-conds]").innerHTML=S.order.map((k,i)=>`<div class="rm-cond"><span class="rm-idx">${i+1}</span><span><b>${k}</b>: <code>${esc(CONDS[k].src)}</code></span>
+    <button class="rm-mv" data-rm-up="${i}" ${i===0?"disabled":""} aria-label="move ${k} up">↑</button><button class="rm-mv" data-rm-down="${i}" ${i===S.order.length-1?"disabled":""} aria-label="move ${k} down">↓</button></div>`).join("");
+  const {res,stopped}=runRoute();
+  const ban=$("[data-rm-banner]");
+  if(stopped){ ban.textContent=`Run stops at ${stopped.id}: a condition failed under fail_fast`; ban.classList.add("rm-on"); } else ban.classList.remove("rm-on");
+  const ports={}; [...S.order,"standard"].forEach(p=>ports[p]=[]); const dlq=[];
+  res.forEach(r=>{ if(r.notReached) return; if(r.result.dlq) dlq.push(r.o.id); else r.result.ports.forEach(p=>ports[p].push(r.o.id)); });
+  $("[data-rm-ports]").innerHTML=[...S.order,"standard"].map(p=>`<div class="rm-port${p==="standard"?" rm-port--def":""}"><h5>classify.${p}</h5>${ports[p].map(x=>`<span>${x}</span>`).join("")||'<span style="border:0;color:var(--dim)">—</span>'}</div>`).join("")+
+    (S.strategy==="continue"?`<div class="rm-port rm-port--dlq"><h5>DLQ</h5>${dlq.map(x=>`<span>${x}</span>`).join("")||'<span style="border:0;color:var(--dim)">—</span>'}</div>`:"");
+  const outTxt={true:["true","rm-out-true"],false:["not true (false)","rm-out-not"],null:["not true (null)","rm-out-not"],fail:["fails","rm-out-fail"],skip:["not checked","rm-out-skip"]};
+  $("[data-rm-recs]").innerHTML=res.map(r=>{
+    const f=`amount ${fmt(r.o.amount)} · qty ${r.o.qty} · country ${r.o.country===null?"null":r.o.country}`;
+    if(r.notReached) return `<div class="rm-rec"><header><b>${r.o.id}</b><span class="rm-fields">${f}</span></header><div class="rm-goes">not reached: the run has stopped</div></div>`;
+    const steps=r.steps.map(s=>{ const [t,c]=outTxt[s.out]; return `<li class="${s.out==="true"?"rm-true":s.out==="fail"?"rm-fail":s.out==="skip"?"rm-skip":""}"><span>${s.k}: ${esc(CONDS[s.k].src)}</span><span class="rm-out ${c}">${t}</span></li>`; }).join("");
+    let goes;
+    if(r.result.dlq) goes=S.strategy==="continue"?`<span class="rm-tag rm-tag--dlq">DLQ</span> takes no branch${r.result.discarded&&r.result.discarded.length?`, not even ${r.result.discarded.join(", ")}, which had matched`:""}, and not the default`:`<span class="rm-tag rm-tag--dlq">run stops</span>`;
+    else goes=r.result.ports.map(p=>`<span class="rm-tag">${p}</span>`).join("")+(r.result.def?" nothing was true, so the default":r.result.ports.length>1?` ${r.result.ports.length} copies`:"");
+    return `<div class="rm-rec${r.result.dlq?" rm-dlq":""}"><header><b>${r.o.id}</b><span class="rm-fields">${f}</span></header><ul class="rm-steps">${steps}</ul><div class="rm-goes">→ ${goes}</div></div>`;
+  }).join("");
+  renderMerge(ports, !!stopped);
+}
+
+/* Merge: inputs are the non-empty branches, in an order the reader controls */
+function renderMerge(ports, stopped){
+  const all=[...S.order,"standard"];
+  if(!S.inputs||S.inputs.length!==all.length||!all.every(p=>S.inputs.includes(p))) S.inputs=all.slice();
+  $('[data-rm-y="inputs"]').textContent="["+S.inputs.map(p=>"classify."+p).join(", ")+"]";
+  $('[data-rm-y="mmode"]').textContent=S.mmode==="concat"?"concat":"interleave";
+  $('[data-rm-y="seed"]').textContent=S.mmode==="seeded"?"\n    interleave_seed: 42":"";
+  $("[data-rm-inputs]").innerHTML=S.inputs.map((p,i)=>`<div class="rm-input"><span class="rm-idx">${i+1}</span><span>classify.${p} <span style="color:var(--dim)">(${ports[p].length})</span></span>
+    <button class="rm-mv" data-rm-iup="${i}" ${i===0?"disabled":""} aria-label="move ${p} up">↑</button><button class="rm-mv" data-rm-idown="${i}" ${i===S.inputs.length-1?"disabled":""} aria-label="move ${p} down">↓</button></div>`).join("");
+  const lists=S.inputs.map(p=>ports[p].map(id=>({id,from:p})));
+  let out=[];
+  if(stopped){ $("[data-rm-mout]").innerHTML=`<span style="border:0;color:var(--dim)">the run stopped before the Merge produced output</span>`; $("[data-rm-runnote]").textContent=""; return; }
+  if(S.mmode==="concat") out=lists.flat();
+  else { // interleave: keep each input's order, mix across inputs
+    const rnd=mulberry(S.mmode==="seeded"?42:(S.run*7919+13)); const q=lists.map(l=>l.slice());
+    while(q.some(l=>l.length)){ const live=q.map((l,i)=>l.length?i:-1).filter(i=>i>=0); const pick=live[Math.floor(rnd()*live.length)]; out.push(q[pick].shift()); }
+  }
+  const counts={}; out.forEach(x=>counts[x.id]=(counts[x.id]||0)+1);
+  $("[data-rm-mout]").innerHTML=out.map(x=>`<span class="${counts[x.id]>1?"rm-dup":""}">${x.id} <span style="color:var(--dim)">${x.from}</span></span>`).join("")||`<span style="border:0;color:var(--dim)">no records</span>`;
+  $("[data-rm-runnote]").textContent=S.mmode==="interleave"?`run ${S.run+1}: the mix can differ each run`:S.mmode==="seeded"?"same mix every run":"same order every run";
+}
+function mulberry(a){ return function(){ a|=0; a=a+0x6D2B79F5|0; let t=Math.imul(a^a>>>15,1|a); t=t+Math.imul(t^t>>>7,61|t)^t; return ((t^t>>>14)>>>0)/4294967296; }; }
+
+document.addEventListener("click",e=>{
+  const b=e.target.closest("[data-rm-bind] button"); if(b){ S[b.parentElement.dataset.rmBind]=b.dataset.v; render(); return; }
+  const up=e.target.closest("[data-rm-up]"), dn=e.target.closest("[data-rm-down]");
+  if(up||dn){ const i=+(up?up.dataset.rmUp:dn.dataset.rmDown), j=up?i-1:i+1; [S.order[i],S.order[j]]=[S.order[j],S.order[i]]; render(); return; }
+  const iu=e.target.closest("[data-rm-iup]"), idn=e.target.closest("[data-rm-idown]");
+  if(iu||idn){ const i=+(iu?iu.dataset.rmIup:idn.dataset.rmIdown), j=iu?i-1:i+1; [S.inputs[i],S.inputs[j]]=[S.inputs[j],S.inputs[i]]; render(); return; }
+  if(e.target.closest("[data-rm-rerun]")){ S.run++; render(); }
+});
+render();
+</script>
+</body>
+</html>
