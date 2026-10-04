@@ -734,9 +734,35 @@ fn settle_ledger(handle: &ConsumerHandle, emitted: &mut EmittedRows) {
 
 impl Drop for DocumentDlqState {
     fn drop(&mut self) {
+        #[cfg(feature = "test-utils")]
+        LAST_DOCUMENT_DLQ_PEAK.with(|peak| peak.set(Some(self.handle.peak_bytes())));
         self.handle.set_bytes(0);
         self.arbitrator.unregister_consumer(self.consumer_id);
     }
+}
+
+#[cfg(feature = "test-utils")]
+thread_local! {
+    /// The charged peak of the last document dead-letter state dropped on
+    /// this thread. Thread-local so concurrent runs in one test binary do
+    /// not read each other's figure.
+    static LAST_DOCUMENT_DLQ_PEAK: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The charged peak of the document dead-letter state of the last run that
+/// finished on this thread, and clears it. `None` when no run on this
+/// thread used `dlq_granularity: document` since the last call.
+///
+/// The state is run-scoped and no node owns it, so it has no entry in
+/// [`crate::executor::ExecutionReport::per_node_peak_charged_bytes`] and
+/// the run-wide `peak_consumer_usage_bytes` mixes it with every other
+/// node's charge. This reads the state's own mark, for a test that must
+/// show the held rows are charged.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub fn take_document_dlq_peak_charged_bytes_for_testing() -> Option<u64> {
+    LAST_DOCUMENT_DLQ_PEAK.with(std::cell::Cell::take)
 }
 
 /// What a held frame's header records about its row besides the encoded

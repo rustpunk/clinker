@@ -8,6 +8,10 @@
 //! only when the budget needs it, and reach the dead-letter output in the
 //! order a rejection writes them: the trigger, then the document's other
 //! failing records in failure order.
+//!
+//! The ample-memory tests read the dead-letter state's own charged peak
+//! through a `test-utils` seam, because the report has no per-node figure
+//! for run-scoped state; they run only with that feature.
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -40,6 +44,7 @@ const PAD_BYTES: usize = 100;
 
 /// The engine columns that differ between two runs of the same input: each
 /// row's id and time, and the trigger id every row of a document carries.
+#[cfg(feature = "test-utils")]
 const RUN_VARIANT_COLUMNS: [&str; 3] = ["_cxl_dlq_id", "_cxl_dlq_trigger_id", "_cxl_dlq_timestamp"];
 
 /// The pipeline: `validate` coerces `value`, which is non-numeric in every
@@ -101,6 +106,7 @@ fn input_files() -> Vec<(String, String)> {
 
 /// The same files with a numeric `value` in every row, so no record fails
 /// and the document dead-letter state holds nothing.
+#[cfg(feature = "test-utils")]
 fn passing_input_files() -> Vec<(String, String)> {
     input_files_with(|row| row.to_string())
 }
@@ -212,6 +218,7 @@ fn held_bytes(rows: &[DlqRow], header: &[String]) -> u64 {
 
 /// Every row as its cells in header order, with the run-variant columns
 /// masked.
+#[cfg(feature = "test-utils")]
 fn masked(rows: &[DlqRow], header: &[String]) -> Vec<Vec<String>> {
     rows.iter()
         .map(|row| {
@@ -304,6 +311,7 @@ fn held_failing_rows_spill_under_a_low_limit_and_keep_their_order() {
     assert!(body.is_empty(), "no record reaches the Sink: {body:?}");
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn held_failing_rows_stay_in_memory_with_ample_memory() {
     let low = run_held_log("2M");
@@ -313,6 +321,7 @@ fn held_failing_rows_stay_in_memory_with_ample_memory() {
         header,
         body,
     } = run_held_log("100G");
+    let charge = held_rows_charge();
     let held = held_bytes(&rows, &header);
 
     assert_eq!(
@@ -321,9 +330,12 @@ fn held_failing_rows_stay_in_memory_with_ample_memory() {
         report.per_stage_spill_bytes
     );
     assert!(
-        held_rows_charge(&report) >= held,
-        "the held rows are charged: peak {} against {held} held bytes",
-        held_rows_charge(&report)
+        charge >= held,
+        "the held rows are charged: the dead-letter state's peak {charge} against {held} held bytes"
+    );
+    assert!(
+        charge > 2 * 1024 * 1024,
+        "the held rows' charge {charge} exceeds the low run's 2 MiB limit"
     );
     assert_rejection_order(&rows);
     assert_eq!(report.counters.dlq_count, low.report.counters.dlq_count);
@@ -336,9 +348,14 @@ fn held_failing_rows_stay_in_memory_with_ample_memory() {
 }
 
 /// The charged peak the ample-memory check compares with the held rows'
-/// bytes.
-fn held_rows_charge(report: &ExecutionReport) -> u64 {
-    report.peak_consumer_usage_bytes
+/// bytes: the document dead-letter state's own mark in the run that last
+/// finished on this thread. The state is run-scoped, so the report has no
+/// per-node figure for it, and the run-wide peak mixes in every other
+/// node's charge.
+#[cfg(feature = "test-utils")]
+fn held_rows_charge() -> u64 {
+    clinker_exec::executor::take_document_dlq_peak_charged_bytes_for_testing()
+        .expect("the run used dlq_granularity: document")
 }
 
 /// The ample-memory check must read the document dead-letter state's own
@@ -346,12 +363,14 @@ fn held_rows_charge(report: &ExecutionReport) -> u64 {
 /// Transform's buffer and the Sink's per-document buckets still hold every
 /// row: a run-wide figure covers the failing run's held bytes anyway, so a
 /// check on it would pass however little the held rows were charged.
+#[cfg(feature = "test-utils")]
 #[test]
 fn the_held_rows_charge_is_the_dead_letter_states_own() {
     let failing = run_held_log("100G");
     let held = held_bytes(&failing.rows, &failing.header);
 
     let (report, sink, body) = run_files("100G", passing_input_files());
+    let charge = held_rows_charge();
     assert!(sink.rows().is_empty(), "no record fails");
     assert_eq!(
         body.len(),
@@ -364,9 +383,8 @@ fn the_held_rows_charge_is_the_dead_letter_states_own() {
         report.peak_consumer_usage_bytes
     );
     assert!(
-        held_rows_charge(&report) < held,
-        "with nothing held, the held rows' charge {} stays below the failing run's {held} held bytes; per-node peaks = {:?}",
-        held_rows_charge(&report),
+        charge < held,
+        "with nothing held, the held rows' charge {charge} stays below the failing run's {held} held bytes; per-node peaks = {:?}",
         report.per_node_peak_charged_bytes
     );
 }

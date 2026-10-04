@@ -56,6 +56,9 @@ use context::{SourceRuntimePolicy, build_stable_eval_context};
 pub use dispatch::DispatchFaultGuard;
 pub use dlq::{DlqEntry, DlqFailureStamp};
 pub(crate) use dlq::{SourceRejectionEvent, SourceRejectionKind};
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub use document_dlq::take_document_dlq_peak_charged_bytes_for_testing;
 pub use ingest::build_source_format_reader;
 use ingest::{IngestTaskOutcome, ingest_source};
 use params::sum_cpu_io_totals;
