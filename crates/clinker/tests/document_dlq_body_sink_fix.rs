@@ -254,15 +254,17 @@ fn remove_sink(path: &Path, name: &str) {
     std::fs::write(path, kept.join("\n") + "\n").expect("write composition");
 }
 
-/// Rewrite every read of `bare` that names no port to read `qualified`.
+/// Rewrite every read of `bare` that names no port to read `qualified`: an
+/// `input:`, a call's `inputs:` entry or a `_compose.outputs:` entry whose
+/// value is `bare`. A node's own `name:` is not a read.
 fn qualify_reads(path: &Path, bare: &str, qualified: &str) {
     let text = std::fs::read_to_string(path).expect("read file");
     let suffix = format!(": {bare}");
     let rewritten: Vec<String> = text
         .lines()
         .map(|line| match line.strip_suffix(&suffix) {
-            Some(head) => format!("{head}: {qualified}"),
-            None => line.to_owned(),
+            Some(head) if head.trim() != "name" => format!("{head}: {qualified}"),
+            _ => line.to_owned(),
         })
         .collect();
     std::fs::write(path, rewritten.join("\n") + "\n").expect("write file");
@@ -349,10 +351,11 @@ fn stderr(output: &Output) -> String {
     )
 }
 
-/// Every `.csv` file a run wrote next to the pipeline, by file name.
+/// Every `.csv` file a run wrote: relative Sink and dead-letter paths resolve
+/// against the working directory, the workspace root here.
 fn outputs(root: &Path) -> BTreeMap<String, Vec<u8>> {
-    std::fs::read_dir(root.join("pipelines"))
-        .expect("read pipelines dir")
+    std::fs::read_dir(root)
+        .expect("read the workspace root")
         .map(|entry| entry.expect("dir entry").path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "csv"))
         .map(|path| {
@@ -467,7 +470,7 @@ fn applying_the_e378_fix_keeps_a_rejected_document_out_of_the_moved_sink() {
             "{sink} holds the clean document only"
         );
     }
-    let mut ids = dead_letter_ids(&fixed.path().join("pipelines/rejected.csv"));
+    let mut ids = dead_letter_ids(&fixed.path().join("rejected.csv"));
     ids.sort_unstable();
     assert_eq!(
         ids,

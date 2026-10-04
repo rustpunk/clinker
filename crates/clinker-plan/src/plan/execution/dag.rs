@@ -471,8 +471,13 @@ pub(crate) fn diagnose_untagged_composition_edges(
 /// inside its composition's dispatch, in the middle of the top-level walk,
 /// where that ordering cannot reach it; it could write a document that a
 /// later operator condemns. The combination is refused rather than
-/// guaranteed for some Sinks only. How body Sinks are wired is tracked in
-/// issue #1242.
+/// guaranteed for some Sinks only.
+///
+/// The help is one fix, the move: each edit is a fragment the author can
+/// paste, and the pipeline Sink block carries the body Sink's compiled
+/// configuration rendered back to YAML. The explain page, not the help,
+/// keeps the record-granularity alternative and the issue that tracks body
+/// Sinks.
 ///
 /// The caller runs this only when a Source declares document granularity;
 /// `source` names the first such Source in declaration order. The walk
@@ -534,6 +539,7 @@ pub(crate) fn diagnose_document_dlq_body_sinks(
             let PlanNode::Sink {
                 name: sink,
                 span: sink_span,
+                resolved,
                 ..
             } = &body.graph[idx]
             else {
@@ -554,6 +560,7 @@ pub(crate) fn diagnose_document_dlq_body_sinks(
                 })
                 .unwrap_or_else(|| "<the node the Sink reads>".to_owned());
             let call = call_site.name;
+            let file = composition_file_label(&body.signature_path);
             let message = format!(
                 "composition {quoted_call} declares Sink {quoted_sink} in its body, but \
                  source {quoted_source} declares `dlq_granularity: document`, which needs \
@@ -562,24 +569,39 @@ pub(crate) fn diagnose_document_dlq_body_sinks(
                 quoted_sink = sink.quoted_name(),
                 quoted_source = source.quoted_name(),
             );
-            let mut help = format!(
-                "move the Sink to the pipeline: in the composition file, under \
-                 `_compose.outputs:`, add `{sink}: {feeding}` and remove Sink \
-                 {quoted_sink} from its `nodes:`; then under the pipeline's `nodes:` \
-                 add\n  - type: sink\n    name: {sink}\n    input: {call}.{sink}\n    \
-                 config: <the body Sink's `config:`, unchanged>",
-                quoted_sink = sink.quoted_name(),
-            );
+            let mut steps = vec![
+                format!("in `{file}`, under `_compose.outputs:`, add:\n    {sink}: {feeding}"),
+                format!(
+                    "in `{file}`, remove Sink {quoted_sink} from `nodes:`",
+                    quoted_sink = sink.quoted_name()
+                ),
+                format!(
+                    "under the pipeline's `nodes:`, add:\n  - type: sink\n    name: {sink}\n    \
+                     input: {call}.{sink}\n{config}",
+                    config = render_sink_config(resolved.as_deref().map(|p| &p.sink), sink),
+                ),
+            ];
             if let [(only_port, _)] = body
                 .output_port_to_node_idx
                 .iter()
                 .collect::<Vec<_>>()
                 .as_slice()
             {
-                help.push_str(&format!(
-                    "\nthe composition then has two output ports, so a node that reads it \
-                     as `input: {call}` must read `input: {call}.{only_port}`"
+                steps.push(format!(
+                    "composition {quoted_call} then has two output ports, so read \
+                     `{call}.{only_port}` wherever the pipeline reads `{call}` without a port",
+                    quoted_call = call.quoted_name(),
                 ));
+            }
+            let mut help = format!(
+                "move Sink {quoted_sink} to the pipeline and feed it through a new output port \
+                 of composition {quoted_call}, so it writes only after every document's \
+                 verdict is final",
+                quoted_sink = sink.quoted_name(),
+                quoted_call = call.quoted_name(),
+            );
+            for (number, step) in steps.iter().enumerate() {
+                help.push_str(&format!("\n{}. {step}", number + 1));
             }
             if !call_site.top_level {
                 help.push_str(&format!(
@@ -589,11 +611,6 @@ pub(crate) fn diagnose_document_dlq_body_sinks(
                     quoted_call = call.quoted_name(),
                 ));
             }
-            help.push_str(&format!(
-                "\nor set `dlq_granularity: record` on source {quoted_source}\nSinks inside \
-                 composition bodies are tracked in issue #1242",
-                quoted_source = source.quoted_name(),
-            ));
             out.push(
                 Diagnostic::error(
                     "E378",
@@ -609,6 +626,39 @@ pub(crate) fn diagnose_document_dlq_body_sinks(
         }
     }
     out
+}
+
+/// A composition file as the help names it: its workspace-relative path with
+/// `/` between components, the form a `use:` line spells on every platform.
+fn composition_file_label(path: &std::path::Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The `config:` lines of a pipeline Sink block: the body Sink's compiled
+/// configuration rendered back to YAML, indented under `config:`.
+///
+/// Every lowered Sink carries its configuration and a `SinkConfig` always
+/// serializes, so the fallback is reached only if lowering changes shape; it
+/// says in words where to copy the block from rather than print YAML that
+/// would not compile.
+fn render_sink_config(sink: Option<&crate::config::SinkConfig>, name: &str) -> String {
+    use clinker_core_types::QuoteName;
+    let Some(Ok(rendered)) = sink.map(crate::yaml::to_string) else {
+        return format!(
+            "    config: copy the `config:` block of Sink {quoted} from the composition file \
+             unchanged",
+            quoted = name.quoted_name()
+        );
+    };
+    let mut block = String::from("    config:");
+    for line in rendered.lines().filter(|line| !line.trim().is_empty()) {
+        block.push_str("\n      ");
+        block.push_str(line);
+    }
+    block
 }
 
 /// Extract the cycle path from a DFS back-edge detection.
