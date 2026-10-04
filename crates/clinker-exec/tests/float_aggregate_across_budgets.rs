@@ -336,3 +336,206 @@ fn relaxed_avg_and_weighted_avg_retract_like_a_baseline_rerun() {
         baseline.csv
     );
 }
+
+// ---- an ill-conditioned column, resident, spilled, streamed and windowed ----
+
+/// Groups in the ill-conditioned fixture. The hash table's periodic memory
+/// check runs every 4,096 folded rows, so with 4,096 groups it falls exactly
+/// where each pass ends.
+const ILL_GROUPS: i64 = 4_096;
+
+/// The event time of every row: one tumbling window holds the whole input.
+const ILL_EVENT_TS: &str = "2026-05-14T10:00:00";
+
+/// Each group's `(x, d)` cells, pass by pass: a float column whose partial
+/// sums are not representable, and a decimal column of the same shape.
+const ILL_PASSES: [(&str, &str); 3] = [
+    ("10000000000000000", "10000000000000000.1"),
+    ("1", "0.01"),
+    ("-10000000000000000", "-10000000000000000.1"),
+];
+
+/// How the Aggregate runs over the ill-conditioned fixture.
+#[derive(Clone, Copy, Debug)]
+enum Strategy {
+    /// The default (hash) strategy.
+    Hash,
+    /// `strategy: streaming`, over a Source that declares its order on `g`.
+    Streaming,
+    /// A tumbling time window over a Source that declares a watermark.
+    Window,
+}
+
+/// A typed Source of `g`, `x`, `w`, `d` and `event_ts` feeding an Aggregate
+/// `grouped` directly, with no Transform, emitting the float `sum`, `avg` and
+/// `weighted_avg` of `x` and the decimal `sum` of `d` per `g`.
+fn ill_conditioned_yaml(strategy: Strategy) -> String {
+    let (source_extra, aggregate_extra, key_emit) = match strategy {
+        Strategy::Hash => ("", "", ""),
+        Strategy::Streaming => (
+            "\n      sort_order:\n        - { field: g, order: asc }",
+            "\n      strategy: streaming",
+            "",
+        ),
+        Strategy::Window => (
+            "\n      watermark: { column: event_ts }",
+            "\n      time_window:\n        tumbling: { size: 1h }",
+            // A windowed Aggregate writes only the columns it emits.
+            "\n        emit g = g",
+        ),
+    };
+    format!(
+        r#"
+pipeline:
+  name: ill_conditioned_sum
+  memory: {{ limit: "512M", backpressure: spill }}
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv{source_extra}
+      schema:
+        - {{ name: g, type: int }}
+        - {{ name: x, type: float }}
+        - {{ name: w, type: int }}
+        - {{ name: d, type: decimal }}
+        - {{ name: event_ts, type: date_time }}
+  - type: aggregate
+    name: grouped
+    input: src
+    config:
+      group_by: [g]{aggregate_extra}
+      cxl: |{key_emit}
+        emit s = sum(x)
+        emit a = avg(x)
+        emit wa = weighted_avg(x, w)
+        emit ds = sum(d)
+  - type: sink
+    name: csv
+    input: grouped
+    config:
+      name: csv
+      type: csv
+      path: out.csv
+      include_unmapped: true
+"#
+    )
+}
+
+/// The fixture's rows. In passes (every group's first value, then every
+/// group's second, then every group's third) unless `by_group`, which writes
+/// each group's three rows together, in pass order, for the streaming
+/// strategy's sorted input.
+fn ill_conditioned_rows(by_group: bool) -> String {
+    let mut cells: Vec<(i64, usize)> = Vec::new();
+    if by_group {
+        for g in 0..ILL_GROUPS {
+            cells.extend((0..ILL_PASSES.len()).map(|pass| (g, pass)));
+        }
+    } else {
+        for pass in 0..ILL_PASSES.len() {
+            cells.extend((0..ILL_GROUPS).map(|g| (g, pass)));
+        }
+    }
+    let mut csv = String::from("g,x,w,d,event_ts\n");
+    for (g, pass) in cells {
+        let (x, d) = ILL_PASSES[pass];
+        csv.push_str(&format!("{g},{x},1,{d},{ILL_EVENT_TS}\n"));
+    }
+    csv
+}
+
+/// Group `g`'s expected line. The CSV writer prints a float with Rust's
+/// shortest round-trip form, so `1.0` is `1` and the double nearest 1/3 is
+/// `0.3333333333333333`, and a decimal at its scale, so `0.01` is `0.01`.
+fn ill_conditioned_line(g: i64) -> String {
+    format!("{g},1,0.3333333333333333,0.3333333333333333,0.01")
+}
+
+/// Ledger capacity of the spilling ill-conditioned run: 6 MiB (6,291,456
+/// bytes).
+///
+/// With ample memory the fixture charges P = 9,437,784 bytes at its peak, of
+/// which the Aggregate's own state is 4,915,200 and the Source's buffer
+/// feeding it 4,521,984. It completes at M = 4,523,000 bytes and is refused
+/// at 4,520,000, where the Source buffer's materialization (4,522,584 bytes
+/// projected) no longer fits. 6 MiB lies between M and P. At it the hash
+/// table spills at rows 2,098, 4,096, 6,194, 8,192, 10,290 and 12,288: its
+/// periodic memory check spills it at 4,096 and 8,192, where the first and
+/// second passes end, so no spill run holds rows of two passes and each
+/// group's three addends reach the finalize merge from three different runs.
+/// The fixture is new, so there is no earlier limit L; every run's
+/// `memory.limit` is 512M.
+const ILL_SPILL_CAPACITY: u64 = 6 * 1024 * 1024;
+
+/// `sum`, `avg` and `weighted_avg` of an ill-conditioned float column, and
+/// `sum` of a decimal column, are exact whether the Aggregate holds every
+/// group in memory, spills its hash table between passes so that each
+/// pass's partial state is merged from its own run, streams over input
+/// sorted on the group key, or runs as a tumbling time window.
+///
+/// Every group's `x` is `1e16`, `1` and `-1e16`, with weight `1`. The exact
+/// total is `1`. A left-to-right fold gives `0`: `1e16 + 1` lies halfway
+/// between the doubles `1e16` and `1e16 + 2` (the spacing of doubles there is
+/// 2) and rounds to the even `1e16`, which `-1e16` then cancels. `-1e16 + 1`
+/// rounds to `-1e16` the same way, so every fold that does not add the `1`
+/// last loses it, and only an exact sum gives `1` whatever the order, the
+/// spill runs or the merge. A column whose partial sums are all representable
+/// gives the same total in every order, so it cannot tell an exact sum from
+/// an order-dependent one; this one can. `avg` and `weighted_avg` divide the exact total,
+/// rounded once, by 3, which gives the double nearest 1/3. The decimal `d` is
+/// `10000000000000000.1`, `0.01` and `-10000000000000000.1`: its exact total
+/// is `0.01`, at the largest input scale, 2.
+///
+/// A hash Aggregate writes its groups in hash-table order, so those outputs
+/// are compared as sets of lines; the streaming run's output is in key order
+/// and is compared byte for byte.
+#[test]
+fn an_ill_conditioned_sum_is_exact_at_every_capacity_and_strategy() {
+    let mut expected: Vec<String> = (0..ILL_GROUPS).map(ill_conditioned_line).collect();
+    expected.push("g,s,a,wa,ds".to_string());
+    expected.sort();
+    let passes = ill_conditioned_rows(false);
+
+    let ample = run(&ill_conditioned_yaml(Strategy::Hash), &passes, None);
+    assert_eq!(sorted_lines(&ample.csv), expected, "hash, ample memory");
+
+    let spilled = run(
+        &ill_conditioned_yaml(Strategy::Hash),
+        &passes,
+        Some(ILL_SPILL_CAPACITY),
+    );
+    assert_eq!(
+        sorted_lines(&spilled.csv),
+        expected,
+        "hash, spilled at {ILL_SPILL_CAPACITY} bytes"
+    );
+    memory_pressure::assert_spill_engaged(&spilled.report);
+    memory_pressure::assert_capacity_below_ample_peak(ILL_SPILL_CAPACITY, &ample.report);
+    assert!(
+        spilled
+            .report
+            .per_stage_spill_bytes_written
+            .get("grouped")
+            .is_some_and(|bytes| *bytes > 0),
+        "the Aggregate itself must spill at {ILL_SPILL_CAPACITY} bytes: {:?}",
+        spilled.report.per_stage_spill_bytes_written
+    );
+
+    let streamed = run(
+        &ill_conditioned_yaml(Strategy::Streaming),
+        &ill_conditioned_rows(true),
+        None,
+    );
+    let mut in_key_order = String::from("g,s,a,wa,ds\n");
+    for g in 0..ILL_GROUPS {
+        in_key_order.push_str(&ill_conditioned_line(g));
+        in_key_order.push('\n');
+    }
+    assert_eq!(streamed.csv, in_key_order, "streaming");
+
+    let windowed = run(&ill_conditioned_yaml(Strategy::Window), &passes, None);
+    assert_eq!(sorted_lines(&windowed.csv), expected, "time window");
+}
