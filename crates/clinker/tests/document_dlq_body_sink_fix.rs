@@ -591,22 +591,86 @@ nodes:
         emit value = value * 2
 "#;
 
-/// Both compositions called from the pipeline, each read by its bare name.
-fn two_sinks_and_nested_pipeline() -> String {
+/// A composition whose Sink `audit` reads `shape` while its one port reads
+/// `doubled`, which reads `shape` too. `port` picks the node behind `out`.
+fn shared_node_comp(port: &str) -> String {
+    format!(
+        r#"_compose:
+  name: shared
+  inputs:
+    inp:
+      schema:
+        - {{ name: id, type: string }}
+        - {{ name: value, type: string }}
+  outputs:
+    out: {port}
+  config_schema: {{}}
+
+nodes:
+  - type: transform
+    name: shape
+    input: inp
+    config:
+      cxl: |
+        emit id = id
+        emit value = value.to_int()
+  - type: transform
+    name: doubled
+    input: shape
+    config:
+      cxl: |
+        emit id = id
+        emit value = value * 2
+  - type: sink
+    name: audit
+    input: shape
+    config:
+      name: audit
+      type: csv
+      path: audit.csv
+"#
+    )
+}
+
+/// One call per `(name, use)` pair, each read by a pipeline Sink of its own
+/// by its bare name.
+fn calls_pipeline(calls: &[(&str, &str)]) -> String {
+    let mut nodes = String::new();
+    for (name, file) in calls {
+        nodes.push_str(&format!(
+            r#"  - type: composition
+    name: {name}
+    input: events
+    use: ../compositions/{file}
+    inputs:
+      inp: events
+  - type: sink
+    name: {name}_out
+    input: {name}
+    config:
+      name: {name}_out
+      type: csv
+      path: {name}_out.csv
+"#
+        ));
+    }
+    format!(
+        "{head}{source}{nodes}",
+        head = pipeline_head("document_dlq_body_sink_calls"),
+        source = source_node("document"),
+    )
+}
+
+/// The two-Sink call, with a pipeline Sink already called `audit`.
+fn two_sinks_pipeline() -> String {
     format!(
         "{head}{source}{rest}",
-        head = pipeline_head("document_dlq_body_sinks_nested"),
+        head = pipeline_head("document_dlq_body_sinks"),
         source = source_node("document"),
         rest = r#"  - type: composition
     name: enrich
     input: events
     use: ../compositions/two_sinks.comp.yaml
-    inputs:
-      inp: events
-  - type: composition
-    name: wrap
-    input: events
-    use: ../compositions/outer.comp.yaml
     inputs:
       inp: events
   - type: sink
@@ -617,22 +681,23 @@ fn two_sinks_and_nested_pipeline() -> String {
       type: csv
       path: primary.csv
   - type: sink
-    name: wrapped
-    input: wrap
+    name: audit
+    input: enrich
     config:
-      name: wrapped
+      name: audit
       type: csv
-      path: wrapped.csv
+      path: primary_audit.csv
 "#,
     )
 }
 
-/// The same work without compositions, on record granularity: each body
-/// Transform at pipeline level and each Sink reading the node it read.
-fn two_sinks_and_nested_reference() -> String {
+/// The same work without the composition, on record granularity: the body
+/// Transform at pipeline level and every Sink reading it, the moved `audit`
+/// under the name the help gives it.
+fn two_sinks_reference() -> String {
     format!(
         "{head}{source}{rest}",
-        head = pipeline_head("document_dlq_body_sinks_nested_reference"),
+        head = pipeline_head("document_dlq_body_sinks_reference"),
         source = source_node("record"),
         rest = r#"  - type: transform
     name: shape
@@ -641,20 +706,6 @@ fn two_sinks_and_nested_reference() -> String {
       cxl: |
         emit id = id
         emit value = value.to_int()
-  - type: transform
-    name: inner_shape
-    input: events
-    config:
-      cxl: |
-        emit id = id
-        emit value = value.to_int()
-  - type: transform
-    name: stamp
-    input: inner_shape
-    config:
-      cxl: |
-        emit id = id
-        emit value = value * 2
   - type: sink
     name: primary
     input: shape
@@ -663,6 +714,13 @@ fn two_sinks_and_nested_reference() -> String {
       type: csv
       path: primary.csv
   - type: sink
+    name: audit
+    input: shape
+    config:
+      name: audit
+      type: csv
+      path: primary_audit.csv
+  - type: sink
     name: out
     input: shape
     config:
@@ -670,44 +728,28 @@ fn two_sinks_and_nested_reference() -> String {
       type: csv
       path: out_copy.csv
   - type: sink
-    name: audit
+    name: audit_2
     input: shape
     config:
-      name: audit
+      name: audit_2
       type: csv
       path: audit.csv
-  - type: sink
-    name: inner_audit
-    input: inner_shape
-    config:
-      name: inner_audit
-      type: csv
-      path: inner_audit.csv
-  - type: sink
-    name: wrapped
-    input: stamp
-    config:
-      name: wrapped
-      type: csv
-      path: wrapped.csv
 "#,
     )
 }
 
 #[test]
-fn applying_every_e378_fix_for_two_body_sinks_and_a_nested_call() {
-    let pipeline = two_sinks_and_nested_pipeline();
+fn applying_every_e378_fix_for_two_body_sinks_and_a_taken_sink_name() {
+    let pipeline = two_sinks_pipeline();
     let files = [
         ("compositions/two_sinks.comp.yaml", TWO_SINK_COMP),
-        ("compositions/inner.comp.yaml", INNER_COMP),
-        ("compositions/outer.comp.yaml", OUTER_COMP),
         (PIPELINE, pipeline.as_str()),
     ];
     let inputs = [("a.csv", CLEAN_DOCUMENT)];
     let fixed = workspace(&files, &inputs);
-    apply_every_help_and_run(fixed.path(), 3, 0);
+    apply_every_help_and_run(fixed.path(), 2, 0);
 
-    let reference_pipeline = two_sinks_and_nested_reference();
+    let reference_pipeline = two_sinks_reference();
     let reference = workspace(&[(PIPELINE, reference_pipeline.as_str())], &inputs);
     let reference_run = run(reference.path());
     assert_eq!(
@@ -722,10 +764,9 @@ fn applying_every_e378_fix_for_two_body_sinks_and_a_nested_call() {
         written.keys().collect::<Vec<_>>(),
         [
             "audit.csv",
-            "inner_audit.csv",
             "out_copy.csv",
             "primary.csv",
-            "wrapped.csv"
+            "primary_audit.csv"
         ],
         "every Sink writes, and nothing is dead-lettered"
     );
@@ -733,5 +774,76 @@ fn applying_every_e378_fix_for_two_body_sinks_and_a_nested_call() {
         written,
         outputs(reference.path()),
         "every Sink writes what the reference writes"
+    );
+}
+
+#[test]
+fn e378_gives_one_next_step_where_the_move_would_not_run() {
+    let shared_first = shared_node_comp("shape");
+    let shared_other = shared_node_comp("doubled");
+    let cases: [(&str, Vec<(&str, &str)>, String); 4] = [
+        (
+            "a Sink in a nested call",
+            vec![
+                ("compositions/inner.comp.yaml", INNER_COMP),
+                ("compositions/outer.comp.yaml", OUTER_COMP),
+            ],
+            calls_pipeline(&[("wrap", "outer.comp.yaml")]),
+        ),
+        (
+            "a Sink reading a node no first port reads",
+            vec![("compositions/shared.comp.yaml", shared_other.as_str())],
+            calls_pipeline(&[("enrich", "shared.comp.yaml")]),
+        ),
+        (
+            "a port node another body node reads",
+            vec![("compositions/shared.comp.yaml", shared_first.as_str())],
+            calls_pipeline(&[("enrich", "shared.comp.yaml")]),
+        ),
+        (
+            "one body Sink reached by two calls",
+            vec![("compositions/audited.comp.yaml", AUDITED_COMP)],
+            calls_pipeline(&[
+                ("enrich", "audited.comp.yaml"),
+                ("again", "audited.comp.yaml"),
+            ]),
+        ),
+    ];
+    for (case, compositions, pipeline) in cases {
+        let mut files = compositions;
+        files.push((PIPELINE, pipeline.as_str()));
+        let dir = workspace(&files, &[("a.csv", CLEAN_DOCUMENT)]);
+        for help in e378_helps(dir.path()) {
+            assert!(
+                help.starts_with("run `clinker explain --code E378` and follow its steps")
+                    && !help.contains('\n'),
+                "{case}: the help is the one next step, got:\n{help}"
+            );
+        }
+        let refused = run(dir.path());
+        assert_eq!(
+            refused.status.code(),
+            Some(1),
+            "{case}: {}",
+            stderr(&refused)
+        );
+        let refused_stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            refused_stderr.contains("E378"),
+            "{case}: {}",
+            stderr(&refused)
+        );
+    }
+
+    // The page the step names covers why these shapes cannot move today.
+    let explain = Command::new(env!("CARGO_BIN_EXE_clinker"))
+        .args(["explain", "--code", "E378"])
+        .output()
+        .expect("spawn clinker");
+    assert!(explain.status.success(), "{}", stderr(&explain));
+    let page = String::from_utf8_lossy(&explain.stdout);
+    assert!(
+        page.contains("#1315"),
+        "`clinker explain --code E378` names the issue that blocks the move:\n{page}"
     );
 }

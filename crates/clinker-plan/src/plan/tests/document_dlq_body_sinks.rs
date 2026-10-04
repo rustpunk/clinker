@@ -346,10 +346,9 @@ fn e378_proposes_a_port_no_output_already_uses() {
     }
 }
 
-#[test]
-fn e378_surfaces_the_port_through_each_enclosing_composition() {
-    let inner = composition("inner", "    out: shape", &body_sink("audit"));
-    let outer = r#"_compose:
+/// The outer composition of the nested-call fixtures: it calls
+/// `./inner.comp.yaml` as `inner` and reads it by its bare name.
+const OUTER_COMP: &str = r#"_compose:
   name: outer
   inputs:
     inp:
@@ -375,10 +374,36 @@ nodes:
         emit id = id
         emit value = value
 "#;
+
+/// A body Transform `doubled` reading `shape`.
+const DOUBLED: &str = r#"  - type: transform
+    name: doubled
+    input: shape
+    config:
+      cxl: |
+        emit id = id
+        emit value = value
+"#;
+
+/// The help of a body Sink that cannot be moved today: one sentence naming
+/// the explain page as the one next step, then the reason. No numbered
+/// steps, no second option, no issue number.
+fn assert_next_step(help: &str, sink: &str, reason: &str) {
+    let expected = format!(
+        "run `clinker explain --code E378` and follow its steps for declaring Sink \
+         \"{sink}\" at pipeline level: moving it through a composition output port does \
+         not work here, because {reason}"
+    );
+    assert_eq!(help, expected, "the help is the one next step");
+}
+
+#[test]
+fn e378_gives_the_next_step_for_a_sink_in_a_nested_call() {
+    let inner = composition("inner", "    out: shape", &body_sink("audit"));
     let diags = e378_for(
         &[
             ("compositions/inner.comp.yaml", &inner),
-            ("compositions/outer.comp.yaml", outer),
+            ("compositions/outer.comp.yaml", OUTER_COMP),
         ],
         r#"  - type: composition
     name: wrap
@@ -396,20 +421,122 @@ nodes:
 "#,
     );
     assert_eq!(diags.len(), 1, "one E378 for the one body Sink");
-    let help = help_for(&diags, "audit");
-    for fragment in [
-        "in `compositions/inner.comp.yaml`, under `_compose.outputs:`, add:\n    audit: shape\n",
-        "in `compositions/inner.comp.yaml`, remove Sink \"audit\" from `nodes:`",
-        "composition \"inner\" then has 2 output ports, so read `inner.out` wherever \
-         `compositions/outer.comp.yaml` reads `inner` without a port",
-        "in `compositions/outer.comp.yaml`, under `_compose.outputs:`, add:\n    audit: inner.audit\n",
-        "composition \"wrap\" then has 2 output ports, so read `wrap.out` wherever the \
-         pipeline reads `wrap` without a port",
-        "\n    name: audit\n    input: wrap.audit\n",
-    ] {
+    assert_next_step(
+        help_for(&diags, "audit"),
+        "audit",
+        "composition \"inner\" is called inside another composition",
+    );
+}
+
+#[test]
+fn e378_gives_the_next_step_when_the_sink_reads_another_port_node() {
+    let comp = composition(
+        "audited",
+        "    out: doubled",
+        &(DOUBLED.to_owned() + &body_sink("audit")),
+    );
+    let diags = e378_for(&[("compositions/audited.comp.yaml", &comp)], ENRICH_CALL);
+    assert_eq!(diags.len(), 1, "one E378 for the one body Sink");
+    assert_next_step(
+        help_for(&diags, "audit"),
+        "audit",
+        "Sink \"audit\" reads \"shape\", and only the first output port of composition \
+         \"enrich\", `out` from \"doubled\", carries rows to the pipeline",
+    );
+}
+
+#[test]
+fn e378_gives_the_next_step_when_the_port_node_has_another_body_reader() {
+    let comp = composition(
+        "audited",
+        "    out: shape",
+        &(DOUBLED.to_owned() + &body_sink("audit")),
+    );
+    let diags = e378_for(&[("compositions/audited.comp.yaml", &comp)], ENRICH_CALL);
+    assert_eq!(diags.len(), 1, "one E378 for the one body Sink");
+    assert_next_step(
+        help_for(&diags, "audit"),
+        "audit",
+        "\"shape\" also feeds \"doubled\" inside composition \"enrich\", and a composition \
+         output port cannot yet carry rows from a node that another node in the \
+         composition reads",
+    );
+}
+
+#[test]
+fn e378_gives_the_next_step_when_two_calls_reach_the_same_sink() {
+    let comp = composition("audited", "    out: shape", &body_sink("audit"));
+    let diags = e378_for(
+        &[("compositions/audited.comp.yaml", &comp)],
+        &(ENRICH_CALL.to_owned()
+            + r#"  - type: composition
+    name: enrich_again
+    input: events
+    use: ../compositions/audited.comp.yaml
+    inputs:
+      inp: events
+  - type: sink
+    name: again
+    input: enrich_again
+    config:
+      name: again
+      type: csv
+      path: again.csv
+"#),
+    );
+    assert_eq!(diags.len(), 2, "one E378 per call's body Sink");
+    for diag in &diags {
+        assert_next_step(
+            diag.help.as_deref().expect("E378 carries a help text"),
+            "audit",
+            "`compositions/audited.comp.yaml` is used by 2 composition calls, so the moved \
+             Sink would be declared once per call, each writing the same output",
+        );
+    }
+}
+
+#[test]
+fn e378_names_the_moved_sink_so_no_pipeline_node_already_uses_it() {
+    // A pipeline Sink is already called `audit`, and two compositions each
+    // move a Sink called `audit`: the first takes `audit_2`, the second
+    // `audit_3`, and each renders its `config.name` to match.
+    let audited = composition("audited", "    out: shape", &body_sink("audit"));
+    let checked = composition("checked", "    out: shape", &body_sink("audit"));
+    let diags = e378_for(
+        &[
+            ("compositions/audited.comp.yaml", &audited),
+            ("compositions/checked.comp.yaml", &checked),
+        ],
+        &(ENRICH_CALL.to_owned()
+            + r#"  - type: composition
+    name: check
+    input: events
+    use: ../compositions/checked.comp.yaml
+    inputs:
+      inp: events
+  - type: sink
+    name: audit
+    input: check
+    config:
+      name: audit
+      type: csv
+      path: pipeline_audit.csv
+"#),
+    );
+    assert_eq!(diags.len(), 2, "one E378 per body Sink");
+    for (call, name) in [("enrich", "audit_2"), ("check", "audit_3")] {
+        let diag = diags
+            .iter()
+            .find(|d| d.message.contains(&format!("composition \"{call}\"")))
+            .unwrap_or_else(|| panic!("an E378 for the Sink in {call}"));
+        let help = diag.help.as_deref().expect("E378 carries a help text");
+        let fragment = format!(
+            "\n  - type: sink\n    name: {name}\n    input: {call}.audit\n    config:\n      \
+             name: {name}\n      path: audit.csv\n"
+        );
         assert!(
-            help.contains(fragment),
-            "the help carries {fragment:?}: {help}"
+            help.contains(&fragment),
+            "the help for {call} carries {fragment:?}: {help}"
         );
     }
 }
