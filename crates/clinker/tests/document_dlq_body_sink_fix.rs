@@ -781,7 +781,7 @@ fn applying_every_e378_fix_for_two_body_sinks_and_a_taken_sink_name() {
 fn e378_gives_one_next_step_where_the_move_would_not_run() {
     let shared_first = shared_node_comp("shape");
     let shared_other = shared_node_comp("doubled");
-    let cases: [(&str, Vec<(&str, &str)>, String); 4] = [
+    let cases = [
         (
             "a Sink in a nested call",
             vec![
