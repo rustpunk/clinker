@@ -7,9 +7,12 @@
 //! A numeric aggregate's result is the exact value of its definition over the
 //! group's values, rounded once, or one of these errors: a failure is never
 //! reported as a null or as a total that silently left out some values. Each
-//! message names the rule the group broke and gives a CXL form the author can
-//! paste; the aggregation engine prefixes the Aggregate and the `emit` that
-//! failed.
+//! message names the rule the group broke and gives one fix, in a form the
+//! author can paste: a CXL expression, a Source schema type or a Transform
+//! config, with the example column named so the author knows what to put in
+//! its place. No fix converts a float to a decimal, which would keep the
+//! float's binary digits. The aggregation engine prefixes the Aggregate and
+//! the `emit` that failed.
 
 use std::fmt;
 
@@ -28,6 +31,8 @@ pub enum AccumulatorError {
     /// Finalize uses `i64::try_from` on the internal i128 sum — never
     /// `as i64` — so overflow surfaces as this error rather than silently
     /// wrapping. Mirrors DuckDB's `HUGEINT` overflow-on-finalize pattern.
+    /// The message's fix sums the column as a decimal, which holds an
+    /// integer total exactly.
     SumOverflow { field: Option<String> },
     /// A decimal total — of `sum`, of the sum `avg` divides, or of either sum
     /// `weighted_avg` divides — is outside the decimal range. Decided on the
@@ -36,6 +41,7 @@ pub enum AccumulatorError {
     DecimalOutOfRange,
     /// An `avg` or `weighted_avg` decimal quotient is outside the decimal
     /// range although both totals are inside it (weights that nearly cancel).
+    /// The message prints the two emits that show the totals.
     QuotientOutOfRange,
     /// A `weighted_avg` row the group holds has a `value * weight` product
     /// outside the decimal range. Counted per row, so retracting the row
@@ -55,16 +61,21 @@ impl fmt::Display for AccumulatorError {
         match self {
             Self::SumOverflow { field: Some(name) } => write!(
                 f,
-                "integer sum overflow on field '{name}' (i64 range exceeded)"
+                "integer sum overflow on field '{name}' (i64 range exceeded); sum the column \
+                 as a decimal instead, `sum({name}.to_decimal())`"
             ),
-            Self::SumOverflow { field: None } => {
-                write!(f, "integer sum overflow (i64 range exceeded)")
-            }
+            Self::SumOverflow { field: None } => write!(
+                f,
+                "integer sum overflow (i64 range exceeded); sum the column as a decimal \
+                 instead, for example `sum(amount.to_decimal())` with your column in place \
+                 of `amount`"
+            ),
             Self::DecimalOutOfRange => write!(
                 f,
                 "decimal total out of range: the group's exact decimal total is outside \
-                 {DECIMAL_RANGE}; aggregate the argument's `.to_float()` if a binary \
-                 float's range and precision will do"
+                 {DECIMAL_RANGE}; aggregate the column as floats, for example \
+                 `sum(amount.to_float())` with your column in place of `amount`, if a \
+                 binary float's range and precision will do"
             ),
             Self::QuotientOutOfRange => write!(
                 f,
@@ -74,23 +85,25 @@ impl fmt::Display for AccumulatorError {
             ),
             Self::ProductOverflow => write!(
                 f,
-                "decimal product out of range: a row's `value * weight` is outside the \
-                 decimal range; convert the operands with `.to_float()` or scale them down \
-                 before the Aggregate"
+                "decimal product out of range: a row's value times its weight is outside \
+                 the decimal range; compute the average in floats, for example \
+                 `weighted_avg(price.to_float(), qty.to_float())` with your columns in place \
+                 of `price` and `qty`"
             ),
             Self::ZeroTotalWeight => write!(
                 f,
                 "zero total weight: the group's weights add up to exactly zero, so the \
-                 weighted average divides by zero; drop zero-weight rows before the \
-                 Aggregate (for example `filter qty != 0`) or emit `sum(value * weight)` \
-                 and `sum(weight)` separately"
+                 weighted average divides by zero; rows whose weight is zero add nothing to \
+                 the average, so add a Transform before the Aggregate with \
+                 `config: {{ cxl: \"filter qty != 0\" }}`, with your weight column in place \
+                 of `qty`"
             ),
             Self::MixedDecimalFloat => write!(
                 f,
                 "decimal and float in one group: a decimal is never added to a float \
-                 without an explicit conversion; convert the aggregate's argument to one \
-                 numeric type, for example `sum(price.to_decimal())` or \
-                 `sum(amount.to_float())`"
+                 without an explicit conversion; declare the column that holds the floats \
+                 `type: decimal` in its Source schema, so every value in the group is a \
+                 decimal"
             ),
         }
     }

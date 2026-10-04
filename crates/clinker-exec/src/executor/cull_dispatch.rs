@@ -1181,11 +1181,24 @@ fn cull_spill_error(node_name: &str, e: clinker_plan::SpillError) -> PipelineErr
 /// into the same bucket. Tracked in issue #1021 with the sibling spill-fault
 /// misclassification — the fix moves user-visible exit codes and DLQ routing,
 /// so the whole family lands under one review rather than riding along here.
+///
+/// An accumulator failure in a rule (an integer `sum` that overflows, say) is
+/// the author's own data error, so its detail names the `drop_group_when` rule
+/// and gives the accumulator's message with its fix, and not the aggregate
+/// error's rendering, which spells the engine's label for the rule's
+/// aggregate. Routing it to an internal error is the interim arrangement
+/// until rule failures route as group failures.
 fn cull_predicate_error(node_name: &str, e: crate::aggregation::HashAggError) -> PipelineError {
+    let detail = match e {
+        crate::aggregation::HashAggError::Accumulator { source, .. } => {
+            format!("a `drop_group_when` rule failed: {source}")
+        }
+        e => format!("drop_group_when predicate evaluation failed: {e}"),
+    };
     PipelineError::Internal {
         op: "cull",
         node: node_name.to_string(),
-        detail: format!("drop_group_when predicate evaluation failed: {e}"),
+        detail,
     }
 }
 

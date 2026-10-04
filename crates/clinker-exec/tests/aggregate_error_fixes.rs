@@ -276,7 +276,6 @@ nodes:
     input: src
     config:
       cxl: |
-        emit g = g
         emit v = if flag then amount else price * 2.0
   - type: sink
     name: csv
@@ -290,7 +289,9 @@ nodes:
 /// A computed float has no Source column to retype, so the E200 prints the
 /// conversion of the decimal side. Pasted over `amount`, the branches are
 /// floats: 0.10 becomes the float 0.1, and the prices doubled are 0.4 and
-/// 0.2 (doubling a float is exact), each printed in its shortest form.
+/// 0.2 (doubling a float is exact), each printed in its shortest form. A
+/// Transform passes its input's columns through, so each line also holds the
+/// row's Source cells, the float `price` printed the same way.
 #[test]
 fn the_printed_conversion_for_a_computed_float_branch_compiles_and_runs() {
     let message = e200(COMPUTED_JOIN_YAML);
@@ -309,10 +310,10 @@ fn the_printed_conversion_for_a_computed_float_branch_compiles_and_runs() {
     assert_eq!(
         run.lines(),
         vec![
-            "a,0.1".to_string(),
-            "a,0.2".to_string(),
-            "a,0.4".to_string(),
-            "g,v".to_string(),
+            "a,false,1.00,0.1,0.2".to_string(),
+            "a,false,1.00,0.2,0.4".to_string(),
+            "a,true,0.10,9.99,0.1".to_string(),
+            "g,flag,amount,price,v".to_string(),
         ]
     );
 }

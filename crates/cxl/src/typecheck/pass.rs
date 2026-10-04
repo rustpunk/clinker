@@ -469,6 +469,14 @@ impl<'a> TypeChecker<'a> {
     /// branches of an `if`, `match` or `??`. Returns whether it rejected, so
     /// the caller types the join as `Any` and raises no second diagnostic.
     ///
+    /// The message gives one fix. When the float branch is an input column
+    /// whose type the Source schema declares, the fix is to declare that
+    /// column a decimal: the reader then parses the text exactly, so the
+    /// author's values are kept and the join is exact. Otherwise there is no
+    /// column to retype, and the fix converts the decimal side with
+    /// `.to_float()`. No fix converts a float to a decimal, which would keep
+    /// the float's binary digits and change the author's values.
+    ///
     /// `Numeric` against a decimal stays permissive, as in binary operators: it
     /// may be an integer at run time, and the aggregates' run-time rule covers
     /// what typecheck cannot see. The fix goes in the message rather than in
@@ -488,33 +496,64 @@ impl<'a> TypeChecker<'a> {
         let (Some(decimal), Some(float)) = (find(&Type::Decimal), find(&Type::Float)) else {
             return false;
         };
-        let name = |(index, expr): (usize, &Expr)| match expr {
-            Expr::FieldRef { name, .. } => (format!("`{name}`"), Some(name.to_string())),
-            _ => (join.position(index), None),
+        let label = |(index, expr): (usize, &Expr)| match expr {
+            Expr::FieldRef { name, .. } => format!("`{name}`"),
+            _ => join.position(index),
         };
-        let fix = |(label, field): &(String, Option<String>), method: &str| match field {
-            Some(field) => format!("`{field}.{method}()`"),
-            None => format!("`.{method}()` on {label}"),
-        };
-        let decimal = name(decimal);
-        let float = name(float);
         let (plural, singular) = join.branch_words();
+        let fix = match self.declared_input_column(float.1) {
+            Some(column) => {
+                let (to, from) = if branches[float.0].1.is_nullable() {
+                    ("type: { nullable: decimal }", "type: { nullable: float }")
+                } else {
+                    ("type: decimal", "type: float")
+                };
+                format!(
+                    "declare `{column}` a decimal in its Source schema, `{to}` in place of \
+                     `{from}`"
+                )
+            }
+            None => {
+                let decimal_fix = match decimal.1 {
+                    Expr::FieldRef { name, .. } => format!("`{name}.to_float()`"),
+                    _ => "`.to_float()`".to_string(),
+                };
+                format!("convert the decimal {singular} with {decimal_fix}")
+            }
+        };
         self.error(
             span,
             format!(
                 "cannot mix decimal and float without an explicit cast: the {plural} of this \
                  `{keyword}` are a decimal ({decimal_label}) and a float ({float_label}); \
-                 convert one {singular} so both have one numeric type, for example \
-                 {float_fix} or {decimal_fix}",
+                 {fix}, so the {plural} have one numeric type",
                 keyword = join.keyword(),
-                decimal_label = decimal.0,
-                float_label = float.0,
-                float_fix = fix(&float, "to_decimal"),
-                decimal_fix = fix(&decimal, "to_float"),
+                decimal_label = label(decimal),
+                float_label = label(float),
             ),
             None,
         );
         true
+    }
+
+    /// The column `expr` reads when it is a bare reference to an input column
+    /// whose type the schema declares, and not a lexical name, a `let`
+    /// binding or any other value: the same tests the `FieldRef` typing arm
+    /// applies before it reads a column's declared type.
+    fn declared_input_column(&self, expr: &Expr) -> Option<String> {
+        let Expr::FieldRef { node_id, name, .. } = expr else {
+            return None;
+        };
+        if self.lexical_type(name).is_some() {
+            return None;
+        }
+        let binding = self
+            .bindings
+            .get(node_id.0 as usize)
+            .and_then(|b| b.as_ref());
+        let declared = matches!(binding, Some(ResolvedBinding::Field(_)))
+            && matches!(self.schema.lookup(name), ColumnLookup::Declared(_));
+        declared.then(|| name.to_string())
     }
 
     fn error(&mut self, span: Span, message: String, help: Option<String>) {
