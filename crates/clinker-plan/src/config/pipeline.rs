@@ -2371,7 +2371,10 @@ impl PipelineConfig {
                 .map(|s| s.name.as_str())
                 .unwrap_or_default();
             diags.extend(crate::plan::execution::diagnose_document_dlq_body_sinks(
-                &dag, &artifacts, source,
+                &dag,
+                &artifacts,
+                &symbol_table,
+                source,
             ));
             if let Err(unreached) = crate::plan::execution::order_sinks_after_operators(&mut dag) {
                 let cycle_path = crate::plan::execution::extract_cycle_path(&dag.graph, unreached);

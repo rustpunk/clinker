@@ -498,6 +498,7 @@ pub(crate) fn diagnose_untagged_composition_edges(
 pub(crate) fn diagnose_document_dlq_body_sinks(
     dag: &ExecutionPlanDag,
     artifacts: &crate::plan::bind_schema::CompileArtifacts,
+    signatures: &crate::config::composition::CompositionSymbolTable,
     source: &str,
 ) -> Vec<clinker_core_types::Diagnostic> {
     use clinker_core_types::QuoteName;
@@ -644,6 +645,17 @@ pub(crate) fn diagnose_document_dlq_body_sinks(
                 quoted_port_node = port_node_name.quoted_name(),
             ));
         }
+        if let Some(input_port) = body
+            .port_name_to_node_idx
+            .iter()
+            .find_map(|(name, &node)| (node == port_node).then_some(name))
+        {
+            return Err(format!(
+                "the first output port of composition {quoted_call}, `{port}`, reads input \
+                 port {quoted_input} rather than a node of the composition",
+                quoted_input = input_port.quoted_name(),
+            ));
+        }
         if matches!(body.graph[port_node], PlanNode::Composition { .. })
             || body.graph[port_node].output_ports().is_some()
         {
@@ -685,9 +697,21 @@ pub(crate) fn diagnose_document_dlq_body_sinks(
         let decision = movable((body_id, idx)).map(|port_node| {
             let body = &artifacts.composition_bodies[&body_id];
             let sink = body.graph[idx].name();
-            let ports = port_taken
-                .entry(body_id)
-                .or_insert_with(|| body.output_port_to_node_idx.keys().cloned().collect());
+            // Every declared output name is taken, including one whose alias
+            // names no body node: bind drops that output, but its key stays
+            // under `_compose.outputs:`.
+            let ports = port_taken.entry(body_id).or_insert_with(|| {
+                body.output_port_to_node_idx
+                    .keys()
+                    .chain(
+                        signatures
+                            .get(&body.signature_path)
+                            .into_iter()
+                            .flat_map(|signature| signature.outputs.keys()),
+                    )
+                    .cloned()
+                    .collect()
+            });
             *moved_per_body.entry(body_id).or_default() += 1;
             Move {
                 port: free_name(sink, ports),
