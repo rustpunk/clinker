@@ -297,3 +297,38 @@ fn split_and_merge_matches_bitrep() {
         );
     }
 }
+
+/// `int_part` as three float addends whose exact sum is `int_part`: bits
+/// [0, 42) and [42, 84) unsigned, and the signed remainder from bit 84, each
+/// scaled by its power of two. Each part has at most 44 significant bits, so
+/// every addend is an exact float, which a single `int_part as f64` is not
+/// beyond 2^53.
+fn integer_part_addends(int_part: i128) -> [f64; 3] {
+    let mask: i128 = (1 << 42) - 1;
+    let low = (int_part & mask) as f64;
+    let middle = ((int_part >> 42) & mask) as f64 * powi2(42);
+    let high = (int_part >> 84) as f64 * powi2(84);
+    [low, middle, high]
+}
+
+/// An integer part anywhere in the `i128` range, not only up to 2^53 where
+/// it is itself an exact float, rounds together with the float addends once.
+#[test]
+fn exact_sum_matches_bitrep_with_integer_parts_across_i128() {
+    let fixed: [i128; 4] = [i128::MIN, i128::MAX, (1 << 53) + 1, -(1 << 100) + 3];
+    let mut rng = SplitMix(0x1A7E_6E12);
+    for index in 0..2_000 {
+        let values = rng.sequence();
+        let ours = exact(&values);
+        let random = ((u128::from(rng.next()) << 64) | u128::from(rng.next())) as i128;
+        for int_part in fixed.into_iter().chain([random]) {
+            let mut with_int = values.clone();
+            with_int.extend(integer_part_addends(int_part));
+            assert_same_bits(
+                ours.round_with(int_part),
+                oracle(&with_int).value(),
+                &format!("sequence {index} with integer part {int_part}"),
+            );
+        }
+    }
+}
