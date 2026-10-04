@@ -213,9 +213,13 @@ to [open questions](80_OPEN_QUESTIONS.md) rather than promoting it here.
   calling an undeclared external binary. `AGENTS.md` carries the normative rule.
 - Adding a non-Rust language to the build, test, or release path is an
   architectural decision requiring approval. The committed tree is Rust plus
-  documentation assets: `git ls-files` matches no `.py`, `.sh`, or `.rb`
-  sources, and the only committed JavaScript is the vendored mdBook theme under
-  `docs/theme/`.
+  documentation assets: `git ls-files` matches no `.py` or `.rb` sources,
+  shell is limited to the CI, release, and maintenance scripts under
+  `scripts/`, C to the no-C gate's probe fixture under
+  `tools/no-c-gate-fixture/`, and the only committed JavaScript is the vendored mdBook theme under
+  `docs/theme/` and the inline script of the static explainer page
+  `docs/engine/src/memory-explainer.html`, which mdBook copies verbatim
+  and which runs only in a reader's browser.
 - Repeated adversarial repair of a hand-written substitute is evidence that the
   dependency decision was wrong, not a reason to keep patching. Reopen the
   approval question instead of growing the substitute.

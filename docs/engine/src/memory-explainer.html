@@ -1,0 +1,791 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clinker · Keeping Memory at Bay</title>
+<style>
+:root{
+  --iron:#14110f; --iron2:#1d1915; --iron3:#29231d; --seam:#3a3129;
+  --ash:#b9ab98; --bone:#ece2d0; --dim:#7d705f;
+  --rust:#d0581f; --rust-d:#8f3a13; --brass:#e0a93e; --verd:#4fb0a0; --verd-d:#2d6f65;
+  --blood:#e0362c; --steel:#7f97ad; --plum:#b07ac0;
+  --disp:"Rajdhani", "Bahnschrift Condensed", "Roboto Condensed", "Arial Narrow", sans-serif;
+  --mono:"Share Tech Mono", "Source Code Pro", Consolas, "Ubuntu Mono", monospace;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--iron);color:var(--bone);font:15px/1.6 var(--mono);
+  background-image:
+   radial-gradient(1200px 600px at 85% -10%, rgba(208,88,31,.18), transparent 60%),
+   radial-gradient(900px 500px at -10% 40%, rgba(79,176,160,.08), transparent 60%),
+   repeating-linear-gradient(0deg, rgba(255,255,255,.012) 0 1px, transparent 1px 4px);
+}
+a{color:var(--brass)}
+code,kbd{font-family:var(--mono);background:var(--iron3);padding:0 .35em;border:1px solid var(--seam);color:var(--brass);font-size:.9em}
+header.hero{padding:72px 6vw 40px;border-bottom:2px solid var(--seam);position:relative;overflow:hidden}
+header.hero::after{content:"";position:absolute;right:-60px;top:-60px;width:420px;height:420px;border-radius:50%;
+  border:28px solid rgba(224,169,62,.07);box-shadow:inset 0 0 0 2px rgba(224,169,62,.12)}
+.kicker{font:700 12px/1 var(--mono);letter-spacing:.3em;text-transform:uppercase;color:var(--rust)}
+h1{font:900 clamp(56px,9vw,128px)/.86 var(--disp);margin:14px 0 18px;text-transform:uppercase;letter-spacing:-.01em}
+h1 em{font-style:normal;color:var(--rust);-webkit-text-stroke:0}
+h1 .thin{font-weight:300;color:var(--ash)}
+.lede{max-width:760px;color:var(--ash);font-size:16px}
+nav.toc{display:flex;flex-wrap:wrap;gap:0;margin-top:30px;border:1px solid var(--seam);width:fit-content}
+nav.toc a{padding:10px 16px;text-decoration:none;color:var(--ash);border-right:1px solid var(--seam);font-size:12px;letter-spacing:.12em;text-transform:uppercase}
+nav.toc a:last-child{border-right:0}
+nav.toc a:hover{background:var(--rust);color:var(--iron)}
+nav.toc b{color:var(--brass);margin-right:6px}
+section{padding:64px 6vw;border-bottom:1px solid var(--seam)}
+section:nth-of-type(even){background:rgba(0,0,0,.18)}
+.sechead{display:grid;grid-template-columns:120px 1fr;gap:24px;align-items:end;margin-bottom:28px}
+.num{font:900 120px/.8 var(--disp);color:transparent;-webkit-text-stroke:2px var(--rust-d)}
+h2{font:800 clamp(36px,4.6vw,64px)/.95 var(--disp);text-transform:uppercase;margin:0}
+h2 small{display:block;font:400 14px/1.4 var(--mono);text-transform:none;color:var(--dim);margin-top:10px;letter-spacing:0}
+h3{font:800 24px/1 var(--disp);text-transform:uppercase;letter-spacing:.04em;color:var(--brass);margin:0 0 12px}
+p{max-width:820px}
+.cols{display:grid;grid-template-columns:minmax(280px,1fr) minmax(320px,1.35fr);gap:36px}
+@media (max-width:980px){.cols{grid-template-columns:1fr}.sechead{grid-template-columns:1fr}.num{font-size:72px}}
+.panel{background:var(--iron2);border:1px solid var(--seam);padding:22px;position:relative}
+.panel::before{content:"";position:absolute;inset:6px;border:1px dashed rgba(255,255,255,.04);pointer-events:none}
+.rivet{position:absolute;width:7px;height:7px;border-radius:50%;background:radial-gradient(circle at 35% 35%, #8a7a64, #2b241d)}
+.rivet.tl{top:8px;left:8px}.rivet.tr{top:8px;right:8px}.rivet.bl{bottom:8px;left:8px}.rivet.br{bottom:8px;right:8px}
+.callout{border-left:4px solid var(--rust);background:rgba(208,88,31,.07);padding:12px 16px;margin:16px 0;max-width:820px}
+.callout.v{border-color:var(--verd);background:rgba(79,176,160,.07)}
+.callout.b{border-color:var(--brass);background:rgba(224,169,62,.06)}
+.src{font-size:11px;color:var(--dim);letter-spacing:.04em}
+.src::before{content:"⌁ source: "}
+label.ctl{display:grid;grid-template-columns:1fr auto;gap:2px 10px;font-size:12px;color:var(--ash);margin:10px 0;align-items:center}
+label.ctl output{color:var(--brass);font-weight:700}
+label.ctl input[type=range]{grid-column:1/-1}
+input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:4px;background:var(--seam);outline:none}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:22px;background:var(--brass);border:2px solid var(--iron);cursor:pointer}
+input[type=range]::-moz-range-thumb{width:14px;height:22px;background:var(--brass);border:2px solid var(--iron);border-radius:0;cursor:pointer}
+input[type=number]{width:74px;background:var(--iron);border:1px solid var(--seam);color:var(--bone);font:13px var(--mono);padding:3px 5px}
+select{background:var(--iron);border:1px solid var(--seam);color:var(--bone);font:13px var(--mono);padding:5px}
+button{font:700 12px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;padding:10px 14px;border:2px solid var(--brass);
+  background:transparent;color:var(--brass);cursor:pointer;transition:background .12s,color .12s,transform .08s}
+button:hover{background:var(--brass);color:var(--iron)}
+button:active{transform:translateY(1px)}
+button.hot{border-color:var(--rust);color:var(--rust)}
+button.hot:hover{background:var(--rust);color:var(--iron)}
+.btnrow{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}
+.seg{display:inline-flex;border:2px solid var(--seam)}
+.seg button{border:0;border-right:1px solid var(--seam);color:var(--ash)}
+.seg button.on{background:var(--rust);color:var(--iron)}
+.seg button:last-child{border-right:0}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--seam)}
+th{font:800 13px var(--disp);letter-spacing:.12em;text-transform:uppercase;color:var(--dim)}
+tr.win td{background:rgba(208,88,31,.18)}
+tr.win td:first-child{box-shadow:inset 4px 0 var(--rust)}
+.pill{display:inline-block;font-size:10px;letter-spacing:.12em;text-transform:uppercase;padding:2px 6px;border:1px solid currentColor;margin-left:4px}
+.pill.bp{color:var(--verd)} .pill.co{color:var(--plum)} .pill.ls{color:var(--dim)}
+
+/* gauge */
+.gauge{position:relative;height:84px;margin:34px 0 46px;background:linear-gradient(90deg,#1f2a22 0%, #1f2a22 70%, #2c2a1b 70%, #2c2a1b 80%, #3a2416 80%, #3a2416 100%);border:2px solid var(--seam)}
+.gauge .zone{position:absolute;top:0;bottom:0}
+.gauge .mark{position:absolute;top:-24px;bottom:-26px;width:2px}
+.gauge .mark span{position:absolute;white-space:nowrap;font-size:11px;transform:translateX(-50%);left:1px}
+.gauge .mark span.t{top:0}.gauge .mark span.b{bottom:0}
+.needle{position:absolute;top:-6px;bottom:-6px;width:4px;background:var(--bone);box-shadow:0 0 18px var(--bone);transition:left .15s}
+.fill{position:absolute;left:0;top:18px;bottom:18px;transition:width .15s}
+.zonelabels{display:grid;grid-template-columns:70fr 10fr 20fr 12fr;font-size:11px;color:var(--dim);margin-top:-30px;margin-bottom:12px}
+.status{font:800 28px/1 var(--disp);letter-spacing:.06em;text-transform:uppercase;margin:6px 0}
+
+/* ledger */
+.ledgerbar{position:relative;height:56px;border:2px solid var(--seam);background:repeating-linear-gradient(90deg,var(--iron) 0 9px,var(--iron2) 9px 10px);margin:12px 0}
+.grant{position:absolute;top:4px;bottom:4px;display:flex;align-items:center;justify-content:center;font-size:11px;color:var(--iron);font-weight:700;transition:all .25s;overflow:hidden;white-space:nowrap}
+.grant.live{background:var(--brass)} .grant.repl{background:var(--rust);top:28px} .grant.old{background:var(--brass);bottom:28px;opacity:.75}
+.logbox{font-size:12px;background:var(--iron);border:1px solid var(--seam);padding:10px;height:170px;overflow:auto;color:var(--ash)}
+.logbox div{border-bottom:1px dotted #2a241e;padding:2px 0}
+.logbox .e{color:var(--blood)} .logbox .s{color:var(--verd)} .logbox .p{color:var(--steel)} .logbox .w{color:var(--brass)} .logbox .ok{color:#9bc76b}
+
+/* arbitration lab */
+.policies{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:16px}
+@media (max-width:900px){.policies{grid-template-columns:1fr}}
+.pcard{border:2px solid var(--seam);padding:14px;background:var(--iron)}
+.pcard h4{margin:0 0 2px;font:800 26px var(--disp);text-transform:uppercase;color:var(--bone)}
+.pcard .pn{font-size:11px;color:var(--dim);margin-bottom:10px}
+.pcard .act{font-size:13px;margin:6px 0;padding-left:10px;border-left:3px solid var(--seam)}
+.pcard .act.pause{border-color:var(--steel)} .pcard .act.spill{border-color:var(--verd)} .pcard .act.none{border-color:var(--dim);color:var(--dim)} .pcard .act.resume{border-color:#9bc76b}
+
+/* simulator */
+.sim{display:grid;grid-template-columns:300px 1fr;gap:20px}
+@media (max-width:1100px){.sim{grid-template-columns:1fr}}
+.dag{display:flex;align-items:stretch;gap:0;overflow-x:auto;padding:6px 0 14px}
+.node{min-width:128px;border:2px solid var(--seam);background:var(--iron);padding:8px 10px;position:relative;transition:border-color .2s, box-shadow .2s}
+.node h5{margin:0;font:800 17px/1 var(--disp);letter-spacing:.05em;text-transform:uppercase}
+.node .k{font-size:10px;color:var(--dim)}
+.node .b{font-size:13px;color:var(--brass);font-weight:700}
+.node .bar{height:6px;background:var(--seam);margin-top:6px;position:relative}
+.node .bar i{position:absolute;left:0;top:0;bottom:0;background:var(--c,var(--brass))}
+.node.active{border-color:var(--brass);box-shadow:0 0 0 2px rgba(224,169,62,.25),0 0 24px rgba(224,169,62,.18)}
+.node.paused{border-color:var(--steel);background:repeating-linear-gradient(45deg,var(--iron) 0 8px,#18202a 8px 16px)}
+.node.gone{opacity:.35}
+.node .tags{position:absolute;top:-10px;right:6px;display:flex;gap:3px}
+.node .tags span{font-size:9px;letter-spacing:.1em;background:var(--iron);border:1px solid;padding:1px 4px;text-transform:uppercase}
+.wire{align-self:center;width:30px;height:2px;background:var(--seam);position:relative;flex:none}
+.wire::after{content:"";position:absolute;right:-1px;top:-4px;border:5px solid transparent;border-left-color:var(--seam)}
+.dagwrap{display:flex;flex-direction:column;gap:10px}
+.lane{display:flex;align-items:center}
+canvas{width:100%;display:block;background:var(--iron);border:1px solid var(--seam)}
+.legend{display:flex;flex-wrap:wrap;gap:12px;font-size:11px;color:var(--ash);margin:8px 0}
+.legend i{display:inline-block;width:12px;height:12px;margin-right:5px;vertical-align:-2px}
+.readout{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin:10px 0}
+.readout div{border:1px solid var(--seam);padding:6px 8px;background:var(--iron)}
+.readout b{display:block;font:800 22px/1 var(--disp);color:var(--bone)}
+.readout span{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim)}
+.banner{font:900 34px/1 var(--disp);text-transform:uppercase;padding:12px 16px;margin:10px 0;display:none;letter-spacing:.04em}
+.banner.err{display:block;background:var(--blood);color:var(--iron)}
+.banner.ok{display:block;background:#9bc76b;color:var(--iron)}
+
+/* scheduler */
+.sched td input{width:70px}
+.rank{font:900 26px var(--disp);color:var(--rust)}
+.keytuple{font-size:12px;color:var(--ash)}
+
+/* codes */
+.codes{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:0;border:2px solid var(--seam)}
+.code{padding:18px;border-right:1px solid var(--seam);border-bottom:1px solid var(--seam)}
+.code b{font:900 48px/1 var(--disp);color:var(--blood);display:block}
+.code b.y{color:var(--brass)}
+.code h4{margin:4px 0 8px;font:800 18px var(--disp);text-transform:uppercase}
+.code p{font-size:13px;color:var(--ash);margin:0}
+footer{padding:40px 6vw;color:var(--dim);font-size:12px}
+.flow{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:0;border:2px solid var(--seam);margin:18px 0}
+.flow div{padding:14px;border-right:1px solid var(--seam);position:relative}
+.flow div:last-child{border-right:0}
+.flow b{font:900 34px/1 var(--disp);color:var(--rust);display:block}
+.flow span{font-size:12px;color:var(--ash)}
+@media (prefers-reduced-motion: reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="kicker">clinker-exec · pipeline/memory.rs · <a href="memory-arbitration.html" style="color:inherit">← back to Memory Arbitration</a></div>
+  <h1>Keeping <em>memory</em><br><span class="thin">at bay</span></h1>
+  <p class="lede">Clinker promises bounded memory for finite batch jobs. No single mechanism delivers that. A budget, a ledger, an arbitrator, spill files, producer pauses and a memory-aware scheduler share the job. This page takes each one apart and gives you a control to try it. The simulator in section 05 runs them all at once.</p>
+  <nav class="toc">
+    <a href="#budget"><b>01</b>Budget</a>
+    <a href="#ledger"><b>02</b>Ledger</a>
+    <a href="#arb"><b>03</b>Arbitration</a>
+    <a href="#bp"><b>04</b>Backpressure &amp; spill</a>
+    <a href="#sim"><b>05</b>Simulator</a>
+    <a href="#sched"><b>06</b>Scheduler</a>
+    <a href="#fail"><b>07</b>When it fails</a>
+  </nav>
+</header>
+
+<!-- ============================ 01 BUDGET ============================ -->
+<section id="budget">
+  <div class="sechead"><div class="num">01</div><h2>The budget<small>One number, three thresholds, two ways to measure</small></h2></div>
+  <div class="cols">
+    <div>
+      <p>An author sets one value, <code>pipeline.memory.limit</code> (default <code>512M</code>; the <code>--memory-limit</code> flag overrides it). The arbitrator turns it into three watermarks:</p>
+      <ul>
+        <li><b style="color:var(--rust)">Soft limit, 80%.</b> Pressure starts here. The arbitrator pauses a producer or asks a stage to spill.</li>
+        <li><b style="color:#9bc76b">Resume watermark, 70%.</b> Paused producers restart once memory drops below this. Authors can tune it with <code>resume_threshold</code>, which must fall inside (0, 0.80); anything else is <code>E324</code>.</li>
+        <li><b style="color:var(--blood)">Hard limit, 100%.</b> Past this the run stops with <code>E310 MemoryBudgetExceeded</code>, naming the stage that overran.</li>
+      </ul>
+      <p>The 20% gap between soft and hard is the <i>spike allowance</i>. Spill reacts at batch boundaries, not on every allocation, so short overshoots have to fit somewhere.</p>
+      <div class="callout b"><b>Two signals, not one.</b> The arbitrator reads process <b>RSS</b> from the OS and the <b>charged sum</b> that registered stages report about themselves. A threshold trips when either one crosses it. On a platform where RSS can't be read, the charged sum still enforces the budget instead of the budget doing nothing.</div>
+      <div class="src">memory.rs · soft_limit(), resume_limit(), should_spill(), should_abort(), current_pressure()</div>
+    </div>
+    <div class="panel"><i class="rivet tl"></i><i class="rivet tr"></i><i class="rivet bl"></i><i class="rivet br"></i>
+      <h3>Pressure gauge</h3>
+      <label class="ctl">memory.limit (MB) <output id="g_lim_o"></output><input id="g_lim" type="range" min="64" max="2048" step="64" value="512"></label>
+      <label class="ctl">resume_threshold <output id="g_res_o"></output><input id="g_res" type="range" min="0.05" max="0.79" step="0.01" value="0.70"></label>
+      <label class="ctl">process RSS (MB) <output id="g_rss_o"></output><input id="g_rss" type="range" min="0" max="2400" step="4" value="300"></label>
+      <label class="ctl">charged sum from stages (MB) <output id="g_chg_o"></output><input id="g_chg" type="range" min="0" max="2400" step="4" value="260"></label>
+      <div class="gauge" id="gauge"></div>
+      <div class="status" id="g_status"></div>
+      <div id="g_detail" style="font-size:13px;color:var(--ash)"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ 02 LEDGER ============================ -->
+<section id="ledger">
+  <div class="sechead"><div class="num">02</div><h2>The ledger<small>Who holds what: pull-mode attribution, plus reserve-before-allocate admission</small></h2></div>
+  <div class="cols">
+    <div>
+      <h3>Layer A: the consumer registry</h3>
+      <p>Each stage that holds memory (Source ingest channels, hash Aggregates, sort buffers, grace-hash partitions, IEJoin arrays, Reshape and Cull group buffers, window arenas, and every inter-stage <code>node_buffers</code> slot) registers a <code>MemoryConsumer</code> with the run's single <code>MemoryArbitrator</code>.</p>
+      <p>A consumer holds a <code>ConsumerHandle</code>, a few atomics: live bytes, peak bytes, a <i>spill-requested</i> flag, a <i>paused</i> flag, and an <i>active</i> flag. The arbitrator never pushes numbers in. It <b>pulls</b> <code>current_usage()</code> from each consumer on every poll, so a grace-hash join with partitions on disk reports only what is still in memory.</p>
+      <p>A registration lasts as long as the state it describes. A Source's consumer is removed when its channel disconnects, and a buffer slot's when its last reader finishes. The registry therefore lists only live memory.</p>
+      <h3 style="margin-top:26px">Layer B: the admission ledger</h3>
+      <p>Newer storage (CSV decoding, prepared output, owned record storage) is stricter. An <code>AllocationLease</code> reserves the full <code>Layout</code> <b>before</b> anything is allocated. Growing a buffer reserves the new block while the old one is still charged. If the reservation is refused, the old contents and their charge stay as they were. Moving a grant between owners never leaves a moment where it is uncharged.</p>
+      <div class="callout v">The two layers answer different questions. Layer A gives estimates the policy uses to choose what to spill. Layer B gives exact grants, and the arbitrator deducts them before admitting anything else. Neither layer is a promise about whole-process RSS; parser buffers and allocator overhead sit outside both.</div>
+      <div class="src">memory.rs · MemoryConsumer, ConsumerHandle · engine docs: memory-arbitration.md "Exact allocation admission"</div>
+    </div>
+    <div class="panel"><i class="rivet tl"></i><i class="rivet tr"></i><i class="rivet bl"></i><i class="rivet br"></i>
+      <h3>Try it: a ReservedVec under a 256 KiB budget</h3>
+      <p style="font-size:13px;color:var(--ash)">Allocate a vector, then double it. During growth, the old and new blocks are both charged at once, and this overlap is what most often hits the budget.</p>
+      <div class="btnrow">
+        <button id="l_alloc">Reserve 48 KiB</button>
+        <button id="l_grow">Grow ×2</button>
+        <button id="l_drop" class="hot">Drop</button>
+      </div>
+      <div class="ledgerbar" id="l_bar"></div>
+      <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--dim)"><span>0</span><span>budget 256 KiB</span></div>
+      <div class="readout"><div><span>granted</span><b id="l_granted">0</b></div><div><span>live vec cap</span><b id="l_cap">0</b></div><div><span>peak grant</span><b id="l_peak">0</b></div></div>
+      <div class="logbox" id="l_log"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ 03 ARBITRATION ============================ -->
+<section id="arb">
+  <div class="sechead"><div class="num">03</div><h2>Arbitration<small>Under pressure, choosing which stage gives memory back</small></h2></div>
+  <div class="cols">
+    <div>
+      <p>Every consumer has two fixed traits. Its <b>spill priority</b> (lower spills first) says how cheaply it can spill. Its <b>can_back_pressure</b> flag says whether its producer can be paused instead. Only Sources can be paused.</p>
+      <p>The <code>memory.backpressure</code> setting picks a policy:</p>
+      <table>
+        <tr><th>knob</th><th>policy object</th><th>picks</th></tr>
+        <tr><td><code>pause</code> (default)</td><td>BackPressurePreferred → Priority</td><td>the first pausable consumer, or else the lowest priority, largest on ties</td></tr>
+        <tr><td><code>spill</code></td><td>Priority</td><td>lowest priority, largest on ties; never pauses</td></tr>
+        <tr><td><code>both</code></td><td>BackPressurePreferred → LargestFirst</td><td>the first pausable consumer, or else the biggest holder</td></tr>
+      </table>
+      <div class="callout">One round has <b>two steps</b>, and each reads a different signal:
+        <br>① <code>reconcile_backpressure</code> handles pause and resume using <i>current</i> pressure. It skips any Source the walk thread is reading from right now (pausing that one would deadlock the run).
+        <br>② <code>poll_arbitration</code> asks the policy for a victim. If the victim cannot be paused, it sets the victim's spill flag, and the stage spills at its next batch boundary. If the victim is pausable, step ② does nothing, because step ① already handled pausing.</div>
+      <p style="font-size:13px;color:var(--ash)">So under <code>pause</code>, while any Source is registered, step ② picks that Source and <b>nobody gets a spill request from the arbitrator</b>. Spill still happens, through the stages' own thresholds and the slot admission check described in section 04.</p>
+      <div class="src">memory.rs · build_policy(), Priority, LargestFirst, BackPressurePreferred, poll_arbitration(), reconcile_backpressure()</div>
+    </div>
+    <div class="panel"><i class="rivet tl"></i><i class="rivet tr"></i><i class="rivet bl"></i><i class="rivet br"></i>
+      <h3>Arbitration lab</h3>
+      <p style="font-size:13px;color:var(--ash)">Tick consumers to register them and set the bytes each holds. Each column runs the real selection code for one policy. Registration order matters for <i>first pausable</i>.</p>
+      <table id="a_tbl"></table>
+      <label class="ctl">current pressure vs. thresholds <output id="a_pr_o"></output>
+        <input id="a_pr" type="range" min="0" max="2" step="1" value="2"></label>
+      <div class="policies" id="a_out"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ 04 BACKPRESSURE & SPILL ============================ -->
+<section id="bp">
+  <div class="sechead"><div class="num">04</div><h2>Backpressure &amp; spill<small>Three ways memory gets pushed back</small></h2></div>
+  <div class="flow">
+    <div><b>Wall</b><span><b>Bounded channels.</b> A Source's ingest thread stops when its <code>crossbeam</code> channel is full, and streaming handoffs work the same way. This happens in the transport layer, and the arbitrator isn't involved.</span></div>
+    <div><b>Brake</b><span><b>Arbitrator pause.</b> Above the soft limit, the first pausable Source that is not active waits on a <code>Condvar</code>. Below the resume watermark it starts again. Between the two thresholds nothing changes (hysteresis).</span></div>
+    <div><b>Valve</b><span><b>Spill.</b> State is written to disk as length-prefixed <code>postcard</code> frames, LZ4-compressed when the per-schema <code>compress</code> setting chooses to. Cumulative disk use is checked against <code>storage.spill.disk_cap_bytes</code> (<code>E320</code>).</span></div>
+    <div><b>Fuse</b><span><b>Hard abort.</b> RSS or the charged sum above the limit stops the run with <code>E310</code>. Probe loops also check every 10K output records.</span></div>
+  </div>
+  <div class="cols">
+    <div>
+      <h3>Where spill actually comes from</h3>
+      <ol>
+        <li><b>Arbitrator request.</b> <code>try_spill</code> sets a flag and does no I/O. The stage reads the flag with <code>take_spill_request()</code> at its next boundary and spills there. Buffer slots are served in a sweep before the next node is dispatched.</li>
+        <li><b>Self-spill at admission.</b> When a <code>node_buffers</code> slot is published and <code>should_spill()</code> returns true, the producer writes those rows straight to a spill file.</li>
+        <li><b>Stage thresholds.</b> A hash Aggregate spills when its group count reaches about 60% of its budget, or its value heap passes 40%. Sort, grace-hash, Reshape and Cull have similar thresholds of their own.</li>
+        <li><b>Spill before resuming.</b> When the walk reaches a Source that is paused, it first calls <code>spill_reclaimable(over)</code>, which spills non-pausable consumers in priority order. Only then does it resume the Source and mark it active, so the resumed Source doesn't push memory straight back over the soft limit.</li>
+      </ol>
+      <div class="callout v"><b>Resume and spill read different signals.</b> <code>peak_rss</code> only ever rises (<code>fetch_max</code>). The spill trigger reads it, so once the run has crossed the soft limit, every later poll counts as under pressure. Spilling too often is safe. Resume reads <i>current</i> RSS, which can fall, because a resume check based on a peak would never fire.</div>
+    </div>
+    <div>
+      <h3>Spill priorities (engine table)</h3>
+      <table>
+        <tr><th>consumer</th><th>prio</th><th>pausable</th></tr>
+        <tr><td>node_buffers slot</td><td>0</td><td>no</td></tr>
+        <tr><td>output staging (writer)</td><td>0</td><td>no <span class="pill co">charged-only</span></td></tr>
+        <tr><td>grace-hash Combine</td><td>10</td><td>no</td></tr>
+        <tr><td>Reshape · Cull</td><td>15</td><td>no</td></tr>
+        <tr><td>sort buffer · IEJoin build</td><td>20</td><td>no</td></tr>
+        <tr><td>sort-merge Combine</td><td>25</td><td>no</td></tr>
+        <tr><td>hash Aggregate · inline-hash Combine</td><td>30</td><td>no</td></tr>
+        <tr><td>Source ingest</td><td>N/A</td><td>yes <span class="pill bp">pause</span></td></tr>
+        <tr><td>streaming Aggregate</td><td>N/A</td><td>no</td></tr>
+        <tr><td>credential registry · scan materialization · window arena</td><td>last</td><td>no <span class="pill ls">last resort</span></td></tr>
+      </table>
+      <p style="font-size:13px;color:var(--ash)">Order follows reload cost. Re-reading a buffer slot is one postcard round-trip. A grace partition costs a little more. Reshape and Cull must re-split groups when they reload. A sort needs an external merge. A hash Aggregate costs the most to bring back.</p>
+      <div class="src">engine docs: memory-arbitration.md "Per-operator arbitration parameters"</div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ 05 SIMULATOR ============================ -->
+<section id="sim">
+  <div class="sechead"><div class="num">05</div><h2>The whole machine<small>A toy pipeline running the real decision rules</small></h2></div>
+  <p>Two Sources start ingesting together. The walk thread drains <b>orders</b> into a buffer slot, aggregates it, then drains <b>refs</b> into a grace-hash build, then probes and writes. Each tick runs the arbitrator's round, the pause/resume reconcile, flag servicing and both limit checks, following the code described above. Rates, sizes and the RSS overhead model are made up for teaching, so read the shapes of the curves, not the numbers.</p>
+  <div class="sim">
+    <div class="panel"><i class="rivet tl"></i><i class="rivet tr"></i><i class="rivet bl"></i><i class="rivet br"></i>
+      <h3>Controls</h3>
+      <label class="ctl">preset
+        <select id="s_preset" style="grid-column:1/-1">
+          <option value="default">Default: pause, 512M</option>
+          <option value="tight">Tight budget: pause, 256M</option>
+          <option value="spill">Spill policy, 256M</option>
+          <option value="both">Both policy, 256M</option>
+          <option value="cap">Disk cap too small (E320)</option>
+          <option value="group">One oversized group (E310)</option>
+        </select></label>
+      <div style="font-size:12px;color:var(--ash);margin:-4px 0 6px">backpressure</div>
+      <div class="seg" id="s_pol"><button data-v="pause" class="on">pause</button><button data-v="spill">spill</button><button data-v="both">both</button></div>
+      <label class="ctl">memory.limit (MB) <output></output><input id="s_lim" type="range" min="96" max="1024" step="16" value="512"></label>
+      <label class="ctl">resume_threshold <output></output><input id="s_res" type="range" min="0.30" max="0.79" step="0.01" value="0.70"></label>
+      <label class="ctl">orders size (MB) <output></output><input id="s_osz" type="range" min="100" max="1500" step="20" value="700"></label>
+      <label class="ctl">source read rate (MB/tick) <output></output><input id="s_rate" type="range" min="2" max="40" step="1" value="14"></label>
+      <label class="ctl">walk drain rate (MB/tick) <output></output><input id="s_walk" type="range" min="2" max="40" step="1" value="10"></label>
+      <label class="ctl">ingest channel bound (MB) <output></output><input id="s_cap" type="range" min="8" max="200" step="4" value="24"></label>
+      <label class="ctl">aggregate state / input <output></output><input id="s_card" type="range" min="0.05" max="1" step="0.05" value="0.45"></label>
+      <label class="ctl">largest single group (MB, can't spill) <output></output><input id="s_grp" type="range" min="0" max="600" step="10" value="10"></label>
+      <label class="ctl">disk_cap_bytes (MB) <output></output><input id="s_disk" type="range" min="50" max="4000" step="50" value="4000"></label>
+      <label class="ctl">allocator overhead on RSS <output></output><input id="s_ovh" type="range" min="0" max="0.4" step="0.01" value="0.08"></label>
+      <div class="btnrow">
+        <button id="s_play" class="hot">▶ Run</button><button id="s_step">Step</button><button id="s_reset">Reset</button>
+      </div>
+      <label class="ctl">speed <output></output><input id="s_speed" type="range" min="1" max="30" step="1" value="10"></label>
+    </div>
+    <div>
+      <div class="dagwrap" id="s_dag"></div>
+      <div class="banner" id="s_banner"></div>
+      <div class="readout" id="s_read"></div>
+      <canvas id="s_chart" height="300"></canvas>
+      <div class="legend" id="s_legend"></div>
+      <canvas id="s_disk_c" height="70"></canvas>
+      <div class="legend"><span><i style="background:var(--verd)"></i>bytes on spill disk (compressed)</span><span><i style="background:var(--blood)"></i>disk_cap_bytes</span><span>▲ spill · ◆ pause · ● resume markers on the memory chart</span></div>
+      <h3 style="margin-top:14px">Arbitrator log</h3>
+      <div class="logbox" id="s_log" style="height:220px"></div>
+    </div>
+  </div>
+  <div class="callout b" style="margin-top:22px"><b>Things to try.</b> On <i>Default</i>, watch <b>refs</b> get paused while the walk is busy with orders, and resumed after a reclaim spill when its turn arrives. Switch to <i>Spill policy</i>: nothing is ever paused, and the arbitrator now elects buffer slots and the build directly. <i>Both</i> stays close to <i>Tight budget</i> here, because it only differs from <code>pause</code> once no Source is registered; from then on it picks the biggest holder whatever its priority. Section 03 shows the difference directly. <i>Oversized group</i> shows the one shape spill can't fix.</div>
+</section>
+
+<!-- ============================ 06 SCHEDULER ============================ -->
+<section id="sched">
+  <div class="sechead"><div class="num">06</div><h2>The scheduler<small>Choosing what runs next, before pressure builds</small></h2></div>
+  <div class="cols">
+    <div>
+      <p>The walk runs one node to completion before starting the next. When several nodes are runnable together (independent chains feeding a later Combine), <code>next_runnable</code> picks one by minimising this tuple:</p>
+      <p style="font-size:17px;color:var(--brass)">( !fits, −predicted_freed, −subtree_reclaim, stable_index )</p>
+      <ol>
+        <li><b>Headroom fit.</b> Prefer a node whose <code>predicted_peak</code> fits within <code>soft_limit − charged</code>. An unknown peak (0B) always counts as fitting.</li>
+        <li><b>Frees the most immediately.</b> A blocking operator that is ready to drain beats a fresh Source.</li>
+        <li><b>Frees the most eventually.</b> Between fresh Sources, start the chain whose downstream Aggregate releases the most.</li>
+        <li><b>Stable index.</b> Topological order, which keeps the choice deterministic on every machine.</li>
+      </ol>
+      <div class="callout v">Predictions come from the plan and the on-disk sizes of input files (shown by <code>--explain</code>). Without them every term is 0, so the order is plain topological. <b>Scheduling never changes output</b>; it only affects how high memory peaks.</div>
+      <div class="src">memory.rs · next_runnable() · engine docs: memory-arbitration.md "Scheduling"</div>
+    </div>
+    <div class="panel"><i class="rivet tl"></i><i class="rivet tr"></i><i class="rivet bl"></i><i class="rivet br"></i>
+      <h3>Runnable frontier</h3>
+      <label class="ctl">remaining headroom (soft − charged), MB <output id="r_head_o"></output><input id="r_head" type="range" min="0" max="600" step="10" value="180"></label>
+      <table class="sched" id="r_tbl"></table>
+      <div class="btnrow"><button id="r_zero">Clear all estimates (glob source)</button><button id="r_demo">Restore example</button></div>
+      <div id="r_pick" style="margin-top:10px"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ 07 FAILURE ============================ -->
+<section id="fail">
+  <div class="sechead"><div class="num">07</div><h2>When it fails<small>The diagnostics, and the limits of the guarantee</small></h2></div>
+  <div class="codes">
+    <div class="code"><b>E310</b><h4>MemoryBudgetExceeded</h4><p>RSS or charged bytes passed the hard limit. Common causes: one indivisible unit (a Reshape or Cull group, one aggregate row, a range-join block pair) is larger than the budget, or a consumer collected more than the limit into memory. The error names the node and the budget category.</p></div>
+    <div class="code"><b class="y">E312</b><h4>Unsatisfiable budget</h4><p>Under <code>pause</code> or <code>both</code>, a limit below the process's baseline RSS is rejected at startup. Otherwise the run would pause forever. <code>spill</code> skips this check and spills hard instead.</p></div>
+    <div class="code"><b>E320</b><h4>SpillCapExceeded</h4><p>Cumulative spill passed <code>storage.spill.disk_cap_bytes</code>. That's your own limit; the volume may still have space. The file that went over the cap is deleted on abort.</p></div>
+    <div class="code"><b>E321</b><h4>Spill volume full</h4><p>The disk itself ran out. Also: tmpfs <code>/tmp</code> is RAM, so spilling there frees nothing. Point <code>storage.spill.dir</code> at a real disk.</p></div>
+    <div class="code"><b class="y">E324</b><h4>Bad resume_threshold</h4><p>The value has to fall strictly between 0 and the 0.80 soft limit, otherwise the hysteresis band doesn't exist.</p></div>
+  </div>
+  <h3 style="margin-top:34px">Honest limits</h3>
+  <ul style="max-width:880px;color:var(--ash)">
+    <li>These are bounds on <i>requested allocations</i>, not on whole-process RSS. Allocator rounding, thread stacks, CSV parser buffers and native I/O are outside them. That gap is why the arbitrator logs a warning when RSS and charged bytes differ by more than 10% of the limit.</li>
+    <li>Some Source and Combine paths can still hold whole inputs in memory (<a href="https://github.com/rustpunk/clinker/issues/1183">#1183</a>).</li>
+    <li>Reshape's group map grows with distinct-group count and has no budget check, so it can be OOM-killed instead of reporting E310 (<a href="https://github.com/rustpunk/clinker/issues/1027">#1027</a>). Cull checks its equivalent and fails with E310.</li>
+    <li>Window arenas are attributed but can't be spilled on their own. They are freed only when the stage consuming them drains, which is why they rank last.</li>
+    <li>Dead-letter writers are not charged: each DLQ file uses a fixed 64 KiB buffer, and DLQ growth is limited by disk and the publication ceiling.</li>
+  </ul>
+</section>
+
+<footer>Derived from <code>crates/clinker-exec/src/pipeline/memory.rs</code>, <code>executor/dispatch.rs</code>, <code>executor/node_buffer.rs</code>, <code>aggregation/hash.rs</code>, <a href="memory-arbitration.html">Memory Arbitration &amp; Scheduling</a> and the User Guide's Memory Tuning page. The policy, reconcile and scheduler functions in the script port those sources and must change with them. The simulator is a teaching model: its decision rules mirror the code, but its rates and sizes are invented.</footer>
+
+<script>
+"use strict";
+const $=s=>document.querySelector(s);
+const fmt=mb=>mb>=1024?(mb/1024).toFixed(2)+" G":mb>=10?Math.round(mb)+" M":mb.toFixed(1)+" M";
+const css=v=>getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+
+/* ---------------- 01 gauge ---------------- */
+(function(){
+  const lim=$("#g_lim"),res=$("#g_res"),rss=$("#g_rss"),chg=$("#g_chg"),g=$("#gauge");
+  function draw(){
+    const L=+lim.value,R=+res.value,r=+rss.value,c=+chg.value;
+    $("#g_lim_o").textContent=L+" MB";$("#g_res_o").textContent=R.toFixed(2);
+    $("#g_rss_o").textContent=r+" MB";$("#g_chg_o").textContent=c+" MB";
+    const span=L*1.25, pct=x=>Math.min(100,x/span*100);
+    const soft=L*.8,resume=L*R,cur=Math.max(r,c);
+    g.style.background=`linear-gradient(90deg,#1f2a22 0 ${pct(resume)}%,#2c2a1b ${pct(resume)}% ${pct(soft)}%,#3a2416 ${pct(soft)}% ${pct(L)}%,#4a1512 ${pct(L)}% 100%)`;
+    g.innerHTML=`
+      <div class="fill" style="width:${pct(c)}%;background:rgba(224,169,62,.55)"></div>
+      <div class="fill" style="width:${pct(r)}%;top:44px;bottom:6px;background:rgba(127,151,173,.6)"></div>
+      <div class="mark" style="left:${pct(resume)}%;background:#9bc76b"><span class="t" style="color:#9bc76b">resume ${fmt(resume)}</span></div>
+      <div class="mark" style="left:${pct(soft)}%;background:var(--rust)"><span class="b" style="color:var(--rust)">soft ${fmt(soft)}</span></div>
+      <div class="mark" style="left:${pct(L)}%;background:var(--blood)"><span class="t" style="color:var(--blood)">hard ${fmt(L)}</span></div>
+      <div class="needle" style="left:calc(${pct(cur)}% - 2px)"></div>`;
+    let s,col,d;
+    if(cur>L){s="E310 · abort";col="var(--blood)";d="Above the hard limit. <code>should_abort()</code> is true, and the next hot-loop check fails the run with MemoryBudgetExceeded, naming that node.";}
+    else if(cur>soft){s="Pressure · arbitrate";col="var(--rust)";d="Above the soft limit. <code>should_spill()</code> trips: reconcile pauses a non-active Source (pause and both policies), then the policy picks a victim to spill.";}
+    else if(cur>=resume){s="Dead zone · hold";col="var(--brass)";d="Between the resume watermark and the soft limit. Nothing changes: paused producers stay paused and running ones keep running. This band prevents flapping.";}
+    else{s="Calm · resume";col="#9bc76b";d="Below the resume watermark. Any Source paused for pressure is resumed.";}
+    $("#g_status").textContent=s;$("#g_status").style.color=col;
+    $("#g_detail").innerHTML=d+`<br><br>current_pressure = max(RSS ${r}, charged ${c}) = <b style="color:var(--bone)">${cur} MB</b>. RSS is the lower bar, the charged sum the upper bar.`;
+  }
+  [lim,res,rss,chg].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------------- 02 ledger ---------------- */
+(function(){
+  const BUD=256; let live=0, peak=0, granted=0, busy=false;
+  const bar=$("#l_bar"), log=$("#l_log");
+  const lg=(m,c="")=>{const d=document.createElement("div");d.className=c;d.textContent=m;log.prepend(d);};
+  function render(extra){
+    const w=x=>x/BUD*100;
+    bar.innerHTML=(extra||"")+(live&&!extra?`<div class="grant live" style="left:0;width:${w(live)}%">vec ${live}K</div>`:"");
+    $("#l_granted").textContent=granted+"K";$("#l_cap").textContent=live+"K";$("#l_peak").textContent=peak+"K";
+  }
+  function reserve(k){ if(granted+k>BUD) return false; granted+=k; peak=Math.max(peak,granted); return true; }
+  $("#l_alloc").onclick=()=>{ if(busy) return;
+    if(live){lg("A vec already exists. Grow it or drop it.","w");return;}
+    if(!reserve(48)){lg("refused","e");return;}
+    live=48; lg("AllocationLease reserved Layout(48K) and allocated afterwards. granted=48K","ok"); render(); };
+  $("#l_grow").onclick=()=>{ if(busy||!live) return;
+    const nw=live*2;
+    if(!reserve(nw)){ lg(`grow to ${nw}K refused: ${granted}K + ${nw}K > ${BUD}K budget. The old ${live}K block and its charge are left untouched, and the insert value is returned unconsumed.`,"e");
+      bar.animate([{outline:"2px solid #e0362c"},{outline:"0px solid transparent"}],{duration:600}); return; }
+    busy=true;
+    lg(`reserved replacement ${nw}K while old ${live}K is still charged. granted=${granted}K (overlap peak)`,"w");
+    const w=x=>x/BUD*100;
+    render(`<div class="grant old" style="left:0;width:${w(live)}%">old ${live}K</div><div class="grant repl" style="left:${w(live)}%;width:${w(nw)}%">new ${nw}K</div>`);
+    setTimeout(()=>{ granted-=live; lg(`copied contents and freed old block, released ${live}K. granted=${granted}K`,"s"); live=nw; busy=false; render(); },1100);
+  };
+  $("#l_drop").onclick=()=>{ if(busy||!live) return; granted-=live; lg(`dropped vec. Allocation freed first, then lease released ${live}K. granted=${granted}K`,"s"); live=0; render(); };
+  render(); lg("Budget is 256 KiB. Try reserve, then grow ×2 twice.","p");
+})();
+
+/* ---------------- shared policy code (mirrors memory.rs) ---------------- */
+// consumers: [{id,name,prio,bp,usage,active,paused}] in registration order
+const Policy={
+  Priority:(cs)=>{ if(!cs.length) return null; let best=cs[0];
+    for(const c of cs){ if(c.prio<best.prio || (c.prio===best.prio && c.usage>best.usage)) best=c; } return best; },
+  LargestFirst:(cs)=>{ if(!cs.length) return null; let best=cs[0];
+    for(const c of cs){ if(c.usage>=best.usage) best=c; } return best; }, // max_by_key: last max wins
+};
+function selectVictim(knob,cs){
+  if(knob==="spill") return Policy.Priority(cs);
+  const bp=cs.find(c=>c.bp); if(bp) return bp;
+  return knob==="both"?Policy.LargestFirst(cs):Policy.Priority(cs);
+}
+const POLNAME={pause:"BackPressurePreferred -> Priority",spill:"Priority",both:"BackPressurePreferred -> LargestFirst"};
+const PRIO_LAST=2147483647;
+
+/* ---------------- 03 arbitration lab ---------------- */
+(function(){
+  const rows=[
+    {name:"source.orders",prio:PRIO_LAST,bp:true,usage:40,on:true,active:true},
+    {name:"source.refs",prio:PRIO_LAST,bp:true,usage:30,on:true,active:false},
+    {name:"node_buffer slot",prio:0,bp:false,usage:20,on:true},
+    {name:"grace-hash Combine",prio:10,bp:false,usage:120,on:true},
+    {name:"sort buffer",prio:20,bp:false,usage:60,on:false},
+    {name:"hash Aggregate",prio:30,bp:false,usage:210,on:true},
+    {name:"window arena",prio:PRIO_LAST,bp:false,usage:80,on:false},
+  ];
+  const tbl=$("#a_tbl"), pr=$("#a_pr");
+  const PR=["below resume (peak already past soft)","in dead zone","above soft"];
+  function build(){
+    tbl.innerHTML=`<tr><th>reg</th><th>consumer</th><th>prio</th><th>MB</th><th>walk active</th></tr>`+rows.map((r,i)=>`
+      <tr><td><input type="checkbox" data-i="${i}" data-k="on" ${r.on?"checked":""}></td>
+      <td>${r.name}${r.bp?'<span class="pill bp">pausable</span>':''}</td>
+      <td>${r.prio===PRIO_LAST?(r.bp?"N/A":"last"):r.prio}</td>
+      <td><input type="number" min="0" max="999" data-i="${i}" data-k="usage" value="${r.usage}"></td>
+      <td>${r.bp?`<input type="checkbox" data-i="${i}" data-k="active" ${r.active?"checked":""}>`:"–"}</td></tr>`).join("");
+    tbl.querySelectorAll("input").forEach(el=>el.addEventListener("input",()=>{
+      const r=rows[+el.dataset.i],k=el.dataset.k; r[k]=el.type==="checkbox"?el.checked:+el.value; run(); }));
+  }
+  function run(){
+    $("#a_pr_o").textContent=PR[+pr.value];
+    const cs=rows.filter(r=>r.on).map((r,i)=>({...r,id:i}));
+    $("#a_out").innerHTML=["pause","spill","both"].map(k=>{
+      let acts=[];
+      const level=+pr.value;
+      if(level===0){ acts.push(`<div class="act none">Assumes peak RSS crossed soft earlier in the run. Peak never falls, so <code>should_spill()</code> keeps tripping and rounds keep running. (If peak never crossed soft, no round runs.)</div>`);
+        acts.push(k==="spill"?`<div class="act none">① reconcile: no-op, because Priority never pauses.</div>`:`<div class="act resume">① reconcile: current pressure is under the resume watermark, so every paused Source resumes.</div>`);}
+      else if(level===1){ acts.push(`<div class="act none">① reconcile: current pressure is in the dead zone, so no pause or resume.</div>`); }
+      if(level===2){
+        if(k==="spill") acts.push(`<div class="act none">① reconcile: no-op, because Priority never pauses.</div>`);
+        else { const p=cs.find(c=>c.bp&&!c.active);
+          acts.push(p?`<div class="act pause">① reconcile: pause <b>${p.name}</b>, the first pausable consumer that is not active.</div>`
+                     :`<div class="act none">① reconcile: no pausable, non-active Source, so nothing is paused.</div>`);}
+      }
+      {
+        const v=selectVictim(k,cs);
+        if(!v) acts.push(`<div class="act none">② no consumers registered, so no victim.</div>`);
+        else if(v.bp) acts.push(`<div class="act none">② policy picks <b>${v.name}</b>, which is pausable, so <i>nobody spills</i> this round.${v.active?" (It is also active, so step ① could not pause it.)":""}</div>`);
+        else acts.push(`<div class="act spill">② policy picks <b>${v.name}</b> (${v.usage} MB). try_spill sets its flag, and it spills at the next boundary${v.usage===0?". It holds 0 B, so nothing is freed":""}.</div>`);
+      }
+      return `<div class="pcard"><h4>${k}</h4><div class="pn">${POLNAME[k]}</div>${acts.join("")}</div>`;
+    }).join("");
+  }
+  pr.addEventListener("input",run); build(); run();
+})();
+
+/* ---------------- 05 simulator ---------------- */
+const Sim=(function(){
+  const COL={orders:"#d0581f",refs:"#b07ac0",slot:"#e0a93e",agg:"#7f97ad",build:"#4fb0a0",stage:"#9bc76b"};
+  const LBL={orders:"source.orders ingest",refs:"source.refs ingest",slot:"node_buffer slot",agg:"hash Aggregate",build:"grace-hash build",stage:"output staging"};
+  const KEYS=["orders","refs","slot","agg","build","stage"];
+  const ctl={pol:"pause"};
+  const ids=["lim","res","osz","rate","walk","cap","card","grp","disk","ovh","speed"];
+  const el={}; ids.forEach(k=>el[k]=$("#s_"+k));
+  const PRESETS={
+    default:{pol:"pause",lim:512,res:.7,osz:700,rate:14,walk:10,cap:24,card:.45,grp:10,disk:4000,ovh:.08},
+    tight:{pol:"pause",lim:256,res:.7,osz:700,rate:14,walk:10,cap:24,card:.45,grp:10,disk:4000,ovh:.08},
+    spill:{pol:"spill",lim:256,res:.7,osz:700,rate:14,walk:10,cap:24,card:.45,grp:10,disk:4000,ovh:.08},
+    both:{pol:"both",lim:256,res:.7,osz:700,rate:14,walk:10,cap:24,card:.45,grp:10,disk:4000,ovh:.08},
+    cap:{pol:"spill",lim:192,res:.7,osz:1100,rate:14,walk:10,cap:24,card:.6,grp:10,disk:250,ovh:.08},
+    group:{pol:"pause",lim:256,res:.7,osz:700,rate:14,walk:10,cap:24,card:.6,grp:280,disk:4000,ovh:.08},
+  };
+  let S, timer=null, hist=[], marks=[];
+  function syncOut(){ ids.forEach(k=>{const o=el[k].parentElement.querySelector("output"); if(o) o.textContent=el[k].value;}); }
+  function applyPreset(p){ const P=PRESETS[p]; Object.entries(P).forEach(([k,v])=>{ if(k==="pol") setPol(v); else el[k].value=v; }); syncOut(); reset(); }
+  function setPol(v){ ctl.pol=v; document.querySelectorAll("#s_pol button").forEach(b=>b.classList.toggle("on",b.dataset.v===v)); }
+  function P(){ const o={}; ids.forEach(k=>o[k]=+el[k].value); o.pol=ctl.pol; return o; }
+
+  function reset(){
+    stop(); const p=P();
+    S={t:0,p,peakRss:0,rss:0,disk:0,diskW:0,phase:0,done:false,err:null,reg:[],lastVictim:"",
+      src:{orders:{total:p.osz,read:0,chan:0,paused:false,active:false,blocked:false,reg:true},
+           refs:{total:Math.round(p.osz*0.22),read:0,chan:0,paused:false,active:false,blocked:false,reg:true}},
+      mem:{slot:0,agg:0,build:0,stage:0}, dsk:{slot:0,agg:0,build:0},
+      flag:{slot:false,agg:false,build:false,stage:false}, regd:{slot:false,agg:false,build:false,stage:false},
+      aggIn:0, out:0, spills:0,pauses:0};
+    hist=[];marks=[]; $("#s_log").innerHTML=""; $("#s_banner").className="banner";
+    log(`run start: limit ${fmt(p.lim)}, soft ${fmt(p.lim*.8)}, resume ${fmt(p.lim*p.res)}, policy ${POLNAME[p.pol]}`,"p");
+    log(`both Sources register pausable consumers; their ingest threads start reading`,"p");
+    sample(); render();
+  }
+  function log(m,c=""){ const d=document.createElement("div"); d.className=c; d.textContent=`[t=${String(S.t).padStart(3)}] ${m}`; const L=$("#s_log"); L.prepend(d); while(L.childNodes.length>400) L.lastChild.remove(); }
+
+  // consumer snapshot in registration order (orders, refs, then stage regs in order of registration)
+  function consumers(){
+    const cs=[];
+    for(const n of ["orders","refs"]){ const s=S.src[n]; if(s.reg) cs.push({key:n,name:"source."+n,prio:PRIO_LAST,bp:true,usage:s.chan,active:s.active,paused:s.paused}); }
+    for(const k of S.reg){ if(S.regd[k]) cs.push({key:k,name:LBL[k],prio:{slot:0,stage:0,build:10,agg:30}[k],bp:false,usage:S.mem[k]}); }
+    return cs;
+  }
+  const charged=()=>consumers().reduce((a,c)=>a+c.usage,0);
+  function register(k){ if(!S.reg.includes(k)) S.reg.push(k); S.regd[k]=true; log(`register ${LBL[k]} consumer`,"p"); }
+  function unregister(k){ S.regd[k]=false; log(`unregister ${LBL[k]}: its state has drained`,"p"); }
+
+  function observe(){ const c=charged(); S.rss=22+c*(1+S.p.ovh); S.peakRss=Math.max(S.peakRss,S.rss); }
+  function curPressure(){ return Math.max(S.rss,charged()); }
+  function shouldSpill(){
+    observe(); const soft=S.p.lim*.8; const tripped=S.peakRss>soft||charged()>soft;
+    if(tripped){ reconcile(); poll(); } return tripped;
+  }
+  function reconcile(){
+    if(S.p.pol==="spill") return;
+    const cur=curPressure(), soft=S.p.lim*.8;
+    if(cur>soft){
+      for(const n of ["orders","refs"]){ const s=S.src[n]; if(s.reg&&!s.active){ if(!s.paused){s.paused=true;S.pauses++;marks.push({t:S.t,k:"pause"});log(`reconcile: pressure ${fmt(cur)} > soft, so pause source.${n} (ingest thread parks on its Condvar)`,"p");} break; } }
+    } else if(cur<S.p.lim*S.p.res){
+      for(const n of ["orders","refs"]){ const s=S.src[n]; if(s.reg&&s.paused){ s.paused=false; marks.push({t:S.t,k:"resume"}); log(`reconcile: pressure ${fmt(cur)} < resume watermark, so resume source.${n}`,"ok"); } }
+    }
+  }
+  function poll(){
+    const cs=consumers(); const v=selectVictim(S.p.pol,cs); if(!v) return;
+    const tag=v.key+(v.bp?"bp":"");
+    if(v.bp){ if(S.lastVictim!==tag) log(`poll: policy picks ${v.name} (pausable), so no spill request this round`,""); }
+    else { S.flag[v.key]=true; if(S.lastVictim!==tag) log(`poll: policy picks ${v.name} (prio ${v.prio}, ${fmt(v.usage)}) and calls try_spill, which sets its flag`,"w"); }
+    S.lastVictim=tag;
+  }
+  // the largest group grows with the input it has seen and can never be spilled
+  function aggFloor(){ return Math.min(S.p.grp,S.aggIn*S.p.card); }
+  function diskAdd(k,mb){
+    const bytes=mb*0.45; S.disk+=bytes; S.diskW+=bytes; S.dsk[k]+=mb; S.spills++; marks.push({t:S.t,k:"spill"});
+    if(S.disk>S.p.disk){ fail(`E320 SpillCapExceeded: ${LBL[k]} spill raised cumulative disk use to ${fmt(S.disk)}, over disk_cap_bytes ${fmt(S.p.disk)}. The file that crossed the cap is removed.`); return false; }
+    return true;
+  }
+  function spill(k,why){
+    let mb=S.mem[k]; if(k==="agg") mb=Math.max(0,S.mem.agg-aggFloor()); if(k==="build") mb=S.mem.build*0.5;
+    if(k==="stage"){ log(`output staging serviced its spill flag; it is charged-only, so only fixed staging tails move`,""); return; }
+    if(mb<0.5){ if(S.lastNoop===k) return; S.lastNoop=k; log(`${LBL[k]} spill: nothing reclaimable (${fmt(S.mem[k])} resident${k==="agg"?", the rest is one indivisible group":""})`,""); return; }
+    S.lastNoop=""; S.mem[k]-=mb; log(`${LBL[k]} spills ${fmt(mb)} to disk (${why}), postcard+LZ4 ≈ ${fmt(mb*.45)} on disk`,"s");
+    diskAdd(k,mb);
+  }
+  function serviceFlags(){ for(const k of ["slot","agg","build","stage"]){ if(S.flag[k]&&S.regd[k]){ S.flag[k]=false; spill(k,"take_spill_request"); if(S.err) return; } S.flag[k]=false; } }
+  function fail(msg){ S.err=msg; S.done=true; log(msg,"e"); const b=$("#s_banner"); b.textContent=msg.split(":")[0]; b.className="banner err"; stop(); }
+  function hardCheck(node){
+    observe(); if(S.err) return;
+    if(S.peakRss>S.p.lim||charged()>S.p.lim) fail(`E310 MemoryBudgetExceeded in ${node}: ${S.peakRss>S.p.lim?"peak RSS "+fmt(S.peakRss):"charged "+fmt(charged())} > limit ${fmt(S.p.lim)}`);
+  }
+  function activate(n){
+    const s=S.src[n];
+    if(s.paused){ const over=Math.max(0,curPressure()-S.p.lim*.8);
+      log(`walk reaches source.${n}, which is paused: spill_reclaimable(${fmt(over)}) runs over non-pausable consumers in priority order, then resume`,"w");
+      if(over>0){ let rem=over; const order=consumers().filter(c=>!c.bp).sort((a,b)=>a.prio-b.prio);
+        for(const c of order){ if(rem<=0) break; const held=S.mem[c.key]; spill(c.key,"spill_reclaimable"); if(S.err) return;
+          // try_spill returns Ok(held) only when held >= remaining; a partial (Err) leaves the target unchanged
+          if(held>=rem) rem-=held; } }
+      s.paused=false; marks.push({t:S.t,k:"resume"});
+    }
+    s.active=true; log(`source.${n} is now active; reconcile will not pause it while the walk drains it`,"p");
+  }
+
+  function step(){
+    if(S.done) return; S.t++; const p=S.p;
+    // ingest threads (concurrent)
+    for(const n of ["orders","refs"]){ const s=S.src[n]; if(!s.reg||s.paused||s.read>=s.total) continue;
+      const room=p.cap-s.chan; const k=Math.min(p.rate*(n==="refs"?.6:1),room,s.total-s.read);
+      if(k<=0.001){ if(!s.blocked){ s.blocked=true; log(`source.${n} channel full (${fmt(p.cap)}): ingest thread blocks on send. This is transport backpressure, not an arbitrator pause`,""); } continue; }
+      s.blocked=false; s.chan+=k; s.read+=k; }
+    serviceFlags(); if(S.err) return;
+    const W=p.walk;
+    if(S.phase===0){ activate("orders"); if(S.err) return; register("slot"); S.phase=1; }
+    if(S.phase===1){ // drain orders -> slot
+      const s=S.src.orders, m=Math.min(W,s.chan); s.chan-=m;
+      if(m>0){ S.mem.slot+=m; if(shouldSpill()){ const mb=S.mem.slot; if(mb>0.5){ S.mem.slot=0; log(`slot admission: should_spill() is true, so the producer writes ${fmt(mb)} straight to a spill file`,"s"); if(!diskAdd("slot",mb)) return; } } }
+      hardCheck("source.orders"); if(S.err) return;
+      if(s.read>=s.total&&s.chan<=0.001){ s.reg=false; s.active=false; log(`source.orders receiver disconnected; its consumer is unregistered`,"p"); S.phase=2; register("agg"); }
+    } else if(S.phase===2){ // aggregate slot -> agg
+      let m=Math.min(W,S.mem.slot); S.mem.slot-=m; let r=Math.min(W-m,S.dsk.slot); if(r>0){ S.dsk.slot-=r; S.disk=Math.max(0,S.disk-r*.45); m+=r; }
+      S.aggIn+=m; S.mem.agg+=m*p.card;
+      shouldSpill();
+      if(S.mem.agg>p.lim*.6){ log(`hash Aggregate reached ~60% of its budget (group-count check), so it spills on its own`,"w"); spill("agg","self-threshold"); if(S.err) return; }
+      hardCheck("aggregation.totals"); if(S.err) return;
+      if(S.mem.slot<=0.001&&S.dsk.slot<=0.001){ unregister("slot"); S.phase=3; }
+    } else if(S.phase===3){ activate("refs"); if(S.err) return; register("build"); S.phase=4; }
+    else if(S.phase===4){ // drain refs -> build
+      const s=S.src.refs, m=Math.min(W,s.chan); s.chan-=m; S.mem.build+=m;
+      if(shouldSpill()&&S.mem.build>p.lim*.25){ log(`grace-hash build: should_spill() is true, so it spills its largest Building partition`,"w"); spill("build","grace-hash should_spill"); if(S.err) return; }
+      hardCheck("combine.enrich"); if(S.err) return;
+      if(s.read>=s.total&&s.chan<=0.001){ s.reg=false; s.active=false; log(`source.refs drained; consumer unregistered`,"p"); S.phase=5; register("stage"); }
+    } else if(S.phase===5){ // probe: agg + build -> stage -> sink
+      let m=Math.min(W,S.mem.agg); S.mem.agg-=m; let r=Math.min(W-m,S.dsk.agg); if(r>0){S.dsk.agg-=r;S.disk=Math.max(0,S.disk-r*.45);}
+      const bd=Math.min(W*.5,S.dsk.build); if(bd>0){S.dsk.build-=bd;S.disk=Math.max(0,S.disk-bd*.45);}
+      S.mem.stage=Math.min(6,S.mem.stage+3); S.out+=m+r; shouldSpill(); hardCheck("combine.enrich → output"); if(S.err) return;
+      if(S.mem.agg<=0.001&&S.dsk.agg<=0.001){ S.mem.build=0;S.dsk.build=0;S.mem.stage=0;S.mem.agg=0; unregister("agg"); unregister("build"); unregister("stage"); S.disk=0;
+        S.done=true; stop(); const b=$("#s_banner"); b.textContent=`Run complete · peak RSS ${fmt(S.peakRss)} · ${S.spills} spills · ${S.pauses} pause${S.pauses===1?"":"s"}`; b.className="banner ok"; log("run complete: every consumer unregistered and spill files released","ok"); }
+    }
+    sample(); render();
+  }
+  function sample(){ observe(); hist.push({t:S.t,orders:S.src.orders.chan,refs:S.src.refs.chan,slot:S.mem.slot,agg:S.mem.agg,build:S.mem.build,stage:S.mem.stage,rss:S.rss,disk:S.disk}); }
+
+  function nodeBox(key,title,kind,mb,cap,opts={}){
+    const tags=(opts.tags||[]).map(([t,c])=>`<span style="color:${c}">${t}</span>`).join("");
+    return `<div class="node ${opts.cls||""}" style="--c:${COL[key]||"#e0a93e"}"><div class="tags">${tags}</div><h5>${title}</h5><div class="k">${kind}</div><div class="b">${fmt(mb)}${opts.extra||""}</div><div class="bar"><i style="width:${Math.min(100,mb/cap*100)}%"></i></div></div>`;
+  }
+  const wire='<div class="wire"></div>';
+  function render(){
+    const p=S.p, L=p.lim;
+    const sTags=n=>{const s=S.src[n],t=[]; if(s.active)t.push(["active","#e0a93e"]); if(s.paused)t.push(["paused","#7f97ad"]); if(s.blocked&&!s.paused)t.push(["chan full","#b9ab98"]); if(!s.reg)t.push(["done","#7d705f"]); return t;};
+    const sCls=n=>{const s=S.src[n]; return (s.paused?"paused ":"")+(s.active?"active ":"")+(!s.reg?"gone":"");};
+    const flagT=k=>{const t=[]; if(S.flag[k])t.push(["spill req","#4fb0a0"]); if(S.dsk[k]>0.5)t.push(["on disk "+fmt(S.dsk[k]),"#4fb0a0"]); return t;};
+    $("#s_dag").innerHTML=`
+      <div class="lane">${nodeBox("orders","orders","Source · ingest chan",S.src.orders.chan,p.cap,{cls:sCls("orders"),tags:sTags("orders"),extra:` <span style="color:var(--dim);font-weight:400">read ${Math.round(S.src.orders.read/S.src.orders.total*100)}%</span>`})}${wire}
+      ${nodeBox("slot","slot 0","node_buffer · prio 0",S.mem.slot,L,{cls:(S.phase===1?"active":"")+(S.regd.slot||S.phase<1?"":" gone"),tags:flagT("slot")})}${wire}
+      ${nodeBox("agg","totals","hash Aggregate · prio 30",S.mem.agg,L,{cls:S.phase===2?"active":"",tags:flagT("agg")})}${wire}
+      ${nodeBox("stage","sink","output staging · charged-only",S.mem.stage,L,{cls:S.phase===5?"active":""})}</div>
+      <div class="lane">${nodeBox("refs","refs","Source · ingest chan",S.src.refs.chan,p.cap,{cls:sCls("refs"),tags:sTags("refs"),extra:` <span style="color:var(--dim);font-weight:400">read ${Math.round(S.src.refs.read/S.src.refs.total*100)}%</span>`})}${wire}
+      ${nodeBox("build","enrich","grace-hash build · prio 10",S.mem.build,L,{cls:(S.phase===4||S.phase===5)?"active":"",tags:flagT("build")})}
+      <div style="align-self:center;color:var(--dim);font-size:11px;margin-left:12px">probes with totals in the final phase →</div></div>`;
+    const c=charged();
+    const ph=["start","drain orders → slot","aggregate","activate refs","drain refs → build","probe → sink"][S.phase]||"";
+    $("#s_read").innerHTML=[
+      ["tick",S.t],["phase",ph],["charged",fmt(c)],["RSS (model)",fmt(S.rss)],["peak RSS",fmt(S.peakRss)],["spill disk",fmt(S.disk)],["spills",S.spills],["pauses",S.pauses]
+    ].map(([a,b])=>`<div><span>${a}</span><b style="${a==="phase"?"font-size:15px":""}">${b}</b></div>`).join("");
+    drawChart(); drawDisk();
+  }
+  function setupCanvas(cv){ const dpr=window.devicePixelRatio||1, w=cv.clientWidth, h=+cv.getAttribute("height"); cv.width=w*dpr; cv.height=h*dpr; const x=cv.getContext("2d"); x.setTransform(dpr,0,0,dpr,0,0); return [x,w,h]; }
+  function drawChart(){
+    const cv=$("#s_chart"); const [x,w,h]=setupCanvas(cv); const L=S.p.lim;
+    const ymax=L*1.3, n=Math.max(60,hist.length), pad=34;
+    const X=i=>pad+(w-pad-6)*(i/(n-1)), Y=v=>h-18-(h-28)*Math.min(v,ymax)/ymax;
+    x.fillStyle="#14110f";x.fillRect(0,0,w,h);
+    // bands
+    const band=(a,b,col)=>{x.fillStyle=col;x.fillRect(pad,Y(b),w-pad-6,Y(a)-Y(b));};
+    band(L*S.p.res,L*.8,"rgba(224,169,62,.06)"); band(L*.8,L,"rgba(208,88,31,.08)"); band(L,ymax,"rgba(224,54,44,.10)");
+    // stacked
+    let base=hist.map(()=>0);
+    for(const k of KEYS){
+      x.beginPath(); hist.forEach((hh,i)=>{ const v=base[i]+hh[k]; i?x.lineTo(X(i),Y(v)):x.moveTo(X(i),Y(v)); });
+      for(let i=hist.length-1;i>=0;i--) x.lineTo(X(i),Y(base[i]));
+      x.closePath(); x.fillStyle=COL[k]+"cc"; x.fill();
+      base=base.map((b,i)=>b+hist[i][k]);
+    }
+    // rss line
+    x.beginPath(); hist.forEach((hh,i)=>{ i?x.lineTo(X(i),Y(hh.rss)):x.moveTo(X(i),Y(hh.rss)); }); x.strokeStyle="#ece2d0"; x.setLineDash([4,3]); x.lineWidth=1.5; x.stroke(); x.setLineDash([]);
+    // threshold lines
+    const line=(v,col,t)=>{x.strokeStyle=col;x.lineWidth=1;x.beginPath();x.moveTo(pad,Y(v));x.lineTo(w-6,Y(v));x.stroke();x.fillStyle=col;x.font="10px Share Tech Mono, monospace";x.fillText(t,pad+4,Y(v)-3);};
+    line(L,"#e0362c","hard "+fmt(L)); line(L*.8,"#d0581f","soft "+fmt(L*.8)); line(L*S.p.res,"#9bc76b","resume "+fmt(L*S.p.res));
+    // markers
+    const seen=new Set();
+    for(const m of marks){ const key=m.t+m.k; if(seen.has(key)) continue; seen.add(key); const i=hist.findIndex(hh=>hh.t===m.t); if(i<0) continue;
+      x.fillStyle=m.k==="spill"?"#4fb0a0":m.k==="pause"?"#7f97ad":"#9bc76b"; x.font="11px sans-serif";
+      x.fillText(m.k==="spill"?"▲":m.k==="pause"?"◆":"●",X(i)-4,h-4); }
+    x.fillStyle="#7d705f";x.font="10px Share Tech Mono, monospace";x.fillText("MB",4,12);x.fillText(fmt(ymax),2,Y(ymax)+10);
+  }
+  function drawDisk(){
+    const cv=$("#s_disk_c"); const [x,w,h]=setupCanvas(cv);
+    const n=Math.max(60,hist.length), pad=34, cap=S.p.disk, ymax=Math.max(cap*1.1, ...hist.map(hh=>hh.disk), 10);
+    const X=i=>pad+(w-pad-6)*(i/(n-1)), Y=v=>h-6-(h-12)*v/ymax;
+    x.fillStyle="#14110f";x.fillRect(0,0,w,h);
+    x.beginPath(); hist.forEach((hh,i)=>{ i?x.lineTo(X(i),Y(hh.disk)):x.moveTo(X(i),Y(hh.disk)); }); x.lineTo(X(hist.length-1),Y(0)); x.lineTo(X(0),Y(0)); x.closePath(); x.fillStyle="rgba(79,176,160,.55)"; x.fill();
+    x.strokeStyle="#e0362c"; x.beginPath(); x.moveTo(pad,Y(cap)); x.lineTo(w-6,Y(cap)); x.stroke();
+    x.fillStyle="#7d705f";x.font="10px Share Tech Mono, monospace";x.fillText("disk",2,12);
+  }
+  function play(){ if(S.done) reset(); if(timer){stop();return;} $("#s_play").textContent="❚❚ Pause";
+    const tick=()=>{ step(); if(!S.done) timer=setTimeout(tick, 1000/(+el.speed.value)); }; tick(); }
+  function stop(){ if(timer){clearTimeout(timer);timer=null;} const b=$("#s_play"); if(b) b.textContent="▶ Run"; }
+  // legend
+  $("#s_legend").innerHTML=KEYS.map(k=>`<span><i style="background:${COL[k]}"></i>${LBL[k]}</span>`).join("")+`<span><i style="background:none;border-top:2px dashed #ece2d0;height:0"></i>RSS (charged × overhead + baseline)</span>`;
+  ids.forEach(k=>el[k].addEventListener("input",()=>{ syncOut(); if(k!=="speed") reset(); }));
+  document.querySelectorAll("#s_pol button").forEach(b=>b.onclick=()=>{ setPol(b.dataset.v); reset(); });
+  $("#s_preset").onchange=e=>applyPreset(e.target.value);
+  $("#s_play").onclick=play; $("#s_step").onclick=()=>{ stop(); if(S.done) reset(); step(); }; $("#s_reset").onclick=reset;
+  window.addEventListener("resize",()=>render());
+  syncOut(); reset();
+  return {};
+})();
+
+/* ---------------- 06 scheduler ---------------- */
+(function(){
+  const EX=[
+    {name:"source.big",peak:400,freed:0,sub:350,idx:0},
+    {name:"source.small",peak:60,freed:0,sub:50,idx:1},
+    {name:"aggregation.ready",peak:120,freed:120,sub:120,idx:2},
+    {name:"sort.heavy",peak:260,freed:260,sub:260,idx:3},
+  ];
+  let rows=EX.map(r=>({...r}));
+  const head=$("#r_head");
+  function build(){
+    $("#r_tbl").innerHTML=`<tr><th>node</th><th>peak</th><th>freed</th><th>subtree</th><th>idx</th></tr>`+rows.map((r,i)=>`<tr data-i="${i}">
+      <td>${r.name}</td>${["peak","freed","sub","idx"].map(k=>`<td><input type="number" min="0" data-i="${i}" data-k="${k}" value="${r[k]}"></td>`).join("")}</tr>`).join("");
+    $("#r_tbl").querySelectorAll("input").forEach(e=>e.addEventListener("input",()=>{rows[+e.dataset.i][e.dataset.k]=+e.value;run();}));
+    run();
+  }
+  function run(){
+    const H=+head.value; $("#r_head_o").textContent=H+" MB";
+    const keyed=rows.map((r,i)=>({r,i,key:[r.peak<=H?0:1,-r.freed,-r.sub,r.idx]}));
+    keyed.sort((a,b)=>{for(let j=0;j<4;j++){if(a.key[j]!==b.key[j])return a.key[j]-b.key[j];}return 0;});
+    $("#r_tbl").querySelectorAll("tr[data-i]").forEach(tr=>tr.classList.toggle("win",+tr.dataset.i===keyed[0].i));
+    const why=(a,b)=>{ if(!b) return "";
+      if(a.key[0]!==b.key[0]) return `it fits the ${H} MB headroom and ${b.r.name} (peak ${b.r.peak}) does not`;
+      if(a.key[1]!==b.key[1]) return `it frees ${a.r.freed} MB as soon as it finishes, against ${b.r.freed}`;
+      if(a.key[2]!==b.key[2]) return `its chain eventually frees ${a.r.sub} MB, against ${b.r.sub}`;
+      return `tie on everything, so the lower stable index wins (${a.r.idx} < ${b.r.idx})`; };
+    $("#r_pick").innerHTML=keyed.map((k,n)=>`<div style="display:flex;gap:12px;align-items:baseline;border-bottom:1px solid var(--seam);padding:4px 0">
+      <span class="rank">${n+1}</span><b>${k.r.name}</b><span class="keytuple">(${k.key.map(v=>Object.is(v,-0)?0:v).join(", ")})</span></div>`).join("")+
+      `<p style="font-size:13px;color:var(--ash)"><b style="color:var(--rust)">${keyed[0].r.name}</b> runs next: ${why(keyed[0],keyed[1])}.</p>`;
+  }
+  head.addEventListener("input",run);
+  $("#r_zero").onclick=()=>{rows=rows.map(r=>({...r,peak:0,freed:0,sub:0}));build();};
+  $("#r_demo").onclick=()=>{rows=EX.map(r=>({...r}));build();};
+  build();
+})();
+</script>
+</body>
+</html>

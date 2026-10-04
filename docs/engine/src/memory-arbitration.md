@@ -2,6 +2,8 @@
 
 *User-facing view: the User Guide's "Memory Tuning" page.*
 
+*Interactive companion: the [memory system explainer](memory-explainer.html) walks through the budget, ledger, arbitration policies, backpressure, spill and scheduler, with a simulator that runs the decision rules on this page. Its script ports `select_victim`, `reconcile_backpressure`, `spill_reclaimable` and `next_runnable`; update it when those change.*
+
 This page is the engine-internals reference for how Clinker tracks, attributes, and reclaims memory at runtime, and how it orders simultaneously-runnable nodes to keep the resident working set bounded. It covers the `MemoryConsumer` wrapper registry, pull-mode byte attribution, the per-operator arbitration parameters the active policy reads, the bounded-memory contract for materialized stages, the `predicted_*` values that feed both `--explain` and the scheduler, and the four ranking rules the scheduler applies (with its fallback to topological order). The user-facing knobs — the `memory:` block, the `--memory-limit` flag, the backpressure-policy selection, sizing guidance, and monitoring — live in the User Guide and are intentionally not repeated here. For how each stage's buffer class (`streaming` vs `materialized`) is decided, see [Streaming vs. Blocking Stages](execution-model.md).
 
 ## How it works
