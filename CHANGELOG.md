@@ -28,21 +28,23 @@ Closes [#1281](https://github.com/rustpunk/clinker/issues/1281).
 
 `null_order: drop` excludes records whose key is null, which only a Sink's
 `sort_order` is for. On a field that only orders records it is now refused
-when the pipeline is planned, with the reason and the filter to write
-instead:
+when the pipeline is planned, with the reason and one fix: delete
+`null_order: drop` and add a Transform whose whole `config` is the printed
+`config: { cxl: "filter not <field>.is_null()" }` line, before the node, or
+after a Source. Node and field names print in double quotes, escaped as in
+every other diagnostic:
 
 - **Cull and Reshape `order_by`.** `drop` used to be accepted and silently
   ignored. It is now an E200 error naming the node and the field:
 
   ```text
-  cull "dedupe": `null_order: drop` is not allowed on `order_by` for field 'txn_date': `order_by` only orders rows within a group and cannot remove them. Use `null_order: first` or `null_order: last`; to exclude rows whose 'txn_date' is null, add a Transform before this node with `filter not txn_date.is_null()`.
+  cull "dedupe": `null_order: drop` is not allowed on `order_by` for field "txn_date": `order_by` only orders the rows of a group, placing nulls `first` or `last`, and cannot remove a row. To remove the rows whose "txn_date" is null, delete `null_order: drop` and add a Transform before this node with `config: { cxl: "filter not txn_date.is_null()" }`.
   ```
 
 - **Source `sort_order`.** `drop` was already refused; the error now also
-  gives the fix, a Transform after the Source with
-  `filter not <field>.is_null()`, and is reported as E200 at the Source like
-  the other ordering-only fields (it used to be an E003 "node property
-  derivation failed" error with no location).
+  gives the fix, the printed filter Transform after the Source, and is
+  reported as E200 at the Source like the other ordering-only fields (it used
+  to be an E003 "node property derivation failed" error with no location).
 - **Transform `analytic_window.sort_by`.** `drop` used to silently take
   null-key rows out of the window partition, so the window functions never
   saw them, while the Transform still wrote those rows. It is now an E200
@@ -51,7 +53,7 @@ instead:
   one; unlike the old behaviour, that also removes them from its output:
 
   ```text
-  transform "running": `null_order: drop` is not allowed on `analytic_window.sort_by` for field 'amount': `sort_by` only orders rows within a window partition and cannot remove them. Use `null_order: first` or `null_order: last`; to exclude rows whose 'amount' is null, add a Transform before this node with `filter not amount.is_null()`.
+  transform "running": `null_order: drop` is not allowed on `analytic_window.sort_by` for field "amount": `sort_by` only orders the rows of a window partition, placing nulls `first` or `last`, and cannot remove a row. To remove the rows whose "amount" is null, delete `null_order: drop` and add a Transform before this node with `config: { cxl: "filter not amount.is_null()" }`.
   ```
 
   Two windows that differ only in `null_order` now each read partitions in
@@ -62,12 +64,14 @@ The filter is printed only for a field CXL can name as it is: one identifier
 of ASCII letters, digits and `_`, not starting with a digit and not a CXL
 keyword. For any other field, such as `order id`, `filter` or a flattened
 `Address.City`, the error prints no CXL, since that text would not parse or,
-for a dotted name, would read another value and drop every row. It asks you
-to rename the column with `source_name` in its Source schema entry and filter
-on the new name instead:
+for a dotted name, would read another value and drop every row. Its one
+next step is the `source_name:` line it prints for that column: in the
+column's Source schema entry, set `name` to a new identifier and add that
+line, then use the new name wherever the pipeline names the column. Planning
+again prints the filter on the new name:
 
 ```text
-source "orders": `null_order: drop` is not allowed on `sort_order` for field 'order id': source verification cannot discard records. Use `null_order: first` or `null_order: last`. CXL cannot name the field 'order id': a CXL field name is one identifier of ASCII letters, digits and `_`, not starting with a digit and not a CXL keyword. To exclude rows whose 'order id' is null, rename the column to such a name in its Source schema entry and keep reading the input column through `source_name` (for example `{ name: order_id, type: string, source_name: "order id" }`), then filter on the new name in a Transform after this source.
+source "orders": `null_order: drop` is not allowed on `sort_order` for field "order id": a Source `sort_order` only states the order its records arrive in, placing nulls `first` or `last`, and verifying it cannot discard a record. To remove the rows whose "order id" is null, first give the column a name CXL can write: in its Source schema entry, set `name` to a new identifier and add `source_name: "order id"`, then use the new name wherever the pipeline names this column; planning again prints the filter to add. A CXL name is one identifier of ASCII letters, digits and `_`, not starting with a digit and not a CXL keyword.
 ```
 
 Cull and Reshape `order_by` also accept a bare field name, as a Sink or
@@ -252,13 +256,20 @@ group key holds:
 - **Negative zero.** `-0.0` and `0.0` remain one group.
 - **NaN.** Every NaN key, whatever its sign, is one group, separate from the
   null group. A NaN key used to stop the run in Aggregate, Cull, window
-  partitions, `distinct` and output splitting, and to join the null group in
-  Reshape and in correlation keys.
+  partitions and output splitting; to fail the record in `distinct`, handled
+  like any other evaluation error under `error_handling`; and to join the
+  null group in Reshape and in correlation keys.
 - **The written group value.** A group reports the value of its first-arriving
   row, the same with or without spilling to disk. An integer group-by column is
   now written as integers (JSON `42` where it was `42.0`), and integers above
   2^53 are written exactly where they were rounded. A column that holds both
   integers and floats writes each group as its first row held it.
+- **Session-window Aggregates.** A session-window Aggregate grouped by an
+  integer column, or by a column holding integers among other numbers,
+  writes its groups in a different order than before. The order is the same
+  on every run, but it is not the value order: a group keyed `10` can be
+  written before one keyed `9`. Session groups are written in key order in a
+  later release.
 
 Reshape still puts empty strings and array- or map-valued cells in its null
 group, unlike Cull

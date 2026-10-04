@@ -645,8 +645,8 @@ values instead.
 ### How values are ordered
 
 Every sort uses one rule for comparing two values: a Sink or Source
-`sort_order`, a window's `sort_by`, and the check that verifies a Source's
-declared order. The rule does not depend on the memory limit, so a sort that
+`sort_order`, a Cull or Reshape `order_by`, a window's `sort_by`, and the
+check that verifies a Source's declared order. The rule does not depend on the memory limit, so a sort that
 spills to disk writes the same records in the same order as one that fits in
 memory.
 

@@ -56,21 +56,24 @@ every value with `last`, in either direction.
 `null_order: drop` is rejected when the pipeline is planned:
 
 ```text
-transform "running": `null_order: drop` is not allowed on `analytic_window.sort_by` for field 'amount': `sort_by` only orders rows within a window partition and cannot remove them. Use `null_order: first` or `null_order: last`; to exclude rows whose 'amount' is null, add a Transform before this node with `filter not amount.is_null()`.
+transform "running": `null_order: drop` is not allowed on `analytic_window.sort_by` for field "amount": `sort_by` only orders the rows of a window partition, placing nulls `first` or `last`, and cannot remove a row. To remove the rows whose "amount" is null, delete `null_order: drop` and add a Transform before this node with `config: { cxl: "filter not amount.is_null()" }`.
 ```
 
-To leave rows with a null key out of the window, filter them in a Transform
-before the windowed one. That also removes them from the windowed
-Transform's output:
+The one fix is the filter the error prints: delete `null_order: drop` and
+add a Transform before the windowed one whose whole `config` is the printed
+line. That leaves rows with a null key out of every partition, and also
+removes them from the windowed Transform's output:
 
 ```yaml
 - type: transform
   name: with_amount
   input: orders
-  config:
-    cxl: |
-      filter not amount.is_null()
+  config: { cxl: "filter not amount.is_null()" }
 ```
+
+For a field CXL cannot write as a bare name, the error prints a
+`source_name:` line instead; see
+[`source_name`](../nodes/source.md#source_name--read-a-differently-named-physical-column).
 
 ## Aggregate window functions
 

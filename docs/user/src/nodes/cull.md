@@ -70,7 +70,7 @@ do not assume one node's grouping matches the other's.
 
 ## `order_by`
 
-Optional. A list of sort fields applied within each group before its predicate runs, so an order-sensitive predicate is deterministic. Arrival order breaks ties.
+Optional. A list of sort fields that orders the rows of each group as they are written. It does not change which groups are removed: the removal rule is evaluated over the group in arrival order ([#1264](https://github.com/rustpunk/clinker/issues/1264)). Arrival order breaks ties.
 
 Each entry is either a field name, which sorts ascending, or a map `{ field, order, null_order }`:
 
