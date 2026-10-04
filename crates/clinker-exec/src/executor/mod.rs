@@ -2203,6 +2203,9 @@ impl PipelineExecutor {
         // above (and any `?` propagation) instead drop the guard implicitly as
         // part of dropping `ctx`, which runs the same lock-before-removal `Drop`,
         // so the directory is cleaned up on EVERY path, not just this one.
+        // The document dead-letter state drops first: its held log's file is
+        // inside the directory, and an open file can block its removal.
+        drop(ctx.document_dlq.take());
         drop(ctx.spill_root);
 
         let rollback_cursors: BTreeMap<String, u64> = ctx

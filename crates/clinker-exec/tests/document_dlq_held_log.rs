@@ -315,6 +315,7 @@ fn held_failing_rows_spill_under_a_low_limit_and_keep_their_order() {
 #[test]
 fn held_failing_rows_stay_in_memory_with_ample_memory() {
     let low = run_held_log("2M");
+    let _ = clinker_exec::executor::take_document_dlq_peak_charged_bytes_for_testing();
     let HeldLogRun {
         report,
         rows,
@@ -368,6 +369,7 @@ fn held_rows_charge() -> u64 {
 fn the_held_rows_charge_is_the_dead_letter_states_own() {
     let failing = run_held_log("100G");
     let held = held_bytes(&failing.rows, &failing.header);
+    let _ = clinker_exec::executor::take_document_dlq_peak_charged_bytes_for_testing();
 
     let (report, sink, body) = run_files("100G", passing_input_files());
     let charge = held_rows_charge();

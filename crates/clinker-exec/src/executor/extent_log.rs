@@ -32,6 +32,8 @@
 //! descriptors: its writer and the one [`ChainReader`] a caller holds at a
 //! time. The file is a temporary: dropping the log removes it, and the
 //! spill directory's lock and crash purge cover a process that dies first.
+//! The owner drops the log before the run's spill-directory guard, so the
+//! file is closed and removed before the directory is.
 //! Nothing in the log is ever promoted; a caller copies frames out of a
 //! [`ChainReader`] to wherever they belong.
 

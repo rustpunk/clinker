@@ -1786,6 +1786,20 @@ pub(crate) struct ExecutorContext<'a> {
     /// overflow.
     pub(crate) recursion_depth: u32,
 
+    /// Run-scoped document-level DLQ state. `Some` iff at least one source
+    /// declares `dlq_granularity: document` — the Output arm then drives a
+    /// per-document buffer (flush clean / reject dirty at each
+    /// `DocumentClose`, peak = concurrently-open documents, spillable under
+    /// budget), and upstream Transform / Route failures mark the failing
+    /// record's document here instead of pushing a per-record DLQ entry.
+    /// `None` otherwise; every record streams through per-record DLQ
+    /// semantics with zero overhead.
+    ///
+    /// Declared before [`Self::spill_root`]: its held log keeps a file open
+    /// inside the spill directory, which must close before the directory is
+    /// removed.
+    pub(crate) document_dlq: Option<crate::executor::document_dlq::DocumentDlqState>,
+
     /// Pipeline-scoped spill directory bundled with the OS advisory lock held on
     /// its `.lock` file. Allocated once at `execute_dag_branching` start; every
     /// spilling operator (grace hash, sort-merge join, sort buffer, hash
@@ -1809,6 +1823,11 @@ pub(crate) struct ExecutorContext<'a> {
     /// run the same lock-before-removal `Drop`, so the ordering holds on every
     /// path by construction rather than by a manual `drop` no error-return could
     /// be trusted to reach.
+    ///
+    /// A field that holds a file inside the directory is declared before this
+    /// one. Fields drop in declaration order, so an early return or an unwind
+    /// closes those files before the directory's removal, which an open file
+    /// can block on Windows; the clean path drops them explicitly first.
     ///
     /// [`SpillDir`]: crate::executor::spill_purge::SpillDir
     pub(crate) spill_root: Arc<crate::executor::spill_purge::SpillDir>,
@@ -1875,16 +1894,6 @@ pub(crate) struct ExecutorContext<'a> {
     /// buffering is disabled. Read by the Output arm before admitting
     /// a record into the buffer to detect overflow at admission time.
     pub(crate) correlation_max_group_buffer: u64,
-
-    /// Run-scoped document-level DLQ state. `Some` iff at least one source
-    /// declares `dlq_granularity: document` — the Output arm then drives a
-    /// per-document buffer (flush clean / reject dirty at each
-    /// `DocumentClose`, peak = concurrently-open documents, spillable under
-    /// budget), and upstream Transform / Route failures mark the failing
-    /// record's document here instead of pushing a per-record DLQ entry.
-    /// `None` otherwise; every record streams through per-record DLQ
-    /// semantics with zero overhead.
-    pub(crate) document_dlq: Option<crate::executor::document_dlq::DocumentDlqState>,
 
     /// Per-aggregate retained state for nodes whose `group_by` omits a
     /// correlation-key field. Populated by the Aggregate dispatch arm
