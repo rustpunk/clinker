@@ -1,12 +1,12 @@
 # Introspection & Debug
 
-CXL provides 4 introspection methods and 1 debug method. These are the **only** methods that accept `null` receivers without propagating null -- they are designed specifically for inspecting and handling null values.
+CXL provides 4 introspection methods and 1 debug method. The four introspection methods are the **only** methods that accept `null` receivers without propagating null -- they are designed specifically for inspecting and handling null values. `debug` follows ordinary null propagation.
 
 ## type_of() -> String
 
 Returns the type name of the receiver as a string. Works on any value, including `null`.
 
-Type name strings: `"String"`, `"Int"`, `"Float"`, `"Bool"`, `"Date"`, `"DateTime"`, `"Null"`, `"Array"`, `"Map"`.
+Type name strings: `"string"`, `"int"`, `"float"`, `"decimal"`, `"bool"`, `"date"`, `"datetime"`, `"null"`, `"array"`, `"map"`.
 
 ```bash
 $ cxl eval -e 'emit a = 42.type_of()' -e 'emit b = "hello".type_of()' \
@@ -15,9 +15,9 @@ $ cxl eval -e 'emit a = 42.type_of()' -e 'emit b = "hello".type_of()' \
 
 ```json
 {
-  "a": "Int",
-  "b": "String",
-  "c": "Null"
+  "a": "int",
+  "b": "string",
+  "c": "null"
 }
 ```
 
@@ -25,8 +25,8 @@ Useful for branching on dynamic types:
 
 ```
 emit formatted = match value.type_of() {
-  "Int"   => value.to_string().concat(" (integer)"),
-  "Float" => value.round_to(2).to_string().concat(" (decimal)"),
+  "int"   => value.to_string().concat(" (integer)"),
+  "float" => value.round_to(2).to_string().concat(" (decimal)"),
   _       => value.to_string()
 }
 ```
@@ -101,7 +101,7 @@ emit name = raw_name ?? "Unknown"
 
 ## debug(label: String) -> Any
 
-Passes the receiver through unchanged while emitting a trace log with the given label. Zero overhead when tracing is disabled. The return value is always the receiver, making it safe to insert into any expression chain.
+Passes the receiver through unchanged while emitting a trace log with the given label. Zero overhead when tracing is disabled. The return value is always the receiver, making it safe to insert into any expression chain. A null receiver returns null without logging.
 
 ```bash
 $ cxl eval -e 'emit result = 42.debug("check value")'
@@ -131,9 +131,9 @@ TRACE source_row=1 source_file=input.csv: qty: Integer(5)
 
 | Method | Null receiver behavior |
 |--------|----------------------|
-| `type_of()` | Returns `"Null"` |
+| `type_of()` | Returns `"null"` |
 | `is_null()` | Returns `true` |
 | `is_empty()` | Returns `true` |
 | `catch(x)` | Returns `x` |
-| `debug(l)` | Passes through `null`, logs it |
+| `debug(l)` | Returns `null`, logs nothing (propagation) |
 | All other methods | Return `null` (propagation) |

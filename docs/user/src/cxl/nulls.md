@@ -2,6 +2,8 @@
 
 Null values in CXL represent missing or absent data. CXL uses null propagation -- most operations on null produce null -- with specific tools for detecting and handling nulls.
 
+*Interactive companion: the [null explainer](nulls-explainer.html) shows, step by step, how an expression is worked out when a field is null, and whether a `filter` keeps the record.*
+
 ## Null propagation
 
 When a method receives a null receiver, it returns null without executing. This is called null propagation and applies to all methods except the [introspection methods](builtins-introspection.md).
@@ -30,25 +32,27 @@ $ cxl eval -e 'emit result = null.trim().upper().length()'
 
 ## Null propagation exceptions
 
-Five methods are exempt from null propagation and actively handle null receivers:
+Four methods are exempt from null propagation and actively handle null receivers:
 
 | Method | Null behavior |
 |--------|--------------|
 | `is_null()` | Returns `true` |
-| `type_of()` | Returns `"Null"` |
+| `type_of()` | Returns `"null"` |
 | `is_empty()` | Returns `true` |
 | `catch(x)` | Returns `x` |
-| `debug(l)` | Passes through null, logs it |
+
+`debug(label)` is not one of them: on a null receiver it returns null without logging, like any other method.
 
 ```bash
-$ cxl eval -e 'emit a = null.is_null()' -e 'emit b = null.type_of()' \
-    -e 'emit c = null.catch("fallback")'
+$ cxl eval -e 'emit a = null.is_null()
+emit b = null.type_of()
+emit c = null.catch("fallback")'
 ```
 
 ```json
 {
   "a": true,
-  "b": "Null",
+  "b": "null",
   "c": "fallback"
 }
 ```
@@ -58,8 +62,8 @@ $ cxl eval -e 'emit a = null.is_null()' -e 'emit b = null.type_of()' \
 The `??` operator returns its left operand if non-null, otherwise its right operand. It is the primary tool for providing default values.
 
 ```bash
-$ cxl eval -e 'emit a = null ?? "default"' \
-    -e 'emit b = "present" ?? "default"'
+$ cxl eval -e 'emit a = null ?? "default"
+emit b = "present" ?? "default"'
 ```
 
 ```json
@@ -83,7 +87,7 @@ $ cxl eval -e 'emit result = null ?? null ?? "last resort"'
 
 ## Three-valued logic
 
-Boolean operations with null follow three-valued logic (like SQL):
+Boolean operations with null follow three-valued logic: read null as "unknown", and a result is decided only when the known side settles it.
 
 ### and
 
@@ -133,10 +137,24 @@ $ cxl eval -e 'emit result = 5 + null'
 
 ## Comparison with null
 
-Comparisons involving null produce null (not false):
+`==` and `!=` never produce null. Two nulls are equal, and a null is not equal to any other value:
 
 ```bash
-$ cxl eval -e 'emit result = null == null'
+$ cxl eval -e 'emit a = null == null
+emit b = null != 100'
+```
+
+```json
+{
+  "a": true,
+  "b": true
+}
+```
+
+Every other comparison (`<`, `>`, `<=`, `>=`) involving null produces null, as arithmetic does:
+
+```bash
+$ cxl eval -e 'emit result = null > 100'
 ```
 
 ```json
@@ -144,6 +162,16 @@ $ cxl eval -e 'emit result = null == null'
   "result": null
 }
 ```
+
+## Null in conditions
+
+A condition that comes out null is treated as "not true":
+
+- `filter` keeps a record only when its condition is exactly `true`. A null condition drops the record, just as `false` does.
+- `if` takes the `else` branch when its condition is null, or produces null when there is no `else`.
+- A `match` without a subject skips an arm whose condition is null. A `match` with a subject compares with `==`, so a `null => …` arm matches a null subject.
+
+Because `not null` is also null, a record whose `amount` is null fails both `filter amount > 100` and `filter not (amount > 100)`. And because `!=` never produces null, `filter amount != 100` keeps it. Test for null explicitly with `is_null()`, or give a default first with `??`, when it matters which way an empty value goes.
 
 To test for null, use `is_null()`:
 

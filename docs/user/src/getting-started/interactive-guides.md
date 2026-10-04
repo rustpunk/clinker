@@ -6,6 +6,12 @@ desktop or a phone. You change a setting or tap a record, and the page shows
 what the engine does with it. The guides don't run a pipeline; each one
 reproduces the rules described on the reference page it links back to.
 
+## [Where does a null go?](../cxl/nulls-explainer.html)
+
+How CXL works out an expression when a field is empty: `and`, `or` and `not`
+with null, why `null == null` is true, and why a `filter` drops a record whose
+condition comes out null. Reference: [Null Handling](../cxl/nulls.md).
+
 ## [Correlation keys](../pipelines/correlation-keys-explainer.html)
 
 How one failing line takes the rest of its order to the DLQ, and how an

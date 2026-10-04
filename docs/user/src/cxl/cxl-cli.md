@@ -107,7 +107,7 @@ $ cxl eval -e 'emit t = amount.type_of()' --field amount=42
 
 ```json
 {
-  "t": "Int"
+  "t": "int"
 }
 ```
 
@@ -117,7 +117,7 @@ $ cxl eval -e 'emit t = name.type_of()' --field name=Alice
 
 ```json
 {
-  "t": "String"
+  "t": "string"
 }
 ```
 

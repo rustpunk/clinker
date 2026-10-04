@@ -324,5 +324,5 @@ so the value and weight share one numeric domain.
 When two types meet in an expression, CXL coerces them automatically:
 
 - Numbers combine: mixing an integer and a float gives a float (`2 + 3.5` is `5.5`).
-- Anything combined with `null` is `null`.
+- Arithmetic and ordering comparisons with `null` give `null`. `==` and `!=` never do (`null == null` is `true`), and `and`/`or` give a definite answer when the other side settles it. See [Null Handling](nulls.md).
 - Mismatched types are an error: `String + Int` fails. Convert first with `.to_int()` or `.to_string()` so both sides are the same type.

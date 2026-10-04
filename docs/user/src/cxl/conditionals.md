@@ -21,7 +21,7 @@ $ cxl eval -e 'emit label = if amount > 100 then "high" else "low"' \
 }
 ```
 
-The `else` branch is optional. When omitted, records where the condition is false produce `null`:
+The `else` branch is optional. When omitted, records where the condition is false or null produce `null`. A null condition takes the `else` branch when there is one:
 
 ```bash
 $ cxl eval -e 'emit bonus = if score > 90 then score * 0.1' \
@@ -104,7 +104,7 @@ The wildcard `_` is the catch-all arm. It matches any value not covered by prece
 
 ### Condition form (without subject)
 
-When no subject is provided, each arm's pattern is evaluated as a boolean condition. This is CXL's equivalent of SQL's `CASE WHEN`:
+When no subject is provided, each arm's pattern is evaluated as a boolean condition, and the first arm whose condition is exactly `true` wins. An arm whose condition is null is skipped:
 
 ```
 match {

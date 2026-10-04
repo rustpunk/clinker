@@ -58,7 +58,7 @@ Note that `tax_rate` does not appear in the output -- only `emit` statements pro
 
 ## filter
 
-The `filter` statement excludes records where the condition evaluates to false. When a filter excludes a record, remaining statements do not execute (short-circuit).
+The `filter` statement keeps a record only when its condition is exactly `true`; a condition that is `false` or null excludes it (see [Null in conditions](nulls.md#null-in-conditions)). When a filter excludes a record, remaining statements do not execute (short-circuit).
 
 ```
 filter condition
@@ -75,7 +75,7 @@ $ cxl eval -e 'filter amount > 0' -e 'emit result = amount * 2' \
 }
 ```
 
-When the filter condition is false, the entire record is dropped and no output is produced.
+When the filter condition is false or null, the entire record is dropped and no output is produced.
 
 Filters can appear anywhere in the statement sequence. Place them early to skip unnecessary computation:
 

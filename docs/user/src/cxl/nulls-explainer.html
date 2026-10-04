@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clinker · Where does a null go?</title>
+<style>
+:root{
+  --iron:#14110f; --iron2:#1d1915; --iron3:#29231d; --seam:#3a3129;
+  --ash:#b9ab98; --bone:#ece2d0; --dim:#7d705f;
+  --rust:#d0581f; --rust-d:#8f3a13; --brass:#e0a93e; --verd:#4fb0a0;
+  --blood:#e0362c; --steel:#7f97ad; --plum:#b07ac0; --moss:#9bc76b;
+  --disp:"Rajdhani", "Bahnschrift Condensed", "Roboto Condensed", "Arial Narrow", sans-serif;
+  --mono:"Share Tech Mono", "Source Code Pro", Consolas, "Ubuntu Mono", monospace;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--iron);color:var(--bone);font:15px/1.6 var(--mono);
+  background-image:
+   radial-gradient(1100px 560px at 88% -10%, rgba(176,122,192,.12), transparent 60%),
+   radial-gradient(900px 500px at -10% 45%, rgba(127,151,173,.08), transparent 60%),
+   repeating-linear-gradient(0deg, rgba(255,255,255,.012) 0 1px, transparent 1px 4px);}
+a{color:var(--brass)}
+code{font-family:var(--mono);background:var(--iron3);padding:0 .35em;border:1px solid var(--seam);color:var(--brass);font-size:.92em;overflow-wrap:anywhere}
+header.hero{padding:64px 6vw 36px;border-bottom:2px solid var(--seam);position:relative;overflow:hidden}
+header.hero::after{content:"";position:absolute;right:-60px;top:-60px;width:360px;height:360px;border-radius:50%;
+  border:26px dashed rgba(176,122,192,.09);pointer-events:none}
+.kicker{font:700 12px/1.4 var(--mono);letter-spacing:.24em;text-transform:uppercase;color:var(--plum)}
+.kicker a{color:inherit}
+h1{font:700 clamp(46px,9vw,118px)/.88 var(--disp);margin:14px 0 18px;text-transform:uppercase;letter-spacing:-.01em}
+h1 em{font-style:normal;color:var(--plum)}
+h1 .thin{font-weight:400;color:var(--ash)}
+.lede{max-width:760px;color:var(--ash);font-size:16px}
+nav.toc{display:flex;flex-wrap:wrap;margin-top:26px;border:1px solid var(--seam);width:fit-content;max-width:100%}
+nav.toc a{padding:10px 14px;text-decoration:none;color:var(--ash);border-right:1px solid var(--seam);font-size:12px;letter-spacing:.12em;text-transform:uppercase}
+nav.toc a:last-child{border-right:0}
+nav.toc b{color:var(--brass);margin-right:6px}
+@media (hover:hover){nav.toc a:hover{background:var(--plum);color:var(--iron)}}
+section{padding:56px 6vw;border-bottom:1px solid var(--seam)}
+section:nth-of-type(even){background:rgba(0,0,0,.18)}
+.sechead{display:grid;grid-template-columns:110px 1fr;gap:22px;align-items:end;margin-bottom:24px}
+.num{font:700 110px/.8 var(--disp);color:transparent;-webkit-text-stroke:2px var(--rust-d)}
+h2{font:700 clamp(32px,4.6vw,60px)/.95 var(--disp);text-transform:uppercase;margin:0}
+h2 small{display:block;font:400 14px/1.4 var(--mono);text-transform:none;color:var(--dim);margin-top:10px}
+h3{font:700 22px/1.1 var(--disp);text-transform:uppercase;letter-spacing:.04em;color:var(--brass);margin:0 0 10px}
+p{max-width:820px}
+.cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.3fr);gap:32px}
+.cols>*{min-width:0}
+.panel{background:var(--iron2);border:1px solid var(--seam);padding:20px;min-width:0}
+.callout{border-left:4px solid var(--rust);background:rgba(208,88,31,.07);padding:12px 16px;margin:16px 0;max-width:820px}
+.callout.v{border-color:var(--verd);background:rgba(79,176,160,.07)}
+.callout.p{border-color:var(--plum);background:rgba(176,122,192,.08)}
+.aside{font-size:13px;color:var(--ash)}
+
+/* the record */
+.record{border:2px solid var(--seam);background:var(--iron);padding:10px;margin-bottom:12px}
+.record h5{margin:0 0 6px;font:700 15px/1 var(--disp);letter-spacing:.1em;text-transform:uppercase;color:var(--steel)}
+.fieldrow{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;padding:4px 0}
+.fieldrow .fname{min-width:64px;color:var(--ash);font-size:13px}
+.chips{display:inline-flex;flex-wrap:wrap;border:2px solid var(--seam)}
+.chips button{font:700 12px/1 var(--mono);padding:8px 10px;border:0;border-right:1px solid var(--seam);background:transparent;color:var(--ash);cursor:pointer}
+.chips button:last-child{border-right:0}
+.chips button[aria-pressed=true]{background:var(--plum);color:var(--iron)}
+.chips button[data-v="null"]{font-style:italic}
+.exprs{display:flex;flex-direction:column;gap:6px;margin:6px 0 12px}
+.exprs button{font:13px/1.25 var(--mono);text-align:left;padding:9px 10px;border:1px solid var(--seam);background:var(--iron);color:var(--ash);cursor:pointer;overflow-wrap:anywhere}
+.exprs button[aria-pressed=true]{border-color:var(--plum);background:rgba(176,122,192,.14);color:var(--bone)}
+.exprs .grp{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim);margin-top:6px}
+
+/* evaluation tree */
+.tree{font-size:13px}
+.tnode{border-left:2px solid var(--seam);padding:3px 0 3px 10px;margin:3px 0 3px 4px}
+.tnode .line{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:baseline}
+.tnode .src{color:var(--bone);overflow-wrap:anywhere}
+.tv{font-weight:700;white-space:nowrap}
+.v-true{color:var(--moss)} .v-false{color:var(--blood)} .v-null{color:var(--plum);font-style:italic} .v-other{color:var(--brass)}
+.tnode.skip{opacity:.45}
+.tnode.skip .src::after{content:"  · not evaluated";color:var(--dim);font-style:italic}
+.note{color:var(--dim);font-size:12px}
+.verdict{margin-top:12px;font:700 26px/1.1 var(--disp);text-transform:uppercase;letter-spacing:.04em;padding:10px 14px}
+.verdict.keep{background:var(--moss);color:var(--iron)}
+.verdict.drop{background:var(--blood);color:var(--iron)}
+.verdict.val{background:var(--iron3);color:var(--bone);border:1px solid var(--seam)}
+.why{font-size:13px;color:var(--ash);margin-top:8px}
+
+/* truth tables */
+.tables{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,230px),1fr));gap:14px}
+.tt{border:1px solid var(--seam);background:var(--iron);padding:10px}
+.tt h4{margin:0 0 6px;font:700 18px/1 var(--disp);text-transform:uppercase}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:3px;font-size:12px;text-align:center}
+.grid div{padding:7px 2px;background:var(--iron2);border:1px solid var(--seam)}
+.grid .h{background:transparent;border-color:transparent;color:var(--dim)}
+.grid .hit{outline:2px solid var(--brass)}
+.tt p{font-size:12px;color:var(--ash);margin:8px 0 0}
+
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));border:2px solid var(--seam)}
+.card{padding:16px 18px;border-right:1px solid var(--seam);border-bottom:1px solid var(--seam);min-width:0}
+.card h4{margin:0 0 6px;font:700 22px/1 var(--disp);text-transform:uppercase}
+.card p{font-size:13px;color:var(--ash);margin:0 0 8px}
+footer{padding:36px 6vw;color:var(--dim);font-size:12px}
+
+@media (max-width:980px){.cols{grid-template-columns:1fr}}
+@media (max-width:720px){
+  .sechead{grid-template-columns:1fr;gap:6px}.num{font-size:64px}
+  h2{font-size:clamp(28px,10vw,36px)}
+  section{padding:44px 5vw}
+  header.hero{padding:44px 5vw 28px}
+}
+@media (max-width:720px),(pointer:coarse){
+  .aside,.card p,footer,.tree,.why,.exprs button,.tt p,.fieldrow .fname{font-size:14px}
+}
+/* 44px targets on touch screens, and on any narrow screen in case the pointer is misreported */
+@media (pointer:coarse),(max-width:720px){
+  .chips button,.exprs button{min-height:44px}
+  nav.toc a{display:flex;align-items:center;min-height:44px}
+  .kicker a{display:inline-block;line-height:44px}
+}
+@media (prefers-reduced-motion: reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="kicker">Clinker user guide · <a href="nulls.html">← back to Null Handling</a></div>
+  <h1>Where does<br>a <em>null</em> go?</h1>
+  <p class="lede">A null is a value that isn't there: an empty cell, a missing field. Most things you do with a null give null back, and a <code>filter</code> treats null as "no". Set a record's fields to a value or to null, pick an expression, and see every step of how it's worked out.</p>
+  <nav class="toc">
+    <a href="#gate"><b>01</b>Kept or dropped?</a>
+    <a href="#values"><b>02</b>Values</a>
+    <a href="#tables"><b>03</b>and · or · not</a>
+    <a href="#traps"><b>04</b>Traps</a>
+  </nav>
+</header>
+
+<!-- ============================ 01 ============================ -->
+<section id="gate">
+  <div class="sechead"><div class="num">01</div><h2>Kept or dropped?<small>A filter keeps a record only when its condition is exactly true</small></h2></div>
+  <div class="cols">
+    <div>
+      <p>A <code>filter</code> condition has three possible results: <b>true</b>, <b>false</b> or <b>null</b>. Only true keeps the record. Null is treated like false, so a record whose condition comes out null is dropped too.</p>
+      <p>That catches people out with "not". If <code>amount</code> is null, then <code>amount &gt; 100</code> is null, and so is <code>not (amount &gt; 100)</code>. Both filters drop the record, so a record can fail a test and its opposite at the same time.</p>
+      <div class="callout p"><b><code>==</code> and <code>!=</code> are different.</b> They never give null: <code>null == null</code> is true, and <code>null != 100</code> is true. So <code>filter amount != 100</code> <i>keeps</i> a record with no amount. Every other comparison (<code>&lt;</code>, <code>&gt;</code>, <code>&lt;=</code>, <code>&gt;=</code>) and every calculation gives null when either side is null.</div>
+      <p class="aside">To decide yourself what happens to empty values, ask for them directly with <code>is_null()</code>, or give a default first with <code>??</code>: <code>filter (amount ?? 0) &gt; 100</code>.</p>
+    </div>
+    <div class="panel">
+      <div class="record" data-record="1"></div>
+      <div class="exprs" data-exprs="gate"></div>
+      <div class="tree" data-tree="gate"></div>
+      <div data-verdict="gate"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ 02 ============================ -->
+<section id="values">
+  <div class="sechead"><div class="num">02</div><h2>Values<small>What null does inside if, match, ??, sums and methods</small></h2></div>
+  <div class="cols">
+    <div>
+      <ul class="aside">
+        <li><b><code>if … then … else</code></b> takes the <i>else</i> branch when the condition is null. With no <code>else</code>, the result is null.</li>
+        <li><b><code>match</code></b> without a subject skips an arm whose condition is null. With a subject (<code>match status { … }</code>) it compares with <code>==</code>, so a <code>null =&gt;</code> arm matches a missing value.</li>
+        <li><b><code>??</code></b> gives the right side only when the left side is null.</li>
+        <li><b>Calculations</b> (<code>+ - * /</code>) give null if either side is null.</li>
+        <li><b>Methods</b> on a null give null without running, except <code>is_null()</code>, <code>is_empty()</code>, <code>type_of()</code> and <code>catch(x)</code>, which are made for nulls.</li>
+      </ul>
+      <div class="callout v">The record panel is shared with section 01: change a field there and these results follow.</div>
+    </div>
+    <div class="panel">
+      <div class="record" data-record="2"></div>
+      <div class="exprs" data-exprs="values"></div>
+      <div class="tree" data-tree="values"></div>
+      <div data-verdict="values"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ 03 ============================ -->
+<section id="tables">
+  <div class="sechead"><div class="num">03</div><h2>and · or · not<small>A null decides nothing unless the other side settles it</small></h2></div>
+  <div class="tables" data-tables></div>
+  <p class="aside" style="margin-top:14px">Read null as "unknown". <code>false and unknown</code> is false whatever the unknown is, so it's false. <code>true and unknown</code> could go either way, so it stays null. The same reasoning makes <code>true or null</code> true. The engine also stops early: if the left side of <code>and</code> is false, or the left side of <code>or</code> is true, the right side is never worked out. The tree in section 01 greys it out.</p>
+</section>
+
+<!-- ============================ 04 ============================ -->
+<section id="traps">
+  <div class="sechead"><div class="num">04</div><h2>Traps<small>Each of these runs without an error and gives a surprising answer</small></h2></div>
+  <div class="cards">
+    <div class="card"><h4>A test and its opposite both fail</h4><p>For a record with no amount, <code>filter amount &gt; 100</code> and <code>filter not (amount &gt; 100)</code> both drop it. Splitting records into two outputs with a condition and its opposite loses the empty ones. Send them somewhere on purpose with <code>is_null()</code>.</p></div>
+    <div class="card"><h4>!= keeps empty values</h4><p><code>filter status != "closed"</code> keeps records with no status, because <code>null != "closed"</code> is true. Add <code>and not status.is_null()</code> if they should go.</p></div>
+    <div class="card"><h4>null == null is true</h4><p>Two missing values count as equal. Comparing two empty fields with <code>==</code> gives true, not unknown. Some other tools treat this differently, so don't carry that habit over.</p></div>
+    <div class="card"><h4>One empty field empties the total</h4><p><code>price * qty</code> is null if either is missing, and so is anything built on it. Give defaults where the value enters: <code>(qty ?? 1)</code>.</p></div>
+    <div class="card"><h4>debug shows nothing for null</h4><p><code>.debug("label")</code> logs the value it's called on, except null: on a null it returns null without logging, like most methods. Check with <code>is_null()</code> instead.</p></div>
+  </div>
+</section>
+
+<footer>The rules on this page come from Clinker's CXL evaluator (<code>crates/cxl/src/eval/compiled.rs</code>: <code>and</code>/<code>or</code>, equality, the other operators, <code>filter</code>, <code>if</code>, <code>match</code>, <code>??</code>; <code>builtins_impl.rs</code> for methods). The page reproduces them in your browser; it does not run the engine.</footer>
+
+<script>
+"use strict";
+const S={amount:null,status:"open",active:true,gate:"gt",values:"ifelse"};
+const CHOICES={amount:[[150,"150"],[100,"100"],[50,"50"],[null,"null"]],status:[["open","\"open\""],["closed","\"closed\""],["","\"\""],[null,"null"]],active:[[true,"true"],[false,"false"],[null,"null"]]};
+
+/* tiny AST helpers */
+const F=n=>({t:"field",n}), L=v=>({t:"lit",v}), B=(op,a,b)=>({t:"bin",op,a,b});
+const AND=(a,b)=>({t:"and",a,b}), OR=(a,b)=>({t:"or",a,b}), NOT=a=>({t:"not",a});
+const M=(r,m,...args)=>({t:"method",r,m,args}), CO=(a,b)=>({t:"co",a,b}), PAR=a=>({t:"par",a});
+const IF=(c,th,el)=>({t:"if",c,th,el}), MATCH=(subj,arms)=>({t:"match",subj,arms});
+const GATES={
+  gt:{g:"comparisons",e:B(">",F("amount"),L(100))},
+  notgt:{g:"comparisons",e:NOT(PAR(B(">",F("amount"),L(100))))},
+  ne:{g:"comparisons",e:B("!=",F("amount"),L(100))},
+  eq:{g:"comparisons",e:B("==",F("amount"),L(100))},
+  active:{g:"and · or",e:F("active")},
+  and:{g:"and · or",e:AND(F("active"),B(">",F("amount"),L(100)))},
+  or:{g:"and · or",e:OR(F("active"),B(">",F("amount"),L(100)))},
+  andshort:{g:"and · or",e:AND(B("==",F("status"),L("closed")),B(">",F("amount"),L(100)))},
+  isnull:{g:"handling nulls",e:NOT(M(F("amount"),"is_null"))},
+  coalesce:{g:"handling nulls",e:B(">",PAR(CO(F("amount"),L(0))),L(100))},
+  statusne:{g:"handling nulls",e:B("!=",F("status"),L("closed"))},
+};
+const VALUES={
+  ifelse:{g:"if · match",e:IF(B(">",F("amount"),L(100)),L("big"),L("small"))},
+  ifnoelse:{g:"if · match",e:IF(B(">",F("amount"),L(100)),L("big"),null)},
+  matchcond:{g:"if · match",e:MATCH(null,[[B(">",F("amount"),L(100)),L("big")],[B("<=",F("amount"),L(100)),L("small")],["_",L("unknown")]])},
+  matchsubj:{g:"if · match",e:MATCH(F("status"),[[L(null),L("missing")],[L("open"),L("active")],["_",L("other")]])},
+  coalesce:{g:"defaults",e:CO(F("amount"),L(0))},
+  catch:{g:"defaults",e:M(F("status"),"catch",L("none"))},
+  times:{g:"calculations",e:B("*",F("amount"),L(2))},
+  plusco:{g:"calculations",e:B("*",PAR(CO(F("amount"),L(0))),L(2))},
+  upper:{g:"methods",e:M(F("status"),"upper")},
+  isnull:{g:"methods",e:M(F("status"),"is_null")},
+  isempty:{g:"methods",e:M(F("status"),"is_empty")},
+  typeof:{g:"methods",e:M(F("status"),"type_of")},
+};
+
+/* source text */
+const fmt=v=>v===null?"null":typeof v==="string"?JSON.stringify(v):String(v);
+function src(e){
+  switch(e.t){
+    case "field": return e.n;
+    case "lit": return fmt(e.v);
+    case "bin": return `${src(e.a)} ${e.op} ${src(e.b)}`;
+    case "and": return `${src(e.a)} and ${src(e.b)}`;
+    case "or": return `${src(e.a)} or ${src(e.b)}`;
+    case "not": return `not ${src(e.a)}`;
+    case "par": return `(${src(e.a)})`;
+    case "co": return `${src(e.a)} ?? ${src(e.b)}`;
+    case "method": return `${src(e.r)}.${e.m}(${e.args.map(src).join(", ")})`;
+    case "if": return `if ${src(e.c)} then ${src(e.th)}${e.el?` else ${src(e.el)}`:""}`;
+    case "match": return `match ${e.subj?src(e.subj)+" ":""}{ ${e.arms.map(([p,b])=>`${p==="_"?"_":src(p)} => ${src(b)}`).join(", ")} }`;
+  }
+}
+
+/* evaluation following compiled.rs; returns {v, kids:[...], note, skip} */
+const isNull=v=>v===null;
+function eq(a,b){ if(a===null&&b===null) return true; if(a===null||b===null) return false; return a===b; }   // values_equal
+function ev(e,skip=false){
+  const node={e,kids:[],skip};
+  if(skip){ // show the structure greyed out, nothing evaluated
+    const sub=x=>x&&typeof x==="object"&&x.t?ev(x,true):null;
+    if(e.t==="bin"||e.t==="and"||e.t==="or"||e.t==="co") node.kids=[sub(e.a),sub(e.b)];
+    else if(e.t==="not"||e.t==="par") node.kids=[sub(e.a)];
+    node.v=undefined; return node;
+  }
+  switch(e.t){
+    case "field": node.v=S[e.n]; break;
+    case "lit": node.v=e.v; break;
+    case "par": { const a=ev(e.a); node.kids=[a]; node.v=a.v; break; }
+    case "bin": {
+      const a=ev(e.a), b=ev(e.b); node.kids=[a,b];
+      if(e.op==="=="){ node.v=eq(a.v,b.v); node.note="== never gives null"; }
+      else if(e.op==="!="){ node.v=!eq(a.v,b.v); node.note="!= never gives null"; }
+      else if(isNull(a.v)||isNull(b.v)){ node.v=null; node.note="a null side makes the result null"; }
+      else node.v={">":a.v>b.v,"<":a.v<b.v,">=":a.v>=b.v,"<=":a.v<=b.v,"+":a.v+b.v,"-":a.v-b.v,"*":a.v*b.v}[e.op];
+      break; }
+    case "and": { const a=ev(e.a); node.kids=[a];
+      if(a.v===false){ node.kids.push(ev(e.b,true)); node.v=false; node.note="left side is false, so the right side is never worked out"; }
+      else { const b=ev(e.b); node.kids.push(b);
+        if(a.v===true) node.v=b.v; else node.v=(b.v===false)?false:null;
+        if(a.v===null) node.note=b.v===false?"false settles it, even next to null":"null and not-false stays null"; }
+      break; }
+    case "or": { const a=ev(e.a); node.kids=[a];
+      if(a.v===true){ node.kids.push(ev(e.b,true)); node.v=true; node.note="left side is true, so the right side is never worked out"; }
+      else { const b=ev(e.b); node.kids.push(b);
+        if(a.v===false) node.v=b.v; else node.v=(b.v===true)?true:null;
+        if(a.v===null) node.note=b.v===true?"true settles it, even next to null":"null or not-true stays null"; }
+      break; }
+    case "not": { const a=ev(e.a); node.kids=[a]; node.v=a.v===null?null:!a.v; if(a.v===null) node.note="not null is null"; break; }
+    case "co": { const a=ev(e.a); node.kids=[a];
+      if(isNull(a.v)){ const b=ev(e.b); node.kids.push(b); node.v=b.v; node.note="left side is null, so the right side is used"; }
+      else { node.kids.push(ev(e.b,true)); node.v=a.v; }
+      break; }
+    case "method": { const r=ev(e.r); node.kids=[r]; const args=e.args.map(x=>ev(x));
+      const exempt=["is_null","is_empty","type_of","catch"].includes(e.m);
+      if(isNull(r.v)&&!exempt){ node.v=null; node.note=`${e.m}() on a null returns null without running`; break; }
+      const v=r.v;
+      node.v={upper:()=>String(v).toUpperCase(),is_null:()=>v===null,is_empty:()=>v===null||v==="",
+        type_of:()=>v===null?"null":typeof v==="number"?"int":typeof v==="boolean"?"bool":"string",   // Value::type_name
+        catch:()=>v===null?args[0].v:v}[e.m]();
+      if(exempt&&v===null) node.note=`${e.m}() is made for nulls`;
+      break; }
+    case "if": { const c=ev(e.c); node.kids=[c];
+      if(c.v===true){ const t=ev(e.th); node.kids.push(t); if(e.el) node.kids.push(ev(e.el,true)); node.v=t.v; }
+      else if(e.el){ node.kids.push(ev(e.th,true)); const el=ev(e.el); node.kids.push(el); node.v=el.v; node.note=c.v===null?"a null condition takes the else branch":""; }
+      else { node.kids.push(ev(e.th,true)); node.v=null; node.note=c.v===null?"a null condition, and no else, so the result is null":"no else, so the result is null"; }
+      break; }
+    case "match": {
+      const sv=e.subj?ev(e.subj):null; if(sv) node.kids.push(sv);
+      let done=false;
+      for(const [p,b] of e.arms){
+        if(done){ if(p!=="_") node.kids.push(ev(p,true)); continue; }
+        if(p==="_"){ const bv=ev(b); node.kids.push(bv); node.v=bv.v; node.note="no earlier arm matched, so _ is used"; done=true; continue; }
+        const pv=ev(p); node.kids.push(pv);
+        const hit=e.subj?eq(sv.v,pv.v):pv.v===true;
+        if(hit){ const bv=ev(b); node.kids.push(bv); node.v=bv.v; node.note=e.subj?`matched with ==`:`first arm that is true`; done=true; }
+        else if(!e.subj&&pv.v===null) pv.note="null is not true, so this arm is skipped";
+      }
+      if(!done) node.v=null;
+      break; }
+  }
+  return node;
+}
+const vcls=v=>v===true?"v-true":v===false?"v-false":v===null?"v-null":"v-other";
+function draw(n){
+  const kids=n.kids.filter(Boolean).map(draw).join("");
+  const val=n.skip?"":`<span class="tv ${vcls(n.v)}">→ ${fmt(n.v)}</span>`;
+  return `<div class="tnode${n.skip?" skip":""}"><div class="line"><span class="src">${esc(src(n.e))}</span>${val}</div>${n.note?`<div class="note">${n.note}</div>`:""}${kids}</div>`;
+}
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const $=(s,r=document)=>r.querySelector(s);
+
+function renderRecord(){
+  document.querySelectorAll("[data-record]").forEach(el=>{
+    el.innerHTML=`<h5>the record</h5>`+Object.entries(CHOICES).map(([f,opts])=>`<div class="fieldrow"><span class="fname">${f}</span><span class="chips" data-field="${f}">${opts.map(([v,t])=>`<button data-v="${esc(v===null?"null":JSON.stringify(v))}" aria-pressed="${S[f]===v}">${esc(t)}</button>`).join("")}</span></div>`).join("");
+  });
+}
+function renderList(kind,defs){
+  let last=""; $(`[data-exprs="${kind}"]`).innerHTML=Object.entries(defs).map(([k,d])=>{ const h=d.g!==last?`<div class="grp">${d.g}</div>`:""; last=d.g;
+    return h+`<button data-kind="${kind}" data-k="${k}" aria-pressed="${S[kind]===k}">${kind==="gate"?"filter ":"emit x = "}${esc(src(d.e))}</button>`; }).join("");
+}
+function render(){
+  renderRecord(); renderList("gate",GATES); renderList("values",VALUES);
+  const g=ev(GATES[S.gate].e); $('[data-tree="gate"]').innerHTML=draw(g);
+  const kept=g.v===true;
+  $('[data-verdict="gate"]').innerHTML=`<div class="verdict ${kept?"keep":"drop"}">${kept?"kept":"dropped"}</div><div class="why">${kept?"The condition is exactly true.":g.v===null?"The condition is null, and a filter keeps only true.":"The condition is false."}</div>`;
+  const v=ev(VALUES[S.values].e); $('[data-tree="values"]').innerHTML=draw(v);
+  $('[data-verdict="values"]').innerHTML=`<div class="verdict val">x = ${esc(fmt(v.v))}</div>`;
+}
+function renderTables(){
+  const vals=[true,false,null], name=v=>v===null?"null":String(v);
+  const andv=(a,b)=>a===false?false:a===true?b:(b===false?false:null);
+  const orv=(a,b)=>a===true?true:a===false?b:(b===true?true:null);
+  const grid=(f,label)=>`<div class="grid"><div class="h">${label}</div>${vals.map(v=>`<div class="h">${name(v)}</div>`).join("")}`+
+    vals.map(a=>`<div class="h">${name(a)}</div>`+vals.map(b=>{ const r=f(a,b); return `<div class="${vcls(r)}${(a===null||b===null)&&r!==null?" hit":""}">${name(r)}</div>`; }).join("")).join("")+`</div>`;
+  $("[data-tables]").innerHTML=
+    `<div class="tt"><h4>and</h4>${grid(andv,"↓ and →")}<p>Outlined: null next to <code>false</code> still gives false.</p></div>`+
+    `<div class="tt"><h4>or</h4>${grid(orv,"↓ or →")}<p>Outlined: null next to <code>true</code> still gives true.</p></div>`+
+    `<div class="tt"><h4>== and !=</h4>${grid((a,b)=>eq(a,b),"↓ == →")}<p>Outlined: never null. <code>null == null</code> is true; <code>!=</code> is the opposite of each cell.</p></div>`+
+    `<div class="tt"><h4>not · &gt; · +</h4><div class="grid" style="grid-template-columns:repeat(2,1fr)"><div class="h">input</div><div class="h">result</div><div>not true</div><div class="v-false">false</div><div>not null</div><div class="v-null">null</div><div>null &gt; 5</div><div class="v-null">null</div><div>null + 5</div><div class="v-null">null</div></div><p>Every other operator gives null if either side is null.</p></div>`;
+}
+document.addEventListener("click",e=>{
+  const c=e.target.closest("[data-field] button"); if(c){ S[c.parentElement.dataset.field]=JSON.parse(c.dataset.v); render(); return; }
+  const x=e.target.closest("[data-kind]"); if(x){ S[x.dataset.kind]=x.dataset.k; render(); }
+});
+renderTables(); render();
+</script>
+</body>
+</html>
