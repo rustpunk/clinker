@@ -11,9 +11,12 @@
 //! whether its state spills.
 //!
 //! A consumer whose `try_spill` frees nothing is [`SpillClass::ChargedOnly`]
-//! and names the approval that allows it. A new charged-only entry needs the
-//! maintainer's recorded approval; the pre-existing ones say they pre-date
-//! this contract, so they are not precedent for another.
+//! and names the approval that allows it. A consumer part of whose charge
+//! spills on the arbitrator's word while the rest never leaves memory is
+//! [`SpillClass::PartlyChargedOnly`] and names the approval for the part
+//! that stays. A new entry in either class needs the maintainer's recorded
+//! approval; the pre-existing charged-only ones say they pre-date this
+//! contract, so they are not precedent for another.
 //!
 //! Registering with the arbitrator is a call a consumer makes, not something
 //! the compiler enforces, so this scan is what makes a new consumer visible in
@@ -60,6 +63,10 @@ enum SpillClass {
     /// recorded maintainer approval, or states that the consumer pre-dates
     /// this contract.
     ChargedOnly { approval: &'static str },
+    /// Part of the charge moves to disk when the arbitrator asks, as for
+    /// [`SpillClass::Spillable`]; the rest is charged state no spill frees.
+    /// `approval` names the recorded maintainer approval for that rest.
+    PartlyChargedOnly { approval: &'static str },
 }
 
 /// One production `MemoryConsumer` implementation.
@@ -109,14 +116,12 @@ const MANIFEST: &[ManifestEntry] = &[
         class: SpillClass::Spillable,
         table_row: "Cull",
     },
-    // The held rows of failed documents spill through the held log. The
-    // per-document dead-letter row ledger it also charges is charged-only
-    // exact dedup state, approved by the maintainer on 2026-09-24 with the
-    // compressed row-set ledger (see the `roaring` comment in the root
-    // Cargo.toml).
     ManifestEntry {
         name: "DocumentDlqConsumer",
-        class: SpillClass::Spillable,
+        class: SpillClass::PartlyChargedOnly {
+            approval: "maintainer approval 2026-09-24: the per-document emitted-row ledger is \
+                       exact dedup state, charged and never spilled; the held failing rows spill",
+        },
         table_row: "document dead-letter state",
     },
     ManifestEntry {
@@ -430,8 +435,14 @@ fn charged_only_entries_cite_an_approval() {
     let unapproved: Vec<&str> = MANIFEST
         .iter()
         .filter_map(|entry| match entry.class {
-            SpillClass::ChargedOnly { approval } if approval.trim().is_empty() => Some(entry.name),
-            SpillClass::ChargedOnly { .. } | SpillClass::Spillable => None,
+            SpillClass::ChargedOnly { approval } | SpillClass::PartlyChargedOnly { approval }
+                if approval.trim().is_empty() =>
+            {
+                Some(entry.name)
+            }
+            SpillClass::ChargedOnly { .. }
+            | SpillClass::PartlyChargedOnly { .. }
+            | SpillClass::Spillable => None,
         })
         .collect();
     assert!(

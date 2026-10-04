@@ -3514,4 +3514,54 @@ mod tests {
             charge(&state, &key)
         );
     }
+
+    /// With ample memory the state's consumer reports a charged high-water
+    /// mark that covers every held row while nothing reaches disk, and taking
+    /// a document's rows lowers its current charge but not the mark.
+    #[test]
+    fn held_rows_are_charged_at_their_peak_with_ample_memory() {
+        let root = tempfile::tempdir().expect("spill root");
+        let arbitrator = ledger_arbitrator(1 << 30);
+        let mut state = held_state(&arbitrator, root.path(), usize::MAX);
+        let docs: Vec<DocKey> = (0..3).map(doc_key).collect();
+        let mut ordinal = 0;
+        for doc in &docs {
+            for _ in 0..20 {
+                ordinal += 1;
+                hold_row(&mut state, doc, ordinal).expect("hold");
+            }
+        }
+        let consumer =
+            DocumentDlqConsumer::new(Arc::clone(&state.handle), state.held.resident_gauge());
+        let held =
+            state.held.resident_bytes() + state.held.index_bytes() + 3 * FAILED_DOCUMENT_BYTES;
+        assert!(state.held.resident_bytes() > 0);
+        assert_eq!(
+            arbitrator.sum_consumer_usage(),
+            held,
+            "the resident rows, the index and the failed-document slots are charged"
+        );
+        let peak = consumer
+            .peak_charged_bytes()
+            .expect("the consumer reports its charged peak");
+        assert!(
+            peak >= held,
+            "the peak {peak} covers the {held} bytes the held rows are charged"
+        );
+        assert_eq!(files_in(root.path()), 0, "nothing reaches disk");
+        assert_eq!(arbitrator.cumulative_spill_bytes(), 0);
+
+        let usage = consumer.current_usage();
+        assert_eq!(take_held_rows(&mut state, &docs[0]), rows_of(1..=20));
+        assert!(
+            consumer.current_usage() < usage,
+            "taking a document's rows releases their charge"
+        );
+        assert_eq!(
+            consumer.peak_charged_bytes(),
+            Some(peak),
+            "the peak stays at its high-water mark"
+        );
+        assert_eq!(files_in(root.path()), 0);
+    }
 }

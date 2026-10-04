@@ -29,6 +29,12 @@ const FILES: usize = 30;
 const ROWS_PER_FILE: usize = 400;
 /// Width of each record's `pad` cell, so the held rows outweigh a small
 /// budget several times over.
+///
+/// The rows are 100 bytes wide rather than 300 because a Source cannot yet
+/// wait for memory: at 300 bytes, under the small budget, a Source's record
+/// admission is refused and the run fails before the held rows are what is
+/// measured. The change that lets a Source wait for memory (#1247, #1250)
+/// restores 300-byte rows.
 const PAD_BYTES: usize = 100;
 
 /// The engine columns that differ between two runs of the same input: each
