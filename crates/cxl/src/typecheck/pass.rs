@@ -4183,12 +4183,8 @@ mod tests {
         for src in programs {
             for errs in [
                 mixed_err(src, AggregateMode::Row),
-                typecheck_mixed_with_price(
-                    src,
-                    AggregateMode::Row,
-                    Type::nullable(Type::Float),
-                )
-                .expect_err(src),
+                typecheck_mixed_with_price(src, AggregateMode::Row, Type::nullable(Type::Float))
+                    .expect_err(src),
             ] {
                 for d in &errs {
                     assert!(!d.message.contains("to_decimal"), "{src}: {}", d.message);
