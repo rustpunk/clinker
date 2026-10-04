@@ -3426,6 +3426,10 @@ mod tests {
     /// charges `NEW_CONTAINER_BYTES` for each 65,536-ordinal container it
     /// opens and, on a document's first row of a Source, `NEW_HIGH_KEY_BYTES`
     /// and four Source-entry slots.
+    /// These per-pass figures hold for rows admitted in ordinal order, as this
+    /// test admits them: a row whose container differs from the previous
+    /// admission's is also charged `NEW_CONTAINER_BYTES`, which the
+    /// out-of-order and 32-bit boundary tests below pin.
     ///
     /// Once settled, `treemap_heap_bound` charges each recorded row at most
     /// 4 bytes: an array container 4 bytes a value; a bitmap container its
@@ -3538,6 +3542,280 @@ mod tests {
             charge(&state, &key) <= contiguous,
             "a million contiguous rows settle to at most {contiguous}, charged {}",
             charge(&state, &key)
+        );
+    }
+
+    /// A document state charged to `arbitrator` holding one failed document
+    /// under `key`.
+    fn ledger_state_for(
+        arbitrator: &Arc<MemoryArbitrator>,
+        key: &str,
+    ) -> (DocumentDlqState, DocKey) {
+        let key: DocKey = Arc::from(key);
+        let mut state = DocumentDlqState::new(
+            HashSet::from([Arc::from("orders")]),
+            Arc::clone(arbitrator),
+            held_config(&std::env::temp_dir()),
+        );
+        state.failed.insert(
+            Arc::clone(&key),
+            FailedDocument {
+                cause: DlqFailureStamp::now(),
+                failing_node: Arc::from("validate"),
+                emitted: EmittedRows::new(),
+            },
+        );
+        (state, key)
+    }
+
+    /// Admit row `ordinal` of Source node 1 to document `key`, which must be
+    /// new to it, and return what the admission charged the ledger. Only for
+    /// an admission that does not reach the in-pass settle.
+    fn admitted_charge(state: &mut DocumentDlqState, key: &DocKey, ordinal: u64) -> u64 {
+        let before = state.failed[key].emitted.charged;
+        assert!(
+            state
+                .admit_emitted(key, row(1, ordinal), "out")
+                .expect("admission"),
+            "row {ordinal} is new to the document"
+        );
+        state.failed[key].emitted.charged - before
+    }
+
+    /// What a document's first row is charged: `ROW_ADMISSION_BYTES`, the
+    /// container and upper-32-bit bitmap it opens (`NEW_CONTAINER_BYTES` and
+    /// `NEW_HIGH_KEY_BYTES`) and four Source-entry slots.
+    const FIRST_ROW_BYTES: u64 =
+        ROW_ADMISSION_BYTES + NEW_CONTAINER_BYTES + NEW_HIGH_KEY_BYTES + 4 * SOURCE_ENTRY_BYTES;
+
+    /// The figure the user documentation states for rows that reach a Sink
+    /// out of ordinal order: up to 96 bytes a row in a pass.
+    ///
+    /// A row whose 65,536-ordinal container differs from the previous
+    /// admission's may open a container, so it is charged
+    /// `ROW_ADMISSION_BYTES + NEW_CONTAINER_BYTES` = 8 + 80 = 88 bytes, and
+    /// `MERGED_INTERVAL_BYTES` = 8 more, 96, when it also joins two runs an
+    /// earlier settle left. A document's first row is charged
+    /// `FIRST_ROW_BYTES` = 920 bytes. The in-pass settle every
+    /// `SETTLE_EVERY_ADMISSIONS` admissions bounds how far one pass grows
+    /// before the charge falls back to the compressed size.
+    #[test]
+    fn out_of_order_rows_are_charged_within_their_documented_bound() {
+        let arbitrator = ledger_arbitrator(1 << 30);
+        let hop = ROW_ADMISSION_BYTES + NEW_CONTAINER_BYTES;
+        let merging_hop = hop + MERGED_INTERVAL_BYTES;
+        assert_eq!(
+            (hop, merging_hop, FIRST_ROW_BYTES),
+            (88, 96, 920),
+            "the figures the user documentation states"
+        );
+        // Row `i` of a pass that alternates between containers 0 and 1.
+        let alternating = |i: u64| if i % 2 == 0 { i / 2 } else { 65_536 + i / 2 };
+
+        // No earlier settle, so nothing merges: every row after the first
+        // hops to the other container.
+        let (mut state, key) = ledger_state(&arbitrator);
+        let rows = 4_096;
+        let charges: Vec<u64> = (0..rows)
+            .map(|i| admitted_charge(&mut state, &key, alternating(i)))
+            .collect();
+        assert_eq!(charges[0], FIRST_ROW_BYTES, "the first row's openings");
+        assert!(
+            charges[1..].iter().all(|&charge| charge == hop),
+            "every later row is charged {hop} bytes"
+        );
+        let pass: u64 = charges.iter().sum();
+        assert!(
+            pass >= hop * (rows - 1) && pass <= merging_hop * rows + FIRST_ROW_BYTES,
+            "an out-of-order pass of {rows} rows charged {pass}"
+        );
+
+        // A settled pass leaves runs with one-ordinal gaps in both
+        // containers; a later pass fills the gaps alternating containers, so
+        // each row hops and joins two runs.
+        let (mut state, key) = ledger_state(&arbitrator);
+        let gap = |ordinal: &u64| ordinal % 32 == 31;
+        for base in [0, 65_536] {
+            for ordinal in (base..base + 16_000).filter(|ordinal| !gap(ordinal)) {
+                admitted_charge(&mut state, &key, ordinal);
+            }
+        }
+        state.settle_emitted(&key);
+        assert!(
+            state.failed[&key].emitted.sources[0].1.has_runs,
+            "the settle leaves run containers"
+        );
+        let fills: Vec<u64> = (0..16_000)
+            .filter(gap)
+            .flat_map(|ordinal| [ordinal, 65_536 + ordinal])
+            .collect();
+        let charges: Vec<u64> = fills
+            .iter()
+            .map(|&ordinal| admitted_charge(&mut state, &key, ordinal))
+            .collect();
+        assert!(
+            charges
+                .iter()
+                .all(|&charge| charge == hop || charge == merging_hop),
+            "every filling row hops, charged {hop} or {merging_hop} bytes"
+        );
+        // The last gap of each container has no recorded right neighbour.
+        let merged = charges
+            .iter()
+            .filter(|&&charge| charge == merging_hop)
+            .count();
+        assert_eq!(
+            merged,
+            fills.len() - 2,
+            "every filling row but the last of each container is charged the {merging_hop}-byte bound"
+        );
+
+        // Just before the in-pass settle the pass is within the bound, and
+        // the settle brings the charge down.
+        let (mut state, key) = ledger_state(&arbitrator);
+        for i in 0..SETTLE_EVERY_ADMISSIONS - 1 {
+            admitted_charge(&mut state, &key, alternating(i));
+        }
+        let before_settle = state.failed[&key].emitted.charged;
+        assert!(
+            before_settle <= merging_hop * (SETTLE_EVERY_ADMISSIONS - 1) + FIRST_ROW_BYTES,
+            "a pass short of the in-pass settle charged {before_settle}"
+        );
+        assert!(
+            state
+                .admit_emitted(
+                    &key,
+                    row(1, alternating(SETTLE_EVERY_ADMISSIONS - 1)),
+                    "out"
+                )
+                .expect("admission")
+        );
+        assert_eq!(
+            state.failed[&key].emitted.unsettled, 0,
+            "the in-pass settle ran"
+        );
+        assert!(
+            state.failed[&key].emitted.charged < before_settle,
+            "the in-pass settle lowers the charge from {before_settle} to {}",
+            state.failed[&key].emitted.charged
+        );
+    }
+
+    /// The figure the user documentation states for rows on either side of
+    /// the 4,294,967,296-row boundary, where the treemap keys a second bitmap.
+    ///
+    /// A row whose upper 32 ordinal bits differ from the previous
+    /// admission's may open a bitmap as well as a container, so it is
+    /// charged `ROW_ADMISSION_BYTES + NEW_CONTAINER_BYTES + NEW_HIGH_KEY_BYTES`
+    /// = 8 + 80 + 576 = 664 bytes, and 672 with `MERGED_INTERVAL_BYTES` when
+    /// it also joins two runs.
+    #[test]
+    fn rows_alternating_across_a_32_bit_ordinal_boundary_are_charged_within_their_bound() {
+        let arbitrator = ledger_arbitrator(1 << 30);
+        let hop = ROW_ADMISSION_BYTES + NEW_CONTAINER_BYTES + NEW_HIGH_KEY_BYTES;
+        let merging_hop = hop + MERGED_INTERVAL_BYTES;
+        assert_eq!(
+            (hop, merging_hop),
+            (664, 672),
+            "the figures the user documentation states"
+        );
+        let boundary = 1_u64 << 32;
+        let (mut state, key) = ledger_state(&arbitrator);
+        let rows = 2_048;
+        let charges: Vec<u64> = (0..rows)
+            .map(|i| {
+                let ordinal = if i % 2 == 0 {
+                    boundary - 1 - i / 2
+                } else {
+                    boundary + i / 2
+                };
+                admitted_charge(&mut state, &key, ordinal)
+            })
+            .collect();
+        assert_eq!(charges[0], FIRST_ROW_BYTES, "the first row's openings");
+        assert!(
+            charges[1..].iter().all(|&charge| charge == hop),
+            "every later row crosses the boundary, charged {hop} bytes"
+        );
+        let pass: u64 = charges.iter().sum();
+        assert!(
+            pass >= hop * (rows - 1) && pass <= merging_hop * rows + FIRST_ROW_BYTES,
+            "a pass of {rows} rows across the boundary charged {pass}"
+        );
+    }
+
+    /// The figure the user documentation states for a settled ledger: at
+    /// most 4 bytes a recorded row, plus 96 bytes for each 65,536-ordinal
+    /// container the rows touch, plus a fixed part.
+    ///
+    /// Per row, an array container's `u16` with vector growth is 4 bytes.
+    /// Per container, `treemap_heap_bound` charges two slots of
+    /// `CONTAINER_BYTES` = 40 bytes and at most 16 bytes of header. The fixed
+    /// part is one map node and four Source-entry slots, `BTREE_NODE_BYTES +
+    /// 4 * SOURCE_ENTRY_BYTES` = 416 + 256 = 672 bytes. Rows lying in a span
+    /// of `s` ordinals touch at most `s / 65,536 + 2` containers. One row per
+    /// container, as a selective Filter can leave a document, reaches the
+    /// bound: about 88 bytes a written row.
+    #[test]
+    fn sparse_rows_settle_within_their_documented_bound() {
+        let per_container = 2 * CONTAINER_BYTES + 16;
+        let fixed = BTREE_NODE_BYTES + 4 * SOURCE_ENTRY_BYTES;
+        assert_eq!(
+            (per_container, fixed),
+            (96, 672),
+            "the figures the user documentation states"
+        );
+        let arbitrator = ledger_arbitrator(1 << 30);
+        let (mut state, key) = ledger_state(&arbitrator);
+        let containers = 64_u64;
+        let ordinals: Vec<u64> = (0..containers).map(|c| c * 65_536 + 5).collect();
+        for &ordinal in &ordinals {
+            admitted_charge(&mut state, &key, ordinal);
+        }
+        state.settle_emitted(&key);
+        let rows = ordinals.len() as u64;
+        let span = ordinals[ordinals.len() - 1] - ordinals[0] + 1;
+        let charged = state.failed[&key].emitted.charged;
+        let bound = 4 * rows + per_container * (span / 65_536 + 2) + fixed;
+        assert!(
+            charged <= bound,
+            "{rows} rows one per container settle to at most {bound}, charged {charged}"
+        );
+        assert!(
+            charged >= (ROW_ADMISSION_BYTES + NEW_CONTAINER_BYTES) * rows,
+            "one row per container reaches the bound, about 88 bytes a row, charged {charged} for {rows} rows"
+        );
+    }
+
+    #[test]
+    fn the_ledger_refusal_names_the_document_as_diagnostics_quote_names() {
+        use clinker_core_types::QuoteName;
+        // A decomposed accent that does not open the name prints as written.
+        let arbitrator = ledger_arbitrator(1024);
+        let (mut state, key) = ledger_state_for(&arbitrator, "cafe\u{301}.csv");
+        let refused = (0..64_u64)
+            .find_map(|step| {
+                state
+                    .admit_emitted(&key, row(1, 1 + step * (1 << 20)), "orders_out")
+                    .err()
+            })
+            .expect("scattered rows reach the 1 KiB hard limit");
+        let detail = match refused {
+            PipelineError::MemoryBudgetExceeded {
+                detail: Some(detail),
+                ..
+            } => detail,
+            other => panic!("expected E310 with a detail, got {other:?}"),
+        };
+        let quoted = key.quoted_name().to_string();
+        assert_eq!(quoted, "\"cafe\u{301}.csv\"");
+        assert!(
+            detail.contains(&quoted),
+            "the detail names the document as {quoted}: {detail}"
+        );
+        assert!(
+            !detail.contains("\\u{301}"),
+            "the detail does not escape the accent: {detail}"
         );
     }
 
