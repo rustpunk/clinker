@@ -1,0 +1,447 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clinker · Combine playground</title>
+<style>
+:root{
+  --iron:#14110f; --iron2:#1d1915; --iron3:#29231d; --seam:#3a3129;
+  --ash:#b9ab98; --bone:#ece2d0; --dim:#7d705f;
+  --rust:#d0581f; --rust-d:#8f3a13; --brass:#e0a93e; --verd:#4fb0a0;
+  --blood:#e0362c; --steel:#7f97ad; --plum:#b07ac0; --moss:#9bc76b;
+  --disp:"Rajdhani", "Bahnschrift Condensed", "Roboto Condensed", "Arial Narrow", sans-serif;
+  --mono:"Share Tech Mono", "Source Code Pro", Consolas, "Ubuntu Mono", monospace;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--iron);color:var(--bone);font:15px/1.6 var(--mono);
+  background-image:
+   radial-gradient(1100px 560px at 88% -10%, rgba(79,176,160,.13), transparent 60%),
+   radial-gradient(900px 500px at -10% 45%, rgba(224,169,62,.07), transparent 60%),
+   repeating-linear-gradient(0deg, rgba(255,255,255,.012) 0 1px, transparent 1px 4px);}
+a{color:var(--brass)}
+code{font-family:var(--mono);background:var(--iron3);padding:0 .35em;border:1px solid var(--seam);color:var(--brass);font-size:.92em;overflow-wrap:anywhere}
+pre{background:var(--iron);border:1px solid var(--seam);padding:12px 14px;overflow-x:auto;font-size:13px;line-height:1.5;color:var(--ash);max-width:100%;margin:10px 0}
+pre b{color:var(--brass);font-weight:400}
+header.hero{padding:64px 6vw 36px;border-bottom:2px solid var(--seam);position:relative;overflow:hidden}
+header.hero::after{content:"";position:absolute;right:-60px;top:-60px;width:360px;height:360px;border-radius:50%;
+  border:26px solid rgba(79,176,160,.07);box-shadow:inset 0 0 0 2px rgba(79,176,160,.12);pointer-events:none}
+.kicker{font:700 12px/1.4 var(--mono);letter-spacing:.24em;text-transform:uppercase;color:var(--verd)}
+.kicker a{color:inherit}
+h1{font:700 clamp(46px,9vw,118px)/.88 var(--disp);margin:14px 0 18px;text-transform:uppercase;letter-spacing:-.01em}
+h1 em{font-style:normal;color:var(--verd)}
+h1 .thin{font-weight:400;color:var(--ash)}
+.lede{max-width:760px;color:var(--ash);font-size:16px}
+nav.toc{display:flex;flex-wrap:wrap;margin-top:26px;border:1px solid var(--seam);width:fit-content;max-width:100%}
+nav.toc a{padding:10px 14px;text-decoration:none;color:var(--ash);border-right:1px solid var(--seam);font-size:12px;letter-spacing:.12em;text-transform:uppercase}
+nav.toc a:last-child{border-right:0}
+nav.toc b{color:var(--brass);margin-right:6px}
+@media (hover:hover){nav.toc a:hover{background:var(--verd);color:var(--iron)}}
+section{padding:56px 6vw;border-bottom:1px solid var(--seam)}
+section:nth-of-type(even){background:rgba(0,0,0,.18)}
+.sechead{display:grid;grid-template-columns:110px 1fr;gap:22px;align-items:end;margin-bottom:24px}
+.num{font:700 110px/.8 var(--disp);color:transparent;-webkit-text-stroke:2px var(--rust-d)}
+h2{font:700 clamp(32px,4.6vw,60px)/.95 var(--disp);text-transform:uppercase;margin:0}
+h2 small{display:block;font:400 14px/1.4 var(--mono);text-transform:none;color:var(--dim);margin-top:10px}
+h3{font:700 22px/1.1 var(--disp);text-transform:uppercase;letter-spacing:.04em;color:var(--brass);margin:0 0 10px}
+p{max-width:820px}
+.cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.3fr);gap:32px}
+.cols>*{min-width:0}
+.panel{background:var(--iron2);border:1px solid var(--seam);padding:20px;min-width:0}
+.callout{border-left:4px solid var(--rust);background:rgba(208,88,31,.07);padding:12px 16px;margin:16px 0;max-width:820px}
+.callout.v{border-color:var(--verd);background:rgba(79,176,160,.07)}
+.callout.b{border-color:var(--brass);background:rgba(224,169,62,.06)}
+.aside{font-size:13px;color:var(--ash)}
+
+/* controls */
+.ctlrow{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;margin:4px 0 12px}
+.ctlhead{font-size:12px;color:var(--ash);min-width:70px}
+.seg{display:inline-flex;border:2px solid var(--seam);flex-wrap:wrap}
+.seg button{font:700 12px/1 var(--mono);letter-spacing:.04em;padding:9px 11px;border:0;border-right:1px solid var(--seam);background:transparent;color:var(--ash);cursor:pointer}
+.seg button:last-child{border-right:0}
+.seg button[aria-pressed=true]{background:var(--verd);color:var(--iron)}
+.seg button:disabled{opacity:.35;cursor:not-allowed}
+.toggle{display:inline-flex;align-items:center;gap:8px;font-size:13px;color:var(--ash);cursor:pointer}
+.toggle input{accent-color:var(--verd);width:18px;height:18px}
+.toggle.off{opacity:.4}
+.badge{display:inline-block;border:1px solid var(--steel);color:var(--steel);font-size:12px;padding:3px 8px;margin:2px 0 10px}
+
+/* inputs */
+.tables{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr));gap:12px}
+.tbl{border:1px solid var(--seam);background:var(--iron);min-width:0}
+.tbl h5{margin:0;padding:8px 10px;font:700 15px/1 var(--disp);letter-spacing:.1em;text-transform:uppercase;border-bottom:1px solid var(--seam);display:flex;justify-content:space-between;gap:6px;flex-wrap:wrap}
+.tbl h5 span{font:400 11px var(--mono);letter-spacing:.04em;text-transform:none;color:var(--dim)}
+.tbl .r{font-size:13px;padding:5px 10px;border-bottom:1px dotted #2d2620;display:flex;gap:10px;flex-wrap:wrap}
+.tbl .r:last-child{border-bottom:0}
+.tbl .r .k{color:var(--dim)}
+.tbl .r.bad{color:var(--blood)}
+
+/* driver cards */
+.drivers{display:flex;flex-direction:column;gap:8px;margin-top:14px}
+.drv{border:2px solid var(--seam);background:var(--iron);padding:8px 10px;min-width:0}
+.drv.miss{border-style:dashed}
+.drv.fail{border-color:var(--blood)}
+.drv.err{border-color:var(--blood);box-shadow:0 0 0 2px rgba(224,54,44,.25)}
+.drv header{display:flex;flex-wrap:wrap;justify-content:space-between;gap:4px 10px;align-items:baseline}
+.drv header b{font:700 17px/1 var(--disp);letter-spacing:.06em;text-transform:uppercase}
+.drv header span{font-size:11px;color:var(--dim)}
+.verdict{font-size:12px;padding:1px 7px;border:1px solid currentColor;white-space:nowrap}
+.v-match{color:var(--moss)} .v-miss{color:var(--steel)} .v-fail{color:var(--blood)} .v-skip{color:var(--brass)}
+.cands{margin:6px 0 0;padding:0;list-style:none}
+.cands li{font-size:13px;display:grid;grid-template-columns:1fr auto;gap:8px;padding:5px 0 5px 10px;border-left:3px solid var(--seam);margin:3px 0}
+.cands li.chosen{border-color:var(--moss);background:rgba(155,199,107,.07)}
+.cands li.failed{border-color:var(--blood);background:rgba(224,54,44,.07)}
+.cands li.outside{opacity:.45}
+.cands li .tag{font-size:10px;letter-spacing:.06em;color:var(--dim);white-space:nowrap;align-self:center}
+.cands li.chosen .tag{color:var(--moss)} .cands li.failed .tag{color:var(--blood)}
+.cands li.none{color:var(--dim);font-style:italic;border-color:transparent}
+.drv .emits{font-size:12px;color:var(--ash);margin-top:4px}
+
+/* outputs */
+.results{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,280px),1fr));gap:12px;margin-top:14px}
+.out{border:1px solid var(--seam);background:var(--iron);padding:10px 12px;min-width:0}
+.out h5{margin:0 0 6px;font:700 15px/1 var(--disp);letter-spacing:.1em;text-transform:uppercase;display:flex;justify-content:space-between;gap:6px;flex-wrap:wrap}
+.out h5 span{font:400 11px var(--mono);color:var(--dim);text-transform:none;letter-spacing:.03em}
+.row{font-size:13px;padding:5px 0;border-bottom:1px dotted #2d2620;display:flex;flex-wrap:wrap;gap:3px 12px;overflow-wrap:anywhere}
+.row:last-child{border-bottom:0}
+.row .k{color:var(--dim)}
+.row.null .n{color:var(--steel)}
+.row.empty{color:var(--dim);font-style:italic}
+.pill{font-size:10px;letter-spacing:.06em;padding:1px 6px;border:1px solid currentColor;white-space:nowrap}
+.pill.t{color:var(--blood)} .pill.c{color:var(--plum)} .pill.s{color:var(--dim)}
+.banner{display:none;font:700 22px/1.15 var(--disp);text-transform:uppercase;letter-spacing:.04em;padding:10px 14px;margin:12px 0 0;background:var(--blood);color:var(--iron)}
+.banner.on{display:block}
+.counts{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.counts div{border:1px solid var(--seam);padding:6px 10px;background:var(--iron);min-width:100px}
+.counts b{display:block;font:700 22px/1 var(--disp)}
+.counts span{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim)}
+
+/* band chart */
+.band{width:100%;display:block;background:var(--iron);border:1px solid var(--seam);margin-top:10px}
+.amts{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0}
+.amts label{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--ash);border:1px solid var(--seam);padding:4px 8px;background:var(--iron)}
+.amts input{width:74px;background:var(--iron2);border:1px solid var(--seam);color:var(--bone);font:14px var(--mono);padding:4px 6px}
+
+/* cards */
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));border:2px solid var(--seam)}
+.card{padding:16px 18px;border-right:1px solid var(--seam);border-bottom:1px solid var(--seam);min-width:0}
+.card h4{margin:0 0 6px;font:700 22px/1 var(--disp);text-transform:uppercase}
+.card p{font-size:13px;color:var(--ash);margin:0 0 8px}
+footer{padding:36px 6vw;color:var(--dim);font-size:12px}
+
+@media (max-width:980px){.cols{grid-template-columns:1fr}}
+@media (max-width:720px){
+  .sechead{grid-template-columns:1fr;gap:6px}.num{font-size:64px}
+  h2{font-size:clamp(28px,10vw,36px)}
+  section{padding:44px 5vw}
+  header.hero{padding:44px 5vw 28px}
+}
+@media (max-width:720px),(pointer:coarse){
+  .aside,.row,.cands li,.tbl .r,.card p,footer,.toggle,.ctlhead,.drv .emits{font-size:14px}
+}
+/* 44px targets on touch screens, and on any narrow screen in case the pointer is misreported */
+@media (pointer:coarse),(max-width:720px){
+  .seg button{min-height:44px}
+  .toggle{min-height:44px;padding-right:8px}
+  .toggle input{width:24px;height:24px;margin:10px}
+  .amts input{min-height:44px;font-size:16px}
+  nav.toc a{display:flex;align-items:center;min-height:44px}
+  .kicker a{display:inline-block;line-height:44px}
+}
+@media (prefers-reduced-motion: reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="kicker">Clinker user guide · <a href="combine.html">← back to Combine Nodes</a></div>
+  <h1>Combine<br><em>playground</em><span class="thin"> who meets whom</span></h1>
+  <p class="lede">A Combine walks one input, the <b>driver</b>, a row at a time and looks each row up in the other inputs, the <b>build</b> side. Three settings decide what comes out: <code>where:</code> picks the build rows that match a driver row, <code>match:</code> decides what to do with several matches, and <code>on_miss:</code> decides what happens when there are none. Change any of them here and watch every driver row's result.</p>
+  <nav class="toc">
+    <a href="#match"><b>01</b>Matching</a>
+    <a href="#range"><b>02</b>Range joins</a>
+    <a href="#more"><b>03</b>More to know</a>
+  </nav>
+</header>
+
+<!-- ============================ 01 ============================ -->
+<section id="match">
+  <div class="sechead"><div class="num">01</div><h2>Matching<small>Orders looked up in a product list that repeats some ids</small></h2></div>
+  <div class="cols">
+    <div>
+      <p>The product list has <b>two rows for P1</b> and two for P4, so a lookup can find more than one match. P2 is inactive, and P3's <code>pack</code> isn't a number. Order O3 asks for P9, which doesn't exist.</p>
+<pre>- type: combine
+  name: enrich
+  input:
+    orders: orders        # first entry drives
+    products: products
+  config:
+    where: <b data-yaml="where"></b>
+    match: <b data-yaml="match"></b>
+    on_miss: <b data-yaml="miss"></b><span data-yaml="drive"></span>
+    propagate_ck: driver
+    cxl: <b data-yaml="cxl"></b></pre>
+      <h3>match:</h3>
+      <ul class="aside">
+        <li><b>first</b> (default): one row per driver, from the earliest matching build row in the order the build input delivered them. To pick a different one, sort the build input upstream.</li>
+        <li><b>all</b>: one row per matching build row.</li>
+        <li><b>collect</b>: one row per driver with every match gathered into an array. The <code>cxl:</code> body must be empty.</li>
+      </ul>
+      <h3>on_miss:</h3>
+      <ul class="aside">
+        <li><b>null_fields</b> (default): keep the driver row; build fields are null.</li>
+        <li><b>skip</b>: drop the driver row.</li>
+        <li><b>error</b>: stop the run at the first driver row with no match.</li>
+      </ul>
+      <div class="callout v"><b>Two things that are not a miss.</b> A driver whose match the body then filters out produces no row, and the engine does <i>not</i> try the next match. A driver for which <code>where:</code> <i>failed to evaluate</i> is dead-lettered with that build row. In both cases <code>on_miss</code> never fires, because the driver wasn't shown to have no match. Try the “+ pack check” condition, or turn the body filter on.</div>
+    </div>
+    <div class="panel">
+      <div class="ctlrow"><span class="ctlhead">where:</span>
+        <div class="seg" data-bind="pred"><button data-v="E">ids equal</button><button data-v="R">+ active</button><button data-v="F">+ pack check</button></div></div>
+      <div class="ctlrow"><span class="ctlhead">match:</span>
+        <div class="seg" data-bind="match"><button data-v="first">first</button><button data-v="all">all</button><button data-v="collect">collect</button></div></div>
+      <div class="ctlrow"><span class="ctlhead">on_miss:</span>
+        <div class="seg" data-bind="miss"><button data-v="null_fields">null_fields</button><button data-v="skip">skip</button><button data-v="error">error</button></div></div>
+      <div class="ctlrow"><span class="ctlhead">drive:</span>
+        <div class="seg" data-bind="drive"><button data-v="orders">orders</button><button data-v="products">products</button></div></div>
+      <div class="ctlrow"><label class="toggle" data-filterlbl><input type="checkbox" data-bind="filter"> body filter drops “Widget v1”</label></div>
+      <div class="badge" data-strategy></div>
+      <div class="tables" data-tables></div>
+      <div class="drivers" data-drivers></div>
+      <div class="banner" data-banner></div>
+      <div class="results">
+        <div class="out"><h5>Output <span data-outnote></span></h5><div data-out></div></div>
+        <div class="out"><h5>DLQ <span>strategy: continue</span></h5><div data-dlq></div></div>
+      </div>
+      <div class="counts" data-counts></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ 02 ============================ -->
+<section id="range">
+  <div class="sechead"><div class="num">02</div><h2>Range joins<small>Match on “between”, not on equal ids</small></h2></div>
+  <div class="cols">
+    <div>
+      <p>A <code>where:</code> built from <code>&lt;</code>, <code>&lt;=</code>, <code>&gt;</code> or <code>&gt;=</code> across the two inputs is a <b>range join</b>. Here each order finds its price tier. Mid and Promo overlap, so an amount between 100 and 130 matches both.</p>
+<pre>where: "orders.amount &gt;= tiers.lo
+        and orders.amount &lt; tiers.hi"</pre>
+      <ul class="aside">
+        <li>“First” still means the earliest tier in the tiers file, not the narrowest or the closest.</li>
+        <li>An order with an empty amount can't be compared, so it is treated as having no match and goes to <code>on_miss</code>. A tier with an empty bound can match nothing.</li>
+        <li>Range keys must be numbers, decimals, dates or datetimes. Comparing, for example, text with a number is rejected when the pipeline is checked (<code>E327</code>).</li>
+      </ul>
+      <div class="callout b">Range joins are where results can grow quickly: a loose condition can match almost every pair. Set <code>max_output_rows</code> to stop the run (<code>E325</code>) instead of writing a huge result.</div>
+    </div>
+    <div class="panel">
+      <div class="ctlrow"><span class="ctlhead">match:</span>
+        <div class="seg" data-bind="rmatch"><button data-v="first">first</button><button data-v="all">all</button><button data-v="collect">collect</button></div></div>
+      <div class="ctlrow"><span class="ctlhead">on_miss:</span>
+        <div class="seg" data-bind="rmiss"><button data-v="null_fields">null_fields</button><button data-v="skip">skip</button></div></div>
+      <div class="badge">strategy: IEJoin (block-band), chosen because the condition is ranges only</div>
+      <div class="amts" data-amts></div>
+      <svg class="band" data-band viewBox="0 0 360 150" role="img" aria-label="Tiers and order amounts on a number line"></svg>
+      <div class="drivers" data-rdrivers></div>
+      <div class="results"><div class="out"><h5>Output</h5><div data-rout></div></div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ 03 ============================ -->
+<section id="more">
+  <div class="sechead"><div class="num">03</div><h2>More to know<small>Settings and limits around the match</small></h2></div>
+  <div class="cards">
+    <div class="card"><h4>Which side drives</h4><p>The first entry in <code>input:</code> drives unless <code>drive:</code> names another. The output has one row per driver row (with <code>first</code> or <code>collect</code>), so pick the side you want to iterate over. The other side is held in memory, so plan for about 1.5–2× its file size.</p></div>
+    <div class="card"><h4>How it runs</h4><p>The planner picks the join method from the shape of <code>where:</code>: an in-memory hash join for equal ids, switching to a disk-spilling grace hash join when the build side is too big; IEJoin for ranges. Every method gives the same rows. <code>strategy: grace_hash</code> forces the disk-spilling hash join for equal-id conditions.</p></div>
+    <div class="card"><h4>Conditions that can't run</h4><p><code>where:</code> needs at least one comparison between the inputs, either equality or a range. A condition that only filters one side is rejected (<code>E313</code>). Extra conditions after the first one are checked on each match.</p></div>
+    <div class="card"><h4>Three or more inputs</h4><p>Each pair of inputs that should be related needs its own equality, joined with <code>and</code>. The planner chains the joins; <code>max_output_rows</code> limits the final output.</p></div>
+    <div class="card"><h4>Correlation keys</h4><p><code>propagate_ck:</code> is required and says which correlation keys the output carries. A correlation key also sorts its Source, which changes what “first” picks. See the <a href="../pipelines/correlation-keys-explainer.html">correlation keys explainer</a>.</p></div>
+    <div class="card"><h4>A known gap</h4><p>When the build side is far over the memory limit and can't be split small enough, the Combine works through it in chunks and currently decides <code>first</code>, <code>collect</code> and <code>on_miss</code> per chunk, so a driver can get more than one <code>first</code> row. The Combine Nodes page describes when this can happen.</p></div>
+  </div>
+</section>
+
+<footer>This page follows the rules documented on <a href="combine.html">Combine Nodes</a>. It reproduces them in your browser; it does not run the engine. The DLQ category shown for a failed condition, <code>combine_output_row</code>, is the one the error-handling reference gives for Combine row failures.</footer>
+
+<script>
+"use strict";
+const ORDERS=[
+  {id:"O1",product_id:"P1",qty:2},{id:"O2",product_id:"P2",qty:1},{id:"O3",product_id:"P9",qty:5},
+  {id:"O4",product_id:"P3",qty:1},{id:"O5",product_id:"P4",qty:3}];
+const PRODUCTS=[
+  {id:"P1",name:"Widget v1",active:true,pack:"10"},{id:"P1",name:"Widget v2",active:true,pack:"12"},
+  {id:"P2",name:"Gadget",active:false,pack:"6"},{id:"P3",name:"Gizmo",active:true,pack:"?"},
+  {id:"P4",name:"Doohickey",active:true,pack:"4"},{id:"P4",name:"Doohickey XL",active:true,pack:"8"},
+  {id:"P5",name:"Thingamajig",active:true,pack:"1"}];
+ORDERS.forEach((o,i)=>o.row=i+1); PRODUCTS.forEach((p,i)=>p.row=i+1);
+const WHERE={E:"orders.product_id == products.product_id",
+  R:"orders.product_id == products.product_id and products.active == true",
+  F:"orders.product_id == products.product_id and products.pack.to_int() > 0"};
+const S={pred:"E",match:"first",miss:"null_fields",drive:"orders",filter:false,
+         rmatch:"first",rmiss:"null_fields",amounts:{O1:50,O2:150,O3:null,O4:999,O5:120}};
+const TIERS=[{id:"Low",lo:0,hi:100},{id:"Mid",lo:100,hi:200},{id:"Promo",lo:100,hi:130}];
+TIERS.forEach((t,i)=>t.row=i+1);
+
+/* one candidate pair → "true" | "false" | "failed", as documented for where: */
+function outcome(order,product){
+  if(order.product_id!==product.id) return null;           // not a candidate: the equality fails
+  if(S.pred==="R") return product.active?"true":"false";
+  if(S.pred==="F") return /^-?\d+$/.test(product.pack)?(+product.pack>0?"true":"false"):"failed";
+  return "true";
+}
+const label=(side,r)=>side==="orders"?r.id:`${r.id} ${r.name}`;
+const bodyKeeps=prod=>!S.filter||((prod?prod.name:null)??"")!=="Widget v1";
+
+function runMatch(){
+  const drvSide=S.drive, bldSide=drvSide==="orders"?"products":"orders";
+  const drivers=drvSide==="orders"?ORDERS:PRODUCTS, build=drvSide==="orders"?PRODUCTS:ORDERS;
+  const out=[], dlq=[], cards=[]; let stoppedAt=null;
+  for(const d of drivers){
+    if(stoppedAt) { cards.push({d,cands:[],verdict:"not reached",cls:"v-skip",note:"run had stopped"}); continue; }
+    // candidates in build arrival order, each with its where: outcome
+    const cands=build.map(b=>{ const o=drvSide==="orders"?outcome(d,b):outcome(b,d); return o?{b,o}:null; }).filter(Boolean);
+    const prodOf=b=>drvSide==="orders"?b:d;
+    const card={d,cands:[],verdict:"",cls:"",note:""};
+    const failPair=c=>{ dlq.push({txt:`${drvSide} ${label(drvSide,d)}`,trig:true,src:drvSide});
+                        dlq.push({txt:`${bldSide} ${label(bldSide,c.b)} (the build row it failed with)`,trig:false,src:bldSide}); };
+    const emit=(b,kind)=>{ const keep=bodyKeeps(prodOf(b)); if(keep) out.push({d,b,kind}); return keep; };
+    if(S.match==="first"){
+      let decided=null;
+      for(const c of cands){
+        if(decided){ card.cands.push({c,cls:"outside",tag:"after the deciding row"}); continue; }
+        if(c.o==="false"){ card.cands.push({c,cls:"",tag:"no match"}); continue; }
+        decided=c;
+        if(c.o==="true"){ const kept=emit(c.b); card.cands.push({c,cls:"chosen",tag:kept?"chosen":"chosen, body dropped it"});
+          card.verdict=kept?"matched":"matched, no row"; card.cls=kept?"v-match":"v-skip"; if(!kept) card.note="the next match is not tried"; }
+        else { failPair(c); card.cands.push({c,cls:"failed",tag:"where: failed, decides"}); card.verdict="dead-lettered"; card.cls="v-fail"; card.note="a later match is not used"; }
+      }
+      if(!decided) miss(card);
+    } else {
+      let anyTrue=false, anyFail=false; const trues=[];
+      for(const c of cands){
+        if(c.o==="true"){ anyTrue=true; trues.push(c); card.cands.push({c,cls:"chosen",tag:"match"}); }
+        else if(c.o==="failed"){ anyFail=true; failPair(c); card.cands.push({c,cls:"failed",tag:"where: failed"}); }
+        else card.cands.push({c,cls:"",tag:"no match"});
+      }
+      if(S.match==="all"){
+        let rows=0; for(const c of trues){ if(emit(c.b)) rows++; else { c.dropped=true; card.cands.find(x=>x.c===c).tag="match, body dropped it"; } }
+        if(anyTrue||anyFail){ card.verdict=`${rows} row${rows===1?"":"s"}`; card.cls=rows?"v-match":(anyFail?"v-fail":"v-skip"); if(anyFail) card.note="failed pairs are dead-lettered; other matches still emit"; }
+        else miss(card);
+      } else { // collect
+        if(anyFail){ card.verdict="no row"; card.cls="v-fail"; card.note="the set of matches is unknown, so no row, not even a partial one"; }
+        else if(anyTrue){ out.push({d,arr:trues.map(c=>c.b)}); card.verdict="1 row"; card.cls="v-match"; }
+        else miss(card);
+      }
+    }
+    if(!card.cands.length) card.cands=[];
+    cards.push(card);
+    function miss(card){
+      card.cls="v-miss";
+      if(S.miss==="null_fields"){
+        if(S.match==="collect"){ out.push({d,arr:[]}); card.verdict="miss: empty array"; }
+        else { const kept=bodyKeeps(drvSide==="orders"?null:d); if(kept) out.push({d,b:null}); card.verdict=kept?"miss: nulls":"miss: body dropped it"; }
+      }
+      else if(S.miss==="skip"){ card.verdict="miss: skipped"; }
+      else { card.verdict="miss: run stops"; card.cls="v-fail"; stoppedAt=d; card.stop=true; }
+    }
+  }
+  return {drvSide,bldSide,out,dlq,cards,stoppedAt};
+}
+
+function runRange(){
+  const out=[], cards=[];
+  for(const o of ORDERS){
+    const amt=S.amounts[o.id];
+    const cands=TIERS.map(t=>({t,o:(amt===null||amt===""||isNaN(amt))?null:(amt>=t.lo&&amt<t.hi?"true":"false")}));
+    const card={o,amt,cands:[],verdict:"",cls:""};
+    if(amt===null||amt===""||isNaN(amt)){ card.cands=[]; card.note="empty amount: can't be compared"; }
+    const trues=cands.filter(c=>c.o==="true");
+    if(card.note===undefined){
+      if(S.rmatch==="first"){ let dec=null; for(const c of cands){ if(dec){card.cands.push({c,cls:"outside",tag:"after the chosen tier"});continue;} if(c.o==="true"){dec=c;card.cands.push({c,cls:"chosen",tag:"chosen"});} else card.cands.push({c,cls:"",tag:"no match"}); } }
+      else cands.forEach(c=>card.cands.push({c,cls:c.o==="true"?"chosen":"",tag:c.o==="true"?"match":"no match"}));
+    }
+    if(trues.length){
+      if(S.rmatch==="first") out.push({o,amt,tiers:[trues[0].t]});
+      else if(S.rmatch==="all") trues.forEach(c=>out.push({o,amt,tiers:[c.t]}));
+      else out.push({o,amt,tiers:trues.map(c=>c.t),arr:true});
+      card.verdict=S.rmatch==="all"?`${trues.length} row${trues.length===1?"":"s"}`:"1 row"; card.cls="v-match";
+    } else {
+      card.cls="v-miss";
+      if(S.rmiss==="null_fields"){ out.push({o,amt,tiers:[],arr:S.rmatch==="collect",nul:S.rmatch!=="collect"}); card.verdict=S.rmatch==="collect"?"miss: empty array":"miss: nulls"; }
+      else card.verdict="miss: skipped";
+    }
+    cards.push(card);
+  }
+  return {out,cards};
+}
+
+/* ---------- rendering ---------- */
+const $=(s,r=document)=>r.querySelector(s);
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function renderMatch(){
+  const sec=$("#match"), r=runMatch();
+  const body=S.match==="collect"?'""':(S.filter?'|\n      filter (products.name ?? "") != "Widget v1"\n      emit …':"|\n      emit …");
+  $('[data-yaml="where"]',sec).textContent=`"${WHERE[S.pred]}"`;
+  $('[data-yaml="match"]',sec).textContent=S.match; $('[data-yaml="miss"]',sec).textContent=S.miss;
+  $('[data-yaml="drive"]',sec).innerHTML=S.drive==="products"?"\n    drive: <b>products</b>":"";
+  $('[data-yaml="cxl"]',sec).textContent=body;
+  $("[data-strategy]",sec).textContent=S.pred==="E"?"strategy: hash join on product_id (grace hash if the build side is too big)":"strategy: hash join on product_id, then the extra condition on each match";
+  const lbl=$("[data-filterlbl]",sec); lbl.classList.toggle("off",S.match==="collect"); $('[data-bind="filter"]',sec).disabled=S.match==="collect";
+  const tRow=(side,x)=>side==="orders"?`<div class="r"><b>${x.id}</b><span class="k">product</span>${x.product_id}<span class="k">qty</span>${x.qty}</div>`
+     :`<div class="r${S.pred==="F"&&x.pack==="?"?" bad":""}"><b>${x.id}</b>${esc(x.name)}<span class="k">active</span>${x.active}<span class="k">pack</span>${x.pack}</div>`;
+  $("[data-tables]",sec).innerHTML=[r.drvSide,r.bldSide].map((side,i)=>`<div class="tbl"><h5>${side}<span>${i?"build side, in arrival order":"driver"}</span></h5>${(side==="orders"?ORDERS:PRODUCTS).map(x=>tRow(side,x)).join("")}</div>`).join("");
+  $("[data-drivers]",sec).innerHTML=r.cards.map(c=>`<div class="drv ${c.cls==="v-miss"?"miss":""} ${c.cls==="v-fail"?(c.stop?"err":"fail"):""}">
+      <header><b>${esc(label(r.drvSide,c.d))}</b><span class="verdict ${c.cls}">${c.verdict}</span></header>
+      <ul class="cands">${c.cands.length?c.cands.map(x=>`<li class="${x.cls}"><span>${esc(label(r.bldSide,x.c.b))}</span><span class="tag">${x.tag}</span></li>`).join(""):`<li class="none">${c.verdict==="not reached"?"not reached":"no build row has this id"}</li>`}</ul>
+      ${c.note?`<div class="emits">${c.note}</div>`:""}</div>`).join("");
+  const ban=$("[data-banner]",sec);
+  if(r.stoppedAt){ ban.textContent=`Run stops: ${label(r.drvSide,r.stoppedAt)} has no match and on_miss is error`; ban.classList.add("on"); } else ban.classList.remove("on");
+  const other=r.bldSide;
+  $("[data-out]",sec).innerHTML=r.stoppedAt?`<div class="row empty">the run stopped with an error</div>`:r.out.length?r.out.map(o=>{
+      if(o.arr) return `<div class="row"><b>${esc(label(r.drvSide,o.d))}</b><span class="k">${other}:</span><span>[${o.arr.map(b=>esc(label(other,b))).join(", ")}]</span></div>`;
+      return `<div class="row${o.b?"":" null"}"><b>${esc(label(r.drvSide,o.d))}</b><span class="k">+</span><span class="n">${o.b?esc(label(other,o.b)):other+" fields null"}</span></div>`;
+    }).join(""):`<div class="row empty">no rows</div>`;
+  $("[data-outnote]",sec).textContent=r.stoppedAt?"":(S.match==="collect"?"one row per driver, matches in an array":"");
+  $("[data-dlq]",sec).innerHTML=r.dlq.length?r.dlq.map(e=>`<div class="row"><span>${esc(e.txt)}</span><span class="pill ${e.trig?"t":"c"}">trigger: ${e.trig}</span><span class="pill s">combine_output_row</span></div>`).join(""):`<div class="row empty">empty</div>`;
+  const misses=r.cards.filter(c=>c.verdict.startsWith("miss")).length;
+  $("[data-counts]",sec).innerHTML=[["output rows",r.stoppedAt?"–":r.out.length],["misses",misses],["dlq rows",r.dlq.length]].map(([a,b])=>`<div><span>${a}</span><b>${b}</b></div>`).join("");
+}
+
+function renderRange(){
+  const sec=$("#range"), r=runRange();
+  // number line 0..250, values beyond are pinned to the edge
+  const W=360,H=150,pad=14,max=250,X=v=>pad+(W-2*pad)*Math.max(0,Math.min(v,max))/max;
+  const col={Low:"#7f97ad",Mid:"#4fb0a0",Promo:"#b07ac0"};
+  let svg=`<line x1="${pad}" y1="${H-26}" x2="${W-pad}" y2="${H-26}" stroke="#3a3129"/>`;
+  for(let v=0;v<=max;v+=50) svg+=`<text x="${X(v)}" y="${H-10}" fill="#7d705f" font-size="10" text-anchor="middle">${v}</text>`;
+  TIERS.forEach((t,i)=>{ svg+=`<rect x="${X(t.lo)}" y="${10+i*20}" width="${X(t.hi)-X(t.lo)}" height="14" fill="${col[t.id]}" opacity=".55"/><text x="${X(t.lo)+4}" y="${21+i*20}" fill="#14110f" font-size="10" font-weight="700">${t.id} [${t.lo},${t.hi})</text>`; });
+  ORDERS.forEach((o,i)=>{ const a=S.amounts[o.id]; if(a===null||a===""||isNaN(a)) return;
+    svg+=`<line x1="${X(a)}" y1="6" x2="${X(a)}" y2="${H-26}" stroke="#e0a93e" stroke-dasharray="3 2"/><text x="${X(a)}" y="${82+(i%2)*12}" fill="#e0a93e" font-size="10" text-anchor="${a>max*.85?"end":a<max*.1?"start":"middle"}">${a<0?a+"←":""}${o.id}${a>max?"→"+a:""}</text>`; });
+  $("[data-band]",sec).innerHTML=svg;
+  $("[data-rdrivers]",sec).innerHTML=r.cards.map(c=>`<div class="drv ${c.cls==="v-miss"?"miss":""}"><header><b>${c.o.id} · ${c.amt===null||c.amt===""||isNaN(c.amt)?"empty":c.amt}</b><span class="verdict ${c.cls}">${c.verdict}</span></header>
+      <ul class="cands">${c.cands.length?c.cands.map(x=>`<li class="${x.cls}"><span>${x.c.t.id} [${x.c.t.lo}, ${x.c.t.hi})</span><span class="tag">${x.tag}</span></li>`).join(""):`<li class="none">${c.note}</li>`}</ul></div>`).join("");
+  $("[data-rout]",sec).innerHTML=r.out.length?r.out.map(o=>`<div class="row${o.nul?" null":""}"><b>${o.o.id}</b><span class="k">${o.amt===null||o.amt===""||isNaN(o.amt)?"empty":o.amt}</span><span class="n">${o.arr?"tiers: ["+o.tiers.map(t=>t.id).join(", ")+"]":o.nul?"tier null":"tier "+o.tiers[0].id}</span></div>`).join(""):`<div class="row empty">no rows</div>`;
+}
+
+function syncControls(){
+  document.querySelectorAll("[data-bind] button").forEach(b=>{ const k=b.parentElement.dataset.bind; b.setAttribute("aria-pressed",String(S[k]===b.dataset.v)); });
+  $('[data-bind="filter"]').checked=S.filter&&S.match!=="collect";
+}
+function buildAmounts(){
+  $("#range [data-amts]").innerHTML=ORDERS.map(o=>`<label>${o.id}<input type="number" inputmode="numeric" data-amt="${o.id}" value="${S.amounts[o.id]??""}" placeholder="empty" aria-label="amount for ${o.id}"></label>`).join("");
+}
+function render(){ syncControls(); renderMatch(); renderRange(); }
+
+document.addEventListener("click",e=>{
+  const b=e.target.closest("[data-bind] button"); if(!b||b.disabled) return;
+  S[b.parentElement.dataset.bind]=b.dataset.v; render();
+});
+$('[data-bind="filter"]').addEventListener("change",e=>{ S.filter=e.target.checked; render(); });
+document.addEventListener("input",e=>{
+  const a=e.target.closest("[data-amt]"); if(!a) return;
+  S.amounts[a.dataset.amt]=a.value===""?null:Number(a.value); renderRange();
+});
+buildAmounts(); render();
+</script>
+</body>
+</html>

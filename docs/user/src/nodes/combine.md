@@ -4,6 +4,8 @@ Combine nodes are the N-ary record-combining operator. Every input is declared u
 
 Combine is distinct from merge: merge concatenates upstream branches that share a schema, while combine joins records across inputs that have different schemas.
 
+*Interactive companion: the [Combine playground](combine-explainer.html) shows, driver row by driver row, which build rows `where:` matches and what `match:` and `on_miss:` do with them, including range joins.*
+
 ## Basic structure
 
 ```yaml
