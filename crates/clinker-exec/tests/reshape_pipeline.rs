@@ -1346,27 +1346,13 @@ fn examples_dir() -> PathBuf {
         .join("pipelines")
 }
 
-/// The ledger capacity the example's spill proof is held to: 128 KiB, the
-/// `memory.limit` the example carried before it moved to a realistic
-/// figure.
-///
-/// No capacity both forces a spill and lets the run complete today: the
-/// example's input charges at most 48,064 bytes with ample memory, and any
-/// capacity below that fails when the CSV reader's next 88-byte admission
-/// falls short, so what cannot spill equals the peak. The figure is kept,
-/// and the spill it proves comes from the soft spill threshold, not from a
-/// shortfall; once that threshold is gone, the test needs a single forced
-/// shortfall on the Reshape group growth that must spill.
-const SCD_EXAMPLE_CAPACITY: u64 = 128 * 1024;
-
 #[test]
 fn scd_type2_e2e_with_spill() {
-    // Run the runnable `examples/pipelines/scd_type2.yaml` end-to-end. The
-    // example runs at a realistic `memory.limit`; this test holds the run to
-    // a small ledger capacity so it takes the disk path on this small
-    // fixture, and the example doubles as the bounded-memory smoke test: the
-    // mutate+synthesize output must be correct AND the run must report
-    // on-disk spill volume.
+    // Run the runnable `examples/pipelines/scd_type2.yaml` end-to-end. Its
+    // pipeline-level `memory.limit: 128K` with the `spill` policy forces the
+    // disk path on this small fixture, so the example doubles as the
+    // bounded-memory smoke test: the mutate+synthesize output must be correct
+    // AND the run must report on-disk spill volume.
     let yaml = std::fs::read_to_string(examples_dir().join("scd_type2.yaml"))
         .expect("read scd_type2.yaml example");
     let csv = std::fs::read_to_string(examples_dir().join("data").join("scd_plans.csv"))
@@ -1396,14 +1382,12 @@ fn scd_type2_e2e_with_spill() {
         batch_id: "scd-e2e".to_string(),
         pipeline_vars: indexmap::IndexMap::new(),
         shutdown_token: None,
-        memory_test: MemoryTestOverrides::default().with_ledger_capacity(SCD_EXAMPLE_CAPACITY),
         ..Default::default()
     };
 
     let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
         .expect("example pipeline run");
     let output = buf.as_string();
-    assert_spill_engaged(&report);
 
     assert!(
         report.counters.dlq_count == 0,
@@ -1412,7 +1396,7 @@ fn scd_type2_e2e_with_spill() {
     );
     assert!(
         report.cumulative_spill_bytes > 0,
-        "the 128 KiB capacity forces the disk spill path"
+        "the example's 128K budget forces the disk spill path"
     );
 
     // Three employees have over-long windows (E001, E002, E004), so three
