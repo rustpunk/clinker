@@ -16,11 +16,12 @@
 //!   pipeline and asserts bit-for-bit equivalence between the
 //!   retract-corrected writer payload and a baseline rerun of the same
 //!   pipeline with the failing record omitted from the input. Covers
-//!   Reversible-only bindings (`sum`, `count`), BufferRequired-only
-//!   bindings (`min`, `max`, `avg`), and a downstream Transform that
-//!   derives a column from the aggregate output. Closes the integration
-//!   gap above the per-aggregator and per-accumulator retract unit
-//!   tests.
+//!   Reversible bindings (`sum`, `count`), which retract on the lineage
+//!   path as `avg` and `weighted_avg` also do; the buffer-mode bindings
+//!   `min` and `max`, beside which an `avg` runs in buffer mode too; and a
+//!   downstream Transform that derives a column from the aggregate output.
+//!   Closes the integration gap above the per-aggregator and
+//!   per-accumulator retract unit tests.
 
 #[path = "common/dlq_fixtures.rs"]
 mod dlq_fixtures;
@@ -436,10 +437,12 @@ O12,HR,60
     );
 }
 
-/// End-to-end retraction over BufferRequired bindings (`min`, `max`,
-/// `avg`). The relaxed-CK aggregator runs in buffer-mode for these
-/// bindings, retains every contribution, and recomputes the finalize
-/// step in place after retract. As with the Reversible test, the DLQ
+/// End-to-end retraction in buffer mode. `min` and `max` are the bindings
+/// that select it; the `avg` beside them runs in buffer mode only because
+/// it shares their Aggregate, since on its own it retracts by subtraction
+/// on the lineage path, as `sum`, `count` and `weighted_avg` do. The
+/// relaxed-CK aggregator retains every contribution and recomputes the
+/// finalize step in place after retract. As with the Reversible test, the DLQ
 /// trigger fires upstream of the aggregate so the bad row is never
 /// added to the aggregator's buffered contributions. The bit-for-bit
 /// equivalence assertion proves the buffer-mode aggregator's
