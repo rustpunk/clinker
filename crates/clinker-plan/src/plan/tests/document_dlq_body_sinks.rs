@@ -122,15 +122,30 @@ fn document_granularity_rejects_a_composition_body_sink() {
         );
     }
     let help = diag.help.as_deref().expect("E378 carries a help text");
-    for fragment in [
-        "input: enrich.audit",
-        "audit: shape",
-        "dlq_granularity: record",
-        "#1242",
-    ] {
+    for fragment in ["input: enrich.audit", "audit: shape", "path: audit.csv"] {
         assert!(
             help.contains(fragment),
             "the help carries {fragment:?}: {help}"
+        );
+    }
+    assert!(
+        !help.contains('<'),
+        "the help prints the Sink's configuration, not a placeholder: {help}"
+    );
+    assert!(
+        !help.contains("dlq_granularity:"),
+        "the help gives one fix, the move: {help}"
+    );
+    // The alternative and the issue that tracks body Sinks live on the
+    // explain page, not in the help.
+    let explain = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/explain/E378.md"),
+    )
+    .expect("read docs/explain/E378.md");
+    for fragment in ["dlq_granularity: record", "#1242"] {
+        assert!(
+            explain.contains(fragment),
+            "the explain page carries {fragment:?}"
         );
     }
     assert_ne!(
