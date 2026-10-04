@@ -238,7 +238,10 @@ overrides, per field:
     Under `error_handling.strategy: continue`, the offending record goes to the
     [dead-letter queue](../pipelines/error-handling.md) (category
     `multi_value_join_collision`) and the run continues; under `fail_fast` it
-    aborts.
+    aborts. The exception is a pipeline where any Source declares
+    `dlq_granularity: document`: there the collision fails the run (see
+    [Not covered](../pipelines/error-handling.md#document-dlq-not-covered),
+    [#933](https://github.com/rustpunk/clinker/issues/933)).
   - `escape` — prefix each delimiter (and each escape character) inside a value
     with `escape` (default `\`), so a matching `split_values` `escape:` recovers
     the original. Lossless. `delimiter` and `escape` must each be a single

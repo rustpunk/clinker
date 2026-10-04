@@ -41,7 +41,12 @@ aggregation.dept_totals:
   buffer: materialized
 ```
 
-`buffer: streaming` marks a stage that holds only a small in-flight slice; `buffer: materialized` marks one that holds a whole stage's output and may spill it. The annotation comes from the same classifier the executor uses at runtime, so what `--explain` reports is exactly what happens. See [Explain Plans](explain.md) and [Memory Tuning](memory.md).
+`buffer: streaming` marks a stage that holds only a small in-flight slice; `buffer: materialized` marks one that holds a whole stage's output and may spill it. The annotation follows the rules the executor applies at runtime, with two known gaps:
+
+- A Sink with `reconstruct_envelope: true` turns streaming output off at runtime, but `--explain` still reports `buffer: streaming` for that Sink and for a Transform feeding it.
+- Under a [correlation key](../pipelines/error-handling.md#correlation-key), `--explain` reports each Sink as `buffer: streaming`, though the correlation commit writes its rows.
+
+See [Explain Plans](explain.md) and [Memory Tuning](memory.md).
 
 Under [`dlq_granularity: document`](../pipelines/error-handling.md#document-level-dlq), as under a correlation key, streaming handoffs are off for the whole pipeline: no Transform, Merge, Route, Aggregate or Combine hands its output to a streaming consumer, so none of them reports `buffer: streaming`. Each Sink reports `buffer: materialized`, because it holds every open document's records until the document's verdict is final. A Source read by a single Transform still hands its records straight to that Transform, and keeps `buffer: streaming`.
 
