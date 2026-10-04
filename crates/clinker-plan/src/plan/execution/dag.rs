@@ -856,16 +856,25 @@ fn composition_file_label(path: &std::path::Path) -> String {
         .join("/")
 }
 
-/// The columns a body Sink restricts its output to, in the order it writes
-/// them, or `None` when it writes every column it receives.
+/// The columns a body Sink restricts its output to, where the moved Sink
+/// would not restrict itself to the same ones, in the order it writes them;
+/// `None` when the moved Sink, with the body Sink's configuration unchanged,
+/// writes what the body Sink wrote.
 ///
 /// A Sink with `include_unmapped: false` and no `mapping:` writes only the
-/// columns its input emits ([`cxl_emit_names_at`], the walk the runtime
+/// columns its input emits ([`cxl_emit_walk`], the walk the runtime
 /// projection reads), less the names its `exclude:` lists, in the order the
-/// record carries them, which is the emit walk's schema order. An input that
-/// emits no named column applies no restriction at runtime, so it is `None`
-/// here too. `Some` of an empty list is a Sink whose `exclude:` removes every
-/// emitted column.
+/// record carries them, which is the emit walk's schema order. Only a walk
+/// that ends at a Transform reports fewer columns than the row the
+/// composition call passes on: the call's own emit names are its whole
+/// output schema, so the moved Sink would also write the columns the
+/// Transform passes through. Every other end already reports the whole row
+/// the port carries, engine-stamped columns included, which the runtime
+/// projection never writes, so the unchanged configuration writes the same
+/// columns and no `mapping:` is needed (one would name those engine columns,
+/// written as empty cells). An input that emits no named column applies no
+/// restriction at runtime, so it is `None` here too. `Some` of an empty list
+/// is a Sink whose `exclude:` removes every column a Transform emits.
 fn projected_columns(graph: &DiGraph<PlanNode, PlanEdge>, idx: NodeIndex) -> Option<Vec<String>> {
     let PlanNode::Sink { resolved, .. } = &graph[idx] else {
         return None;
@@ -874,8 +883,8 @@ fn projected_columns(graph: &DiGraph<PlanNode, PlanEdge>, idx: NodeIndex) -> Opt
     if sink.include_unmapped || sink.mapping.is_some() {
         return None;
     }
-    let emitted = cxl_emit_names_at(graph, idx);
-    if emitted.is_empty() {
+    let (end, emitted) = cxl_emit_walk(graph, idx)?;
+    if !matches!(graph[end], PlanNode::Transform { .. }) || emitted.is_empty() {
         return None;
     }
     let excluded = sink.exclude.as_deref().unwrap_or_default();

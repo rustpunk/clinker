@@ -53,9 +53,10 @@ gets written.
 
 Where moving the Sink to the pipeline through a new composition output port
 runs today, the error's help prints that move ready to paste, including the
-Sink's own configuration. For a Sink that writes only the columns its input
-emits (`include_unmapped: false` with no `mapping:`), the printed move writes
-those columns as a `mapping:`, so the moved Sink writes the same columns.
+Sink's own configuration. For a Sink that reads a Transform and writes only
+the columns it emits (`include_unmapped: false` with no `mapping:`), the
+printed move writes those columns as a `mapping:`, so the moved Sink writes
+the same columns.
 Otherwise the help names
 `clinker explain --code E378`, which shows how to declare the Sink's work at
 pipeline level.

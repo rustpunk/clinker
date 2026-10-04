@@ -1061,41 +1061,75 @@ pub(crate) fn cxl_emit_names_at(
     graph: &DiGraph<PlanNode, PlanEdge>,
     idx: NodeIndex,
 ) -> Vec<String> {
-    match &graph[idx] {
-        PlanNode::Source { output_schema, .. } => output_schema
-            .columns()
-            .iter()
-            .map(|c| c.to_string())
-            .collect(),
+    cxl_emit_walk(graph, idx)
+        .map(|(_, names)| names)
+        .unwrap_or_default()
+}
+
+/// The walk [`cxl_emit_names_at`] reads: from `idx`, up each pass-through
+/// variant's first upstream, to the first node that emits columns of its
+/// own. Returns that node and the names it emits, or `None` when a
+/// pass-through has no upstream.
+///
+/// The end node tells a caller what kind of set the names are. Only a
+/// Transform's names are narrower than the row it produces; every other end
+/// reports its whole output schema, engine-stamped columns included.
+pub(crate) fn cxl_emit_walk(
+    graph: &DiGraph<PlanNode, PlanEdge>,
+    mut idx: NodeIndex,
+) -> Option<(NodeIndex, Vec<String>)> {
+    loop {
+        match own_cxl_emit_names(&graph[idx]) {
+            Some(names) => return Some((idx, names)),
+            None => {
+                idx = graph
+                    .neighbors_directed(idx, petgraph::Direction::Incoming)
+                    .next()?;
+            }
+        }
+    }
+}
+
+/// The emit names `node` produces itself, or `None` for a variant that
+/// passes its upstream's columns through and adds none.
+fn own_cxl_emit_names(node: &PlanNode) -> Option<Vec<String>> {
+    match node {
+        PlanNode::Source { output_schema, .. } => Some(
+            output_schema
+                .columns()
+                .iter()
+                .map(|c| c.to_string())
+                .collect(),
+        ),
         PlanNode::Transform {
             write_set,
             output_schema,
             ..
-        } => output_schema
-            .columns()
-            .iter()
-            .filter(|c| write_set.contains(c.as_ref()))
-            .map(|c| c.to_string())
-            .collect(),
+        } => Some(
+            output_schema
+                .columns()
+                .iter()
+                .filter(|c| write_set.contains(c.as_ref()))
+                .map(|c| c.to_string())
+                .collect(),
+        ),
         PlanNode::Aggregation { output_schema, .. }
         | PlanNode::Combine { output_schema, .. }
         | PlanNode::Composition { output_schema, .. }
         | PlanNode::Reshape { output_schema, .. }
         | PlanNode::Cull { output_schema, .. }
         | PlanNode::Envelope { output_schema, .. }
-        | PlanNode::Merge { output_schema, .. } => output_schema
-            .columns()
-            .iter()
-            .map(|c| c.to_string())
-            .collect(),
+        | PlanNode::Merge { output_schema, .. } => Some(
+            output_schema
+                .columns()
+                .iter()
+                .map(|c| c.to_string())
+                .collect(),
+        ),
         PlanNode::Route { .. }
         | PlanNode::Sort { .. }
         | PlanNode::Sink { .. }
-        | PlanNode::CorrelationCommit { .. } => graph
-            .neighbors_directed(idx, petgraph::Direction::Incoming)
-            .next()
-            .map(|upstream| cxl_emit_names_at(graph, upstream))
-            .unwrap_or_default(),
+        | PlanNode::CorrelationCommit { .. } => None,
     }
 }
 
