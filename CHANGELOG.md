@@ -12,11 +12,12 @@ names the rule and the fix; only a group with no non-null value gives null.
 
 - **Decimal totals are exact.** A decimal `sum`, and the sums inside `avg` and
   `weighted_avg`, are the exact total of the group's values, rounded once (half
-  to even) only when the total needs more than 28 significant digits. Before,
-  each addition rounded as it went, so a total of quotients such as
+  to even) only when the total does not fit a decimal at the result's scale.
+  Before, each addition rounded as it went, so a total of quotients such as
   `sum(amount / qty)` could change in its last digits with the order rows
-  arrived in or the way a spilled aggregation split the group. Results beyond
-  28 significant digits can change in the last digit. The result's scale is the
+  arrived in or the way a spilled aggregation split the group. A total that
+  does not fit a decimal at that scale can change in the last digit. The
+  result's scale is the
   largest scale among the group's values, zeros and integers included, so the
   sum of `1.00`, `-1.00` and `2` is now `2.00` in every order (it could be
   `2`). A decimal total is out of range only when the whole group's exact total

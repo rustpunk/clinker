@@ -69,7 +69,7 @@ NaN. Results can differ in the last bit from a version that rounded after each
 addition.
 
 A decimal sum is the exact total of the group's values, rounded once (half to
-even) only when it needs more than 28 significant digits. Its scale is the
+even) only when it does not fit a decimal at its scale. Its scale is the
 largest scale among the group's values, zeros and integers included, so the
 sum of `1.00`, `-1.00` and `2` is `2.00` whatever order the rows arrive in. It
 is an error only when the whole group's exact total is outside the decimal

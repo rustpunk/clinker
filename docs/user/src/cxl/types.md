@@ -313,9 +313,9 @@ JSON output renders a decimal as a scale-preserving string.)
 `sum`, `avg`, `min`, `max`, `count`, and `distinct` all work over a `decimal`
 column and stay exact — no binary float ever touches a running total:
 
-- `sum(amount)` returns a `decimal`: the exact total of the group's values,
-  rounded once (half to even) only when it needs more than 28 significant
-  digits, at the largest scale among the group's values. The sum of `1.00`,
+- `sum(amount)` returns a `decimal`: the exact total of the group's values at
+  the largest scale among them, rounded once (half to even) only when it does
+  not fit a decimal at that scale. The sum of `1.00`,
   `-1.00` and `2` is `2.00` in any order, and a total of amounts with two
   decimal places is exact to the cent.
 - `avg(amount)` is `sum(amount) / count(amount)`, a `decimal` at full division
