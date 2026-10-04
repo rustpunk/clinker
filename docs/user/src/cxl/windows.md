@@ -4,6 +4,8 @@ Window functions allow CXL expressions to access aggregated values across a set 
 
 Window functions are accessed via the `$window.*` namespace and require an `analytic_window:` configuration on the transform node.
 
+*Interactive companion: the [window functions explainer](windows-explainer.html) shows, for any row, which rows of its partition each function reads.*
+
 ## Configuring an analytic window
 
 Window functions are only available in transform nodes that declare an `analytic_window:` section in YAML:
@@ -22,8 +24,9 @@ nodes:
       cxl: |
         emit region = region
         emit amount = amount
-        emit running_total = $window.sum(amount)
-        emit rank_position = $window.count()
+        emit region_total = $window.sum(amount)
+        emit running_total = $window.cumulative_sum(amount)
+        emit rank_position = $window.row_number()
 ```
 
 ### Window configuration fields
@@ -35,23 +38,37 @@ nodes:
 | `source` | Optional explicit source-name reference for cross-source windows. |
 | `on` | Optional cross-source partition-lookup field. |
 
-Frame specification (`frame: { rows: ... }` / `frame: { range: ... }`) is not yet plumbed through the YAML parser; today every window evaluates with a `rows: unbounded_preceding..current_row` semantic, which matches the SQL default for the listed window functions. See [the deferred-work tracker](https://github.com/rustpunk/clinker/issues) for status of explicit frame syntax.
+### Which rows a function reads
+
+There is no frame option. A window function reads one of three things:
+
+- **The whole partition.** `sum`, `avg`, `min`, `max`, `count`, `first_value`, `last_value`, `first()`, `last()`, `any`, `every`, `exists`, `not_exists`, `collect` and `distinct` read every row of the record's partition, whatever the record's position. Every record in a partition gets the same `$window.sum(amount)`.
+- **The partition up to the current record.** `cumulative_sum` is the running total, from the partition's first record (in `sort_by` order) through the current one.
+- **A position.** `row_number`, `rank` and `dense_rank` give the current record's place in `sort_by` order; `lag(n)` and `lead(n)` read the record `n` places before or after it.
 
 ## Aggregate window functions
 
-These compute aggregate values over the window frame.
+These compute values over the record's whole partition, except `cumulative_sum`, which stops at the current record.
 
 ### $window.sum(field)
 
-Sum of the field values in the window frame.
+Sum of the field values across the whole partition. Null and non-numeric values are skipped; a sum of integers returns a Float.
 
 ```
 emit running_total = $window.sum(amount)
 ```
 
+### $window.cumulative_sum(field)
+
+Running total of the field values from the partition's first record (in `sort_by` order) through the current record. Like `$window.sum`, a sum of integers returns a Float.
+
+```
+emit running_total = $window.cumulative_sum(amount)
+```
+
 ### $window.avg(field)
 
-Average of the field values in the window frame. Returns Float.
+Average of the field values across the whole partition. Returns Float.
 
 ```
 emit moving_avg = $window.avg(amount)
@@ -59,7 +76,7 @@ emit moving_avg = $window.avg(amount)
 
 ### $window.min(field)
 
-Minimum value in the window frame.
+Minimum value in the partition.
 
 ```
 emit window_min = $window.min(amount)
@@ -67,7 +84,7 @@ emit window_min = $window.min(amount)
 
 ### $window.max(field)
 
-Maximum value in the window frame.
+Maximum value in the partition.
 
 ```
 emit window_max = $window.max(amount)
@@ -75,7 +92,7 @@ emit window_max = $window.max(amount)
 
 ### $window.count()
 
-Count of records in the window frame. Takes no arguments.
+Number of records in the partition, the same for every record in it. Takes no arguments. For a record's position, use `$window.row_number()`.
 
 ```
 emit window_size = $window.count()
@@ -83,7 +100,7 @@ emit window_size = $window.count()
 
 ### $window.first_value(field)
 
-Returns the value of `field` at the first record of the window frame
+Returns the value of `field` at the first record of the partition
 (ordered by `sort_by`). Equivalent to SQL `FIRST_VALUE(field)`.
 
 ```
@@ -92,8 +109,8 @@ emit opening_amount = $window.first_value(amount)
 
 ### $window.last_value(field)
 
-Returns the value of `field` at the last record of the window frame
-(ordered by `sort_by`). Equivalent to SQL `LAST_VALUE(field)`.
+Returns the value of `field` at the last record of the partition
+(ordered by `sort_by`), the same for every record in it.
 
 ```
 emit closing_amount = $window.last_value(amount)
@@ -132,39 +149,39 @@ emit sales_dense_rank = $window.dense_rank()
 
 ## Positional window functions
 
-These access specific records by position within the window frame.
+These return a whole record by position within the partition. Name the field to read after the call, as in `$window.lag(1).amount`. Without a field name the call returns null on every record, and no error is raised.
 
-### $window.first()
+### $window.first().field
 
-Returns the value of the current field from the first record in the window frame.
-
-```
-emit first_amount = $window.first()
-```
-
-### $window.last()
-
-Returns the value of the current field from the last record in the window frame.
+The first record of the partition, in `sort_by` order.
 
 ```
-emit last_amount = $window.last()
+emit first_amount = $window.first().amount
 ```
 
-### $window.lag(n)
+### $window.last().field
 
-Returns the value from `n` records before the current record. Returns `null` if there is no record at that offset.
-
-```
-emit prev_amount = $window.lag(1)
-emit two_back = $window.lag(2)
-```
-
-### $window.lead(n)
-
-Returns the value from `n` records after the current record. Returns `null` if there is no record at that offset.
+The last record of the partition, in `sort_by` order.
 
 ```
-emit next_amount = $window.lead(1)
+emit last_amount = $window.last().amount
+```
+
+### $window.lag(n).field
+
+The record `n` places before the current record. Returns `null` if there is no record at that offset.
+
+```
+emit prev_amount = $window.lag(1).amount
+emit two_back = $window.lag(2).amount
+```
+
+### $window.lead(n).field
+
+The record `n` places after the current record. Returns `null` if there is no record at that offset.
+
+```
+emit next_amount = $window.lead(1).amount
 ```
 
 ## Iterable window functions
@@ -244,13 +261,14 @@ nodes:
         emit store_id = store_id
         emit sale_date = sale_date
         emit daily_revenue = revenue
-        emit week_avg = $window.avg(revenue)
-        emit week_total = $window.sum(revenue)
-        emit prev_day_revenue = $window.lag(1)
-        emit day_over_day = revenue - ($window.lag(1) ?? revenue)
+        emit store_avg = $window.avg(revenue)
+        emit store_total = $window.sum(revenue)
+        emit revenue_to_date = $window.cumulative_sum(revenue)
+        emit prev_day_revenue = $window.lag(1).revenue
+        emit day_over_day = revenue - ($window.lag(1).revenue ?? revenue)
 ```
 
-This computes per-store running averages and totals over the partition's history-up-to-and-including the current row.
+For each sale this adds the store's average and total over all of its days, its revenue to date, and the change from the previous day.
 
 ## Correlation-key error handling
 

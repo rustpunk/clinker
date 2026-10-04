@@ -858,6 +858,39 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
   a test with a Sink and a relaxed Aggregate on the same input.
 - Implementation owner: Executor maintainers.
 
+### 69. Is a `$window.sum` meant to be a whole-partition total or a running total?
+
+- Filed: 2026-10-04.
+- Status: Open.
+- Priority: Medium.
+- Evidence: `PartitionWindowContext` computes `sum`, `avg`, `min`, `max`,
+  `count`, `collect`, `distinct`, `first_value`, `last_value`, `first()` and
+  `last()` over the record's whole partition, and the predicate folds
+  (`any`, `every`, `exists`, `not_exists`) walk every partition record; only
+  `cumulative_sum` stops at the current record. The user guide's Window
+  Functions page described a fixed `unbounded_preceding..current_row` frame
+  and used `$window.sum` and `$window.count()` as a running total and a
+  position; it now describes the implemented behaviour. The running-total
+  reading survives elsewhere: `examples/pipelines/retract-demo` emits
+  `running_total = $window.sum(amount)` and its README calls `sum`, `lag(1)`
+  and `first()` "running, prior, and opening totals", and
+  `crates/clinker-exec/tests/correlated_window_after_aggregate_retract.rs`
+  names a `$window.sum` column `running_total`, though its assertions use
+  one-row partitions, where both readings agree. Separately, a record whose
+  `group_by` value is null gets no window context at all
+  (`executor/transform.rs`, `value_to_group_key` returns `None`), and a
+  bare positional call such as `$window.lag(1)` evaluates to null rather
+  than failing to compile.
+- Files/modules involved: `crates/clinker-exec/src/pipeline/window_context.rs`,
+  `crates/clinker-exec/src/executor/transform.rs`,
+  `crates/cxl/src/eval/compiled.rs` (`compile_window_call`).
+- Suggested way to resolve it: Confirm whole-partition aggregates as the
+  contract (then rename the demo and test columns) or decide the frame
+  semantics an explicit frame option should provide. Decide what a null
+  partition key should yield, and whether a bare positional call should be
+  a compile-time error instead of a silent null.
+- Implementation owner: CXL and executor maintainers.
+
 ## Resolved Archive
 
 ### 61. Decoded allocation ownership

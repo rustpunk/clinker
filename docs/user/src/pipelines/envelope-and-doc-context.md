@@ -8,23 +8,32 @@ exposes these sections to CXL through the `$doc.<section>.<field>`
 namespace.
 
 ```yaml
-sources:
-  - name: payments
-    path: data/payments.xml
-    format: xml
-    envelope:
-      sections:
-        BatchInfo:
-          extract: { xml_path: "/payments/BatchInfo" }
-          fields:
-            batch_id: string
-            run_date: date
-        Summary:
-          extract: { xml_path: "/payments/Summary" }
-          fields:
-            record_count: int
-            checksum: string
+nodes:
+  - type: source
+    name: payments
+    config:
+      name: payments
+      type: xml
+      path: data/payments.xml
+      options:
+        record_path: payments/Payment
+      envelope:
+        sections:
+          BatchInfo:
+            extract: { xml_path: "/payments/BatchInfo" }
+            fields:
+              batch_id: string
+              run_date: date
+          Summary:
+            extract: { xml_path: "/payments/Summary" }
+            fields:
+              record_count: int
+              checksum: string
+      schema:
+        - { name: amount, type: int }
 ```
+
+*Interactive companion: the [document context explainer](envelope-and-doc-context-explainer.html) shows which records read each section, how each file becomes its own document, and what `dlq_granularity: document` rejects.*
 
 Like the rest of the pipeline config, the `envelope:` block is strict:
 an unknown key at any level (a misspelled `sections:`, `extract:`, or
@@ -64,13 +73,17 @@ Multi-record CSV and fixed-width `record_type` extraction captures the
 leading header region only; it does not extract arbitrary trailing sections.
 
 For formats with trailing-section extraction, a trailer field is available
-*during* body processing, not just at end-of-file. A pipeline can compute,
-on every row, a ratio
-against the trailer's total:
+*during* body processing, not just at end-of-file. A Transform can compare
+every row, including the first, against the trailer's count:
 
 ```yaml
-project:
-  - running_fraction: row_index / $doc.Summary.record_count
+- type: transform
+  name: check_count
+  input: payments
+  config:
+    cxl: |
+      emit amount = amount
+      emit declared_count = $doc.Summary.record_count
 ```
 
 Note that an *extracted* trailer section you read via `$doc.*` is distinct
@@ -274,11 +287,14 @@ for the full reference.
 A JSON example:
 
 ```yaml
-sources:
-  - name: payments
+- type: source
+  name: payments
+  config:
+    name: payments
+    type: json
     path: data/payments.json
-    format: json
-    record_path: records
+    options:
+      record_path: records
     envelope:
       sections:
         Head:
@@ -289,6 +305,8 @@ sources:
           extract: { json_pointer: "/Foot" }
           fields:
             count: int
+    schema:
+      - { name: amount, type: int }
 ```
 
 against:
@@ -371,10 +389,10 @@ for the full bracket-index reference. Integer indices select array
 elements; string keys select map entries; the two compose into a chain:
 
 ```yaml
-project:
-  - first_line:   $doc.Header.line_items[0]      # array element
-  - run_date:     $doc.Header.meta["run_date"]   # map entry
-  - first_sku:    $doc.Header.line_items[0]["sku"]  # array-of-maps chain
+cxl: |
+  emit first_line = $doc.Header.line_items[0]          # array element
+  emit run_date   = $doc.Header.meta["run_date"]       # map entry
+  emit first_sku  = $doc.Header.line_items[0]["sku"]   # array-of-maps chain
 ```
 
 An out-of-range array index or a missing map key resolves to `null` — it
@@ -494,11 +512,11 @@ sections `functional_group` and `transaction_set`, each keyed by positional
 `eNN` elements:
 
 ```yaml
-project:
-  - interchange_control: $doc.interchange.e13        # ISA13, declared section
-  - functional_id:       $doc.functional_group.e01   # GS01 (reader-supplied)
-  - transaction_type:    $doc.transaction_set.e01     # ST01 (reader-supplied)
-  - claim_amount:        amount                       # body field
+cxl: |
+  emit interchange_control = $doc.interchange.e13        # ISA13, declared section
+  emit functional_id       = $doc.functional_group.e01   # GS01 (reader-supplied)
+  emit transaction_type    = $doc.transaction_set.e01     # ST01 (reader-supplied)
+  emit claim_amount        = amount                       # body field
 ```
 
 A record streamed inside the ST level resolves the ST section, the

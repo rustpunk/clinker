@@ -7,14 +7,25 @@ Every node in a pipeline is one of two kinds at runtime, and the difference is w
 
 Peak memory includes all concurrently live operator state, source queues, writer buffers, and retained intermediate records. The shared budget and spill policies govern that combined working set; the largest blocking stage alone is not a peak-memory bound.
 
+*Interactive companion: the [streaming vs. blocking explainer](streaming-vs-blocking-explainer.html) classifies every stage of a few pipeline shapes as you change their settings, and shows the `--explain` lines.*
+
 ## Which stages stream
 
-- **Source → Transform → Sink** chains — records flow straight from the reader through the transform to the writer.
-- **`Sink`** — a sink always streams its records to the configured writer.
-- **`Route`** — predicate fan-out passes records through.
-- **`Merge`** — concatenation or interleaving passes records through.
-- **`Aggregate` with `strategy: streaming`** — when the input is pre-sorted on the group key, each group is emitted as soon as the key advances, so the whole input is never held. (See [Aggregate Nodes](../nodes/aggregate.md#strategy-hint).)
-- **The probe (driver) side of a hash `Combine`** — the driver streams against the already-built lookup table.
+A stage streams when two things hold: it is one of the stages listed below, and its output goes to **exactly one** consumer that can take a stream, which is a Sink, the input of an Aggregate, or the driver side of a hash `Combine`. Any other stage, a stage that feeds two consumers, and a stage that roots an analytic window keep their output in a buffer instead. For example, in Source → Transform → Transform → Sink only the first Transform streams.
+
+Two shapes stream *and* hold only one batch at a time, however large the input:
+
+- **Source → Transform → Sink** chains, where the Transform has no window and its Source feeds only it. Records flow straight from the reader through the transform to the writer.
+- **`Merge` in `interleave` mode without an `interleave_seed`, whose inputs are all Sources**, each feeding only the Merge.
+
+These hand their output straight to their one consumer, but still build their own result first:
+
+- **`Route` with only one branch wired to a downstream stage.** The `default:` branch counts: a Route with one condition and a wired `default` has two consumers, and gives each its own buffer.
+- **`Merge`** in `concat` mode, in seeded `interleave` mode, or in `interleave` mode fed by other stages.
+- **`Aggregate` with `strategy: streaming`** — when the input is pre-sorted on the group key, each group is emitted as soon as the key advances. (See [Aggregate Nodes](../nodes/aggregate.md#strategy-hint).)
+- **A hash `Combine`'s output**, and its driver side, which streams in against the already-built lookup table.
+- **A range `Combine`'s output**, once it has sorted both sides.
+- **`Sink`** — a Sink writes each record to its writer as it arrives. A Sink with `sort_order`, `split` or a per-source-file path takes no stream, so the stage before it keeps a buffer.
 
 Document boundaries (the signals behind [`$doc.*`](../pipelines/envelope-and-doc-context.md)) flow inline with records through streaming stages, so a document's close always trails its last record.
 
