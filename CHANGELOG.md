@@ -16,8 +16,12 @@ failing rows had to fit in memory.
   Sinks last, and dead-letter rows that other nodes write come before the
   rows a Sink writes.
 - Each source row of a rejected document is dead-lettered once, however many
-  Sinks held it. Rows that only a later Sink held are no longer lost, and
-  `dlq_count` counts each row once.
+  Sinks held it, and `dlq_count` counts it once. Rows that only a later Sink
+  held are no longer lost. The exception is a record that an Aggregate, a
+  Combine or a Reshape failure already dead-lettered: it is written again, as
+  a `document_rejected` row, when a Sink on another branch also received it
+  and its document is rejected, and `dlq_count` counts that record twice
+  ([#1232](https://github.com/rustpunk/clinker/issues/1232)).
 - A failed document's failing rows are held, charged to the memory budget,
   until the document is rejected, and move to one file in the spill
   directory when the budget needs the memory. Past
@@ -28,21 +32,31 @@ failing rows had to fit in memory.
   it would pass the limit once every held row is on disk.
 - A row failure inside an Aggregate, a Combine or a Reshape still
   dead-letters only that record and does not reject its document
-  ([#1232](https://github.com/rustpunk/clinker/issues/1232)). The rows those
-  nodes write are not yet held back by their document's verdict. See "Not
+  ([#1232](https://github.com/rustpunk/clinker/issues/1232)). A Sink on
+  another branch that also received that record writes it again as a
+  `document_rejected` row when another failure rejects its document, and
+  publishes it when none does. The rows a Combine or an Aggregate writes are
+  not yet held back by their document's verdict
+  ([#1317](https://github.com/rustpunk/clinker/issues/1317)), nor are the
+  rows that pass through a Reshape (#1232). See "Not
   covered" under "Document-level DLQ" in the error-handling reference.
 
 ### Changed — a Sink inside a composition body no longer compiles under `dlq_granularity: document`
 
 **Breaking change.** A pipeline whose Source declares
 `dlq_granularity: document` and whose composition body declares a Sink is
-now refused at compile time with E378. A body Sink runs inside its
-composition, where it cannot be held back until every document's verdict is
-final.
+now refused at compile time with E378. The refusal keeps the guarantee that
+no Sink writes a rejected document's records for when body Sinks write
+([#1242](https://github.com/rustpunk/clinker/issues/1242)); today a body Sink
+writes nothing in a run, so moving it to the pipeline is also how its output
+gets written.
 
 Where moving the Sink to the pipeline through a new composition output port
 runs today, the error's help prints that move ready to paste, including the
-Sink's own configuration. Otherwise the help names
+Sink's own configuration. For a Sink that writes only the columns its input
+emits (`include_unmapped: false` with no `mapping:`), the printed move writes
+those columns as a `mapping:`, so the moved Sink writes the same columns.
+Otherwise the help names
 `clinker explain --code E378`, which shows how to declare the Sink's work at
 pipeline level.
 

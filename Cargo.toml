@@ -96,15 +96,16 @@ crossbeam-channel = "0.5"
 fs4 = { version = "1", default-features = false, features = ["sync"] }
 # The set of dead-lettered `SourceRowId` ordinals per rejected document under
 # `dlq_granularity: document`, so each row is dead-lettered once however many
-# Sinks hold it. Compressed containers (array, bitmap and run) keep a
-# contiguous document to a few bytes and cost at most about 2 bytes per row in
-# any shape; `RoaringTreemap` takes the absolute u64 ordinal, so no first
-# ordinal is recorded per document. Chosen over `fixedbitset` (grows one way
-# only, needs a recorded first ordinal per document and costs N/8 bytes even
-# for a contiguous document), a hand-rolled bitset (the same capability
-# without review) and `HashSet<SourceRowId>` (16+ bytes per row). Pure Rust
-# with no build script; the default `std` feature pulls `bytemuck` and
-# `byteorder`. Approved by the maintainer on 2026-09-24.
+# Sinks hold it. Compressed containers (array, bitmap and run) keep about 2
+# bytes of heap per value in an array container, which the memory charge
+# counts at up to 4 with vector growth, and settle a contiguous document to a
+# few bytes per 65,536 rows; `RoaringTreemap` takes the absolute u64 ordinal,
+# so no first ordinal is recorded per document. Chosen over `fixedbitset`
+# (grows one way only, needs a recorded first ordinal per document and costs
+# N/8 bytes even for a contiguous document), a hand-rolled bitset (the same
+# capability without review) and `HashSet<SourceRowId>` (16+ bytes per row).
+# Pure Rust with no build script; the default `std` feature pulls `bytemuck`
+# and `byteorder`. Approved by the maintainer on 2026-09-24.
 roaring = "0.11"
 criterion = { version = "0.5", features = ["html_reports"] }
 serial_test = "3"

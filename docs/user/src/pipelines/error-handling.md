@@ -328,7 +328,8 @@ Two rules decide which rows a DLQ file holds:
   `dlq_granularity: document` this rule has an exception: a rejected
   document's later failing record is written as a `document_rejected` row
   paired with the document's first failure, and a record that failed twice
-  at the Source, in a Transform or in a Route is written once (see
+  at the Source, in a Transform or in a Route is written once
+  ([#1316](https://github.com/rustpunk/clinker/issues/1316); see
   [Document-level DLQ](#document-level-dlq)).
 - **Each condemned row once.** A correlation group or document that fails
   adds each of its other rows once, as a collateral of its first failure.
@@ -672,7 +673,8 @@ declare the Sink's work at pipeline level.
   still reach a Sink. A failure on such a row, in any node after the Combine
   or Aggregate, dead-letters only that row and does not reject its document,
   so the document's other records, and that row's own source record on
-  another branch, can still be published.
+  another branch, can still be published
+  ([#1317](https://github.com/rustpunk/clinker/issues/1317)).
 - A Reshape's output rows do not keep their input row's document, so a
   rejected document's rows that pass through a Reshape still reach a Sink.
 - In a pipeline where any Source declares `dlq_granularity: document`, a CSV
