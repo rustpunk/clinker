@@ -467,22 +467,24 @@ pub(crate) fn diagnose_untagged_composition_edges(
 /// Document granularity guarantees that no Sink writes a record of a
 /// document that is rejected. The plan and the scheduler hold that
 /// guarantee by running every Sink after every other node, so each
-/// document's verdict is final before any Sink writes. A body Sink runs
+/// document's verdict is final before any Sink writes. A body Sink would run
 /// inside its composition's dispatch, in the middle of the top-level walk,
-/// where that ordering cannot reach it; it could write a document that a
-/// later operator condemns. The combination is refused rather than
-/// guaranteed for some Sinks only.
+/// where that ordering cannot reach it. Body Sinks do not write in a run yet
+/// (#1242); the refusal keeps the guarantee for when they do, rather than
+/// guaranteeing it for some Sinks only.
 ///
 /// The help gives one fix. Where moving the Sink to the pipeline through a
 /// new composition output port runs on the engine as it is, the help is
 /// that move as numbered fragments the author can paste, the pipeline Sink
 /// block carrying the body Sink's compiled configuration rendered back to
-/// YAML. A call carries only the rows of its composition's first declared
-/// output port, and only when nothing else in the body reads that port's
-/// node (#1315), so the move is offered only for a pipeline-level call,
-/// made once, whose body Sink reads the plain node behind that first port
-/// and shares it with no other body node. Everywhere else the help is one
-/// next step, the explain page, with the reason.
+/// YAML, with the columns of a Sink that writes only emitted columns written
+/// out as its `mapping:`. A call carries only the rows of its composition's
+/// first declared output port, and only when nothing else in the body reads
+/// that port's node (#1315), so the move is offered only for a
+/// pipeline-level call, made once, whose body Sink reads the plain node
+/// behind that first port and shares it with no other body node, and whose
+/// columns a `mapping:` can state. Everywhere else the help is one next step,
+/// the explain page, with the reason.
 ///
 /// Every help is written as if every movable Sink moves, so applying them
 /// all gives one consistent pipeline: new ports and pipeline Sink names take
@@ -679,14 +681,23 @@ pub(crate) fn diagnose_document_dlq_body_sinks(
                 quoted_reader = body.graph[reader].name().quoted_name(),
             ));
         }
+        if projected_columns(&body.graph, idx).is_some_and(|kept| kept.is_empty()) {
+            return Err(format!(
+                "Sink {quoted_sink} sets `include_unmapped: false` and its `exclude:` removes \
+                 every column {quoted_port_node} emits, so at pipeline level it would write \
+                 the columns composition {quoted_call} passes through instead",
+                quoted_sink = body.graph[idx].name().quoted_name(),
+                quoted_port_node = port_node_name.quoted_name(),
+            ));
+        }
         Ok(port_node_name)
     };
 
     // Names for every move, in walk order: a port per composition and a
     // pipeline Sink name, each free of what is already there and of earlier
-    // moves.
+    // moves. A composition's taken set ends as every output its file declares
+    // after every move, so its size is the port count step 3 states.
     let mut port_taken: HashMap<BodyId, HashSet<String>> = HashMap::new();
-    let mut moved_per_body: HashMap<BodyId, usize> = HashMap::new();
     let mut sink_taken: HashSet<String> = dag
         .graph
         .node_weights()
@@ -712,7 +723,6 @@ pub(crate) fn diagnose_document_dlq_body_sinks(
                     .cloned()
                     .collect()
             });
-            *moved_per_body.entry(body_id).or_default() += 1;
             Move {
                 port: free_name(sink, ports),
                 port_node,
@@ -768,14 +778,29 @@ pub(crate) fn diagnose_document_dlq_body_sinks(
                     steps.push(format!(
                         "composition {quoted_call} then has {count} output ports, so read \
                          `{call}.{only_port}` wherever the pipeline reads `{call}` without a port",
-                        count = 1 + moved_per_body.get(&body_id).copied().unwrap_or(0),
+                        count = port_taken.get(&body_id).map_or(0, HashSet::len),
                         call = call.name,
                     ));
                 }
-                // The Sink's own configuration, under its pipeline name.
+                // The Sink's own configuration, under its pipeline name. A
+                // Sink that writes only emitted columns gets them written out
+                // as its `mapping:`: in the body its input is the port node,
+                // which emits only those columns, but at pipeline level its
+                // input is the call, whose emitted columns are its whole
+                // output, pass-through columns included. A mapping under
+                // `include_unmapped: false` writes exactly the listed columns
+                // in the listed order, which is what the body Sink wrote.
                 let config = resolved.as_deref().map(|payload| {
                     let mut config = payload.sink.clone();
                     config.name.clone_from(&pipeline_name);
+                    if let Some(columns) = projected_columns(&body.graph, idx) {
+                        config.mapping = Some(crate::config::OutputMapping::new(
+                            columns
+                                .into_iter()
+                                .map(crate::config::MappingEntry::passthrough)
+                                .collect(),
+                        ));
+                    }
                     config
                 });
                 steps.push(format!(
@@ -829,6 +854,37 @@ fn composition_file_label(path: &std::path::Path) -> String {
         .map(|component| component.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// The columns a body Sink restricts its output to, in the order it writes
+/// them, or `None` when it writes every column it receives.
+///
+/// A Sink with `include_unmapped: false` and no `mapping:` writes only the
+/// columns its input emits ([`cxl_emit_names_at`], the walk the runtime
+/// projection reads), less the names its `exclude:` lists, in the order the
+/// record carries them, which is the emit walk's schema order. An input that
+/// emits no named column applies no restriction at runtime, so it is `None`
+/// here too. `Some` of an empty list is a Sink whose `exclude:` removes every
+/// emitted column.
+fn projected_columns(graph: &DiGraph<PlanNode, PlanEdge>, idx: NodeIndex) -> Option<Vec<String>> {
+    let PlanNode::Sink { resolved, .. } = &graph[idx] else {
+        return None;
+    };
+    let sink = &resolved.as_deref()?.sink;
+    if sink.include_unmapped || sink.mapping.is_some() {
+        return None;
+    }
+    let emitted = cxl_emit_names_at(graph, idx);
+    if emitted.is_empty() {
+        return None;
+    }
+    let excluded = sink.exclude.as_deref().unwrap_or_default();
+    Some(
+        emitted
+            .into_iter()
+            .filter(|column| !excluded.contains(column))
+            .collect(),
+    )
 }
 
 /// The `config:` lines of a pipeline Sink block: the body Sink's compiled

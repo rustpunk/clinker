@@ -800,48 +800,13 @@ impl PlanNode {
     ///   of explicitly produced columns.
     /// - Route / Sort / Output: walk to the immediate upstream and
     ///   inherit its emit names (these variants don't add their own).
+    ///
+    /// The walk itself is [`cxl_emit_names_at`], which reads any node graph,
+    /// a composition body's included.
     pub fn cxl_emit_names_in(&self, dag: &ExecutionPlanDag) -> Vec<String> {
-        match self {
-            PlanNode::Source { output_schema, .. } => output_schema
-                .columns()
-                .iter()
-                .map(|c| c.to_string())
-                .collect(),
-            PlanNode::Transform {
-                write_set,
-                output_schema,
-                ..
-            } => output_schema
-                .columns()
-                .iter()
-                .filter(|c| write_set.contains(c.as_ref()))
-                .map(|c| c.to_string())
-                .collect(),
-            PlanNode::Aggregation { output_schema, .. }
-            | PlanNode::Combine { output_schema, .. }
-            | PlanNode::Composition { output_schema, .. }
-            | PlanNode::Reshape { output_schema, .. }
-            | PlanNode::Cull { output_schema, .. }
-            | PlanNode::Envelope { output_schema, .. }
-            | PlanNode::Merge { output_schema, .. } => output_schema
-                .columns()
-                .iter()
-                .map(|c| c.to_string())
-                .collect(),
-            PlanNode::Route { .. }
-            | PlanNode::Sort { .. }
-            | PlanNode::Sink { .. }
-            | PlanNode::CorrelationCommit { .. } => {
-                let idx = match dag.index_of_or_scan(self.id()) {
-                    Some(i) => i,
-                    None => return Vec::new(),
-                };
-                dag.graph
-                    .neighbors_directed(idx, petgraph::Direction::Incoming)
-                    .next()
-                    .map(|upstream| dag.graph[upstream].cxl_emit_names_in(dag))
-                    .unwrap_or_default()
-            }
+        match dag.index_of_or_scan(self.id()) {
+            Some(idx) => cxl_emit_names_at(&dag.graph, idx),
+            None => Vec::new(),
         }
     }
 
@@ -1081,6 +1046,56 @@ impl PlanNode {
                 )
             }
         }
+    }
+}
+
+/// Names of the CXL-emitted columns the node at `idx` of `graph` produces, in
+/// the order [`PlanNode::cxl_emit_names_in`] documents.
+///
+/// Takes the graph rather than an [`ExecutionPlanDag`] so a composition
+/// body's graph answers the same question: the runtime's `include_unmapped:
+/// false` projection and E378's moved-Sink help both read this one walk. A
+/// pass-through variant inherits from its first upstream, and has none when
+/// nothing feeds it.
+pub(crate) fn cxl_emit_names_at(
+    graph: &DiGraph<PlanNode, PlanEdge>,
+    idx: NodeIndex,
+) -> Vec<String> {
+    match &graph[idx] {
+        PlanNode::Source { output_schema, .. } => output_schema
+            .columns()
+            .iter()
+            .map(|c| c.to_string())
+            .collect(),
+        PlanNode::Transform {
+            write_set,
+            output_schema,
+            ..
+        } => output_schema
+            .columns()
+            .iter()
+            .filter(|c| write_set.contains(c.as_ref()))
+            .map(|c| c.to_string())
+            .collect(),
+        PlanNode::Aggregation { output_schema, .. }
+        | PlanNode::Combine { output_schema, .. }
+        | PlanNode::Composition { output_schema, .. }
+        | PlanNode::Reshape { output_schema, .. }
+        | PlanNode::Cull { output_schema, .. }
+        | PlanNode::Envelope { output_schema, .. }
+        | PlanNode::Merge { output_schema, .. } => output_schema
+            .columns()
+            .iter()
+            .map(|c| c.to_string())
+            .collect(),
+        PlanNode::Route { .. }
+        | PlanNode::Sort { .. }
+        | PlanNode::Sink { .. }
+        | PlanNode::CorrelationCommit { .. } => graph
+            .neighbors_directed(idx, petgraph::Direction::Incoming)
+            .next()
+            .map(|upstream| cxl_emit_names_at(graph, upstream))
+            .unwrap_or_default(),
     }
 }
 
