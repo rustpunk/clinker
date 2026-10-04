@@ -847,3 +847,176 @@ fn e378_gives_one_next_step_where_the_move_would_not_run() {
         "`clinker explain --code E378` names the issue that blocks the move:\n{page}"
     );
 }
+
+/// A composition that declares a second output, `audit`, naming a node the
+/// body does not have. The compile ignores that output, but the name is
+/// still a key under `_compose.outputs:`, so a port proposed under it would
+/// be a duplicate key.
+const DANGLING_OUTPUT_COMP: &str = r#"_compose:
+  name: dangling
+  inputs:
+    inp:
+      schema:
+        - { name: id, type: string }
+        - { name: value, type: string }
+  outputs:
+    out: shape
+    audit: nosuch
+  config_schema: {}
+
+nodes:
+  - type: transform
+    name: shape
+    input: inp
+    config:
+      cxl: |
+        emit id = id
+        emit value = value.to_int()
+  - type: sink
+    name: audit
+    input: shape
+    config:
+      name: audit
+      type: csv
+      path: audit.csv
+"#;
+
+/// The work of `calls_pipeline(&[("enrich", ..)])` over a composition whose
+/// body Sink `audit` reads `audit_from` and whose port feeds `enrich_out`
+/// from `out_from`, written without the composition, on record granularity.
+/// `body` is the body's non-Sink nodes, already reading `events`.
+fn inline_reference(body: &str, audit_from: &str, out_from: &str) -> String {
+    format!(
+        r#"{head}{source}{body}  - type: sink
+    name: enrich_out
+    input: {out_from}
+    config:
+      name: enrich_out
+      type: csv
+      path: enrich_out.csv
+  - type: sink
+    name: audit
+    input: {audit_from}
+    config:
+      name: audit
+      type: csv
+      path: audit.csv
+"#,
+        head = pipeline_head("document_dlq_body_sink_inline_reference"),
+        source = source_node("record"),
+    )
+}
+
+/// `shape` from the fixtures above, reading `events`.
+const SHAPE_AT_PIPELINE: &str = r#"  - type: transform
+    name: shape
+    input: events
+    config:
+      cxl: |
+        emit id = id
+        emit value = value.to_int()
+"#;
+
+/// Applying the help, then compiling and running, must reproduce `reference`
+/// byte for byte, and the moved Sink's port must not collide with any
+/// declared output, resolved or not.
+fn assert_applied_help_matches(files: &[(&str, &str)], reference: &str, written: &[&str]) {
+    let inputs = [("a.csv", CLEAN_DOCUMENT)];
+    let fixed = workspace(files, &inputs);
+    apply_every_help_and_run(fixed.path(), 1, 0);
+    let reference = workspace(&[(PIPELINE, reference)], &inputs);
+    let reference_run = run(reference.path());
+    assert_eq!(
+        reference_run.status.code(),
+        Some(0),
+        "{}",
+        stderr(&reference_run)
+    );
+    let outputs_fixed = outputs(fixed.path());
+    assert_eq!(
+        outputs_fixed.keys().map(String::as_str).collect::<Vec<_>>(),
+        written,
+        "every Sink writes, and nothing is dead-lettered"
+    );
+    assert_eq!(
+        outputs_fixed,
+        outputs(reference.path()),
+        "every Sink writes what the reference writes"
+    );
+}
+
+#[test]
+fn e378_proposes_a_port_no_declared_output_uses() {
+    let pipeline = calls_pipeline(&[("enrich", "dangling.comp.yaml")]);
+    let files = [
+        ("compositions/dangling.comp.yaml", DANGLING_OUTPUT_COMP),
+        (PIPELINE, pipeline.as_str()),
+    ];
+    let probe = workspace(&files, &[("a.csv", CLEAN_DOCUMENT)]);
+    let helps = e378_helps(probe.path());
+    assert_eq!(helps.len(), 1, "E378 helps: {helps:#?}");
+    assert!(
+        helps[0].contains("\n    audit_2: shape\n"),
+        "the new port skips the declared `audit` output:\n{}",
+        helps[0]
+    );
+    assert_applied_help_matches(
+        &files,
+        &inline_reference(SHAPE_AT_PIPELINE, "shape", "shape"),
+        &["audit.csv", "enrich_out.csv"],
+    );
+}
+
+/// A composition whose first output port aliases its input port, and whose
+/// only node is a Sink reading that input port. Moving the Sink would leave
+/// the body with no node, which does not compile (E111), so the help must be
+/// the one next step. A port that reads an input port is refused the move
+/// whatever else the body holds; that the move runs there is not shown.
+const INPUT_ALIAS_COMP: &str = r#"_compose:
+  name: passthrough
+  inputs:
+    inp:
+      schema:
+        - { name: id, type: string }
+        - { name: value, type: string }
+  outputs:
+    out: inp
+  config_schema: {}
+
+nodes:
+  - type: sink
+    name: audit
+    input: inp
+    config:
+      name: audit
+      type: csv
+      path: audit.csv
+"#;
+
+#[test]
+fn e378_gives_the_next_step_when_the_first_port_aliases_the_input_port() {
+    let pipeline = calls_pipeline(&[("enrich", "passthrough.comp.yaml")]);
+    let files = [
+        ("compositions/passthrough.comp.yaml", INPUT_ALIAS_COMP),
+        (PIPELINE, pipeline.as_str()),
+    ];
+    let dir = workspace(&files, &[("a.csv", CLEAN_DOCUMENT)]);
+    let helps = e378_helps(dir.path());
+    assert_eq!(
+        helps,
+        [
+            "run `clinker explain --code E378` and follow its steps for declaring Sink \
+             \"audit\" at pipeline level: moving it through a composition output port does \
+             not work here, because the first output port of composition \"enrich\", `out`, \
+             reads input port \"inp\" rather than a node of the composition"
+        ],
+        "the help is the one next step"
+    );
+    let refused = run(dir.path());
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("E378"),
+        "{}",
+        stderr(&refused)
+    );
+}
