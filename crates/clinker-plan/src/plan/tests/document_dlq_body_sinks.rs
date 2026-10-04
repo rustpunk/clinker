@@ -635,3 +635,71 @@ nodes:
          carry rows from one of those",
     );
 }
+
+#[test]
+fn e378_gives_the_next_step_when_the_sink_excludes_every_column_its_input_emits() {
+    // `shape` emits only `value` and passes `id` through. The body Sink writes
+    // only emitted columns and excludes `value`, so no `mapping:` can say
+    // what it writes, and at pipeline level it would write `id`.
+    let comp = r#"_compose:
+  name: audited
+  inputs:
+    inp:
+      schema:
+        - { name: id, type: string }
+        - { name: value, type: string }
+  outputs:
+    out: shape
+  config_schema: {}
+
+nodes:
+  - type: transform
+    name: shape
+    input: inp
+    config:
+      cxl: |
+        emit value = value
+  - type: sink
+    name: audit
+    input: shape
+    config:
+      name: audit
+      type: csv
+      path: audit.csv
+      include_unmapped: false
+      exclude: [value]
+"#;
+    let diags = e378_for(&[("compositions/audited.comp.yaml", comp)], ENRICH_CALL);
+    assert_eq!(diags.len(), 1, "one E378 for the one body Sink");
+    assert_next_step(
+        help_for(&diags, "audit"),
+        "audit",
+        "Sink \"audit\" sets `include_unmapped: false` and its `exclude:` removes every \
+         column \"shape\" emits, so at pipeline level it would write the columns \
+         composition \"enrich\" passes through instead",
+    );
+}
+
+#[test]
+fn e378_counts_every_declared_output_port() {
+    // `audit: nosuch` names no body node, so the compile drops it, but it is
+    // still a declared output: after the move the file declares `out`,
+    // `audit` and the new `audit_2`.
+    let comp = composition(
+        "audited",
+        "    out: shape\n    audit: nosuch",
+        &body_sink("audit"),
+    );
+    let diags = e378_for(&[("compositions/audited.comp.yaml", &comp)], ENRICH_CALL);
+    assert_eq!(diags.len(), 1, "one E378 for the one body Sink");
+    let help = help_for(&diags, "audit");
+    for fragment in [
+        "\n    audit_2: shape\n",
+        "composition \"enrich\" then has 3 output ports",
+    ] {
+        assert!(
+            help.contains(fragment),
+            "the help carries {fragment:?}: {help}"
+        );
+    }
+}

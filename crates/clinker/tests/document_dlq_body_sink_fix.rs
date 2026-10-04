@@ -1165,3 +1165,147 @@ fn e378_gives_the_next_step_when_the_first_port_aliases_the_input_port() {
         stderr(&refused)
     );
 }
+
+/// A composition whose `shape` emits three of its four input columns in
+/// place, in an order other than the schema's, and passes `extra` through.
+/// Its body Sink writes only emitted columns and excludes `flag`, so in the
+/// body it writes `id,value`, in schema order.
+const PROJECTED_COMP: &str = r#"_compose:
+  name: projected
+  inputs:
+    inp:
+      schema:
+        - { name: id, type: string }
+        - { name: value, type: string }
+        - { name: extra, type: string }
+        - { name: flag, type: string }
+  outputs:
+    out: shape
+  config_schema: {}
+
+nodes:
+  - type: transform
+    name: shape
+    input: inp
+    config:
+      cxl: |
+        emit flag = flag
+        emit value = value
+        emit id = id
+  - type: sink
+    name: audit
+    input: shape
+    config:
+      name: audit
+      type: csv
+      path: audit.csv
+      include_unmapped: false
+      exclude: [flag]
+"#;
+
+/// The Source of the projected case: one document per file under `in/`,
+/// with the four columns `PROJECTED_COMP` reads.
+fn projected_source(granularity: &str) -> String {
+    format!(
+        r#"  - type: source
+    name: events
+    config:
+      name: events
+      type: csv
+      glob: ./in/*.csv
+      dlq_granularity: {granularity}
+      schema:
+        - {{ name: id, type: string }}
+        - {{ name: value, type: string }}
+        - {{ name: extra, type: string }}
+        - {{ name: flag, type: string }}
+"#
+    )
+}
+
+#[test]
+fn applying_the_e378_fix_writes_only_the_columns_the_body_sink_wrote() {
+    let pipeline = format!(
+        r#"{head}{source}  - type: composition
+    name: enrich
+    input: events
+    use: ../compositions/projected.comp.yaml
+    inputs:
+      inp: events
+  - type: sink
+    name: enrich_out
+    input: enrich
+    config:
+      name: enrich_out
+      type: csv
+      path: enrich_out.csv
+"#,
+        head = pipeline_head("document_dlq_body_sink_projected"),
+        source = projected_source("document"),
+    );
+    // The same work inline, on record granularity: `shape` at pipeline level,
+    // and the Sink `audit` with the body Sink's own configuration.
+    let reference = format!(
+        r#"{head}{source}  - type: transform
+    name: shape
+    input: events
+    config:
+      cxl: |
+        emit flag = flag
+        emit value = value
+        emit id = id
+  - type: sink
+    name: enrich_out
+    input: shape
+    config:
+      name: enrich_out
+      type: csv
+      path: enrich_out.csv
+  - type: sink
+    name: audit
+    input: shape
+    config:
+      name: audit
+      type: csv
+      path: audit.csv
+      include_unmapped: false
+      exclude: [flag]
+"#,
+        head = pipeline_head("document_dlq_body_sink_projected_reference"),
+        source = projected_source("record"),
+    );
+    let files = [
+        ("compositions/projected.comp.yaml", PROJECTED_COMP),
+        (PIPELINE, pipeline.as_str()),
+    ];
+    let inputs = [("a.csv", "id,value,extra,flag\n1,10,x,p\n2,20,y,q\n")];
+    let fixed = workspace(&files, &inputs);
+    apply_every_help_and_run(fixed.path(), 1, 0);
+    let reference = workspace(&[(PIPELINE, reference.as_str())], &inputs);
+    let reference_run = run(reference.path());
+    assert_eq!(
+        reference_run.status.code(),
+        Some(0),
+        "{}",
+        stderr(&reference_run)
+    );
+
+    let written = outputs(fixed.path());
+    let expected = outputs(reference.path());
+    assert_eq!(
+        String::from_utf8_lossy(&expected["audit.csv"])
+            .lines()
+            .collect::<Vec<_>>(),
+        ["id,value", "1,10", "2,20"],
+        "the reference writes only the emitted columns the Sink keeps"
+    );
+    assert_eq!(
+        written.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["audit.csv", "enrich_out.csv"],
+        "both Sinks write, and nothing is dead-lettered"
+    );
+    assert_eq!(
+        written, expected,
+        "every Sink writes what the reference writes"
+    );
+}
