@@ -148,18 +148,15 @@ fn reshape_yaml(order_by: &str, input: &str) -> String {
     )
 }
 
-/// A Transform between `vals` and the node under test that keeps only the
-/// rows whose key is not null: the filter the `drop` refusal offers.
-const NON_NULL_FILTER: &str = r#"  - type: transform
-    name: kept
-    input: vals
-    config:
-      cxl: |
-        filter not k.is_null()
-        emit id = id
-        emit g = g
-        emit k = k
-"#;
+/// Insert, before the first line equal to `before`, a Transform `not_null`
+/// reading `input` whose whole config is `printed`, pasted exactly as the
+/// refusal printed it.
+fn paste_filter(yaml: &str, input: &str, before: &str, printed: &str) -> String {
+    assert!(yaml.contains(before), "no {before:?} line in:\n{yaml}");
+    let transform =
+        format!("  - type: transform\n    name: not_null\n    input: {input}\n    {printed}\n");
+    yaml.replacen(before, &format!("{transform}{before}"), 1)
+}
 
 // ---- running --------------------------------------------------------------
 
@@ -376,15 +373,42 @@ fn drop_message(yaml: &str) -> String {
     matching[0].message.clone()
 }
 
+/// The one backticked span of `message` that starts with `prefix`: a line
+/// the refusal prints for the author to paste. Fails unless there is
+/// exactly one, so a refusal that offers a menu cannot pass.
+fn printed_span(message: &str, prefix: &str) -> String {
+    let spans: Vec<&str> = message
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|span| span.starts_with(prefix))
+        .collect();
+    assert_eq!(
+        spans.len(),
+        1,
+        "expected exactly one printed `{prefix}...` line in: {message}"
+    );
+    spans[0].to_string()
+}
+
+/// The `config:` line the refusal prints for the filter Transform.
+fn printed_config_line(message: &str) -> String {
+    printed_span(message, "config: ")
+}
+
+/// The `source_name:` line the refusal prints for a field CXL cannot name.
+fn printed_source_name_line(message: &str) -> String {
+    printed_span(message, "source_name: ")
+}
+
 #[test]
 fn drop_refusal_fixes_do_what_the_message_says() {
     let dropped = "[{ field: k, null_order: drop }]";
+    let cull_message = drop_message(&cull_yaml(dropped, "vals"));
+    assert_eq!(cull_message, format!("cull \"culled\": {GROUP_DROP_TEXT}"));
+    let reshape_message = drop_message(&reshape_yaml(dropped, "vals"));
     assert_eq!(
-        drop_message(&cull_yaml(dropped, "vals")),
-        format!("cull \"culled\": {GROUP_DROP_TEXT}")
-    );
-    assert_eq!(
-        drop_message(&reshape_yaml(dropped, "vals")),
+        reshape_message,
         format!("reshape \"reshaped\": {GROUP_DROP_TEXT}")
     );
 
@@ -405,24 +429,286 @@ fn drop_refusal_fixes_do_what_the_message_says() {
     assert_eq!(reshape_ids(first, FIXTURE_P), "a2 a4 a3 a5 a1 b1 b3 b2");
     assert_eq!(reshape_ids(last, FIXTURE_P), "a3 a5 a1 a2 a4 b3 b2 b1");
 
-    // The second fix: the upstream filter. It removes the null-keyed rows,
-    // which is what `drop` was reaching for.
-    let filtered_cull = cull_yaml("[k]", "kept");
-    let filtered_cull = filtered_cull.replace(
+    // The fix itself: delete `null_order: drop` and paste the printed line
+    // as a Transform before the node. It removes the null-keyed rows, which
+    // is what `drop` was reaching for.
+    let fixed = dropped.replace(", null_order: drop", "");
+    let filtered_cull = paste_filter(
+        &cull_yaml(&fixed, "not_null"),
+        "vals",
         "  - type: cull",
-        &format!("{NON_NULL_FILTER}  - type: cull"),
+        &printed_config_line(&cull_message),
     );
     let outputs = run(&filtered_cull, FIXTURE_P, &["out", "audit"]);
     assert_eq!(
         (ids(&outputs["out"]), ids(&outputs["audit"])),
         ("a3 a5 a1".to_string(), "b3 b2".to_string()),
-        "the filter the refusal offers must write exactly the non-null rows"
+        "the printed filter must write exactly the non-null rows"
     );
-    let filtered_reshape = reshape_yaml("[k]", "kept");
-    let filtered_reshape = filtered_reshape.replace(
+    let filtered_reshape = paste_filter(
+        &reshape_yaml(&fixed, "not_null"),
+        "vals",
         "  - type: reshape",
-        &format!("{NON_NULL_FILTER}  - type: reshape"),
+        &printed_config_line(&reshape_message),
     );
     let outputs = run(&filtered_reshape, FIXTURE_P, &["out"]);
     assert_eq!(ids(&outputs["out"]), "a3 a5 a1 b3 b2");
+}
+
+// ---- the printed fix at every other site ----------------------------------
+
+/// Source `src` over `id` and a nullable integer `k`, declared sorted by
+/// `sort_order`, feeding one Sink that reads `sink_input`.
+fn sorted_source_yaml(sort_order: &str, sink_input: &str) -> String {
+    format!(
+        r#"
+pipeline:
+  name: sorted_source
+  memory: {{ limit: "{AMPLE_LIMIT}" }}
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - {{ name: id, type: string }}
+        - {{ name: k, type: {{ nullable: int }} }}
+      sort_order: {sort_order}
+  - type: sink
+    name: out
+    input: {sink_input}
+    config: {{ name: out, type: csv, path: out.csv }}
+"#
+    )
+}
+
+/// Sorted by `k` ascending with the null keys last, the order a Source
+/// declares once `null_order: drop` is deleted (`last` is the default).
+const FIXTURE_S: &str = "id,k\n\
+     s1,1\n\
+     s2,3\n\
+     s3,3\n\
+     s4,8\n\
+     s5,\n\
+     s6,\n";
+
+#[test]
+fn the_printed_fix_after_a_source_writes_only_the_non_null_rows() {
+    let dropped = "[{ field: k, null_order: drop }]";
+    let message = drop_message(&sorted_source_yaml(dropped, "src"));
+    let fixed = dropped.replace(", null_order: drop", "");
+
+    // Control: the fixed Source without the filter writes every row in file
+    // order, the null-keyed ones last.
+    let outputs = run(&sorted_source_yaml(&fixed, "src"), FIXTURE_S, &["out"]);
+    assert_eq!(ids(&outputs["out"]), "s1 s2 s3 s4 s5 s6");
+
+    // The fix: the printed line pasted as a Transform after the Source.
+    let filtered = paste_filter(
+        &sorted_source_yaml(&fixed, "not_null"),
+        "src",
+        "  - type: sink",
+        &printed_config_line(&message),
+    );
+    let outputs = run(&filtered, FIXTURE_S, &["out"]);
+    assert_eq!(
+        ids(&outputs["out"]),
+        "s1 s2 s3 s4",
+        "the printed filter after a Source must write exactly the non-null rows"
+    );
+}
+
+/// Source `src` over `id`, `dept` and a nullable integer `amount`, a
+/// windowed Transform `running` reading `input` and partitioned by `dept`
+/// with the given `sort_by`, and one Sink.
+fn window_yaml(sort_by: &str, input: &str) -> String {
+    format!(
+        r#"
+pipeline:
+  name: window_sort
+  memory: {{ limit: "{AMPLE_LIMIT}" }}
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - {{ name: id, type: string }}
+        - {{ name: dept, type: string }}
+        - {{ name: amount, type: {{ nullable: int }} }}
+  - type: transform
+    name: running
+    input: {input}
+    config:
+      analytic_window:
+        group_by: [dept]
+        sort_by: {sort_by}
+      cxl: |
+        emit id = id
+        emit dept = dept
+        emit amount = amount
+        emit total = $window.sum(amount)
+        emit n = $window.count()
+  - type: sink
+    name: out
+    input: running
+    config: {{ name: out, type: csv, path: out.csv }}
+"#
+    )
+}
+
+/// Partition `a` holds 10, null, 30, 20 and partition `b` holds 5, null, 7.
+const FIXTURE_W: &str = "id,dept,amount\n\
+     w1,a,10\n\
+     w2,a,\n\
+     w3,b,5\n\
+     w4,a,30\n\
+     w5,b,\n\
+     w6,b,7\n\
+     w7,a,20\n";
+
+/// After the filter, partition `a` is w1, w4, w7 (10 + 30 + 20 = 60 over 3
+/// rows) and partition `b` is w3, w6 (5 + 7 = 12 over 2 rows). With the null
+/// rows still in, each `count()` would be one higher (4 and 3) and w2 and w5
+/// would be written. Rows are listed by id, since only the set and the
+/// window values are under test. A sum of integers is a float, written
+/// without a fraction when it has none.
+const WINDOW_FILTERED: &str = "w1,a,10,60,3\n\
+     w3,b,5,12,2\n\
+     w4,a,30,60,3\n\
+     w6,b,7,12,2\n\
+     w7,a,20,60,3";
+
+#[test]
+fn the_printed_fix_before_a_window_leaves_the_null_rows_out_of_every_partition() {
+    let dropped = "[{ field: amount, null_order: drop }]";
+    let message = drop_message(&window_yaml(dropped, "src"));
+    let fixed = dropped.replace(", null_order: drop", "");
+    let filtered = paste_filter(
+        &window_yaml(&fixed, "not_null"),
+        "src",
+        "  - type: transform\n    name: running",
+        &printed_config_line(&message),
+    );
+    let outputs = run(&filtered, FIXTURE_W, &["out"]);
+    let mut lines = outputs["out"].lines();
+    assert_eq!(lines.next(), Some("id,dept,amount,total,n"));
+    let mut rows: Vec<&str> = lines.collect();
+    rows.sort_unstable();
+    assert_eq!(
+        rows.join("\n"),
+        WINDOW_FILTERED,
+        "the printed filter before a window must leave the null rows out of every partition"
+    );
+}
+
+/// Source `src` over `id`, `g` and the schema entry `column`, a Cull
+/// reading `input` partitioned by `g` with the given `order_by`, whose one
+/// rule removes group `b`, and its two Sinks.
+fn renamed_cull_yaml(column: &str, order_by: &str, input: &str) -> String {
+    format!(
+        r#"
+pipeline:
+  name: renamed_cull
+  memory: {{ limit: "{AMPLE_LIMIT}" }}
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - {{ name: id, type: string }}
+        - {{ name: g, type: string }}
+        - {column}
+  - type: cull
+    name: culled
+    input: {input}
+    config:
+      partition_by: [g]
+      order_by: {order_by}
+      removed_to: removed
+      rules:
+        - name: drop_b
+          drop_group_when: "max(g) == \"b\""
+  - type: sink
+    name: out
+    input: culled
+    config: {{ name: out, type: csv, path: out.csv }}
+  - type: sink
+    name: audit
+    input: culled.removed
+    config: {{ name: audit, type: csv, path: audit.csv }}
+"#
+    )
+}
+
+#[test]
+fn the_printed_rename_then_the_printed_filter_remove_the_null_rows() {
+    // Each column name CXL cannot write bare, the line the refusal must
+    // print for it, and the identifier the author picks.
+    let cases = [
+        ("order id", r#"source_name: "order id""#, "order_id"),
+        ("filter", r#"source_name: "filter""#, "filter_value"),
+        (
+            "Address.City",
+            r#"source_name: "Address.City""#,
+            "address_city",
+        ),
+    ];
+    for (field, expected_line, renamed) in cases {
+        // The input file keeps its column name. Group `a` holds 3, null,
+        // 1, 2 and group `b` holds null, 2; the filter leaves a1, a3, a4
+        // ordered a3 a4 a1, and b2 on the removed port.
+        let csv = format!(
+            "id,g,{field}\n\
+             a1,a,3\n\
+             b1,b,\n\
+             a2,a,\n\
+             a3,a,1\n\
+             b2,b,2\n\
+             a4,a,2\n"
+        );
+        let column = format!(r#"{{ name: "{field}", type: {{ nullable: int }} }}"#);
+        let order_by = format!(r#"[{{ field: "{field}", null_order: drop }}]"#);
+        let message = drop_message(&renamed_cull_yaml(&column, &order_by, "src"));
+        assert!(
+            !message.contains("config: "),
+            "{field}: a field CXL cannot name must get no filter to paste: {message}"
+        );
+        let printed = printed_source_name_line(&message);
+        assert_eq!(printed, expected_line, "{field}: {message}");
+
+        // The rename: the printed line on the schema entry, a new
+        // identifier as its `name`, and the new name in `order_by`.
+        let column = format!("{{ name: {renamed}, type: {{ nullable: int }}, {printed} }}");
+        let dropped = format!("[{{ field: {renamed}, null_order: drop }}]");
+        let message = drop_message(&renamed_cull_yaml(&column, &dropped, "src"));
+        let config_line = printed_config_line(&message);
+        assert_eq!(
+            config_line,
+            format!(r#"config: {{ cxl: "filter not {renamed}.is_null()" }}"#),
+            "{field}: planning again must print the filter on the new name"
+        );
+
+        // The filter: delete `null_order: drop`, paste the printed line.
+        let fixed = dropped.replace(", null_order: drop", "");
+        let filtered = paste_filter(
+            &renamed_cull_yaml(&column, &fixed, "not_null"),
+            "src",
+            "  - type: cull",
+            &config_line,
+        );
+        let outputs = run(&filtered, &csv, &["out", "audit"]);
+        assert_eq!(
+            (ids(&outputs["out"]), ids(&outputs["audit"])),
+            ("a3 a4 a1".to_string(), "b2".to_string()),
+            "{field}: the rename then the filter must write exactly the non-null rows"
+        );
+    }
 }

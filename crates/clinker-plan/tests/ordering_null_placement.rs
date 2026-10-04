@@ -580,3 +580,126 @@ fn a_field_cxl_can_name_keeps_the_paste_able_filter() {
     assert!(message.contains("`filter not txn_date.is_null()`"));
     assert!(!message.contains("source_name"));
 }
+
+/// A node name the Debug form and the quoting helper print differently: a
+/// combining accent prints as written through the helper, and as an escape
+/// through Debug.
+const ACCENTED: &str = "cafe\u{301}";
+
+/// A top-level windowed Transform named `name` over `src`, sorting each
+/// partition by `amount` with `null_order: drop`.
+fn window_block(name: &str) -> String {
+    format!(
+        r#"  - type: transform
+    name: {name}
+    input: src
+    config:
+      analytic_window:
+        group_by: [account]
+        sort_by: [{{ field: amount, null_order: drop }}]
+      cxl: |
+        emit account = account
+        emit total = $window.sum(amount)
+  - type: sink
+    name: out
+    input: {name}
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#
+    )
+}
+
+#[test]
+fn drop_refusals_quote_the_node_name_as_written() {
+    let dropped = "[{ field: txn_date, null_order: drop }]";
+    let cases = [
+        (
+            sorted_source_pipeline(dropped)
+                .replace("name: src\n", &format!("name: {ACCENTED}\n"))
+                .replace("input: src\n", &format!("input: {ACCENTED}\n")),
+            "source \"cafe\u{301}\": ",
+        ),
+        (
+            pipeline(&cull_block(dropped))
+                .replace("name: cd\n", &format!("name: {ACCENTED}\n"))
+                .replace("input: cd", &format!("input: {ACCENTED}")),
+            "cull \"cafe\u{301}\": ",
+        ),
+        (
+            pipeline(&reshape_block(dropped))
+                .replace("name: rs\n", &format!("name: {ACCENTED}\n"))
+                .replace("input: rs\n", &format!("input: {ACCENTED}\n")),
+            "reshape \"cafe\u{301}\": ",
+        ),
+        (
+            pipeline(&window_block(ACCENTED)),
+            "transform \"cafe\u{301}\": ",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (yaml, prefix) in cases {
+        let message = the_drop_message(&yaml, ACCENTED);
+        if !message.starts_with(prefix) || message.contains("\\u{") {
+            wrong.push(format!("expected the prefix {prefix:?}, got {message:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn drop_refusals_quote_field_names_and_print_a_yaml_source_name() {
+    // Each field name, as a YAML double-quoted scalar for the fixture, and
+    // as the quoting helper prints it.
+    let cases = [
+        ("it's", r#""it's""#, r#""it's""#),
+        (r#"a"b\c"#, r#""a\"b\\c""#, r#""a\"b\\c""#),
+        ("tab\there", r#""tab\there""#, r#""tab\there""#),
+        (ACCENTED, "\"cafe\u{301}\"", "\"cafe\u{301}\""),
+    ];
+    for (field, yaml_scalar, quoted) in cases {
+        let yaml = format!(
+            r#"
+pipeline:
+  name: ordering_null_placement
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - {{ name: account, type: string }}
+        - {{ name: {yaml_scalar}, type: {{ nullable: string }} }}
+        - {{ name: amount, type: int }}
+{}"#,
+            cull_block(&format!("[{{ field: {yaml_scalar}, null_order: drop }}]"))
+        );
+        let message = the_drop_message(&yaml, "cd");
+        assert!(
+            message.contains(&format!("for field {quoted}:")),
+            "{field:?}: the field must print as {quoted}: {message}"
+        );
+        let printed: Vec<&str> = message
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|span| span.starts_with("source_name: "))
+            .collect();
+        assert_eq!(
+            printed.len(),
+            1,
+            "{field:?}: expected one printed `source_name:` line: {message}"
+        );
+        let parsed: std::collections::BTreeMap<String, String> =
+            clinker_plan::yaml::from_str(printed[0])
+                .unwrap_or_else(|err| panic!("{field:?}: {:?} must parse: {err}", printed[0]));
+        assert_eq!(
+            parsed,
+            std::collections::BTreeMap::from([("source_name".to_string(), field.to_string())]),
+            "{field:?}: the printed line must name the column exactly"
+        );
+    }
+}
