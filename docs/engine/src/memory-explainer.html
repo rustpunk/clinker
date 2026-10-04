@@ -34,7 +34,7 @@ h1 .thin{font-weight:300;color:var(--ash)}
 nav.toc{display:flex;flex-wrap:wrap;gap:0;margin-top:30px;border:1px solid var(--seam);width:fit-content}
 nav.toc a{padding:10px 16px;text-decoration:none;color:var(--ash);border-right:1px solid var(--seam);font-size:12px;letter-spacing:.12em;text-transform:uppercase}
 nav.toc a:last-child{border-right:0}
-nav.toc a:hover{background:var(--rust);color:var(--iron)}
+@media (hover:hover){nav.toc a:hover{background:var(--rust);color:var(--iron)}}
 nav.toc b{color:var(--brass);margin-right:6px}
 section{padding:64px 6vw;border-bottom:1px solid var(--seam)}
 section:nth-of-type(even){background:rgba(0,0,0,.18)}
@@ -55,6 +55,7 @@ p{max-width:820px}
 .callout.b{border-color:var(--brass);background:rgba(224,169,62,.06)}
 .src{font-size:11px;color:var(--dim);letter-spacing:.04em}
 .src::before{content:"⌁ source: "}
+.aside{font-size:13px;color:var(--ash)}
 label.ctl{display:grid;grid-template-columns:1fr auto;gap:2px 10px;font-size:12px;color:var(--ash);margin:10px 0;align-items:center}
 label.ctl output{color:var(--brass);font-weight:700}
 label.ctl input[type=range]{grid-column:1/-1}
@@ -65,10 +66,10 @@ input[type=number]{width:74px;background:var(--iron);border:1px solid var(--seam
 select{background:var(--iron);border:1px solid var(--seam);color:var(--bone);font:13px var(--mono);padding:5px}
 button{font:700 12px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;padding:10px 14px;border:2px solid var(--brass);
   background:transparent;color:var(--brass);cursor:pointer;transition:background .12s,color .12s,transform .08s}
-button:hover{background:var(--brass);color:var(--iron)}
+@media (hover:hover){button:hover{background:var(--brass);color:var(--iron)}}
 button:active{transform:translateY(1px)}
 button.hot{border-color:var(--rust);color:var(--rust)}
-button.hot:hover{background:var(--rust);color:var(--iron)}
+@media (hover:hover){button.hot:hover{background:var(--rust);color:var(--iron)}}
 .btnrow{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}
 .seg{display:inline-flex;border:2px solid var(--seam)}
 .seg button{border:0;border-right:1px solid var(--seam);color:var(--ash)}
@@ -159,6 +160,34 @@ footer{padding:40px 6vw;color:var(--dim);font-size:12px}
 .flow b{font:900 34px/1 var(--disp);color:var(--rust);display:block}
 .flow span{font-size:12px;color:var(--ash)}
 @media (prefers-reduced-motion: reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+
+/* narrow screens: wide rows scroll inside their own region, not the page */
+@media (max-width:720px){
+  .cols>*,.sim>*{min-width:0}
+  .lane{overflow-x:auto;padding-top:12px;margin-top:-12px}
+  table{display:block;overflow-x:auto}
+  table>tbody{display:table;width:100%}
+  .banner{font-size:clamp(20px,6vw,34px);overflow-wrap:anywhere}
+  .gauge .mark span{font-size:10px}
+  .gauge .mark.hard span{transform:translateX(3px)}
+}
+@media (max-width:720px),(pointer:coarse){
+  table,th,.aside,.code p,.pcard .act,.logbox,label.ctl,.flow span,.keytuple,footer{font-size:14px}
+}
+/* touch: 44px targets */
+@media (pointer:coarse){
+  input[type=range]{height:44px;background:linear-gradient(var(--seam),var(--seam)) center/100% 4px no-repeat}
+  input[type=range]::-webkit-slider-thumb{width:24px;height:36px}
+  input[type=range]::-moz-range-thumb{width:24px;height:36px}
+  button,select,input[type=number]{min-height:44px}
+  select,input[type=number]{font-size:16px}
+  input[type=checkbox]{-webkit-appearance:none;appearance:none;width:44px;height:44px;margin:0;border:10px solid transparent;padding:2px;
+    background:linear-gradient(var(--iron),var(--iron)) content-box,linear-gradient(var(--ash),var(--ash)) padding-box}
+  input[type=checkbox]:checked{background:linear-gradient(var(--brass),var(--brass)) content-box,linear-gradient(var(--ash),var(--ash)) padding-box}
+  nav.toc a{display:flex;align-items:center;min-height:44px}
+  .kicker a{display:inline-block;line-height:44px}
+  p a,li a,footer a{padding:14px 2px}
+}
 </style>
 </head>
 <body>
@@ -201,7 +230,7 @@ footer{padding:40px 6vw;color:var(--dim);font-size:12px}
       <label class="ctl">charged sum from stages (MB) <output id="g_chg_o"></output><input id="g_chg" type="range" min="0" max="2400" step="4" value="260"></label>
       <div class="gauge" id="gauge"></div>
       <div class="status" id="g_status"></div>
-      <div id="g_detail" style="font-size:13px;color:var(--ash)"></div>
+      <div id="g_detail" class="aside"></div>
     </div>
   </div>
 </section>
@@ -222,7 +251,7 @@ footer{padding:40px 6vw;color:var(--dim);font-size:12px}
     </div>
     <div class="panel"><i class="rivet tl"></i><i class="rivet tr"></i><i class="rivet bl"></i><i class="rivet br"></i>
       <h3>Try it: a ReservedVec under a 256 KiB budget</h3>
-      <p style="font-size:13px;color:var(--ash)">Allocate a vector, then double it. During growth, the old and new blocks are both charged at once, and this overlap is what most often hits the budget.</p>
+      <p class="aside">Allocate a vector, then double it. During growth, the old and new blocks are both charged at once, and this overlap is what most often hits the budget.</p>
       <div class="btnrow">
         <button id="l_alloc">Reserve 48 KiB</button>
         <button id="l_grow">Grow ×2</button>
@@ -252,12 +281,12 @@ footer{padding:40px 6vw;color:var(--dim);font-size:12px}
       <div class="callout">One round has <b>two steps</b>, and each reads a different signal:
         <br>① <code>reconcile_backpressure</code> handles pause and resume using <i>current</i> pressure. It skips any Source the walk thread is reading from right now (pausing that one would deadlock the run).
         <br>② <code>poll_arbitration</code> asks the policy for a victim. If the victim cannot be paused, it sets the victim's spill flag, and the stage spills at its next batch boundary. If the victim is pausable, step ② does nothing, because step ① already handled pausing.</div>
-      <p style="font-size:13px;color:var(--ash)">So under <code>pause</code>, while any Source is registered, step ② picks that Source and <b>nobody gets a spill request from the arbitrator</b>. Spill still happens, through the stages' own thresholds and the slot admission check described in section 04.</p>
+      <p class="aside">So under <code>pause</code>, while any Source is registered, step ② picks that Source and <b>nobody gets a spill request from the arbitrator</b>. Spill still happens, through the stages' own thresholds and the slot admission check described in section 04.</p>
       <div class="src">memory.rs · build_policy(), Priority, LargestFirst, BackPressurePreferred, poll_arbitration(), reconcile_backpressure()</div>
     </div>
     <div class="panel"><i class="rivet tl"></i><i class="rivet tr"></i><i class="rivet bl"></i><i class="rivet br"></i>
       <h3>Arbitration lab</h3>
-      <p style="font-size:13px;color:var(--ash)">Tick consumers to register them and set the bytes each holds. Each column runs the real selection code for one policy. Registration order matters for <i>first pausable</i>.</p>
+      <p class="aside">Tick consumers to register them and set the bytes each holds. Each column runs the real selection code for one policy. Registration order matters for <i>first pausable</i>.</p>
       <table id="a_tbl"></table>
       <label class="ctl">current pressure vs. thresholds <output id="a_pr_o"></output>
         <input id="a_pr" type="range" min="0" max="2" step="1" value="2"></label>
@@ -301,7 +330,7 @@ footer{padding:40px 6vw;color:var(--dim);font-size:12px}
         <tr><td>streaming Aggregate</td><td>N/A</td><td>no</td></tr>
         <tr><td>credential registry · scan materialization · window arena</td><td>last</td><td>no <span class="pill ls">last resort</span></td></tr>
       </table>
-      <p style="font-size:13px;color:var(--ash)">Order follows reload cost. Re-reading a buffer slot is one postcard round-trip. A grace partition costs a little more. Reshape and Cull must re-split groups when they reload. A sort needs an external merge. A hash Aggregate costs the most to bring back.</p>
+      <p class="aside">Order follows reload cost. Re-reading a buffer slot is one postcard round-trip. A grace partition costs a little more. Reshape and Cull must re-split groups when they reload. A sort needs an external merge. A hash Aggregate costs the most to bring back.</p>
       <div class="src">engine docs: memory-arbitration.md "Per-operator arbitration parameters"</div>
     </div>
   </div>
@@ -424,7 +453,7 @@ const css=v=>getComputedStyle(document.documentElement).getPropertyValue(v).trim
       <div class="fill" style="width:${pct(r)}%;top:44px;bottom:6px;background:rgba(127,151,173,.6)"></div>
       <div class="mark" style="left:${pct(resume)}%;background:#9bc76b"><span class="t" style="color:#9bc76b">resume ${fmt(resume)}</span></div>
       <div class="mark" style="left:${pct(soft)}%;background:var(--rust)"><span class="b" style="color:var(--rust)">soft ${fmt(soft)}</span></div>
-      <div class="mark" style="left:${pct(L)}%;background:var(--blood)"><span class="t" style="color:var(--blood)">hard ${fmt(L)}</span></div>
+      <div class="mark hard" style="left:${pct(L)}%;background:var(--blood)"><span class="t" style="color:var(--blood)">hard ${fmt(L)}</span></div>
       <div class="needle" style="left:calc(${pct(cur)}% - 2px)"></div>`;
     let s,col,d;
     if(cur>L){s="E310 · abort";col="var(--blood)";d="Above the hard limit. <code>should_abort()</code> is true, and the next hot-loop check fails the run with MemoryBudgetExceeded, naming that node.";}
@@ -679,6 +708,7 @@ const Sim=(function(){
     return `<div class="node ${opts.cls||""}" style="--c:${COL[key]||"#e0a93e"}"><div class="tags">${tags}</div><h5>${title}</h5><div class="k">${kind}</div><div class="b">${fmt(mb)}${opts.extra||""}</div><div class="bar"><i style="width:${Math.min(100,mb/cap*100)}%"></i></div></div>`;
   }
   const wire='<div class="wire"></div>';
+  let frame=0;
   function render(){
     const p=S.p, L=p.lim;
     const sTags=n=>{const s=S.src[n],t=[]; if(s.active)t.push(["active","#e0a93e"]); if(s.paused)t.push(["paused","#7f97ad"]); if(s.blocked&&!s.paused)t.push(["chan full","#b9ab98"]); if(!s.reg)t.push(["done","#7d705f"]); return t;};
@@ -697,9 +727,10 @@ const Sim=(function(){
     $("#s_read").innerHTML=[
       ["tick",S.t],["phase",ph],["charged",fmt(c)],["RSS (model)",fmt(S.rss)],["peak RSS",fmt(S.peakRss)],["spill disk",fmt(S.disk)],["spills",S.spills],["pauses",S.pauses]
     ].map(([a,b])=>`<div><span>${a}</span><b style="${a==="phase"?"font-size:15px":""}">${b}</b></div>`).join("");
-    drawChart(); drawDisk();
+    // charts redraw at most once per frame: at phone DPR a canvas repaint can outlast a tick
+    if(!frame) frame=requestAnimationFrame(()=>{ frame=0; drawChart(); drawDisk(); });
   }
-  function setupCanvas(cv){ const dpr=window.devicePixelRatio||1, w=cv.clientWidth, h=+cv.getAttribute("height"); cv.width=w*dpr; cv.height=h*dpr; const x=cv.getContext("2d"); x.setTransform(dpr,0,0,dpr,0,0); return [x,w,h]; }
+  function setupCanvas(cv){ const dpr=window.devicePixelRatio||1, w=cv.clientWidth, h=+cv.getAttribute("height"), W=w*dpr|0, H=h*dpr|0; if(cv.width!==W||cv.height!==H){ cv.width=W; cv.height=H; } const x=cv.getContext("2d"); x.setTransform(dpr,0,0,dpr,0,0); return [x,w,h]; }
   function drawChart(){
     const cv=$("#s_chart"); const [x,w,h]=setupCanvas(cv); const L=S.p.lim;
     const ymax=L*1.3, n=Math.max(60,hist.length), pad=34;
@@ -738,7 +769,9 @@ const Sim=(function(){
     x.fillStyle="#7d705f";x.font="10px Share Tech Mono, monospace";x.fillText("disk",2,12);
   }
   function play(){ if(S.done) reset(); if(timer){stop();return;} $("#s_play").textContent="❚❚ Pause";
-    const tick=()=>{ step(); if(!S.done) timer=setTimeout(tick, 1000/(+el.speed.value)); }; tick(); }
+    // pace ticks against a deadline so slow paints don't stretch the interval (catch-up capped at 100 ms)
+    let due=performance.now();
+    const tick=()=>{ step(); const now=performance.now(); due=Math.max(due+1000/(+el.speed.value),now-100); if(!S.done) timer=setTimeout(tick, Math.max(0,due-now)); }; tick(); }
   function stop(){ if(timer){clearTimeout(timer);timer=null;} const b=$("#s_play"); if(b) b.textContent="▶ Run"; }
   // legend
   $("#s_legend").innerHTML=KEYS.map(k=>`<span><i style="background:${COL[k]}"></i>${LBL[k]}</span>`).join("")+`<span><i style="background:none;border-top:2px dashed #ece2d0;height:0"></i>RSS (charged × overhead + baseline)</span>`;
@@ -779,7 +812,7 @@ const Sim=(function(){
       return `tie on everything, so the lower stable index wins (${a.r.idx} < ${b.r.idx})`; };
     $("#r_pick").innerHTML=keyed.map((k,n)=>`<div style="display:flex;gap:12px;align-items:baseline;border-bottom:1px solid var(--seam);padding:4px 0">
       <span class="rank">${n+1}</span><b>${k.r.name}</b><span class="keytuple">(${k.key.map(v=>Object.is(v,-0)?0:v).join(", ")})</span></div>`).join("")+
-      `<p style="font-size:13px;color:var(--ash)"><b style="color:var(--rust)">${keyed[0].r.name}</b> runs next: ${why(keyed[0],keyed[1])}.</p>`;
+      `<p class="aside"><b style="color:var(--rust)">${keyed[0].r.name}</b> runs next: ${why(keyed[0],keyed[1])}.</p>`;
   }
   head.addEventListener("input",run);
   $("#r_zero").onclick=()=>{rows=rows.map(r=>({...r,peak:0,freed:0,sub:0}));build();};
