@@ -81,7 +81,7 @@
 //! - INDIRECT influence covers the predicate / grouping / sort surfaces above (for
 //!   record columns, plus `$doc` terms in the Route / Cull / Combine predicates);
 //!   an aggregate's pre-aggregation row `filter`, a Transform-inline `filter`, and
-//!   Reshape `order_by` / `partition_by` are not (yet) attributed as influence.
+//!   Reshape `partition_by` are not (yet) attributed as influence.
 //! - Constant and `count(*)` columns (no source input) are omitted from `fields`.
 //! - Engine-stamped columns (`$ck.*` / `$meta.*` / `$source.*` / `$widened`) are
 //!   skipped, mirroring the default-writer strip.
@@ -2552,7 +2552,12 @@ fn node_indirect_influence(
                 IndirectSub::Filter,
             );
         }
-        PlanNode::Cull { config, typed, .. } => {
+        PlanNode::Cull {
+            config,
+            order_by,
+            typed,
+            ..
+        } => {
             let up = single_upstream(dag, idx);
             if let Some(PredicateSupport::CullDrop(cols)) = predicate_support(node) {
                 for col in &cols {
@@ -2571,6 +2576,15 @@ fn node_indirect_influence(
                     &mut inf,
                     upstream_col(lineage, up, base_col(col)),
                     IndirectSub::GroupBy,
+                );
+            }
+            // `order_by` decides the order of a group's rows and cannot
+            // remove any of them, so it is SORT influence and never FILTER.
+            for field in order_by {
+                add_upstream_influence(
+                    &mut inf,
+                    upstream_col(lineage, up, base_col(&field.field)),
+                    IndirectSub::Sort,
                 );
             }
             // A `drop_group_when` predicate may read the envelope; the decision
@@ -2624,7 +2638,11 @@ fn node_indirect_influence(
                 }
             }
         }
-        PlanNode::Reshape { compiled_rules, .. } => {
+        PlanNode::Reshape {
+            compiled_rules,
+            order_by,
+            ..
+        } => {
             // A `when:` trigger cannot read `$doc`: the planner rejects any
             // envelope reference in a Reshape rule (E200, see `bind_reshape`), so
             // only record columns reach here.
@@ -2639,6 +2657,15 @@ fn node_indirect_influence(
                         IndirectSub::Conditional,
                     );
                 }
+            }
+            // `order_by` decides the order of a group's rows and cannot
+            // remove any of them, so it is SORT influence and never FILTER.
+            for field in order_by {
+                add_upstream_influence(
+                    &mut inf,
+                    upstream_col(lineage, up, base_col(&field.field)),
+                    IndirectSub::Sort,
+                );
             }
         }
         PlanNode::Combine {
@@ -3582,12 +3609,110 @@ nodes:
 "#;
         let lineage = lineage_of(yaml);
         let src = "/w/data/plans.csv";
-        use TransformationSubtype::Conditional;
+        use TransformationSubtype::{Conditional, Sort};
         // Sorted by (namespace, name, field): plan_end before plan_start.
+        // `plan_start` is both the rule's guard and the group's ordering key.
         assert_eq!(
             only_output(&lineage).facet.dataset,
             vec![
                 indirect(src, "plan_end", &[Conditional]),
+                indirect(src, "plan_start", &[Sort, Conditional]),
+            ],
+        );
+    }
+
+    #[test]
+    fn cull_order_by_is_sort_influence() {
+        let yaml = r#"
+pipeline: { name: c }
+nodes:
+  - type: source
+    name: s
+    config:
+      name: s
+      type: csv
+      path: data/s.csv
+      options: { has_header: true }
+      schema:
+        - { name: employee_id, type: string }
+        - { name: amount, type: int }
+        - { name: hired, type: date }
+  - type: cull
+    name: trim
+    input: s
+    config:
+      partition_by: [employee_id]
+      order_by: [hired]
+      removed_to: removed
+      rules:
+        - name: drop_big
+          drop_group_when: "sum(amount) > 100"
+  - type: sink
+    name: out
+    input: trim
+    config: { name: out, type: csv, path: out/c.csv }
+  - type: sink
+    name: audit
+    input: trim.removed
+    config: { name: audit, type: csv, path: out/audit.csv }
+"#;
+        let lineage = lineage_of(yaml);
+        let src = "/w/data/s.csv";
+        let out = output_named(&lineage, "c.csv");
+        use TransformationSubtype::{Filter, GroupBy, Sort};
+        // `hired` only orders the rows inside a group, so it is SORT: it
+        // decides which row comes first, never which rows survive.
+        assert_eq!(
+            out.facet.dataset,
+            vec![
+                indirect(src, "amount", &[Filter]),
+                indirect(src, "employee_id", &[GroupBy]),
+                indirect(src, "hired", &[Sort]),
+            ],
+        );
+    }
+
+    #[test]
+    fn reshape_order_by_is_sort_influence() {
+        let yaml = r#"
+pipeline: { name: r }
+nodes:
+  - type: source
+    name: plans
+    config:
+      name: plans
+      type: csv
+      path: data/plans.csv
+      options: { has_header: true }
+      schema:
+        - { name: employee_id, type: string }
+        - { name: plan_start, type: int }
+        - { name: plan_end, type: int }
+  - type: reshape
+    name: backfill
+    input: plans
+    config:
+      partition_by: [employee_id]
+      order_by:
+        - { field: plan_end, order: desc, null_order: first }
+      rules:
+        - name: split
+          when: "plan_start > 365"
+          mutate:
+            set:
+              plan_end: "plan_start"
+  - type: sink
+    name: out
+    input: backfill
+    config: { name: out, type: csv, path: out/r.csv }
+"#;
+        let lineage = lineage_of(yaml);
+        let src = "/w/data/plans.csv";
+        use TransformationSubtype::{Conditional, Sort};
+        assert_eq!(
+            only_output(&lineage).facet.dataset,
+            vec![
+                indirect(src, "plan_end", &[Sort]),
                 indirect(src, "plan_start", &[Conditional]),
             ],
         );

@@ -61,13 +61,14 @@ use crate::executor::{GroupedNodeKind, giant_group_error};
 use crate::pipeline::memory::{
     ConsumerHandle, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
 };
+use crate::pipeline::sort_key::compare_authored_keys;
 use crate::pipeline::spill::{SpillFile, SpillWriter};
 use clinker_core_types::dlq::{DlqErrorCategory, stage_reshape_mutation_conflict};
+use clinker_plan::config::SortField;
 use clinker_plan::config::pipeline_node::{
     CopyFrom, RESHAPE_MUTATED_BY_COLUMN, RESHAPE_SYNTHESIZED_BY_COLUMN, RESHAPE_SYNTHETIC_COLUMN,
     ReshapeBody,
 };
-use clinker_plan::config::{SortField, SortOrder};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{
     CompiledReshapeRule, ExecutionPlanDag, PlanNode, single_predecessor,
@@ -224,6 +225,7 @@ where
     let PlanNode::Reshape {
         ref name,
         ref config,
+        ref order_by,
         ref output_schema,
         ref compiled_rules,
         ..
@@ -299,6 +301,9 @@ where
     // grouping/finalize work runs inside a closure whose result is matched
     // below — success, conflict-DLQ, and hard error all funnel through the
     // single `unregister_consumer` call.
+    // The validated, placement-only ordering, in the form the Sort node's
+    // comparator takes. Converted once per dispatch, not once per group.
+    let order_fields: Vec<SortField> = order_by.iter().map(SortField::from).collect();
     let result = run_reshape_grouped(
         ctx,
         current_dag,
@@ -310,6 +315,7 @@ where
         input,
         input_puncts,
         &handle,
+        &order_fields,
     );
     ctx.memory_budget.unregister_consumer(consumer_id);
     result
@@ -334,6 +340,7 @@ fn run_reshape_grouped(
     input: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
     input_puncts: Vec<crate::executor::stream_event::Punctuation>,
     handle: &Arc<ConsumerHandle>,
+    order_fields: &[SortField],
 ) -> Result<(), PipelineError> {
     // Rebuild the per-dispatch evaluators from the node's compiled rule
     // programs (typechecked once at lowering). The `ProgramEvaluator` is
@@ -396,8 +403,11 @@ fn run_reshape_grouped(
     for key in group_order {
         let mut group = buffer.take_group(name, &config.partition_by, &key, hard_limit)?;
         handle.set_bytes(buffer.resident_bytes() as u64);
-        if !config.order_by.is_empty() {
-            sort_group(&mut group, &config.order_by);
+        if !order_fields.is_empty() {
+            // The Sort node's order, so each group's rows reach the rules in
+            // the order a Sink `sort_order` would write them, with the
+            // authored `null_order`. Stable, so arrival order breaks ties.
+            group.sort_by(|(a, _), (b, _)| compare_authored_keys(a, b, order_fields));
         }
         process_group(ctx, name, &mut rules, output_schema, group, &mut out)?;
     }
@@ -1114,35 +1124,6 @@ fn partition_key(record: &Record, partition_by: &[String]) -> Vec<GroupByKey> {
                 .unwrap_or(GroupByKey::Null)
         })
         .collect()
-}
-
-/// Sort a group in place by `order_by`, stable across equal keys (so
-/// arrival order breaks ties deterministically).
-fn sort_group(
-    group: &mut [(Record, crate::executor::stream_event::SourceRowId)],
-    order_by: &[SortField],
-) {
-    group.sort_by(|(a, _), (b, _)| {
-        for sf in order_by {
-            let av = a.get(&sf.field).unwrap_or(&Value::Null);
-            let bv = b.get(&sf.field).unwrap_or(&Value::Null);
-            let ord = match (av, bv) {
-                (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
-                // Nulls sort last regardless of direction (SQL convention).
-                (Value::Null, _) => std::cmp::Ordering::Greater,
-                (_, Value::Null) => std::cmp::Ordering::Less,
-                _ => av.partial_cmp(bv).unwrap_or(std::cmp::Ordering::Equal),
-            };
-            let ord = match sf.order {
-                SortOrder::Asc => ord,
-                SortOrder::Desc => ord.reverse(),
-            };
-            if ord != std::cmp::Ordering::Equal {
-                return ord;
-            }
-        }
-        std::cmp::Ordering::Equal
-    });
 }
 
 /// Re-key a record onto the (audit-widened) output schema, carrying every

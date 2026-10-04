@@ -219,11 +219,12 @@ permanent stability.
   `f64` widening or a per-type byte encoding reintroduces the disagreement the
   module removes. The Sort node's comparator and byte key
   (`pipeline/sort_key.rs`) and group keys (`GroupByKey`, whose equality, hash
-  and `encode_tie_bytes` are the order's tie) are on it; Cull and Reshape
-  group sorting still carry their own rule, are moving onto it and are not
-  precedent. The module defines ordering, not predicates: a comparison
+  and `encode_tie_bytes` are the order's tie) are on it; the Cull and Reshape
+  group sorts call the Sort node's comparator over the plan node's
+  placement-only `order_by`, so they carry no rule of their own. The module
+  defines ordering, not predicates: a comparison
   operator decides its own answer for a NaN or null operand.
-- **Verified:** 2026-09-29.
+- **Verified:** 2026-10-04.
 
 ## Construction And Organization Patterns
 

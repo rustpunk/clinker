@@ -151,7 +151,8 @@ pub struct OrderField {
 /// selects the reason and the fix a refused `drop` gives the author.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderingSite {
-    /// A Cull or Reshape `order_by`: orders the rows of one group.
+    /// A Cull or Reshape `order_by`: orders the rows of one group, by the
+    /// same value order a Sink `sort_order` uses.
     GroupOrderBy,
     /// A Source `sort_order`: the order its records are verified against.
     SourceSortOrder,
@@ -165,6 +166,10 @@ pub enum OrderingSite {
 /// reason, and how to remove null-keyed rows instead. Callers prefix the
 /// node (`cull "name": `, `source "name": `) and add nothing else, so this
 /// is the one place the wording lives.
+///
+/// The `first` and `last` the message offers are applied by the group sort
+/// that refused `drop`, so either one is a working replacement that keeps
+/// every row.
 ///
 /// The fix is a paste-able `filter` only when CXL can write the field as a
 /// bare name ([`cxl::lexer::is_bare_field_name`]). Any other name gets no

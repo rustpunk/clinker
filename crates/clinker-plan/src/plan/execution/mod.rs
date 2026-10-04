@@ -240,15 +240,15 @@ pub enum PlanNode {
         #[serde(skip)]
         span: Span,
         /// Parsed Reshape configuration (`partition_by` / `order_by` /
-        /// `rules`). Still consumed at dispatch for the grouping key and
-        /// group ordering; the rule CXL is carried separately as typed
-        /// programs in `compiled_rules`.
+        /// `rules`). Still consumed at dispatch for the grouping key; the
+        /// within-group order comes from `order_by` below and the rule CXL
+        /// is carried separately as typed programs in `compiled_rules`.
         config: crate::config::pipeline_node::ReshapeBody,
         /// The validated within-group ordering: `config.order_by` converted
         /// to placement-only fields at bind time, so it can place nulls
-        /// first or last but never hold `null_order: drop`. The executor's
-        /// group sort still reads `config.order_by` and does not yet honour
-        /// the placement.
+        /// first or last but never hold `null_order: drop`. The group sort
+        /// orders each group by these fields with the Sort node's
+        /// comparator, applying the resolved placement.
         order_by: Vec<crate::config::OrderField>,
         /// Widened output schema: the upstream columns plus the three
         /// `$meta.*` audit columns Reshape stamps. Populated by
@@ -285,14 +285,15 @@ pub enum PlanNode {
         span: Span,
         /// Parsed Cull configuration (`partition_by` / `order_by` /
         /// `rules` / `removed_to`). Still consumed at dispatch for the
-        /// grouping key, group ordering, and `removed_to` port routing; the
-        /// predicate CXL is carried separately as `compiled` + `typed`.
+        /// grouping key and `removed_to` port routing; the within-group
+        /// order comes from `order_by` below and the predicate CXL is
+        /// carried separately as `compiled` + `typed`.
         config: crate::config::pipeline_node::CullBody,
         /// The validated within-group ordering: `config.order_by` converted
         /// to placement-only fields at bind time, so it can place nulls
-        /// first or last but never hold `null_order: drop`. The executor's
-        /// group sort still reads `config.order_by` and does not yet honour
-        /// the placement.
+        /// first or last but never hold `null_order: drop`. The group sort
+        /// orders each group by these fields with the Sort node's
+        /// comparator, applying the resolved placement.
         order_by: Vec<crate::config::OrderField>,
         /// Output schema, equal to the upstream schema (Cull does not
         /// widen). Both the main and `removed_to` ports carry it.

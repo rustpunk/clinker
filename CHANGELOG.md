@@ -4,6 +4,26 @@ All notable changes to Clinker are tracked here.
 
 ## Unreleased
 
+### Changed — Cull and Reshape order each group like a Sink sort
+
+A Cull or Reshape `order_by` now orders the rows of each group by the same
+rule a Sink `sort_order` uses (see
+[How values are ordered](docs/user/src/nodes/sink.md#how-values-are-ordered)),
+and applies the `null_order` written there, `last` by default for `asc` and
+`desc` alike. Output changes where a group's ordering key holds:
+
+- **A null under `desc`, or with `null_order` omitted.** Nulls came first
+  under `desc`; they now come last unless the field says
+  `null_order: first`.
+- **An authored `null_order: first`.** It was accepted and then ignored; it
+  now places the nulls.
+- **NaN, `-0.0`, and a column mixing integers with floats or decimals.** An
+  integer and a float used to compare as equal, and a NaN could stop the
+  comparison, so the rows around them came out in no fixed order. They now
+  take their place in the value order.
+
+Closes [#1281](https://github.com/rustpunk/clinker/issues/1281).
+
 ### Changed — null_order: drop is accepted only on a Sink sort_order
 
 `null_order: drop` excludes records whose key is null, which only a Sink's

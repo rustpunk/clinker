@@ -96,7 +96,7 @@ order_by:
   - { field: plan_end, order: desc, null_order: first }
 ```
 
-Reshape does not yet apply `null_order`: a null sorts after every value in an `asc` field and before every value in a `desc` field.
+Each group is ordered this way before its rules run, exactly as a Sink `sort_order` orders rows (see [How values are ordered](sink.md#how-values-are-ordered)): a null goes where `null_order` puts it, `last` by default for `asc` and `desc` alike; numbers compare by their exact value across integers, floats and decimals; every `NaN` is one value after every number, and so comes first under `desc`; `-0.0` equals `0.0`; and rows the order calls equal keep their arrival order.
 
 `null_order: drop` is rejected when the pipeline is planned. `order_by` only arranges the rows of a group; it never removes any. To leave out rows whose field is null, filter them in a Transform before the Reshape:
 
