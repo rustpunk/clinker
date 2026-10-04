@@ -5,7 +5,7 @@
 
 use super::dag::parse_fixture;
 use crate::config::CompileContext;
-use crate::plan::execution::{ExecutionPlanDag, PlanNode};
+use crate::plan::execution::{ExecutionPlanDag, PlanNode, StreamClass, classify_stream_nodes};
 use petgraph::graph::NodeIndex;
 
 /// Two sibling branches off one Source: `t2` condemns a document and feeds
@@ -116,6 +116,99 @@ fn document_policy_orders_sinks_after_operators() {
         operators(&dag),
         operators(&record),
         "the non-Sinks keep the relative order they have under record granularity"
+    );
+}
+
+/// One Source read by one Transform that feeds one Sink: the shape whose
+/// Transform hands its batches straight to a streaming Sink when nothing
+/// turns streaming off.
+const CHAIN_YAML: &str = r#"
+pipeline: { name: chain }
+error_handling: { strategy: continue, dlq: { path: rejected.csv } }
+nodes:
+  - type: source
+    name: events
+    config:
+      name: events
+      type: csv
+      glob: ./*.csv
+      dlq_granularity: {granularity}
+      files: { on_no_match: skip }
+      schema:
+        - { name: id, type: string }
+        - { name: value, type: string }
+  - type: transform
+    name: shape
+    input: events
+    config:
+      cxl: |
+        emit id = id
+        emit val = value
+  - type: sink
+    name: out
+    input: shape
+    config: { name: out, type: csv, path: out.csv, include_unmapped: true }
+"#;
+
+fn chain_classes(granularity: &str) -> Vec<(String, StreamClass)> {
+    let yaml = CHAIN_YAML.replace("{granularity}", granularity);
+    let plan = parse_fixture(&yaml)
+        .compile(&CompileContext::default())
+        .expect("compile");
+    let dag = plan.dag();
+    let classes = classify_stream_nodes(dag, plan.config());
+    let mut named: Vec<(String, StreamClass)> = classes
+        .into_iter()
+        .map(|(idx, class)| (dag.graph[idx].name().to_owned(), class))
+        .collect();
+    named.sort_by(|a, b| a.0.cmp(&b.0));
+    named
+}
+
+fn class_of(classes: &[(String, StreamClass)], name: &str) -> StreamClass {
+    classes
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, class)| *class)
+        .unwrap_or_else(|| panic!("no node named {name:?} in {classes:?}"))
+}
+
+/// Under `dlq_granularity: document` the run turns streaming Output,
+/// streaming Aggregate ingest and streaming Combine probe off for the whole
+/// pipeline, and each Sink holds every open document's records in a
+/// charged, spillable bucket until the document's verdict. `--explain` must
+/// say so: no producer streams and the Sink is materialized. The Source
+/// still hands its receiver to the Transform at runtime, so it keeps its
+/// streaming class.
+#[test]
+fn document_granularity_explain_reports_no_streaming_stage() {
+    let record = chain_classes("record");
+    assert_eq!(
+        class_of(&record, "shape"),
+        StreamClass::Streaming,
+        "under record granularity the Transform streams to its Sink: {record:?}"
+    );
+    assert_eq!(
+        class_of(&record, "out"),
+        StreamClass::Streaming,
+        "under record granularity the Sink streams: {record:?}"
+    );
+
+    let document = chain_classes("document");
+    assert_eq!(
+        class_of(&document, "shape"),
+        StreamClass::Materialized,
+        "under document granularity no producer streams: {document:?}"
+    );
+    assert_eq!(
+        class_of(&document, "out"),
+        StreamClass::Materialized,
+        "under document granularity the Sink holds each open document's records: {document:?}"
+    );
+    assert_eq!(
+        class_of(&document, "events"),
+        class_of(&record, "events"),
+        "the Source's class does not depend on the granularity: {document:?}"
     );
 }
 
