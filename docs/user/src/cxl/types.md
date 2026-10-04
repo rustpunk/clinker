@@ -273,12 +273,18 @@ branches are a decimal and a float does not compile, because its result would
 be a decimal on some rows and a float on others:
 
 ```text
-cannot mix decimal and float without an explicit cast: the branches of this `if` are a decimal (`amount`) and a float (`price`); convert one branch so both have one numeric type, for example `price.to_decimal()` or `amount.to_float()`
+cannot mix decimal and float without an explicit cast: the branches of this `if` are a decimal (`amount`) and a float (`price`); declare `price` a decimal in its Source schema, `type: decimal` in place of `type: float`, so the branches have one numeric type
 ```
 
-Convert one branch, as the message shows:
-`if flag then amount else price.to_decimal()` is a decimal, and
-`if flag then amount.to_float() else price` a float.
+The message gives one fix. When the float is a Source column, declare it
+`type: decimal` in its Source schema: the reader parses the column's text
+exactly, so `if flag then amount else price` is a decimal holding the values
+the file holds. (A JSON number read into a `decimal` column is still parsed
+through a float first; see [#1299](https://github.com/rustpunk/clinker/issues/1299).) When the float is computed
+rather than read from a Source column, convert the decimal side instead:
+`if flag then amount.to_float() else price * 2.0` is a float. Converting a
+float with `.to_decimal()` does not make it exact: the decimal keeps the
+float's binary digits.
 
 ### Casting
 
@@ -339,8 +345,9 @@ hard error, whereas the rounded value fits.
 both) gives `sum(value * weight) / sum(weight)` over exact totals, at full
 division precision. A zero total weight is an error, as `x / 0` is. A decimal
 in one position mixed with a binary `float` in the other is a type error,
-matching the `decimal ⊗ float` arithmetic rule — cast with `.to_decimal()` or
-`.to_float()` so the value and weight share one numeric domain.
+matching the `decimal ⊗ float` arithmetic rule. Declare a float Source column
+`type: decimal` so the value and weight share one numeric domain, or, when the
+float is computed, convert the decimal argument with `.to_float()`.
 
 ## Type unification rules
 
@@ -348,6 +355,7 @@ When two types meet in an expression, CXL coerces them automatically:
 
 - Numbers combine: mixing an integer and a float gives a float (`2 + 3.5` is `5.5`).
 - A decimal and a float never combine, in an operator or in the branches of an
-  `if`, `match` or `??`: convert one with `.to_decimal()` or `.to_float()`.
+  `if`, `match` or `??`: declare a float Source column `type: decimal`, or
+  convert the decimal side with `.to_float()` when the float is computed.
 - Arithmetic and ordering comparisons with `null` give `null`. `==` and `!=` never do (`null == null` is `true`), and `and`/`or` give a definite answer when the other side settles it. See [Null Handling](nulls.md).
 - Mismatched types are an error: `String + Int` fails. Convert first with `.to_int()` or `.to_string()` so both sides are the same type.

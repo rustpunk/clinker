@@ -34,7 +34,7 @@ names the rule and the fix; only a group with no non-null value gives null.
   The group now fails with:
 
   ```text
-  decimal and float in one group: a decimal is never added to a float without an explicit conversion; convert the aggregate's argument to one numeric type, for example `sum(price.to_decimal())` or `sum(amount.to_float())`
+  decimal and float in one group: a decimal is never added to a float without an explicit conversion; declare the column that holds the floats `type: decimal` in its Source schema, so every value in the group is a decimal
   ```
 
 - **`if`, `match` and `??` over a decimal and a float no longer compile.** They
@@ -42,14 +42,25 @@ names the rule and the fix; only a group with no non-null value gives null.
   They are now an E200:
 
   ```text
-  cannot mix decimal and float without an explicit cast: the branches of this `if` are a decimal (`amount`) and a float (`price`); convert one branch so both have one numeric type, for example `price.to_decimal()` or `amount.to_float()`
+  cannot mix decimal and float without an explicit cast: the branches of this `if` are a decimal (`amount`) and a float (`price`); declare `price` a decimal in its Source schema, `type: decimal` in place of `type: float`, so the branches have one numeric type
   ```
 
 - **The error's message reaches the author.** The `aggregate_finalize`
   dead-letter reason and a run that stops on an aggregate error print the
   error's message with its fix, and name the author's `emit` instead of an
   internal label (`aggregate by_category.total: ...`). A decimal total out of
-  range no longer says "integer sum overflow".
+  range no longer says "integer sum overflow". Each message gives one fix the
+  author can paste, and none converts a float to a decimal: a float Source
+  column is declared `type: decimal`, which the reader parses exactly, and a
+  computed float is matched by converting the decimal side with `.to_float()`.
+  The integer `sum` overflow now prints `sum(amount.to_decimal())`, and a
+  `weighted_avg` whose weights are all zero prints a Transform that drops them,
+  `config: { cxl: "filter qty != 0" }`. A JSON number read into a `decimal`
+  column is still parsed through a float first ([#1299](https://github.com/rustpunk/clinker/issues/1299)).
+- **A Cull rule's failure names the rule.** An accumulator failure in a
+  `drop_group_when` rule says `` a `drop_group_when` rule failed: `` and gives
+  the accumulator's message, instead of naming the engine's label for the
+  rule.
 - **Envelope footers.** An aggregate in an Envelope `footer:` that fails now
   reports that aggregate error, naming the node and `<section>.<field>`,
   instead of an internal error. It still stops the run.

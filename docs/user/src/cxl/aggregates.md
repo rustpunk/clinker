@@ -74,9 +74,9 @@ largest scale among the group's values, zeros and integers included, so the
 sum of `1.00`, `-1.00` and `2` is `2.00` whatever order the rows arrive in. It
 is an error only when the whole group's exact total is outside the decimal
 range, ±79,228,162,514,264,337,593,543,950,335; a group whose running total
-passes outside the range and comes back is fine. The fix the error suggests is
-to sum the argument's `.to_float()` when a binary float's range and precision
-will do.
+passes outside the range and comes back is fine. The error's fix aggregates the
+column as floats, `sum(amount.to_float())` with your column in place of
+`amount`, when a binary float's range and precision will do.
 
 A group whose values are all null gives null. Null is never a substitute for a
 failure: a group that fails is an `aggregate_finalize` error (see [Error
@@ -90,15 +90,20 @@ aggregate as in `amount + price`. A `sum`, `avg` or `weighted_avg` whose values
 in one group include both a decimal and a float fails that group with:
 
 ```text
-decimal and float in one group: a decimal is never added to a float without an explicit conversion; convert the aggregate's argument to one numeric type, for example `sum(price.to_decimal())` or `sum(amount.to_float())`
+decimal and float in one group: a decimal is never added to a float without an explicit conversion; declare the column that holds the floats `type: decimal` in its Source schema, so every value in the group is a decimal
 ```
 
 When the typechecker can see the mix, for example
 `sum(if flag then amount else price)`, the pipeline does not compile (E200; see
 [Conditionals](conditionals.md)). The run-time error covers what it cannot see:
 a value whose type is only known at run time, such as an untyped column or a
-`numeric` result like `amount.clamp(0, 100)`. Convert the argument to one type,
-`sum(if flag then amount else price.to_decimal())`, to keep the total exact.
+`numeric` result like `amount.clamp(0, 100)`. Declaring the float column
+`type: decimal` in its Source schema keeps the total exact: the reader parses
+the column's text as a decimal, so every value in the group is a decimal. (A
+JSON number read into a `decimal` column is still parsed through a float first;
+see [#1299](https://github.com/rustpunk/clinker/issues/1299).) When the floats are computed upstream rather than read
+from a Source column, there is no column to retype: convert the decimal values
+with `.to_float()` instead, accepting binary float precision.
 
 ### count(*) -> Int
 
@@ -203,20 +208,28 @@ These groups fail with an `aggregate_finalize` error rather than writing a
 value:
 
 - **Zero total weight.** The group's weights add up to exactly zero, so the
-  average divides by zero, as `x / 0` does in any expression. Drop zero-weight
-  rows before the Aggregate (for example `filter qty != 0`), or emit
-  `sum(value * weight)` and `sum(weight)` separately.
+  average divides by zero, as `x / 0` does in any expression. Rows whose weight
+  is zero add nothing to the average, so the error's fix drops them with a
+  Transform before the Aggregate, `config: { cxl: "filter qty != 0" }` with
+  your weight column in place of `qty`. A group whose non-zero weights cancel,
+  such as a sale and its return, still totals zero after that filter and still
+  fails.
 - **A row's product out of range.** A row's decimal `value * weight` is outside
-  the decimal range. Retracting that row clears the error.
+  the decimal range. Retracting that row clears the error. The error's fix
+  computes the average in floats,
+  `weighted_avg(price.to_float(), qty.to_float())` with your columns in place
+  of `price` and `qty`.
 - **A total or the quotient out of range.** A decimal total is outside the
   decimal range, or the quotient is because the weights nearly cancel.
 - **Decimal and float in one group**, in one row or across rows (see
   [above](#decimal-and-float-in-one-group)).
 
 Mixing a `decimal` with a binary `float` across the two arguments is a type
-error when the typechecker can see it: cast with `.to_decimal()` or
-`.to_float()` so both share one numeric type. A group with no row whose value
-and weight are both non-null gives null.
+error when the typechecker can see it. Declare the float column
+`type: decimal` in its Source schema so both arguments are decimals, or, when
+the float is computed rather than read from a Source column, convert the
+decimal argument with `.to_float()`. A group with no row whose value and
+weight are both non-null gives null.
 
 ## Aggregates vs. windows
 

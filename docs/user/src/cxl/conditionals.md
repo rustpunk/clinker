@@ -41,11 +41,18 @@ result would be a decimal on some rows and a float on others. Such an `if` does
 not compile:
 
 ```text
-cannot mix decimal and float without an explicit cast: the branches of this `if` are a decimal (`amount`) and a float (`price`); convert one branch so both have one numeric type, for example `price.to_decimal()` or `amount.to_float()`
+cannot mix decimal and float without an explicit cast: the branches of this `if` are a decimal (`amount`) and a float (`price`); declare `price` a decimal in its Source schema, `type: decimal` in place of `type: float`, so the branches have one numeric type
 ```
 
-Convert one branch: `if flag then amount else price.to_decimal()`. An integer
-branch is fine beside either: it widens exactly into the decimal or float.
+The message gives one fix. When the float branch is a Source column, it is
+the column's schema type: declare `price` with `type: decimal` in place of
+`type: float`, and the reader parses its text exactly, so both branches are
+decimals holding the values the file holds. (A JSON number read into a
+`decimal` column is still parsed through a float first; see [#1299](https://github.com/rustpunk/clinker/issues/1299).)
+When the float branch is computed rather than read from a Source column, the
+fix converts the decimal branch with `.to_float()` instead, accepting binary
+float precision. An integer branch is fine beside either: it widens exactly
+into the decimal or float.
 
 ### Chained conditionals
 
@@ -186,8 +193,9 @@ emit region = match country {
 
 As with `if`, the arms of a `match` must not include both a decimal and a
 float. The error names the first decimal arm and the first float arm, counted
-from 1, or the field when an arm is a bare field; convert one of them with
-`.to_decimal()` or `.to_float()`.
+from 1, or the field when an arm is a bare field, and gives the same one fix:
+the Source schema type when the float arm is a float column, otherwise
+`.to_float()` on the decimal arm.
 
 ### Match arms are evaluated in order
 

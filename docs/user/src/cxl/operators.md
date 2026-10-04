@@ -110,8 +110,10 @@ $ cxl eval -e 'emit result = "present" ?? "default"'
 ```
 
 Like the branches of an `if`, the two sides of `??` must not be a decimal and a
-float: `amount ?? price` does not compile. Convert one side, as in
-`amount ?? price.to_decimal()`.
+float: `amount ?? price` does not compile. As for `if`, the fix is to declare
+`price` with `type: decimal` in its Source schema, or, when the float side is
+computed rather than a Source column, to convert the decimal side with
+`.to_float()`.
 
 ## String concatenation
 
