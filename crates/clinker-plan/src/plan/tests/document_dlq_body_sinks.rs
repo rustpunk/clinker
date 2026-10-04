@@ -574,3 +574,64 @@ fn e378_gives_the_next_step_when_the_first_port_reads_a_route_branch() {
          carry rows from one of those",
     );
 }
+
+#[test]
+fn e378_gives_the_next_step_when_the_first_port_reads_a_nested_call() {
+    // The composition is called from the pipeline, and its Sink reads the
+    // node behind its first port, but that node is a composition call.
+    let inner = composition("inner", "    out: shape", "");
+    let outer = r#"_compose:
+  name: outer
+  inputs:
+    inp:
+      schema:
+        - { name: id, type: string }
+        - { name: value, type: string }
+  outputs:
+    out: inner
+  config_schema: {}
+
+nodes:
+  - type: composition
+    name: inner
+    input: inp
+    use: ./inner.comp.yaml
+    inputs:
+      inp: inp
+  - type: sink
+    name: audit
+    input: inner
+    config:
+      name: audit
+      type: csv
+      path: audit.csv
+"#;
+    let diags = e378_for(
+        &[
+            ("compositions/inner.comp.yaml", &inner),
+            ("compositions/outer.comp.yaml", outer),
+        ],
+        r#"  - type: composition
+    name: wrap
+    input: events
+    use: ../compositions/outer.comp.yaml
+    inputs:
+      inp: events
+  - type: sink
+    name: main
+    input: wrap
+    config:
+      name: main
+      type: csv
+      path: main.csv
+"#,
+    );
+    assert_eq!(diags.len(), 1, "one E378 for the one body Sink");
+    assert_next_step(
+        help_for(&diags, "audit"),
+        "audit",
+        "the first output port of composition \"wrap\", `out`, reads \"inner\", which \
+         sends rows to output ports of its own, and a composition output port cannot yet \
+         carry rows from one of those",
+    );
+}
