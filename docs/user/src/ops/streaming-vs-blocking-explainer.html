@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clinker · Streaming vs. blocking, visually</title>
+<style>
+:root{
+  --iron:#14110f; --iron2:#1d1915; --iron3:#29231d; --seam:#3a3129;
+  --ash:#b9ab98; --bone:#ece2d0; --dim:#7d705f;
+  --rust:#d0581f; --rust-d:#8f3a13; --brass:#e0a93e; --verd:#4fb0a0;
+  --blood:#e0362c; --steel:#7f97ad; --plum:#b07ac0; --moss:#9bc76b;
+  --disp:"Rajdhani", "Bahnschrift Condensed", "Roboto Condensed", "Arial Narrow", sans-serif;
+  --mono:"Share Tech Mono", "Source Code Pro", Consolas, "Ubuntu Mono", monospace;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--iron);color:var(--bone);font:15px/1.6 var(--mono);
+  background-image:
+   radial-gradient(1100px 560px at 88% -10%, rgba(155,199,107,.12), transparent 60%),
+   radial-gradient(900px 500px at -10% 45%, rgba(224,169,62,.07), transparent 60%),
+   repeating-linear-gradient(0deg, rgba(255,255,255,.012) 0 1px, transparent 1px 4px);}
+a{color:var(--brass)}
+code{font-family:var(--mono);background:var(--iron3);padding:0 .35em;border:1px solid var(--seam);color:var(--brass);font-size:.92em;overflow-wrap:anywhere}
+pre{background:var(--iron);border:1px solid var(--seam);padding:12px 14px;overflow-x:auto;font-size:13px;line-height:1.5;color:var(--ash);max-width:100%;margin:10px 0}
+header.hero{padding:64px 6vw 36px;border-bottom:2px solid var(--seam);position:relative;overflow:hidden}
+header.hero::after{content:"";position:absolute;right:-60px;top:-60px;width:360px;height:360px;border-radius:50%;
+  border:26px solid rgba(155,199,107,.07);box-shadow:inset 0 0 0 2px rgba(155,199,107,.12);pointer-events:none}
+.kicker{font:700 12px/1.4 var(--mono);letter-spacing:.24em;text-transform:uppercase;color:var(--moss)}
+.kicker a{color:inherit}
+h1{font:700 clamp(46px,9vw,118px)/.88 var(--disp);margin:14px 0 18px;text-transform:uppercase;letter-spacing:-.01em}
+h1 em{font-style:normal;color:var(--moss)}
+h1 .thin{font-weight:400;color:var(--ash)}
+.lede{max-width:760px;color:var(--ash);font-size:16px}
+nav.toc{display:flex;flex-wrap:wrap;margin-top:26px;border:1px solid var(--seam);width:fit-content;max-width:100%}
+nav.toc a{padding:10px 14px;text-decoration:none;color:var(--ash);border-right:1px solid var(--seam);font-size:12px;letter-spacing:.12em;text-transform:uppercase}
+nav.toc a:last-child{border-right:0}
+nav.toc b{color:var(--brass);margin-right:6px}
+@media (hover:hover){nav.toc a:hover{background:var(--moss);color:var(--iron)}}
+section{padding:56px 6vw;border-bottom:1px solid var(--seam)}
+section:nth-of-type(even){background:rgba(0,0,0,.18)}
+.sechead{display:grid;grid-template-columns:110px 1fr;gap:22px;align-items:end;margin-bottom:24px}
+.num{font:700 110px/.8 var(--disp);color:transparent;-webkit-text-stroke:2px var(--rust-d)}
+h2{font:700 clamp(32px,4.6vw,60px)/.95 var(--disp);text-transform:uppercase;margin:0}
+h2 small{display:block;font:400 14px/1.4 var(--mono);text-transform:none;color:var(--dim);margin-top:10px}
+h3{font:700 22px/1.1 var(--disp);text-transform:uppercase;letter-spacing:.04em;color:var(--brass);margin:0 0 10px}
+p{max-width:820px}
+.cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.3fr);gap:32px}
+.cols>*{min-width:0}
+.panel{background:var(--iron2);border:1px solid var(--seam);padding:20px;min-width:0}
+.callout{border-left:4px solid var(--rust);background:rgba(208,88,31,.07);padding:12px 16px;margin:16px 0;max-width:820px}
+.callout.v{border-color:var(--verd);background:rgba(79,176,160,.07)}
+.callout.b{border-color:var(--brass);background:rgba(224,169,62,.06)}
+.aside{font-size:13px;color:var(--ash)}
+
+.ctlrow{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;margin:4px 0 12px}
+.ctlhead{font-size:12px;color:var(--ash);min-width:70px}
+.seg{display:inline-flex;border:2px solid var(--seam);flex-wrap:wrap}
+.seg button{font:700 12px/1 var(--mono);letter-spacing:.04em;padding:9px 11px;border:0;border-right:1px solid var(--seam);background:transparent;color:var(--ash);cursor:pointer}
+.seg button:last-child{border-right:0}
+.seg button[aria-pressed=true]{background:var(--moss);color:var(--iron)}
+.presets{display:flex;flex-direction:column;gap:6px;margin:0 0 12px}
+.presets button{font:13px/1.25 var(--mono);text-align:left;padding:9px 10px;border:1px solid var(--seam);background:var(--iron);color:var(--ash);cursor:pointer}
+.presets button[aria-pressed=true]{border-color:var(--moss);background:rgba(155,199,107,.12);color:var(--bone)}
+.opts{display:flex;flex-direction:column;gap:6px;margin:6px 0 12px}
+.toggle{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--ash);cursor:pointer}
+.toggle input{accent-color:var(--moss);width:18px;height:18px;flex:none}
+.opt-local{border:1px dashed var(--seam);padding:8px 10px;margin:4px 0 12px}
+
+/* DAG as rows */
+.dag{display:flex;flex-direction:column;gap:0}
+.tier{display:flex;flex-wrap:wrap;gap:10px}
+.node{flex:1 1 150px;min-width:0;border:2px solid var(--seam);background:var(--iron);padding:8px 10px}
+.node h5{margin:0;font:700 17px/1 var(--disp);letter-spacing:.06em;text-transform:uppercase;display:flex;justify-content:space-between;gap:6px;flex-wrap:wrap}
+.node h5 span{font:400 11px var(--mono);color:var(--dim);letter-spacing:.03em;text-transform:none}
+.cls{display:inline-block;margin-top:6px;font-size:11px;letter-spacing:.06em;padding:2px 7px;border:1px solid currentColor}
+.c-fused{color:var(--moss)} .c-stream{color:var(--verd)} .c-mat{color:var(--brass)}
+.node.fused{border-color:var(--moss)} .node.stream{border-color:var(--verd)} .node.mat{border-color:var(--brass)}
+.node .why{font-size:12px;color:var(--ash);margin-top:6px}
+.node .state{font-size:12px;color:var(--plum);margin-top:4px}
+.edges{display:flex;flex-wrap:wrap;gap:6px 14px;padding:6px 4px 6px 14px;margin:2px 0;border-left:2px solid var(--seam)}
+.edge{font-size:12px;color:var(--ash);display:flex;gap:6px;align-items:baseline;flex-wrap:wrap}
+.edge b{font-weight:400;padding:1px 6px;border:1px solid currentColor;font-size:11px}
+.edge .ch{color:var(--verd)} .edge .slot{color:var(--brass)} .edge .own{color:var(--moss)}
+.legend{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12px;color:var(--ash);margin:10px 0}
+.explain-out{white-space:pre;font-size:12px}
+.off-banner{display:none;border:2px solid var(--brass);background:rgba(224,169,62,.08);padding:8px 12px;margin:0 0 10px;font-size:13px}
+.off-banner.on{display:block}
+
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));border:2px solid var(--seam)}
+.card{padding:16px 18px;border-right:1px solid var(--seam);border-bottom:1px solid var(--seam);min-width:0}
+.card h4{margin:0 0 6px;font:700 22px/1 var(--disp);text-transform:uppercase}
+.card p{font-size:13px;color:var(--ash);margin:0 0 8px}
+footer{padding:36px 6vw;color:var(--dim);font-size:12px}
+
+@media (max-width:980px){.cols{grid-template-columns:1fr}}
+@media (max-width:720px){
+  .sechead{grid-template-columns:1fr;gap:6px}.num{font-size:64px}
+  h2{font-size:clamp(28px,10vw,36px)}
+  section{padding:44px 5vw}
+  header.hero{padding:44px 5vw 28px}
+}
+@media (max-width:720px),(pointer:coarse){
+  .aside,.card p,footer,.ctlhead,.node .why,.edge,.toggle,.presets button,.off-banner{font-size:14px}
+}
+/* 44px targets on touch screens, and on any narrow screen in case the pointer is misreported */
+@media (pointer:coarse),(max-width:720px){
+  .seg button,.presets button{min-height:44px}
+  .toggle{min-height:44px}
+  .toggle input{width:24px;height:24px;margin:10px}
+  nav.toc a{display:flex;align-items:center;min-height:44px}
+  .kicker a{display:inline-block;line-height:44px}
+}
+@media (prefers-reduced-motion: reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="kicker">Clinker user guide · <a href="streaming-vs-blocking.html">← back to Streaming vs. Blocking</a></div>
+  <h1>Stream<br><em>or hold</em><span class="thin"> stage by stage</span></h1>
+  <p class="lede">Some stages pass records along as they arrive; others have to collect their whole input first. Which one a stage is decides how much memory it needs. Pick a pipeline shape and flip its settings, and every stage shows its class, why, and the <code>--explain</code> lines you would see.</p>
+  <nav class="toc">
+    <a href="#builder"><b>01</b>Pipeline builder</a>
+    <a href="#classes"><b>02</b>The three classes</a>
+    <a href="#switches"><b>03</b>What turns it off</a>
+  </nav>
+</header>
+
+<!-- ============================ 01 ============================ -->
+<section id="builder">
+  <div class="sechead"><div class="num">01</div><h2>Pipeline builder<small>Every stage classified the way the planner does it</small></h2></div>
+  <div class="cols">
+    <div class="panel">
+      <div class="ctlhead" style="margin-bottom:6px">pipeline shape</div>
+      <div class="presets" data-presets></div>
+      <div class="opt-local" data-local></div>
+      <div class="ctlhead">whole pipeline</div>
+      <div class="opts">
+        <label class="toggle"><input type="checkbox" data-g="ck"><span>a Source declares <code>correlation_key</code></span></label>
+        <label class="toggle"><input type="checkbox" data-g="doc"><span>a Source sets <code>dlq_granularity: document</code></span></label>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="off-banner" data-off></div>
+      <div class="legend">
+        <span class="c-fused">■ streams, holds one batch</span>
+        <span class="c-stream">■ streams, builds its own result first</span>
+        <span class="c-mat">■ materialized: output held in a buffer</span>
+      </div>
+      <div class="dag" data-dag></div>
+      <h3 style="margin-top:18px">--explain</h3>
+      <pre class="explain-out" data-explain></pre>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ 02 ============================ -->
+<section id="classes">
+  <div class="sechead"><div class="num">02</div><h2>The three classes<small>And the one question that decides them</small></h2></div>
+  <div class="cards">
+    <div class="card"><h4 class="c-fused">Streams, one batch</h4><p>Only two shapes: a <b>Source → Transform → Sink</b> chain, and an <code>interleave</code> Merge without an <code>interleave_seed</code> whose inputs are all Sources. They pull records off the reader and pass each batch on, so their memory stays at one batch (<code>pipeline.batch_size</code>, default 2048) however big the input is.</p></div>
+    <div class="card"><h4 class="c-stream">Streams, result built first</h4><p>A Route with one wired branch, any Merge, a <code>streaming</code> Aggregate, a hash Combine, or a range Combine's output. Each hands its output straight to <b>one</b> consumer instead of copying it into a buffer, but still builds its own result first.</p></div>
+    <div class="card"><h4 class="c-mat">Materialized</h4><p>The output goes into a buffer between stages. The buffer counts against <code>memory.limit</code> and spills to disk under pressure, so materialized is not unbounded: it is held, not lost.</p></div>
+  </div>
+  <div class="callout v" style="margin-top:20px"><b>Two questions:</b> is this a stage that can hand off a stream (a Transform reading straight from one Source, a Merge, a Route, a <code>streaming</code> Aggregate, or a hash or range Combine)? And does its output go to exactly one consumer that can take one (a Sink, the input side of an Aggregate that isn't time-windowed, or the driver side of a hash Combine)? A no to either, two consumers, or a window all mean a buffer. In Source → Transform → Transform → Sink, only the first Transform streams.</div>
+  <p class="aside">Separately, some stages <b>block</b> by nature: a hash Aggregate needs every group member before it can emit, a sort needs all its input, and a Combine builds its whole lookup side first. They hold that state within the memory budget and spill when it gets tight. A blocking stage can still have a streamed input, as the Aggregate in “Source → Transform → Aggregate” shows.</p>
+</section>
+
+<!-- ============================ 03 ============================ -->
+<section id="switches">
+  <div class="sechead"><div class="num">03</div><h2>What turns it off<small>Settings that force buffers</small></h2></div>
+  <div class="cards">
+    <div class="card"><h4>Correlation keys</h4><p>A <code>correlation_key</code> on any Source makes the engine hold rows until each group's outcome is known, so no stage streams to a consumer anywhere in the pipeline. Sinks still show <code>streaming</code> in <code>--explain</code>, although the correlation commit writes their rows (tracked in <a href="https://github.com/rustpunk/clinker/issues/1318">#1318</a>).</p></div>
+    <div class="card"><h4>Document DLQ</h4><p><code>dlq_granularity: document</code> on any Source does the same, and every Sink becomes materialized: it keeps each open file's records until the file's verdict. A Source read live by a single Transform or by an unseeded interleave Merge still hands its records straight over.</p></div>
+    <div class="card"><h4>Sink settings</h4><p>A Sink with <code>sort_order</code>, <code>split</code>, or a per-source-file path takes no stream; the stage before it keeps a buffer.</p></div>
+    <div class="card"><h4>Windows and fan-out</h4><p>A Transform with an <code>analytic_window</code> needs its whole input to build the window. A stage feeding two consumers, like a Transform read by two Sinks or a Route with two branches, gives each its own buffer.</p></div>
+    <div class="card"><h4>Batch size</h4><p><code>pipeline.batch_size</code> sets how many records cross a stream at a time. It caps memory only for the one-batch shapes; for the others it sets the slice size. It never changes the output.</p></div>
+  </div>
+</section>
+
+<footer>The classification on this page ports the planner's streaming classifier (<code>classify_stream_nodes</code> and <code>certify_streaming_edge</code>) for the shapes shown, and matches the committed <code>--explain</code> buffer-class tests. It runs in your browser; it does not run the engine.</footer>
+
+<script>
+"use strict";
+/* Each preset: nodes {id,kind,name,label,...props} and edges [from,to]. */
+const PRESETS={
+  linear:{label:"Source → Transform → Sink",
+    nodes:[{id:"s",kind:"Source",name:"orders"},{id:"t",kind:"Transform",name:"clean",window:false},{id:"k",kind:"Sink",name:"out"}],
+    edges:[["s","t"],["t","k"]],
+    local:[{key:"t.window",label:"Transform has an analytic_window"},{key:"k.sort",label:"Sink sets sort_order"},{key:"extraSink",label:"Transform also feeds a second Sink"}]},
+  agg:{label:"Source → Transform → Aggregate → Sink",
+    nodes:[{id:"s",kind:"Source",name:"orders"},{id:"t",kind:"Transform",name:"clean",window:false},{id:"a",kind:"Aggregate",name:"totals",strategy:"hash"},{id:"k",kind:"Sink",name:"out"}],
+    edges:[["s","t"],["t","a"],["a","k"]],
+    local:[{key:"a.strategy",label:"Aggregate strategy: streaming (input sorted on the key)"},{key:"a.timewin",label:"Aggregate is time-windowed"}]},
+  route:{label:"Source → Route → Sinks",
+    nodes:[{id:"s",kind:"Source",name:"orders"},{id:"t",kind:"Transform",name:"clean",window:false},{id:"r",kind:"Route",name:"by_region"},{id:"k1",kind:"Sink",name:"north"},{id:"k2",kind:"Sink",name:"south"}],
+    edges:[["s","t"],["t","r"],["r","k1"],["r","k2"]],
+    local:[{key:"single",label:"only one Route branch is wired to a stage (the default: branch counts)"}]},
+  merge:{label:"Two Sources → Merge → Sink",
+    nodes:[{id:"s1",kind:"Source",name:"east"},{id:"s2",kind:"Source",name:"west"},{id:"m",kind:"Merge",name:"all",mode:"interleave"},{id:"k",kind:"Sink",name:"out"}],
+    edges:[["s1","m"],["s2","m"],["m","k"]],
+    local:[{key:"m.mode",label:"Merge mode: concat (instead of interleave)"},{key:"m.seed",label:"Merge sets interleave_seed"}]},
+  combine:{label:"Orders × products → Combine → Sink",
+    nodes:[{id:"s",kind:"Source",name:"orders"},{id:"t",kind:"Transform",name:"clean",window:false},{id:"p",kind:"Source",name:"products"},{id:"c",kind:"Combine",name:"enrich",strategy:"hash"},{id:"k",kind:"Sink",name:"out"}],
+    edges:[["s","t"],["t","c"],["p","c"],["c","k"]], driver:{c:"t"},
+    local:[{key:"c.strategy",label:"join strategy",choices:[["hash","hash (equal ids)"],["iejoin","range (IEJoin)"],["sortmerge","sort-merge"],["grace","grace hash"]]}]},
+};
+const S={preset:"linear",ck:false,doc:false,opt:{}};
+
+function build(){
+  const P=PRESETS[S.preset];
+  const nodes=P.nodes.map(n=>({...n})), edges=P.edges.map(e=>[...e]); const o=S.opt;
+  const N=id=>nodes.find(n=>n.id===id);
+  if(S.preset==="linear"){ N("t").window=!!o["t.window"]; N("k").sort=!!o["k.sort"];
+    if(o.extraSink){ nodes.push({id:"k2",kind:"Sink",name:"audit"}); edges.push(["t","k2"]); } }
+  if(S.preset==="agg"){ N("a").strategy=o["a.strategy"]?"streaming":"hash"; N("a").timewin=!!o["a.timewin"]; }
+  if(S.preset==="route"&&o.single){ const i=nodes.findIndex(n=>n.id==="k2"); nodes.splice(i,1); edges.splice(edges.findIndex(e=>e[1]==="k2"),1); }
+  if(S.preset==="merge"){ N("m").mode=o["m.mode"]?"concat":"interleave"; N("m").seed=!!o["m.seed"]; }
+  if(S.preset==="combine") N("c").strategy=o["c.strategy"]||"hash";
+  return {nodes,edges,driver:P.driver||{}};
+}
+
+/* Port of classify_stream_nodes / certify_streaming_edge for these shapes. */
+function classify(g){
+  const N=id=>g.nodes.find(n=>n.id===id);
+  const out=id=>g.edges.filter(e=>e[0]===id).map(e=>e[1]);
+  const inn=id=>g.edges.filter(e=>e[1]===id).map(e=>e[0]);
+  const single=id=>out(id).length===1;
+  // Merge.interleave fused with Sources that feed only it
+  const mergeFused=new Set();
+  for(const m of g.nodes.filter(n=>n.kind==="Merge"&&n.mode==="interleave"&&!n.seed)){   // a seeded interleave takes no fusion
+    const preds=inn(m.id); if(preds.length&&preds.every(p=>N(p).kind==="Source"&&single(p))) preds.forEach(p=>mergeFused.add(p));
+  }
+  // Source → Transform fusion: no window, single Source input, Source feeds only it
+  const fusedT=new Set(), transformFused=new Set();
+  for(const t of g.nodes.filter(n=>n.kind==="Transform")){
+    const preds=inn(t.id); if(t.window||preds.length!==1) continue;
+    const s=N(preds[0]); if(s.kind!=="Source"||mergeFused.has(s.id)||!single(s.id)) continue;
+    fusedT.add(t.id); transformFused.add(s.id);
+  }
+  const fusedSources=new Set([...mergeFused,...transformFused]);
+  const off=S.ck||S.doc;
+  const why={}, producers=new Set();
+  const certifyProducer=(pid,cid)=>{
+    const p=N(pid);
+    if(!single(pid)){ why[pid]=`feeds ${out(pid).length} consumers, so each gets its own buffer`; return false; }
+    if(p.kind==="Transform"){ if(!fusedT.has(pid)){ why[pid]=p.window?"has an analytic_window, which needs its whole input":"is not fused to a single Source"; return false; } return true; }
+    if(p.kind==="Merge"||p.kind==="Route") return true;
+    if(p.kind==="Aggregate"){ if(p.strategy!=="streaming"){ why[pid]="a hash Aggregate emits only after its whole input, into a buffer"; return false; } return true; }
+    if(p.kind==="Combine"){ if(!["hash","iejoin"].includes(p.strategy)){ why[pid]=`a ${p.strategy==="grace"?"grace hash":"sort-merge"} join keeps its output in a buffer`; return false; } return true; }
+    return false; // a Source is never a certified producer on its own
+  };
+  if(!off){
+    for(const c of g.nodes){
+      let pid=null;
+      if(c.kind==="Sink"){ if(c.sort) { inn(c.id).forEach(p=>why[p]=why[p]||"its Sink sets sort_order, so the Sink takes no stream"); continue; } const ps=inn(c.id); if(ps.length===1) pid=ps[0]; }
+      else if(c.kind==="Aggregate"){ if(c.timewin){ inn(c.id).forEach(p=>why[p]=why[p]||"a time-windowed Aggregate needs several passes over its input"); continue; } const ps=inn(c.id); if(ps.length===1) pid=ps[0]; }
+      else if(c.kind==="Combine"){ if(c.strategy!=="hash"){ const d=g.driver[c.id]; if(d) why[d]=why[d]||"only a hash join takes its driver as a stream"; continue; } pid=g.driver[c.id]||null; }
+      if(pid&&certifyProducer(pid,c.id)) producers.add(pid);
+    }
+  }
+  const cls={};
+  for(const n of g.nodes){
+    if(n.kind==="Sink"){ cls[n.id]=S.doc?"mat":"sink"; continue; }
+    if(n.kind==="Source"){ cls[n.id]=fusedSources.has(n.id)?"fusedsrc":"mat"; continue; }
+    if(producers.has(n.id)){ cls[n.id]=(n.kind==="Transform"||(n.kind==="Merge"&&n.mode==="interleave"&&inn(n.id).every(p=>mergeFused.has(p))))?"fused":"stream"; continue; }
+    cls[n.id]="mat";
+  }
+  return {cls,why,off,fusedSources,producers,out,inn,N};
+}
+
+function render(){
+  const g=build(), r=classify(g), P=PRESETS[S.preset];
+  document.querySelectorAll("[data-preset]").forEach(b=>b.setAttribute("aria-pressed",String(b.dataset.preset===S.preset)));
+  $("[data-local]").innerHTML=`<div class="ctlhead" style="margin-bottom:4px">this shape</div>`+P.local.map(l=>{
+    if(l.choices) return `<div class="ctlrow"><span class="ctlhead">${l.label}</span><div class="seg" data-choice="${l.key}">${l.choices.map(([v,t])=>`<button data-v="${v}" aria-pressed="${(S.opt[l.key]||l.choices[0][0])===v}">${t}</button>`).join("")}</div></div>`;
+    return `<label class="toggle"><input type="checkbox" data-opt="${l.key}" ${S.opt[l.key]?"checked":""}><span>${l.label}</span></label>`; }).join("");
+  document.querySelectorAll("[data-g]").forEach(i=>i.checked=S[i.dataset.g]);
+  const ob=$("[data-off]");
+  ob.innerHTML=r.off?`<b>Streaming is off for the whole pipeline:</b> ${S.ck?"a correlation key holds rows until each group's outcome is known":"document DLQ holds each file's records until its verdict"}. Sources read live by a Transform or by an unseeded interleave Merge keep streaming.`:""; ob.classList.toggle("on",r.off);
+  // tiers by longest path from a root
+  const depth={}; const d=id=>depth[id]??(depth[id]=Math.max(0,...r.inn(id).map(p=>d(p)+1)));
+  g.nodes.forEach(n=>d(n.id));
+  const tiers=[]; g.nodes.forEach(n=>(tiers[depth[n.id]]=tiers[depth[n.id]]||[]).push(n));
+  const label={fused:["streams · one batch","c-fused","fused"],fusedsrc:["streams · read directly","c-fused","fused"],stream:["streams · builds result first","c-stream","stream"],sink:["streaming (writes as it goes)","c-stream","stream"],mat:["materialized","c-mat","mat"]};
+  const reason=n=>{
+    const c=r.cls[n.id];
+    if(n.kind==="Sink") return S.doc?"keeps each open file's records until the file's verdict":"writes each record to its file as it arrives";
+    if(c==="fusedsrc") return r.out(n.id).length===1&&r.N(r.out(n.id)[0]).kind==="Merge"?"the interleave Merge reads it live":"its Transform reads it live, without a buffer";
+    if(n.kind==="Source") return r.out(n.id).length>1?"read by two consumers, so its records go into a buffer":"no fused reader, so its records go into a buffer for the next stage";
+    if(c==="fused") return n.kind==="Transform"?"reads its Source live and hands each batch on":"reads every Source live and passes records on as they arrive";
+    if(c==="stream") return `hands its output straight to ${r.N(r.out(n.id)[0]).name}`;
+    if(r.off) return "streaming is off pipeline-wide";
+    return r.why[n.id]||"its consumer can't take a stream";
+  };
+  const state=n=>n.kind==="Aggregate"?(n.strategy==="streaming"?"emits each group as the key changes":"holds every group until its input ends"):n.kind==="Combine"?({hash:"holds the products lookup table",iejoin:"sorts both sides into blocks on disk",sortmerge:"sorts both sides",grace:"partitions the build side, spilling to disk"}[n.strategy]):"";
+  const edgeKind=(a,b)=>{ const ca=r.cls[a];
+    if(ca==="fusedsrc") return ["read live","own"];
+    if(ca==="fused"||ca==="stream") return ["stream (channel)","ch"];
+    if(r.N(b).kind==="Combine"&&g.driver[b]!==a) return ["build side, loaded in full","slot"];
+    return ["node_buffer slot","slot"]; };
+  $("[data-dag]").innerHTML=tiers.map((t,i)=>{
+    const nodesHtml=`<div class="tier">${t.map(n=>{ const [txt,cc,bc]=label[r.cls[n.id]];
+      return `<div class="node ${bc}"><h5>${n.name}<span>${n.kind}${n.kind==="Merge"?" · "+n.mode+(n.seed?" (seeded)":""):""}${n.kind==="Aggregate"?" · "+n.strategy:""}</span></h5><span class="cls ${cc}">${txt}</span><div class="why">${reason(n)}</div>${state(n)?`<div class="state">state: ${state(n)}</div>`:""}</div>`; }).join("")}</div>`;
+    const es=t.flatMap(n=>r.out(n.id).map(b=>[n.id,b]));
+    const edgesHtml=es.length?`<div class="edges">${es.map(([a,b])=>{ const [txt,cc]=edgeKind(a,b); return `<span class="edge">${r.N(a).name} → ${r.N(b).name} <b class="${cc}">${txt}</b></span>`; }).join("")}</div>`:"";
+    return nodesHtml+edgesHtml;
+  }).join("");
+  const kindSlug={Source:"source",Transform:"transform",Aggregate:"aggregation",Route:"route",Merge:"merge",Combine:"combine",Sink:"sink"};
+  $("[data-explain]").textContent="=== Physical Properties ===\n\n"+g.nodes.map(n=>`${kindSlug[n.kind]}.${n.name}:\n  buffer: ${["mat"].includes(r.cls[n.id])?"materialized":"streaming"}`).join("\n\n");
+}
+const $=(s,r=document)=>r.querySelector(s);
+$("[data-presets]").innerHTML=Object.entries(PRESETS).map(([k,p])=>`<button data-preset="${k}">${p.label}</button>`).join("");
+document.addEventListener("click",e=>{
+  const p=e.target.closest("[data-preset]"); if(p){ S.preset=p.dataset.preset; S.opt={}; render(); return; }
+  const c=e.target.closest("[data-choice] button"); if(c){ S.opt[c.parentElement.dataset.choice]=c.dataset.v; render(); }
+});
+document.addEventListener("change",e=>{
+  const o=e.target.closest("[data-opt]"); if(o){ S.opt[o.dataset.opt]=o.checked; render(); return; }
+  const gl=e.target.closest("[data-g]"); if(gl){ S[gl.dataset.g]=gl.checked; render(); }
+});
+render();
+</script>
+</body>
+</html>

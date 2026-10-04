@@ -231,10 +231,11 @@ These stages stream their output to a single downstream consumer too — sparing
 - **`Merge` in `concat` mode, or `interleave` fed by non-Source inputs**, feeding one Sink. The merge drains its predecessors' buffers in order (concat) or round-robin (interleave) into the merged result, then streams it.
 - **`streaming`-strategy `Aggregate`** feeding one Sink. When the planner certifies the aggregate's input is pre-sorted on the group key, it finalizes the group rows and streams them rather than buffering them for a downstream arm.
 - **`Combine` probe side** (hash build-probe strategy) feeding one Sink. The build relation stays fully materialized in the hash table; the matched probe output streams to the writer.
+- **Block-band `Combine` output** (`IEJoin` and `HashPartitionIEJoin`) feeding one Sink. The join blocks on its inputs, sorting both sides first, but its bounded, payload-sorted output drain streams to the consumer instead of admitting a node buffer. The sort-merge and grace-hash joins keep their output materialized.
 
 Each of these requires the producer to feed exactly one downstream consumer and to root no window; a producer that roots a window keeps the materialized path because the window arena needs the producer's full output to build.
 
-- **Every `Sink`** writes records to its configured writer and never buffers a whole stage.
+- **Every `Sink`** writes records to its configured writer and never buffers a whole stage, except under `dlq_granularity: document`, where it holds each open document's records until the document's verdict. A Sink with an authored `sort_order`, a `split`, or a per-source-file path does not certify its producer as a streaming edge (`certify_streaming_edge`), so that producer keeps a materialized slot.
 
 Document-boundary punctuations (`DocumentOpen` / `DocumentClose`, the signals behind the `$doc.*` context) flow inline with records through streaming stages, preserving their order: a document's close always trails the document's last record, even when the document's records span several batches.
 
