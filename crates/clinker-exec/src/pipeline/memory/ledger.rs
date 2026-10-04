@@ -303,7 +303,10 @@ impl MemoryArbitrator {
 
     /// High-water mark of `id`'s handle bytes plus the bytes granted in its
     /// name, raised by every charge to it and never lowered by a release.
-    /// `None` when the ledger holds no entry for `id`.
+    /// `None` when the ledger holds no entry for `id`. A charge in the name of
+    /// a consumer that has already unregistered recreates an unlabelled entry
+    /// for it, and this then returns that entry's partial mark rather than
+    /// `None`; only tests read the figure today.
     pub fn consumer_peak_charged_bytes(&self, id: ConsumerId) -> Option<u64> {
         self.admission.ledger.lock().consumer_mark(id.0)
     }
@@ -378,6 +381,12 @@ impl MemoryArbitrator {
     /// path. Arming again replaces an arm that has not fired. The charge may
     /// be a [`Self::reserve`], a [`Grant::try_grow`] or a consumer handle's
     /// `try_grow` / `try_resize`.
+    ///
+    /// Arming an arbitrator the test builds itself is the supported form in
+    /// this build. Armed for a whole run, the lever reaches only a Source's
+    /// record allocations, because node state charges its handles unchecked,
+    /// and nothing answers that refusal (see
+    /// [`crate::executor::ForcedShortfall`]).
     ///
     /// For the two kinds of test [`crate::executor::ForcedShortfall`]
     /// permits: a test that spills a whole unit and then reloads it, where no

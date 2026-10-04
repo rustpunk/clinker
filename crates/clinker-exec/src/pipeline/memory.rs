@@ -1825,8 +1825,8 @@ impl MemoryArbitrator {
     }
 
     /// Number of consumers currently registered. Diagnostics surface
-    /// for `--explain` and integration tests; per-consumer attribution
-    /// reads `current_usage()` via `sum_consumer_usage`.
+    /// for `--explain` and integration tests; per-consumer charges are
+    /// read from the ledger under its lock.
     pub fn consumer_count(&self) -> usize {
         self.consumers.load().len()
     }
@@ -1925,9 +1925,9 @@ impl MemoryArbitrator {
     ///    byte-for-byte today's order.
     ///
     /// Headroom is recomputed fresh on every call (never cached) because
-    /// `sum_consumer_usage()` is a lock-free snapshot that a concurrent
-    /// register / unregister can move between calls — the same benign
-    /// race `poll_arbitration` already tolerates.
+    /// `sum_consumer_usage()` reads the ledger total under its mutex, and a
+    /// concurrent charge, register or unregister can move it between calls
+    /// — the same benign race `poll_arbitration` already tolerates.
     ///
     /// # Panics
     ///

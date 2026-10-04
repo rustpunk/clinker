@@ -104,9 +104,13 @@ count every staged byte twice. It stays registered for its inventory row. It
 is never backpressureable: parking
 the synchronous writer would prevent its own release progress. Spill requests
 are consumed at chunk boundaries, and cancellation is checked before consulting
-pause state. Grants and cleanup debt keep the admission owner registered after
-the provider handle drops; the final owner unregisters it on success, error or
-cancellation while the run remains open. Closing the run closes admission and
+pause state. Grants and cleanup debt issued through the writer's own admission
+keep the admission owner registered after the provider handle drops; the final
+owner unregisters it on success, error or cancellation while the run remains
+open. A lease issued through a Source's attributed view is the exception: it
+releases through its reservation state and holds no release authority, so it
+does not keep the writer consumer registered. The accounting stays correct
+because that consumer's handle charges nothing. Closing the run closes admission and
 unregisters the consumer even if an allocation escapes the run. Such an
 allocation retains only the synchronized release state and a weak arbitrator
 reference, so its eventual drop still settles the ledger without retaining the

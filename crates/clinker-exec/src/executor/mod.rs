@@ -292,8 +292,9 @@ struct DagExecResources {
     /// consumer, keyed by Source node name in lockstep with
     /// `source_records`. The dispatch arm that takes a source's receiver
     /// out of `source_records` also owns this entry and releases it at
-    /// receiver disconnect, so a drained source's queue estimate leaves
-    /// `sum_consumer_usage` instead of freezing until arbitrator drop.
+    /// receiver disconnect, so a drained source's per-attempt queued charge
+    /// leaves the ledger total `sum_consumer_usage` reads instead of
+    /// freezing until arbitrator drop.
     source_consumers: HashMap<
         String,
         (
@@ -2074,14 +2075,14 @@ impl PipelineExecutor {
         // Sources the walk never drained — an error unwind or an interrupt
         // before their dispatch turn — still hold their ingest-channel
         // registration. Release them here so the registry does not outlive
-        // the walk with a frozen queue estimate summed in. On a completed
+        // the walk with a frozen queued charge on the ledger. On a completed
         // walk this map is empty: each drain arm released its entry at
         // receiver disconnect. `resume` before unregister is load-bearing:
         // an arbitration round may have paused an undrained source's ingest
         // thread, and once the wrapper leaves the registry nothing else can
         // unpark it — the thread would sit parked forever and the caller's
         // ingest-thread join would hang. `set_bytes(0)` keeps the shared
-        // handle's mirrored estimate truthful; the unregister is what drops
+        // handle's ledger charge truthful; the unregister is what drops
         // the consumer out of `sum_consumer_usage`.
         for (_, (id, handle)) in std::mem::take(&mut ctx.source_consumers) {
             handle.resume();

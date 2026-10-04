@@ -284,29 +284,34 @@ It keeps `memory.limit` ample and uses the test levers on
   `with_baseline_rss(bytes)` injects another figure; `with_process_memory()`
   measures instead. Without those builds `Default` is
   `MemoryTestOverrides::process()`, which measures and overrides nothing.
-- `with_forced_shortfall(ForcedShortfall::at(matcher, nth))`, or
-  `MemoryArbitrator::force_shortfall_once(matcher, nth)` on an arbitrator a
-  test builds itself, makes the `nth` (from 1) charge by a requester whose
+- `MemoryArbitrator::force_shortfall_once(matcher, nth)` on an arbitrator a
+  test builds itself makes the `nth` (from 1) charge by a requester whose
   label `matcher` accepts fall short, as a real shortage would, and marks
-  the refusal forced (`Shortfall::forced`). Every charge path counts:
-  `reserve`, `Grant::try_grow` and a handle's `try_grow` / `try_resize`. A
-  due firing waits for a charge whose requester holds resident bytes, so it
-  never refuses a consumer with nothing to free. `.times(n)` and
-  `.every(k)` repeat it `n` times, `k` matching charges apart
-  (`MemoryArbitrator::arm_forced_shortfall` arms such a value directly), and
-  `.fired()` is a shared counter of its firings. Every other charge takes
-  the real path. It has two permitted uses, and each test records its
-  reason in its doc comment: a test that spills a whole unit and then
-  reloads it, where no capacity both forces the spill and admits the
-  reload; and a spill-path-equivalence test (spilled output equals resident
-  output), run twice at the same ample limit, unarmed with zero spill bytes
-  and armed with the arm fired and the named node's
-  `per_stage_spill_bytes_written` above 0.
+  the refusal forced (`Shortfall::forced`). On such an arbitrator every
+  checked charge path counts: `reserve`, `Grant::try_grow` and a handle's
+  `try_grow` / `try_resize`. A due firing waits for a charge whose requester
+  holds resident bytes. `.times(n)` and `.every(k)` repeat it `n` times, `k`
+  matching charges apart (`MemoryArbitrator::arm_forced_shortfall` arms such
+  a value directly), and `.fired()` is a shared counter of its firings.
+  Every other charge takes the real path. This is the supported use in this
+  build.
+- `with_forced_shortfall(...)` arms the same lever for a whole run, but in a
+  run node state charges its handles through the unchecked forms, so the arm
+  reaches only a Source's record allocations. Nothing answers that refusal,
+  and the run fails with a budget error rather than spilling. The run-level
+  uses (a test that spills a whole unit and then reloads it, where no
+  capacity both forces the spill and admits the reload; and a
+  spill-path-equivalence test run twice at one ample limit) need a run whose
+  requester can answer a forced refusal, which arrives with the waiting
+  work for requesters off the walk
+  ([#1247](https://github.com/rustpunk/clinker/issues/1247)).
 - Pick the lever by what the test proves:
   - a pressure pair is a derived ledger capacity and an input several
     times larger than it;
-  - a path test is an ample limit and a targeted forced spill, checked per
-    node.
+  - a run-level path test (an ample limit and a targeted forced spill,
+    checked per node) waits for the same off-walk waiting work
+    ([#1247](https://github.com/rustpunk/clinker/issues/1247)); until then
+    a path is forced on an arbitrator the test builds itself.
 - `CLINKER_TEST_LEDGER_CAPACITY=<bytes>` (a plain byte count) is the same
   capacity for a subprocess test of the debug `clinker` binary. Set it on
   the child `Command`, never on the test process. Release builds do not

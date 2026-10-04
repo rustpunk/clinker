@@ -193,6 +193,12 @@ impl<L, A> LedgerState<L, A> {
     /// larger than [`Self::available`] is refused as short. A grant raises
     /// the peak and, when attributed, the consumer's attributed bytes and
     /// mark.
+    ///
+    /// A charge attributed to a consumer the ledger holds no entry for (one
+    /// already unregistered, reached through a later lease from its view or
+    /// a grant's growth) creates an unlabelled entry for it, which nothing
+    /// removes until the run ends. The entry is never reported as a labelled
+    /// holder, but its consumer's peak mark reads from it again.
     pub(crate) fn try_charge(&mut self, bytes: u64, attribution: Option<u32>) -> Result<(), Refusal>
     where
         A: AdmissionGate<L>,
@@ -276,11 +282,14 @@ impl<L, A> LedgerState<L, A> {
 
     /// Release `bytes` charged with attribution `attribution`.
     ///
-    /// Lowers the charged total and, when the attributed consumer still has
-    /// an entry, its attributed bytes. When the entry was already removed
-    /// (its consumer unregistered while a grant in its name was still live)
-    /// the per-consumer figures are left alone: those bytes were
-    /// unattributed from the removal on. Advances the release epoch.
+    /// Lowers the charged total and, whenever the attributed consumer has an
+    /// entry, its attributed bytes. That entry may be one a later charge
+    /// recreated after the consumer unregistered (see [`Self::try_charge`]),
+    /// and the release then lowers it too. Only when no entry exists (its
+    /// consumer unregistered while a grant in its name was still live, and
+    /// nothing charged in its name since) are the per-consumer figures
+    /// untouched: those bytes were unattributed from the removal on.
+    /// Advances the release epoch.
     pub(crate) fn release(&mut self, bytes: u64, attribution: Option<u32>) {
         if bytes == 0 {
             return;

@@ -247,7 +247,10 @@ impl MemoryTestOverrides {
     /// For the two kinds of test [`ForcedShortfall`] permits: a whole-unit
     /// spill-then-reload test, and a spill-path-equivalence test run twice
     /// at one ample limit. Each use records its reason in its test's doc
-    /// comment.
+    /// comment. In this build a run-level arm reaches only a Source's record
+    /// allocations and fails the run, because nothing answers the refusal
+    /// until requesters off the walk can wait
+    /// ([#1247](https://github.com/rustpunk/clinker/issues/1247)).
     pub fn with_forced_shortfall(mut self, shortfall: ForcedShortfall) -> Self {
         self.forced_shortfall = Some(shortfall);
         self
@@ -289,18 +292,30 @@ fn env_ledger_capacity() -> Option<u64> {
 /// accepts fall short as if nothing were available, from the `nth` matching
 /// charge on, [`Self::times`] times, [`Self::every`] matching charges apart.
 ///
-/// Every charge path counts: `MemoryArbitrator::reserve`, `Grant::try_grow`
-/// and `ConsumerHandle::try_grow` / `try_resize` all reach the one locked
-/// admission check that consults it. `nth` counts from 1 and counts only
-/// matching charges, so `nth = 1` is the next one. A charge for zero bytes or
-/// for more than the whole limit, a charge on a closed ledger, a governed
-/// charge and one by an unlabelled consumer never count. A due firing waits
-/// for a matching charge whose requester holds resident bytes (its handle
-/// plus the grants made in its name), so a forced refusal always leaves the
-/// requester something to free. The refusal is the one a real shortage
-/// gives, with nothing charged, and reports itself as forced
+/// Every checked charge path counts: `MemoryArbitrator::reserve`,
+/// `Grant::try_grow` and `ConsumerHandle::try_grow` / `try_resize` all reach
+/// the one locked admission check that consults it. `nth` counts from 1 and
+/// counts only matching charges, so `nth = 1` is the next one. A charge for
+/// zero bytes or for more than the whole limit, a charge on a closed ledger,
+/// a governed charge and one by an unlabelled consumer never count. A due
+/// firing waits for a matching charge whose requester holds resident bytes
+/// (its handle plus the grants made in its name). The refusal is the one a
+/// real shortage gives, with nothing charged, and reports itself as forced
 /// (`Shortfall::forced`); every charge that does not fire takes the real
 /// path.
+///
+/// In this build the supported use is on an arbitrator a test builds
+/// itself, armed with `MemoryArbitrator::force_shortfall_once` or
+/// `MemoryArbitrator::arm_forced_shortfall`: there a matching labelled
+/// charge through any of the checked paths above counts and fires as
+/// described. In a run, node state charges its handles through the
+/// unchecked forms, so an arm set with
+/// [`MemoryTestOverrides::with_forced_shortfall`] reaches only a Source's
+/// record allocations; nothing answers that refusal, and the run fails with
+/// a budget error rather than spilling. The run-level uses below need a run
+/// whose requester can answer a forced refusal, which arrives with the
+/// waiting work for requesters off the walk
+/// ([#1247](https://github.com/rustpunk/clinker/issues/1247)).
 ///
 /// Two kinds of test may use it, and each records its reason in its doc
 /// comment:
@@ -560,6 +575,8 @@ pub struct ExecutionReport {
     /// their sum. Run-scoped state that no node owns (writer output staging,
     /// the credential registry) has no entry. A consumer's mark covers its
     /// handle's charge plus the governed allocations made in its name.
+    /// Attribution travels with each lease, so a Source's figure includes its
+    /// admitted records wherever they are held downstream.
     /// Unlike [`Self::peak_consumer_usage_bytes`], the run-wide peak of
     /// everything charged at once, this is the figure that says how much one
     /// node's state held. Sampled after all Source workers have joined.

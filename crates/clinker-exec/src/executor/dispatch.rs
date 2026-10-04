@@ -4345,8 +4345,9 @@ pub(crate) fn merge_fused_interleave(
                 // Source closed. Stamp finalized per-source count, drop
                 // the receiver slot so subsequent iterations skip it, and
                 // release the source's arbitrator registration — its
-                // channel is drained, so its queue estimate must leave
-                // `sum_consumer_usage`.
+                // channel is drained, so the Source's per-attempt queued
+                // charge must leave the ledger total `sum_consumer_usage`
+                // reads.
                 let count = per_source_counts[i];
                 let name_arc = Arc::clone(&states[i].source_name_arc);
                 receivers[i] = None;

@@ -337,7 +337,8 @@ fn public_lazy_source(domain: Domain, cancel: bool) {
     // This is aggregate nonmanaged attribution, not an exact Source handle
     // sample. At least MIN_QUEUED_ROWS remain in the source queue because the
     // writer is blocked and downstream has only DOWNSTREAM_ROWS row slots.
-    // Direct channel tests independently pin exact EWMA/depth arithmetic.
+    // Direct channel tests independently pin the exact per-attempt queued
+    // charge.
     assert_eq!(memory.backpressureable_consumer_count(), 1);
     if cancel {
         gates.shutdown.request();
