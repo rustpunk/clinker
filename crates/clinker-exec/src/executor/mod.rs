@@ -59,6 +59,9 @@ pub(crate) use dlq::{SourceRejectionEvent, SourceRejectionKind};
 #[cfg(feature = "test-utils")]
 #[doc(hidden)]
 pub use document_dlq::take_document_dlq_peak_charged_bytes_for_testing;
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub use document_dlq::{DocumentDlqTeardown, take_document_dlq_teardown_for_testing};
 pub use ingest::build_source_format_reader;
 use ingest::{IngestTaskOutcome, ingest_source};
 use params::sum_cpu_io_totals;

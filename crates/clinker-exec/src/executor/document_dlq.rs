@@ -740,6 +740,15 @@ impl Drop for DocumentDlqState {
     fn drop(&mut self) {
         #[cfg(feature = "test-utils")]
         LAST_DOCUMENT_DLQ_PEAK.with(|peak| peak.set(Some(self.handle.peak_bytes())));
+        // Read before the fields drop, so while the held log's file is
+        // still open.
+        #[cfg(feature = "test-utils")]
+        LAST_DOCUMENT_DLQ_TEARDOWN.with(|teardown| {
+            teardown.set(Some(DocumentDlqTeardown {
+                held_file_created: self.held.has_file(),
+                spill_dir_present: self.held.spill_root().exists(),
+            }));
+        });
         self.handle.set_bytes(0);
         self.arbitrator.unregister_consumer(self.consumer_id);
     }
@@ -752,6 +761,38 @@ thread_local! {
     /// not read each other's figure.
     static LAST_DOCUMENT_DLQ_PEAK: std::cell::Cell<Option<u64>> =
         const { std::cell::Cell::new(None) };
+
+    /// What the last document dead-letter state dropped on this thread saw
+    /// of its held log's file and the run's spill directory as it dropped.
+    static LAST_DOCUMENT_DLQ_TEARDOWN: std::cell::Cell<Option<DocumentDlqTeardown>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// What a document dead-letter state saw as it dropped, before its held
+/// log's file closed.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DocumentDlqTeardown {
+    /// Whether the held log had created its file in the run's spill
+    /// directory.
+    pub held_file_created: bool,
+    /// Whether the run's spill directory still existed. The held log's file
+    /// is inside it, so the directory must outlive the state: an open file
+    /// can block the directory's removal on Windows.
+    pub spill_dir_present: bool,
+}
+
+/// What the document dead-letter state of the last run that finished on
+/// this thread saw as it dropped, and clears it. `None` when no run on this
+/// thread used `dlq_granularity: document` since the last call.
+///
+/// Linux removes a directory with an open file inside it, so a test there
+/// cannot see the removal fail; it reads the teardown order instead.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub fn take_document_dlq_teardown_for_testing() -> Option<DocumentDlqTeardown> {
+    LAST_DOCUMENT_DLQ_TEARDOWN.with(std::cell::Cell::take)
 }
 
 /// The charged peak of the document dead-letter state of the last run that

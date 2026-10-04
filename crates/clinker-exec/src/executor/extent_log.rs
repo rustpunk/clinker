@@ -137,6 +137,18 @@ impl<K: Eq + Hash + Clone> ExtentLog<K> {
         }
     }
 
+    /// Whether the log has created its file.
+    #[cfg(feature = "test-utils")]
+    pub(crate) fn has_file(&self) -> bool {
+        self.file.is_some()
+    }
+
+    /// The directory the log creates its file in.
+    #[cfg(feature = "test-utils")]
+    pub(crate) fn spill_root(&self) -> &Path {
+        &self.spill_root
+    }
+
     /// The resident tail bytes, kept current as the log changes, for a
     /// consumer that reports what a flush would free.
     pub(crate) fn resident_gauge(&self) -> Arc<AtomicU64> {

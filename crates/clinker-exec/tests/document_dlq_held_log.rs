@@ -388,3 +388,121 @@ fn the_held_rows_charge_is_the_dead_letter_states_own() {
         report.per_node_peak_charged_bytes
     );
 }
+
+/// `held_log_yaml(memory_limit)` with the pipeline-wide dead-letter rate
+/// ceiling `max_rate`, checked once `min_records` source rows are read.
+#[cfg(feature = "test-utils")]
+fn held_log_yaml_with_rate(memory_limit: &str, max_rate: &str, min_records: u64) -> String {
+    let yaml = held_log_yaml(memory_limit);
+    let dlq = "  dlq:\n    path: rejected.csv\n";
+    assert!(
+        yaml.contains(dlq),
+        "the pipeline declares its dead-letter file"
+    );
+    yaml.replacen(
+        dlq,
+        &format!("{dlq}    max_rate: {max_rate}\n    min_records: {min_records}\n"),
+        1,
+    )
+}
+
+/// One run of `yaml` over `files`, returning the run's result rather than
+/// requiring it to succeed.
+#[cfg(feature = "test-utils")]
+fn try_run_yaml(
+    yaml: &str,
+    files: Vec<(String, String)>,
+) -> Result<ExecutionReport, clinker_plan::error::PipelineError> {
+    let config = parse_config(yaml).expect("parse held-log pipeline");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("compile held-log pipeline");
+    let slots: Vec<FileSlot> = files
+        .into_iter()
+        .map(|(name, body)| {
+            FileSlot::new(
+                PathBuf::from(name),
+                Box::new(Cursor::new(body.into_bytes())),
+            )
+        })
+        .collect();
+    let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
+        "events".to_string(),
+        clinker_exec::executor::SourceInput::Files(slots),
+    )]);
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(SharedBuffer::new()) as Box<dyn std::io::Write + Send>,
+    )]);
+    let params = PipelineRunParams {
+        execution_id: "e".to_string(),
+        batch_id: "b".to_string(),
+        pipeline_vars: indexmap::IndexMap::new(),
+        shutdown_token: None,
+        ..Default::default()
+    };
+    let sink = CollectingDlqSink::new();
+    PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        dlq_sink::registry(writers, &sink),
+        &params,
+    )
+}
+
+/// What the document dead-letter state of the last run on this thread saw
+/// as it dropped. The held log's one file is inside the run's spill
+/// directory, so the state must drop, closing it, before the directory's
+/// guard removes the directory: an open file can block that removal on
+/// Windows. Linux removes the directory anyway, so the tests read the order.
+#[cfg(feature = "test-utils")]
+fn teardown() -> clinker_exec::executor::DocumentDlqTeardown {
+    clinker_exec::executor::take_document_dlq_teardown_for_testing()
+        .expect("the run used dlq_granularity: document")
+}
+
+#[cfg(feature = "test-utils")]
+#[test]
+fn the_held_log_closes_before_the_spill_directory_is_removed_when_the_run_succeeds() {
+    let _ = clinker_exec::executor::take_document_dlq_teardown_for_testing();
+    let run = run_held_log("2M");
+    assert!(
+        run.report
+            .per_stage_spill_bytes
+            .get("validate")
+            .is_some_and(|&b| b > 0),
+        "the held rows flush to the held log's file; per-stage spill = {:?}",
+        run.report.per_stage_spill_bytes
+    );
+    let teardown = teardown();
+    assert!(
+        teardown.held_file_created,
+        "the held log created its file: {teardown:?}"
+    );
+    assert!(
+        teardown.spill_dir_present,
+        "the spill directory outlives the held log's file: {teardown:?}"
+    );
+}
+
+#[cfg(feature = "test-utils")]
+#[test]
+fn the_held_log_closes_before_the_spill_directory_is_removed_when_the_run_fails() {
+    let _ = clinker_exec::executor::take_document_dlq_teardown_for_testing();
+    // Every row fails, so the first rejection's rows alone pass the ceiling.
+    let yaml = held_log_yaml_with_rate("2M", "0.01", 100);
+    let error = try_run_yaml(&yaml, input_files()).expect_err("the dead-letter rate stops the run");
+    match error {
+        clinker_plan::error::PipelineError::DlqRateExceeded { source: None, .. } => {}
+        other => panic!("expected the pipeline-wide rate stop (E315), got {other:?}"),
+    }
+    let teardown = teardown();
+    assert!(
+        teardown.held_file_created,
+        "the held log created its file before the run stopped: {teardown:?}"
+    );
+    assert!(
+        teardown.spill_dir_present,
+        "the spill directory outlives the held log's file on the error path: {teardown:?}"
+    );
+}
