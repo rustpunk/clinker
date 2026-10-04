@@ -45,12 +45,12 @@ The `analytic_window` field enables cross-source lookups by joining a secondary 
       group_by: [product_id]
     cxl: |
       emit order_id = order_id
-      emit product_name = $window.first()
+      emit product_name = $window.first().product_name
       emit quantity = quantity
       emit line_total = quantity * price
 ```
 
-The `$window.*` namespace provides access to the windowed data. Functions like `$window.first()`, `$window.last()`, and `$window.count()` operate over the matched group.
+The `$window.*` namespace provides access to the windowed data. Functions like `$window.first().<field>`, `$window.last().<field>`, and `$window.count()` operate over the matched group. `first()` and `last()` return a whole record, so name the field to read; without one they return null. See [Window Functions](../cxl/windows.md).
 
 ## Validations
 

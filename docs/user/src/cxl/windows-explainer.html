@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clinker · Window functions, visually</title>
+<style>
+:root{
+  --iron:#14110f; --iron2:#1d1915; --iron3:#29231d; --seam:#3a3129;
+  --ash:#b9ab98; --bone:#ece2d0; --dim:#7d705f;
+  --rust:#d0581f; --rust-d:#8f3a13; --brass:#e0a93e; --verd:#4fb0a0;
+  --blood:#e0362c; --steel:#7f97ad; --plum:#b07ac0; --moss:#9bc76b;
+  --disp:"Rajdhani", "Bahnschrift Condensed", "Roboto Condensed", "Arial Narrow", sans-serif;
+  --mono:"Share Tech Mono", "Source Code Pro", Consolas, "Ubuntu Mono", monospace;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--iron);color:var(--bone);font:15px/1.6 var(--mono);
+  background-image:
+   radial-gradient(1100px 560px at 88% -10%, rgba(224,169,62,.13), transparent 60%),
+   radial-gradient(900px 500px at -10% 45%, rgba(127,151,173,.08), transparent 60%),
+   repeating-linear-gradient(0deg, rgba(255,255,255,.012) 0 1px, transparent 1px 4px);}
+a{color:var(--brass)}
+code{font-family:var(--mono);background:var(--iron3);padding:0 .35em;border:1px solid var(--seam);color:var(--brass);font-size:.92em;overflow-wrap:anywhere}
+pre{background:var(--iron);border:1px solid var(--seam);padding:12px 14px;overflow-x:auto;font-size:13px;line-height:1.5;color:var(--ash);max-width:100%;margin:10px 0}
+pre b{color:var(--brass);font-weight:400}
+header.hero{padding:64px 6vw 36px;border-bottom:2px solid var(--seam);position:relative;overflow:hidden}
+header.hero::after{content:"";position:absolute;right:-60px;top:-60px;width:360px;height:360px;border-radius:50%;
+  border:26px solid rgba(224,169,62,.07);box-shadow:inset 0 0 0 2px rgba(224,169,62,.12);pointer-events:none}
+.kicker{font:700 12px/1.4 var(--mono);letter-spacing:.24em;text-transform:uppercase;color:var(--brass)}
+.kicker a{color:inherit}
+h1{font:700 clamp(46px,9vw,118px)/.88 var(--disp);margin:14px 0 18px;text-transform:uppercase;letter-spacing:-.01em}
+h1 em{font-style:normal;color:var(--brass)}
+h1 .thin{font-weight:400;color:var(--ash)}
+.lede{max-width:760px;color:var(--ash);font-size:16px}
+nav.toc{display:flex;flex-wrap:wrap;margin-top:26px;border:1px solid var(--seam);width:fit-content;max-width:100%}
+nav.toc a{padding:10px 14px;text-decoration:none;color:var(--ash);border-right:1px solid var(--seam);font-size:12px;letter-spacing:.12em;text-transform:uppercase}
+nav.toc a:last-child{border-right:0}
+nav.toc b{color:var(--brass);margin-right:6px}
+@media (hover:hover){nav.toc a:hover{background:var(--brass);color:var(--iron)}}
+section{padding:56px 6vw;border-bottom:1px solid var(--seam)}
+section:nth-of-type(even){background:rgba(0,0,0,.18)}
+.sechead{display:grid;grid-template-columns:110px 1fr;gap:22px;align-items:end;margin-bottom:24px}
+.num{font:700 110px/.8 var(--disp);color:transparent;-webkit-text-stroke:2px var(--rust-d)}
+h2{font:700 clamp(32px,4.6vw,60px)/.95 var(--disp);text-transform:uppercase;margin:0}
+h2 small{display:block;font:400 14px/1.4 var(--mono);text-transform:none;color:var(--dim);margin-top:10px}
+h3{font:700 22px/1.1 var(--disp);text-transform:uppercase;letter-spacing:.04em;color:var(--brass);margin:0 0 10px}
+p{max-width:820px}
+.cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.3fr);gap:32px}
+.cols>*{min-width:0}
+.panel{background:var(--iron2);border:1px solid var(--seam);padding:20px;min-width:0}
+.callout{border-left:4px solid var(--rust);background:rgba(208,88,31,.07);padding:12px 16px;margin:16px 0;max-width:820px}
+.callout.v{border-color:var(--verd);background:rgba(79,176,160,.07)}
+.callout.b{border-color:var(--brass);background:rgba(224,169,62,.06)}
+.aside{font-size:13px;color:var(--ash)}
+
+.ctlrow{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;margin:4px 0 12px}
+.ctlhead{font-size:12px;color:var(--ash);min-width:70px}
+.seg{display:inline-flex;border:2px solid var(--seam);flex-wrap:wrap}
+.seg button{font:700 12px/1 var(--mono);letter-spacing:.04em;padding:9px 11px;border:0;border-right:1px solid var(--seam);background:transparent;color:var(--ash);cursor:pointer}
+.seg button:last-child{border-right:0}
+.seg button[aria-pressed=true]{background:var(--brass);color:var(--iron)}
+.fns{display:flex;flex-wrap:wrap;gap:6px;margin:4px 0 12px}
+.fns button{font:12px/1 var(--mono);padding:8px 10px;border:1px solid var(--seam);background:var(--iron);color:var(--ash);cursor:pointer}
+.fns button[aria-pressed=true]{border-color:var(--brass);color:var(--iron);background:var(--brass)}
+.fns .grp{width:100%;font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim);margin-top:4px}
+.expr{border:1px solid var(--seam);background:var(--iron);padding:10px 12px;margin:6px 0 12px}
+.expr code{font-size:14px}
+.expr p{margin:6px 0 0;font-size:13px;color:var(--ash)}
+
+.parts{display:flex;flex-direction:column;gap:12px}
+.part{border:2px solid var(--seam);background:var(--iron);min-width:0}
+.part h4{margin:0;padding:8px 10px;font:700 17px/1 var(--disp);letter-spacing:.08em;text-transform:uppercase;border-bottom:1px solid var(--seam);display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.part h4 span{font:400 11px var(--mono);color:var(--dim);letter-spacing:.04em;text-transform:none}
+.wrow{display:grid;grid-template-columns:2.2em minmax(0,1fr) auto;gap:4px 10px;align-items:center;width:100%;text-align:left;
+  font:13px/1.25 var(--mono);color:var(--bone);background:transparent;border:0;border-bottom:1px dotted #2d2620;padding:8px 10px;cursor:pointer;transition:background .12s}
+.wrow:last-child{border-bottom:0}
+.wrow .pos{color:var(--dim);font-size:11px}
+.wrow .who{overflow-wrap:anywhere}
+.wrow .who .k{color:var(--dim)}
+.wrow .val{font:700 16px/1 var(--disp);color:var(--brass);text-align:right;white-space:nowrap}
+.wrow .val.null{color:var(--steel);font-weight:400;font-style:italic;font-size:13px}
+.wrow.cur{background:rgba(224,169,62,.14);box-shadow:inset 4px 0 var(--brass)}
+.wrow.feed{background:rgba(79,176,160,.12);box-shadow:inset 4px 0 var(--verd)}
+.wrow.cur.feed{box-shadow:inset 4px 0 var(--brass), inset 8px 0 var(--verd)}
+.wrow.fade{opacity:.4}
+@media (hover:hover){.wrow:hover{background:rgba(255,255,255,.04)}}
+.legend{display:flex;flex-wrap:wrap;gap:12px;font-size:12px;color:var(--ash);margin:8px 0}
+.legend i{display:inline-block;width:12px;height:12px;margin-right:5px;vertical-align:-2px}
+.explain{border-left:4px solid var(--verd);padding:8px 12px;margin:12px 0 0;font-size:13px;color:var(--ash);background:rgba(79,176,160,.06)}
+
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));border:2px solid var(--seam)}
+.card{padding:16px 18px;border-right:1px solid var(--seam);border-bottom:1px solid var(--seam);min-width:0}
+.card h4{margin:0 0 6px;font:700 22px/1 var(--disp);text-transform:uppercase}
+.card p{font-size:13px;color:var(--ash);margin:0 0 8px}
+.tblwrap{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--seam);vertical-align:top}
+th{font:700 13px var(--disp);letter-spacing:.12em;text-transform:uppercase;color:var(--dim)}
+footer{padding:36px 6vw;color:var(--dim);font-size:12px}
+
+@media (max-width:980px){.cols{grid-template-columns:1fr}}
+@media (max-width:720px){
+  .sechead{grid-template-columns:1fr;gap:6px}.num{font-size:64px}
+  h2{font-size:clamp(28px,10vw,36px)}
+  section{padding:44px 5vw}
+  header.hero{padding:44px 5vw 28px}
+}
+@media (max-width:720px),(pointer:coarse){
+  .aside,.wrow,.card p,table,footer,.ctlhead,.expr p,.explain,.legend{font-size:14px}
+}
+/* 44px targets on touch screens, and on any narrow screen in case the pointer is misreported */
+@media (pointer:coarse),(max-width:720px){
+  .seg button,.fns button,.wrow{min-height:44px}
+  nav.toc a{display:flex;align-items:center;min-height:44px}
+  .kicker a{display:inline-block;line-height:44px}
+}
+@media (prefers-reduced-motion: reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="kicker">Clinker user guide · <a href="windows.html">← back to Window Functions</a></div>
+  <h1>Window<br><em>functions</em><span class="thin"> on every row</span></h1>
+  <p class="lede">An Aggregate turns a group into one row. A window keeps every row and adds a value worked out from the row's group: the group's total, the row's rank, the amount on the row before it. Pick a function, then tap a row to see exactly which rows its value came from.</p>
+  <nav class="toc">
+    <a href="#play"><b>01</b>Playground</a>
+    <a href="#gotchas"><b>02</b>Easy mistakes</a>
+    <a href="#ref"><b>03</b>Quick reference</a>
+  </nav>
+</header>
+
+<!-- ============================ 01 ============================ -->
+<section id="play">
+  <div class="sechead"><div class="num">01</div><h2>Playground<small>Eight sales, split by region and put in order</small></h2></div>
+  <div class="cols">
+    <div>
+      <p>Two settings shape the window:</p>
+      <ul>
+        <li><b><code>group_by</code></b> splits the rows into <i>partitions</i>. Each row only sees the rows in its own partition. The field is required; write <code>group_by: []</code> to put all rows in one partition.</li>
+        <li><b><code>sort_by</code></b> puts each partition in order. Order matters for positions (<code>row_number</code>, <code>lag</code>, <code>lead</code>), ranks, first and last, and the running total.</li>
+      </ul>
+<pre>- type: transform
+  name: ranked
+  input: sales
+  config:
+    analytic_window:
+      group_by: <b data-yaml="group"></b>
+      sort_by:
+        - field: <b data-yaml="sortf"></b>
+          order: <b data-yaml="sorto"></b>
+    cxl: |
+      emit rep = rep
+      emit amount = amount
+      emit result = <b data-yaml="fn"></b></pre>
+      <div class="callout b">Most functions look at the <b>whole partition</b>, not just the rows up to the current one. <code>$window.sum(amount)</code> gives every row in North the same North total (530.0). For a running total, use <code>$window.cumulative_sum(amount)</code>.</div>
+    </div>
+    <div class="panel">
+      <div class="ctlrow"><span class="ctlhead">group_by</span>
+        <div class="seg" data-bind="group"><button data-v="region">[region]</button><button data-v="none">[]</button></div></div>
+      <div class="ctlrow"><span class="ctlhead">sort_by</span>
+        <div class="seg" data-bind="sort"><button data-v="amount-desc">amount desc</button><button data-v="day-asc">day asc</button></div></div>
+      <div class="fns" data-fns></div>
+      <div class="expr" data-expr></div>
+      <div class="legend"><span><i style="background:var(--brass)"></i>the row you tapped</span><span><i style="background:var(--verd)"></i>rows its value comes from</span></div>
+      <div class="parts" data-parts></div>
+      <div class="explain" data-explain></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ 02 ============================ -->
+<section id="gotchas">
+  <div class="sechead"><div class="num">02</div><h2>Easy mistakes<small>Three that give quiet wrong answers rather than errors</small></h2></div>
+  <div class="cards">
+    <div class="card"><h4>sum is not a running total</h4><p><code>sum</code>, <code>avg</code>, <code>min</code>, <code>max</code>, <code>count</code>, <code>collect</code>, <code>distinct</code>, <code>any</code> and <code>every</code> all look at the whole partition, whatever the row's position. Only <code>cumulative_sum</code> stops at the current row.</p><p>There is no frame option to change this.</p></div>
+    <div class="card"><h4>lag, lead, first and last need a field</h4><p>These return a whole row, so name the field you want: <code>$window.lag(1).amount</code>. Written on its own, <code>$window.lag(1)</code> gives null on every row, with no error.</p><p><code>first_value(amount)</code> and <code>last_value(amount)</code> take the field as an argument instead.</p></div>
+    <div class="card"><h4>count is the partition size</h4><p><code>$window.count()</code> is the number of rows in the partition, the same on every row. For a position use <code>$window.row_number()</code>; for a position where ties share a number, <code>rank()</code> or <code>dense_rank()</code>.</p></div>
+  </div>
+</section>
+
+<!-- ============================ 03 ============================ -->
+<section id="ref">
+  <div class="sechead"><div class="num">03</div><h2>Quick reference<small>What each function looks at</small></h2></div>
+  <div class="tblwrap"><table>
+    <tr><th>function</th><th>looks at</th><th>notes</th></tr>
+    <tr><td><code>sum</code> <code>avg</code> <code>min</code> <code>max</code></td><td>whole partition</td><td>Empty values are skipped. <code>avg</code> returns a decimal-point number, and so does <code>sum</code> of whole numbers (530 comes back as 530.0).</td></tr>
+    <tr><td><code>cumulative_sum</code></td><td>first row through the current row</td><td>The running total. Like <code>sum</code>, whole numbers come back as a decimal-point number.</td></tr>
+    <tr><td><code>count()</code></td><td>whole partition</td><td>Number of rows in the partition.</td></tr>
+    <tr><td><code>row_number()</code></td><td>current position</td><td>1 for the first row in <code>sort_by</code> order.</td></tr>
+    <tr><td><code>rank()</code> <code>dense_rank()</code></td><td>current position</td><td>Rows with equal <code>sort_by</code> values share a rank. <code>rank</code> then skips numbers (1, 2, 2, 4); <code>dense_rank</code> doesn't (1, 2, 2, 3).</td></tr>
+    <tr><td><code>first_value(f)</code> <code>last_value(f)</code></td><td>first or last row of the partition</td><td>In <code>sort_by</code> order.</td></tr>
+    <tr><td><code>first().f</code> <code>last().f</code></td><td>first or last row of the partition</td><td>Name the field after the call.</td></tr>
+    <tr><td><code>lag(n).f</code> <code>lead(n).f</code></td><td>the row n before or after</td><td>Null when there is no such row.</td></tr>
+    <tr><td><code>any(p)</code> <code>every(p)</code> <code>exists(p)</code> <code>not_exists(p)</code></td><td>whole partition</td><td>A condition checked on every row of the partition.</td></tr>
+    <tr><td><code>collect(f)</code> <code>distinct(f)</code></td><td>whole partition</td><td>An array of the values, empty values left out.</td></tr>
+  </table></div>
+  <p class="aside" style="margin-top:16px">Windows also work with <a href="../pipelines/correlation-keys.html">correlation keys</a>: if rows are taken back out of an upstream group, the window recomputes the partitions they were in.</p>
+</section>
+
+<footer>The behavior on this page follows Clinker's window implementation, which computes every function listed here over the row's whole partition except <code>cumulative_sum</code>, <code>row_number</code>, the ranks and <code>lag</code>/<code>lead</code>. The page reproduces those rules in your browser; it does not run the engine. Tied rows are shown in file order.</footer>
+
+<script>
+"use strict";
+const SALES=[
+  {row:1,region:"North",day:"2024-03-01",rep:"Ana",amount:120},
+  {row:2,region:"South",day:"2024-03-01",rep:"Bo",amount:80},
+  {row:3,region:"North",day:"2024-03-02",rep:"Cy",amount:200},
+  {row:4,region:"North",day:"2024-03-03",rep:"Di",amount:120},
+  {row:5,region:"South",day:"2024-03-02",rep:"Ed",amount:150},
+  {row:6,region:"North",day:"2024-03-04",rep:"Fay",amount:90},
+  {row:7,region:"South",day:"2024-03-03",rep:"Gus",amount:150},
+  {row:8,region:"West", day:"2024-03-01",rep:"Hal",amount:60},
+];
+const FNS=[
+  {g:"whole partition",id:"sum",expr:"$window.sum(amount)",say:"The total of amount over the whole partition."},
+  {g:"whole partition",id:"avg",expr:"$window.avg(amount)",say:"The average amount over the whole partition."},
+  {g:"whole partition",id:"min",expr:"$window.min(amount)",say:"The smallest amount in the partition."},
+  {g:"whole partition",id:"max",expr:"$window.max(amount)",say:"The largest amount in the partition."},
+  {g:"whole partition",id:"count",expr:"$window.count()",say:"How many rows the partition has."},
+  {g:"whole partition",id:"any",expr:"$window.any(amount > 140)",say:"Whether any row in the partition has an amount over 140."},
+  {g:"whole partition",id:"collect",expr:"$window.collect(amount)",say:"Every amount in the partition, in sort_by order."},
+  {g:"whole partition",id:"first_value",expr:"$window.first_value(amount)",say:"The amount on the partition's first row in sort_by order."},
+  {g:"whole partition",id:"last_value",expr:"$window.last_value(amount)",say:"The amount on the partition's last row in sort_by order."},
+  {g:"up to this row",id:"cumulative_sum",expr:"$window.cumulative_sum(amount)",say:"The running total: amounts from the partition's first row through this one."},
+  {g:"position",id:"row_number",expr:"$window.row_number()",say:"This row's position in sort_by order, starting at 1."},
+  {g:"position",id:"rank",expr:"$window.rank()",say:"Rows with the same sort_by value share a rank, and the next rank skips ahead."},
+  {g:"position",id:"dense_rank",expr:"$window.dense_rank()",say:"Rows with the same sort_by value share a rank, with no gaps after a tie."},
+  {g:"position",id:"lag",expr:"$window.lag(1).amount",say:"The amount on the row just before this one. Null on the first row."},
+  {g:"position",id:"lead",expr:"$window.lead(1).amount",say:"The amount on the row just after this one. Null on the last row."},
+  {g:"position",id:"lag_bare",expr:"$window.lag(1)",say:"Without a field name this returns null on every row. It is not an error, so it is easy to miss."},
+];
+const S={group:"region",sort:"amount-desc",fn:"sum",tap:null};
+
+function partitions(){
+  const key=r=>S.group==="region"?r.region:"all rows";
+  const [field,dir]=S.sort.split("-");
+  const m=new Map();
+  for(const r of SALES){ const k=key(r); if(!m.has(k)) m.set(k,[]); m.get(k).push(r); }
+  for(const rows of m.values()){
+    rows.sort((a,b)=>{ const x=a[field], y=b[field]; const c=x<y?-1:x>y?1:0; return (dir==="desc"?-c:c)||a.row-b.row; }); // ties stay in file order
+  }
+  return [...m.entries()].sort((a,b)=>a[0].localeCompare(b[0]));
+}
+const sortKey=r=>r[S.sort.split("-")[0]];
+
+/* one window value, and the positions inside the partition it was taken from */
+function evaluate(fn,rows,i){
+  const all=rows.map((_,k)=>k), amts=rows.map(r=>r.amount);
+  switch(fn){
+    case "sum": return {v:amts.reduce((a,b)=>a+b,0).toFixed(1),from:all};   // a sum of whole numbers comes back as a decimal-point number
+    case "avg": return {v:+(amts.reduce((a,b)=>a+b,0)/amts.length).toFixed(2),from:all};
+    case "min": { const m=Math.min(...amts); return {v:m,from:all}; }
+    case "max": { const m=Math.max(...amts); return {v:m,from:all}; }
+    case "count": return {v:rows.length,from:all};
+    case "any": return {v:amts.some(a=>a>140),from:all};
+    case "collect": return {v:"["+amts.join(", ")+"]",from:all};
+    case "first_value": return {v:rows[0].amount,from:[0]};
+    case "last_value": return {v:rows[rows.length-1].amount,from:[rows.length-1]};
+    case "cumulative_sum": return {v:amts.slice(0,i+1).reduce((a,b)=>a+b,0).toFixed(1),from:all.slice(0,i+1)};
+    case "row_number": return {v:i+1,from:all.slice(0,i+1)};
+    case "rank": { let r=1; for(let k=1;k<=i;k++) if(sortKey(rows[k-1])!==sortKey(rows[k])) r=k+1;
+      const tie=all.filter(k=>sortKey(rows[k])===sortKey(rows[i])); return {v:r,from:all.slice(0,i+1).filter(k=>k<tie[0]||tie.includes(k))}; }
+    case "dense_rank": { let r=1; for(let k=1;k<=i;k++) if(sortKey(rows[k-1])!==sortKey(rows[k])) r++;
+      return {v:r,from:all.slice(0,i+1)}; }
+    case "lag": return i>0?{v:rows[i-1].amount,from:[i-1]}:{v:null,from:[]};
+    case "lead": return i<rows.length-1?{v:rows[i+1].amount,from:[i+1]}:{v:null,from:[]};
+    case "lag_bare": return {v:null,from:[]};
+  }
+}
+
+const $=(s,r=document)=>r.querySelector(s);
+function render(){
+  const f=FNS.find(x=>x.id===S.fn);
+  $('[data-yaml="group"]').textContent=S.group==="region"?"[region]":"[]   # one partition";
+  const [field,dir]=S.sort.split("-");
+  $('[data-yaml="sortf"]').textContent=field; $('[data-yaml="sorto"]').textContent=dir;
+  $('[data-yaml="fn"]').textContent=f.expr;
+  document.querySelectorAll("[data-bind] button").forEach(b=>b.setAttribute("aria-pressed",String(S[b.parentElement.dataset.bind]===b.dataset.v)));
+  let last="";
+  $("[data-fns]").innerHTML=FNS.map(x=>{ const h=x.g!==last?`<div class="grp">${x.g}</div>`:""; last=x.g;
+    return h+`<button data-fn="${x.id}" aria-pressed="${x.id===S.fn}">${x.id==="lag_bare"?"lag(1) without .amount":x.expr.replace("$window.","").replace("(amount)","")}</button>`; }).join("");
+  $("[data-expr]").innerHTML=`<code>${f.expr}</code><p>${f.say}</p>`;
+  const parts=partitions(); let tapped=null;
+  $("[data-parts]").innerHTML=parts.map(([k,rows])=>{
+    const tapHere=S.tap!==null&&rows.some(r=>r.row===S.tap);
+    const ti=tapHere?rows.findIndex(r=>r.row===S.tap):-1;
+    const feed=tapHere?evaluate(S.fn,rows,ti).from:[];
+    if(tapHere) tapped={k,rows,ti};
+    return `<div class="part"><h4>${k}<span>${rows.length} row${rows.length===1?"":"s"}, sorted by ${field} ${dir}</span></h4>`+
+      rows.map((r,i)=>{ const res=evaluate(S.fn,rows,i);
+        const cls=(r.row===S.tap?" cur":"")+(feed.includes(i)?" feed":"")+(S.tap!==null&&!tapHere?" fade":"");
+        const shown=res.v===null?'<span class="val null">null</span>':`<span class="val">${res.v}</span>`;
+        return `<button class="wrow${cls}" data-row="${r.row}" aria-pressed="${r.row===S.tap}"><span class="pos">#${i+1}</span><span class="who">${r.rep} <span class="k">${r.day.slice(5)}</span> ${r.amount}</span>${shown}</button>`; }).join("")+`</div>`;
+  }).join("");
+  const ex=$("[data-explain]");
+  if(!tapped){ ex.textContent="Tap a row to see which rows its value comes from."; return; }
+  const {k,rows,ti}=tapped, r=rows[ti], res=evaluate(S.fn,rows,ti), n=res.from.length;
+  const reps=res.from.map(i=>rows[i].rep).join(", ");
+  ex.innerHTML=`<b>${r.rep}</b> in ${k}: ${f.expr} = <b>${res.v===null?"null":res.v}</b>. `+
+    (S.fn==="lag_bare"?"No field was named, so there is nothing to read.":
+     n===0?"There is no row at that position.":
+     n===rows.length&&!["cumulative_sum","row_number","rank","dense_rank"].includes(S.fn)?`It reads all ${n} rows of ${k}, whatever ${r.rep}'s position.`:
+     `It reads ${n===1?"one row":n+" rows"}: ${reps}.`);
+}
+document.addEventListener("click",e=>{
+  const b=e.target.closest("[data-bind] button"); if(b){ S[b.parentElement.dataset.bind]=b.dataset.v; render(); return; }
+  const fn=e.target.closest("[data-fn]"); if(fn){ S.fn=fn.dataset.fn; render(); return; }
+  const row=e.target.closest("[data-row]"); if(row){ const r=+row.dataset.row; S.tap=S.tap===r?null:r; render(); }
+});
+S.tap=4; render();
+</script>
+</body>
+</html>
