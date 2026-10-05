@@ -376,7 +376,7 @@ E310 totals: needed 2.0 MiB more for group state, but only 704.0 KiB of memory.l
     pipeline:
       memory: { limit: "10M" }
     or: --memory-limit 10M
-  remedy: enrich's join build side holds 3.5 MiB and cannot be spilled; see "Join build side" in clinker explain --code E310
+  remedy: enrich's join build side holds 3.5 MiB and could not be spilled; see "Join build side" in clinker explain --code E310
 ```
 
 - The headline keeps the greppable `E310 <node>:` prefix and names what the
@@ -396,7 +396,9 @@ E310 totals: needed 2.0 MiB more for group state, but only 704.0 KiB of memory.l
   and why each still held its memory, what the reclaim round asked and
   freed, the smallest limit that would have granted the request in YAML
   and `--memory-limit` form, and a remedy keyed to the largest holder that
-  cannot spill.
+  cannot spill. A Source still reading is listed as `active source`; a
+  Source's rows, paused or active, never count as state that cannot spill,
+  and a Source is never the remedy.
 - A Reshape or Cull group too large to hold whole is identified by where its
   first row came from (`group: the one whose first row is row 4812 of source
   orders`, the row number the dead-letter output writes in
