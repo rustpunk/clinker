@@ -833,7 +833,7 @@ fn cull_giant_group_exceeds_budget_fails_loud() {
 
     let rendered = err.to_string();
     assert!(
-        rendered.starts_with("E310 drop_big:"),
+        rendered.starts_with("E310 \"drop_big\":"),
         "the rendered diagnostic must lead with the E310 code and the node: {rendered}"
     );
     assert!(
@@ -841,7 +841,7 @@ fn cull_giant_group_exceeds_budget_fails_loud() {
         "a configured-limit overrun must never read as an engine bug: {rendered}"
     );
     assert!(
-        rendered.contains("\n  group: the one whose first row is row 1 of source events\n"),
+        rendered.contains("\n  group: the one whose first row is row 1 of source \"events\"\n"),
         "the rendered diagnostic must name the group by its first row: {rendered}"
     );
     assert!(

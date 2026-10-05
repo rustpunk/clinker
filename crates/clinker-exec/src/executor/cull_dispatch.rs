@@ -1591,7 +1591,7 @@ mod tests {
 
         let rendered = err.to_string();
         assert!(
-            rendered.starts_with("E310 cl:"),
+            rendered.starts_with("E310 \"cl\":"),
             "the rendered diagnostic must lead with the E310 code and the node: {rendered}"
         );
         assert!(

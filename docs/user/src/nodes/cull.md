@@ -204,8 +204,8 @@ The on-disk spill volume Cull produces is surfaced per stage in `clinker run --e
 Cull evaluates its group-level predicate against the *whole* group at once, so even though cross-group and ingest-time peaks spill to disk, the finalize reload of one group needs that group to fit the memory budget. Skew slicing bounds the ingest peak, but a single correlation group larger than `memory.limit` has no in-budget representation. Rather than risk an out-of-memory crash, the run **fails loud** with `E310`. The report names the Cull node and says that one request for the rows it holds for its groups needs more than `memory.limit` can hold, so spilling cannot help. It names the group by the Source and row number of its first row — the row number the dead-letter output writes in `_cxl_dlq_source_row` — and prints byte counts and node names only, never the group's key value:
 
 ```
-E310 drop_big: one request for rows held for Cull groups needs 500.0 KiB, more than memory.limit 8.0 KiB can hold — spilling cannot help
-  group: the one whose first row is row 1 of source events
+E310 "drop_big": one request for rows held for Cull groups needs 500.0 KiB, more than memory.limit 8.0 KiB can hold — spilling cannot help
+  group: the one whose first row is row 1 of source "events"
   ...
   fix: raise the limit to at least 1M — this request needed 500.0 KiB; later stages may need more
     pipeline:

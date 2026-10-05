@@ -413,7 +413,7 @@ fn oversized_request_says_spilling_cannot_help() {
     let text = report.to_string();
     assert!(
         text.starts_with(
-            "E310 big_join: one request for join build side needs 5.0 MiB, more than \
+            "E310 \"big_join\": one request for join build side needs 5.0 MiB, more than \
              memory.limit 4.0 MiB can hold — spilling cannot help\n"
         ),
         "{text}"
@@ -443,7 +443,7 @@ fn oversized_request_says_spilling_cannot_help() {
     let text = report.to_string();
     assert!(
         text.starts_with(
-            "E310 totals: one request for group state needs 2.0 MiB, more than memory.limit \
+            "E310 \"totals\": one request for group state needs 2.0 MiB, more than memory.limit \
              4.0 MiB can hold beside 3.0 MiB of state that cannot spill — spilling cannot help\n"
         ),
         "{text}"
@@ -456,7 +456,7 @@ fn oversized_request_says_spilling_cannot_help() {
     );
     assert!(
         text.contains(
-            "\n  remedy: enrich's join build side holds 3.0 MiB and cannot be spilled; \
+            "\n  remedy: \"enrich\"'s join build side holds 3.0 MiB and cannot be spilled; \
              see \"Join build side\" in clinker explain --code E310"
         ),
         "{text}"
@@ -468,7 +468,7 @@ fn oversized_request_says_spilling_cannot_help() {
     assert!(!report.oversized);
     assert!(
         report.to_string().starts_with(
-            "E310 totals: needed 2.0 MiB more for group state, but memory.limit 8.0 MiB is \
+            "E310 \"totals\": needed 2.0 MiB more for group state, but memory.limit 8.0 MiB is \
              fully held and nothing more could be spilled\n"
         ),
         "{report}"
@@ -597,7 +597,7 @@ fn admission_refusal_is_an_e310_naming_the_source() {
     assert_eq!(report.limit_bytes, capacity);
     assert!(
         err.to_string()
-            .starts_with("E310 accounts: one request for rows read from the source needs "),
+            .starts_with("E310 \"accounts\": one request for rows read from the source needs "),
         "{err}"
     );
 }

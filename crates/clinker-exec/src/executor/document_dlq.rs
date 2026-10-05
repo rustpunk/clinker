@@ -3574,13 +3574,14 @@ mod tests {
         assert_eq!(take_held_rows(&mut state, &holding), rows_of(1..=8));
     }
 
-    /// A spill request the arbitrator raised on a poll that holds no row,
-    /// as the late-record path's is, is answered by the next ledger
-    /// admission.
+    /// A spill request raised on the state's handle while it held no row is
+    /// answered by the next held row, once. A ledger admission that fits
+    /// spills nothing: a growth flushes the tails only when it falls short,
+    /// so no row leaves memory while there is room for it.
     #[test]
-    fn a_ledger_admission_answers_a_pending_spill_request() {
+    fn a_pending_spill_request_is_answered_by_the_next_held_row() {
         let root = tempfile::tempdir().expect("spill root");
-        let arbitrator = ledger_arbitrator(1 << 30);
+        let arbitrator = electing_arbitrator(1 << 30);
         let mut state = held_state(&arbitrator, root.path(), usize::MAX);
         let (rejected, holding) = (doc_key(0), doc_key(1));
         for ordinal in 1..=8 {
@@ -3596,13 +3597,27 @@ mod tests {
                 .expect("admission"),
             "the row is new"
         );
+        assert_eq!(
+            files_in(root.path()),
+            0,
+            "an admission that fits leaves every held row resident"
+        );
+        let resident_before = state.held.resident_bytes();
+        assert!(resident_before > 0);
+
+        // The hold answers the request before it appends, so the eight rows
+        // already held move to disk and only the new row stays resident.
+        hold_row(&mut state, &holding, 9).expect("hold");
         assert_eq!(files_in(root.path()), 1, "the held rows moved to one file");
-        assert_eq!(state.held.resident_bytes(), 0);
+        assert!(
+            state.held.resident_bytes() < resident_before,
+            "the rows held before the request left memory"
+        );
         assert!(
             !state.handle.take_spill_request(),
-            "the admission consumed the request"
+            "the held row consumed the request"
         );
-        assert_eq!(take_held_rows(&mut state, &holding), rows_of(1..=8));
+        assert_eq!(take_held_rows(&mut state, &holding), rows_of(1..=9));
     }
 
     /// A flush during a rejection's replay appends another document's tail
@@ -3642,7 +3657,12 @@ mod tests {
             .decode(reader.next_frame().expect("frame").expect("a first frame"))
             .expect("decode")
             .source_row;
-        arbitrator.spill_reclaimable(1);
+        // A reclaim pass that elects the state while the replay is in flight
+        // flushes every resident tail, the other document's included.
+        state
+            .held
+            .flush_all(&arbitrator, "validate")
+            .expect("flush");
         assert!(
             state
                 .admit_emitted(&replayed, first, "out")
@@ -3727,8 +3747,11 @@ mod tests {
         );
 
         hold_row_at(&mut state, &other, 4, "validate").expect("hold");
-        arbitrator.spill_reclaimable(1);
         let (key, node) = &swept[0];
+        // A flush while the sweep runs — a pass that elects the state, or the
+        // sweep's own growth falling short — is credited to the node the
+        // sweep rejects the document under.
+        state.held.flush_all(&arbitrator, node).expect("flush");
         let mut reader = state
             .take_held(key, node)
             .expect("take")

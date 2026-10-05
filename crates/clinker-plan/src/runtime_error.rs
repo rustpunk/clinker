@@ -182,10 +182,16 @@ pub enum MemorySurface {
 
 impl std::fmt::Display for MemorySurface {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use clinker_core_types::QuoteName;
         match self {
             Self::RowsRead => f.write_str("rows read from the source"),
             Self::BufferedRows { from, to } => {
-                write!(f, "rows buffered between {from} and {to}")
+                write!(
+                    f,
+                    "rows buffered between {} and {}",
+                    from.as_str().quoted_name(),
+                    to.as_str().quoted_name()
+                )
             }
             Self::GroupState => f.write_str("group state"),
             Self::SortBuffer => f.write_str("sort buffer"),
@@ -202,7 +208,12 @@ impl std::fmt::Display for MemorySurface {
             Self::CredentialRegistry => f.write_str("credential registry"),
             Self::CorrelationGroups => f.write_str("rows held for correlation groups"),
             Self::ParkedCrossRegionRows { from, to } => {
-                write!(f, "rows held between {from} and {to} for commit")
+                write!(
+                    f,
+                    "rows held between {} and {} for commit",
+                    from.as_str().quoted_name(),
+                    to.as_str().quoted_name()
+                )
             }
         }
     }

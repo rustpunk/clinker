@@ -1452,7 +1452,7 @@ mod tests {
         // with a route to the remedy for a Reshape group.
         let rendered = err.to_string();
         assert!(
-            rendered.starts_with("E310 rs:"),
+            rendered.starts_with("E310 \"rs\":"),
             "the rendered diagnostic must lead with the E310 code and the node: {rendered}"
         );
         assert!(

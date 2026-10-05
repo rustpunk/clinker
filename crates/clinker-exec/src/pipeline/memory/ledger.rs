@@ -1849,7 +1849,7 @@ mod tests {
                 to: "totals".to_string(),
             }
             .to_string(),
-            "rows buffered between orders and totals"
+            "rows buffered between \"orders\" and \"totals\""
         );
         for surface in every_surface() {
             let text = surface.to_string();
@@ -2119,7 +2119,7 @@ mod tests {
         assert!(!rendered.contains("fully held"), "{rendered}");
         assert!(
             rendered.starts_with(
-                "E310 enrich: process memory peaked at 96.0 MiB resident, over memory.limit \
+                "E310 \"enrich\": process memory peaked at 96.0 MiB resident, over memory.limit \
                  64.0 MiB"
             ),
             "{rendered}"
@@ -3318,9 +3318,9 @@ mod walk_pass_tests {
         let text = report.to_string();
         assert!(
             text.contains(
-                "\n  remedy: sticky's rows buffered between sticky and next holds 200.0 KiB \
-                 and could not be spilled further; see \"Rows buffered between two steps\" \
-                 in clinker explain --code E310"
+                "\n  remedy: \"sticky\"'s rows buffered between \"sticky\" and \"next\" holds \
+                 200.0 KiB and could not be spilled further; see \
+                 \"Rows buffered between two steps\" in clinker explain --code E310"
             ),
             "{text}"
         );

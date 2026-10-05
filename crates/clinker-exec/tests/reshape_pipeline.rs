@@ -1339,11 +1339,11 @@ fn reshape_giant_group_exceeds_budget_fails_loud() {
 
     let rendered = err.to_string();
     assert!(
-        rendered.starts_with("E310 backfill:"),
+        rendered.starts_with("E310 \"backfill\":"),
         "the rendered diagnostic must lead with the E310 code and the node: {rendered}"
     );
     assert!(
-        rendered.contains("\n  group: the one whose first row is row 1 of source plans\n"),
+        rendered.contains("\n  group: the one whose first row is row 1 of source \"plans\"\n"),
         "the rendered diagnostic must name the group by its first row: {rendered}"
     );
     assert!(
