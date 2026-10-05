@@ -4670,6 +4670,43 @@ mod tests {
         Arc::clone(&cell.borrow().buckets[key].handle)
     }
 
+    /// A record of a document no verdict has reached yet builds that
+    /// document's bucket, and the bucket is registered as the Output's rows
+    /// held until their document is decided, not as a failed document's
+    /// held rows: an E310 that lists it must name what it holds and point
+    /// at that state's remedy.
+    #[test]
+    fn an_open_documents_rows_are_named_as_held_until_it_is_decided() {
+        let root = tempfile::tempdir().expect("bucket spill root");
+        let arbitrator = ledger_arbitrator(1 << 30);
+        let cell = DocumentBuckets::new_cell("out", Arc::from(root.path()), CompressMode::Auto, 8);
+        let key: DocKey = Arc::from("orders.csv");
+
+        fill_bucket(&cell, &arbitrator, &key, 0..1);
+        let consumer_id = cell.borrow().buckets[&key].consumer_id;
+        let registered = arbitrator
+            .ledger_snapshot(
+                0,
+                crate::pipeline::memory::ledger::Requester::for_consumer(consumer_id),
+            )
+            .requester_label
+            .map(|label| *label);
+        assert_eq!(
+            registered,
+            Some(clinker_plan::runtime_error::ConsumerLabel {
+                node: "out".to_string(),
+                surface: clinker_plan::runtime_error::MemorySurface::OpenDocumentRows,
+            }),
+            "the open document's bucket is named by its Output and its own state"
+        );
+
+        let bucket = cell
+            .borrow_mut()
+            .take(&key)
+            .expect("the bucket leaves its cell");
+        arbitrator.unregister_consumer(bucket.consumer_id);
+    }
+
     /// A request another consumer makes on the walk spills an Output's
     /// per-document bucket when it does not fit beside it, and the bucket
     /// drains afterwards in arrival order.

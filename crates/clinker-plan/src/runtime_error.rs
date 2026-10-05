@@ -156,6 +156,10 @@ pub enum MemorySurface {
     /// The failing rows of a failed document, held until the document is
     /// dead-lettered.
     HeldFailingRows,
+    /// The rows of a document an Output holds until the run knows whether
+    /// the document failed: under document-granularity dead-lettering a
+    /// document's rows are written only once it is known not to have failed.
+    OpenDocumentRows,
     /// The run's record of rows already dead-lettered, kept so a row several
     /// Sinks hold is dead-lettered once.
     DeadLetteredRowSet,
@@ -198,6 +202,7 @@ impl std::fmt::Display for MemorySurface {
             Self::JoinBuildSide => f.write_str("join build side"),
             Self::JoinState => f.write_str("join state"),
             Self::HeldFailingRows => f.write_str("held failing rows of a failed document"),
+            Self::OpenDocumentRows => f.write_str("rows held until their document is decided"),
             Self::DeadLetteredRowSet => f.write_str("set of rows already dead-lettered"),
             Self::DecisionState => f.write_str("decision state"),
             Self::ReshapeGroups => f.write_str("rows held for Reshape groups"),
@@ -485,6 +490,7 @@ fn fix_section(surface: &MemorySurface) -> Option<&'static str> {
         MemorySurface::HeldFailingRows | MemorySurface::DeadLetteredRowSet => {
             Some("Held failing rows")
         }
+        MemorySurface::OpenDocumentRows => Some("Rows held until their document is decided"),
         MemorySurface::RowsRead
         | MemorySurface::OutputStaging
         | MemorySurface::CredentialRegistry => None,
@@ -911,6 +917,21 @@ mod tests {
                  across partitions, so repartitioning cannot make them fit"
             ),
             "{rendered}"
+        );
+    }
+
+    /// An Output's rows of a still-open document are named as waiting for
+    /// the document's verdict, and their remedy is their own section, not
+    /// the one for a failed document's held rows.
+    #[test]
+    fn open_document_rows_point_at_their_own_section() {
+        assert_eq!(
+            MemorySurface::OpenDocumentRows.to_string(),
+            "rows held until their document is decided"
+        );
+        assert_eq!(
+            fix_section(&MemorySurface::OpenDocumentRows),
+            Some("Rows held until their document is decided")
         );
     }
 

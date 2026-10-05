@@ -1516,6 +1516,7 @@ mod tests {
             MemorySurface::JoinBuildSide,
             MemorySurface::JoinState,
             MemorySurface::HeldFailingRows,
+            MemorySurface::OpenDocumentRows,
             MemorySurface::DeadLetteredRowSet,
             MemorySurface::DecisionState,
             MemorySurface::ReshapeGroups,
@@ -1539,6 +1540,7 @@ mod tests {
                 | MemorySurface::JoinBuildSide
                 | MemorySurface::JoinState
                 | MemorySurface::HeldFailingRows
+                | MemorySurface::OpenDocumentRows
                 | MemorySurface::DeadLetteredRowSet
                 | MemorySurface::DecisionState
                 | MemorySurface::ReshapeGroups
