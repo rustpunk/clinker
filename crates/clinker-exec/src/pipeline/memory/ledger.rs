@@ -3806,7 +3806,17 @@ mod walk_pass_tests {
             "{rendered}"
         );
         assert!(!rendered.contains("needed"), "{rendered}");
-        assert!(rendered.contains("at least 9G"), "{rendered}");
+        assert!(
+            rendered.contains(
+                "\n  fix: raise the limit to at least 9G — the smallest limit with room for what \
+                 the run already holds; \"enrich\" and later stages may need more\
+                 \n    pipeline:\
+                 \n      memory: { limit: \"9G\" }\
+                 \n    or: --memory-limit 9G\n"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("this request"), "{rendered}");
 
         // The same check with 2 GiB the site was about to hold.
         let report = scripted(&script, || {
@@ -3819,6 +3829,35 @@ mod walk_pass_tests {
             11 * GIB,
             "the charged total plus the request, rounded up"
         );
+        assert!(
+            report.to_string().contains(
+                "\n  fix: raise the limit to at least 11G — the smallest limit with room for \
+                 this request and what the run already holds; later stages may need more\n"
+            ),
+            "{report}"
+        );
+
+        // Under a test capacity the same report raises the capacity and has
+        // no paste lines.
+        drop(_walk);
+        let held_to_capacity = run(2 * BACKSTOP_LIMIT, Box::new(Priority));
+        held_to_capacity.set_test_capacity(BACKSTOP_LIMIT);
+        register(&held_to_capacity, "grown", 0, 9 * GIB);
+        let set = empty_set();
+        let _walk = walk(&held_to_capacity, &set);
+        let rendered = scripted(&script, || {
+            held_to_capacity.check_hard_limit("enrich", MemorySurface::JoinBuildSide, governed(), 0)
+        })
+        .expect_err("nothing the walk owns can spill")
+        .to_string();
+        assert!(
+            rendered.contains(
+                "\n  fix: raise the test ledger capacity to at least 9G — the smallest capacity \
+                 with room for what the run already holds\n"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("pipeline:"), "{rendered}");
     }
 
     #[test]
