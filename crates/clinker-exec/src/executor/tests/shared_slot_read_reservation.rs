@@ -16,13 +16,18 @@ use std::sync::Arc;
 
 use clinker_plan::config::CompressMode;
 use clinker_plan::error::PipelineError;
-use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface};
+use clinker_plan::runtime_error::{ConsumerLabel, HolderState, MemorySurface};
 use clinker_record::owned_storage::SharedStorage;
 use clinker_record::{Record, Schema, Value};
 use petgraph::graph::NodeIndex;
 
-use crate::executor::dispatch::{NodeBufferKey, shared_node_buffer_read};
-use crate::executor::node_buffer::{NodeBuffer, NodeBufferConsumer};
+use crate::executor::dispatch::{
+    NodeBufferInput, NodeBufferKey, NodeBufferSpillSweep, service_pending_node_buffer_spills,
+    shared_node_buffer_read,
+};
+use crate::executor::node_buffer::{
+    NodeBuffer, NodeBufferConsumer, reserve_node_buffer_materialization,
+};
 use crate::executor::stream_event::SourceRowId;
 use crate::pipeline::memory::walk::{
     SlotSpill, WalkContextGuard, WalkReclaimSet, WalkSpillSettings,
@@ -305,4 +310,192 @@ fn refused_shared_read_leaves_the_slot_and_its_reader_count_unchanged() {
     assert_eq!(read_rows(cursor), expected);
     drop(reservation);
     assert_eq!(remaining_readers(&set, &key), Some(1));
+}
+
+/// Free bytes beside the held state, so a request of the slot's size plus
+/// twice this falls short by less than the slot.
+const SPARE: u64 = 256;
+
+/// The shared slot with a streaming reader's cursor on it, and a
+/// charged-only holder that leaves `slot_bytes + SPARE` free: a request of
+/// `slot_bytes + 2 * SPARE` fits only if the slot spills. The cursor pins
+/// the slot's backing while it lives.
+struct PinnedSlot {
+    arbitrator: Arc<MemoryArbitrator>,
+    set: Rc<RefCell<WalkReclaimSet>>,
+    key: NodeBufferKey,
+    cursor: Option<NodeBuffer>,
+    slot_bytes: u64,
+    _held: Arc<ConsumerHandle>,
+    _spill_dir: tempfile::TempDir,
+}
+
+fn pinned_slot() -> PinnedSlot {
+    let s = schema();
+    let slot = NodeBuffer::memory_from_records(rows(&s));
+    let slot_bytes = slot.estimated_memory_bytes();
+    let capacity = 4 * slot_bytes;
+    let arbitrator = arbitrator(capacity);
+    let spill_dir = tempfile::tempdir().expect("spill dir");
+    let set = reclaim_set(spill_dir.path());
+    let key = NodeBufferKey::from(NodeIndex::new(0));
+    publish_shared_slot(&arbitrator, &set, &key, slot, slot_bytes);
+    let (cursor, reservation) = shared_node_buffer_read(&set, key.clone(), READER)
+        .and_then(NodeBufferInput::into_parts)
+        .expect("a streaming read takes its cursor");
+    assert!(reservation.is_none(), "a streaming read reserves no copy");
+    let (_held_id, held) = register_held(&arbitrator, capacity - 2 * slot_bytes - SPARE);
+    PinnedSlot {
+        arbitrator,
+        set,
+        key,
+        cursor: Some(cursor),
+        slot_bytes,
+        _held: held,
+        _spill_dir: spill_dir,
+    }
+}
+
+#[test]
+fn a_pass_reports_a_slot_its_reader_pins_as_in_use() {
+    let pinned = pinned_slot();
+    let _walk = WalkContextGuard::install(&pinned.arbitrator, Rc::clone(&pinned.set));
+    assert!(
+        pinned.cursor.is_some(),
+        "the premise: the reader's cursor is live"
+    );
+
+    let report = match reserve_node_buffer_materialization(
+        pinned.slot_bytes + 2 * SPARE,
+        &pinned.arbitrator,
+        "requester",
+    ) {
+        Err(PipelineError::MemoryBudgetExceeded { report }) => report,
+        Ok(_) => panic!("the pinned slot frees nothing, so the request must be refused"),
+        Err(other) => panic!("expected the requester's E310; got {other:?}"),
+    };
+
+    let slot = report
+        .holders
+        .iter()
+        .find(|holder| holder.node == PRODUCER)
+        .expect("the report lists the shared slot");
+    assert_eq!(
+        slot.state,
+        HolderState::InUse,
+        "a slot its reader pins is in use, not spilled down to its floor"
+    );
+    let reclaim = report.reclaim.as_ref().expect("the request ran a pass");
+    assert!(
+        reclaim.holders_asked.iter().any(|node| node == PRODUCER),
+        "the pass asked the shared slot to spill"
+    );
+    assert!(
+        !report.to_string().contains("at its floor"),
+        "no holder is reported at its floor: {report}"
+    );
+    assert_eq!(
+        pinned
+            .arbitrator
+            .per_stage_spill_bytes_written()
+            .get(PRODUCER)
+            .copied()
+            .unwrap_or(0),
+        0,
+        "the pinned slot wrote nothing"
+    );
+    assert!(
+        pinned
+            .set
+            .borrow()
+            .slots()
+            .buffer(&pinned.key)
+            .expect("the slot stays published")
+            .is_resident_memory(),
+        "the pinned slot is still resident"
+    );
+}
+
+#[test]
+fn a_slot_no_reader_pins_spills_when_a_pass_elects_it() {
+    let mut pinned = pinned_slot();
+    let _walk = WalkContextGuard::install(&pinned.arbitrator, Rc::clone(&pinned.set));
+    drop(pinned.cursor.take());
+
+    let reservation = reserve_node_buffer_materialization(
+        pinned.slot_bytes + 2 * SPARE,
+        &pinned.arbitrator,
+        "requester",
+    )
+    .expect("with no cursor on it, the slot spills and the request fits");
+
+    assert!(
+        pinned
+            .arbitrator
+            .per_stage_spill_bytes_written()
+            .get(PRODUCER)
+            .is_some_and(|bytes| *bytes > 0),
+        "the slot spilled to disk"
+    );
+    assert!(
+        !pinned
+            .set
+            .borrow()
+            .slots()
+            .buffer(&pinned.key)
+            .expect("the slot stays published")
+            .is_resident_memory(),
+        "the slot is on disk"
+    );
+    drop(reservation);
+}
+
+#[test]
+fn a_sweep_that_writes_nothing_leaves_a_views_figure_at_zero() {
+    let s = schema();
+    let mut owner = NodeBuffer::memory_from_records(rows(&s));
+    let view = owner.reread().expect("a resident slot re-reads");
+    assert!(view.reclaimable_bytes() > 0, "the premise: the view has rows");
+    let arbitrator = arbitrator(64 * 1024 * 1024);
+    let spill_dir = tempfile::tempdir().expect("spill dir");
+    let set = reclaim_set(spill_dir.path());
+    let key = NodeBufferKey::from(NodeIndex::new(0));
+    // Published as a view is: registered with nothing charged, and a figure
+    // of 0 because its rows are another owner's.
+    let handle = publish_shared_slot(&arbitrator, &set, &key, view, 0);
+    handle.set_reclaimable(0);
+    handle.request_spill();
+
+    {
+        let mut set = set.borrow_mut();
+        let (node_buffers, consumer_ids, settings) = set.spill_sweep_parts();
+        service_pending_node_buffer_spills(
+            node_buffers,
+            &NodeBufferSpillSweep {
+                consumer_ids,
+                arbitrator: &arbitrator,
+                spill_root: settings.spill_root.as_ref(),
+                spill_compress: settings.spill_compress,
+                batch_size: settings.batch_size,
+                is_spill_allowed: &|_| true,
+                node_name: &|_| PRODUCER.to_string(),
+            },
+        )
+        .expect("a sweep that writes nothing succeeds");
+    }
+
+    assert_eq!(
+        handle.reclaimable(),
+        0,
+        "a sweep that wrote nothing leaves the view's figure where it was"
+    );
+    assert!(
+        set.borrow()
+            .slots()
+            .buffer(&key)
+            .expect("the view stays published")
+            .is_resident_memory(),
+        "the view's rows stay where their owner holds them"
+    );
+    drop(owner);
 }
