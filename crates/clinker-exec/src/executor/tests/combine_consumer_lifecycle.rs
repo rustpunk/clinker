@@ -906,6 +906,28 @@ fn an_inline_join_build_over_the_limit_spills_other_state_and_completes() {
         "the capacity {RECLAIM_CAPACITY} must sit below the ample charged peak {}",
         ample.peak_consumer_usage_bytes
     );
+    // The window the capacity must sit in, from the ample run's figures:
+    // what the run holds once the first join's table is charged does not
+    // fit, and fits once `widened`'s rows are gone.
+    let peak = |node: &str| {
+        ample
+            .per_node_peak_charged_bytes
+            .get(node)
+            .copied()
+            .unwrap_or_else(|| panic!("the ample run charges {node}"))
+    };
+    let at_build = peak("orders") + peak("products") + peak("widened") + peak("enriched");
+    assert!(
+        RECLAIM_CAPACITY < at_build,
+        "the capacity {RECLAIM_CAPACITY} must not hold the first join's table beside \
+         everything else the run holds ({at_build})"
+    );
+    assert!(
+        RECLAIM_CAPACITY >= at_build - peak("widened"),
+        "the capacity {RECLAIM_CAPACITY} must hold the first join's table once `widened`'s \
+         rows are spilled ({})",
+        at_build - peak("widened")
+    );
 
     let (low, low_output) = inline_reclaim_run(Some(RECLAIM_CAPACITY))
         .expect("the join's check makes room by spilling other state and the run completes");
@@ -915,6 +937,17 @@ fn an_inline_join_build_over_the_limit_spills_other_state_and_completes() {
             .is_some_and(|&bytes| bytes > 0),
         "`widened`'s resident rows must be spilled to make room: {:?}",
         low.per_stage_spill_bytes_written
+    );
+    assert!(
+        !low.per_stage_spill_bytes_written.contains_key("orders"),
+        "room is made from `widened`, not by spilling the join's driver rows earlier: {:?}",
+        low.per_stage_spill_bytes_written
+    );
+    assert!(
+        low.peak_consumer_usage_bytes < at_build,
+        "`widened`'s rows were spilled before the table was charged beside them: peak {} \
+         against {at_build}",
+        low.peak_consumer_usage_bytes
     );
     assert!(
         low_output == ample_output,
