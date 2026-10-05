@@ -807,9 +807,9 @@ struct CullGroupBuffer {
     reclaimable_bytes: u64,
     next_seq: u64,
     /// The Source name behind each Source identity a group's first record
-    /// carried, read from that record's `$source.name` stamp; one entry per
-    /// Source feeding the node.
-    source_names: Vec<(clinker_plan::plan::PlanNodeId, Arc<str>)>,
+    /// carried, read from that record's `$source.name` stamp, or `None` when
+    /// that record carried no stamp; one entry per Source identity seen.
+    source_names: Vec<(clinker_plan::plan::PlanNodeId, Option<Arc<str>>)>,
 }
 
 impl CullGroupBuffer {
@@ -833,20 +833,19 @@ impl CullGroupBuffer {
     }
 
     /// Where `row` came from, as the dead-letter output names a row: its
-    /// Source's name and its number among that Source's rows.
-    fn row_position(&self, row: SourceRowId) -> RowPosition {
-        let source = self
+    /// Source's name and its number among that Source's rows. `None` when no
+    /// Source name is known for it (the group's first row carried no
+    /// `$source.name` stamp): the report then names no group rather than an
+    /// engine placeholder in the Source's place.
+    fn row_position(&self, row: SourceRowId) -> Option<RowPosition> {
+        let (_, name) = self
             .source_names
             .iter()
-            .find(|(source, _)| *source == row.source())
-            .map_or_else(
-                || crate::executor::dispatch::MERGED_SOURCE_NAME.to_string(),
-                |(_, name)| name.to_string(),
-            );
-        RowPosition {
-            source,
+            .find(|(source, _)| *source == row.source())?;
+        Some(RowPosition {
+            source: name.as_deref()?.to_string(),
             row: row.ordinal(),
-        }
+        })
     }
 
     #[cfg(test)]
@@ -882,7 +881,10 @@ impl CullGroupBuffer {
         let state = self.groups.entry(key.clone()).or_insert_with(|| {
             order.push(key);
             if !names.iter().any(|(source, _)| *source == row_num.source()) {
-                names.push((row_num.source(), source_name_arc_of(&record)));
+                names.push((
+                    row_num.source(),
+                    crate::executor::dispatch::source_name_of(&record).map(Arc::from),
+                ));
             }
             CullGroupState::new(row_num)
         });
@@ -1127,7 +1129,7 @@ impl CullGroupBuffer {
                 node_name,
                 MemorySurface::CullGroups,
                 group_bytes,
-                Some(self.row_position(state.first_row)),
+                self.row_position(state.first_row),
             ));
         }
 
@@ -1761,44 +1763,21 @@ mod tests {
     // "internal error" that implies a broken engine.
     #[test]
     fn take_group_rejects_a_group_larger_than_the_hard_limit_with_e310() {
-        let schema: SharedStorage<Schema> =
-            SharedStorage::from_arc(Arc::new(Schema::new(vec!["account".into()])));
-        let spill_root = tempfile::tempdir().unwrap();
-        let arb = arbitrator(512);
-        let handle = ConsumerHandle::new();
-        let key = vec![GroupByKey::Str("g".into())];
-
+        // Rows as Source ingest delivers them: stamped with the Source that
+        // read them and numbered from that Source's first row.
+        let schema = clinker_record::SchemaBuilder::with_capacity(2)
+            .with_field("account")
+            .with_field_meta("$source.name", clinker_record::FieldMetadata::SourceName)
+            .build();
         // One group, ~5 KiB across 64 records against a 512 B soft limit, so
         // part of it partition-spills — exercising the reload path the hard
         // limit gates rather than a purely resident group.
-        let mut buffer = CullGroupBuffer::new(
-            schema.clone(),
-            true,
-            clinker_format::preparation::MemoryOnlyResources::new(
-                std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+        let (mut buffer, key, _spill_root) = oversized_group(&schema, |payload| {
+            Record::new(
+                schema.clone(),
+                vec![Value::String(payload.into()), Value::from("orders")],
             )
-            .resources()
-            .allocation()
-            .clone(),
-        );
-        for row_num in 0..64u64 {
-            let payload = format!("{row_num:063}");
-            buffer.push(
-                key.clone(),
-                record(&schema, Value::String(payload.into())),
-                crate::executor::stream_event::SourceRowId::new(PlanNodeId::new(0), row_num),
-            );
-            handle.set_bytes(buffer.unaccounted_resident_bytes() as u64);
-            if arb.spill_threshold_bytes() < buffer.resident_bytes() as u64 {
-                buffer
-                    .spill_until_under_budget("cl", &arb, spill_root.path(), &handle)
-                    .unwrap();
-            }
-        }
-        assert!(
-            !buffer.groups[&key].spilled.is_empty(),
-            "the oversized group must have partition-spilled for this to test the reload gate"
-        );
+        });
 
         // The finalize gate and the report read the same limit in production
         // (`budget.hard_limit()` of the run's arbitrator); here the report
@@ -1831,12 +1810,13 @@ mod tests {
             report.limit.bytes()
         );
         // The group is named by where its first row came from, never by its
-        // key (a record value). These rows carry no Source stamp.
+        // key (a record value): the Source that read it and its row number,
+        // counted from 1 as the dead-letter output counts it.
         assert_eq!(
             report.group_first_row,
             Some(RowPosition {
-                source: crate::executor::dispatch::MERGED_SOURCE_NAME.to_string(),
-                row: 0,
+                source: "orders".to_string(),
+                row: 1,
             }),
             "the diagnostic must identify the offending group"
         );
@@ -1847,7 +1827,7 @@ mod tests {
             "the rendered diagnostic must lead with the E310 code and the node: {rendered}"
         );
         assert!(
-            rendered.contains("\n  group: the one whose first row is row 0 of source"),
+            rendered.contains("\n  group: the one whose first row is row 1 of source \"orders\""),
             "the rendered diagnostic must name the group: {rendered}"
         );
         assert!(

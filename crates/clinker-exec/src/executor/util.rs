@@ -459,6 +459,8 @@ fn format_group_key_part(k: &GroupByKey) -> String {
 /// the configured limit. The report names `node`, `surface` and the group's
 /// footprint as the request, and identifies the group by where its first row
 /// came from (`first_row`), never by its key, which is a record value.
+/// `first_row` is `None` when no Source is known for that row; the report
+/// then names no group.
 pub(crate) fn giant_group_error(
     arbitrator: &crate::pipeline::memory::MemoryArbitrator,
     node_name: &str,

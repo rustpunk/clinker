@@ -568,9 +568,9 @@ struct ReshapeGroupBuffer {
     /// monotonic in true (merged) arrival order across every source.
     next_seq: u64,
     /// The Source name behind each Source identity a group's first record
-    /// carried, read from that record's `$source.name` stamp; one entry per
-    /// Source feeding the node.
-    source_names: Vec<(clinker_plan::plan::PlanNodeId, Arc<str>)>,
+    /// carried, read from that record's `$source.name` stamp, or `None` when
+    /// that record carried no stamp; one entry per Source identity seen.
+    source_names: Vec<(clinker_plan::plan::PlanNodeId, Option<Arc<str>>)>,
 }
 
 impl ReshapeGroupBuffer {
@@ -588,20 +588,19 @@ impl ReshapeGroupBuffer {
     }
 
     /// Where `row` came from, as the dead-letter output names a row: its
-    /// Source's name and its number among that Source's rows.
-    fn row_position(&self, row: SourceRowId) -> RowPosition {
-        let source = self
+    /// Source's name and its number among that Source's rows. `None` when no
+    /// Source name is known for it (the group's first row carried no
+    /// `$source.name` stamp): the report then names no group rather than an
+    /// engine placeholder in the Source's place.
+    fn row_position(&self, row: SourceRowId) -> Option<RowPosition> {
+        let (_, name) = self
             .source_names
             .iter()
-            .find(|(source, _)| *source == row.source())
-            .map_or_else(
-                || crate::executor::dispatch::MERGED_SOURCE_NAME.to_string(),
-                |(_, name)| name.to_string(),
-            );
-        RowPosition {
-            source,
+            .find(|(source, _)| *source == row.source())?;
+        Some(RowPosition {
+            source: name.as_deref()?.to_string(),
             row: row.ordinal(),
-        }
+        })
     }
 
     /// Total resident (in-memory) input-record bytes across all groups.
@@ -632,7 +631,10 @@ impl ReshapeGroupBuffer {
         let state = self.groups.entry(key.clone()).or_insert_with(|| {
             order.push(key);
             if !names.iter().any(|(source, _)| *source == row_num.source()) {
-                names.push((row_num.source(), source_name_arc_of(&record)));
+                names.push((
+                    row_num.source(),
+                    crate::executor::dispatch::source_name_of(&record).map(Arc::from),
+                ));
             }
             ReshapeGroupState::new(row_num)
         });
@@ -915,7 +917,7 @@ impl ReshapeGroupBuffer {
                 node_name,
                 MemorySurface::ReshapeGroups,
                 group_bytes,
-                Some(self.row_position(state.first_row)),
+                self.row_position(state.first_row),
             ));
         }
 
@@ -1505,6 +1507,33 @@ mod tests {
         crate::executor::stream_event::SourceRowId::new(PlanNodeId::new(23), ordinal)
     }
 
+    /// [`schema`] with the `$source.name` stamp Source ingest adds.
+    fn stamped_schema() -> SharedStorage<Schema> {
+        clinker_record::SchemaBuilder::with_capacity(3)
+            .with_field("gid")
+            .with_field("payload")
+            .with_field_meta("$source.name", FieldMetadata::SourceName)
+            .build()
+    }
+
+    /// [`rec`] as Source `orders` read it, over [`stamped_schema`].
+    fn stamped_rec(schema: &SharedStorage<Schema>, gid: &str, payload: &str) -> Record {
+        Record::new(
+            schema.clone(),
+            vec![
+                Value::String(gid.into()),
+                Value::String(payload.into()),
+                Value::from("orders"),
+            ],
+        )
+    }
+
+    /// The identity Source ingest mints for its `index`-th row (from 0):
+    /// ordinals count from the first row, as the dead-letter output does.
+    fn ingest_row(index: u64) -> crate::executor::stream_event::SourceRowId {
+        source_row(crate::executor::stream_event::SourceRowId::FIRST_ORDINAL + index)
+    }
+
     /// An arbitrator whose soft limit is `soft_bytes` and whose seeded peak
     /// RSS is well below it, so `should_spill_self` is driven purely by the
     /// caller's explicit spill calls rather than the live process RSS.
@@ -1544,15 +1573,28 @@ mod tests {
         spill_root: &std::path::Path,
         n: u64,
     ) -> ReshapeGroupBuffer {
+        fill_single_group_with(
+            schema,
+            arb,
+            spill_root,
+            (0..n).map(|row_num| {
+                let payload = format!("{row_num:063}");
+                (rec(schema, "g", &payload), source_row(row_num))
+            }),
+        )
+    }
+
+    /// [`fill_single_group`] over the given rows and their identities.
+    fn fill_single_group_with(
+        schema: &SharedStorage<Schema>,
+        arb: &MemoryArbitrator,
+        spill_root: &std::path::Path,
+        rows: impl IntoIterator<Item = (Record, crate::executor::stream_event::SourceRowId)>,
+    ) -> ReshapeGroupBuffer {
         let handle = ConsumerHandle::new();
         let mut buffer = ReshapeGroupBuffer::new(schema.clone(), true);
-        for row_num in 0..n {
-            let payload = format!("{row_num:063}");
-            buffer.push(
-                single_group_key(),
-                rec(schema, "g", &payload),
-                source_row(row_num),
-            );
+        for (row, row_num) in rows {
+            buffer.push(single_group_key(), row, row_num);
             handle.set_bytes(buffer.resident_bytes() as u64);
             if arb.spill_threshold_bytes() < buffer.resident_bytes() as u64 {
                 buffer
@@ -1649,11 +1691,21 @@ mod tests {
     // reload of one giant group.
     #[test]
     fn take_group_rejects_a_group_larger_than_the_hard_limit() {
-        let schema = schema();
+        // Rows as Source ingest delivers them: stamped with the Source that
+        // read them and numbered from that Source's first row.
+        let schema = stamped_schema();
         let spill_root = tempfile::tempdir().unwrap();
         let arb = arbitrator(512);
         let key = single_group_key();
-        let mut buffer = fill_single_group(&schema, &arb, spill_root.path(), 64);
+        let mut buffer = fill_single_group_with(
+            &schema,
+            &arb,
+            spill_root.path(),
+            (0..64u64).map(|index| {
+                let payload = format!("{index:063}");
+                (stamped_rec(&schema, "g", &payload), ingest_row(index))
+            }),
+        );
         // A hard limit far below the group's reloaded footprint must fail loud.
         // The finalize gate and the report read the same limit in production
         // (`budget.hard_limit()` of the run's arbitrator); here the report
@@ -1689,12 +1741,13 @@ mod tests {
             report.limit.bytes()
         );
         // The group is named by where its first row came from, never by its
-        // key (a record value). These rows carry no Source stamp.
+        // key (a record value): the Source that read it and its row number,
+        // counted from 1 as the dead-letter output counts it.
         assert_eq!(
             report.group_first_row,
             Some(RowPosition {
-                source: crate::executor::dispatch::MERGED_SOURCE_NAME.to_string(),
-                row: 0,
+                source: "orders".to_string(),
+                row: 1,
             }),
             "the diagnostic must identify the offending group"
         );
@@ -1707,7 +1760,7 @@ mod tests {
             "the rendered diagnostic must lead with the E310 code and the node: {rendered}"
         );
         assert!(
-            rendered.contains("\n  group: the one whose first row is row 0 of source"),
+            rendered.contains("\n  group: the one whose first row is row 1 of source \"orders\""),
             "the rendered diagnostic must name the group: {rendered}"
         );
         assert!(
@@ -1769,15 +1822,15 @@ mod tests {
     // remediation would tell them to narrow a key they never declared.
     #[test]
     fn a_whole_input_group_names_itself_and_offers_no_key_to_narrow() {
-        let schema = schema();
+        let schema = stamped_schema();
         let mut buffer = ReshapeGroupBuffer::new(schema.clone(), true);
         // Every record keys to the empty tuple, so all 8 land in one group.
-        for row_num in 0..8u64 {
-            let payload = format!("{row_num:063}");
+        for index in 0..8u64 {
+            let payload = format!("{index:063}");
             buffer.push(
                 Vec::new(),
-                rec(&schema, "any", &payload),
-                source_row(row_num),
+                stamped_rec(&schema, "any", &payload),
+                ingest_row(index),
             );
         }
         assert_eq!(
@@ -1796,7 +1849,7 @@ mod tests {
         // group, never as an empty bracket pair that names nothing.
         assert_eq!(
             report.group_first_row.as_ref().map(|first| first.row),
-            Some(0),
+            Some(1),
             "the whole-input group must be named readably: {report:?}"
         );
         let rendered = err.to_string();
@@ -1828,12 +1881,12 @@ mod tests {
     // hunts for missing values they do not have.
     #[test]
     fn a_blank_partition_value_group_is_named_unambiguously() {
-        let schema = schema();
+        let schema = stamped_schema();
         let spill_root = tempfile::tempdir().unwrap();
         let arb = arbitrator(512);
         let handle = ConsumerHandle::new();
         // A blank `gid` keys to Null through this node's `partition_key`.
-        let key = partition_key(&rec(&schema, "", "x"), &partition_by());
+        let key = partition_key(&stamped_rec(&schema, "", "x"), &partition_by());
         assert_eq!(
             key,
             vec![GroupByKey::Null],
@@ -1841,9 +1894,13 @@ mod tests {
         );
 
         let mut buffer = ReshapeGroupBuffer::new(schema.clone(), true);
-        for row_num in 0..64u64 {
-            let payload = format!("{row_num:063}");
-            buffer.push(key.clone(), rec(&schema, "", &payload), source_row(row_num));
+        for index in 0..64u64 {
+            let payload = format!("{index:063}");
+            buffer.push(
+                key.clone(),
+                stamped_rec(&schema, "", &payload),
+                ingest_row(index),
+            );
             handle.set_bytes(buffer.resident_bytes() as u64);
             if arb.spill_threshold_bytes() < buffer.resident_bytes() as u64 {
                 buffer
@@ -1860,7 +1917,7 @@ mod tests {
         };
         assert_eq!(
             report.group_first_row.as_ref().map(|first| first.row),
-            Some(0),
+            Some(1),
             "the group must still be named: {report:?}"
         );
         // `partition_key` funnels several distinct causes into the null group,

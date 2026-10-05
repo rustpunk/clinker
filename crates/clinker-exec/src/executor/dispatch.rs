@@ -229,7 +229,7 @@ pub(crate) fn source_file_arc_of(record: &Record) -> Arc<str> {
 /// Read the per-record Source-node name from the record's
 /// [`FieldMetadata::SourceName`] engine-stamped column. Returns `None`
 /// when the column is absent (synthetic emits) or non-String.
-fn source_name_of(record: &Record) -> Option<&str> {
+pub(crate) fn source_name_of(record: &Record) -> Option<&str> {
     let schema = record.schema();
     for idx in 0..schema.column_count() {
         if matches!(schema.field_metadata(idx), Some(FieldMetadata::SourceName))
