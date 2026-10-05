@@ -3208,9 +3208,47 @@ pub(crate) fn single_input_node_buffer_key(
 
 #[cfg(test)]
 mod required_node_buffer_tests {
-    use super::{NodeBufferKey, NodeBufferReaderLedger, missing_node_buffer_input_error};
+    use super::{
+        NodeBufferKey, NodeBufferReaderLedger, PlannedNodeBufferReaders,
+        missing_node_buffer_input_error,
+    };
     use clinker_plan::error::PipelineError;
+    use clinker_plan::runtime_error::MemorySurface;
     use petgraph::graph::NodeIndex;
+
+    /// A slot several nodes read is reported with every reader named on its
+    /// own, once each, in the order the plan reads the slot: joined into one
+    /// name, two readers would print like a single node whose name contains a
+    /// comma.
+    #[test]
+    fn slot_label_lists_every_reader_of_a_shared_slot() {
+        let split = NodeIndex::new(0);
+        let key = NodeBufferKey::from(split);
+        let mut planned = PlannedNodeBufferReaders::default();
+        planned.node_names.insert(split, Box::from("split"));
+        // One entry per reading edge: "b" reads the slot over two edges.
+        planned.readers.insert(
+            key.clone(),
+            vec![Box::from("b"), Box::from("a"), Box::from("b")],
+        );
+
+        let label = planned.slot_label("split", &key, &[]);
+
+        assert_eq!(label.node, "split");
+        assert_eq!(
+            label.surface,
+            MemorySurface::BufferedRows {
+                from: "split".to_string(),
+                to: vec!["b".to_string(), "a".to_string()],
+            },
+            "every distinct reader, in planned order"
+        );
+        assert_eq!(
+            label.surface.to_string(),
+            "rows buffered between \"split\" and \"b\", \"a\"",
+            "each reader is quoted on its own"
+        );
+    }
 
     fn internal_detail(error: PipelineError) -> String {
         let PipelineError::Internal { op, detail, .. } = error else {
