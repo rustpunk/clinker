@@ -27,7 +27,9 @@ use crate::executor::dispatch::{
 };
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{DlqEntry, DlqFailureStamp, operator_memory_limit, stage_metrics};
-use crate::pipeline::memory::walk::WalkOwnedRegistration;
+use crate::pipeline::memory::walk::{
+    OwnedSpillResult, WalkOwnedRegistration, WalkOwnedSpill, register_walk_owned,
+};
 use clinker_plan::config::ErrorStrategy;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
@@ -967,6 +969,36 @@ pub(crate) trait KeyedGroupTables {
     fn tables_mut(&mut self) -> &mut HashMap<Self::Key, GroupTable>;
 }
 
+/// Spill the table among `tables` that consumer `id` charges, for the pass
+/// that elected `id`: wrote when it had groups resident, nothing to write
+/// when it holds them all on disk, not held when no table here is `id`'s.
+/// The table records the run under its node; never reserves.
+fn spill_elected_table<K>(
+    tables: &mut HashMap<K, GroupTable>,
+    id: crate::pipeline::memory::ConsumerId,
+) -> Result<OwnedSpillResult, PipelineError> {
+    let Some((stream, _)) = tables.values_mut().find(|(_, consumer)| *consumer == id) else {
+        return Ok(OwnedSpillResult::NotHeld);
+    };
+    Ok(if stream.spill_resident()? {
+        OwnedSpillResult::Wrote
+    } else {
+        OwnedSpillResult::NothingToWrite
+    })
+}
+
+impl WalkOwnedSpill for RegisteredTables {
+    /// A pass that elects one of these tables' consumers spills that
+    /// table's resident groups, the way the table's own triggers do.
+    fn spill_owned(
+        &mut self,
+        id: crate::pipeline::memory::ConsumerId,
+        _arbitrator: &crate::pipeline::memory::MemoryArbitrator,
+    ) -> Result<OwnedSpillResult, PipelineError> {
+        spill_elected_table(&mut self.tables, id)
+    }
+}
+
 impl KeyedGroupTables for RegisteredTables {
     type Key = DocumentId;
 
@@ -1051,17 +1083,6 @@ impl<T: KeyedGroupTables> WalkGroupTables<T> {
         Ok((result, built))
     }
 
-    /// Make the table just built reachable by every reclaim pass on the walk,
-    /// under its consumer, until it leaves the cell.
-    ///
-    /// # Errors
-    ///
-    /// As [`register_walk_owned`].
-    fn enroll(&mut self, built: BuiltTable) -> Result<(), PipelineError> {
-        let _ = (built, &self.arbitrator);
-        Ok(())
-    }
-
     /// Take the table under `key` out of the cell for its finalize, under
     /// one short borrow; `None` when there is none.
     pub(crate) fn take(&mut self, key: &T::Key) -> Option<GroupTable> {
@@ -1087,6 +1108,24 @@ impl<T: KeyedGroupTables> WalkGroupTables<T> {
             .tables()
             .get(key)
             .map(|(stream, _)| read(stream))
+    }
+}
+
+impl<T: KeyedGroupTables + WalkOwnedSpill + 'static> WalkGroupTables<T> {
+    /// Make the table just built reachable by every reclaim pass on the walk,
+    /// under its consumer, until it leaves the cell. A table with no handle
+    /// holds no group table and is not registered.
+    ///
+    /// # Errors
+    ///
+    /// As [`register_walk_owned`].
+    fn enroll(&mut self, built: BuiltTable) -> Result<(), PipelineError> {
+        let (id, Some(handle)) = built else {
+            return Ok(());
+        };
+        let registration = register_walk_owned(&self.arbitrator, id, &handle, &self.cell)?;
+        self.registrations.insert(id, registration);
+        Ok(())
     }
 }
 
@@ -1473,7 +1512,11 @@ struct AggregateEmit {
 /// spills independently under RSS pressure; flushing a table unregisters its
 /// consumer, so the arbitrator's live-usage reflects exactly the open
 /// documents. This is a deliberate, bounded change from the prior
-/// single-table model — the correct per-document memory shape.
+/// single-table model — the correct per-document memory shape. The worker
+/// owns its [`RegisteredTables`] by value on its own thread, so no reclaim
+/// pass on the walk can reach them until they are lent to the walk: a pass
+/// that elects one of their consumers skips it, and only the table's own
+/// triggers spill it.
 ///
 /// The scoped thread holds no `&mut ExecutorContext`; it accumulates cursor
 /// advances and `add_record` DLQ errors into [`StreamingIngestEffects`],

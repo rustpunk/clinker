@@ -1044,6 +1044,24 @@ impl HashAggregator {
         Ok(())
     }
 
+    /// Spill the groups resident now to one new run, as the table's own
+    /// triggers do, for the owner a reclaim pass elected: the table's charge
+    /// falls to 0 and the run is recorded under the node. Writes nothing and
+    /// returns `false` when no group is resident (every group is already on
+    /// disk, or none was added); returns `true` when it wrote. Blocks on the
+    /// spill's I/O; never reserves memory.
+    ///
+    /// # Errors
+    ///
+    /// As the table's own spill: a failed write, or E320 past the spill cap.
+    pub(crate) fn spill_resident(&mut self) -> Result<bool, HashAggError> {
+        if self.groups.is_empty() && self.buffered_groups.is_empty() {
+            return Ok(false);
+        }
+        self.spill()?;
+        Ok(true)
+    }
+
     /// Spill the in-memory groups to disk as postcard, optionally LZ4.
     ///
     /// 1. Drain `self.groups` (fold-mode) or `self.buffered_groups`

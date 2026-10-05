@@ -772,6 +772,20 @@ impl AggregateStream {
         }
     }
 
+    /// Spill a hash table's resident groups for the reclaim pass that
+    /// elected it ([`HashAggregator::spill_resident`]); `false` when nothing
+    /// was resident. The streaming arm holds no table and writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`HashAggregator::spill_resident`].
+    pub(crate) fn spill_resident(&mut self) -> Result<bool, HashAggError> {
+        match self {
+            Self::Hash(h) => h.spill_resident(),
+            Self::Streaming(_) => Ok(false),
+        }
+    }
+
     /// The handle a hash table's charge is mirrored onto; `None` for the
     /// streaming arm, which holds no table and charges nothing.
     pub(crate) fn consumer_handle(&self) -> Option<&Arc<crate::pipeline::memory::ConsumerHandle>> {
