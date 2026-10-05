@@ -97,7 +97,7 @@ use build::{GraceHll, PartitionAssigner, estimated_build_entry_bytes};
 use probe::{EmitArgs, GraceEmitSink, InMemoryProbe, ProbeMatches, ProbeOutcome, emit_for_probe};
 use spill::{ReloadContext, SpilledPartition, process_spilled_partition};
 
-/// Period (matches emitted) between [`MemoryArbitrator::should_abort`] polls
+/// Period (matches emitted) between hard-limit checks
 /// during the probe loop. Same cadence as the inline hash probe.
 const MEMORY_CHECK_INTERVAL: usize = 10_000;
 
@@ -1074,12 +1074,14 @@ pub(crate) fn execute_combine_grace_hash(
         emitted_since_check += 1;
         if emitted_since_check >= MEMORY_CHECK_INTERVAL {
             emitted_since_check = 0;
-            if budget.should_abort() {
-                return Err(budget.backstop_refusal(
+            budget
+                .check_hard_limit(
                     name,
                     clinker_plan::runtime_error::MemorySurface::JoinState,
-                ));
-            }
+                    crate::pipeline::memory::ledger::Requester::for_consumer(consumer_id),
+                    0,
+                )
+                .map_err(|report| PipelineError::MemoryBudgetExceeded { report })?;
         }
     }
 

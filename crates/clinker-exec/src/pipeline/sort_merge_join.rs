@@ -78,13 +78,14 @@ use clinker_plan::plan::combine::{DecomposedPredicate, RangeOp};
 /// threshold.
 const COLLECT_PER_GROUP_CAP: usize = 10_000;
 
-/// Emitted-row period between global [`MemoryArbitrator::should_abort`] polls
-/// during the merge walk. The self-spilling output sort is the primary bound on
-/// this operator's own residency; this poll is the last-resort defense that
-/// catches cross-consumer or under-counted global pressure the output sort
-/// cannot see — the same cadence `pipeline::grace_hash` and `pipeline::combine`
-/// use. `should_abort` trips on either RSS or the byte-counted consumer sum, so
-/// the backstop still fires on targets where RSS is unmeasurable.
+/// Emitted-row period between the run's hard-limit checks during the merge
+/// walk. The self-spilling output sort is the primary bound on this operator's
+/// own residency; this check is the last-resort defense that catches
+/// cross-consumer or under-counted global pressure the output sort cannot see —
+/// the same cadence `pipeline::grace_hash` and `pipeline::combine` use. On the
+/// walk it reclaims other state before it refuses. It trips on either the
+/// process's peak resident reading or the charged total, so the backstop still
+/// fires on targets where RSS is unmeasurable.
 const MEMORY_CHECK_INTERVAL: usize = 10_000;
 
 /// Per-side external-sort spill threshold in bytes: half the soft RSS limit,
@@ -1652,12 +1653,17 @@ fn push_output_row(
     let emitted = mspill.emitted_since_check.get() + 1;
     if emitted >= MEMORY_CHECK_INTERVAL {
         mspill.emitted_since_check.set(0);
-        if mspill.budget.should_abort() {
-            return Err(mspill.budget.backstop_refusal(
+        // Checked after the fact in the kernel's own consumer's name: on the
+        // walk a reclaim round runs (that consumer last) before a refusal.
+        mspill
+            .budget
+            .check_hard_limit(
                 mspill.name,
                 clinker_plan::runtime_error::MemorySurface::JoinState,
-            ));
-        }
+                mspill.consumer.requester(),
+                0,
+            )
+            .map_err(|report| PipelineError::MemoryBudgetExceeded { report })?;
     } else {
         mspill.emitted_since_check.set(emitted);
     }

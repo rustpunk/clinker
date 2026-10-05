@@ -667,9 +667,9 @@ where
             // equi+range combines, which now share the one path. The
             // path is threshold-driven: it spills its sorted runs,
             // min/max-tagged blocks, and output sort when a buffer
-            // exceeds its own threshold, so the handle's
-            // `should_abort_local` gate is a genuine last resort for a
-            // single block-pair plus kernel aux that still cannot fit.
+            // exceeds its own threshold, so its pre-output check is a
+            // genuine last resort for a single block-pair plus kernel aux
+            // that still cannot fit the whole limit.
             let ie_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
             let ie_consumer_id = ctx.memory_budget.register_node_consumer(
                 Arc::new(crate::pipeline::sort_buffer::SortConsumer::new(

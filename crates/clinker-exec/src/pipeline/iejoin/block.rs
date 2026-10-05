@@ -128,10 +128,10 @@
 //! derived caps. Each per-pair gate proves `phase_working_set + reservation ≤
 //! hard`; because every reserved buffer spills at its cap, the true phase-peak
 //! stays within `hard`, a provable bound rather than the earlier ~1.4×hard worst
-//! case. The per-pair EMIT loop keeps no global-pressure abort: it polls no
-//! `should_abort`, so a handle transiently summing the input footprint plus the
+//! case. The per-pair EMIT loop keeps no global-pressure abort: it makes no
+//! hard-limit check, so a handle transiently summing the input footprint plus the
 //! output sort's resident bytes is only ever an attribution reading, never an abort
-//! trigger. The deferred-miss dispatch does run one `should_abort` backstop
+//! trigger. The deferred-miss dispatch does run the run's one hard-limit backstop
 //! ([`poll_finalize_backstop`]) every
 //! [`MEMORY_CHECK_INTERVAL`](super::MEMORY_CHECK_INTERVAL) dispatched rows, but as
 //! defense-in-depth against a cross-consumer or host-RSS overrun surfacing during
@@ -2175,7 +2175,7 @@ fn dispatch_deferred_misses(
             }
             inblock_cur = inblock_stream.next().transpose()?;
         }
-        poll_finalize_backstop(cfg, &mut emitted_since_check)?;
+        poll_finalize_backstop(cfg, sink.consumer, &mut emitted_since_check)?;
     }
     Ok(())
 }
@@ -2194,22 +2194,28 @@ fn dispatch_deferred_misses(
 /// residency, or host RSS the byte-counted view does not fully capture — so poll the
 /// global ceiling here every [`MEMORY_CHECK_INTERVAL`](super::MEMORY_CHECK_INTERVAL)
 /// dispatched rows, matching the cadence the engine's other spill operators poll at.
-/// An overshoot then aborts cleanly with the typed diagnostic instead of allocating
-/// past the hard limit in silence. [`should_abort`](MemoryArbitrator::should_abort)
-/// trips on RSS OR the byte-counted consumer sum, so the guard still fires on a host
-/// where RSS cannot be measured.
+/// The check is the run's one hard-limit backstop, made after the fact in the
+/// kernel's own consumer's name (`consumer`): on the walk it runs a reclaim round,
+/// that consumer last, before it refuses, so an overshoot another node's spill can
+/// relieve does not stop the run, and one it cannot aborts cleanly with the typed
+/// diagnostic instead of allocating past the hard limit in silence. It trips on the
+/// charged total OR the process's peak resident reading, so the guard still fires
+/// on a host where RSS cannot be measured.
 fn poll_finalize_backstop(
     cfg: &EmitConfig<'_>,
+    consumer: &ConsumerHandle,
     emitted_since_check: &mut usize,
 ) -> Result<(), PipelineError> {
     *emitted_since_check += 1;
     if *emitted_since_check >= super::MEMORY_CHECK_INTERVAL {
-        if cfg.budget.should_abort() {
-            return Err(cfg.budget.backstop_refusal(
+        cfg.budget
+            .check_hard_limit(
                 cfg.name,
                 clinker_plan::runtime_error::MemorySurface::JoinState,
-            ));
-        }
+                consumer.requester(),
+                0,
+            )
+            .map_err(|report| PipelineError::MemoryBudgetExceeded { report })?;
         *emitted_since_check = 0;
     }
     Ok(())

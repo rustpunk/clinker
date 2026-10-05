@@ -107,8 +107,8 @@ mod block;
 /// truncate at the same threshold.
 const COLLECT_PER_GROUP_CAP: usize = 10_000;
 
-/// Period (matched pairs emitted) between [`MemoryArbitrator::should_abort`]
-/// polls during the IEJoin scan. Same cadence as the hash probe loop.
+/// Period (rows dispatched) between the run's hard-limit checks during the
+/// IEJoin finalize. Same cadence as the hash probe loop.
 const MEMORY_CHECK_INTERVAL: usize = 10_000;
 
 /// Order-tracking sidecar carried alongside every record in the

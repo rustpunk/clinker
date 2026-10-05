@@ -860,45 +860,6 @@ impl MemoryArbitrator {
         }
     }
 
-    /// The E310 report for a backstop that found the run already past its
-    /// limit ([`Self::should_abort`] true) while `node` held `surface`.
-    ///
-    /// The report says which reading was over the limit, from one ledger
-    /// snapshot and the process's peak resident reading taken now. When the
-    /// charged total is over, it is the ledger form and its request is how
-    /// far over the charged total stands. When only the process's memory is
-    /// over, it is the process-memory form: the request is how far over the
-    /// peak stands, the suggested limit is the peak rounded up (a limit that
-    /// peak would not have passed), and nothing is oversized, because no one
-    /// request was measured. A charged total that has fallen back under the
-    /// limit since the backstop checked, with no process reading over it,
-    /// reports the ledger form with a request of 0.
-    pub fn backstop_report(
-        &self,
-        node: &str,
-        surface: MemorySurface,
-    ) -> Box<MemoryShortfallReport> {
-        let limit = self.hard_limit();
-        let mut snapshot = self.ledger_snapshot(0, Requester::governed());
-        let charged_over_by = snapshot.charged.saturating_sub(limit);
-        match self.peak_rss().filter(|peak| *peak > limit) {
-            Some(peak) if charged_over_by == 0 => {
-                self.process_memory_report(snapshot, node, surface, limit, peak)
-            }
-            _ => {
-                snapshot.requested = charged_over_by;
-                self.off_ledger_report(snapshot, node, surface)
-            }
-        }
-    }
-
-    /// [`Self::backstop_report`] as the run-ending E310.
-    pub fn backstop_refusal(&self, node: &str, surface: MemorySurface) -> PipelineError {
-        PipelineError::MemoryBudgetExceeded {
-            report: self.backstop_report(node, surface),
-        }
-    }
-
     /// The process-memory form of a backstop's E310: the process's peak
     /// resident reading `peak` stood over `limit` while `node` held
     /// `surface`, with the ledger as `snapshot` read it. The request is how
@@ -2272,11 +2233,13 @@ mod tests {
         let peak = 96 * MIB;
         arbitrator.set_peak_rss_for_test(peak);
 
-        let PipelineError::MemoryBudgetExceeded { report } =
-            arbitrator.backstop_refusal("enrich", MemorySurface::JoinBuildSide)
-        else {
-            panic!("a backstop refusal is an E310");
-        };
+        let report = arbitrator.process_memory_report(
+            arbitrator.ledger_snapshot(0, governed()),
+            "enrich",
+            MemorySurface::JoinBuildSide,
+            arbitrator.hard_limit(),
+            peak,
+        );
         assert_eq!(
             report.reading,
             LimitReading::ProcessMemory {
