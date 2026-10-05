@@ -2773,28 +2773,38 @@ fn registered_partitions(
     (id, handle, partitions)
 }
 
-/// Add `builds` to `partitions` in arrival order, each placed by the hash
-/// of its join key as the kernel's build loop places it.
+/// Add `builds` to `partitions` in arrival order.
 fn add_builds(
     partitions: &GracePartitions,
     h: &BnlHarness,
     builds: &[Record],
     budget: &MemoryArbitrator,
 ) {
-    let ctx = EvalContext::test_with_file(&h.stable, &h.source_file, 0);
-    let hash_state = partitions.hash_state();
     for (index, record) in builds.iter().enumerate() {
-        let keys = h.build_extractor.extract(&ctx, record).unwrap();
-        partitions
-            .add_build_record(
-                record.clone(),
-                build_row(index),
-                crate::pipeline::combine::BuildSeq(index as u64),
-                hash_composite_key(&keys, &hash_state),
-                budget,
-            )
-            .expect("build row added");
+        add_build(partitions, h, record, index, budget);
     }
+}
+
+/// Add build row `index` to `partitions`, placed by the hash of its join key
+/// as the kernel's build loop places it.
+fn add_build(
+    partitions: &GracePartitions,
+    h: &BnlHarness,
+    record: &Record,
+    index: usize,
+    budget: &MemoryArbitrator,
+) {
+    let ctx = EvalContext::test_with_file(&h.stable, &h.source_file, 0);
+    let keys = h.build_extractor.extract(&ctx, record).unwrap();
+    partitions
+        .add_build_record(
+            record.clone(),
+            build_row(index),
+            crate::pipeline::combine::BuildSeq(index as u64),
+            hash_composite_key(&keys, &partitions.hash_state()),
+            budget,
+        )
+        .expect("build row added");
 }
 
 /// Finish `partitions`' build, probe `drivers` and reload every spilled
@@ -3025,6 +3035,87 @@ fn grace_partitions_spill_when_another_walk_request_falls_short() {
             "a build a pass spilled joins as an unspilled build does"
         );
         drop(partitions);
+        arbitrator.unregister_consumer(id);
+    });
+}
+
+/// The grace consumer's figure is what spilling its building partitions
+/// frees now: their bytes while the build runs, and 0 once the build has
+/// finished, since the probe keeps every in-memory partition. A pass another
+/// request starts after the build never asks the grace consumer, and its
+/// partitions stay built.
+#[test]
+fn grace_partitions_after_the_build_are_not_reclaimable() {
+    use crate::pipeline::memory::MemoryConsumer;
+    use crate::pipeline::memory::walk::walk_test_support::{
+        TestWalkOwned, foreign_walk_request, with_test_walk_frame,
+    };
+    let h = build_bnl_harness();
+    let resident_limit = 10 * 1024 * 1024 * 1024;
+    let arbitrator = Arc::new(MemoryArbitrator::with_policy(
+        resident_limit,
+        0.80,
+        0.70,
+        Box::new(crate::pipeline::memory::Priority),
+    ));
+    let dir = tempfile::Builder::new()
+        .prefix("gh-pinned-")
+        .tempdir()
+        .unwrap();
+    with_test_walk_frame(&arbitrator, || {
+        let (id, handle, partitions) = registered_partitions(&arbitrator, dir.path());
+        let consumer = GraceHashConsumer::new(Arc::clone(&handle));
+        let (builds, _drivers) = reclaim_join_inputs(&h);
+        let mut building = 0u64;
+        for (index, record) in builds.iter().enumerate() {
+            building += estimated_build_entry_bytes(record) as u64;
+            add_build(&partitions, &h, record, index, &arbitrator);
+            assert_eq!(
+                consumer.reclaimable_bytes(),
+                building,
+                "the figure is the building partitions' bytes"
+            );
+        }
+        assert!(building > 0);
+
+        let ctx = EvalContext::test_with_file(&h.stable, &h.source_file, 0);
+        partitions
+            .finish_build(&h.build_extractor, &ctx, &arbitrator, &h.emit.name)
+            .expect("build finished");
+        assert_eq!(
+            consumer.reclaimable_bytes(),
+            0,
+            "the probe keeps every in-memory partition"
+        );
+        assert_eq!(handle.bytes(), building, "the partitions stay charged");
+        let all_ready = || {
+            partitions
+                .cell
+                .borrow()
+                .executor
+                .partitions
+                .iter()
+                .all(|state| matches!(state, PartitionState::Ready(_)))
+        };
+        assert!(all_ready(), "every partition is built for the probe");
+
+        let other = TestWalkOwned::register(&arbitrator, "other", (0..64).collect(), FOREIGN_FREE);
+        arbitrator
+            .set_limit(arbitrator.charged_bytes() + FOREIGN_FREE)
+            .expect("limit");
+        let shortfall = foreign_walk_request(&arbitrator, 3 * FOREIGN_FREE)
+            .expect_err("spilling the other owner leaves too little room");
+        let report = shortfall.into_report(&arbitrator);
+        let round = report.reclaim.as_ref().expect("the walk ran a round");
+        assert_eq!(
+            round.holders_asked,
+            vec!["other".to_string()],
+            "the round asks the other owner and never the grace consumer"
+        );
+        assert!(all_ready(), "the built partitions stay in memory");
+        arbitrator.set_limit(resident_limit).expect("limit");
+        drop(partitions);
+        arbitrator.unregister_consumer(other.id);
         arbitrator.unregister_consumer(id);
     });
 }
