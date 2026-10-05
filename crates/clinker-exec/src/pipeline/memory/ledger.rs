@@ -11,7 +11,7 @@
 use super::protocol::Refusal;
 use super::reservation::{LockedLedger, ReservationState};
 use super::walk::{self, BorrowedReclaimSet, ThreadRole, VictimOutcome, WalkReclaim};
-use super::{ConsumerId, MemoryArbitrator, MemoryConsumer, NO_WALK_REQUESTER, ReclaimCandidate};
+use super::{ConsumerId, MemoryArbitrator, NO_WALK_REQUESTER, ReclaimCandidate};
 use clinker_format::FormatError;
 use clinker_format::preparation::{ResourceError, ResourceErrorKind};
 use clinker_plan::error::PipelineError;
@@ -1053,10 +1053,10 @@ impl MemoryArbitrator {
     /// ledger down to the resume watermark with the request charged,
     /// reclaiming on demand only. Candidates are the registered consumers
     /// that cannot be paused and that a spill would free bytes from now
-    /// ([`MemoryConsumer::reclaimable_bytes`] above 0), ordered by the run's
-    /// policy, which ranks them by those bytes, with ties to the older
-    /// (lower) id, the requester after all of them; a consumer whose charge
-    /// no spill can free is never a candidate, however much it holds. A
+    /// ([`super::MemoryConsumer::reclaimable_bytes`] above 0), ordered by
+    /// the run's policy, which ranks them by those bytes, with ties to the
+    /// older (lower) id, the requester after all of them; a consumer whose
+    /// charge no spill can free is never a candidate, however much it holds. A
     /// forced pass's only candidate is the requester. A victim the walk does
     /// not own is skipped and never asked to act; one it owns but cannot
     /// spill now is `Busy` and frees nothing.
@@ -2330,7 +2330,7 @@ mod walk_pass_tests {
     };
     use crate::pipeline::memory::{
         ArbitrationPolicy, BackPressurePreferred, ConsumerHandle, ConsumerSpillError, LargestFirst,
-        Priority,
+        MemoryConsumer, Priority,
     };
     use clinker_plan::config::CompressMode;
     use clinker_plan::runtime_error::MemorySurface;
@@ -3327,7 +3327,7 @@ mod reclaim_entry_tests {
         KIB, MIB, Scripted, empty_set, governed, register, run, scripted, walk,
     };
     use super::*;
-    use crate::pipeline::memory::{ConsumerHandle, ConsumerSpillError, Priority};
+    use crate::pipeline::memory::{ConsumerHandle, ConsumerSpillError, MemoryConsumer, Priority};
     use clinker_plan::runtime_error::MemorySurface;
     use std::sync::Mutex;
 
@@ -3553,7 +3553,7 @@ mod candidate_order_tests {
     use super::*;
     use crate::pipeline::memory::{
         ArbitrationPolicy, BackPressurePreferred, ConsumerHandle, ConsumerSpillError, LargestFirst,
-        Priority,
+        MemoryConsumer, Priority,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -3614,7 +3614,7 @@ mod candidate_order_tests {
                     Arc::new(Counted {
                         reclaimable: (seed >> 33) % 5,
                         priority: ((seed >> 20) % 3) as i32,
-                        pausable: (seed >> 50) % 8 == 0,
+                        pausable: (seed >> 50).is_multiple_of(8),
                         reads: Arc::clone(&reads),
                     }),
                     ConsumerHandle::new(),
@@ -3628,7 +3628,11 @@ mod candidate_order_tests {
             .collect()
     }
 
-    fn shipped_policies() -> Vec<(&'static str, fn() -> Box<dyn ArbitrationPolicy>)> {
+    /// Builds one fresh instance of a policy.
+    type MakePolicy = fn() -> Box<dyn ArbitrationPolicy>;
+
+    /// The shipped policies and the back-pressure wrapper over each, by name.
+    fn shipped_policies() -> Vec<(&'static str, MakePolicy)> {
         vec![
             ("Priority", || Box::new(Priority)),
             ("LargestFirst", || Box::new(LargestFirst)),
