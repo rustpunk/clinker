@@ -207,7 +207,7 @@ Cull evaluates its group-level predicate against the *whole* group at once, so e
 E310 "drop_big": one request for rows held for Cull groups needs 500.0 KiB, more than memory.limit 8.0 KiB can hold — spilling cannot help
   group: the one whose first row is row 1 of source "events"
   ...
-  fix: raise the limit to at least 1M — this request needed 500.0 KiB; later stages may need more
+  fix: raise the limit to at least 1M — the smallest limit with room for this request and what the run already holds; later stages may need more
     pipeline:
       memory: { limit: "1M" }
     or: --memory-limit 1M

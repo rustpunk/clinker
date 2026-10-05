@@ -366,13 +366,13 @@ the engine refused, read from one account of the run's charged memory at the
 refusal:
 
 ```
-E310 totals: needed 2.0 MiB more for group state, but memory.limit 8.0 MiB is fully held and nothing more could be spilled
+E310 totals: needed 2.0 MiB more for group state, but only 704.0 KiB of memory.limit 8.0 MiB was left
   charged 7.3 MiB of 8.0 MiB (91%) · private memory 200.0 MiB
   largest holders:
     enrich  join build side  3.5 MiB  cannot spill
     ...
   reclaim: none attempted
-  fix: raise the limit to at least 10M — this request needed 9.3 MiB; later stages may need more
+  fix: raise the limit to at least 10M — the smallest limit with room for this request and what the run already holds; later stages may need more
     pipeline:
       memory: { limit: "10M" }
     or: --memory-limit 10M
@@ -380,7 +380,10 @@ E310 totals: needed 2.0 MiB more for group state, but memory.limit 8.0 MiB is fu
 ```
 
 - The headline keeps the greppable `E310 <node>:` prefix and names what the
-  memory was for in pipeline terms. A request larger than the limit on its
+  memory was for in pipeline terms and how much of the limit was left. It
+  adds `and nothing more could be spilled` only after the engine tried to
+  spill; a report whose reclaim line says `none attempted` does not claim
+  it. A request larger than the limit on its
   own, or than the limit leaves beside state that cannot spill, says
   `one request ... needs N, more than memory.limit L can hold — spilling
   cannot help`.
