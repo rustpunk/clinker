@@ -1204,7 +1204,12 @@ where
         // The finished table is not charged yet: the backstop makes room for
         // it beside the run's charges (spilling other state on the walk)
         // before the handle takes it on below, or refuses naming the reading
-        // that tripped.
+        // that tripped. Its rows are also still charged under the build
+        // input's reservation, so the check counts them twice, as the ledger
+        // will once the handle takes the table on (#1394). Counting them
+        // once here alone would pass a table the charge below then puts over
+        // the limit, and the next request, however small, would be refused
+        // in its place.
         budget
             .check_hard_limit(
                 name,

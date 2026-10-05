@@ -816,8 +816,7 @@ impl MemoryArbitrator {
     /// is refusing them.
     ///
     /// The figures are one ledger reading taken now, as a shortfall's would
-    /// be; `requested` is the bytes the site was about to add (for a
-    /// backstop that fires after the fact, what it found over the limit).
+    /// be; `requested` is the bytes the site was about to add.
     /// No reclaim round preceded the refusal, so the report says none was
     /// attempted. The request is oversized when it is larger than the limit
     /// on its own, or than what the limit leaves beside what cannot spill.

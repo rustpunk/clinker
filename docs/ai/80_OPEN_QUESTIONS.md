@@ -1048,9 +1048,22 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
   or refusal begin, earlier than the memory actually held requires. A cross-
   region park, by contrast, charges only what its copy alone keeps alive
   (`Record::clone_allocation_bytes`).
+- Evidence (the inline hash join's build rows): the inline join's build rows
+  stay charged under the build input's reservation until the join's arm
+  exits, and its join build side handle charges the whole finished table,
+  rows included, on top. Its hard-limit check counts the rows twice too, so
+  it agrees with what the ledger holds once the handle takes the table on.
+  Counting the rows once in the check alone, without removing the second
+  charge, moves the failure rather than the limit: in a two-Source join
+  probe (2,000 driver rows, 6,000 build rows) every capacity from 2.7 MB to
+  4.0 MB still failed, but with an E310 that names the Output's 504-byte
+  staging request instead of the join's build side. The check and the
+  charge have to change together.
 - Files/modules involved:
   `crates/clinker-exec/src/pipeline/combine.rs` (`memory_bytes` and the
-  other build-side sizing), `crates/clinker-record/src/field_str.rs`
+  other build-side sizing), `crates/clinker-exec/src/executor/combine_dispatch.rs`
+  (the inline build's check and its handle charge),
+  `crates/clinker-record/src/field_str.rs`
   (`heap_size` against the run-aware `unaccounted_heap_size`),
   `crates/clinker-record/src/record/mod.rs` (`clone_allocation_bytes`).
 - Suggested way to resolve it: #1394 decides one charge rule for every

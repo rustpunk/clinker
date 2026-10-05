@@ -765,12 +765,17 @@ impl CombineHashTable {
     ///   (`MemoryArbitrator::check_hard_limit`) is checked every
     ///   [`MEMORY_CHECK_INTERVAL`] inserts and at the end of build, for
     ///   `node`'s join build side and in `requester`'s name, with the
-    ///   table's bytes so far as the bytes not yet charged: `records` are
-    ///   charged to no consumer while the table takes them, and the caller
-    ///   charges the finished table. On the walk the check runs a reclaim
-    ///   round before it refuses; a refusal is
+    ///   table's bytes so far, its records included, as the bytes not yet
+    ///   charged; the caller charges the finished table. That is exact for
+    ///   `records` charged to no consumer while the table takes them (rows
+    ///   reloaded from a spill file). The inline hash join's build rows stay
+    ///   charged under the build input's reservation while it builds, so for
+    ///   it the check counts them twice, matching the second charge it makes
+    ///   when its handle takes on the finished table (#1394). On the walk
+    ///   the check runs a reclaim round before it refuses; a refusal is
     ///   [`CombineError::MemoryRefused`] carrying the check's E310. A caller
-    ///   whose records stay charged while they are indexed builds through
+    ///   whose records stay charged while they are indexed, and that does
+    ///   not charge them a second time, builds through
     ///   [`Self::build_from_charged`].
     /// * `estimated_rows` — optional capacity hint. When `Some`, the
     ///   underlying [`HashTable`] is pre-sized via `with_capacity` to avoid
@@ -2515,9 +2520,10 @@ mod tests {
     fn test_combine_hash_table_oom_aborts_during_build_probe() {
         // With a 1-byte budget the 10-record table's own footprint trivially
         // exceeds the hard limit, so the final-check safety net's
-        // `should_abort_local(table.memory_bytes())` fires regardless of
-        // whether RSS is measurable — the build-side cap is no longer an
-        // RSS-only gate that goes silent when `rss_bytes()` returns `None`.
+        // `check_hard_limit`, given the table's bytes as not yet charged,
+        // refuses regardless of whether RSS is measurable — the build-side
+        // cap is no longer an RSS-only gate that goes silent when
+        // `rss_bytes()` returns `None`.
         let schema = test_schema(&["k"]);
         let records: Vec<Record> = (0..10)
             .map(|i| mk_record(&schema, vec![Value::Integer(i)]))
