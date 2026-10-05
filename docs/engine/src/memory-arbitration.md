@@ -114,9 +114,10 @@ one of two ways:
   registered under the consumer it charges through `register_walk_owned`
   (`crates/clinker-exec/src/pipeline/memory/walk.rs`). Registered today:
   the run's document dead-letter state, an Output's per-document buckets,
-  the rows parked for a deferred consumer, and a Cull's and a Reshape's
-  group buffers. Sorts, aggregate tables, grace partitions and join state
-  do not register yet, so a pass skips them as `NotOwned`. The registry is
+  the rows parked for a deferred consumer, a Cull's and a Reshape's group
+  buffers, and a grace-hash Combine's partition table. Sorts, aggregate
+  tables and the other join strategies' state do not register yet, so a
+  pass skips them as `NotOwned`. The registry is
   run-scoped, outside every frame, and holds only a `Weak` to each cell, so
   an owner dropped on any exit is never reached. Several cells may register
   under one consumer; one cell may serve several consumers and spills only
@@ -158,7 +159,11 @@ exceptions. Registering changes none of a consumer's charge, priority,
 spill triggers or admission; it only makes the state reachable. A
 registered group buffer (Cull, Reshape) also records on its consumer's
 handle what spilling its resident groups frees now, which is the figure
-it ranks by.
+it ranks by. A grace-hash partition table records the bytes of the
+partitions its build is still filling; a pass that elects it spills
+every one of them. Once the build finishes the probe holds every
+in-memory partition, so the figure is 0 and no pass elects the consumer,
+though the partitions stay charged until they drop.
 
 The execution report samples the arbitrator's spill totals and the ledger's
 charged peak after dispatch has finished and every Source worker has joined. Ordered
@@ -430,7 +435,7 @@ dataset boundary. Raw temporary bytes are internal storage, not a new dataset.
 
 ### Existing consumer attribution
 
-Clinker tracks memory in two layers. RSS (resident set size) is sampled at chunk boundaries and supplies the primary spill / abort signal. Alongside RSS, every memory-touching operator (Source ingest channels, Aggregate hash maps, sort buffers, grace-hash partitions, sort-merge accumulators, IEJoin arrays, inline-Combine hash tables, the Reshape per-group input buffer, `node_buffers` slots and their transient scan materializations, and window-runtime arenas) registers a `MemoryConsumer` wrapper with the pipeline-scoped arbitrator. Each operator owns its live byte counter and updates it on every admit / spill transition; that counter is the consumer handle's charge on the run's one ledger. Victims are ranked by `reclaimable_bytes()`, what a spill of each consumer would free now, which the arbitrator reads per consumer at every policy poll and reclaim pass. A Source ingest channel's handle charges exactly the heap its queued attempts hold outside the run's ledger (foreign-provider or legacy storage, and a rejection's box): each attempt carries that charge from just before it is sent until the walk takes it off the channel, or until it is dropped unconsumed. Its records' admitted bytes are charged when they are allocated, in the Source's name, so no byte is counted twice. This pull-mode attribution lets the policy distinguish *reclaimable* bytes (what an operator can give up right now) from currently-held bytes — a grace-hash with on-disk partitions, for instance, reports only its in-memory portion, and the Reshape and Cull buffers report what spilling the groups still resident would free, each row counted as a `node_buffers` slot counts it, with rows on disk or taken out for processing counting 0.
+Clinker tracks memory in two layers. RSS (resident set size) is sampled at chunk boundaries and supplies the primary spill / abort signal. Alongside RSS, every memory-touching operator (Source ingest channels, Aggregate hash maps, sort buffers, grace-hash partitions, sort-merge accumulators, IEJoin arrays, inline-Combine hash tables, the Reshape per-group input buffer, `node_buffers` slots and their transient scan materializations, and window-runtime arenas) registers a `MemoryConsumer` wrapper with the pipeline-scoped arbitrator. Each operator owns its live byte counter and updates it on every admit / spill transition; that counter is the consumer handle's charge on the run's one ledger. Victims are ranked by `reclaimable_bytes()`, what a spill of each consumer would free now, which the arbitrator reads per consumer at every policy poll and reclaim pass. A Source ingest channel's handle charges exactly the heap its queued attempts hold outside the run's ledger (foreign-provider or legacy storage, and a rejection's box): each attempt carries that charge from just before it is sent until the walk takes it off the channel, or until it is dropped unconsumed. Its records' admitted bytes are charged when they are allocated, in the Source's name, so no byte is counted twice. This pull-mode attribution lets the policy distinguish *reclaimable* bytes (what an operator can give up right now) from currently-held bytes — a grace-hash Combine, for instance, reports only the partitions its build is still filling in memory, and nothing once its probe holds them, and the Reshape and Cull buffers report what spilling the groups still resident would free, each row counted as a `node_buffers` slot counts it, with rows on disk or taken out for processing counting 0.
 
 Registrations are scoped to the state they mirror, not to the run: each wrapper is unregistered when the state it attributes drains. A Source's ingest-channel consumer is released the moment its receiver disconnects (whichever arm consumed it — the Source arm, a fused `Merge.interleave`, or a fused Transform); a Combine branch's consumer is released when the branch exits — the IEJoin, grace-hash, and sort-merge branches route their clean return and every internal `?` early-return through a single unregister, and the inline-hash branch unregisters at its clean exit; and a `node_buffers` slot's consumer leaves the registry after its final planned reader. A consumer that collects a sequential scan into a resident vector carries an RAII materialization reservation for its complete synchronous use, so normal completion and every error return unregister it. Composition input seeding transfers that same registration into the body-local node-buffer registry without an unregister/register gap or a second charge. While the body Source canonicalizes its seed, the same byte handle first reserves the prospective output in addition to the still-live seed, then drops back to the output estimate when the seed allocation is gone; admission atomically swaps the wrapper under the existing consumer id. Later stages therefore never see charged bytes from state that has already moved downstream, and the registry the policy polls contains live contributors only.
 
