@@ -51,7 +51,7 @@ p{max-width:820px}
 .fd-callout--green{border-color:var(--verd);background:rgba(79,176,160,.07)}
 .fd-aside{font-size:13px;color:var(--ash)}
 
-.fd-ctlrow{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;margin:4px 0 10px}
+.fd-ctlrow{display:grid;grid-template-columns:11rem auto;justify-content:start;gap:6px 12px;align-items:center;margin:4px 0 10px}
 .fd-ctlhead{font-size:12px;color:var(--ash);min-width:96px}
 .fd-seg{display:inline-flex;border:2px solid var(--seam);flex-wrap:wrap}
 .fd-seg button{font:700 12px/1 var(--mono);letter-spacing:.03em;padding:9px 10px;border:0;border-right:1px solid var(--seam);background:transparent;color:var(--ash);cursor:pointer}
@@ -99,6 +99,12 @@ footer{padding:36px 6vw;color:var(--dim);font-size:12px}
   .fd-aside,.fd-card p,footer,.fd-ctlhead,.fd-file,.fd-tree,.fd-final ol,.fd-final p,.fd-matchers button{font-size:14px}
 }
 /* 44px targets on touch screens, and on any narrow screen in case the pointer is misreported */
+/* phones: every label on its own line, every button group full width, so all rows share one left and right edge */
+@media (max-width:560px){
+  .fd-ctlrow{grid-template-columns:1fr}
+  .fd-ctlrow .fd-seg{display:flex}
+  .fd-ctlrow .fd-seg button{flex:1 1 auto}
+}
 @media (pointer:coarse),(max-width:720px){
   .fd-seg button,.fd-matchers button{min-height:44px}
   nav.fd-toc a{display:flex;align-items:center;min-height:44px}
