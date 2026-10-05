@@ -3121,3 +3121,92 @@ fn grace_partitions_after_the_build_are_not_reclaimable() {
         arbitrator.unregister_consumer(id);
     });
 }
+
+/// A grace partition's records are already charged to the grace consumer
+/// while the build turns them into a table, so the hard-limit check counts
+/// only what the build adds on top of them: the index and the key cache.
+/// The run is placed so the table's records part is exactly what tips it
+/// over the limit if they were counted a second time; no walk frame, so a
+/// refusal would come at once.
+#[test]
+fn a_grace_partition_build_near_the_limit_does_not_count_its_records_twice() {
+    let h = build_bnl_harness();
+    // Far above what the test process holds: the check samples its memory.
+    let limit = 10 * 1024 * 1024 * 1024;
+    let arbitrator = MemoryArbitrator::with_policy(
+        limit,
+        0.80,
+        0.70,
+        Box::new(crate::pipeline::memory::NoOpPolicy),
+    );
+    let dir = tempfile::Builder::new()
+        .prefix("gh-charged-records-")
+        .tempdir()
+        .unwrap();
+    let (id, handle, partitions) = registered_partitions(&arbitrator, dir.path());
+    // One key, so every row lands in one partition and its table is the
+    // only one with records.
+    let builds: Vec<Record> = (0..2_000).map(|n| keyed_build(&h, 7, n)).collect();
+    add_builds(&partitions, &h, &builds, &arbitrator);
+    let charged_records = handle.bytes();
+    assert!(charged_records > 0, "the partition's rows are charged");
+
+    // The figures of the table the build will make, from the same rows.
+    let held: Vec<Record> = {
+        let cell = partitions.cell.borrow();
+        let mut held = Vec::new();
+        for state in &cell.executor.partitions {
+            if let PartitionState::Building { records, .. } = state {
+                held.extend(records.iter().map(|(record, _, _)| record.clone()));
+            }
+        }
+        held
+    };
+    assert_eq!(held.len(), builds.len());
+    let ctx = EvalContext::test_with_file(&h.stable, &h.source_file, 0);
+    let ample = MemoryArbitrator::with_policy(
+        limit,
+        0.80,
+        0.70,
+        Box::new(crate::pipeline::memory::NoOpPolicy),
+    );
+    let records_part = (held.len() * std::mem::size_of::<Record>()
+        + held.iter().map(Record::estimated_heap_size).sum::<usize>())
+        as u64;
+    let rows = held.len();
+    let table = CombineHashTable::build(
+        held,
+        &h.build_extractor,
+        &ctx,
+        &ample,
+        "joined",
+        crate::pipeline::memory::ledger::Requester::governed(),
+        Some(rows),
+    )
+    .expect("an ample build");
+    let table_bytes = table.memory_bytes() as u64;
+    drop(table);
+    let added = table_bytes - records_part;
+    assert!(records_part > 0 && added > 0, "{records_part} {added}");
+
+    // Charge the rest of the run so the build's own additions fit with half
+    // the records part to spare: counting the records again would carry the
+    // run past the limit.
+    let room = added + records_part / 2;
+    let (filler, filler_handle) = register_grace_consumer(&arbitrator, "elsewhere");
+    filler_handle.set_bytes(limit - arbitrator.charged_bytes() - room);
+    assert_eq!(arbitrator.charged_bytes(), limit - room);
+
+    partitions
+        .finish_build(&h.build_extractor, &ctx, &arbitrator, &h.emit.name)
+        .expect("the build adds only its index and key cache to what is charged");
+    assert_eq!(
+        handle.bytes(),
+        charged_records,
+        "the partition's rows stay charged once"
+    );
+    drop(partitions);
+    filler_handle.set_bytes(0);
+    arbitrator.unregister_consumer(filler);
+    arbitrator.unregister_consumer(id);
+}
