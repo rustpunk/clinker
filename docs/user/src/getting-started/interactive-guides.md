@@ -24,6 +24,13 @@ Where `$doc.*` values come from, how each file becomes its own document with
 its own Aggregate roll-up, and what `dlq_granularity: document` rejects.
 Reference: [Document Envelope Context](../pipelines/envelope-and-doc-context.md).
 
+## [How many documents?](../nodes/envelope-explainer.html)
+
+What an Envelope node's `preserve` and `concat` do to the documents a Sink
+writes, how a synthesized footer differs between them, how an Aggregate after
+the Envelope rolls up, and which pipeline shapes E347 and E355 reject.
+Reference: [Envelope Nodes](../nodes/envelope.md).
+
 ## [Which files get read?](../nodes/file-discovery-explainer.html)
 
 How a Source turns `glob:`, `regex:`, `paths:` and its filters into the list of

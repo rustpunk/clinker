@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clinker · How many documents?</title>
+<style>
+:root{
+  --iron:#14110f; --iron2:#1d1915; --iron3:#29231d; --seam:#3a3129;
+  --ash:#b9ab98; --bone:#ece2d0; --dim:#7d705f;
+  --rust:#d0581f; --rust-d:#8f3a13; --brass:#e0a93e; --verd:#4fb0a0;
+  --blood:#e0362c; --steel:#7f97ad; --plum:#b07ac0; --moss:#9bc76b;
+  --disp:"Rajdhani", "Bahnschrift Condensed", "Roboto Condensed", "Arial Narrow", sans-serif;
+  --mono:"Share Tech Mono", "Source Code Pro", Consolas, "Ubuntu Mono", monospace;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--iron);color:var(--bone);font:15px/1.6 var(--mono);
+  background-image:
+   radial-gradient(1000px 520px at 90% -10%, rgba(127,151,173,.13), transparent 60%),
+   radial-gradient(800px 480px at -10% 50%, rgba(224,169,62,.07), transparent 60%),
+   repeating-linear-gradient(135deg, rgba(255,255,255,.012) 0 1px, transparent 1px 7px);}
+a{color:var(--steel)}
+code{font-family:var(--mono);background:var(--iron3);padding:0 .35em;border:1px solid var(--seam);color:var(--brass);font-size:.92em;overflow-wrap:anywhere}
+pre{background:var(--iron);border:1px solid var(--seam);padding:12px 14px;overflow-x:auto;font-size:13px;line-height:1.5;color:var(--ash);max-width:100%;margin:10px 0}
+header.hero{padding:64px 6vw 36px;border-bottom:2px solid var(--seam);position:relative;overflow:hidden}
+header.hero::after{content:"";position:absolute;right:-20px;top:20px;width:300px;height:300px;pointer-events:none;
+  background:
+   linear-gradient(var(--steel),var(--steel)) 0 0/100% 3px no-repeat,
+   linear-gradient(var(--steel),var(--steel)) 0 100%/100% 3px no-repeat,
+   repeating-linear-gradient(0deg,rgba(127,151,173,.14) 0 2px,transparent 2px 24px);
+  opacity:.5;transform:rotate(-6deg)}
+.ev-kicker{font:700 12px/1.4 var(--mono);letter-spacing:.24em;text-transform:uppercase;color:var(--steel)}
+.ev-kicker a{color:inherit}
+h1{font:700 clamp(46px,9vw,118px)/.88 var(--disp);margin:14px 0 18px;text-transform:uppercase;letter-spacing:-.01em}
+h1 em{font-style:normal;color:var(--steel)}
+.ev-lede{max-width:800px;color:var(--ash);font-size:16px}
+nav.ev-toc{display:flex;flex-wrap:wrap;margin-top:26px;border:1px solid var(--seam);width:fit-content;max-width:100%}
+nav.ev-toc a{padding:10px 14px;text-decoration:none;color:var(--ash);border-right:1px solid var(--seam);font-size:12px;letter-spacing:.12em;text-transform:uppercase}
+nav.ev-toc a:last-child{border-right:0}
+nav.ev-toc b{color:var(--steel);margin-right:6px}
+@media (hover:hover){nav.ev-toc a:hover{background:var(--steel);color:var(--iron)}}
+section{padding:52px 6vw;border-bottom:1px solid var(--seam)}
+section:nth-of-type(even){background:rgba(0,0,0,.18)}
+.ev-sechead{display:grid;grid-template-columns:110px 1fr;gap:22px;align-items:end;margin-bottom:22px}
+.ev-num{font:700 110px/.8 var(--disp);color:transparent;-webkit-text-stroke:2px #45586a}
+h2{font:700 clamp(30px,4.4vw,56px)/.95 var(--disp);text-transform:uppercase;margin:0}
+h2 small{display:block;font:400 14px/1.4 var(--mono);text-transform:none;color:var(--dim);margin-top:10px}
+h3{font:700 19px/1.1 var(--disp);text-transform:uppercase;letter-spacing:.05em;color:var(--steel);margin:0 0 10px}
+p{max-width:840px}
+.ev-aside{font-size:13px;color:var(--ash)}
+.ev-cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.3fr);gap:28px}
+.ev-cols>*{min-width:0}
+.ev-panel{background:var(--iron2);border:1px solid var(--seam);padding:18px;min-width:0}
+.ev-callout{border-left:4px solid var(--steel);background:rgba(127,151,173,.08);padding:12px 16px;margin:14px 0;max-width:840px}
+.ev-callout--warn{border-color:var(--brass);background:rgba(224,169,62,.07)}
+
+.ev-ctlrow{display:grid;grid-template-columns:9rem auto;justify-content:start;gap:6px 12px;align-items:center;margin:4px 0 10px}
+.ev-ctlhead{font-size:12px;color:var(--ash)}
+.ev-seg{display:inline-flex;border:2px solid var(--seam);flex-wrap:wrap}
+.ev-seg button{font:700 12px/1 var(--mono);letter-spacing:.03em;padding:9px 10px;border:0;border-right:1px solid var(--seam);background:transparent;color:var(--ash);cursor:pointer}
+.ev-seg button:last-child{border-right:0}
+.ev-seg button[aria-pressed=true]{background:var(--steel);color:var(--iron)}
+.ev-seg button:disabled{opacity:.35;cursor:default}
+
+.ev-inputs{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0 12px}
+.ev-in{border:1px dashed var(--seam);padding:6px 9px;font-size:12px;background:var(--iron)}
+.ev-in b{color:var(--steel)}
+
+.ev-doc{border:2px solid var(--steel);margin:0 0 10px;background:var(--iron)}
+.ev-doc>div{padding:5px 10px;font-size:13px;border-bottom:1px solid var(--seam);overflow-wrap:anywhere}
+.ev-doc>div:last-child{border-bottom:0}
+.ev-doc .ev-dh{background:rgba(127,151,173,.12);color:var(--steel);font:700 12px/1.3 var(--mono);letter-spacing:.06em;text-transform:uppercase}
+.ev-doc .ev-foot{color:var(--brass)}
+.ev-doc .ev-none{color:var(--dim);font-style:italic}
+.ev-err{border:2px solid var(--blood);padding:12px 14px;font-size:13px}
+.ev-err b{color:var(--blood)}
+.ev-ok{border:2px solid var(--moss);padding:12px 14px;font-size:13px}
+.ev-ok b{color:var(--moss)}
+.ev-warn{border:2px solid var(--brass);padding:12px 14px;font-size:13px}
+.ev-warn b{color:var(--brass)}
+table.ev-t{border-collapse:collapse;font-size:13px}
+table.ev-t td,table.ev-t th{border:1px solid var(--seam);padding:5px 9px;text-align:left}
+table.ev-t th{font:700 12px/1.2 var(--disp);letter-spacing:.08em;text-transform:uppercase;color:var(--steel);background:var(--iron)}
+footer{padding:36px 6vw;color:var(--dim);font-size:12px}
+
+@media (max-width:980px){.ev-cols{grid-template-columns:1fr}}
+@media (max-width:720px){
+  .ev-sechead{grid-template-columns:1fr;gap:6px}.ev-num{font-size:64px}
+  h2{font-size:clamp(28px,10vw,36px)}
+  section{padding:44px 5vw}
+  header.hero{padding:44px 5vw 28px}
+}
+@media (max-width:720px),(pointer:coarse){
+  .ev-aside,footer,.ev-ctlhead,.ev-doc>div,.ev-err,.ev-ok,.ev-warn,table.ev-t,.ev-in{font-size:14px}
+}
+/* phones: every label on its own line, every button group full width */
+@media (max-width:560px){
+  .ev-ctlrow{grid-template-columns:1fr}
+  .ev-ctlrow .ev-seg{display:flex}
+  .ev-ctlrow .ev-seg button{flex:1 1 auto}
+}
+@media (pointer:coarse),(max-width:720px){
+  .ev-seg button{min-height:44px}
+  nav.ev-toc a{display:flex;align-items:center;min-height:44px}
+  .ev-kicker a{display:inline-block;line-height:44px}
+}
+@media (prefers-reduced-motion: reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="ev-kicker">Clinker user guide · <a href="envelope.html">← Envelope Nodes</a></div>
+  <h1>How many<br><em>documents?</em></h1>
+  <p class="ev-lede">An EDI interchange, an HL7 message or an XML file is one <b>document</b>: a header, a run of records, maybe a footer. When two documents flow into one output, something has to decide whether they are written as two framed documents or one. That is the Envelope node's job. Change the settings and see the documents the Sink writes. For what <code>$doc.*</code> sections are and how documents start, see <a href="../pipelines/envelope-and-doc-context-explainer.html">Document context</a> first.</p>
+  <nav class="ev-toc">
+    <a href="#frame"><b>01</b>Preserve or concat</a>
+    <a href="#rollup"><b>02</b>And an Aggregate</a>
+    <a href="#plan"><b>03</b>Will it plan?</a>
+  </nav>
+</header>
+
+<!-- ============================ 01 ============================ -->
+<section id="frame">
+  <div class="ev-sechead"><div class="ev-num">01</div><h2>Preserve or concat<small>Two input documents, one CSV output with <code>reconstruct_envelope: true</code></small></h2></div>
+  <div class="ev-cols">
+    <div class="ev-panel">
+      <h3>Inputs</h3>
+      <div class="ev-inputs" data-ev-inputs></div>
+      <div class="ev-ctlrow"><span class="ev-ctlhead">Their headers</span><div class="ev-seg" data-ev-bind="hdr"><button data-v="same">same partner</button><button data-v="diff">different partners</button><button data-v="none">b has none</button></div></div>
+      <div class="ev-ctlrow"><span class="ev-ctlhead">Envelope node</span><div class="ev-seg" data-ev-bind="env"><button data-v="none">no Envelope</button><button data-v="preserve">preserve</button><button data-v="concat">concat</button></div></div>
+      <div class="ev-ctlrow"><span class="ev-ctlhead">footer:</span><div class="ev-seg" data-ev-bind="foot"><button data-v="off">none</button><button data-v="count">record_count: count()</button><button data-v="sum">id_sum: sum(id)</button></div></div>
+      <pre data-ev-yaml></pre>
+    </div>
+    <div class="ev-panel">
+      <h3>What the Sink writes</h3>
+      <div data-ev-out></div>
+      <p class="ev-aside" data-ev-why></p>
+    </div>
+  </div>
+  <div class="ev-callout">
+    <p style="margin:0"><b>Rows are <code>id,tag</code></b>: a Transform before the Envelope emits <code>tag = $doc.interchange.tag</code>, so each row keeps its own document's tag even after <code>concat</code>. The footer row is the <code>interchange</code> section, rendered by the Sink's <code>footer_from_doc: interchange</code>; a document without that section gets no footer row.</p>
+  </div>
+</section>
+
+<!-- ============================ 02 ============================ -->
+<section id="rollup">
+  <div class="ev-sechead"><div class="ev-num">02</div><h2>And an Aggregate<small>Count rows per category after the Envelope</small></h2></div>
+  <div class="ev-cols">
+    <div class="ev-panel">
+      <div class="ev-inputs"><span class="ev-in"><b>a.csv</b> · x, x, y</span><span class="ev-in"><b>b.csv</b> · x, x, x</span></div>
+      <div class="ev-ctlrow"><span class="ev-ctlhead">Envelope node</span><div class="ev-seg" data-ev-bind="aenv"><button data-v="none">no Envelope</button><button data-v="preserve">preserve</button><button data-v="concat">concat</button></div></div>
+      <pre>- type: aggregate
+  name: per_category
+  input: <span data-ev-ain>sources</span>
+  config:
+    group_by: [category]
+    cxl: |
+      emit n = count(*)</pre>
+    </div>
+    <div class="ev-panel">
+      <h3>Aggregate output</h3>
+      <div data-ev-agg></div>
+      <p class="ev-aside" data-ev-aggwhy></p>
+    </div>
+  </div>
+  <div class="ev-callout ev-callout--warn">
+    <p style="margin:0">Aggregate rows belong to no document: they carry no header, no <code>$doc.*</code> values and no source file. A Sink with <code>reconstruct_envelope: true</code> writes them with no header or footer, and today a <code>concat</code> Envelope placed after the Aggregate does not change that, although it plans without error (<a data-ev-issue="aggconcat" href="https://github.com/rustpunk/clinker/issues/603">#603</a>). Reshape output is the same (<a data-ev-issue="reshape" href="https://github.com/rustpunk/clinker/issues/1317">#1317</a>).</p>
+  </div>
+</section>
+
+<!-- ============================ 03 ============================ -->
+<section id="plan">
+  <div class="ev-sechead"><div class="ev-num">03</div><h2>Will it plan?<small>The two checks that guard framed output</small></h2></div>
+  <div class="ev-cols">
+    <div class="ev-panel">
+      <div class="ev-ctlrow"><span class="ev-ctlhead">Input</span><div class="ev-seg" data-ev-bind="pin"><button data-v="one">one file</button><button data-v="two">two files, merged</button></div></div>
+      <div class="ev-ctlrow"><span class="ev-ctlhead">Before the Envelope</span><div class="ev-seg" data-ev-bind="pmid"><button data-v="none">nothing</button><button data-v="combine">a Combine</button><button data-v="aggregate">an Aggregate</button></div></div>
+      <div class="ev-ctlrow"><span class="ev-ctlhead">Envelope node</span><div class="ev-seg" data-ev-bind="penv"><button data-v="none">none</button><button data-v="preserve">preserve</button><button data-v="concat">concat</button></div></div>
+      <div class="ev-ctlrow"><span class="ev-ctlhead">Output</span><div class="ev-seg" data-ev-bind="pout"><button data-v="csv">CSV, reconstruct_envelope</button><button data-v="single">X12 / EDIFACT / HL7 / SWIFT</button></div></div>
+      <pre data-ev-pyaml></pre>
+    </div>
+    <div class="ev-panel">
+      <h3>Outcome</h3>
+      <div data-ev-pout></div>
+    </div>
+  </div>
+  <p class="ev-aside">X12, EDIFACT, HL7 and SWIFT output frame exactly one document per file, so a body that could hold two documents must be consolidated first (E355). A Sink with <code>reconstruct_envelope: true</code> needs every row to belong to a document, so rows from a Combine, Aggregate or Composition must pass through a <code>concat</code> Envelope first (E347). E347 has three other forms — per-file <code>split:</code> or <code>{source_file}</code> paths, <code>dlq_granularity: document</code>, and <code>correlation_key</code> — see <code>clinker explain --code E347</code>.</p>
+</section>
+
+<footer>Rules: the Envelope node (<code>executor/envelope_dispatch.rs</code>), the framed Sink (<code>sink_dispatch.rs</code>, CSV writer footer rows), and the plan checks for E347 and E355 (<code>clinker-plan/src/config/pipeline.rs</code>). The cases follow the engine's tests <code>envelope_node.rs</code> and <code>output_envelope_seam.rs</code>. Clinker user guide.</footer>
+
+<script>
+(() => {
+"use strict";
+const $ = (s, r = document) => r.querySelector(s);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const S = { hdr: "diff", env: "preserve", foot: "off", aenv: "preserve", pin: "two", pmid: "none", penv: "none", pout: "csv" };
+
+/* ---------- 01 ---------- */
+const HDR = { same: ["SHARED", "SHARED"], diff: ["ISA-A", "ISA-B"], none: ["ISA-A", null] };
+function frame() {
+  const [ha, hb] = HDR[S.hdr];
+  const docs = [{ file: "a.xml", tag: ha, ids: [1, 2, 3] }, { file: "b.xml", tag: hb, ids: [4] }];
+  const rows = d => d.ids.map(id => `${id},${d.tag ?? ""}`);
+  const foot = S.env === "none" ? "off" : S.foot;
+  const synth = ids => foot === "count" ? String(ids.length) : String(ids.reduce((a, b) => a + b, 0));
+  if (S.env !== "concat") {
+    return { docs: docs.map(d => ({ title: d.file, header: d.tag, rows: rows(d), footer: foot !== "off" ? synth(d.ids) : d.tag })) };
+  }
+  const distinct = [...new Set(docs.map(d => d.tag).filter(t => t))];
+  if (distinct.length >= 2) return { error: distinct.length };
+  const all = docs.flatMap(d => d.ids);
+  return { docs: [{ title: "one consolidated document", header: distinct[0] ?? null, rows: docs.flatMap(rows), footer: foot !== "off" ? synth(all) : (distinct[0] ?? null) }] };
+}
+function renderFrame() {
+  const [ha, hb] = HDR[S.hdr];
+  $("[data-ev-inputs]").innerHTML = `<span class="ev-in"><b>a.xml</b> · interchange.tag = ${esc(ha)} · ids 1, 2, 3</span><span class="ev-in"><b>b.xml</b> · ${hb ? "interchange.tag = " + esc(hb) : "no interchange header"} · id 4</span>`;
+  document.querySelectorAll('[data-ev-bind="foot"] button').forEach(b => b.disabled = S.env === "none");
+  const fsec = S.foot === "count" ? "record_count: count()" : "id_sum: sum(id)";
+  $("[data-ev-yaml]").textContent = (S.env === "none" ? "# no Envelope: the Sink reads the Transform directly\n" :
+`- type: envelope
+  name: framed
+  body: tag
+  config:
+    strategy: ${S.env}` + (S.foot !== "off" ? `
+    footer:
+      interchange: { ${fsec} }` : "") + "\n") +
+`- type: sink
+  name: out
+  input: ${S.env === "none" ? "tag" : "framed"}
+  config:
+    type: csv
+    reconstruct_envelope: true
+    options:
+      envelope:
+        footer_from_doc: interchange`;
+  const R = frame();
+  const out = $("[data-ev-out]");
+  if (R.error) {
+    out.innerHTML = `<div class="ev-err" data-ev-result="E350"><b>The run stops with E350.</b> concat collapses the body into one document, but the body carried ${R.error} different headers, and one document can frame only one. Nothing is written.<br><br>Fix: make the headers identical upstream, or use <code>strategy: preserve</code> to keep one document per header.</div>`;
+  } else {
+    out.innerHTML = `<p class="ev-aside" data-ev-count="${R.docs.length}">${R.docs.length} document${R.docs.length === 1 ? "" : "s"} written</p>` + R.docs.map(d =>
+      `<div class="ev-doc"><div class="ev-dh">${esc(d.title)}</div>${d.rows.map(r => `<div data-ev-row>${esc(r)}</div>`).join("")}${d.footer !== null ? `<div class="ev-foot" data-ev-foot>${esc(d.footer)}</div>` : '<div class="ev-none">no interchange section: no footer row</div>'}</div>`).join("");
+  }
+  const why = S.env === "concat"
+    ? (R.error ? "Two different non-empty headers cannot share one document; concat refuses to drop one silently. The check runs while the pipeline runs, not when it is planned." :
+       `concat re-stamps every row onto one document, so the body opens and closes once. ${S.hdr === "none" ? "A document without a header does not conflict: the consolidated document keeps the one header there is. " : "Identical headers fold into one. "}${S.foot !== "off" ? "The footer is computed once, over all four rows." : "Its header is the first document's."}`)
+    : `${S.env === "preserve" ? `preserve keeps one framed document per input document.${S.foot === "off" ? " The output is byte for byte what you get with no Envelope node at all." : ""}` : "Each input document is framed on its own."}${S.foot !== "off" && S.env !== "none" ? " The footer is computed per document, so the same footer gives different values here and under concat." : ""}`;
+  $("[data-ev-why]").textContent = why + (S.foot !== "off" && S.env !== "none" ? " A synthesized footer section replaces the whole section of the same name, which is why the tag is gone from the footer row: footer_from_doc can only name a section a Source declares, so the synthesized fields have to live in that section." : "");
+}
+
+/* ---------- 02 ---------- */
+function renderAgg() {
+  $("[data-ev-ain]").textContent = S.aenv === "none" ? "sources" : "framed";
+  const per = S.aenv !== "concat";
+  const rows = per ? [["a.csv", "x", 2], ["a.csv", "y", 1], ["b.csv", "x", 3]] : [["(one document)", "x", 5], ["(one document)", "y", 1]];
+  $("[data-ev-agg]").innerHTML = `<table class="ev-t" data-ev-aggt><tr><th>from</th><th>category</th><th>n</th></tr>${rows.map(r => `<tr><td>${esc(r[0])}</td><td>${r[1]}</td><td>${r[2]}</td></tr>`).join("")}</table>`;
+  $("[data-ev-aggwhy]").textContent = per
+    ? "An Aggregate rolls up each document separately, so x is counted once per file. preserve changes nothing about that."
+    : "concat makes the two files one document before the Aggregate sees them, so it rolls up once over all six rows.";
+}
+
+/* ---------- 03 ---------- */
+function planCheck() {
+  const multiIn = S.pin === "two";
+  const stripper = S.pmid !== "none";
+  // stream cardinality: Combine / Aggregate / concat consolidate; preserve passes through
+  const multi = multiIn && !stripper && S.penv !== "concat";
+  if (S.pout === "single") {
+    if (multi) return { code: "E355", text: "output `swift` frames a single top-level document envelope, but its body can carry more than one document with no consolidating node on the path.", fix: "Insert an envelope node with strategy: concat before the Sink, or write to a format that holds a sequence of documents (CSV, JSON, XML, fixed-width)." };
+    return { ok: true, text: "Plans: no second document can reach the output." + (multiIn ? (S.penv === "concat" ? " The concat Envelope consolidated the two files." : ` The ${S.pmid === "combine" ? "Combine" : "Aggregate"} consolidated the two files.`) : "") };
+  }
+  if (stripper && S.penv !== "concat") {
+    const node = S.pmid === "combine" ? "Combine" : "Aggregate";
+    return { code: "E347", text: `reconstruct_envelope cannot be combined with an upstream node (${node.toLowerCase()}) that strips document lineage unless an envelope node with strategy: concat consolidates the merged stream first.${S.penv === "preserve" ? (S.pmid === "combine" ? " A preserve Envelope does not lift it. For a Combine the check is stricter than it needs to be: the joined rows keep their driver row's document (#1384)." : " A preserve Envelope does not lift it: the Aggregate's rows would pass through with no document.") : ""}`, fix: "Change the Envelope to strategy: concat, or drop reconstruct_envelope." };
+  }
+  if (S.pmid === "aggregate") return { warn: true, text: "Plans without error, but the Aggregate's rows carry no source file, so the consolidated document has none either, and the Sink writes the rows with no header or footer.", issue: true };
+  const n = S.penv === "concat" || stripper ? 1 : (multiIn ? 2 : 1);
+  return { ok: true, text: `Plans. The Sink frames ${n} document${n === 1 ? "" : "s"}${S.pmid === "combine" ? " (Combine rows keep their driver row's document, and concat makes them one)" : ""}.` };
+}
+function renderPlan() {
+  const src = S.pin === "two" ? "- type: merge\n  name: both\n  inputs: [file_a, file_b]\n" : "# one source, file_a\n";
+  const mid = S.pmid === "combine" ? "- type: combine\n  name: enriched   # orders joined to a lookup\n  ...\n" : S.pmid === "aggregate" ? "- type: aggregate\n  name: totals\n  ...\n" : "";
+  const env = S.penv !== "none" ? `- type: envelope\n  name: framed\n  config: { strategy: ${S.penv} }\n` : "";
+  const sink = S.pout === "csv" ? "- type: sink\n  name: out\n  config:\n    type: csv\n    reconstruct_envelope: true" : "- type: sink\n  name: out\n  config:\n    type: swift";
+  $("[data-ev-pyaml]").textContent = src + mid + env + sink;
+  const R = planCheck();
+  $("[data-ev-pout]").innerHTML = R.code
+    ? `<div class="ev-err" data-ev-plan="${R.code}"><b>Rejected with ${R.code}.</b> ${esc(R.text)}<br><br>Fix: ${esc(R.fix)}</div>`
+    : R.warn
+    ? `<div class="ev-warn" data-ev-plan="warn"><b>Plans, with a known gap.</b> ${esc(R.text)} (<a data-ev-issue="aggconcat2" href="https://github.com/rustpunk/clinker/issues/603">#603</a>)</div>`
+    : `<div class="ev-ok" data-ev-plan="ok"><b>OK.</b> ${esc(R.text)}</div>`;
+}
+
+function render() {
+  document.querySelectorAll("[data-ev-bind]").forEach(g => g.querySelectorAll("button").forEach(b => b.setAttribute("aria-pressed", String(S[g.dataset.evBind] === b.dataset.v))));
+  renderFrame(); renderAgg(); renderPlan();
+}
+document.querySelectorAll("[data-ev-bind]").forEach(g => g.querySelectorAll("button").forEach(b => b.addEventListener("click", () => {
+  if (b.disabled) return; S[g.dataset.evBind] = b.dataset.v; render();
+})));
+render();
+})();
+</script>
+</body>
+</html>
