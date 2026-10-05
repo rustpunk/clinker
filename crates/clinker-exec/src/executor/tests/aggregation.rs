@@ -2081,7 +2081,7 @@ mod walk_owned_tables {
 
     use clinker_record::owned_storage::{OwnedKey, SharedStorage};
     use clinker_record::{DocumentId, Record, Schema, Value};
-    use cxl::eval::{EvalContext, StableEvalContext};
+    use cxl::eval::{EvalContext, ProgramEvaluator, StableEvalContext};
     use cxl::parser::Parser;
     use cxl::plan::{CompiledAggregate, extract_aggregates};
     use cxl::resolve::pass::resolve_program;
@@ -2090,15 +2090,18 @@ mod walk_owned_tables {
     use cxl::typecheck::{QualifiedField, Row, TypedProgram};
     use indexmap::IndexMap;
 
-    use crate::aggregation::{AggregateStream, SortRow};
+    use crate::aggregation::{
+        AggregateConsumer, AggregateStream, AggregatorConfig, HashAggregator, SortRow,
+    };
     use crate::executor::aggregate_dispatch::{
         AggregateSpec, DocAggregatorFactory, WalkGroupTables,
     };
-    use crate::pipeline::memory::MemoryArbitrator;
     use crate::pipeline::memory::walk::walk_test_support::{
-        foreign_walk_request, with_test_walk_frame,
+        TestWalkOwned, foreign_walk_request, with_test_walk_frame,
     };
+    use crate::pipeline::memory::{ConsumerHandle, MemoryArbitrator, MemoryConsumer};
     use clinker_plan::plan::types::AggregateStrategy;
+    use clinker_plan::runtime_error::HolderState;
 
     /// The Aggregate's node name: its tables' consumers and spills are
     /// recorded under it.
@@ -2338,5 +2341,207 @@ mod walk_owned_tables {
                 "a table a foreign pass spilled finalizes the rows an unspilled one gives"
             );
         });
+    }
+
+    /// The time-windowed arm's per-window table answers the same foreign
+    /// request the same way: the pass spills it and its finalize gives the
+    /// rows an unspilled table gives.
+    #[test]
+    fn windowed_group_state_spills_when_another_walk_request_falls_short() {
+        const WINDOW_START: i64 = 0;
+        let spill_root = tempfile::tempdir().expect("spill root");
+        let program = program();
+        let rows = input();
+        let expected = unspilled_rows(&program, &rows, spill_root.path());
+        let arbitrator = arbitrator();
+        with_test_walk_frame(&arbitrator, || {
+            let factory = factory(&program, &arbitrator, spill_root.path());
+            let mut windows = WalkGroupTables::for_windows(&arbitrator);
+            let stable = StableEvalContext::test_default();
+            let ctx = EvalContext::test_default_borrowed(&stable);
+            let mut emitted = Vec::new();
+            for (row, record) in rows.iter().enumerate() {
+                windows
+                    .add_window_record(
+                        WINDOW_START,
+                        || factory.make(),
+                        record,
+                        (row as u64).into(),
+                        &ctx,
+                        &mut emitted,
+                    )
+                    .expect("table built")
+                    .expect("record added");
+            }
+            let handle = windows
+                .inspect(&WINDOW_START, |stream| {
+                    Arc::clone(stream.consumer_handle().expect("a hash table"))
+                })
+                .expect("the window's table");
+            let charge = handle.bytes();
+            assert!(charge > FREE, "the table holds a value heap");
+            arbitrator
+                .set_limit(arbitrator.charged_bytes() + FREE)
+                .expect("limit");
+            let spilled_before = spilled_bytes(&arbitrator);
+
+            let grant = foreign_walk_request(&arbitrator, FREE + charge / 2)
+                .expect("the pass spills the window's table and the request fits");
+            assert_eq!(
+                handle.bytes(),
+                0,
+                "the table's handle falls by its whole resident charge"
+            );
+            assert!(
+                windows
+                    .inspect(&WINDOW_START, |stream| match stream {
+                        AggregateStream::Hash(table) => !table.spill_files().is_empty(),
+                        _ => false,
+                    })
+                    .expect("the window's table"),
+                "the window's groups are on disk"
+            );
+            assert!(
+                spilled_bytes(&arbitrator) > spilled_before,
+                "the spill is recorded under the Aggregate's node"
+            );
+            drop(grant);
+
+            let (stream, id) = windows.take(&WINDOW_START).expect("the window's table");
+            let mut out = Vec::new();
+            stream.finalize(&ctx, &mut out).expect("finalized");
+            arbitrator.unregister_consumer(id);
+            assert_eq!(
+                canonical(out),
+                expected,
+                "a window table a foreign pass spilled finalizes the rows an unspilled one gives"
+            );
+        });
+    }
+
+    /// A table taken out of its arm for its finalize ranks by 0: no pass can
+    /// spill it, so a round never asks it and the E310 lists it as unable to
+    /// spill, never as in use. A table with no spill directory ranks by 0
+    /// throughout.
+    #[test]
+    fn a_table_taken_for_its_finalize_is_not_reclaimable() {
+        let spill_root = tempfile::tempdir().expect("spill root");
+        let program = program();
+        let rows = input();
+        let arbitrator = arbitrator();
+        let stable = StableEvalContext::test_default();
+        let ctx = EvalContext::test_default_borrowed(&stable);
+        with_test_walk_frame(&arbitrator, || {
+            let factory = factory(&program, &arbitrator, spill_root.path());
+            let mut tables = WalkGroupTables::for_documents(&arbitrator);
+            let doc = DocumentId::next();
+            let mut emitted = Vec::new();
+            for (row, record) in rows.iter().enumerate() {
+                tables
+                    .add_document_record(
+                        doc,
+                        &factory,
+                        record,
+                        (row as u64).into(),
+                        &ctx,
+                        &mut emitted,
+                    )
+                    .expect("table built")
+                    .expect("record added");
+            }
+            let handle = tables
+                .inspect(&doc, |stream| {
+                    Arc::clone(stream.consumer_handle().expect("a hash table"))
+                })
+                .expect("the document's table");
+            let consumer = AggregateConsumer::new(Arc::clone(&handle));
+            let charge = handle.bytes();
+            assert!(charge > 2 * FREE, "the table holds a value heap");
+            assert_eq!(
+                consumer.reclaimable_bytes(),
+                charge,
+                "a resident table ranks by what its spill frees: its charge"
+            );
+
+            let (stream, id) = tables
+                .take_closing_document(doc, &factory)
+                .expect("the close takes the table")
+                .expect("the document's table");
+            assert_eq!(
+                consumer.reclaimable_bytes(),
+                0,
+                "a table taken for its finalize is out of every pass's reach"
+            );
+            assert_eq!(
+                handle.bytes(),
+                charge,
+                "it stays charged until it finalizes"
+            );
+
+            let other = TestWalkOwned::register(&arbitrator, "other", (0..64).collect(), FREE);
+            arbitrator
+                .set_limit(arbitrator.charged_bytes() + FREE)
+                .expect("limit");
+            let shortfall = foreign_walk_request(&arbitrator, 3 * FREE)
+                .expect_err("spilling the other owner leaves too little room");
+            let report = shortfall.into_report(&arbitrator);
+            let round = report.reclaim.as_ref().expect("the walk ran a round");
+            assert_eq!(
+                round.holders_asked,
+                vec!["other".to_string()],
+                "the round asks the other owner and never the finalizing table"
+            );
+            let holder = report
+                .holders
+                .iter()
+                .find(|holder| holder.node == NODE)
+                .expect("the finalizing table is a holder");
+            assert_eq!(
+                holder.state,
+                HolderState::CannotSpill,
+                "the E310 never calls a finalizing table in use"
+            );
+
+            let mut out = Vec::new();
+            stream.finalize(&ctx, &mut out).expect("finalized");
+            assert_eq!(consumer.reclaimable_bytes(), 0);
+            arbitrator.unregister_consumer(id);
+            arbitrator.unregister_consumer(other.id);
+        });
+
+        // The shape of a Cull's decision fold: no spill directory, so no
+        // spill could ever free the table.
+        let handle = ConsumerHandle::new();
+        let mut table = HashAggregator::new(AggregatorConfig {
+            compiled: Arc::clone(&program.compiled),
+            evaluator: ProgramEvaluator::new(Arc::clone(&program.typed), false),
+            output_schema: program.output_schema.clone(),
+            spill_schema: SharedStorage::from_arc(Arc::new(Schema::new(vec![
+                "k".into(),
+                "__acc_state".into(),
+                "__meta_tracker".into(),
+            ]))),
+            memory_budget: 0,
+            spill_dir: None,
+            spill_compress: false,
+            transform_name: NODE.to_string(),
+            consumer_handle: Arc::clone(&handle),
+            arbitrator: Arc::clone(&arbitrator),
+        });
+        let consumer = AggregateConsumer::new(Arc::clone(&handle));
+        for (row, record) in rows.iter().enumerate() {
+            table
+                .add_record(record, row as u64, &ctx)
+                .expect("record added");
+            assert_eq!(
+                consumer.reclaimable_bytes(),
+                0,
+                "a table with no spill directory never ranks as reclaimable"
+            );
+        }
+        assert!(handle.bytes() > 0, "it is charged all the same");
+        let mut out = Vec::new();
+        table.finalize(&ctx, &mut out).expect("finalized");
+        assert_eq!(consumer.reclaimable_bytes(), 0);
     }
 }

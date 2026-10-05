@@ -1011,6 +1011,24 @@ impl KeyedGroupTables for RegisteredTables {
     }
 }
 
+/// A time-windowed Aggregate's tables: one per window (tumbling, hopping) or
+/// per group's session, keyed by `K`. Every table finalizes at end of input.
+pub(crate) struct WindowTables<K> {
+    tables: HashMap<K, GroupTable>,
+}
+
+impl<K: Eq + std::hash::Hash + Clone> KeyedGroupTables for WindowTables<K> {
+    type Key = K;
+
+    fn tables(&self) -> &HashMap<K, GroupTable> {
+        &self.tables
+    }
+
+    fn tables_mut(&mut self) -> &mut HashMap<K, GroupTable> {
+        &mut self.tables
+    }
+}
+
 /// A walk arm's group tables in one walk-owned cell, each table that holds
 /// a hash table registered in the walk reclaim set under its own consumer.
 ///
@@ -1088,6 +1106,11 @@ impl<T: KeyedGroupTables> WalkGroupTables<T> {
     pub(crate) fn take(&mut self, key: &T::Key) -> Option<GroupTable> {
         let table = self.cell.borrow_mut().tables_mut().remove(key)?;
         Some(self.withdraw(table))
+    }
+
+    /// The keys of the tables in the cell, in no particular order.
+    pub(crate) fn keys(&self) -> Vec<T::Key> {
+        self.cell.borrow().tables().keys().cloned().collect()
     }
 
     /// A table leaving the cell leaves the walk reclaim set with it.
@@ -1195,6 +1218,50 @@ impl WalkGroupTables<RegisteredTables> {
         let mut tables = self.cell.borrow_mut();
         tables.open_owed_sentinel(empty_input, factory)?;
         Ok(tables.remaining_keys())
+    }
+}
+
+impl<K: Eq + std::hash::Hash + Clone + 'static> WalkGroupTables<WindowTables<K>> {
+    /// A time-windowed arm's tables, empty, for the run whose arbitrator is
+    /// `arbitrator`.
+    pub(crate) fn for_windows(arbitrator: &Arc<crate::pipeline::memory::MemoryArbitrator>) -> Self {
+        Self::new(
+            arbitrator,
+            WindowTables {
+                tables: HashMap::new(),
+            },
+        )
+    }
+
+    /// Add `record` to the table of window or session `key`, building that
+    /// table through `make` when it is the key's first record. Returns the
+    /// add's own result for the caller to route.
+    ///
+    /// # Errors
+    ///
+    /// A failed build.
+    pub(crate) fn add_window_record(
+        &mut self,
+        key: K,
+        make: impl FnOnce() -> Result<GroupTable, PipelineError>,
+        record: &Record,
+        row_num: crate::executor::stream_event::SourceRowId,
+        eval_ctx: &EvalContext,
+        out: &mut Vec<crate::aggregation::SortRow>,
+    ) -> Result<Result<(), crate::aggregation::HashAggError>, PipelineError> {
+        let (result, built) = self.add_with(key, make, record, row_num, eval_ctx, out)?;
+        let _ = built;
+        Ok(result)
+    }
+}
+
+/// The error for a table listed for its finalize that is no longer in its
+/// arm's cell: the arm took it twice.
+fn missing_group_table(name: &str) -> PipelineError {
+    PipelineError::Internal {
+        op: "aggregation",
+        node: name.to_string(),
+        detail: "a group table listed for its finalize left before it".to_string(),
     }
 }
 
@@ -1335,12 +1402,7 @@ fn run_strict_aggregate_per_document(
     // `remaining_keys`. This leftover fold spans no single document, so its
     // DLQ attribution keeps the batch-first-record behavior.
     for key in tables.remaining_keys(input.is_empty(), &factory)? {
-        let bucket = tables.take(&key).ok_or_else(|| PipelineError::Internal {
-            op: "aggregation",
-            node: name.to_string(),
-            detail: "a group table listed for the end-of-input flush left before its finalize"
-                .to_string(),
-        })?;
+        let bucket = tables.take(&key).ok_or_else(|| missing_group_table(name))?;
         let result = finalize_bucket(bucket, &finalize_ctx, &factory.arbitrator, &mut out_rows);
         route_document_flush_result(ctx, name, input, output_schema, result)?;
     }
@@ -1933,7 +1995,7 @@ fn run_time_windowed_aggregate(
     let name = win_ctx.name;
     let compiled = win_ctx.compiled;
     let output_schema = win_ctx.output_schema.clone();
-    use crate::aggregation::{AggregateStream, HashAggError, SortRow as AggSortRow};
+    use crate::aggregation::{HashAggError, SortRow as AggSortRow};
     use crate::executor::time_window::{
         WindowBounds, duration_to_nanos, hopping_windows, partition_into_sessions,
         record_event_time_nanos, session_is_closed, tumbling_window, upstream_source_names,
@@ -2014,10 +2076,7 @@ fn run_time_windowed_aggregate(
                     detail: "tumbling window size must be > 0".to_string(),
                 });
             }
-            let mut per_window: HashMap<
-                i64,
-                (AggregateStream, crate::pipeline::memory::ConsumerId),
-            > = HashMap::new();
+            let mut per_window = WalkGroupTables::for_windows(&ctx.memory_budget);
             (|| -> Result<(), PipelineError> {
                 for (record, row_num) in input {
                     let Some(t) = record_event_time_nanos(record) else {
@@ -2071,10 +2130,7 @@ fn run_time_windowed_aggregate(
                     detail: "hopping window size and slide must both be > 0".to_string(),
                 });
             }
-            let mut per_window: HashMap<
-                i64,
-                (AggregateStream, crate::pipeline::memory::ConsumerId),
-            > = HashMap::new();
+            let mut per_window = WalkGroupTables::for_windows(&ctx.memory_budget);
             (|| -> Result<(), PipelineError> {
                 for (record, row_num) in input {
                     let Some(t) = record_event_time_nanos(record) else {
@@ -2187,10 +2243,8 @@ fn run_time_windowed_aggregate(
             // (group_key, session_idx) separates session emits
             // without changing the underlying HashAggregator's
             // group-by contract.
-            let mut session_streams: HashMap<
-                SessionStreamKey,
-                (AggregateStream, crate::pipeline::memory::ConsumerId),
-            > = HashMap::new();
+            let mut session_streams: WalkGroupTables<WindowTables<SessionStreamKey>> =
+                WalkGroupTables::for_windows(&ctx.memory_budget);
             (|| -> Result<(), PipelineError> {
                 for (i, (rec, rn)) in input.iter().enumerate() {
                     let Some(info) = record_session_info[i].clone() else {
@@ -2223,23 +2277,23 @@ fn run_time_windowed_aggregate(
                             .or_insert(t);
                     }
                     let stream_key = (info.key, info.session_idx);
-                    let entry = session_streams.entry(stream_key);
-                    let (stream, _consumer_id) = match entry {
-                        std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
-                        std::collections::hash_map::Entry::Vacant(v) => {
-                            let fresh = win_ctx.make_stream(ctx)?;
-                            v.insert(fresh)
-                        }
-                    };
                     let source_file_arc = source_file_arc_of(rec);
                     let source_name_arc = source_name_arc_of(rec);
-                    let eval_ctx = ctx.eval_ctx_for_record(
+                    let walk_ctx: &ExecutorContext<'_> = ctx;
+                    let eval_ctx = walk_ctx.eval_ctx_for_record(
                         &source_file_arc,
                         &source_name_arc,
                         *rn,
                         rec.doc_ctx(),
                     );
-                    let add_result = stream.add_record(rec, *rn, &eval_ctx, &mut out_rows);
+                    let add_result = session_streams.add_window_record(
+                        stream_key,
+                        || win_ctx.make_stream(walk_ctx),
+                        rec,
+                        *rn,
+                        &eval_ctx,
+                        &mut out_rows,
+                    )?;
                     if add_result.is_ok() {
                         advance_cursor(ctx, &source_name_arc, *rn);
                     }
@@ -2251,22 +2305,23 @@ fn run_time_windowed_aggregate(
             })()?;
             // Finalize every (group, session) stream. Walk in
             // deterministic order (sorted by (group_key, session_idx))
-            // so emit order is stable across runs.
-            let mut entries: Vec<(
-                SessionStreamKey,
-                (AggregateStream, crate::pipeline::memory::ConsumerId),
-            )> = session_streams.into_iter().collect();
+            // so emit order is stable across runs. Each stream leaves the
+            // walk-owned cell just before its finalize.
+            let mut keys: Vec<SessionStreamKey> = session_streams.keys();
             // `GroupByKey` does not implement `Ord`; fall back to a
             // Debug-formatted key for deterministic finalize order
             // across runs. The session_idx breaks ties for the same
             // group key.
-            entries.sort_by(|a, b| {
-                let ka: Vec<String> = a.0.0.iter().map(|k| format!("{k:?}")).collect();
-                let kb: Vec<String> = b.0.0.iter().map(|k| format!("{k:?}")).collect();
-                ka.cmp(&kb).then(a.0.1.cmp(&b.0.1))
+            keys.sort_by(|a, b| {
+                let ka: Vec<String> = a.0.iter().map(|k| format!("{k:?}")).collect();
+                let kb: Vec<String> = b.0.iter().map(|k| format!("{k:?}")).collect();
+                ka.cmp(&kb).then(a.1.cmp(&b.1))
             });
             let finalize_ctx = ctx.merged_eval_ctx();
-            for (_, (stream, consumer_id)) in entries {
+            for key in keys {
+                let (stream, consumer_id) = session_streams
+                    .take(&key)
+                    .ok_or_else(|| missing_group_table(name))?;
                 // Finalize consumes this session's stream; unregister
                 // its wrapper unconditionally afterward so the session's
                 // bytes leave `sum_consumer_usage` whether finalize
@@ -2317,37 +2372,33 @@ fn add_to_window(
     record: &Record,
     row_num: crate::executor::stream_event::SourceRowId,
     window_start: i64,
-    per_window: &mut std::collections::HashMap<
-        i64,
-        (
-            crate::aggregation::AggregateStream,
-            crate::pipeline::memory::ConsumerId,
-        ),
-    >,
+    per_window: &mut WalkGroupTables<WindowTables<i64>>,
     out_rows: &mut Vec<crate::aggregation::SortRow>,
 ) -> Result<(), PipelineError> {
     let source_file_arc = source_file_arc_of(record);
     let source_name_arc = source_name_arc_of(record);
-    let eval_ctx = ctx.eval_ctx_for_record(
+    let walk_ctx: &ExecutorContext<'_> = ctx;
+    let eval_ctx = walk_ctx.eval_ctx_for_record(
         &source_file_arc,
         &source_name_arc,
         row_num,
         record.doc_ctx(),
     );
-    let (stream, _consumer_id) = match per_window.entry(window_start) {
-        std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
-        std::collections::hash_map::Entry::Vacant(v) => {
-            let fresh = win_ctx.make_stream(ctx)?;
-            v.insert(fresh)
+    let add_result = per_window.add_window_record(
+        window_start,
+        || win_ctx.make_stream(walk_ctx),
+        record,
+        row_num,
+        &eval_ctx,
+        out_rows,
+    )?;
+    match add_result {
+        Ok(()) => {
+            advance_cursor(ctx, &source_name_arc, row_num);
+            Ok(())
         }
-    };
-    let add_result = stream.add_record(record, row_num, &eval_ctx, out_rows);
-    if add_result.is_ok() {
-        advance_cursor(ctx, &source_name_arc, row_num);
-        return Ok(());
+        Err(e) => handle_aggregate_add_error(ctx, win_ctx.name, record, row_num, e),
     }
-    let e = add_result.err().unwrap();
-    handle_aggregate_add_error(ctx, win_ctx.name, record, row_num, e)
 }
 
 /// Shared per-record `add_record` error handler for every materialized
@@ -2400,28 +2451,21 @@ fn handle_aggregate_add_error(
 fn finalize_windows(
     ctx: &mut ExecutorContext<'_>,
     name: &str,
-    per_window: std::collections::HashMap<
-        i64,
-        (
-            crate::aggregation::AggregateStream,
-            crate::pipeline::memory::ConsumerId,
-        ),
-    >,
+    mut per_window: WalkGroupTables<WindowTables<i64>>,
     out_rows: &mut Vec<crate::aggregation::SortRow>,
     output_schema: &SharedStorage<Schema>,
     input: &[(Record, crate::executor::stream_event::SourceRowId)],
 ) -> Result<(), PipelineError> {
     use crate::aggregation::HashAggError;
-    let mut entries: Vec<(
-        i64,
-        (
-            crate::aggregation::AggregateStream,
-            crate::pipeline::memory::ConsumerId,
-        ),
-    )> = per_window.into_iter().collect();
-    entries.sort_by_key(|(start, _)| *start);
+    let mut starts = per_window.keys();
+    starts.sort_unstable();
     let finalize_ctx = ctx.merged_eval_ctx();
-    for (_, (stream, consumer_id)) in entries {
+    for start in starts {
+        // The window's table leaves the walk-owned cell just before its
+        // finalize, so no pass can reach a table being finalized.
+        let (stream, consumer_id) = per_window
+            .take(&start)
+            .ok_or_else(|| missing_group_table(name))?;
         // Finalize consumes this window's stream; unregister its
         // wrapper unconditionally afterward so the window's bytes leave
         // `sum_consumer_usage` whether finalize emitted rows or routed a
