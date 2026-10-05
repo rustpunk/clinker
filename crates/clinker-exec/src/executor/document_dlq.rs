@@ -1431,8 +1431,8 @@ impl DocumentBuckets {
     }
 
     /// Borrow (building on first sight) the bucket for file `key`. A new
-    /// bucket's consumer is registered under the Output's name, and this
-    /// cell is registered under that consumer in the walk reclaim set of
+    /// bucket's consumer is registered under the Output's name as rows held
+    /// until their document is decided, and this cell is registered under that consumer in the walk reclaim set of
     /// `arbitrator`'s walk ([`register_walk_owned`]), when the calling
     /// thread is that walk, so any reclaim pass there can spill the bucket.
     /// The registration is kept in the bucket and drops with it. A thread
@@ -1464,9 +1464,11 @@ impl DocumentBuckets {
                         Arc::clone(&handle),
                     )),
                     Arc::clone(&handle),
+                    // Every row of a document no verdict has reached, not
+                    // only failing ones: a clean document waits here too.
                     ConsumerLabel {
                         node: self.output_name.clone(),
-                        surface: MemorySurface::HeldFailingRows,
+                        surface: MemorySurface::OpenDocumentRows,
                     },
                 );
                 let reclaim = match register_walk_owned(arbitrator, consumer_id, &handle, &cell) {
