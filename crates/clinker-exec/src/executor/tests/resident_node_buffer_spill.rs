@@ -54,7 +54,7 @@ fn register(arb: &MemoryArbitrator, handle: &Arc<ConsumerHandle>) -> ConsumerId 
             node: "producer".to_string(),
             surface: clinker_plan::runtime_error::MemorySurface::BufferedRows {
                 from: "producer".to_string(),
-                to: "reader".to_string(),
+                to: vec!["reader".to_string()],
             },
         },
     )

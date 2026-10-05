@@ -2316,7 +2316,7 @@ impl<'a> ExecutorContext<'a> {
                 node: producer_name.to_string(),
                 surface: clinker_plan::runtime_error::MemorySurface::BufferedRows {
                     from: producer_name.to_string(),
-                    to: reader_name.to_string(),
+                    to: vec![reader_name.to_string()],
                 },
             },
         );
@@ -3674,15 +3674,15 @@ impl PlannedNodeBufferReaders {
             }
         }
         let to = if !readers.is_empty() {
-            readers.join(", ")
+            vec![readers.join(", ")]
         } else if let Some(keyed) = self.node_names.get(&key.node)
             && &**keyed != producer
         {
-            keyed.to_string()
+            vec![keyed.to_string()]
         } else if let Some(call_site) = composition_call_sites.last() {
-            call_site.clone()
+            vec![call_site.clone()]
         } else {
-            producer.to_string()
+            vec![producer.to_string()]
         };
         clinker_plan::runtime_error::ConsumerLabel {
             node: producer.to_string(),

@@ -143,8 +143,12 @@ impl From<lz4_flex::frame::Error> for SpillError {
 pub enum MemorySurface {
     /// Records a Source has read and not yet handed on.
     RowsRead,
-    /// Rows waiting between two nodes, named by their author-given names.
-    BufferedRows { from: String, to: String },
+    /// Rows waiting between two nodes: `from` is the author-given name of the
+    /// node that buffered them, and `to` holds the author-given name of every
+    /// node that reads them, one name per element. Each reader prints as its
+    /// own quoted name, so a slot read by several nodes can never be mistaken
+    /// for one node whose name contains a comma.
+    BufferedRows { from: String, to: Vec<String> },
     /// Per-group accumulators of an Aggregate.
     GroupState,
     /// Rows collected for sorting.
@@ -194,7 +198,7 @@ impl std::fmt::Display for MemorySurface {
                     f,
                     "rows buffered between {} and {}",
                     from.as_str().quoted_name(),
-                    to.as_str().quoted_name()
+                    quoted_names(to)
                 )
             }
             Self::GroupState => f.write_str("group state"),
@@ -1244,6 +1248,39 @@ mod tests {
         assert_eq!(
             fix_section(&MemorySurface::OpenDocumentRows),
             Some("Rows held until their document is decided")
+        );
+    }
+
+    /// Rows read by several nodes name every reader, each quoted on its own:
+    /// one quoted `"a, b"` would read the same as a single node named `a, b`.
+    #[test]
+    fn a_slot_read_by_several_nodes_quotes_each_reader() {
+        let buffered = |readers: &[&str]| {
+            MemorySurface::BufferedRows {
+                from: "split".to_string(),
+                to: readers.iter().map(|reader| reader.to_string()).collect(),
+            }
+            .to_string()
+        };
+
+        let two_readers = buffered(&["a", "b"]);
+        assert_eq!(
+            two_readers, "rows buffered between \"split\" and \"a\", \"b\"",
+            "each reader is quoted on its own"
+        );
+        let one_reader_with_a_comma = buffered(&["a, b"]);
+        assert_eq!(
+            one_reader_with_a_comma, "rows buffered between \"split\" and \"a, b\"",
+            "a name containing a comma stays one quoted name"
+        );
+        assert_ne!(
+            two_readers, one_reader_with_a_comma,
+            "two readers never read as one node whose name contains a comma"
+        );
+        assert_eq!(
+            buffered(&["totals"]),
+            "rows buffered between \"split\" and \"totals\"",
+            "one reader reads as one quoted name"
         );
     }
 

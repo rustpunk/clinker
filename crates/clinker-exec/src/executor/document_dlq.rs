@@ -4481,7 +4481,7 @@ mod tests {
                 node: node.to_string(),
                 surface: clinker_plan::runtime_error::MemorySurface::BufferedRows {
                     from: node.to_string(),
-                    to: "out".to_string(),
+                    to: vec!["out".to_string()],
                 },
             },
         );
