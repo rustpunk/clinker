@@ -6,7 +6,9 @@
 //! the policy jobs; the workflow trust gate pins which jobs may skip.
 //!
 //! The classification fails open. Every case it cannot establish reports
-//! `false`, which runs the full workflow.
+//! `false`, which runs the full workflow; a `git` process that cannot start or
+//! a diff that fails is an error, which fails the scope job and leaves its
+//! output empty, so the full workflow still runs.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
