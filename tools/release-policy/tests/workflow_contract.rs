@@ -371,3 +371,125 @@ fn only_release_workflow_may_match_protected_version_tags() {
     assert!(output.stdout.is_empty());
     assert!(!output.stderr.is_empty());
 }
+
+#[test]
+fn ci_docs_only_lane_rejects_fail_closed_or_misplaced_guards() {
+    const JOB_GUARD: &str = "${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}";
+    const JOB_ALWAYS: &str = "${{ !cancelled() }}";
+    const STEP_GUARD: &str = "needs.changes.outputs.docs_only != 'true'";
+    let root = fixture();
+    let ci = ci_workflow();
+    write_workflow(root.path(), "ci.yml", &ci);
+    let control = gate(root.path());
+    assert_eq!(
+        control.status.code(),
+        Some(0),
+        "the unmodified CI workflow must pass on its own: {}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+    let scenarios = [
+        (
+            "job guard that skips when the classification is missing",
+            ci.replacen(
+                JOB_GUARD,
+                "${{ !cancelled() && needs.changes.outputs.docs_only == 'false' }}",
+                1,
+            ),
+        ),
+        (
+            "job guard that a failed classification skips",
+            ci.replacen(JOB_GUARD, "${{ needs.changes.outputs.docs_only != 'true' }}", 1),
+        ),
+        (
+            "step guard that skips when the classification is missing",
+            ci.replacen(
+                &format!("        if: {STEP_GUARD}\n"),
+                "        if: needs.changes.outputs.docs_only == 'false'\n",
+                1,
+            ),
+        ),
+        (
+            "Linux test job skippable",
+            ci.replacen(
+                &format!("  check:\n    runs-on: ubuntu-latest\n    needs: changes\n    if: {JOB_ALWAYS}\n"),
+                &format!("  check:\n    runs-on: ubuntu-latest\n    needs: changes\n    if: {JOB_GUARD}\n"),
+                1,
+            ),
+        ),
+        (
+            "Linux test suite skipped",
+            ci.replacen(
+                "      - run: cargo test --workspace\n",
+                &format!("      - run: cargo test --workspace\n        if: {STEP_GUARD}\n"),
+                1,
+            ),
+        ),
+        (
+            "filesystem matrix skippable",
+            ci.replacen(
+                "  filesystem-matrix:\n    runs-on: ubuntu-24.04\n",
+                &format!("  filesystem-matrix:\n    runs-on: ubuntu-24.04\n    needs: changes\n    if: {JOB_GUARD}\n"),
+                1,
+            ),
+        ),
+        (
+            "macOS AI documentation check skipped",
+            ci.replacen(
+                "      - name: Check AI documentation portability\n",
+                &format!("      - name: Check AI documentation portability\n        if: {STEP_GUARD}\n"),
+                1,
+            ),
+        ),
+        (
+            "classifier output replaced by a constant",
+            ci.replacen(
+                "          >> \"$GITHUB_OUTPUT\"\n",
+                "          > /dev/null; echo docs_only=true >> \"$GITHUB_OUTPUT\"\n",
+                1,
+            ),
+        ),
+        (
+            "classifier told every run is a pull request",
+            ci.replacen("--event \"${EVENT_NAME}\"", "--event pull_request", 1),
+        ),
+        (
+            "classifier delegated to a script",
+            ci.replacen(
+                "          cargo run --quiet --manifest-path tools/release-policy/Cargo.toml\n          --locked --offline -- ci change-scope\n",
+                "          bash scripts/ci/change-scope.sh\n",
+                1,
+            ),
+        ),
+        (
+            "classifier dependencies not fetched",
+            ci.replacen(
+                "      - name: Fetch locked policy dependencies\n        run: cargo fetch --manifest-path tools/release-policy/Cargo.toml --locked\n      - name: Classify the change\n",
+                "      - name: Classify the change\n",
+                1,
+            ),
+        ),
+        (
+            "shallow checkout that hides the base commit",
+            ci.replacen("          fetch-depth: 2\n", "          fetch-depth: 1\n", 1),
+        ),
+        (
+            "second job publishing a scope",
+            ci.replacen(
+                "  deny:\n    runs-on: ubuntu-latest\n",
+                "  deny:\n    runs-on: ubuntu-latest\n    outputs:\n      docs_only: \"true\"\n",
+                1,
+            ),
+        ),
+    ];
+
+    for (scenario, mutated) in scenarios {
+        assert_ne!(mutated, ci, "scenario fixture must change: {scenario}");
+        write_workflow(root.path(), "ci.yml", &mutated);
+        let output = gate(root.path());
+        assert_eq!(output.status.code(), Some(1), "scenario: {scenario}");
+        assert!(output.stdout.is_empty(), "scenario: {scenario}");
+        assert!(!output.stderr.is_empty(), "scenario: {scenario}");
+        fs::remove_file(root.path().join(".github/workflows/ci.yml"))
+            .expect("negative fixture cleanup");
+    }
+}

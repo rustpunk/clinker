@@ -13,6 +13,29 @@ const CHECKOUT: &str = "actions/checkout";
 const EVIDENCE_PATH: &str = "${{ runner.temp }}/filesystem-${{ matrix.profile }}.json";
 const NFS_PROFILE: &str = "linux-nfsv4.1-loopback-ci";
 const SMB_PROFILE: &str = "linux-smb3.1.1-loopback-ci";
+/// The `ci.yml` job that classifies a run as documentation-only or not.
+const SCOPE_JOB: &str = "changes";
+/// Job guard that skips a job for a documentation-only change. It fails open:
+/// a failed classification leaves the output empty, which is not `'true'`, and
+/// `!cancelled()` stops the job being skipped because the scope job failed.
+const SCOPE_JOB_GUARD: &str = "${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}";
+/// The classification command; its output line becomes the scope job's output.
+const CHANGE_SCOPE_COMMAND: &str = "cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- ci change-scope --event \"${EVENT_NAME}\" --before \"${BEFORE}\" >> \"$GITHUB_OUTPUT\"";
+/// Job guard for a job that always runs but skips some steps.
+const SCOPE_JOB_ALWAYS: &str = "${{ !cancelled() }}";
+/// Step guard that skips a step for a documentation-only change.
+const SCOPE_STEP_GUARD: &str = "needs.changes.outputs.docs_only != 'true'";
+/// `ci.yml` jobs that a documentation-only change may skip entirely. Nothing
+/// they run reads `docs/`.
+const SKIPPABLE_CI_JOBS: [&str; 4] = [
+    "build-portability",
+    "cross-platform",
+    "deny",
+    "test-windows",
+];
+/// `ci.yml` jobs that always run but may skip steps for a documentation-only
+/// change. Every other job runs in full for every change.
+const STEP_SCOPED_CI_JOBS: [&str; 2] = ["check", "test-macos"];
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,6 +81,8 @@ struct Job {
     with: Option<BTreeMap<String, Value>>,
     #[serde(default)]
     env: Option<BTreeMap<String, Value>>,
+    #[serde(default)]
+    outputs: Option<BTreeMap<String, Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -177,6 +202,7 @@ fn verify_file(path: &Path) -> Result<(), GateError> {
     if name == "ci.yml" {
         validate_ci_policy_jobs(&workflow.jobs)?;
         validate_filesystem_job(&workflow.jobs)?;
+        validate_ci_scope(&workflow.jobs)?;
     } else if name == "release.yml" {
         validate_release(&workflow)?;
     } else if name == "publish-release.yml" {
@@ -347,6 +373,7 @@ fn expected_permissions(
     let read = || BTreeMap::from([("contents", Access::Read)]);
     let entries = match name {
         "ci.yml" => vec![
+            ("changes", read()),
             ("dependency-policy", read()),
             ("release-policy", read()),
             ("build-portability", read()),
@@ -571,6 +598,140 @@ fn validate_ci_policy_jobs(jobs: &BTreeMap<String, Job>) -> Result<(), GateError
     )
 }
 
+/// Pins the documentation-only lane in `ci.yml`: the job that classifies a
+/// change, and the guards that consume its result.
+///
+/// The lane lets a required check report "skipped" instead of running, so
+/// every guard must be one of the reviewed fail-open expressions, and the jobs
+/// whose result matters for every change must carry none.
+fn validate_ci_scope(jobs: &BTreeMap<String, Job>) -> Result<(), GateError> {
+    let scope = jobs
+        .get(SCOPE_JOB)
+        .ok_or_else(|| policy("CI change-scope job is absent"))?;
+    if scope.name.as_deref() != Some("Change scope")
+        || scope.runs_on.as_ref().and_then(Value::as_str) != Some("ubuntu-24.04")
+        || scope.needs.is_some()
+        || scope.condition.is_some()
+        || scope.timeout_minutes.is_some()
+        || scope.strategy.is_some()
+        || scope.environment.is_some()
+        || scope.uses.is_some()
+        || scope.with.is_some()
+        || scope.env.is_some()
+        || !exact_value_map(
+            scope.outputs.as_ref(),
+            &["docs_only", "${{ steps.scope.outputs.docs_only }}"],
+        )
+        || scope.steps.as_ref().is_none_or(|steps| steps.len() != 4)
+    {
+        return Err(policy("CI change-scope job differs from reviewed policy"));
+    }
+    let steps = scope.steps.as_deref().expect("validated step inventory");
+    require_unnamed_action_step(
+        &steps[0],
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        &["persist-credentials", "false", "fetch-depth", "2"],
+    )?;
+    require_unnamed_action_step(
+        &steps[1],
+        "dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de",
+        &["toolchain", "1.91"],
+    )?;
+    require_plain_command_step(
+        &steps[2],
+        "Fetch locked policy dependencies",
+        "cargo fetch --manifest-path tools/release-policy/Cargo.toml --locked",
+    )?;
+    let classify = &steps[3];
+    if classify.name.as_deref() != Some("Classify the change")
+        || classify.id.as_deref() != Some("scope")
+        || classify.condition.is_some()
+        || classify.uses.is_some()
+        || classify.with.is_some()
+        || classify
+            .run
+            .as_deref()
+            .is_none_or(|run| !exact_script(run, CHANGE_SCOPE_COMMAND))
+        || !exact_value_map(
+            classify.env.as_ref(),
+            &[
+                "EVENT_NAME",
+                "${{ github.event_name }}",
+                "BEFORE",
+                "${{ github.event.before }}",
+            ],
+        )
+        || classify.shell.is_some()
+        || classify.continue_on_error.is_some()
+        || classify.timeout_minutes.is_some()
+        || classify.working_directory.is_some()
+    {
+        return Err(policy(
+            "CI change-scope classification step differs from reviewed policy",
+        ));
+    }
+
+    for (job_name, job) in jobs {
+        if job_name == SCOPE_JOB {
+            continue;
+        }
+        if job.outputs.is_some() {
+            return Err(policy(format!(
+                "CI job '{job_name}' declares outputs; only the change-scope job may"
+            )));
+        }
+        let guard =
+            match job.condition.as_ref() {
+                None => None,
+                Some(condition) => Some(condition.as_str().ok_or_else(|| {
+                    policy(format!("CI job '{job_name}' condition is not a string"))
+                })?),
+            };
+        let expected_guard = if SKIPPABLE_CI_JOBS.contains(&job_name.as_str()) {
+            Some(SCOPE_JOB_GUARD)
+        } else if STEP_SCOPED_CI_JOBS.contains(&job_name.as_str()) {
+            Some(SCOPE_JOB_ALWAYS)
+        } else {
+            None
+        };
+        let expected_needs = expected_guard.map(|_| SCOPE_JOB);
+        if guard != expected_guard
+            || job.needs.as_ref().and_then(Value::as_str) != expected_needs
+            || (job.needs.is_some() && expected_needs.is_none())
+        {
+            return Err(policy(format!(
+                "CI job '{job_name}' change-scope guard differs from reviewed policy"
+            )));
+        }
+        for step in job.steps.iter().flatten() {
+            let Some(condition) = step.condition.as_ref() else {
+                continue;
+            };
+            let condition = condition.as_str().ok_or_else(|| {
+                policy(format!(
+                    "CI job '{job_name}' has a non-string step condition"
+                ))
+            })?;
+            if condition == SCOPE_STEP_GUARD {
+                let run = step.run.as_deref().unwrap_or_default();
+                if guard != Some(SCOPE_JOB_ALWAYS)
+                    || run.contains("check-ai-docs.sh")
+                    || (job_name == "check" && exact_script(run, "cargo test --workspace"))
+                {
+                    return Err(policy(format!(
+                        "CI job '{job_name}' skips a step that must run for every change"
+                    )));
+                }
+            } else if condition.contains("needs.") || condition.contains("docs_only") {
+                return Err(policy(format!(
+                    "CI job '{job_name}' has a step condition that is not the reviewed change-scope guard"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn require_ci_policy_job(
     job: &Job,
     name: &str,
@@ -581,6 +742,7 @@ fn require_ci_policy_job(
         || job.runs_on.as_ref().and_then(Value::as_str) != Some(runner)
         || job.needs.is_some()
         || job.condition.is_some()
+        || job.outputs.is_some()
         || job.timeout_minutes.is_some()
         || job.strategy.is_some()
         || job.environment.is_some()
@@ -722,6 +884,7 @@ fn require_exact_release_dependency(job: &Job) -> Result<(), GateError> {
         || job.runs_on.as_ref().and_then(Value::as_str) != Some("ubuntu-24.04")
         || job.needs.is_some()
         || job.condition.is_some()
+        || job.outputs.is_some()
         || job.timeout_minutes.is_some()
         || job.strategy.is_some()
         || job.environment.is_some()
@@ -759,6 +922,7 @@ fn require_exact_release_build(build: &Job) -> Result<(), GateError> {
         || build.runs_on.as_ref().and_then(Value::as_str) != Some("${{ matrix.os }}")
         || build.needs.as_ref().and_then(Value::as_str) != Some("dependency-policy")
         || build.condition.is_some()
+        || build.outputs.is_some()
         || build.timeout_minutes.is_some()
         || build.environment.is_some()
         || build.uses.is_some()
@@ -859,6 +1023,7 @@ fn require_exact_release_assembly(assemble: &Job) -> Result<(), GateError> {
         || assemble.runs_on.as_ref().and_then(Value::as_str) != Some("ubuntu-24.04")
         || assemble.needs.as_ref().and_then(Value::as_str) != Some("build")
         || assemble.condition.is_some()
+        || assemble.outputs.is_some()
         || assemble.timeout_minutes.is_some()
         || assemble.strategy.is_some()
         || assemble.environment.is_some()
@@ -1146,6 +1311,7 @@ fn consume_optional_fields(workflow: &Workflow) {
             &job.environment,
             &job.with,
             &job.env,
+            &job.outputs,
         );
         if let Some(strategy) = &job.strategy {
             let _ = (&strategy.fail_fast, &strategy.max_parallel);

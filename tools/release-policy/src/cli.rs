@@ -32,6 +32,8 @@ pub mod github;
 pub mod publication;
 #[path = "repository.rs"]
 mod repository;
+#[path = "scope.rs"]
+mod scope;
 #[path = "workflow.rs"]
 mod workflow;
 
@@ -198,6 +200,16 @@ fn execute(cli: Cli) -> Result<String, GateError> {
             let mut transport = github::ChildGitHubTransport::from_environment();
             release::stage_candidate_draft(&repo_root, &arguments.into_request()?, &mut transport)
         }
+        Domain::Ci(CiDomain {
+            operation: CiOperation::ChangeScope(arguments),
+        }) => {
+            let before = arguments
+                .before
+                .as_deref()
+                .filter(|value| !value.is_empty());
+            let docs_only = scope::docs_only(&arguments.event, before)?;
+            Ok(format!("docs_only={docs_only}\n"))
+        }
         Domain::Workflow(WorkflowDomain {
             operation: WorkflowOperation::Verify,
         }) => {
@@ -321,6 +333,8 @@ enum Domain {
     Release(ReleaseDomain),
     /// Verify repository workflow trust policy.
     Workflow(WorkflowDomain),
+    /// Classify the change a CI run is validating.
+    Ci(CiDomain),
     /// Verify committed and live repository controls.
     Repository(RepositoryDomain),
     /// Run staged release eligibility and completion gates.
@@ -858,6 +872,28 @@ struct WorkflowDomain {
 enum WorkflowOperation {
     /// Verify every repository workflow against the typed trust contract.
     Verify,
+}
+
+#[derive(Debug, Args)]
+struct CiDomain {
+    #[command(subcommand)]
+    operation: CiOperation,
+}
+
+#[derive(Debug, Subcommand)]
+enum CiOperation {
+    /// Print `docs_only=true` or `docs_only=false` as a GitHub Actions output.
+    ChangeScope(CiChangeScopeArgs),
+}
+
+#[derive(Debug, Args)]
+struct CiChangeScopeArgs {
+    /// Triggering event name, from `github.event_name`.
+    #[arg(long)]
+    event: String,
+    /// Previous branch tip for a push, from `github.event.before`; empty otherwise.
+    #[arg(long)]
+    before: Option<String>,
 }
 
 #[derive(Debug, Args)]
