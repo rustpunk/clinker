@@ -848,13 +848,19 @@ fn a_run_held_to_a_test_capacity_reports_it_in_the_headline() {
 
     // The same pipeline under a `memory.limit` of the capacity's size and no
     // test capacity. The startup check judges that limit against an
-    // injected baseline it passes, so the run reaches the same refusal.
+    // injected baseline it passes, so the run reaches the same refusal. The
+    // in-process capacity is set above any limit, which holds the run to
+    // nothing below `memory.limit` and overrides CLINKER_TEST_LEDGER_CAPACITY,
+    // so a capacity set in the environment cannot change what this half
+    // checks.
     let limited = SOURCE_TO_SINK.replace("limit: \"512M\"", "limit: \"64K\"");
     assert_ne!(limited, SOURCE_TO_SINK, "the fixture's limit was replaced");
     let err = run_pipeline_refused(
         &limited,
         &csv,
-        MemoryTestOverrides::default().with_baseline_rss(capacity),
+        MemoryTestOverrides::default()
+            .with_baseline_rss(capacity)
+            .with_ledger_capacity(u64::MAX),
     );
     let clinker_plan::error::PipelineError::MemoryBudgetExceeded { report } = &err else {
         panic!("a row larger than memory.limit must fail with E310; got {err:?}");
