@@ -54,7 +54,7 @@ p{max-width:820px}
 .rm-callout--brass{border-color:var(--brass);background:rgba(224,169,62,.06)}
 .rm-aside{font-size:13px;color:var(--ash)}
 
-.rm-ctlrow{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;margin:4px 0 12px}
+.rm-ctlrow{display:grid;grid-template-columns:8rem auto;justify-content:start;gap:6px 14px;align-items:center;margin:4px 0 12px}
 .rm-ctlhead{font-size:12px;color:var(--ash);min-width:70px}
 .rm-seg{display:inline-flex;border:2px solid var(--seam);flex-wrap:wrap}
 .rm-seg button{font:700 12px/1 var(--mono);letter-spacing:.04em;padding:9px 11px;border:0;border-right:1px solid var(--seam);background:transparent;color:var(--ash);cursor:pointer}
@@ -124,6 +124,12 @@ footer{padding:36px 6vw;color:var(--dim);font-size:12px}
   .rm-aside,.rm-card p,footer,.rm-ctlhead,.rm-cond,.rm-steps li,.rm-goes,.rm-input,.rm-mout span{font-size:14px}
 }
 /* 44px targets on touch screens, and on any narrow screen in case the pointer is misreported */
+/* phones: every label on its own line, every button group full width, so all rows share one left and right edge */
+@media (max-width:560px){
+  .rm-ctlrow{grid-template-columns:1fr}
+  .rm-ctlrow .rm-seg{display:flex}
+  .rm-ctlrow .rm-seg button{flex:1 1 auto}
+}
 @media (pointer:coarse),(max-width:720px){
   .rm-seg button,button.rm-plain{min-height:44px}
   .rm-mv{width:44px;height:44px}
@@ -203,7 +209,7 @@ footer{padding:36px 6vw;color:var(--dim);font-size:12px}
       <div class="rm-ctlrow"><span class="rm-ctlhead">mode</span><div class="rm-seg" data-rm-bind="mmode"><button data-v="concat">concat</button><button data-v="interleave">interleave</button><button data-v="seeded">interleave + seed</button></div></div>
       <div class="rm-ctlhead">inputs, in order (the branches from section 01)</div>
       <div class="rm-inputs" data-rm-inputs></div>
-      <div class="rm-ctlrow" style="margin-top:10px"><button class="rm-plain" data-rm-rerun>Run again</button><span class="rm-aside" data-rm-runnote></span></div>
+      <div class="rm-ctlrow" style="margin-top:10px;display:flex;flex-wrap:wrap"><button class="rm-plain" data-rm-rerun>Run again</button><span class="rm-aside" data-rm-runnote></span></div>
       <div class="rm-mout" data-rm-mout></div>
     </div>
   </div>
