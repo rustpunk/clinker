@@ -2077,8 +2077,8 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
         // Late records of failed documents are admitted to their ledgers
         // outside any rejection pass, so this Sink's pass settles those
         // ledgers before it ends.
-        if let Some(state) = ctx.document_dlq.as_mut() {
-            state.settle_unsettled_ledgers();
+        if let Some(state) = ctx.document_dlq.as_ref() {
+            state.borrow_mut().settle_unsettled_ledgers();
         }
 
         if let Some(mut writer) = self.writer.take() {
@@ -3766,11 +3766,15 @@ mod tests {
             .set_limit(arbitrator.charged_bytes())
             .expect("limit");
         match state.admit_emitted(key, row(1, 99), node) {
-            Err(PipelineError::MemoryBudgetExceeded { node, detail, .. }) => {
-                assert_eq!(node, "route_x");
-                assert!(
-                    detail.is_some_and(|d| d.contains("dead-letter ledger")),
-                    "the detail names the ledger"
+            Err(PipelineError::MemoryBudgetExceeded { report }) => {
+                assert_eq!(
+                    report.requester,
+                    Some(clinker_plan::runtime_error::ConsumerLabel {
+                        node: "route_x".to_string(),
+                        surface:
+                            clinker_plan::runtime_error::MemorySurface::DeadLetteredRowSet,
+                    }),
+                    "the report names the node that failed the document and its row set"
                 );
             }
             other => panic!("expected E310, got {other:?}"),
@@ -4214,10 +4218,11 @@ mod tests {
         );
     }
 
+    /// A refused ledger admission names the node that asked and what the
+    /// memory was for, and never the document the rows belong to: the report
+    /// carries nodes, surfaces and byte counts only.
     #[test]
-    fn the_ledger_refusal_names_the_document_as_diagnostics_quote_names() {
-        use clinker_core_types::QuoteName;
-        // A decomposed accent that does not open the name prints as written.
+    fn the_ledger_refusal_names_the_node_and_never_the_document() {
         let arbitrator = ledger_arbitrator(1024);
         let (mut state, key) = ledger_state_for(&arbitrator, "cafe\u{301}.csv");
         let refused = (0..64_u64)
@@ -4227,22 +4232,22 @@ mod tests {
                     .err()
             })
             .expect("scattered rows reach the 1 KiB hard limit");
-        let detail = match refused {
-            PipelineError::MemoryBudgetExceeded {
-                detail: Some(detail),
-                ..
-            } => detail,
-            other => panic!("expected E310 with a detail, got {other:?}"),
+        let report = match refused {
+            PipelineError::MemoryBudgetExceeded { report } => report,
+            other => panic!("expected E310, got {other:?}"),
         };
-        let quoted = key.quoted_name().to_string();
-        assert_eq!(quoted, "\"cafe\u{301}.csv\"");
-        assert!(
-            detail.contains(&quoted),
-            "the detail names the document as {quoted}: {detail}"
+        assert_eq!(
+            report.requester,
+            Some(clinker_plan::runtime_error::ConsumerLabel {
+                node: "orders_out".to_string(),
+                surface: clinker_plan::runtime_error::MemorySurface::DeadLetteredRowSet,
+            }),
+            "the report names the node that asked and its row set"
         );
+        let rendered = report.to_string();
         assert!(
-            !detail.contains("\\u{301}"),
-            "the detail does not escape the accent: {detail}"
+            !rendered.contains("cafe"),
+            "the report never names the document: {rendered}"
         );
     }
 
@@ -4577,7 +4582,7 @@ mod tests {
             admitted,
             "the admission is the charge"
         );
-        state.insert_failed(Arc::clone(&key), DlqFailureStamp::now());
+        state.insert_failed(Arc::clone(&key), DlqFailureStamp::now(), "validate");
         assert_eq!(
             state.charged_bytes() - before,
             admitted,

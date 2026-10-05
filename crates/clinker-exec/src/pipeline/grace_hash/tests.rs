@@ -2215,7 +2215,7 @@ fn chunked_loop_over_a_one_byte_limit(
         bnl_fallback(
             rc,
             sp,
-            crate::test_support::with_build_row_ids(builds),
+            with_build_ids(builds),
             &mut body_eval,
             &budget,
             &mut GraceEmitSink {
@@ -2656,7 +2656,9 @@ fn run_grace_arrival_order(
         consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
         strategy: clinker_plan::config::ErrorStrategy::FailFast,
         stats_sink: test_stats_sink(&stats_catalog, "products", "products"),
-    })
+    },
+    crate::test_support::test_kernel_pool(),
+    )
     .expect("grace hash arrival-order run")
     .records
     .into_iter()
