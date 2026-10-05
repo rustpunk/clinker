@@ -891,11 +891,13 @@ impl TransientNodeBufferReservation {
     ///
     /// The growth is charged through the handle, so on the walk a shortfall
     /// first spills other walk-owned state; the error (E310) names `node`
-    /// only when that reclaim could not make room.
+    /// reserving `surface`, the rows the caller is reserving for, only when
+    /// that reclaim could not make room.
     pub(crate) fn reserve_additional(
         &self,
         additional_bytes: u64,
         node: &str,
+        surface: clinker_plan::runtime_error::MemorySurface,
     ) -> Result<(), PipelineError> {
         // A zero limit has always meant that a materialization is not
         // checked at all; the ledger itself would refuse every byte.
@@ -903,23 +905,28 @@ impl TransientNodeBufferReservation {
             self.handle.add_bytes(additional_bytes);
             return Ok(());
         }
-        self.handle
-            .try_grow(additional_bytes)
-            .map_err(|shortfall| node_buffer_shortfall_error(node, shortfall, &self.budget))
+        self.handle.try_grow(additional_bytes).map_err(|shortfall| {
+            node_buffer_shortfall_error(node, surface, shortfall, &self.budget)
+        })
     }
 
     /// Restate the reservation's bytes after a representation transition
     /// has completed: a fall is a release; a rise is a growth, checked (and
     /// on the walk reclaimed for) as [`Self::reserve_additional`] checks it,
-    /// failing with E310 naming `node`.
-    pub(crate) fn resize(&self, bytes: u64, node: &str) -> Result<(), PipelineError> {
+    /// failing with E310 naming `node` reserving `surface`.
+    pub(crate) fn resize(
+        &self,
+        bytes: u64,
+        node: &str,
+        surface: clinker_plan::runtime_error::MemorySurface,
+    ) -> Result<(), PipelineError> {
         if self.budget.hard_limit() == 0 {
             self.handle.set_bytes(bytes);
             return Ok(());
         }
-        self.handle
-            .try_resize(bytes)
-            .map_err(|shortfall| node_buffer_shortfall_error(node, shortfall, &self.budget))
+        self.handle.try_resize(bytes).map_err(|shortfall| {
+            node_buffer_shortfall_error(node, surface, shortfall, &self.budget)
+        })
     }
 
     /// Current bytes held by this reservation.
@@ -977,20 +984,22 @@ impl Drop for TransientNodeBufferReservation {
 /// The reservation's consumer registers empty and then grows by
 /// `reserved_bytes` through its handle, so on the walk a shortfall first
 /// spills other walk-owned state (this reservation's own consumer, elected
-/// last, holds nothing yet). E310 naming `node` is returned only when that
-/// reclaim could not make room; the registration is then removed.
+/// last, holds nothing yet). E310 naming `node` and its rows collected for a
+/// full scan is returned only when that reclaim could not make room; the
+/// registration is then removed.
 pub(crate) fn reserve_node_buffer_materialization(
     reserved_bytes: u64,
     budget: &std::sync::Arc<crate::pipeline::memory::MemoryArbitrator>,
     node: &str,
 ) -> Result<TransientNodeBufferReservation, PipelineError> {
+    let surface = clinker_plan::runtime_error::MemorySurface::ScanMaterialization;
     let handle = crate::pipeline::memory::ConsumerHandle::new();
     let consumer_id = budget.register_node_consumer(
         std::sync::Arc::new(TransientNodeBufferConsumer::new(handle.clone())),
         handle.clone(),
         clinker_plan::runtime_error::ConsumerLabel {
             node: node.to_string(),
-            surface: clinker_plan::runtime_error::MemorySurface::ScanMaterialization,
+            surface: surface.clone(),
         },
     );
     let reservation = TransientNodeBufferReservation {
@@ -1000,24 +1009,25 @@ pub(crate) fn reserve_node_buffer_materialization(
         owns_registration: true,
     };
     // Dropping the reservation on a refusal unregisters its consumer.
-    reservation.reserve_additional(reserved_bytes, node)?;
+    reservation.reserve_additional(reserved_bytes, node, surface)?;
     Ok(reservation)
 }
 
-/// The E310 for a growth of a materialization the node `node` collects,
-/// refused after reclaiming: the refusal's own report, naming `node` and its
-/// rows collected for a full scan as the requester. The growth may be charged
-/// through a slot registered under another node (the producer whose buffer
-/// the reader materializes); the holder list still shows that slot.
+/// The E310 for a growth of rows the node `node` reserves as `surface`,
+/// refused after reclaiming: the refusal's own report, naming `node` and
+/// `surface` as the requester. The growth may be charged through a slot
+/// registered under another node (the producer whose buffer the reader
+/// takes); the holder list still shows that slot.
 pub(crate) fn node_buffer_shortfall_error(
     node: &str,
+    surface: clinker_plan::runtime_error::MemorySurface,
     shortfall: crate::pipeline::memory::ledger::Shortfall,
     budget: &crate::pipeline::memory::MemoryArbitrator,
 ) -> PipelineError {
     let mut report = shortfall.into_report(budget);
     report.requester = Some(clinker_plan::runtime_error::ConsumerLabel {
         node: node.to_string(),
-        surface: clinker_plan::runtime_error::MemorySurface::ScanMaterialization,
+        surface,
     });
     PipelineError::MemoryBudgetExceeded { report }
 }
@@ -1357,6 +1367,7 @@ mod tests {
     use std::sync::Arc;
 
     use clinker_plan::plan::EntityRef;
+    use clinker_plan::runtime_error::MemorySurface;
     use clinker_record::{Schema, Value, synthetic_document_context};
 
     use crate::executor::stream_event::{Punctuation, StreamEvent};
@@ -2097,7 +2108,7 @@ mod tests {
         assert_eq!(budget.charged_bytes(), 16 * kib);
 
         reservation
-            .resize(40 * kib, "canonicalize")
+            .resize(40 * kib, "canonicalize", MemorySurface::ScanMaterialization)
             .expect("a rise that fits is granted");
         assert_eq!(
             budget.charged_bytes(),
@@ -2107,7 +2118,11 @@ mod tests {
 
         // Off the walk nothing is reclaimed, so a rise past the capacity is
         // refused at once.
-        match reservation.resize(capacity + 1, "canonicalize") {
+        match reservation.resize(
+            capacity + 1,
+            "canonicalize",
+            MemorySurface::ScanMaterialization,
+        ) {
             Err(PipelineError::MemoryBudgetExceeded { report }) => {
                 assert_eq!(
                     report.requester,
@@ -2128,7 +2143,7 @@ mod tests {
         assert_eq!(reservation.bytes(), 40 * kib);
 
         reservation
-            .resize(8 * kib, "canonicalize")
+            .resize(8 * kib, "canonicalize", MemorySurface::ScanMaterialization)
             .expect("a fall is a release and always succeeds");
         assert_eq!(
             budget.charged_bytes(),
@@ -2147,7 +2162,7 @@ mod tests {
         let reservation = reserve_node_buffer_materialization(kib, &unlimited, "canonicalize")
             .expect("a zero limit is unchecked");
         reservation
-            .resize(1 << 30, "canonicalize")
+            .resize(1 << 30, "canonicalize", MemorySurface::ScanMaterialization)
             .expect("a zero limit records a rise unchecked");
         assert_eq!(unlimited.charged_bytes(), 1 << 30);
     }
@@ -2194,7 +2209,7 @@ mod tests {
         let baseline = register_fixed(&budget, hard);
 
         reservation
-            .reserve_additional(0, "plain_memory")
+            .reserve_additional(0, "plain_memory", MemorySurface::ScanMaterialization)
             .expect("a zero-overlap ownership move is a true no-op");
 
         budget.unregister_consumer(baseline);

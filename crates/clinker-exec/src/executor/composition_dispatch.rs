@@ -311,9 +311,18 @@ fn collect_port_records(
         let materialized_bytes =
             input.materialization_bytes_without_transfer(&ctx.allocation_resources);
         let transferred_overlap_bytes = input.transferred_materialization_overlap_bytes();
+        // What the call reserves here: the rows its producer buffered for it.
+        let port_rows = clinker_plan::runtime_error::MemorySurface::BufferedRows {
+            from: parent_dag.graph[edge.source()].name().to_string(),
+            to: vec![composition_name.to_string()],
+        };
         let reservation = match reservation {
             Some(reservation) => {
-                reservation.reserve_additional(transferred_overlap_bytes, composition_name)?;
+                reservation.reserve_additional(
+                    transferred_overlap_bytes,
+                    composition_name,
+                    port_rows.clone(),
+                )?;
                 reservation
             }
             None => reserve_node_buffer_materialization(
@@ -329,6 +338,7 @@ fn collect_port_records(
                 &ctx.allocation_resources,
             ),
             composition_name,
+            port_rows,
         )?;
         // Two parallel edges to the same port (e.g. `inputs: { p: a,
         // p: a }` — currently rejected at parse, but the runtime is

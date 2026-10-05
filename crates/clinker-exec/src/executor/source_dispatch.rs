@@ -269,7 +269,11 @@ where
             .as_ref()
             .map(|schema| seeded.estimated_materialized_bytes_for_columns(schema.column_count()))
             .unwrap_or_else(|| seeded.estimated_materialized_bytes());
-        reservation.reserve_additional(prospective_bytes, name)?;
+        reservation.reserve_additional(
+            prospective_bytes,
+            name,
+            clinker_plan::runtime_error::MemorySurface::ScanMaterialization,
+        )?;
         let mut out_records: Vec<(Record, crate::executor::stream_event::SourceRowId)> =
             Vec::with_capacity(seeded.len_hint());
         let mut out_puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
@@ -292,6 +296,7 @@ where
         reservation.resize(
             estimate_node_buffer_unaccounted_bytes(&out_records, &ctx.allocation_resources),
             name.as_str(),
+            clinker_plan::runtime_error::MemorySurface::ScanMaterialization,
         )?;
         (out_records, out_puncts, Some(reservation))
     } else if let Some(rx) = ctx.source_records.remove(name.as_str()) {

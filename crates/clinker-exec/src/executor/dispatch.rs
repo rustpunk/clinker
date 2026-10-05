@@ -2892,6 +2892,7 @@ impl NodeBufferInput {
                         reservation.reserve_additional(
                             buffer.transferred_materialization_overlap_bytes(),
                             node,
+                            clinker_plan::runtime_error::MemorySurface::ScanMaterialization,
                         )?;
                         reservation
                     }

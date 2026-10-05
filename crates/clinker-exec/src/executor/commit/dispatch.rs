@@ -592,9 +592,14 @@ fn recurse_into_body(
             // re-emit at the parent's call site; here we take records only.
             let (records, _puncts) = input.drain_split()?;
             if let Some(reservation) = reservation.as_ref() {
+                // The body's output rows, buffered back into the call site.
                 reservation.resize(
                     estimate_node_buffer_unaccounted_bytes(&records, &ctx.allocation_resources),
                     parent_dag.graph[composition_idx].name(),
+                    clinker_plan::runtime_error::MemorySurface::BufferedRows {
+                        from: body_dag.graph[*body_out_idx].name().to_string(),
+                        to: vec![parent_dag.graph[composition_idx].name().to_string()],
+                    },
                 )?;
             }
             harvested.extend(records);
@@ -654,6 +659,17 @@ fn recurse_into_body(
         // read; discard its count/registration before combining the rows.
         let mut rows = match drain_node_buffer_slot(ctx, composition_idx) {
             Some(slot) => {
+                // The re-charge names the call site's own buffered rows,
+                // under the label its slot is admitted under: the rows it
+                // buffers for its readers.
+                let slot_rows = ctx
+                    .planned_node_buffer_readers
+                    .slot_label(
+                        parent_dag.graph[composition_idx].name(),
+                        &crate::executor::dispatch::NodeBufferKey::from(composition_idx),
+                        &ctx.composition_call_sites,
+                    )
+                    .surface;
                 let reservation =
                     crate::executor::node_buffer::reserve_node_buffer_materialization(
                         slot.replacement_materialization_bytes_after_unregister(
@@ -666,6 +682,7 @@ fn recurse_into_body(
                 reservation.resize(
                     estimate_node_buffer_unaccounted_bytes(&rows, &ctx.allocation_resources),
                     parent_dag.graph[composition_idx].name(),
+                    slot_rows,
                 )?;
                 harvest_reservations.push(reservation);
                 rows
