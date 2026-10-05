@@ -427,6 +427,9 @@ pub struct LedgerSnapshot {
     /// consumer's name, and grants attributed to a consumer the ledger has
     /// no label for.
     pub unattributed: u64,
+    /// The part of `unattributed` that rows a Source read still hold after
+    /// the Source finished reading.
+    pub retired_source: u64,
 }
 
 /// One labelled consumer's charged bytes in a [`LedgerSnapshot`].
@@ -446,7 +449,7 @@ fn snapshot(
     requested: u64,
     requester: Option<ConsumerId>,
 ) -> LedgerSnapshot {
-    let (holders, unattributed) = ledger.holders();
+    let (holders, unattributed, retired_source) = ledger.holders();
     LedgerSnapshot {
         limit: if ledger.attachment.test_capacity {
             EnforcedLimit::TestCapacity(ledger.limit())
@@ -466,6 +469,7 @@ fn snapshot(
             })
             .collect(),
         unattributed,
+        retired_source,
     }
 }
 
@@ -1479,9 +1483,13 @@ impl MemoryArbitrator {
         ledger.set_handle(id.0, held.saturating_sub(bytes));
     }
 
-    /// Remove `id`'s entry as unregistration does, returning its mark.
+    /// Remove `id`'s entry as unregistration does for a consumer that is not
+    /// a Source, returning its mark.
     pub(crate) fn forget_consumer_entry(&self, id: ConsumerId) -> Option<u64> {
-        self.admission.ledger.lock().remove_consumer(id.0)
+        self.admission
+            .ledger
+            .lock()
+            .remove_consumer(id.0, super::protocol::Departure::Other)
     }
 }
 
@@ -2383,6 +2391,110 @@ mod tests {
             None,
             "the release leaves the removed consumer's figures alone"
         );
+    }
+
+    /// A Source-like consumer: its producer can be paused, and its handle
+    /// charges nothing.
+    struct ReadingSource(Arc<ConsumerHandle>);
+
+    impl MemoryConsumer for ReadingSource {
+        fn current_usage(&self) -> u64 {
+            self.0.bytes()
+        }
+        fn peak_charged_bytes(&self) -> Option<u64> {
+            Some(self.0.peak_bytes())
+        }
+        fn spill_priority(&self) -> i32 {
+            0
+        }
+        fn try_spill(&self, _: u64) -> Result<u64, ConsumerSpillError> {
+            Ok(0)
+        }
+        fn can_back_pressure(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_finished_sources_rows_stay_identifiable_until_their_last_byte_drops() {
+        let arbitrator = arbitrator(MIB);
+        let handle = ConsumerHandle::new();
+        let source = arbitrator.register_node_consumer(
+            Arc::new(ReadingSource(Arc::clone(&handle))),
+            Arc::clone(&handle),
+            label("orders", MemorySurface::RowsRead),
+        );
+        let first = arbitrator
+            .reserve(4 * KIB, Requester::for_consumer(source))
+            .expect("fits");
+        let mut second = arbitrator
+            .reserve(2 * KIB, Requester::for_consumer(source))
+            .expect("fits");
+        let run_wide = arbitrator.reserve(KIB, governed()).expect("fits");
+
+        arbitrator
+            .unregister_consumer(source)
+            .expect("the Source was registered");
+        let snapshot = arbitrator.ledger_snapshot(0, governed());
+        assert!(snapshot.holders.is_empty(), "{snapshot:?}");
+        assert_eq!(snapshot.unattributed, 7 * KIB);
+        assert_eq!(
+            snapshot.retired_source,
+            6 * KIB,
+            "the rows the finished Source read stay identifiable"
+        );
+        assert_holders_cover_charged(&snapshot);
+        assert_eq!(arbitrator.consumer_peak_charged_bytes(source), None);
+
+        second.try_grow(KIB).expect("fits");
+        let snapshot = arbitrator.ledger_snapshot(0, governed());
+        assert_eq!(
+            snapshot.retired_source,
+            7 * KIB,
+            "a grant in the finished Source's name grows its rows"
+        );
+        assert!(snapshot.holders.is_empty(), "{snapshot:?}");
+        assert_holders_cover_charged(&snapshot);
+
+        let epoch = arbitrator.release_epoch();
+        drop(first);
+        assert_eq!(arbitrator.release_epoch(), epoch + 1);
+        let snapshot = arbitrator.ledger_snapshot(0, governed());
+        assert_eq!(snapshot.retired_source, 3 * KIB);
+        assert_eq!(snapshot.unattributed, 4 * KIB);
+
+        drop(second);
+        let snapshot = arbitrator.ledger_snapshot(0, governed());
+        assert_eq!(snapshot.retired_source, 0);
+        assert_eq!(snapshot.unattributed, KIB);
+        assert_holders_cover_charged(&snapshot);
+
+        // Its last row has dropped, so nothing marks the Source as finished
+        // any more: a later grant in its name is memory no node holds, like
+        // any other consumer's that has unregistered.
+        let late = arbitrator
+            .reserve(512, Requester::for_consumer(source))
+            .expect("fits");
+        let snapshot = arbitrator.ledger_snapshot(0, governed());
+        assert_eq!(snapshot.retired_source, 0);
+        assert_eq!(snapshot.unattributed, KIB + 512);
+
+        // A consumer that is not a Source leaves its live grant as memory no
+        // node holds, never as a finished Source's rows.
+        let (_other_handle, other) = register_node(&arbitrator, "totals");
+        let group_state = arbitrator
+            .reserve(2 * KIB, Requester::for_consumer(other))
+            .expect("fits");
+        arbitrator
+            .unregister_consumer(other)
+            .expect("the Aggregate was registered");
+        let snapshot = arbitrator.ledger_snapshot(0, governed());
+        assert_eq!(snapshot.unattributed, 3 * KIB + 512);
+        assert_eq!(snapshot.retired_source, 0);
+        assert_holders_cover_charged(&snapshot);
+
+        drop((late, group_state, run_wide));
+        assert_eq!(arbitrator.charged_bytes(), 0);
     }
 }
 

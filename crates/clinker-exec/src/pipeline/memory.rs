@@ -762,13 +762,13 @@ impl ConsumerHandle {
     /// End consumer `id`'s binding: release the handle's remaining charge,
     /// remove the consumer's ledger entry, and keep its final mark as the
     /// handle's own. A no-op when the handle is not bound for `id`.
-    fn unbind(&self, id: ConsumerId) {
+    fn unbind(&self, id: ConsumerId, departure: protocol::Departure) {
         let mut binding = self.binding();
         if binding.as_ref().is_none_or(|binding| binding.id != id) {
             return;
         }
         if let Some(binding) = binding.take()
-            && let Some(mark) = binding.state.ledger.lock().remove_consumer(id.0)
+            && let Some(mark) = binding.state.ledger.lock().remove_consumer(id.0, departure)
         {
             self.raise_peak(mark);
         }
@@ -2069,6 +2069,11 @@ impl MemoryArbitrator {
                 .collect::<Vec<_>>()
         });
         if let Some(consumer) = &removed {
+            let departure = if consumer.can_back_pressure() {
+                protocol::Departure::Source
+            } else {
+                protocol::Departure::Other
+            };
             let mut owners = self
                 .consumer_owners
                 .lock()
@@ -2076,7 +2081,7 @@ impl MemoryArbitrator {
             owners.retain_peak(id, consumer.as_ref());
             owners.live.remove(&id);
             if let Some(handle) = owners.handles.remove(&id) {
-                handle.unbind(id);
+                handle.unbind(id, departure);
             }
         }
         removed

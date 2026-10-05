@@ -90,6 +90,15 @@ pub(crate) trait AdmissionGate<L> {
 
 impl<L> AdmissionGate<L> for () {}
 
+/// What a consumer leaving the ledger was.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Departure {
+    /// A Source: the bytes granted in its name are the rows it read.
+    Source,
+    /// Any other consumer.
+    Other,
+}
+
 /// Bytes charged in one consumer's name.
 ///
 /// `handle` is what the consumer's own handle has charged and `attributed`
@@ -490,8 +499,10 @@ impl<L, A> LedgerState<L, A> {
 
     /// Remove consumer `id`'s entry, releasing its remaining handle charge,
     /// and return its mark. Bytes still granted in its name stay charged and
-    /// are unattributed from here on.
-    pub(crate) fn remove_consumer(&mut self, id: u32) -> Option<u64> {
+    /// are unattributed from here on. `departure` says what the consumer
+    /// was.
+    pub(crate) fn remove_consumer(&mut self, id: u32, departure: Departure) -> Option<u64> {
+        let _ = departure;
         let entry = self.consumers.remove(&id)?;
         if entry.handle > 0 {
             self.discharge(entry.handle);
@@ -520,7 +531,7 @@ impl<L, A> LedgerState<L, A> {
     /// The remainder is what grants made in no consumer's name hold, plus
     /// what consumers without a label hold, so the holders' figures and the
     /// remainder add up to the charged total.
-    pub(crate) fn holders(&self) -> (Vec<(u32, &L, u64)>, u64) {
+    pub(crate) fn holders(&self) -> (Vec<(u32, &L, u64)>, u64, u64) {
         let mut holders: Vec<(u32, &L, u64)> = self
             .consumers
             .iter()
@@ -536,6 +547,6 @@ impl<L, A> LedgerState<L, A> {
         let held = holders
             .iter()
             .fold(0u64, |sum, holder| sum.saturating_add(holder.2));
-        (holders, self.charged.saturating_sub(held))
+        (holders, self.charged.saturating_sub(held), 0)
     }
 }

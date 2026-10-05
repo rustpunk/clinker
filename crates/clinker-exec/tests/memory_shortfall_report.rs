@@ -577,6 +577,97 @@ fn a_source_holder_never_counts_as_state_that_cannot_spill() {
     assert!(!text.contains("\n  remedy: \"orders\""), "{text}");
 }
 
+/// A Source that has finished reading is no longer listed, but the rows it
+/// read stay charged while a slot downstream holds them, as memory no single
+/// node holds. Those rows never count as state that cannot spill, so a
+/// second Source refused beside them is not oversized and the report does
+/// not say spilling cannot help. Memory a finished step that is not a
+/// Source still has granted keeps counting.
+#[test]
+fn rows_a_finished_source_read_never_count_as_state_that_cannot_spill() {
+    let arbitrator = run(4 * MIB);
+    let (orders, _orders_handle) = hold(
+        &arbitrator,
+        "orders",
+        MemorySurface::RowsRead,
+        0,
+        Kind::ActiveSource,
+    );
+    let rows_read = arbitrator
+        .reserve(3 * MIB, Requester::for_consumer(orders))
+        .expect("fits");
+    let slot = ConsumerHandle::new();
+    arbitrator.register_node_consumer(
+        Arc::new(SlotOfSourceRows {
+            handle: Arc::clone(&slot),
+            payload: 3 * MIB,
+        }),
+        Arc::clone(&slot),
+        ConsumerLabel {
+            node: "sorted".to_string(),
+            surface: MemorySurface::BufferedRows {
+                from: "orders".to_string(),
+                to: vec!["sorted".to_string()],
+            },
+        },
+    );
+    let (totals, _totals_handle) = hold(
+        &arbitrator,
+        "totals",
+        MemorySurface::GroupState,
+        0,
+        Kind::CannotSpill,
+    );
+    let group_state = arbitrator
+        .reserve(512 * KIB, Requester::for_consumer(totals))
+        .expect("fits");
+    // Both finish while what was granted in their names stays live.
+    arbitrator
+        .unregister_consumer(orders)
+        .expect("the Source was registered");
+    arbitrator
+        .unregister_consumer(totals)
+        .expect("the Aggregate was registered");
+    let (returns, _returns_handle) = hold(
+        &arbitrator,
+        "returns",
+        MemorySurface::RowsRead,
+        0,
+        Kind::ActiveSource,
+    );
+
+    let report =
+        refuse(&arbitrator, MIB, Requester::for_consumer(returns)).into_report(&arbitrator);
+    assert_rows_sum_to_charged(&report);
+    assert_eq!(report.charged_bytes, 3 * MIB + 512 * KIB);
+    assert_eq!(
+        report.unattributed_bytes,
+        3 * MIB + 512 * KIB,
+        "a finished step's memory is held by no one node"
+    );
+    assert_eq!(
+        report.unspillable_bytes,
+        512 * KIB,
+        "rows a finished Source read never count as state that cannot spill; other memory \
+         no node holds still does"
+    );
+    assert!(
+        !report.oversized,
+        "spilling the slot makes room for the request"
+    );
+    assert!(report.reclaim.is_none(), "{report:#?}");
+    let text = report.to_string();
+    assert!(text.contains("\n  reclaim: none attempted"), "{text}");
+    assert!(!text.contains("spilling cannot help"), "{text}");
+    assert!(
+        text.contains("\n    not held by any one node  3.5 MiB"),
+        "{text}"
+    );
+    assert!(!text.contains("\n  remedy: \"orders\""), "{text}");
+    assert!(!text.contains("\n  remedy: \"returns\""), "{text}");
+    drop((rows_read, group_state));
+}
+
 #[test]
 fn report_text_uses_author_vocabulary() {
     let example = example();
