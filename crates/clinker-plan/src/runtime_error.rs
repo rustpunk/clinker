@@ -420,6 +420,9 @@ pub enum HolderState {
     /// A Source paused so it reads no further until memory is freed; the
     /// rows it has already read stay in memory.
     PausedSource,
+    /// A Source still reading; the rows it has read stay counted here until
+    /// the steps holding them pass them on, write them out, or spill them.
+    ActiveSource,
     /// The node that made the refused request.
     Requester,
     /// Its memory can spill, but it was in use while the request was made, so
@@ -433,6 +436,7 @@ impl std::fmt::Display for HolderState {
             Self::CannotSpill => "cannot spill",
             Self::AtFloor => "at its floor",
             Self::PausedSource => "paused source",
+            Self::ActiveSource => "active source",
             Self::Requester => "requester",
             Self::InUse => "in use",
         })
@@ -1112,6 +1116,53 @@ mod tests {
                 "E310 \"totals\": needed 2.0 MiB more for group state, but none of memory.limit \
                  8.0 MiB was left and nothing more could be spilled"
             )
+        );
+    }
+
+    /// A Source's rows are relieved by spilling the steps that hold them or
+    /// by the limit the fix line gives, never by anything the author does to
+    /// the Source, so the remedy passes over every holder of rows read from a
+    /// source, whatever state it is listed in.
+    #[test]
+    fn a_source_is_never_the_remedy() {
+        let source = |node: &str, state: HolderState| HolderReport {
+            node: node.to_string(),
+            surface: MemorySurface::RowsRead,
+            bytes: 2 * MIB,
+            state,
+        };
+
+        let mut report = charged_report();
+        report.holders = vec![
+            source("orders", HolderState::CannotSpill),
+            HolderReport {
+                node: "enrich".to_string(),
+                surface: MemorySurface::JoinBuildSide,
+                bytes: 3 * MIB,
+                state: HolderState::CannotSpill,
+            },
+        ];
+        let rendered = report.to_string();
+        assert!(
+            rendered.contains("\n  remedy: \"enrich\"'s join build side holds 3.0 MiB and "),
+            "the remedy passes over the Source to the join:\n{rendered}"
+        );
+        assert!(!rendered.contains("remedy: \"orders\""), "{rendered}");
+
+        let mut report = charged_report();
+        report.holders = vec![
+            source("orders", HolderState::CannotSpill),
+            source("returns", HolderState::ActiveSource),
+            source("accounts", HolderState::AtFloor),
+        ];
+        let rendered = report.to_string();
+        assert!(
+            !rendered.contains("\n  remedy: "),
+            "with only Sources holding memory there is no holder to name:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("\n  fix: raise the limit to at least 10M"),
+            "{rendered}"
         );
     }
 

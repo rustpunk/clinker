@@ -2908,6 +2908,120 @@ mod walk_pass_tests {
         );
     }
 
+    /// Register an Aggregate's table, held and reclaimable at `bytes`, that
+    /// the walk does not own: its owner is another thread.
+    fn table_off_the_walk(
+        arbitrator: &MemoryArbitrator,
+        node: &str,
+        bytes: u64,
+    ) -> (ConsumerId, Arc<ConsumerHandle>) {
+        let handle = ConsumerHandle::new();
+        let id = arbitrator.register_node_consumer(
+            Arc::new(crate::aggregation::AggregateConsumer::new(Arc::clone(
+                &handle,
+            ))),
+            Arc::clone(&handle),
+            ConsumerLabel {
+                node: node.to_string(),
+                surface: MemorySurface::GroupState,
+            },
+        );
+        handle.set_bytes(bytes);
+        handle.set_reclaimable(bytes);
+        (id, handle)
+    }
+
+    /// With no round there is no evidence that a holder was out of reach,
+    /// so a table another thread owns, whose figure says a spill would free
+    /// it, still reads `in use` and is not counted as state that cannot
+    /// spill.
+    #[test]
+    fn with_no_round_a_table_off_the_walk_reads_in_use() {
+        let arbitrator = run(MIB, Box::new(Priority));
+        let (_table, _table_handle) = table_off_the_walk(&arbitrator, "totals", 400 * KIB);
+        let _filler = arbitrator
+            .reserve(500 * KIB, governed())
+            .expect("filler fits");
+        let report = arbitrator
+            .reserve(200 * KIB, governed())
+            .expect_err("off the walk the request is checked once")
+            .into_report(&arbitrator);
+
+        assert!(report.reclaim.is_none(), "no round runs off the walk");
+        assert_eq!(report.holders.len(), 1);
+        assert_eq!(report.holders[0].state, HolderState::InUse);
+        assert_eq!(report.unspillable_bytes, 500 * KIB);
+        assert!(!report.oversized);
+    }
+
+    /// No pass can reach the sort-merge or range join kernels, which spill
+    /// on thresholds of their own: their figure is 0, so no pass elects
+    /// them, and a refused request lists them as unable to spill and counts
+    /// their bytes as state that cannot spill, with or without a round.
+    #[test]
+    fn a_join_kernel_is_listed_as_unable_to_spill() {
+        let arbitrator = run(4 * MIB, Box::new(Priority));
+        let merge = ConsumerHandle::new();
+        let merge_consumer = Arc::new(crate::pipeline::sort_merge_join::SortMergeConsumer::new(
+            Arc::clone(&merge),
+        ));
+        arbitrator.register_node_consumer(
+            merge_consumer.clone(),
+            Arc::clone(&merge),
+            ConsumerLabel {
+                node: "matched".to_string(),
+                surface: MemorySurface::JoinState,
+            },
+        );
+        merge.set_bytes(1536 * KIB);
+        let band = ConsumerHandle::new();
+        let band_consumer = Arc::new(crate::pipeline::sort_buffer::SortConsumer::new(
+            Arc::clone(&band),
+        ));
+        arbitrator.register_node_consumer(
+            band_consumer.clone(),
+            Arc::clone(&band),
+            ConsumerLabel {
+                node: "banded".to_string(),
+                surface: MemorySurface::JoinState,
+            },
+        );
+        band.set_bytes(MIB);
+        assert_eq!(merge_consumer.reclaimable_bytes(), 0);
+        assert_eq!(band_consumer.reclaimable_bytes(), 0);
+
+        let off_walk = arbitrator
+            .reserve(2 * MIB, governed())
+            .expect_err("the kernels leave too little room")
+            .into_report(&arbitrator);
+        assert!(off_walk.reclaim.is_none());
+
+        let set = empty_set();
+        let _walk = walk(&arbitrator, &set);
+        let on_walk = arbitrator
+            .reserve(2 * MIB, governed())
+            .expect_err("no pass can free a kernel's state")
+            .into_report(&arbitrator);
+        let round = on_walk.reclaim.as_ref().expect("the walk ran a round");
+        assert!(round.holders_asked.is_empty(), "{round:?}");
+
+        for report in [&off_walk, &on_walk] {
+            let states: Vec<(&str, HolderState)> = report
+                .holders
+                .iter()
+                .map(|holder| (holder.node.as_str(), holder.state))
+                .collect();
+            assert_eq!(
+                states,
+                vec![
+                    ("matched", HolderState::CannotSpill),
+                    ("banded", HolderState::CannotSpill)
+                ]
+            );
+            assert_eq!(report.unspillable_bytes, 2560 * KIB);
+        }
+    }
+
     #[test]
     fn forced_shortfall_spills_the_requester_even_with_a_priority_0_slot_resident() {
         for armed in [true, false] {

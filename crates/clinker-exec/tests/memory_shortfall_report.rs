@@ -69,6 +69,7 @@ enum Kind {
     Spillable,
     CannotSpill,
     PausedSource,
+    ActiveSource,
 }
 
 /// Register `node`'s `surface` holding `bytes` on its handle.
@@ -83,7 +84,7 @@ fn hold(
     let holder = Arc::new(Holder {
         handle: Arc::clone(&handle),
         spillable: matches!(kind, Kind::Spillable),
-        pausable: matches!(kind, Kind::PausedSource),
+        pausable: matches!(kind, Kind::PausedSource | Kind::ActiveSource),
         paused: AtomicBool::new(false),
     });
     if matches!(kind, Kind::PausedSource) {
@@ -476,6 +477,103 @@ fn oversized_request_says_spilling_cannot_help() {
         ),
         "{report}"
     );
+}
+
+/// A slot holding rows a Source read: its own charge is only what the rows
+/// cost beyond their payload, which stays charged in the Source's name, and a
+/// spill of the slot frees the rows with their payload.
+struct SlotOfSourceRows {
+    handle: Arc<ConsumerHandle>,
+    payload: u64,
+}
+
+impl MemoryConsumer for SlotOfSourceRows {
+    fn current_usage(&self) -> u64 {
+        self.handle.bytes()
+    }
+    fn reclaimable_bytes(&self) -> u64 {
+        self.handle.bytes() + self.payload
+    }
+    fn spill_priority(&self) -> i32 {
+        0
+    }
+    fn try_spill(&self, _: u64) -> Result<u64, ConsumerSpillError> {
+        Ok(0)
+    }
+    fn can_back_pressure(&self) -> bool {
+        false
+    }
+}
+
+/// An active Source's bytes are the rows it has read, here sitting in a
+/// slot downstream that a spill would free. They are not state that cannot
+/// spill: the request is not oversized, the report does not say spilling
+/// cannot help, and the Source is never the remedy.
+#[test]
+fn a_source_holder_never_counts_as_state_that_cannot_spill() {
+    let arbitrator = run(4 * MIB);
+    let (_, _orders) = hold(
+        &arbitrator,
+        "orders",
+        MemorySurface::RowsRead,
+        3 * MIB,
+        Kind::ActiveSource,
+    );
+    let slot = ConsumerHandle::new();
+    arbitrator.register_node_consumer(
+        Arc::new(SlotOfSourceRows {
+            handle: Arc::clone(&slot),
+            payload: 3 * MIB,
+        }),
+        Arc::clone(&slot),
+        ConsumerLabel {
+            node: "sorted".to_string(),
+            surface: MemorySurface::BufferedRows {
+                from: "orders".to_string(),
+                to: "sorted".to_string(),
+            },
+        },
+    );
+    let (totals, _totals_handle) = hold(
+        &arbitrator,
+        "totals",
+        MemorySurface::GroupState,
+        0,
+        Kind::Spillable,
+    );
+
+    let report =
+        refuse(&arbitrator, 2 * MIB, Requester::for_consumer(totals)).into_report(&arbitrator);
+    assert_rows_sum_to_charged(&report);
+    assert_eq!(report.charged_bytes, 3 * MIB);
+    let source = report
+        .holders
+        .iter()
+        .find(|holder| holder.node == "orders")
+        .expect("the Source is listed");
+    assert_eq!(source.state, HolderState::ActiveSource);
+    assert_eq!(
+        report.unspillable_bytes, 0,
+        "a Source's rows never count as state that cannot spill"
+    );
+    assert!(
+        !report.oversized,
+        "spilling the slot makes room for the request"
+    );
+    let text = report.to_string();
+    assert!(
+        text.starts_with(
+            "E310 \"totals\": needed 2.0 MiB more for group state, but only 1.0 MiB of \
+             memory.limit 4.0 MiB was left\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("\n    \"orders\"  rows read from the source  3.0 MiB  active source"),
+        "{text}"
+    );
+    assert!(!text.contains("spilling cannot help"), "{text}");
+    assert!(!text.contains("\n  remedy: \"orders\""), "{text}");
 }
 
 #[test]
