@@ -13,6 +13,12 @@ Clinker uses structured exit codes to communicate the outcome of a pipeline run.
 | 4 | Infrastructure or retained cleanup debt | File/format failure, disk full, a `--lineage` export that failed in a way a retry may resolve — a reader that went away, a write that timed out, a volume that was out of space, or a flush that exceeded its deadline — an environment that refused the SIGINT/SIGTERM handler the run requires, in which case the run stops before reading or writing anything and the environment is what must change, or an attempt operation stopped with bounded, ambiguous, live, or otherwise retryable cleanup debt. This status never means completed-with-DLQ. |
 | 130 | Cancelled | Graceful SIGINT or SIGTERM cancellation won before publication, or a required `--machine` lifecycle record could not be written before publication. Final paths for the current attempt remain unchanged. |
 
+> **Known issue:** a command-line usage error (an unknown flag or a missing
+> argument) currently exits 2, the partial-success code, instead of 1, except
+> under `clinker attempts` ([#1372](https://github.com/rustpunk/clinker/issues/1372)). A scheduler that treats 2 as
+> "completed with dead letters" cannot tell the two apart yet; check stderr for a
+> usage message.
+
 For an ordinary standalone run, these statuses are the complete process
 result. A `--machine ndjson-v1` consumer must additionally require exactly one
 supported terminal event whose result and embedded exit, where present, match
@@ -223,13 +229,14 @@ set -euo pipefail
 PIPELINE=/opt/clinker/pipelines/daily_etl.yaml
 METRICS_DIR=/var/spool/clinker/
 
+# `set -e` would end the script as soon as clinker exits non-zero, before the
+# `case` below runs. `|| EXIT=$?` captures the status without stopping.
+EXIT=0
 clinker run "$PIPELINE" \
   --memory-limit 512M \
   --log-level warn \
   --metrics-spool-dir "$METRICS_DIR" \
-  --force
-
-EXIT=$?
+  --force || EXIT=$?
 
 case $EXIT in
   0)
@@ -270,3 +277,9 @@ Type=oneshot
 SuccessExitStatus=2
 ExecStart=/opt/clinker/bin/clinker run /opt/clinker/pipelines/daily_etl.yaml --force
 ```
+
+> **Known issue:** a command-line usage error, such as a mistyped flag or a missing
+> argument, currently exits 2 instead of 1 (except under `clinker attempts`), so
+> `SuccessExitStatus=2` would also count a typo in `ExecStart` as a success
+> ([#1372](https://github.com/rustpunk/clinker/issues/1372)). After editing the unit, run its `ExecStart` command once by
+> hand and check that it does not print a usage error.

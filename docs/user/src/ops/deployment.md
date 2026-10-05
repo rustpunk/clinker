@@ -90,6 +90,12 @@ sudo systemctl enable --now clinker-daily.timer
 
 Note: `SuccessExitStatus=2` tells systemd that exit code 2 (partial success with DLQ entries) is not a service failure. See [Exit Codes](exit-codes.md) for the full reference.
 
+> **Known issue:** a command-line usage error, such as a mistyped flag or a missing
+> argument, currently exits 2 instead of 1 (except under `clinker attempts`), so
+> `SuccessExitStatus=2` would also count a typo in `ExecStart` as a success
+> ([#1372](https://github.com/rustpunk/clinker/issues/1372)). After editing the unit, run its `ExecStart` command once by
+> hand and check that it does not print a usage error.
+
 ## Cron scheduling
 
 ```cron
