@@ -5093,6 +5093,12 @@ pub(crate) fn service_pending_node_buffer_spills(
     node_buffers: &mut HashMap<NodeBufferKey, NodeBuffer>,
     sweep: &NodeBufferSpillSweep<'_>,
 ) -> Result<(), PipelineError> {
+    let spill = ResidentSlotSpill {
+        arbitrator: sweep.arbitrator,
+        spill_root: sweep.spill_root,
+        spill_compress: sweep.spill_compress,
+        batch_size: sweep.batch_size,
+    };
     // Phase 1: collect the slots whose consumer flagged a spill request and
     // that are eligible to spill (resident `Memory` or re-readable resident
     // memory). `take_spill_request` read-and-clears every observed flag.
@@ -5118,34 +5124,66 @@ pub(crate) fn service_pending_node_buffer_spills(
         else {
             continue;
         };
-        let Some(buffer) = node_buffers.remove(&key) else {
-            continue;
-        };
         let name = (sweep.node_name)(key.node);
+        spill.spill_slot(node_buffers, &key, &handle, &name)?;
+    }
+    Ok(())
+}
+
+/// What spilling one resident node-buffer slot needs besides the slot: the
+/// arbitrator its file bytes are charged to and the run's spill settings.
+pub(crate) struct ResidentSlotSpill<'a> {
+    pub(crate) arbitrator: &'a crate::pipeline::memory::MemoryArbitrator,
+    pub(crate) spill_root: &'a std::path::Path,
+    pub(crate) spill_compress: clinker_plan::config::CompressMode,
+    pub(crate) batch_size: usize,
+}
+
+impl ResidentSlotSpill<'_> {
+    /// Spill the slot at `key` to one file now, if it is resident, and
+    /// release its in-memory charge: the slot's residue through `handle`,
+    /// and its records' own allocations as they drop once written. Charges
+    /// the file to `node_name` against the disk quota, failing with the
+    /// spill-cap error (E320) past it. A slot that is not resident, or is
+    /// absent, is left as it is. Returns the file's bytes (0 when nothing
+    /// was written).
+    ///
+    /// Blocks on the file write. Never reserves memory, so a reclaim may call
+    /// it while it holds the reclaim set.
+    pub(crate) fn spill_slot(
+        &self,
+        node_buffers: &mut HashMap<NodeBufferKey, NodeBuffer>,
+        key: &NodeBufferKey,
+        handle: &crate::pipeline::memory::ConsumerHandle,
+        node_name: &str,
+    ) -> Result<u64, PipelineError> {
+        let Some(buffer) = node_buffers.remove(key) else {
+            return Ok(0);
+        };
         // Resolve the compression mode against this slot's schema width and
         // the run's batch size, matching the admission path so the on-disk
         // format agrees with what `--explain` projects.
         let column_count = buffer.first_record_column_count();
-        let compress = sweep
+        let compress = self
             .spill_compress
-            .resolve_for_schema(column_count, sweep.batch_size as u64);
+            .resolve_for_schema(column_count, self.batch_size as u64);
         let (spilled, file_bytes) =
-            buffer.spill_resident_memory(Some(sweep.spill_root), compress)?;
-        node_buffers.insert(key, spilled);
+            buffer.spill_resident_memory(Some(self.spill_root), compress)?;
+        node_buffers.insert(key.clone(), spilled);
         if file_bytes > 0 {
             // Rows are on disk now; the slot's in-memory charge is zero.
-            handle.set_bytes(0);
-            if sweep.arbitrator.record_spill_bytes(&name, file_bytes) {
+            handle.shrink(handle.bytes());
+            if self.arbitrator.record_spill_bytes(node_name, file_bytes) {
                 return Err(PipelineError::spill_cap_exceeded(
-                    name,
-                    sweep.arbitrator.max_spill_bytes(),
+                    node_name,
+                    self.arbitrator.max_spill_bytes(),
                     file_bytes,
-                    sweep.arbitrator.cumulative_spill_bytes(),
+                    self.arbitrator.cumulative_spill_bytes(),
                 ));
             }
         }
+        Ok(file_bytes)
     }
-    Ok(())
 }
 
 /// Execute one DAG node by routing it to its arm.
@@ -5159,7 +5197,32 @@ pub(crate) fn service_pending_node_buffer_spills(
 /// Output sink errors are collected into `ctx.output_errors` instead of
 /// short-circuiting so sibling outputs still get their chance to fail (and be
 /// reported) — the caller aggregates after the walk.
+///
+/// While the arm runs, governed allocations on the walk are charged to the
+/// node's own first registered consumer when it has one, so a reclaim they
+/// start elects that node's state last; the previous walk requester is
+/// restored afterwards. A spill a reclaim pass could not complete during the
+/// arm fails the node with that spill's error, ahead of whatever the arm
+/// returned, since the request that met it saw only a shortfall.
 pub(crate) fn dispatch_plan_node(
+    ctx: &mut ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
+    node_idx: NodeIndex,
+) -> Result<(), PipelineError> {
+    let node_consumer = current_dag
+        .graph
+        .node_weight(node_idx)
+        .and_then(|node| ctx.memory_budget.first_node_consumer(node.name()));
+    let previous = ctx.memory_budget.set_walk_requester(node_consumer);
+    let result = dispatch_plan_node_arm(ctx, current_dag, node_idx);
+    ctx.memory_budget.set_walk_requester(previous);
+    match ctx.memory_budget.take_reclaim_failure() {
+        Some(failure) => Err(failure),
+        None => result,
+    }
+}
+
+fn dispatch_plan_node_arm(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,

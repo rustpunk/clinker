@@ -798,35 +798,24 @@ impl TransientNodeBufferReservation {
     /// consumer registered. Materializing a sequential scan uses this for the
     /// interval where the immutable backing and its resident output vector
     /// coexist.
+    ///
+    /// The growth is charged through the handle, so on the walk a shortfall
+    /// first spills other walk-owned state; the error (E310) names `node`
+    /// only when that reclaim could not make room.
     pub(crate) fn reserve_additional(
         &self,
         additional_bytes: u64,
         node: &str,
     ) -> Result<(), PipelineError> {
-        if additional_bytes == 0 {
+        // A zero limit has always meant that a materialization is not
+        // checked at all; the ledger itself would refuse every byte.
+        if self.budget.hard_limit() == 0 {
+            self.handle.add_bytes(additional_bytes);
             return Ok(());
         }
-        // This preflight accounts the pipeline-owned allocations represented by
-        // consumer handles. Adding an allocation estimate to process RSS would
-        // double-count tracked state already present in RSS and make a small,
-        // intentionally spill-heavy budget fail solely on the host process's
-        // fixed baseline.
-        let charged_pressure = self.budget.sum_consumer_usage();
-        let projected_pressure = charged_pressure.saturating_add(additional_bytes);
-        let hard_limit = self.budget.hard_limit();
-        if hard_limit != 0 && projected_pressure > hard_limit {
-            return Err(PipelineError::MemoryBudgetExceeded {
-                node: node.to_string(),
-                used: projected_pressure,
-                limit: hard_limit,
-                source: clinker_plan::BudgetCategory::NodeBuffer,
-                detail: Some(format!(
-                    "node-buffer materialization overlap projected {projected_pressure} bytes from charged pressure {charged_pressure} plus {additional_bytes} temporary bytes"
-                )),
-            });
-        }
-        self.handle.add_bytes(additional_bytes);
-        Ok(())
+        self.handle
+            .try_grow(additional_bytes)
+            .map_err(|shortfall| node_buffer_shortfall_error(node, &shortfall))
     }
 
     /// Replace the reservation's reported bytes after a representation
@@ -846,7 +835,7 @@ impl TransientNodeBufferReservation {
     /// handle grows, so the arbitrator never observes a transient duplicate
     /// charge while several harvested vectors become one node-buffer slot.
     pub(crate) fn absorb_charges(&self, others: Vec<Self>) {
-        let charged_before = self.budget.sum_consumer_usage();
+        let charged_before = self.budget.charged_bytes();
         let mut combined = self.bytes();
         for other in &others {
             debug_assert!(std::sync::Arc::ptr_eq(&self.budget, &other.budget));
@@ -856,7 +845,7 @@ impl TransientNodeBufferReservation {
         drop(others);
         self.set_bytes(combined);
         debug_assert_eq!(
-            self.budget.sum_consumer_usage(),
+            self.budget.charged_bytes(),
             charged_before,
             "reservation charge consolidation must preserve total usage"
         );
@@ -887,32 +876,18 @@ impl Drop for TransientNodeBufferReservation {
 /// events into a new resident vector. This retains the reservation mechanism
 /// used by composition canonicalization without coupling fan-out access to a
 /// memory-only buffer clone.
+///
+/// The reservation's consumer registers empty and then grows by
+/// `reserved_bytes` through its handle, so on the walk a shortfall first
+/// spills other walk-owned state (this reservation's own consumer, elected
+/// last, holds nothing yet). E310 naming `node` is returned only when that
+/// reclaim could not make room; the registration is then removed.
 pub(crate) fn reserve_node_buffer_materialization(
     reserved_bytes: u64,
     budget: &std::sync::Arc<crate::pipeline::memory::MemoryArbitrator>,
     node: &str,
 ) -> Result<TransientNodeBufferReservation, PipelineError> {
-    // Use the exact pipeline-owned charge ledger for an allocation preflight.
-    // RSS remains the asynchronous spill/abort signal; adding this estimate to
-    // RSS here would double-count charged state and include the process's fixed
-    // baseline, which a spill-backed scan cannot reclaim.
-    let charged_pressure = budget.sum_consumer_usage();
-    let projected_pressure = charged_pressure.saturating_add(reserved_bytes);
-    let hard_limit = budget.hard_limit();
-    if hard_limit != 0 && projected_pressure > hard_limit {
-        return Err(PipelineError::MemoryBudgetExceeded {
-            node: node.to_string(),
-            used: projected_pressure,
-            limit: hard_limit,
-            source: clinker_plan::BudgetCategory::NodeBuffer,
-            detail: Some(format!(
-                "transient node-buffer materialization projected {projected_pressure} bytes from charged pressure {charged_pressure} plus {reserved_bytes} reserved bytes"
-            )),
-        });
-    }
-
     let handle = crate::pipeline::memory::ConsumerHandle::new();
-    handle.set_bytes(reserved_bytes);
     let consumer_id = budget.register_node_consumer(
         std::sync::Arc::new(TransientNodeBufferConsumer::new(handle.clone())),
         handle.clone(),
@@ -927,8 +902,41 @@ pub(crate) fn reserve_node_buffer_materialization(
         handle,
         owns_registration: true,
     };
-
+    // Dropping the reservation on a refusal unregisters its consumer.
+    reservation.reserve_additional(reserved_bytes, node)?;
     Ok(reservation)
+}
+
+/// The E310 for a node-buffer growth of `node` the arbitrator refused after
+/// reclaiming: the bytes the ledger would have held with the request
+/// granted, its limit, and the largest holders at the refusal.
+pub(crate) fn node_buffer_shortfall_error(
+    node: &str,
+    shortfall: &crate::pipeline::memory::ledger::Shortfall,
+) -> PipelineError {
+    let snapshot = &shortfall.snapshot;
+    let holders: Vec<String> = snapshot
+        .holders
+        .iter()
+        .take(5)
+        .map(|holder| format!("{} {} bytes", holder.label.surface, holder.charged))
+        .collect();
+    PipelineError::MemoryBudgetExceeded {
+        node: node.to_string(),
+        used: snapshot.charged.saturating_add(shortfall.requested),
+        limit: snapshot.limit,
+        source: clinker_plan::BudgetCategory::NodeBuffer,
+        detail: Some(format!(
+            "node-buffer materialization of {} bytes did not fit beside {} charged bytes; largest holders: {}",
+            shortfall.requested,
+            snapshot.charged,
+            if holders.is_empty() {
+                "none".to_string()
+            } else {
+                holders.join(", ")
+            }
+        )),
+    }
 }
 
 /// Arbitrator wrapper for a transient materialization. Unlike a resident

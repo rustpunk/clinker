@@ -2051,6 +2051,14 @@ impl PipelineExecutor {
             }
             Ok(())
         })();
+        // A spill a reclaim pass met between dispatches (none is expected:
+        // every allocation of the walk runs inside a dispatch) still fails
+        // the run rather than being lost.
+        if walk_result.is_ok()
+            && let Some(failure) = ctx.memory_budget.take_reclaim_failure()
+        {
+            walk_result = Err(failure);
+        }
 
         // Streaming-output drain. Drop every remaining sender BEFORE
         // joining so the writer threads' `rx.recv` returns `Err`

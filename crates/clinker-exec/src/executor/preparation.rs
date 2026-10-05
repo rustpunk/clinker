@@ -287,6 +287,9 @@ struct ExecutorAuthority {
 struct AdmissionAuthority {
     arbitrator: AdmissionLink,
     release: Arc<ReleaseAuthority>,
+    /// The release side of the walk requester's grants, kept while the
+    /// requester stays the same so each walk allocation reuses it.
+    walk_release: std::sync::Mutex<Option<Arc<AttributedRelease>>>,
     handle: Arc<ConsumerHandle>,
     shutdown: ShutdownToken,
     telemetry: Option<TelemetryProducer>,
@@ -424,6 +427,12 @@ impl AdmissionLink {
     fn admit_writer_descriptor(&self, limit: usize) -> Result<(), ResourceError> {
         self.live()?.admit_writer_descriptor(limit)
     }
+    /// The consumer a governed allocation by the calling thread is charged
+    /// to: the run's walk requester on its walk, none elsewhere or once the
+    /// run is gone.
+    fn walk_requester(&self) -> Option<ConsumerId> {
+        self.0.upgrade().and_then(|arb| arb.walk_requester())
+    }
 }
 
 impl Drop for ExecutorAuthority {
@@ -512,6 +521,7 @@ impl ExecutorResources {
         let admission = Arc::new(AdmissionAuthority {
             arbitrator: AdmissionLink(Arc::downgrade(&arbitrator)),
             release,
+            walk_release: std::sync::Mutex::new(None),
             handle,
             shutdown,
             telemetry,
@@ -595,17 +605,44 @@ impl AdmissionAuthority {
         signal.finish(result.as_ref().map(|_| ()).map_err(|error| *error));
         result
     }
+
+    /// The release authority for grants made in `consumer`'s name, reused
+    /// while the walk requester stays `consumer`.
+    fn walk_release(&self, consumer: ConsumerId) -> Arc<AttributedRelease> {
+        let mut cached = self.walk_release.lock().unwrap_or_else(|e| e.into_inner());
+        match cached.as_ref() {
+            Some(release) if release.attribution == Some(consumer) => Arc::clone(release),
+            _ => {
+                let release = Arc::new(AttributedRelease {
+                    state: self.release.state.clone(),
+                    attribution: Some(consumer),
+                });
+                *cached = Some(Arc::clone(&release));
+                release
+            }
+        }
+    }
 }
 impl AllocationAuthority for AdmissionAuthority {
     fn identity(&self) -> usize {
         self.release.identity()
     }
+    /// On the run's walk, an allocation made while a walk requester is
+    /// named is a grant in that consumer's name, and its lease releases in
+    /// that name whatever the walk requester is when it drops. Anywhere
+    /// else it is charged to no consumer.
     fn try_reserve(
         self: Arc<Self>,
         owner: OwnerId,
         layout: Layout,
     ) -> Result<AllocationLease, ResourceError> {
-        self.admit(owner, layout, Requester::governed(), self.release.clone())
+        match self.arbitrator.walk_requester() {
+            Some(consumer) => {
+                let release = self.walk_release(consumer);
+                self.admit(owner, layout, Requester::for_consumer(consumer), release)
+            }
+            None => self.admit(owner, layout, Requester::governed(), self.release.clone()),
+        }
     }
     fn release(&self, _: OwnerId, bytes: usize) {
         self.release.state.release_writer_memory(bytes, None);

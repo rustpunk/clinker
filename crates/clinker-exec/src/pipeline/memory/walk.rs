@@ -15,9 +15,11 @@ use std::rc::Rc;
 use std::sync::{Arc, Weak};
 
 use clinker_plan::config::CompressMode;
+use clinker_plan::error::PipelineError;
 
+use super::reservation::ReservationState;
 use super::{ConsumerHandle, ConsumerId, MemoryArbitrator};
-use crate::executor::dispatch::{NodeBufferKey, NodeBufferReaderLedger};
+use crate::executor::dispatch::{NodeBufferKey, NodeBufferReaderLedger, ResidentSlotSpill};
 use crate::executor::node_buffer::NodeBuffer;
 
 /// Where the calling thread stands relative to one run's walk.
@@ -214,6 +216,99 @@ impl WalkReclaimSet {
     }
 }
 
+/// What a reclaim pass got from asking the walk to spill one elected
+/// consumer's state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VictimOutcome {
+    /// The walk owns the consumer's state and spilled whatever of it was
+    /// resident, now, on the walk.
+    Spilled,
+    /// The walk holds no spillable state for the consumer: another thread
+    /// owns it, or it is not the kind of state a pass spills. Skipped; its
+    /// owner is never asked to act.
+    NotOwned,
+    /// The walk owns the consumer's state but cannot spill it now: the
+    /// running dispatch arm holds it, or the reclaim set itself is borrowed.
+    /// Frees nothing this pass. When the set could tell which state it is,
+    /// that state's own spill request is raised, so the walk spills it at
+    /// its next safe point.
+    Busy,
+}
+
+/// The walk-owned state a reclaim pass can spill, by consumer.
+///
+/// Implemented by [`WalkReclaimSet`]; a pass reaches it only on the walk,
+/// only while nothing else borrows the set, and never with the ledger lock
+/// held.
+pub(crate) trait WalkReclaim {
+    /// Spill the state the walk holds for consumer `id` now, charging any
+    /// spill file to `arbitrator`'s disk quota. Blocks on the spill's I/O;
+    /// never reserves memory and never waits on another thread. An error is
+    /// a failed spill (I/O, or the disk quota passed), which ends the pass.
+    fn spill_victim(
+        &mut self,
+        id: ConsumerId,
+        arbitrator: &MemoryArbitrator,
+    ) -> Result<VictimOutcome, PipelineError>;
+}
+
+impl WalkReclaim for WalkReclaimSet {
+    /// A registered node-buffer slot of the current scope whose buffer is
+    /// resident spills through the same core as the walk's spill-request
+    /// sweep (`service_pending_node_buffer_spills`). A registered slot whose
+    /// buffer is out of the set is held by the running arm: its spill
+    /// request is raised and it is `Busy`. Anything else is `NotOwned`.
+    fn spill_victim(
+        &mut self,
+        id: ConsumerId,
+        arbitrator: &MemoryArbitrator,
+    ) -> Result<VictimOutcome, PipelineError> {
+        let Some((key, handle)) = self
+            .slots
+            .registrations
+            .iter()
+            .find(|(_, (registered, _))| *registered == id)
+            .map(|(key, (_, handle))| (key.clone(), Arc::clone(handle)))
+        else {
+            return Ok(VictimOutcome::NotOwned);
+        };
+        let Some(spill) = self.slots.spill.get(&key) else {
+            return Ok(VictimOutcome::NotOwned);
+        };
+        if !spill.spill_allowed {
+            return Ok(VictimOutcome::NotOwned);
+        }
+        if !self.slots.buffers.contains_key(&key) {
+            handle.request_spill();
+            return Ok(VictimOutcome::Busy);
+        }
+        let node_name = spill.node_name.clone();
+        ResidentSlotSpill {
+            arbitrator,
+            spill_root: self.spill_settings.spill_root.as_ref(),
+            spill_compress: self.spill_settings.spill_compress,
+            batch_size: self.spill_settings.batch_size,
+        }
+        .spill_slot(&mut self.slots.buffers, &key, &handle, &node_name)?;
+        Ok(VictimOutcome::Spilled)
+    }
+}
+
+/// The stand-in a pass uses when the reclaim set is already borrowed (the
+/// walk is part-way through changing it): it cannot tell which consumers the
+/// walk owns, so every candidate is `Busy` and nothing is flagged.
+pub(crate) struct BorrowedReclaimSet;
+
+impl WalkReclaim for BorrowedReclaimSet {
+    fn spill_victim(
+        &mut self,
+        _id: ConsumerId,
+        _arbitrator: &MemoryArbitrator,
+    ) -> Result<VictimOutcome, PipelineError> {
+        Ok(VictimOutcome::Busy)
+    }
+}
+
 /// One installed walk: whose run it is and the state that walk owns.
 struct WalkFrame {
     /// The run's arbitrator, compared by address. Weak so the frame never
@@ -312,6 +407,46 @@ pub(crate) fn walk_reclaim_set(
         })
         .ok()
         .flatten()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_RECLAIM: RefCell<Option<Rc<RefCell<dyn WalkReclaim>>>> = const { RefCell::new(None) };
+}
+
+/// Run `body` with `reclaim` standing in for the walk's reclaim set in every
+/// pass this thread runs, so a unit test can script what each victim frees.
+#[cfg(test)]
+pub(crate) fn with_test_reclaim<R>(
+    reclaim: Rc<RefCell<dyn WalkReclaim>>,
+    body: impl FnOnce() -> R,
+) -> R {
+    let previous = TEST_RECLAIM.with_borrow_mut(|slot| slot.replace(reclaim));
+    let result = body();
+    TEST_RECLAIM.with_borrow_mut(|slot| *slot = previous);
+    result
+}
+
+/// The stand-in [`with_test_reclaim`] installed, if any.
+#[cfg(test)]
+pub(crate) fn test_reclaim() -> Option<Rc<RefCell<dyn WalkReclaim>>> {
+    TEST_RECLAIM.with_borrow(Clone::clone)
+}
+
+/// The arbitrator whose ledger is `state`, when the calling thread is that
+/// run's walk; `None` on any other thread or once the run's arbitrator is
+/// gone. How a charge made through a handle or a grant, which hold only the
+/// ledger, finds the run it may reclaim in.
+pub(crate) fn walk_arbitrator(state: &Arc<ReservationState>) -> Option<Arc<MemoryArbitrator>> {
+    WALK_FRAME
+        .try_with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .and_then(|frame| frame.arbitrator.upgrade())
+        })
+        .ok()
+        .flatten()
+        .filter(|arbitrator| Arc::ptr_eq(&arbitrator.admission, state))
 }
 
 #[cfg(test)]

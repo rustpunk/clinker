@@ -1,17 +1,19 @@
 //! The memory ledger's synchronized core: the charged total and its peak, the
 //! bytes charged in each consumer's name with their high-water mark, the
-//! release epoch, and the disk and descriptor counts that share its lock.
+//! release epoch, the progress of a reclaim pass in flight, and the disk and
+//! descriptor counts that share its lock.
 //!
 //! It holds byte counts, an epoch and holder labels, never records, RSS
 //! readings or cleanup callbacks. Nothing here performs I/O, logs, emits
 //! telemetry or calls into a consumer, so every critical section is a few
 //! arithmetic steps (a snapshot also copies the holders' labels).
 //!
-//! The file locks only through `super::sync` and names no other crate type:
+//! The file locks and names threads only through `super::sync`, and names no
+//! other crate type:
 //! consumer ids are raw `u32`s and the holder label is a type parameter. That
 //! keeps it compilable against a model checker's `sync` module unchanged.
 
-use super::sync::{Mutex, MutexGuard};
+use super::sync::{Mutex, MutexGuard, ThreadId, current_thread};
 use std::collections::BTreeMap;
 
 /// The ledger state behind its one mutex.
@@ -34,6 +36,7 @@ impl<L, A> LedgerCore<L, A> {
                 peak_granted: 0,
                 release_epoch: 0,
                 consumers: BTreeMap::new(),
+                pass: None,
                 closed: false,
                 disk: 0,
                 descriptors: 0,
@@ -119,6 +122,25 @@ impl<L> ConsumerEntry<L> {
     }
 }
 
+/// What the ledger records about a reclaim pass while the walk runs one.
+///
+/// Every release made during the pass lands in exactly one of two places: a
+/// release on the walk thread while a victim's scope is open is that
+/// victim's progress; any other release (another thread's, or the walk's own
+/// between victims) is a release during the pass. So a victim's progress is
+/// never inflated by a release it did not cause, and a release it did not
+/// cause is never lost.
+struct PassTrack {
+    walk: ThreadId,
+    victim_open: bool,
+    victim_freed: u64,
+    /// Bytes the walk charged inside the open victim's scope, netted
+    /// against what it released there: a spill that charged what it freed
+    /// made no progress.
+    victim_charged: u64,
+    released_during: bool,
+}
+
 /// The locked ledger. Reached only through [`LedgerCore::lock`].
 pub(crate) struct LedgerState<L, A> {
     limit: u64,
@@ -133,6 +155,9 @@ pub(crate) struct LedgerState<L, A> {
     /// in it.
     release_epoch: u64,
     consumers: BTreeMap<u32, ConsumerEntry<L>>,
+    /// The reclaim pass in progress, if any. At most one runs at a time: only
+    /// the walk runs one, and never inside another.
+    pass: Option<PassTrack>,
     pub(crate) closed: bool,
     /// Writer disk quota currently granted.
     pub(crate) disk: u64,
@@ -277,7 +302,19 @@ impl<L, A> LedgerState<L, A> {
         };
         self.charged = charged;
         self.peak_charged = self.peak_charged.max(charged);
+        self.note_charge(bytes);
         Ok(())
+    }
+
+    /// Count `bytes` just charged against the open victim's progress when
+    /// the walk charged them inside its scope.
+    fn note_charge(&mut self, bytes: u64) {
+        if let Some(pass) = &mut self.pass
+            && pass.victim_open
+            && current_thread() == Some(pass.walk)
+        {
+            pass.victim_charged = pass.victim_charged.saturating_add(bytes);
+        }
     }
 
     /// Release `bytes` charged with attribution `attribution`.
@@ -311,6 +348,58 @@ impl<L, A> LedgerState<L, A> {
         );
         self.charged = self.charged.saturating_sub(bytes);
         self.release_epoch = self.release_epoch.wrapping_add(1);
+        if let Some(pass) = &mut self.pass {
+            if pass.victim_open && current_thread() == Some(pass.walk) {
+                pass.victim_freed = pass.victim_freed.saturating_add(bytes);
+            } else {
+                pass.released_during = true;
+            }
+        }
+    }
+
+    /// Start tracking a reclaim pass run by the thread `walk`. A pass
+    /// already open is replaced, which only a pass that never ended (a
+    /// panic between its start and end) can leave behind.
+    pub(crate) fn begin_pass(&mut self, walk: ThreadId) {
+        self.pass = Some(PassTrack {
+            walk,
+            victim_open: false,
+            victim_freed: 0,
+            victim_charged: 0,
+            released_during: false,
+        });
+    }
+
+    /// Open the scope of the pass's next victim: from here until
+    /// [`Self::close_victim`], every release the walk thread makes is that
+    /// victim's progress, and every charge it makes is taken back from it.
+    /// A no-op outside a pass.
+    pub(crate) fn open_victim(&mut self) {
+        if let Some(pass) = &mut self.pass {
+            pass.victim_open = true;
+            pass.victim_freed = 0;
+            pass.victim_charged = 0;
+        }
+    }
+
+    /// Close the open victim's scope and return its progress: what the walk
+    /// released inside it less what the walk charged there. 0 outside a
+    /// pass.
+    pub(crate) fn close_victim(&mut self) -> u64 {
+        match &mut self.pass {
+            Some(pass) => {
+                pass.victim_open = false;
+                let freed = std::mem::take(&mut pass.victim_freed);
+                freed.saturating_sub(std::mem::take(&mut pass.victim_charged))
+            }
+            None => 0,
+        }
+    }
+
+    /// Stop tracking the pass and say whether any release not counted as a
+    /// victim's progress happened while it ran. False outside a pass.
+    pub(crate) fn end_pass(&mut self) -> bool {
+        self.pass.take().is_some_and(|pass| pass.released_during)
     }
 
     /// Number of nonzero releases so far. An unchanged epoch across a span
@@ -325,6 +414,7 @@ impl<L, A> LedgerState<L, A> {
     pub(crate) fn bind_handle(&mut self, id: u32, label: L, bytes: u64) {
         self.charged = self.charged.saturating_add(bytes);
         self.peak_charged = self.peak_charged.max(self.charged);
+        self.note_charge(bytes);
         let entry = self
             .consumers
             .entry(id)
@@ -348,6 +438,7 @@ impl<L, A> LedgerState<L, A> {
         if bytes >= previous {
             self.charged = self.charged.saturating_add(bytes - previous);
             self.peak_charged = self.peak_charged.max(self.charged);
+            self.note_charge(bytes - previous);
         } else {
             self.discharge(previous - bytes);
         }
@@ -380,6 +471,7 @@ impl<L, A> LedgerState<L, A> {
         if after >= before {
             self.charged = self.charged.saturating_add(after - before);
             self.peak_charged = self.peak_charged.max(self.charged);
+            self.note_charge(after - before);
         } else {
             self.discharge(before - after);
         }

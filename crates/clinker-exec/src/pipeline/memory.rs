@@ -38,6 +38,17 @@ pub(crate) mod walk;
 /// instead.
 pub(crate) mod sync {
     pub(crate) use std::sync::{Mutex, MutexGuard};
+    pub(crate) use std::thread::ThreadId;
+
+    std::thread_local! {
+        static CURRENT: ThreadId = std::thread::current().id();
+    }
+
+    /// The calling thread's id, or `None` while its thread-local storage is
+    /// being torn down, when no thread can be named.
+    pub(crate) fn current_thread() -> Option<ThreadId> {
+        CURRENT.try_with(|id| *id).ok()
+    }
 }
 use clinker_format::preparation::{ResourceError, ResourceErrorKind};
 use clinker_plan::plan::scheduling_hint::SchedulingHint;
@@ -576,7 +587,43 @@ impl ConsumerHandle {
     /// ledger's lock together with every other charge; on a shortfall
     /// nothing is charged. A growth raises the mark. A handle never
     /// registered has no limit to check and always grows.
+    ///
+    /// On the run's walk a growth that does not fit first runs reclaim
+    /// passes with this handle's consumer as the requester (elected last),
+    /// as [`MemoryArbitrator::reserve`] does, and is refused only by their
+    /// failure rule. The handle's locks are not held while a pass spills.
     pub fn try_grow(&self, n: u64) -> Result<(), ledger::Shortfall> {
+        self.charge_or_reclaim(n, || self.try_grow_now(n))
+    }
+
+    /// Run `attempt`, a checked charge of `need` bytes to this handle; on
+    /// the walk of the run the handle is bound to, reclaim before accepting
+    /// its shortfall.
+    fn charge_or_reclaim(
+        &self,
+        need: u64,
+        mut attempt: impl FnMut() -> Result<(), ledger::Shortfall>,
+    ) -> Result<(), ledger::Shortfall> {
+        let first = match attempt() {
+            Ok(()) => return Ok(()),
+            Err(shortfall) => shortfall,
+        };
+        let bound = self
+            .binding()
+            .as_ref()
+            .map(|binding| (Arc::clone(&binding.state), binding.id));
+        match bound.and_then(|(state, id)| walk::walk_arbitrator(&state).map(|arb| (arb, id))) {
+            Some((arbitrator, id)) => arbitrator.reclaim_until_granted(
+                need,
+                ledger::Requester::for_consumer(id),
+                first,
+                attempt,
+            ),
+            None => Err(first),
+        }
+    }
+
+    fn try_grow_now(&self, n: u64) -> Result<(), ledger::Shortfall> {
         let binding = self.binding();
         match &*binding {
             Some(binding) => {
@@ -596,10 +643,15 @@ impl ConsumerHandle {
         }
     }
 
-    /// Set the charge to exactly `total` bytes: a growth is checked as
-    /// [`Self::try_grow`] checks it, a reduction is a release. On a
-    /// shortfall the charge is unchanged.
+    /// Set the charge to exactly `total` bytes: a growth is checked (and on
+    /// the walk reclaimed for) as [`Self::try_grow`] does it, a reduction is
+    /// a release. On a shortfall the charge is unchanged.
     pub fn try_resize(&self, total: u64) -> Result<(), ledger::Shortfall> {
+        let growth = total.saturating_sub(self.bytes());
+        self.charge_or_reclaim(growth, || self.try_resize_now(total))
+    }
+
+    fn try_resize_now(&self, total: u64) -> Result<(), ledger::Shortfall> {
         let binding = self.binding();
         match &*binding {
             Some(binding) => {
@@ -1192,7 +1244,21 @@ pub struct MemoryArbitrator {
     next_consumer_id: AtomicU32,
     /// Constructor-set; immutable thereafter.
     policy: Box<dyn ArbitrationPolicy>,
+    /// Reclaim passes run so far this run, of every kind.
+    reclaim_rounds: AtomicU64,
+    /// The consumer governed allocations made on the walk are charged to,
+    /// as its raw id, or [`NO_WALK_REQUESTER`]. Written and read only on the
+    /// walk.
+    walk_requester: AtomicU64,
+    /// The first spill a reclaim pass could not complete (an I/O failure or
+    /// the disk quota passed). The request that ran the pass sees only a
+    /// shortfall, so the walk takes this at its next dispatch boundary and
+    /// fails the run with it.
+    reclaim_failure: Mutex<Option<clinker_plan::error::PipelineError>>,
 }
+
+/// [`MemoryArbitrator::walk_requester`]'s "no consumer" value.
+const NO_WALK_REQUESTER: u64 = u64::MAX;
 
 impl Drop for MemoryArbitrator {
     fn drop(&mut self) {
@@ -1249,6 +1315,9 @@ impl MemoryArbitrator {
             consumers: ArcSwap::from_pointee(Vec::new()),
             next_consumer_id: AtomicU32::new(0),
             policy,
+            reclaim_rounds: AtomicU64::new(0),
+            walk_requester: AtomicU64::new(NO_WALK_REQUESTER),
+            reclaim_failure: Mutex::new(None),
         }
     }
 
@@ -1823,6 +1892,20 @@ impl MemoryArbitrator {
             }
         }
         removed
+    }
+
+    /// The earliest-registered consumer still registered through
+    /// [`Self::register_node_consumer`] for the node named `node`, if any.
+    /// Takes the owner map's lock.
+    pub(crate) fn first_node_consumer(&self, node: &str) -> Option<ConsumerId> {
+        self.consumer_owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .live
+            .iter()
+            .filter(|(_, owner)| owner.as_str() == node)
+            .map(|(id, _)| *id)
+            .min_by_key(|id| id.0)
     }
 
     /// Number of consumers currently registered. Diagnostics surface
