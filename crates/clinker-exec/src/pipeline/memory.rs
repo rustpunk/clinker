@@ -2103,7 +2103,9 @@ impl MemoryArbitrator {
     /// them as state that cannot spill. A Source must therefore unregister
     /// here while the handle it registered with is still bound to the ledger,
     /// since only that path marks its entry. Lock order is unchanged: the
-    /// owner map, then the ledger.
+    /// owner map, then the ledger. When the walk requester names the
+    /// consumer, it is cleared: the walk's later governed allocations are
+    /// charged to no consumer, never to one that has left.
     ///
     /// Clones the snapshot minus the removed entry and swaps it in.
     /// The `id` lookup is a linear scan, acceptable because the
@@ -2137,6 +2139,17 @@ impl MemoryArbitrator {
             if let Some(handle) = owners.handles.remove(&id) {
                 handle.unbind(id, departure);
             }
+            // A consumer that has left requests nothing more on the walk: the
+            // rest of its arm charges no consumer. Otherwise a finished
+            // Source would go on naming every later walk allocation, and
+            // each would join its rows instead of the memory that cannot
+            // spill.
+            let _ = self.walk_requester.compare_exchange(
+                u64::from(id.0),
+                NO_WALK_REQUESTER,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
         }
         removed
     }

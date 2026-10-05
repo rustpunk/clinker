@@ -74,7 +74,10 @@ bytes drops; the snapshot reports them as `retired_source`, always inside the
 remainder. Nothing is re-charged. An E310 shows them as memory not held by
 any one node and never counts them as state that cannot spill, the same rule
 as for a Source still listed; bytes granted in no consumer's name, or in the
-name of another consumer that has unregistered, still count. A reserve made for
+name of another consumer that has unregistered, still count. A consumer that
+unregisters while it is the walk requester stops being the requester, so the
+rest of its arm's walk allocations are charged to no consumer and never join
+a finished Source's rows. A reserve made for
 a consumer is attributed to it for the life of the grant, and the ledger keeps
 each consumer's high-water mark over its handle bytes plus its attributed
 bytes; attribution never changes what is admitted. Every release advances a

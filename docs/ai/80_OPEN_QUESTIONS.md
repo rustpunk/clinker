@@ -995,17 +995,16 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
   edge, a buffered slot) that keeps them alive; and the parked edge's
   reclaimable figure leaves them out, so a reclaim pass underrates what
   spilling that edge would free.
-- Charges made in a finished Source's name: on the walk, governed
-  allocations are charged to the dispatching node's first registered
-  consumer (`dispatch_plan_node`), and the plain Source arm unregisters its
-  consumer before it builds node-rooted windows, parks cross-region copies
-  and admits its slot, so whatever those steps allocate through the walk's
-  governed view is charged in the finished Source's name. While the
-  Source's rows are still charged, those bytes join the finished Source's
-  figure; when the Source unregistered with nothing granted in its name,
-  they create an unlabelled entry and count as state that cannot spill, as
-  they did before. Which of those steps allocate through that view was not
-  confirmed.
+- Charges made in a finished Source's name (resolved): on the walk,
+  governed allocations are charged to the dispatching node's first
+  registered consumer (`dispatch_plan_node`), and the plain Source arm
+  unregisters its consumer before it builds node-rooted windows, parks
+  cross-region copies and admits its slot. `unregister_consumer` clears the
+  walk requester when it names the departing consumer, so anything those
+  steps allocate through the walk's governed view is charged to no consumer
+  and counts as state that cannot spill; it never joins the finished
+  Source's figure. None of them allocates through that view today: window
+  building, parking and slot admission charge their own labelled handles.
 - Unconfirmed general case: a consumer that is not a Source and unregisters
   while rows granted in its name on the walk stay resident downstream leaves
   those rows as memory not held by any one node, still counted as state that
