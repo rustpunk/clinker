@@ -69,7 +69,7 @@ pipeline shapes, with the `--explain` lines each one produces. Reference:
 
 ## For engine developers
 
-The Clinker Engine Internals book has two more:
+The Clinker Engine Internals book has three more:
 
 - a memory system explainer, linked from its *Memory Arbitration & Scheduling*
   chapter. It covers the memory budget, back-pressure, spilling to disk and the
@@ -77,3 +77,6 @@ The Clinker Engine Internals book has two more:
 - a range-join explainer, linked from its *Combine Internals* chapter. It runs
   the block-band IEJoin on small inputs: sorting and slicing into blocks,
   pruning block pairs, the kernel step by step, and the nested-loop fallback.
+- a retraction-loop explainer, linked from its *Retraction Protocol* chapter.
+  It replays the commit loop that corrects an Aggregate whose `group_by` leaves
+  out a correlation-key field, on three of the engine's test pipelines.
