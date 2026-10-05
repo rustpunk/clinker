@@ -3508,6 +3508,55 @@ mod walk_pass_tests {
         drop(walk_frame);
     }
 
+    /// A Source that finishes reading mid-arm leaves the walk requester: a
+    /// governed allocation the walk makes after it is charged in no
+    /// consumer's name, never added to the finished Source's rows.
+    #[test]
+    fn a_walk_allocation_after_its_source_finishes_is_not_charged_to_it() {
+        let arbitrator = run(64 * MIB, Box::new(Priority));
+        let provider = crate::executor::preparation::ExecutorResources::new(
+            Arc::clone(&arbitrator),
+            crate::pipeline::shutdown::ShutdownToken::detached(),
+            None,
+            std::num::NonZeroUsize::MIN,
+            None,
+        )
+        .expect("provider");
+        let scope = provider.allocation().scope().expect("scope");
+        let layout = std::alloc::Layout::from_size_align(4096, 8).expect("layout");
+        let (source, _handle) = register_as(&arbitrator, "orders", 0, 0, true);
+        let set = empty_set();
+        let walk_frame = walk(&arbitrator, &set);
+
+        let previous = arbitrator.set_walk_requester(Some(source));
+        let rows_read = scope.reserve(layout).expect("fits");
+        arbitrator
+            .unregister_consumer(source)
+            .expect("the Source was registered");
+        assert_eq!(
+            arbitrator.ledger_snapshot(0, governed()).retired_source,
+            4096,
+            "the rows the Source read stay its rows"
+        );
+
+        let later = scope.reserve(layout).expect("fits");
+        let snapshot = arbitrator.ledger_snapshot(0, governed());
+        assert_eq!(
+            snapshot.retired_source, 4096,
+            "a later walk allocation is not one of the Source's rows"
+        );
+        assert_eq!(snapshot.unattributed, 2 * 4096);
+        assert_eq!(
+            arbitrator.walk_requester(),
+            None,
+            "the finished Source no longer requests on the walk"
+        );
+
+        drop((later, rows_read));
+        arbitrator.set_walk_requester(previous);
+        drop(walk_frame);
+    }
+
     #[test]
     fn optional_growth_never_reclaims() {
         use clinker_format::reserved::ReservedVec;
