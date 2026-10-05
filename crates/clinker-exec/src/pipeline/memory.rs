@@ -1023,6 +1023,102 @@ pub trait ArbitrationPolicy: Send + Sync {
     fn prefers_backpressure(&self) -> bool {
         false
     }
+
+    /// The order a reclaim pass asks `candidates` to spill in, first to spill
+    /// first. Each candidate's figures were read once, when the pass began,
+    /// and are taken to hold for the whole pass; ordering reads nothing more.
+    /// `candidates` arrive in ascending id order.
+    ///
+    /// The default asks [`Self::select_victim`] for one victim at a time over
+    /// the candidates still unordered, once in id order and once reversed,
+    /// and takes the lower id of the two, so a tie goes to the older consumer
+    /// whichever way the policy breaks it. It stops at the first round the
+    /// policy elects nothing. A policy whose choice is a fixed ranking
+    /// overrides it with one sort.
+    fn order_candidates(&self, candidates: &[ReclaimCandidate]) -> Vec<ConsumerId> {
+        order_by_selection(self, candidates)
+    }
+}
+
+/// One consumer's figures as a reclaim pass read them, once, when it began:
+/// what [`ArbitrationPolicy::order_candidates`] ranks it by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReclaimCandidate {
+    /// The consumer.
+    pub id: ConsumerId,
+    /// [`MemoryConsumer::reclaimable_bytes`] as read.
+    pub reclaimable_bytes: u64,
+    /// [`MemoryConsumer::spill_priority`] as read.
+    pub spill_priority: i32,
+    /// [`MemoryConsumer::can_back_pressure`] as read.
+    pub can_back_pressure: bool,
+}
+
+/// A candidate as a pass read it, presented to a policy's
+/// [`ArbitrationPolicy::select_victim`]. It answers the figures the pass
+/// read and can spill nothing. It holds no separate usage reading: the pass
+/// ranks by what a spill frees, so its usage is its reclaimable figure.
+struct FrozenCandidate<'a>(&'a ReclaimCandidate);
+
+impl MemoryConsumer for FrozenCandidate<'_> {
+    fn current_usage(&self) -> u64 {
+        self.0.reclaimable_bytes
+    }
+
+    fn reclaimable_bytes(&self) -> u64 {
+        self.0.reclaimable_bytes
+    }
+
+    fn spill_priority(&self) -> i32 {
+        self.0.spill_priority
+    }
+
+    fn try_spill(&self, target_bytes: u64) -> Result<u64, ConsumerSpillError> {
+        Err(ConsumerSpillError::BelowTarget {
+            target: target_bytes,
+            freed: 0,
+        })
+    }
+
+    fn can_back_pressure(&self) -> bool {
+        self.0.can_back_pressure
+    }
+}
+
+/// [`ArbitrationPolicy::order_candidates`]'s default: `policy`'s
+/// [`ArbitrationPolicy::select_victim`] asked once per pick, forwards and
+/// reversed, over the figures already read.
+fn order_by_selection<P: ArbitrationPolicy + ?Sized>(
+    policy: &P,
+    candidates: &[ReclaimCandidate],
+) -> Vec<ConsumerId> {
+    let frozen: Vec<FrozenCandidate<'_>> = candidates.iter().map(FrozenCandidate).collect();
+    let mut others: Vec<(ConsumerId, &dyn MemoryConsumer)> = frozen
+        .iter()
+        .map(|candidate| (candidate.0.id, candidate as &dyn MemoryConsumer))
+        .collect();
+    others.sort_by_key(|(id, _)| id.0);
+    let mut order = Vec::with_capacity(others.len());
+    while !others.is_empty() {
+        let forward = policy.select_victim(&others, 0);
+        let reversed: Vec<(ConsumerId, &dyn MemoryConsumer)> =
+            others.iter().rev().copied().collect();
+        let backward = policy.select_victim(&reversed, 0);
+        let pick = match (forward, backward) {
+            (Some(a), Some(b)) => {
+                if a.0 <= b.0 {
+                    a
+                } else {
+                    b
+                }
+            }
+            (Some(only), None) | (None, Some(only)) => only,
+            (None, None) => break,
+        };
+        order.push(pick);
+        others.retain(|(id, _)| *id != pick);
+    }
+    order
 }
 
 /// Policy that selects no victim under any pressure.
@@ -1077,6 +1173,19 @@ impl ArbitrationPolicy for LargestFirst {
     fn policy_name(&self) -> Cow<'static, str> {
         Cow::Borrowed("LargestFirst")
     }
+
+    /// Most reclaimable bytes first, the older consumer first on a tie: one
+    /// sort giving exactly the order repeated selection gives.
+    fn order_candidates(&self, candidates: &[ReclaimCandidate]) -> Vec<ConsumerId> {
+        let mut ranked = candidates.to_vec();
+        ranked.sort_by_key(|candidate| {
+            (
+                std::cmp::Reverse(candidate.reclaimable_bytes),
+                candidate.id.0,
+            )
+        });
+        ranked.into_iter().map(|candidate| candidate.id).collect()
+    }
 }
 
 /// Policy that elects the consumer with the lowest
@@ -1108,6 +1217,20 @@ impl ArbitrationPolicy for Priority {
 
     fn policy_name(&self) -> Cow<'static, str> {
         Cow::Borrowed("Priority")
+    }
+
+    /// Lowest priority first, then most reclaimable bytes, then the older
+    /// consumer: one sort giving exactly the order repeated selection gives.
+    fn order_candidates(&self, candidates: &[ReclaimCandidate]) -> Vec<ConsumerId> {
+        let mut ranked = candidates.to_vec();
+        ranked.sort_by_key(|candidate| {
+            (
+                candidate.spill_priority,
+                std::cmp::Reverse(candidate.reclaimable_bytes),
+                candidate.id.0,
+            )
+        });
+        ranked.into_iter().map(|candidate| candidate.id).collect()
     }
 }
 
@@ -1155,6 +1278,20 @@ impl ArbitrationPolicy for BackPressurePreferred {
 
     fn prefers_backpressure(&self) -> bool {
         true
+    }
+
+    /// With no candidate able to back-pressure, every selection falls to the
+    /// wrapped policy, so its order is the pass's; a reclaim pass never
+    /// lists one that can.
+    fn order_candidates(&self, candidates: &[ReclaimCandidate]) -> Vec<ConsumerId> {
+        if candidates
+            .iter()
+            .any(|candidate| candidate.can_back_pressure)
+        {
+            order_by_selection(self, candidates)
+        } else {
+            self.fallback.order_candidates(candidates)
+        }
     }
 }
 

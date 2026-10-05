@@ -11,7 +11,7 @@
 use super::protocol::Refusal;
 use super::reservation::{LockedLedger, ReservationState};
 use super::walk::{self, BorrowedReclaimSet, ThreadRole, VictimOutcome, WalkReclaim};
-use super::{ConsumerId, MemoryArbitrator, MemoryConsumer, NO_WALK_REQUESTER};
+use super::{ConsumerId, MemoryArbitrator, MemoryConsumer, NO_WALK_REQUESTER, ReclaimCandidate};
 use clinker_format::FormatError;
 use clinker_format::preparation::{ResourceError, ResourceErrorKind};
 use clinker_plan::error::PipelineError;
@@ -1128,51 +1128,45 @@ impl MemoryArbitrator {
         Ok(pass.end())
     }
 
-    /// The consumers a pass of `kind` asks to spill, in order.
+    /// The consumers a pass of `kind` asks to spill, in order: every
+    /// registered consumer that cannot back-pressure and has reclaimable
+    /// bytes, in the policy's order, and the requester last when it is one.
+    ///
+    /// Reads each consumer's figures once, here, and orders them with what
+    /// was read ([`super::ArbitrationPolicy::order_candidates`]): a figure
+    /// can sit behind a lock, so the cost is one read per consumer and one
+    /// sort, not a read per consumer for every pick. The figures are taken
+    /// to hold for the pass.
     fn pass_candidates(&self, requester: Option<ConsumerId>, kind: PassKind) -> Vec<ConsumerId> {
         if kind == PassKind::Forced {
             return requester.into_iter().collect();
         }
         let registered = self.consumers.load();
-        let mut others: Vec<(ConsumerId, &dyn MemoryConsumer)> = registered
-            .iter()
-            .filter(|(id, consumer)| {
-                Some(*id) != requester
-                    && !consumer.can_back_pressure()
-                    && consumer.reclaimable_bytes() > 0
-            })
-            .map(|(id, consumer)| (*id, consumer.as_ref()))
-            .collect();
-        others.sort_by_key(|(id, _)| id.0);
-        let mut order = Vec::with_capacity(others.len() + 1);
-        while !others.is_empty() {
-            // A policy breaks a tie by slice position, first or last
-            // depending on the policy; asking it over the slice in both
-            // directions and keeping the lower id sends every tie to the
-            // older consumer whichever rule it uses.
-            let forward = self.policy.select_victim(&others, 0);
-            let reversed: Vec<(ConsumerId, &dyn MemoryConsumer)> =
-                others.iter().rev().copied().collect();
-            let backward = self.policy.select_victim(&reversed, 0);
-            let pick = match (forward, backward) {
-                (Some(a), Some(b)) => {
-                    if a.0 <= b.0 {
-                        a
-                    } else {
-                        b
-                    }
-                }
-                (Some(only), None) | (None, Some(only)) => only,
-                (None, None) => break,
-            };
-            order.push(pick);
-            others.retain(|(id, _)| *id != pick);
+        let mut others: Vec<ReclaimCandidate> = Vec::with_capacity(registered.len());
+        let mut requester_can_spill = false;
+        for (id, consumer) in registered.iter() {
+            let can_back_pressure = consumer.can_back_pressure();
+            if can_back_pressure {
+                continue;
+            }
+            let reclaimable_bytes = consumer.reclaimable_bytes();
+            if reclaimable_bytes == 0 {
+                continue;
+            }
+            if Some(*id) == requester {
+                requester_can_spill = true;
+                continue;
+            }
+            others.push(ReclaimCandidate {
+                id: *id,
+                reclaimable_bytes,
+                spill_priority: consumer.spill_priority(),
+                can_back_pressure,
+            });
         }
-        if let Some(requester) = requester
-            && let Some((_, consumer)) = registered.iter().find(|(id, _)| *id == requester)
-            && !consumer.can_back_pressure()
-            && consumer.reclaimable_bytes() > 0
-        {
+        others.sort_by_key(|candidate| candidate.id.0);
+        let mut order = self.policy.order_candidates(&others);
+        if requester_can_spill && let Some(requester) = requester {
             order.push(requester);
         }
         order
