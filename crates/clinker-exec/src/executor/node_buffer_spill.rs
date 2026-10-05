@@ -54,13 +54,28 @@ pub(crate) fn spill_node_buffer<R>(
 where
     R: Copy + Into<SourceRowId>,
 {
+    spill_borrowed_rows(&rows, spill_dir, compress)
+}
+
+/// Write borrowed rows to one spill file without copying them, in the same
+/// format and with the same result as [`spill_node_buffer`]. The caller keeps
+/// its rows; nothing resident is built, so a holder refused memory for a
+/// copy can still put the rows on disk.
+pub(crate) fn spill_borrowed_rows<R>(
+    rows: &[(Record, R)],
+    spill_dir: Option<&Path>,
+    compress: bool,
+) -> Result<Option<(SpillFile<SourceRowId>, u64)>, PipelineError>
+where
+    R: Copy + Into<SourceRowId>,
+{
     let Some((first, _)) = rows.first() else {
         return Ok(None);
     };
     let schema = first.schema().clone();
     let mut writer: SpillWriter<SourceRowId> = SpillWriter::new(schema, spill_dir, compress)?;
     let count = rows.len() as u64;
-    for (record, rn) in &rows {
+    for (record, rn) in rows {
         writer.write_pair(record, &(*rn).into())?;
     }
     let file = writer.finish()?;

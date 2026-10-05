@@ -35,9 +35,11 @@ use clinker_plan::error::PipelineError;
 use clinker_plan::plan::CompositionBodyId;
 use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface};
 use clinker_record::Record;
+use clinker_record::owned_storage::AllocationResources;
 use petgraph::graph::EdgeIndex;
 
 use crate::executor::node_buffer::{NodeBuffer, ReReadableNodeBuffer};
+use crate::executor::node_buffer_spill::spill_borrowed_rows;
 use crate::executor::stream_event::SourceRowId;
 use crate::pipeline::memory::walk::{WalkOwnedRegistration, WalkOwnedSpill, register_walk_owned};
 use crate::pipeline::memory::{ConsumerHandle, ConsumerId, ConsumerSpillError, MemoryArbitrator};
@@ -64,6 +66,8 @@ pub(crate) enum Generation {
 /// dropped, so no registration and no file outlives the run on any exit.
 pub(crate) struct ParkedGenerations {
     arbitrator: Arc<MemoryArbitrator>,
+    /// The run's allocation resources, over the ledger `arbitrator` keeps.
+    resources: AllocationResources,
     spill_root: Arc<Path>,
     spill_compress: CompressMode,
     batch_size: usize,
@@ -87,12 +91,18 @@ pub(crate) struct ParkCopies {
     pub(crate) charge_at_first_copy: Option<u64>,
 }
 
-/// What parking `rows` charges: the bytes a copy of them allocates or alone
-/// may keep alive.
-fn parked_copy_bytes(rows: &[(Record, SourceRowId)]) -> u64 {
+/// What parking `rows` charges in the run whose allocation `resources` are
+/// given: the bytes a copy of them allocates or alone may keep alive with no
+/// other charge in that run. Each row counts the `(Record, SourceRowId)` pair
+/// its copy occupies plus [`Record::clone_allocation_bytes`], which counts
+/// the value slots once and leaves out only governed shared text the run
+/// itself admitted. Reads the borrowed rows only, so the charge can be taken
+/// before the copy is made.
+fn parked_copy_bytes(rows: &[(Record, SourceRowId)], resources: &AllocationResources) -> u64 {
     rows.iter()
         .map(|(record, _)| {
-            (std::mem::size_of::<(Record, SourceRowId)>() + record.clone_allocation_bytes()) as u64
+            (std::mem::size_of::<(Record, SourceRowId)>()
+                + record.clone_allocation_bytes(resources)) as u64
         })
         .sum()
 }
@@ -224,14 +234,18 @@ impl crate::pipeline::memory::MemoryConsumer for ParkedEdgeConsumer {
 
 impl ParkedGenerations {
     /// An empty store charging `arbitrator` and spilling under `spill_root`.
+    /// `resources` are the run's allocation resources over that same ledger:
+    /// a park leaves out of its charge only text whose admission they hold.
     pub(crate) fn new(
         arbitrator: Arc<MemoryArbitrator>,
+        resources: AllocationResources,
         spill_root: Arc<Path>,
         spill_compress: CompressMode,
         batch_size: usize,
     ) -> Self {
         Self {
             arbitrator,
+            resources,
             spill_root,
             spill_compress,
             batch_size,
@@ -276,13 +290,19 @@ impl ParkedGenerations {
     /// registers the store under that consumer in the walk reclaim set
     /// ([`register_walk_owned`]), so any reclaim pass on the walk can spill
     /// the edge. A spill
-    /// request raised on the edge since its last park is answered first. The
-    /// copy's resident size is grown on the edge's handle with no borrow of
-    /// the store held, so a reclaim that growth starts on the walk can spill
-    /// any parked edge, this one included. When it still does not fit, the
-    /// edge's own resident segments spill and the growth is retried once; if
-    /// that falls short too, the rows are written straight to disk. Parking
-    /// is never refused for memory; past the spill cap it fails with E320.
+    /// request raised on the edge since its last park is answered first.
+    ///
+    /// The rows are charged what their copy allocates or alone may keep
+    /// alive with no other charge in this run (the store's run resources
+    /// decide which governed text the run already holds charged), computed
+    /// from the borrowed rows before any copy is made. The
+    /// charge is grown on the edge's handle with no borrow of the store held,
+    /// so a reclaim that growth starts on the walk can spill any parked edge,
+    /// this one included. When it still does not fit, the edge's own resident
+    /// segments spill and the growth is retried once; if that falls short
+    /// too, the borrowed rows are written straight to disk and no resident
+    /// copy is made. Parking is never refused for memory; past the spill cap
+    /// it fails with E320.
     pub(crate) fn park(
         store: &Rc<RefCell<Self>>,
         generation: Generation,
@@ -305,27 +325,33 @@ impl ParkedGenerations {
         if handle.take_spill_request() {
             store.borrow_mut().spill_edge(generation, &key)?;
         }
-        #[cfg(test)]
-        store.borrow_mut().note_copy(rows.len(), handle.bytes());
-        let segment = NodeBuffer::memory_from_records(
-            rows.iter()
-                .map(|(record, row)| (record.clone(), *row))
-                .collect::<Vec<_>>(),
-        );
-        // A clone copies every value into storage no other consumer charges,
-        // so the copy's resident size is its slots plus its whole payload.
-        let bytes = parked_copy_bytes(rows);
-        let charged = if handle.try_grow(bytes).is_ok() {
-            bytes
-        } else {
+        // Charged from the borrowed rows, before any copy exists, so no copy
+        // is ever held uncharged. The figure is what the copy allocates or
+        // alone may keep alive (`Record::clone_allocation_bytes`): governed
+        // shared text this run admitted is left out, its admission covering
+        // every alias; text another authority admitted and ungoverned shared
+        // text stay in, since the copy may outlive the original whose holder
+        // carried the only charge, or none in this run.
+        let bytes = parked_copy_bytes(rows, &store.borrow().resources);
+        let mut granted = handle.try_grow(bytes).is_ok();
+        if !granted {
             store.borrow_mut().spill_edge(generation, &key)?;
-            if handle.try_grow(bytes).is_ok() {
-                bytes
-            } else {
-                0
-            }
-        };
-        store.borrow_mut().append(generation, key, segment, charged)
+            granted = handle.try_grow(bytes).is_ok();
+        }
+        if granted {
+            #[cfg(test)]
+            store.borrow_mut().note_copy(rows.len(), handle.bytes());
+            let segment = NodeBuffer::memory_from_records(rows.to_vec());
+            return store
+                .borrow_mut()
+                .append(generation, key, segment, bytes, 0);
+        }
+        // Still short: the borrowed rows go straight to disk, and no
+        // resident copy is built.
+        let (segment, file_bytes) = store.borrow().write_rows_to_disk(rows)?;
+        store
+            .borrow_mut()
+            .append(generation, key, segment, 0, file_bytes)
     }
 
     /// The edges parked in `generation`.
@@ -401,21 +427,17 @@ impl ParkedGenerations {
         Ok(())
     }
 
-    /// Add `segment`, whose resident size `charged` bytes the edge's handle
-    /// already holds, after edge `key`'s other segments. A segment nothing
-    /// was charged for is written to disk first.
+    /// Add `segment` after edge `key`'s other segments: a resident one whose
+    /// `charged` bytes the edge's handle already holds, or one already on
+    /// disk (`charged` 0) whose file is `file_bytes` long.
     fn append(
         &mut self,
         generation: Generation,
         key: ParkedKey,
         segment: NodeBuffer,
         charged: u64,
+        file_bytes: u64,
     ) -> Result<(), PipelineError> {
-        let (segment, file_bytes) = if charged == 0 {
-            self.write_to_disk(segment)?
-        } else {
-            (segment, 0)
-        };
         let producer = self
             .edges(generation)
             .get(&key)
@@ -522,13 +544,31 @@ impl ParkedGenerations {
         }
     }
 
-    /// Write `segment` to one spill file; returns the spilled segment and
-    /// the file's bytes.
-    fn write_to_disk(&self, segment: NodeBuffer) -> Result<(NodeBuffer, u64), PipelineError> {
+    /// Write the borrowed `rows` to one spill file without copying them;
+    /// returns the spilled segment and the file's bytes.
+    fn write_rows_to_disk(
+        &self,
+        rows: &[(Record, SourceRowId)],
+    ) -> Result<(NodeBuffer, u64), PipelineError> {
+        let column_count = rows
+            .first()
+            .map_or(0, |(record, _)| record.schema().column_count());
         let compress = self
             .spill_compress
-            .resolve_for_schema(segment.first_record_column_count(), self.batch_size as u64);
-        segment.spill_resident_memory(Some(self.spill_root.as_ref()), compress)
+            .resolve_for_schema(column_count, self.batch_size as u64);
+        match spill_borrowed_rows(rows, Some(self.spill_root.as_ref()), compress)? {
+            Some((file, count)) => {
+                let file_bytes = std::fs::metadata(file.path()).map_or(0, |meta| meta.len());
+                Ok((
+                    NodeBuffer::Spilled {
+                        chunks: vec![(file, count)],
+                        pending_puncts: Vec::new(),
+                    },
+                    file_bytes,
+                ))
+            }
+            None => Ok((NodeBuffer::Memory(Vec::new()), 0)),
+        }
     }
 
     /// Charge `bytes` written for `producer` to the disk quota, failing with
@@ -694,9 +734,30 @@ mod tests {
             .collect()
     }
 
-    /// The bytes a park of `rows` charges: every row's slots and payload.
+    /// The bytes a park of `rows` charges: what their copy allocates or
+    /// alone may keep alive, the figure the park itself computes. The
+    /// fixtures this sizes hold no governed text, so the figure is the same
+    /// whichever run's resources it is read under.
     fn resident_bytes(rows: &[(Record, SourceRowId)]) -> u64 {
-        NodeBuffer::memory_from_records(rows.to_vec()).reclaimable_bytes()
+        let standalone =
+            clinker_format::preparation::MemoryOnlyResources::new(std::num::NonZeroUsize::MIN);
+        parked_copy_bytes(rows, standalone.resources().allocation())
+    }
+
+    /// The allocation provider of a run over `arbitrator`, as the executor
+    /// builds it: text admitted through its allocation resources is charged
+    /// to `arbitrator`'s ledger.
+    fn run_provider(
+        arbitrator: &Arc<MemoryArbitrator>,
+    ) -> crate::executor::preparation::ExecutorResources {
+        crate::executor::preparation::ExecutorResources::new(
+            Arc::clone(arbitrator),
+            crate::pipeline::shutdown::ShutdownToken::detached(),
+            None,
+            std::num::NonZeroUsize::MIN,
+            None,
+        )
+        .expect("a run provider")
     }
 
     /// One edge parks twice with a cursor over its first segment still open
@@ -721,8 +782,10 @@ mod tests {
             spill_compress: CompressMode::Auto,
             batch_size: 1024,
         })));
+        let provider = run_provider(&arbitrator);
         let store = Rc::new(RefCell::new(ParkedGenerations::new(
             Arc::clone(&arbitrator),
+            provider.allocation(),
             Arc::from(root.path()),
             CompressMode::Auto,
             1024,
@@ -821,8 +884,11 @@ mod tests {
     /// a parked-row store spilling under `root`.
     struct ParkedWalk {
         arbitrator: Arc<MemoryArbitrator>,
+        /// The run's allocation resources, which the store also holds.
+        resources: AllocationResources,
         store: Rc<RefCell<ParkedGenerations>>,
         _walk: WalkContextGuard,
+        _provider: crate::executor::preparation::ExecutorResources,
     }
 
     fn parked_walk(limit: u64, root: &Path) -> ParkedWalk {
@@ -837,8 +903,11 @@ mod tests {
             spill_compress: CompressMode::Auto,
             batch_size: 1024,
         })));
+        let provider = run_provider(&arbitrator);
+        let resources = provider.allocation();
         let store = Rc::new(RefCell::new(ParkedGenerations::new(
             Arc::clone(&arbitrator),
+            resources.clone(),
             Arc::from(root),
             CompressMode::Auto,
             1024,
@@ -846,8 +915,10 @@ mod tests {
         let walk = WalkContextGuard::install(&arbitrator, set);
         ParkedWalk {
             arbitrator,
+            resources,
             store,
             _walk: walk,
+            _provider: provider,
         }
     }
 
@@ -1007,8 +1078,8 @@ mod tests {
     fn a_park_charges_the_rows_before_it_copies_them() {
         let root = tempfile::tempdir().expect("spill root");
         let rows = rows(0, 32);
-        let figure = parked_copy_bytes(&rows);
         let walk = parked_walk(64 * 1024 * 1024, root.path());
+        let figure = parked_copy_bytes(&rows, &walk.resources);
         let key: ParkedKey = (None, EdgeIndex::new(2));
         park_rows(&walk, key, &rows);
 
@@ -1032,7 +1103,7 @@ mod tests {
     fn a_refused_park_writes_the_rows_without_a_resident_copy() {
         let root = tempfile::tempdir().expect("spill root");
         let rows = rows(0, 32);
-        let walk = parked_walk(parked_copy_bytes(&rows) / 2, root.path());
+        let walk = parked_walk(resident_bytes(&rows) / 2, root.path());
         let key: ParkedKey = (None, EdgeIndex::new(3));
         park_rows(&walk, key, &rows);
 
@@ -1066,8 +1137,8 @@ mod tests {
         let inline = rows_with_payload(0, 32, &["id", "payload"], |row| {
             vec![Value::String(format!("short-{row:06}").into())]
         });
-        let figure = parked_copy_bytes(&long);
         let walk = parked_walk(64 * 1024 * 1024, root.path());
+        let figure = parked_copy_bytes(&long, &walk.resources);
         let (long_key, inline_key): (ParkedKey, ParkedKey) =
             ((None, EdgeIndex::new(5)), (None, EdgeIndex::new(6)));
         park_rows(&walk, long_key, &long);
@@ -1089,61 +1160,166 @@ mod tests {
         );
     }
 
-    /// Rows whose long text a Source reader admitted: the copy of a governed
-    /// unique string is a fresh allocation nothing admitted, so the edge
-    /// charges it; a governed shared string's admission covers every alias,
-    /// so the edge does not charge it again. The same rows with inline text
-    /// set the baseline.
-    #[test]
-    fn a_park_charges_a_governed_unique_copy_and_not_a_governed_shared_alias() {
-        use clinker_format::preparation::MemoryOnlyResources;
-        use clinker_record::FieldStr;
-        use std::num::NonZeroUsize;
+    /// Length of the governed shared text in [`governed_rows`].
+    const GOVERNED_SHARED_LEN: usize = 257;
+    /// Length of the governed unique text in [`governed_rows`].
+    const GOVERNED_UNIQUE_LEN: usize = 513;
 
-        const SHARED: usize = 257;
-        const UNIQUE: usize = 513;
-        let resources = MemoryOnlyResources::new(NonZeroUsize::new(1 << 20).expect("non-zero"));
-        let scope = resources
-            .resources()
-            .allocation()
-            .clone()
-            .scope()
-            .expect("a run scope");
+    /// Rows as a park borrows them.
+    type ParkRows = Vec<(Record, SourceRowId)>;
+
+    /// 32 rows of an id, a governed shared string and a governed unique
+    /// string, their text admitted under `scope` as a Source reader admits
+    /// it; and the same rows with inline text, as the baseline.
+    fn governed_rows(
+        scope: &clinker_record::owned_storage::AllocationScope,
+    ) -> (ParkRows, ParkRows) {
+        use clinker_record::FieldStr;
+
         let columns = ["id", "shared", "unique"];
         let governed = rows_with_payload(0, 32, &columns, |_| {
             vec![
-                Value::String(FieldStr::try_new(&"s".repeat(SHARED), &scope).expect("admitted")),
                 Value::String(
-                    FieldStr::try_new_unique(&"u".repeat(UNIQUE), &scope).expect("admitted"),
+                    FieldStr::try_new(&"s".repeat(GOVERNED_SHARED_LEN), scope).expect("admitted"),
+                ),
+                Value::String(
+                    FieldStr::try_new_unique(&"u".repeat(GOVERNED_UNIQUE_LEN), scope)
+                        .expect("admitted"),
                 ),
             ]
         });
         let inline = rows_with_payload(0, 32, &columns, |_| {
             vec![Value::String("s".into()), Value::String("u".into())]
         });
-        let figure = parked_copy_bytes(&governed);
-        let root = tempfile::tempdir().expect("spill root");
-        let walk = parked_walk(64 * 1024 * 1024, root.path());
+        (governed, inline)
+    }
+
+    /// The edge charges of parking `governed` and `inline` on two edges of
+    /// `walk`'s store.
+    fn park_pair(
+        walk: &ParkedWalk,
+        governed: &[(Record, SourceRowId)],
+        inline: &[(Record, SourceRowId)],
+    ) -> (u64, u64) {
         let (governed_key, inline_key): (ParkedKey, ParkedKey) =
             ((None, EdgeIndex::new(7)), (None, EdgeIndex::new(8)));
-        park_rows(&walk, governed_key, &governed);
-        park_rows(&walk, inline_key, &inline);
+        park_rows(walk, governed_key, governed);
+        park_rows(walk, inline_key, inline);
+        let store = walk.store.borrow();
+        let (_, governed_handle) = store.edge_consumer(&governed_key).expect("edge");
+        let (_, inline_handle) = store.edge_consumer(&inline_key).expect("edge");
+        (governed_handle.bytes(), inline_handle.bytes())
+    }
 
-        let (_, governed_handle) = walk
-            .store
-            .borrow()
-            .edge_consumer(&governed_key)
-            .expect("edge");
-        let (_, inline_handle) = walk
-            .store
-            .borrow()
-            .edge_consumer(&inline_key)
-            .expect("edge");
-        assert_eq!(governed_handle.bytes(), figure);
+    /// The admitted size of the text in column `column` of `row`.
+    fn admitted_text(row: &(Record, SourceRowId), column: usize) -> u64 {
+        match &row.0.values()[column] {
+            Value::String(text) => text.heap_size() as u64,
+            other => panic!("column {column} holds {other:?}, not text"),
+        }
+    }
+
+    /// Rows whose long text this run's Source reader admitted: the copy of a
+    /// governed unique string is a fresh allocation nothing admitted, so the
+    /// edge charges it; a governed shared string's admission in this run's
+    /// ledger covers every alias, so the edge does not charge it again. The
+    /// same rows with inline text set the baseline.
+    #[test]
+    fn a_park_charges_a_governed_unique_copy_and_not_a_governed_shared_alias() {
+        let root = tempfile::tempdir().expect("spill root");
+        let walk = parked_walk(64 * 1024 * 1024, root.path());
+        let scope = walk.resources.scope().expect("a run scope");
+        let (governed, inline) = governed_rows(&scope);
+        let figure = parked_copy_bytes(&governed, &walk.resources);
+        let (governed_bytes, inline_bytes) = park_pair(&walk, &governed, &inline);
+
+        assert_eq!(governed_bytes, figure);
         assert_eq!(
-            governed_handle.bytes() - inline_handle.bytes(),
-            32 * UNIQUE as u64,
+            governed_bytes - inline_bytes,
+            32 * GOVERNED_UNIQUE_LEN as u64,
             "each governed unique copy is charged its text and no governed shared alias is"
+        );
+    }
+
+    /// Rows whose governed text another allocation authority admitted, as a
+    /// custom Source may supply it: that admission is no charge in this
+    /// run's ledger, and the parked copy keeps the shared text alive, so the
+    /// edge charges the shared text at its admitted size as well as the
+    /// unique copy.
+    #[test]
+    fn a_park_charges_governed_text_another_authority_admitted() {
+        use clinker_format::preparation::MemoryOnlyResources;
+        use std::num::NonZeroUsize;
+
+        let other = MemoryOnlyResources::new(NonZeroUsize::new(1 << 20).expect("non-zero"));
+        let scope = other
+            .resources()
+            .allocation()
+            .scope()
+            .expect("another authority's scope");
+        let (governed, inline) = governed_rows(&scope);
+        let shared_admitted = admitted_text(&governed[0], 1);
+        assert!(shared_admitted >= GOVERNED_SHARED_LEN as u64);
+        let root = tempfile::tempdir().expect("spill root");
+        let walk = parked_walk(64 * 1024 * 1024, root.path());
+        let figure = parked_copy_bytes(&governed, &walk.resources);
+        let (governed_bytes, inline_bytes) = park_pair(&walk, &governed, &inline);
+
+        assert_eq!(governed_bytes, figure);
+        assert_eq!(
+            governed_bytes - inline_bytes,
+            32 * (shared_admitted + GOVERNED_UNIQUE_LEN as u64),
+            "text another authority admitted is no charge in this run, so the edge charges it"
+        );
+    }
+
+    /// A note this run's reader admitted is charged once, by the reader's
+    /// admission. Parking the rows adds only the copy's own bytes; the note
+    /// stays charged while the parked copy alone keeps it alive, and the
+    /// last copy's release returns every byte.
+    #[test]
+    fn a_parked_alias_keeps_its_note_charged_once_until_the_last_copy_drops() {
+        use clinker_record::FieldStr;
+
+        const NOTE: usize = 512;
+        let root = tempfile::tempdir().expect("spill root");
+        let walk = parked_walk(64 * 1024 * 1024, root.path());
+        let scope = walk.resources.scope().expect("a run scope");
+        let before = walk.arbitrator.charged_bytes();
+        let rows = rows_with_payload(0, 32, &["id", "note"], |_| {
+            vec![Value::String(
+                FieldStr::try_new(&"n".repeat(NOTE), &scope).expect("admitted"),
+            )]
+        });
+        let note_layouts: u64 = rows.iter().map(|row| admitted_text(row, 1)).sum();
+        assert!(note_layouts >= 32 * NOTE as u64);
+        let admitted = walk.arbitrator.charged_bytes();
+        assert_eq!(
+            admitted,
+            before + note_layouts,
+            "the reader's admission charges each note once"
+        );
+
+        let parked = parked_copy_bytes(&rows, &walk.resources);
+        park_rows(&walk, (None, EdgeIndex::new(9)), &rows);
+        assert_eq!(
+            walk.arbitrator.charged_bytes(),
+            admitted + parked,
+            "the park charges its copy, never the notes again"
+        );
+
+        drop(rows);
+        assert_eq!(
+            walk.arbitrator.charged_bytes(),
+            before + note_layouts + parked,
+            "the notes stay charged while only the parked copy keeps them alive"
+        );
+
+        walk.store.borrow_mut().release_all();
+        assert_eq!(
+            walk.arbitrator.charged_bytes(),
+            before,
+            "the last copy's release returns the notes and the copy"
         );
     }
 }

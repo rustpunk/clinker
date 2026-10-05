@@ -176,10 +176,29 @@ impl Record {
             })
     }
 
-    /// What a clone of this record copies or alone may keep alive.
-    pub fn clone_allocation_bytes(&self) -> usize {
-        std::mem::size_of::<Value>() * self.schema.column_count()
-            + self.legacy_estimated_heap_size()
+    /// Heap bytes a clone of this record allocates, or keeps alive with no
+    /// charge in the run whose `resources` are given once the original is
+    /// gone: the value slots, counted once, each value by
+    /// [`Value::clone_allocation_bytes`], and the record variables' map with
+    /// its keys and values by the same rule. Only governed shared text that
+    /// run admitted is left out; text another authority admitted counts its
+    /// admitted size, since that admission is no charge in this run.
+    ///
+    /// The shared schema and document context are left out: a clone only
+    /// bumps their reference counts and their owners report them. The record
+    /// value itself is left out too; whoever holds the copy counts the place
+    /// it sits in. Computed from a borrow, so a holder can be charged before
+    /// it makes the copy.
+    pub fn clone_allocation_bytes(&self, resources: &AllocationResources) -> usize {
+        self.values.clone_allocation_bytes(resources)
+            + self.record_vars.as_ref().map_or(0, |map| {
+                std::mem::size_of::<IndexMap<Box<str>, Value>>()
+                    + crate::value::indexmap_backing_size::<Box<str>>(map.capacity())
+                    + map
+                        .iter()
+                        .map(|(key, value)| key.len() + value.clone_allocation_bytes(resources))
+                        .sum::<usize>()
+            })
     }
 
     pub fn new(schema: SharedStorage<Schema>, mut values: Vec<Value>) -> Self {
@@ -777,9 +796,8 @@ mod tests {
         use crate::field_str::FieldStr;
         use crate::owned_storage::OwnedKey;
 
-        let scope = AllocationResources::new(Arc::new(OpenAuthority))
-            .scope()
-            .expect("an open scope");
+        let run = AllocationResources::new(Arc::new(OpenAuthority));
+        let scope = run.scope().expect("an open scope");
         let text = |byte: char, len: usize| byte.to_string().repeat(len);
         let (shared, unique, governed_shared, governed_unique) = (101, 203, 307, 409);
         let (element, region, note, tag) = (53, 71, 89, 37);
@@ -839,19 +857,37 @@ mod tests {
             + "region".len()
             + region
             + "note".len();
+        let vars_copy = record.clone().record_vars.expect("one record variable");
         let vars_bytes = std::mem::size_of::<IndexMap<Box<str>, Value>>()
-            + crate::value::indexmap_backing_size::<Box<str>>(1)
+            + crate::value::indexmap_backing_size::<Box<str>>(vars_copy.capacity())
             + "tag".len()
             + tag;
         let expected =
             7 * value + shared + unique + governed_unique + list_bytes + map_bytes + vars_bytes;
 
         assert_eq!(
-            record.clone_allocation_bytes(),
+            record.clone_allocation_bytes(&run),
             expected,
             "the value slots once, the ungoverned shared, ungoverned unique and governed \
              unique text, the list and the map with their contents, and the record \
-             variables; no inline and no governed shared text"
+             variables; no inline and no governed shared text the run admitted"
+        );
+
+        // Seen from a run whose ledger did not admit them, the governed
+        // shared strings are kept alive by the clone with no charge there,
+        // so they count at their admitted size.
+        let other_run = AllocationResources::new(Arc::new(OpenAuthority));
+        let admitted = |value: &Value| match value {
+            Value::String(text) => text.heap_size(),
+            _ => panic!("text"),
+        };
+        let governed_shared_admitted = admitted(&record.values()[1]);
+        let note_admitted = admitted(map.as_map().expect("a map").get("note").expect("note"));
+        assert!(governed_shared_admitted > governed_shared && note_admitted > note);
+        assert_eq!(
+            record.clone_allocation_bytes(&other_run),
+            expected + governed_shared_admitted + note_admitted,
+            "governed shared text another authority admitted is counted at its admitted size"
         );
     }
 }

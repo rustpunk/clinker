@@ -427,6 +427,22 @@ impl Value {
             _ => 0,
         }
     }
+
+    /// Heap bytes a `clone()` of this value allocates, or keeps alive with no
+    /// charge in the run whose `resources` are given once the original is
+    /// gone; the enum itself is not counted. Text follows
+    /// [`FieldStr::clone_allocation_bytes`]: governed shared text that run
+    /// admitted is the only long text left out, because its admission covers
+    /// every alias. A list or map counts the fresh backing its clone
+    /// allocates plus its elements by this same rule. Scalars are 0.
+    pub fn clone_allocation_bytes(&self, resources: &AllocationResources) -> usize {
+        match self {
+            Value::String(text) => text.clone_allocation_bytes(resources),
+            Value::Array(values) => values.clone_allocation_bytes(resources),
+            Value::Map(map) => map.clone_allocation_bytes(resources),
+            _ => 0,
+        }
+    }
     /// Returns the CXL type name as a static string.
     pub fn type_name(&self) -> &'static str {
         match self {

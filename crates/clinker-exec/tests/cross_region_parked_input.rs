@@ -287,6 +287,9 @@ enum BuildSide {
     RouteBranch,
     /// The kept (main) port of Cull `trim` over `dept_lookup`.
     CullPort,
+    /// The `wanted` branch of Route `split` over Transform `shout`, which
+    /// computes each note in upper case from `dept_lookup`'s.
+    ComputedRouteBranch,
 }
 
 impl BuildSide {
@@ -294,7 +297,7 @@ impl BuildSide {
     fn producer(self) -> &'static str {
         match self {
             Self::Source => "dept_lookup",
-            Self::RouteBranch => "split",
+            Self::RouteBranch | Self::ComputedRouteBranch => "split",
             Self::CullPort => "trim",
         }
     }
@@ -303,7 +306,7 @@ impl BuildSide {
     fn outputs(self) -> &'static [&'static str] {
         match self {
             Self::Source => &["out"],
-            Self::RouteBranch => &["out", "unwanted_out"],
+            Self::RouteBranch | Self::ComputedRouteBranch => &["out", "unwanted_out"],
             Self::CullPort => &["out", "removed_out"],
         }
     }
@@ -356,6 +359,34 @@ fn parked_pipeline(build: BuildSide) -> String {
     include_unmapped: true
 "#,
             "trim",
+        ),
+        BuildSide::ComputedRouteBranch => (
+            r#"- type: transform
+  name: shout
+  input: dept_lookup
+  config:
+    cxl: |
+      emit department = department
+      emit budget = budget
+      emit note = note.upper()
+- type: route
+  name: split
+  input: shout
+  config:
+    mode: exclusive
+    conditions:
+      wanted: "budget >= 0"
+    default: unwanted
+- type: sink
+  name: unwanted_out
+  input: split.unwanted
+  config:
+    name: unwanted_out
+    path: unwanted.csv
+    type: csv
+    include_unmapped: true
+"#,
+            "split.wanted",
         ),
     };
     format!(
@@ -445,11 +476,22 @@ const LOOKUP_FILLER_ROWS: usize = 1_000;
 /// Characters in every build-side row's note.
 const NOTE_BYTES: usize = 512;
 
-/// HR and ENG, then the filler departments; every seventh filler has a
-/// negative budget (the rows Route `split` sends to `unwanted` and Cull
-/// `trim` removes).
-fn big_lookup_csv() -> String {
-    let note = "n".repeat(NOTE_BYTES);
+/// Characters in every note of the second, wider-note run that shows who is
+/// charged for the notes.
+const WIDE_NOTE_BYTES: usize = 4 * NOTE_BYTES;
+
+/// Characters in every note of the widest run, which the composition body
+/// compares against a `WIDE_NOTE_BYTES` run.
+const WIDER_NOTE_BYTES: usize = 8 * NOTE_BYTES;
+
+/// The columns a build-side row is authored with: department, budget, note.
+const AUTHORED_LOOKUP_COLUMNS: u64 = 3;
+
+/// HR and ENG, then the filler departments, each with a `note_bytes`-character
+/// note; every seventh filler has a negative budget (the rows Route `split`
+/// sends to `unwanted` and Cull `trim` removes).
+fn lookup_csv_with(note_bytes: usize) -> String {
+    let note = "n".repeat(note_bytes);
     let mut csv = format!("department,budget,note\nHR,100,{note}\nENG,500,{note}\n");
     for row in 0..LOOKUP_FILLER_ROWS {
         let budget = if row % 7 == 0 {
@@ -462,15 +504,16 @@ fn big_lookup_csv() -> String {
     csv
 }
 
-/// Run the parked-rows pipeline over `build` with ample memory, with or
-/// without HR's orders (with them the commit iterates twice).
-fn run_parked(build: BuildSide, with_hr: bool) -> Run {
+/// Run the parked-rows pipeline over `build` with ample memory and
+/// `note_bytes`-character notes, with or without HR's orders (with them the
+/// commit iterates twice).
+fn run_parked_with(build: BuildSide, with_hr: bool, note_bytes: usize) -> Run {
     run_in(
         &parked_pipeline(build),
         CompileContext::default(),
         &[
             ("orders", orders_csv(with_hr)),
-            ("dept_lookup", big_lookup_csv()),
+            ("dept_lookup", lookup_csv_with(note_bytes)),
         ],
         build.outputs(),
     )
@@ -490,12 +533,87 @@ fn kept_lookup_rows() -> u64 {
     2 + (0..LOOKUP_FILLER_ROWS).filter(|row| row % 7 != 0).count() as u64
 }
 
+/// The highest charge `run` recorded under the node named `node`, or 0.
+fn peak(run: &Run, node: &str) -> u64 {
+    run.report
+        .per_node_peak_charged_bytes
+        .get(node)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// `producer` parked `parked_rows` of `dept_lookup`'s rows in both runs,
+/// whose notes differ only in length (`NOTE_BYTES` in `narrow`,
+/// `WIDE_NOTE_BYTES` in `wide`). The parked rows are charged under the
+/// producer, and their notes once, under the Source that read them: longer
+/// notes raise `dept_lookup`'s charge and leave the producer's exactly as it
+/// was, since its parked copy shares the notes and is not charged again.
+fn assert_notes_charged_once(narrow: &Run, wide: &Run, producer: &str, parked_rows: u64) {
+    assert_parked_and_source_charges(narrow, producer, parked_rows);
+    source_rise_covers_note_growth(narrow, wide, NOTE_BYTES, WIDE_NOTE_BYTES, parked_rows);
+    assert_producer_charge_unchanged(producer, narrow, &[wide]);
+}
+
+/// In `narrow`, whose notes are `NOTE_BYTES` long, `producer`'s parked rows
+/// are charged under it, and `dept_lookup`, the Source that read them,
+/// carries at least their notes.
+fn assert_parked_and_source_charges(narrow: &Run, producer: &str, parked_rows: u64) {
+    let value = std::mem::size_of::<clinker_record::Value>() as u64;
+    assert!(
+        peak(narrow, producer) >= parked_rows * AUTHORED_LOOKUP_COLUMNS * value,
+        "`{producer}`'s parked rows are charged under it ({parked_rows} rows; peak {})",
+        peak(narrow, producer)
+    );
+    assert!(
+        peak(narrow, "dept_lookup") >= parked_rows * NOTE_BYTES as u64,
+        "the notes are charged under `dept_lookup`, the Source that read them \
+         ({parked_rows} rows of {NOTE_BYTES}-byte notes; peak {})",
+        peak(narrow, "dept_lookup")
+    );
+}
+
+/// From `shorter` to `longer`, whose notes are `shorter_bytes` and
+/// `longer_bytes` characters long, `dept_lookup`'s charge rises by at least
+/// the notes' growth over `parked_rows` rows. Returns the rise.
+fn source_rise_covers_note_growth(
+    shorter: &Run,
+    longer: &Run,
+    shorter_bytes: usize,
+    longer_bytes: usize,
+    parked_rows: u64,
+) -> u64 {
+    let rise = peak(longer, "dept_lookup").saturating_sub(peak(shorter, "dept_lookup"));
+    assert!(
+        rise >= parked_rows * (longer_bytes - shorter_bytes) as u64,
+        "notes of {longer_bytes} bytes instead of {shorter_bytes} are charged to \
+         `dept_lookup` (peak {} against {})",
+        peak(longer, "dept_lookup"),
+        peak(shorter, "dept_lookup")
+    );
+    rise
+}
+
+/// `producer`'s charge in every run of `others` is exactly its charge in
+/// `narrow`: its parked copy shares the notes `dept_lookup` already holds
+/// charged, so longer notes do not charge it again.
+fn assert_producer_charge_unchanged(producer: &str, narrow: &Run, others: &[&Run]) {
+    for other in others {
+        assert_eq!(
+            peak(other, producer),
+            peak(narrow, producer),
+            "`{producer}` is not charged again for notes `dept_lookup` already holds charged"
+        );
+    }
+}
+
 /// With ample memory, `build`'s rows are parked under its producer, charged
 /// there, read again by the commit's second iteration and never written to
-/// disk; the run converges to what a run without HR's orders writes.
+/// disk; the run converges to what a run without HR's orders writes. Below
+/// the Source, the notes are charged once, under `dept_lookup`
+/// ([`assert_notes_charged_once`]).
 fn assert_parks_and_rereads(build: BuildSide, parked_rows: u64) {
-    let converged = run_parked(build, true);
-    let reference = run_parked(build, false);
+    let converged = run_parked_with(build, true, NOTE_BYTES);
+    let reference = run_parked_with(build, false, NOTE_BYTES);
     assert!(
         converged.report.counters.retraction.iterations >= 2,
         "the commit re-reads the parked rows on a second iteration; got {}",
@@ -508,17 +626,17 @@ fn assert_parks_and_rereads(build: BuildSide, parked_rows: u64) {
         converged.report.per_stage_spill_bytes_written
     );
     let producer = build.producer();
-    let peak = converged
-        .report
-        .per_node_peak_charged_bytes
-        .get(producer)
-        .copied()
-        .unwrap_or(0);
-    assert!(
-        peak >= parked_rows * NOTE_BYTES as u64,
-        "`{producer}`'s parked rows are charged at their resident size, notes included \
-         ({parked_rows} rows of {NOTE_BYTES}-byte notes; peak charged {peak})"
-    );
+    if producer == "dept_lookup" {
+        let peak = peak(&converged, producer);
+        assert!(
+            peak >= parked_rows * NOTE_BYTES as u64,
+            "`{producer}`'s parked rows are charged at their resident size, notes included \
+             ({parked_rows} rows of {NOTE_BYTES}-byte notes; peak charged {peak})"
+        );
+    } else {
+        let wide = run_parked_with(build, true, WIDE_NOTE_BYTES);
+        assert_notes_charged_once(&converged, &wide, producer, parked_rows);
+    }
     assert_eq!(
         sorted_lines(&converged.output),
         sorted_lines(&reference.output),
@@ -540,6 +658,47 @@ fn route_branch_crossing_parks_under_the_route() {
 #[test]
 fn cull_port_crossing_parks_under_the_cull() {
     assert_parks_and_rereads(BuildSide::CullPort, kept_lookup_rows());
+}
+
+/// Notes a Transform computes are new text no Source admitted: once the
+/// Route parks its rows, the parked copy may outlive the rows that carried
+/// the text's only charge, so the Route's park charges the notes, and longer
+/// notes raise its charge by at least their growth.
+#[test]
+fn computed_text_crossing_is_charged_under_the_route() {
+    let build = BuildSide::ComputedRouteBranch;
+    let narrow = run_parked_with(build, true, NOTE_BYTES);
+    let wide = run_parked_with(build, true, WIDE_NOTE_BYTES);
+    assert!(
+        narrow.report.counters.retraction.iterations >= 2,
+        "the commit re-reads the parked rows on a second iteration; got {}",
+        narrow.report.counters.retraction.iterations
+    );
+    assert!(
+        narrow.report.per_stage_spill_bytes_written.is_empty()
+            && wide.report.per_stage_spill_bytes_written.is_empty(),
+        "ample memory writes nothing to disk"
+    );
+    let parked_rows = kept_lookup_rows();
+    assert!(
+        peak(&narrow, "split") >= parked_rows * NOTE_BYTES as u64,
+        "the Route's park charges the computed notes ({parked_rows} rows of \
+         {NOTE_BYTES}-byte notes; peak {})",
+        peak(&narrow, "split")
+    );
+    assert!(
+        peak(&wide, "split").saturating_sub(peak(&narrow, "split"))
+            >= parked_rows * (WIDE_NOTE_BYTES - NOTE_BYTES) as u64,
+        "four-times-longer computed notes are charged to the Route's park \
+         (peak {} against {})",
+        peak(&wide, "split"),
+        peak(&narrow, "split")
+    );
+    assert!(
+        narrow.output.contains(",500,"),
+        "ENG carries its budget through the computed build side: {}",
+        narrow.output
+    );
 }
 
 /// The relaxed-key aggregate and the Combine live in a composition body,
@@ -651,7 +810,7 @@ fn composition_body_crossing_parks_under_its_body_key() {
     std::fs::create_dir_all(workspace.path().join("pipelines")).expect("pipelines dir");
     std::fs::write(compositions.join("parked_body.comp.yaml"), BODY_COMPOSITION)
         .expect("write the body");
-    let run_body = |with_hr: bool| {
+    let run_body = |with_hr: bool, note_bytes: usize| {
         run_in(
             BODY_PIPELINE,
             CompileContext::with_pipeline_dir(
@@ -660,14 +819,14 @@ fn composition_body_crossing_parks_under_its_body_key() {
             ),
             &[
                 ("orders", orders_csv(with_hr)),
-                ("dept_lookup", big_lookup_csv()),
+                ("dept_lookup", lookup_csv_with(note_bytes)),
             ],
             &["out"],
         )
         .expect("the body crossing completes")
     };
-    let converged = run_body(true);
-    let reference = run_body(false);
+    let converged = run_body(true, NOTE_BYTES);
+    let reference = run_body(false, NOTE_BYTES);
     assert!(
         converged.report.counters.retraction.iterations >= 2,
         "the commit re-enters the body and re-reads its parked rows; got {}",
@@ -675,17 +834,28 @@ fn composition_body_crossing_parks_under_its_body_key() {
     );
     assert_eq!(reference.report.counters.retraction.iterations, 1);
     assert!(converged.report.per_stage_spill_bytes_written.is_empty());
-    let parked_under_port = converged
-        .report
-        .per_node_peak_charged_bytes
-        .get("lookup")
-        .copied()
-        .unwrap_or(0);
-    assert!(
-        parked_under_port >= (2 + LOOKUP_FILLER_ROWS as u64) * NOTE_BYTES as u64,
-        "the body port's parked rows are charged under the port ({parked_under_port}): {:?}",
-        converged.report.per_node_peak_charged_bytes
+    // `dept_lookup` has a second holder besides the reader that holds the
+    // notes: the buffer handing its rows to the body, charged the same per
+    // row whatever the notes' length. A node's figure is its largest single
+    // holder, and with `NOTE_BYTES` notes that buffer is the larger, so the
+    // notes' growth is measured between two widths where their holder leads.
+    let parked_rows = 2 + LOOKUP_FILLER_ROWS as u64;
+    assert_parked_and_source_charges(&converged, "lookup", parked_rows);
+    let wide = run_body(true, WIDE_NOTE_BYTES);
+    let wider = run_body(true, WIDER_NOTE_BYTES);
+    let rise = source_rise_covers_note_growth(
+        &wide,
+        &wider,
+        WIDE_NOTE_BYTES,
+        WIDER_NOTE_BYTES,
+        parked_rows,
     );
+    let growth = parked_rows * (WIDER_NOTE_BYTES - WIDE_NOTE_BYTES) as u64;
+    assert!(
+        rise < 2 * growth,
+        "`dept_lookup` charges the notes once, not twice (rise {rise} against growth {growth})"
+    );
+    assert_producer_charge_unchanged("lookup", &converged, &[&wide, &wider]);
     assert_eq!(
         sorted_lines(&converged.output),
         sorted_lines(&reference.output)

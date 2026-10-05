@@ -1908,6 +1908,7 @@ impl PipelineExecutor {
         let parked_generations = std::rc::Rc::new(std::cell::RefCell::new(
             parked_generations::ParkedGenerations::new(
                 Arc::clone(&memory_budget),
+                allocation_resources.clone(),
                 Arc::clone(&spill_root_path),
                 params.spill_compress,
                 batch_size,

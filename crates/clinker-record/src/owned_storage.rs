@@ -610,6 +610,17 @@ impl OwnedValues {
                 .map(crate::Value::legacy_heap_size)
                 .sum::<usize>()
     }
+    /// Heap bytes a clone allocates or alone may keep alive uncharged in the
+    /// run whose `resources` are given: a fresh ungoverned backing of exactly
+    /// the values' length, whatever this backing's capacity or governance,
+    /// plus each value by [`crate::Value::clone_allocation_bytes`].
+    pub fn clone_allocation_bytes(&self, resources: &AllocationResources) -> usize {
+        self.len() * std::mem::size_of::<crate::Value>()
+            + self
+                .iter()
+                .map(|value| value.clone_allocation_bytes(resources))
+                .sum::<usize>()
+    }
 }
 impl Deref for OwnedValues {
     type Target = [crate::Value];
@@ -737,6 +748,11 @@ impl OwnedKey {
             KeyStorage::Legacy(k) => k.len(),
             KeyStorage::Governed(_) => 0,
         }
+    }
+    /// Heap bytes a clone allocates: the key's text, which every clone
+    /// copies into a fresh ungoverned box, governed or not.
+    pub fn clone_allocation_bytes(&self) -> usize {
+        self.as_str().len()
     }
 }
 impl From<Box<str>> for OwnedKey {
@@ -1010,6 +1026,21 @@ impl OwnedMap {
                 .as_map()
                 .iter()
                 .map(|(key, value)| key.legacy_heap_size() + value.legacy_heap_size())
+                .sum::<usize>()
+    }
+    /// Heap bytes a clone allocates or alone may keep alive uncharged in the
+    /// run whose `resources` are given: a fresh ungoverned map, which keeps
+    /// this map's table capacity, plus each key and value by their own
+    /// `clone_allocation_bytes`.
+    pub fn clone_allocation_bytes(&self, resources: &AllocationResources) -> usize {
+        let map = self.as_map();
+        std::mem::size_of::<ValueMap>()
+            + crate::value::indexmap_backing_size::<OwnedKey>(map.capacity())
+            + map
+                .iter()
+                .map(|(key, value)| {
+                    key.clone_allocation_bytes() + value.clone_allocation_bytes(resources)
+                })
                 .sum::<usize>()
     }
 }
