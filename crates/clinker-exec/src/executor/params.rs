@@ -165,6 +165,8 @@ pub struct MemoryTestOverrides {
     baseline_rss: Option<u64>,
     #[cfg(any(test, feature = "test-utils"))]
     forced_shortfall: Option<ForcedShortfall>,
+    #[cfg(any(test, feature = "test-utils"))]
+    no_process_memory: bool,
 }
 
 impl MemoryTestOverrides {
@@ -176,6 +178,8 @@ impl MemoryTestOverrides {
             baseline_rss: None,
             #[cfg(any(test, feature = "test-utils"))]
             forced_shortfall: None,
+            #[cfg(any(test, feature = "test-utils"))]
+            no_process_memory: false,
         }
     }
 
@@ -259,6 +263,22 @@ impl MemoryTestOverrides {
     /// The baseline this value injects in place of a measurement, if any.
     pub fn injected_baseline_rss(&self) -> Option<u64> {
         self.baseline_rss
+    }
+
+    /// Make the run read no process memory, as on a target where the
+    /// process's resident memory cannot be read: its limits trip only on the
+    /// charged total. For an in-process test of what a charged check does
+    /// under a small test capacity, which the test process's own resident
+    /// memory, shared with the harness and sibling tests, would otherwise
+    /// trip first. The startup check still judges the injected baseline.
+    pub fn with_no_process_memory(mut self) -> Self {
+        self.no_process_memory = true;
+        self
+    }
+
+    /// Whether the run reads no process memory.
+    pub(crate) fn reads_no_process_memory(&self) -> bool {
+        self.no_process_memory
     }
 }
 

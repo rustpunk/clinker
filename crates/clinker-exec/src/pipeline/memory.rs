@@ -1436,6 +1436,13 @@ pub struct MemoryArbitrator {
     /// shortfall, so the walk takes this at its next dispatch boundary and
     /// fails the run with it.
     reclaim_failure: Mutex<Option<clinker_plan::error::PipelineError>>,
+    /// A test run reads no process memory, as on a target where
+    /// [`rss_bytes`] is `None`: every reading the arbitrator takes of the
+    /// process is absent, so only the charged total can trip a limit. Set
+    /// once, before the run, by
+    /// [`crate::executor::MemoryTestOverrides::with_no_process_memory`].
+    #[cfg(any(test, feature = "test-utils"))]
+    process_memory_unread: std::sync::atomic::AtomicBool,
 }
 
 /// [`MemoryArbitrator::walk_requester`]'s "no consumer" value.
@@ -1499,6 +1506,8 @@ impl MemoryArbitrator {
             reclaim_rounds: AtomicU64::new(0),
             walk_requester: AtomicU64::new(NO_WALK_REQUESTER),
             reclaim_failure: Mutex::new(None),
+            #[cfg(any(test, feature = "test-utils"))]
+            process_memory_unread: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1522,9 +1531,30 @@ impl MemoryArbitrator {
     /// capable operator; also called from `should_spill()` and
     /// `should_abort()`. Lock-free `fetch_max`.
     pub fn observe(&self) {
-        if let Some(rss) = rss_bytes() {
+        if let Some(rss) = self.process_resident_bytes() {
             self.peak_rss.fetch_max(rss, Ordering::Relaxed);
         }
+    }
+
+    /// The process's resident memory as this run reads it: [`rss_bytes`],
+    /// or none when a test run was set to read no process memory. Every
+    /// decision the arbitrator takes on the process's memory reads it here.
+    fn process_resident_bytes(&self) -> Option<u64> {
+        #[cfg(any(test, feature = "test-utils"))]
+        if self.process_memory_unread.load(Ordering::Relaxed) {
+            return None;
+        }
+        rss_bytes()
+    }
+
+    /// Read no process memory for the rest of this run, as on a target
+    /// where [`rss_bytes`] is `None`, so the charged total is the only
+    /// reading that can trip a limit. An in-process test shares its process
+    /// with the harness and every sibling test, whose resident memory would
+    /// otherwise trip a small test capacity before any charge could.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn read_no_process_memory(&self) {
+        self.process_memory_unread.store(true, Ordering::Relaxed);
     }
 
     /// True when EITHER current RSS or the pull-mode charged-byte sum
@@ -1708,7 +1738,9 @@ impl MemoryArbitrator {
     /// where `rss_bytes()` is `None`, and tests can drive it
     /// deterministically through registered-consumer bytes.
     pub fn current_pressure(&self) -> u64 {
-        rss_bytes().unwrap_or(0).max(self.sum_consumer_usage())
+        self.process_resident_bytes()
+            .unwrap_or(0)
+            .max(self.sum_consumer_usage())
     }
 
     /// Spike allowance between soft and hard limits (default 20%).

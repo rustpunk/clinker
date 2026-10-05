@@ -389,6 +389,10 @@ pub(crate) fn build_arbitrator_from_config(
     if let Some(shortfall) = overrides.forced_shortfall() {
         arbitrator.arm_forced_shortfall(shortfall.clone());
     }
+    #[cfg(any(test, feature = "test-utils"))]
+    if overrides.reads_no_process_memory() {
+        arbitrator.read_no_process_memory();
+    }
     Ok(arbitrator)
 }
 
