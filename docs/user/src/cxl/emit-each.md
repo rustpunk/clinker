@@ -51,6 +51,14 @@ The body reads both `it` (the current element) and `order_id` (an outer record f
 
 If the source array has N elements, `emit each` produces exactly N output records. Empty array sources produce zero records. A `null` source also produces zero records -- no DLQ entry, no error -- mirroring the explode-on-null convention used elsewhere in CXL.
 
+> **Known issue:** a top-level plain `emit each` over an empty array or `null`
+> currently passes the input row through as one record instead of producing
+> zero records ([#1350](https://github.com/rustpunk/clinker/issues/1350)). This comes from reading the engine's code;
+> it has not been confirmed with a pipeline run. Until it is fixed, put
+> `filter not items.is_empty()` (with your own field for `items`) before the
+> block if you rely on the row being dropped: `is_empty()` is true for both an
+> empty array and `null`.
+
 When fan-out [nests](#nested-fan-out-fan-out-within-fan-out), the cardinalities multiply: an outer array of M elements whose inner arrays have N elements each produces up to M×N records. The cumulative [`max_expansion`](#safety-cap-max_expansion) cap bounds that product.
 
 A non-array, non-null source raises a runtime type-mismatch error and routes the originating record to the DLQ.
@@ -70,8 +78,8 @@ The only behavioral difference is what happens when the source is `null` or an e
 | Source       | `emit each ...`         | `emit each ... outer`                       |
 | ------------ | ----------------------- | ------------------------------------------- |
 | 3-element    | 3 records               | 3 records (identical)                       |
-| empty array  | 0 records               | 1 record, binding = `null`                  |
-| `null`       | 0 records               | 1 record, binding = `null`                  |
+| empty array  | 0 records (see the known issue above) | 1 record, binding = `null`    |
+| `null`       | 0 records (see the known issue above) | 1 record, binding = `null`    |
 
 This is the shape SQL engines spell `LATERAL VIEW OUTER EXPLODE` (Spark, Hive) or an outer `UNNEST` (DuckDB): "for each tag on this article emit a tagged row, **but keep articles that have no tags**."
 

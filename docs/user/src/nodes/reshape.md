@@ -167,6 +167,10 @@ If two rules write the **same field** on the **same row**, that is a mutation co
 
 A runtime conflict routes a dead-letter-queue entry under the `mutation_conflict` category, and the **whole correlation group rolls back** — none of that group's mutated or synthesized rows reach the output. The DLQ entry's stage label is `reshape:<node>:<rule_a>+<rule_b>`, naming the colliding rule pair. See [Error Handling & DLQ](../pipelines/error-handling.md).
 
+> **Known issue:** today only the row where the conflict happened gets a DLQ
+> entry. The group's other rows are dropped without one, so they appear in
+> neither the output nor the DLQ ([#1349](https://github.com/rustpunk/clinker/issues/1349)).
+
 ## Audit stamps
 
 Reshape stamps three engine-written columns on its output records so the provenance of a synthesized or mutated row is queryable downstream:
