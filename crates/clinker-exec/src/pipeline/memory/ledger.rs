@@ -2948,6 +2948,40 @@ mod walk_pass_tests {
         (id, handle)
     }
 
+    /// A table the round elected but could not reach was something the
+    /// engine had no way to spill for the request: it is listed as unable
+    /// to spill and its bytes count as state that cannot spill, though the
+    /// reclaim line never names it as asked.
+    #[test]
+    fn a_holder_the_round_could_not_reach_cannot_spill_and_is_counted() {
+        let arbitrator = run(MIB, Box::new(Priority));
+        let (_table, _table_handle) = table_off_the_walk(&arbitrator, "totals", 400 * KIB);
+        let _filler = arbitrator
+            .reserve(500 * KIB, governed())
+            .expect("filler fits");
+        let set = empty_set();
+        let _walk = walk(&arbitrator, &set);
+        let report = arbitrator
+            .reserve(200 * KIB, governed())
+            .expect_err("the only candidate is not the walk's to spill")
+            .into_report(&arbitrator);
+
+        let round = report.reclaim.as_ref().expect("the walk ran a round");
+        assert!(round.holders_asked.is_empty(), "{round:?}");
+        let states: Vec<(&str, HolderState)> = report
+            .holders
+            .iter()
+            .map(|holder| (holder.node.as_str(), holder.state))
+            .collect();
+        assert_eq!(states, vec![("totals", HolderState::CannotSpill)]);
+        assert_eq!(
+            report.unspillable_bytes,
+            900 * KIB,
+            "the table's bytes and the memory no single node holds"
+        );
+        assert!(report.oversized, "no spill could have made room: {report}");
+    }
+
     /// With no round there is no evidence that a holder was out of reach,
     /// so a table another thread owns, whose figure says a spill would free
     /// it, still reads `in use` and is not counted as state that cannot
@@ -3413,7 +3447,7 @@ mod walk_pass_tests {
             states,
             vec![
                 ("busy", HolderState::InUse),
-                ("unreached", HolderState::InUse)
+                ("unreached", HolderState::CannotSpill)
             ],
             "the spilled victim holds nothing and is no longer listed"
         );
