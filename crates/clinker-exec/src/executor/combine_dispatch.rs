@@ -1197,13 +1197,18 @@ where
         let inline_bytes = hash_table
             .memory_bytes()
             .saturating_add(build_identity_bytes);
-        if budget.should_abort_local(inline_bytes as u64) {
-            return Err(budget.refusal(
+        // The finished table is not charged yet: the backstop makes room for
+        // it beside the run's charges (spilling other state on the walk)
+        // before the handle takes it on below, or refuses naming the reading
+        // that tripped.
+        budget
+            .check_hard_limit(
                 name,
                 clinker_plan::runtime_error::MemorySurface::JoinBuildSide,
+                crate::pipeline::memory::ledger::Requester::for_consumer(inline_consumer_id),
                 inline_bytes as u64,
-            ));
-        }
+            )
+            .map_err(|report| PipelineError::MemoryBudgetExceeded { report })?;
         let build_records_out = hash_table.len() as u64;
         // Mirror the freshly-built table's footprint into the
         // consumer handle so the arbitrator's pull-mode

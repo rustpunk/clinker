@@ -238,7 +238,9 @@ impl Shortfall {
 /// `requester` as the node that asked, with the reclaim round that preceded
 /// it when there was one. `oversized` is the ledger's own verdict that no
 /// release could make the request fit; the report also calls a request
-/// oversized when it does not fit beside what cannot spill.
+/// oversized when it does not fit beside what cannot spill. A snapshot that
+/// requested nothing is never oversized, and its suggested limit is the
+/// charged total rounded up.
 ///
 /// A holder is the requester when it is the snapshot's requesting consumer
 /// or, for a refusal made in no consumer's name, when its label is
@@ -377,8 +379,10 @@ fn build_report(
         unspillable_bytes,
         reclaim,
         suggested_limit_bytes: suggested_limit_floor(snapshot.charged, requested),
-        oversized: oversized
-            || requested.saturating_add(unspillable_bytes) > snapshot.limit.bytes(),
+        // A refusal that asked for nothing (a backstop that found the run
+        // already past its limit) measured no request, so none is oversized.
+        oversized: requested > 0
+            && (oversized || requested.saturating_add(unspillable_bytes) > snapshot.limit.bytes()),
     })
 }
 
@@ -755,12 +759,18 @@ impl MemoryArbitrator {
     }
 
     /// Whether `projected` more bytes fit now, checked under the ledger lock
-    /// as a charge would be, without charging them.
+    /// as a charge would be, without charging them: the charged total plus
+    /// the projection must fit the limit.
+    ///
+    /// An unchecked growth can carry the charged total past the limit, so a
+    /// projection of 0 does not fit a ledger already past it: the check is
+    /// then whether the run is back within its limit, and a reclaim pass is
+    /// what can bring it there.
     fn projection_fits(&self, projected: u64, requester: Requester) -> Result<(), Shortfall> {
         let ledger = self.admission.ledger.lock();
         let refusal = if ledger.closed {
             Refusal::Closed
-        } else if projected <= ledger.available() {
+        } else if ledger.charged().saturating_add(projected) <= ledger.limit() {
             return Ok(());
         } else {
             Refusal::Short {
@@ -873,14 +883,7 @@ impl MemoryArbitrator {
         let charged_over_by = snapshot.charged.saturating_sub(limit);
         match self.peak_rss().filter(|peak| *peak > limit) {
             Some(peak) if charged_over_by == 0 => {
-                snapshot.requested = peak - limit;
-                let mut report = self.off_ledger_report(snapshot, node, surface);
-                report.reading = LimitReading::ProcessMemory {
-                    peak_resident_bytes: peak,
-                };
-                report.suggested_limit_bytes = suggested_limit_floor(peak, 0);
-                report.oversized = false;
-                report
+                self.process_memory_report(snapshot, node, surface, limit, peak)
             }
             _ => {
                 snapshot.requested = charged_over_by;
@@ -896,9 +899,53 @@ impl MemoryArbitrator {
         }
     }
 
-    /// The one check every hard-limit backstop makes: `node`, holding
-    /// `surface` for `requester`, is about to hold `uncharged` bytes no
-    /// consumer has charged yet (0 for a check made after the fact).
+    /// The process-memory form of a backstop's E310: the process's peak
+    /// resident reading `peak` stood over `limit` while `node` held
+    /// `surface`, with the ledger as `snapshot` read it. The request is how
+    /// far over the peak stands, the suggested limit is the peak rounded up
+    /// (a limit that peak would not have passed), and nothing is oversized,
+    /// because no one request was measured.
+    fn process_memory_report(
+        &self,
+        mut snapshot: LedgerSnapshot,
+        node: &str,
+        surface: MemorySurface,
+        limit: u64,
+        peak: u64,
+    ) -> Box<MemoryShortfallReport> {
+        snapshot.requested = peak.saturating_sub(limit);
+        let mut report = self.off_ledger_report(snapshot, node, surface);
+        report.reading = LimitReading::ProcessMemory {
+            peak_resident_bytes: peak,
+        };
+        report.suggested_limit_bytes = suggested_limit_floor(peak, 0);
+        report.oversized = false;
+        report
+    }
+
+    /// The one check a hard-limit backstop makes before it lets `node` go
+    /// on holding `surface`: whether the run is within its limit with the
+    /// `uncharged` bytes the site is about to hold that no consumer has
+    /// charged yet (0 for a check made after the fact), reclaiming for
+    /// `requester` before it refuses.
+    ///
+    /// It decides which reading tripped before anything else, from the
+    /// charged total and the process's peak resident reading (sampled here):
+    /// - The charged total plus `uncharged` over the limit: the check runs
+    ///   [`Self::reclaim_before_abort`] for `uncharged`, which on the run's
+    ///   walk runs reclaim passes (the requester elected last) and retries,
+    ///   and off the walk returns at once. When that leaves the run short,
+    ///   the refusal is the E310 built from the shortfall that ended the
+    ///   round, naming `node` and `surface`: its request is `uncharged`
+    ///   (none for a check after the fact), its floor is the charged total
+    ///   plus that request rounded up, and its reclaim line is the round the
+    ///   walk ran, or `none attempted` off the walk.
+    /// - Otherwise, or once a round has made room, the process's peak
+    ///   resident reading over the limit: the process-memory E310, at once.
+    ///   No pass can lower a peak.
+    ///
+    /// It streams nothing and holds no lock while a victim spills; it blocks
+    /// only on the spills the walk runs, and runs passes only on the walk.
     pub(crate) fn check_hard_limit(
         &self,
         node: &str,
@@ -906,15 +953,52 @@ impl MemoryArbitrator {
         requester: Requester,
         uncharged: u64,
     ) -> Result<(), Box<MemoryShortfallReport>> {
-        let _ = requester;
-        if !self.should_abort_local(uncharged) {
-            return Ok(());
+        self.observe();
+        let limit = self.hard_limit();
+        if self.charged_bytes().saturating_add(uncharged) > limit
+            && let Err(shortfall) = self.reclaim_before_abort(requester, uncharged)
+        {
+            return Err(self.backstop_shortfall_report(shortfall, node, surface));
         }
-        Err(if uncharged > 0 {
-            self.refusal_report(node, surface, uncharged)
-        } else {
-            self.backstop_report(node, surface)
-        })
+        match self.peak_rss().filter(|peak| *peak > limit) {
+            Some(peak) => Err(self.process_memory_report(
+                self.ledger_snapshot(0, Requester::governed()),
+                node,
+                surface,
+                limit,
+                peak,
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// The E310 for a backstop whose reclaim round ended in `shortfall`,
+    /// naming `node` and `surface` as the requester. The request, the floor
+    /// and the round are the shortfall's own: the bytes the site was about
+    /// to hold, the charged total plus those bytes rounded up, and what the
+    /// walk's passes did.
+    fn backstop_shortfall_report(
+        &self,
+        shortfall: Shortfall,
+        node: &str,
+        surface: MemorySurface,
+    ) -> Box<MemoryShortfallReport> {
+        let Shortfall {
+            snapshot,
+            oversized,
+            round,
+            ..
+        } = shortfall;
+        build_report(
+            self,
+            snapshot,
+            Some(ConsumerLabel {
+                node: node.to_string(),
+                surface,
+            }),
+            round.map(|round| *round),
+            oversized,
+        )
     }
 
     /// High-water mark of `id`'s handle bytes plus the bytes granted in its
@@ -3717,12 +3801,7 @@ mod walk_pass_tests {
         let _walk = walk(&arbitrator, &set);
         let script = Scripted::default().resident(owner, &owner_handle).shared();
         scripted(&script, || {
-            arbitrator.check_hard_limit(
-                "enrich",
-                MemorySurface::JoinBuildSide,
-                governed(),
-                0,
-            )
+            arbitrator.check_hard_limit("enrich", MemorySurface::JoinBuildSide, governed(), 0)
         })
         .expect("spilling the walk-owned owner brings the run back within its limit");
         assert_eq!(script.borrow().spilled, vec![owner]);
@@ -3743,12 +3822,7 @@ mod walk_pass_tests {
         // Checked after the fact: the run is past its limit and asked for
         // nothing more.
         let report = scripted(&script, || {
-            arbitrator.check_hard_limit(
-                "enrich",
-                MemorySurface::JoinBuildSide,
-                governed(),
-                0,
-            )
+            arbitrator.check_hard_limit("enrich", MemorySurface::JoinBuildSide, governed(), 0)
         })
         .expect_err("nothing the walk owns can spill");
         assert_eq!(report.reading, LimitReading::Charged, "{report:?}");
@@ -3773,12 +3847,7 @@ mod walk_pass_tests {
 
         // The same check with 2 GiB the site was about to hold.
         let report = scripted(&script, || {
-            arbitrator.check_hard_limit(
-                "enrich",
-                MemorySurface::JoinBuildSide,
-                governed(),
-                2 * GIB,
-            )
+            arbitrator.check_hard_limit("enrich", MemorySurface::JoinBuildSide, governed(), 2 * GIB)
         })
         .expect_err("nothing the walk owns can spill");
         assert_eq!(report.requested_bytes, 2 * GIB);
@@ -3799,12 +3868,7 @@ mod walk_pass_tests {
         // The charged total plus the projection fits; only the process's
         // reading is over the limit.
         let report = arbitrator
-            .check_hard_limit(
-                "enrich",
-                MemorySurface::JoinBuildSide,
-                governed(),
-                2 * MIB,
-            )
+            .check_hard_limit("enrich", MemorySurface::JoinBuildSide, governed(), 2 * MIB)
             .expect_err("the process's memory is over the limit");
         assert_eq!(
             report.reading,

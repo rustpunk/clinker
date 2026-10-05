@@ -274,7 +274,9 @@ pub struct MemoryShortfallReport {
     /// total, or the process's own memory. The headline and the suggested
     /// limit state only what this reading established.
     pub reading: LimitReading,
-    /// Bytes the refused request asked for.
+    /// Bytes the refused request asked for; 0 when a check made after the
+    /// fact found the run already holding more than the limit and asked for
+    /// nothing.
     pub requested_bytes: u64,
     /// The limit charges were granted against, named as the run enforced
     /// it: `memory.limit`, or the smaller test capacity a test run was held
@@ -381,7 +383,8 @@ impl std::fmt::Display for EnforcedLimit {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LimitReading {
     /// The charged total: the request did not fit beside what the run had
-    /// charged. `requested_bytes` is the request.
+    /// charged. `requested_bytes` is the request, 0 when the run was already
+    /// past the limit and asked for nothing more.
     Charged,
     /// The process's memory as the operating system reports it: its highest
     /// resident reading stood over the limit, whatever the charged total was.
@@ -757,14 +760,16 @@ impl std::fmt::Display for MemoryShortfallReport {
 }
 
 impl MemoryShortfallReport {
-    /// The first line of the E310 text, in one of three forms: the process
-    /// reading over the limit; one request no spill can make room for; or
+    /// The first line of the E310 text, in one of four forms: the process
+    /// reading over the limit; the run already holding more than the limit
+    /// with no request of its own (a check made after the fact found the
+    /// charged total past it); one request no spill can make room for; or
     /// the ordinary form, which states the request and how much of the limit
     /// was left (`limit − charged`, from the same reading). The ordinary
-    /// form adds that nothing more could be spilled only when
-    /// [`Self::reclaim`] holds the round that tried; a report with no round
-    /// claims no spill was tried. Every form names the limit the run
-    /// enforced.
+    /// form and the form with no request add that nothing more could be
+    /// spilled only when [`Self::reclaim`] holds the round that tried; a
+    /// report with no round claims no spill was tried. Every form names the
+    /// limit the run enforced.
     fn write_headline(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use clinker_core_types::QuoteName;
         f.write_str("E310")?;
@@ -791,6 +796,26 @@ impl MemoryShortfallReport {
                 )?;
             }
             return write!(f, "; the run had charged {}", Bytes(self.charged_bytes));
+        }
+        if self.requested_bytes == 0 && self.charged_bytes > self.limit.bytes() {
+            write!(
+                f,
+                "the run held {}, over {}",
+                Bytes(self.charged_bytes),
+                self.limit
+            )?;
+            if let Some(requester) = &self.requester {
+                write!(
+                    f,
+                    ", while {} held {}",
+                    requester.node.quoted_name(),
+                    requester.surface
+                )?;
+            }
+            if self.reclaim.is_some() {
+                f.write_str(" and nothing more could be spilled")?;
+            }
+            return Ok(());
         }
         if self.oversized {
             f.write_str("one request")?;
