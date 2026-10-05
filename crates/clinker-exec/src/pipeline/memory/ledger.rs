@@ -1770,6 +1770,68 @@ mod tests {
         assert_eq!(report.requested_bytes, 100 * KIB);
     }
 
+    /// A governed refusal wrapped before it reaches the conversion is E310
+    /// too. Inside `CompositionBodyError` the wrapper and its composition
+    /// name stay and the inner error becomes the E310 with the recorded
+    /// report; inside `Multiple` each member that is such a refusal converts,
+    /// with the same requester stamping, and the others are kept as they are.
+    #[test]
+    fn a_refusal_inside_a_composition_body_error_is_e310() {
+        let arbitrator = arbitrator(64 * KIB);
+        let in_body = arbitrator
+            .admit_writer_memory((100 * KIB) as usize, governed())
+            .expect_err("100 KiB does not fit a 64 KiB limit");
+        let wrapped = PipelineError::CompositionBodyError {
+            composition_name: "enrich_call".to_string(),
+            inner: Box::new(admission_error(in_body)),
+        };
+        match governed_refusal_error(wrapped, None) {
+            PipelineError::CompositionBodyError {
+                composition_name,
+                inner,
+            } => {
+                assert_eq!(composition_name, "enrich_call", "the wrapper is kept");
+                let PipelineError::MemoryBudgetExceeded { report } = *inner else {
+                    panic!("the body's refusal converts to E310; got {inner:?}");
+                };
+                assert_eq!(report.requested_bytes, 100 * KIB);
+            }
+            other => panic!("the composition wrapper is kept; got {other:?}"),
+        }
+
+        let in_writer = arbitrator
+            .admit_writer_memory((200 * KIB) as usize, governed())
+            .expect_err("200 KiB does not fit a 64 KiB limit");
+        let collected = PipelineError::Multiple(vec![
+            PipelineError::Internal {
+                op: "writer",
+                node: "audit".to_string(),
+                detail: "kept as it is".to_string(),
+            },
+            admission_error(in_writer),
+        ]);
+        let PipelineError::Multiple(errors) =
+            governed_refusal_error(collected, Some(("out", MemorySurface::OutputStaging)))
+        else {
+            panic!("the collected errors stay collected");
+        };
+        assert_eq!(errors.len(), 2);
+        assert!(
+            matches!(&errors[0], PipelineError::Internal { node, .. } if node == "audit"),
+            "a member that is not a refusal is kept: {:?}",
+            errors[0]
+        );
+        let PipelineError::MemoryBudgetExceeded { report } = &errors[1] else {
+            panic!("the writer's refusal converts to E310; got {:?}", errors[1]);
+        };
+        assert_eq!(report.requested_bytes, 200 * KIB);
+        assert_eq!(
+            report.requester,
+            Some(label("out", MemorySurface::OutputStaging)),
+            "an unnamed refusal is stamped with the thread's requester"
+        );
+    }
+
     #[test]
     fn ledger_grants_exactly_to_the_limit() {
         let arbitrator = arbitrator(MIB);
