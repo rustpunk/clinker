@@ -795,6 +795,15 @@ impl AggregateStream {
         }
     }
 
+    /// Mark the hash table as kept for retraction
+    /// ([`HashAggregator::keep_for_retraction`]). The streaming arm holds no
+    /// table.
+    pub(crate) fn keep_for_retraction(&mut self) {
+        if let Self::Hash(h) = self {
+            h.keep_for_retraction();
+        }
+    }
+
     /// The handle a hash table's charge is mirrored onto; `None` for the
     /// streaming arm, which holds no table and charges nothing.
     pub(crate) fn consumer_handle(&self) -> Option<&Arc<crate::pipeline::memory::ConsumerHandle>> {

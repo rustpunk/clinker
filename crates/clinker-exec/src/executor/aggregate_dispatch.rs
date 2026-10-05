@@ -291,6 +291,13 @@ where
         // per-document flush does not apply here — a document-aware
         // relaxed-CK aggregate keeps its single cross-document table.
         //
+        // No reclaim pass or soft-threshold poll may spill that table, while
+        // it ingests or while the commit keeps it: the in-place finalize and
+        // the commit's retract read only resident groups, so its spill would
+        // end the run or lose its groups rather than free memory (#1288). It
+        // is built kept for retraction, which makes it rank by 0, and it is
+        // not registered in the walk reclaim set.
+        //
         // The table is built and its `AggregateConsumer` registered the way
         // every other hash table of this node is: the same evaluator, spill
         // schema, memory limit, spill directory and compression mode, with
@@ -697,6 +704,13 @@ impl DocAggregatorFactory {
     /// and which the correlation commit keeps to retract rows from and
     /// finalize again in place, and register its arbitrator consumer as
     /// [`Self::make`] does.
+    ///
+    /// The table is marked kept for retraction from its first record on, so
+    /// it ranks by 0 and no reclaim pass or soft-threshold poll elects it: a
+    /// spill of it cannot be finalized in place or retracted from, so it
+    /// would end the run or lose the Aggregate's groups at the commit
+    /// rather than free memory (#1288). It is not registered in the walk
+    /// reclaim set. Its own spill triggers still fire.
     pub(crate) fn make_for_retraction(
         &self,
     ) -> Result<
@@ -706,7 +720,9 @@ impl DocAggregatorFactory {
         ),
         PipelineError,
     > {
-        self.make()
+        let (mut stream, consumer_id) = self.make()?;
+        stream.keep_for_retraction();
+        Ok((stream, consumer_id))
     }
 }
 

@@ -2133,6 +2133,13 @@ pub(crate) enum CommitStepPath {
 /// orchestrator's recompute-aggregates phase can call `retract_row` +
 /// `finalize_in_place`. Populated only on relaxed-CK aggregates;
 /// strict pipelines never instantiate this struct.
+///
+/// The aggregator was built kept for retraction
+/// ([`crate::aggregation::HashAggregator::keep_for_retraction`]): it ranks by
+/// 0 and is not in the walk reclaim set, so no reclaim pass or
+/// soft-threshold poll spills it while it is held here. A spilled table
+/// would fail the next `retract_row` and send the Aggregate to the degrade
+/// path, which loses its groups (#1288).
 pub(crate) struct RetainedAggregatorState {
     pub(crate) aggregator: Box<crate::aggregation::HashAggregator>,
     /// Arbitrator registration for this aggregator's memory consumer.

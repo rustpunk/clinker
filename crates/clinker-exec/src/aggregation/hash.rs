@@ -185,7 +185,8 @@ pub struct HashAggregator {
     /// read at batch boundaries once that integration lands.
     consumer_handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
     /// Whether a spill a reclaim pass asks for could free this table's
-    /// charge now: it has a spill directory and no finalize has taken it.
+    /// charge now: it has a spill directory, no finalize has taken it, and
+    /// it is not kept for retraction ([`Self::keep_for_retraction`]).
     /// Every charge mirror records the reclaimable figure from it (the
     /// charge when true, 0 when false), so the figure is never more than a
     /// spill would free.
@@ -377,6 +378,26 @@ impl HashAggregator {
     /// charge stays until the table drops. Idempotent; every finalize calls
     /// it first, and a walk arm calls it as the table leaves its cell.
     pub(crate) fn begin_finalize(&mut self) {
+        self.leave_reclaim();
+    }
+
+    /// Mark the table as kept for the correlation commit's retraction, for
+    /// its whole life: it ranks by 0 while it ingests, after its in-place
+    /// finalize and while the commit keeps it, so no reclaim pass and no
+    /// soft-threshold poll elects it, and a refused request's report lists
+    /// it as unable to spill. Neither [`Self::finalize_in_place`] nor
+    /// [`Self::retract_row`] can read groups a spill wrote, so a spill of
+    /// this table ends the run with an internal error or loses its groups
+    /// at the commit; it never frees memory the run can go on without
+    /// (#1288). The table's own spill triggers are unchanged. Its charge
+    /// stays until it drops.
+    pub(crate) fn keep_for_retraction(&mut self) {
+        self.leave_reclaim();
+    }
+
+    /// From here on no spill a reclaim pass could ask for frees anything:
+    /// record 0 and keep every later charge mirror at 0.
+    fn leave_reclaim(&mut self) {
         self.reclaim_by_spill = false;
         self.consumer_handle.set_reclaimable(0);
     }
@@ -1453,7 +1474,9 @@ fn mirror_charge(
 /// change: what spilling its resident groups frees now. That is the table's
 /// charge while it can spill, and 0 once a spill wrote its groups, from the
 /// moment a finalize takes the table (in place or consuming), and always for
-/// a table with no spill directory. A table on the strict per-document or
+/// a table with no spill directory or kept for retraction (the relaxed-key
+/// arm's, which no pass can spill until retraction can read spilled groups).
+/// A table on the strict per-document or
 /// time-windowed arm is walk-owned state any reclaim pass on the walk can
 /// spill while the table is in its arm's cell; the streaming-ingest
 /// worker's tables are reached only once lent to the walk, and a pass that
