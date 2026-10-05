@@ -39,7 +39,10 @@
 //! each record's admission sequence) so the ingest-time resident peak stays
 //! bounded under skew. The consumer registers at priority `15` (between
 //! grace-hash and external sort) and cannot back-pressure: there is no
-//! upstream channel to gate once the predecessor has drained.
+//! upstream channel to gate once the predecessor has drained. The buffer
+//! itself is walk-owned state registered in the walk reclaim set, so a
+//! reclaim pass that another node's request starts spills its resident
+//! groups as well.
 //!
 //! The drop decision per group is computed by folding the same records
 //! through an in-memory aggregate over the predicate (group-by =
@@ -75,8 +78,13 @@ use crate::executor::dispatch::{
     require_single_input_node_buffer_slot, source_file_arc_of, source_name_arc_of,
 };
 use crate::executor::giant_group_error;
-use crate::executor::node_buffer::unaccounted_record_byte_cost;
+use crate::executor::node_buffer::{
+    resident_record_reclaimable_bytes, unaccounted_record_byte_cost,
+};
 use crate::executor::stream_event::SourceRowId;
+use crate::pipeline::memory::walk::{
+    OwnedSpillResult, WalkOwnedRegistration, WalkOwnedSpill, register_walk_owned,
+};
 use crate::pipeline::memory::{
     ConsumerHandle, ConsumerId, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
 };
@@ -113,6 +121,12 @@ use clinker_plan::config::pipeline_node::CULL_DROP_DECISION_COLUMN as DROP_DECIS
 /// remains once the predecessor has drained). On `try_spill` it flips the
 /// handle's spill-request flag; the dispatch loop reads it at the next
 /// grouping boundary and evicts resident groups to disk in-thread.
+///
+/// The buffer is also walk-owned state registered under this consumer
+/// ([`CullGroups`]), so a reclaim pass that elects it spills the resident
+/// groups at once. It ranks by the figure the buffer records on the handle:
+/// what that spill frees now. Rows already on disk count 0, and so do rows
+/// taken out of the buffer for routing, which no spill can reach.
 struct CullConsumer {
     handle: Arc<ConsumerHandle>,
 }
@@ -126,6 +140,12 @@ impl CullConsumer {
 impl MemoryConsumer for CullConsumer {
     fn current_usage(&self) -> u64 {
         self.handle.bytes()
+    }
+
+    /// What a spill of the resident groups frees now, as the buffer last
+    /// recorded it after a push, spill or take.
+    fn reclaimable_bytes(&self) -> u64 {
+        self.handle.reclaimable()
     }
 
     fn peak_charged_bytes(&self) -> Option<u64> {
@@ -741,6 +761,9 @@ struct CullGroupState {
     resident: Vec<BufferedRecord>,
     resident_bytes: usize,
     unaccounted_resident_bytes: usize,
+    /// What spilling `resident` frees now, each row counted as a slot
+    /// counts it ([`resident_record_reclaimable_bytes`]).
+    reclaimable_bytes: u64,
     spilled_bytes: usize,
     spilled: Vec<SpillFile<CullSpillPayload>>,
     /// The source-row identity of the group's first record, which names the
@@ -755,6 +778,7 @@ impl CullGroupState {
             resident: Vec::new(),
             resident_bytes: 0,
             unaccounted_resident_bytes: 0,
+            reclaimable_bytes: 0,
             spilled_bytes: 0,
             spilled: Vec::new(),
         }
@@ -778,6 +802,9 @@ struct CullGroupBuffer {
     groups: HashMap<Vec<GroupByKey>, CullGroupState>,
     resident_bytes: usize,
     unaccounted_resident_bytes: usize,
+    /// Sum of every group's `reclaimable_bytes`: what spilling every
+    /// resident group frees now. Rows on disk or taken out count 0.
+    reclaimable_bytes: u64,
     next_seq: u64,
     /// The Source name behind each Source identity a group's first record
     /// carried, read from that record's `$source.name` stamp; one entry per
@@ -799,6 +826,7 @@ impl CullGroupBuffer {
             groups: HashMap::new(),
             resident_bytes: 0,
             unaccounted_resident_bytes: 0,
+            reclaimable_bytes: 0,
             next_seq: 0,
             source_names: Vec::new(),
         }
@@ -830,6 +858,12 @@ impl CullGroupBuffer {
         self.unaccounted_resident_bytes
     }
 
+    /// What spilling every resident group frees now; 0 once nothing is
+    /// resident.
+    fn reclaimable_bytes(&self) -> u64 {
+        self.reclaimable_bytes
+    }
+
     /// Admit one record into its group, stamping a Cull-local admission
     /// sequence and recording first-seen group order.
     fn push(
@@ -840,6 +874,7 @@ impl CullGroupBuffer {
     ) {
         let bytes = estimated_input_bytes(&record);
         let unaccounted = unaccounted_input_bytes(&record, &self.allocation_resources);
+        let reclaimable = resident_record_reclaimable_bytes(&record);
         let seq = self.next_seq;
         self.next_seq += 1;
         let order = &mut self.group_order;
@@ -860,6 +895,8 @@ impl CullGroupBuffer {
         self.resident_bytes += bytes;
         state.unaccounted_resident_bytes += unaccounted;
         self.unaccounted_resident_bytes += unaccounted;
+        state.reclaimable_bytes += reclaimable;
+        self.reclaimable_bytes += reclaimable;
     }
 
     /// Take the first-seen group order, consuming it for the finalize drain.
@@ -880,7 +917,30 @@ impl CullGroupBuffer {
         handle: &Arc<ConsumerHandle>,
     ) -> Result<(), PipelineError> {
         let soft = budget.spill_threshold_bytes() as usize;
-        while self.resident_bytes > soft {
+        self.spill_resident_above(node_name, budget, spill_root, soft, |buffer| {
+            handle.set_bytes(buffer.unaccounted_resident_bytes as u64);
+            handle.set_reclaimable(buffer.reclaimable_bytes);
+        })
+        .map(|_| ())
+    }
+
+    /// Evict resident groups, largest first, until at most `keep` bytes stay
+    /// resident, calling `evicted` after each eviction. A group larger than
+    /// the soft threshold is sliced ([`Self::spill_group_partitioned`]),
+    /// any other is spilled whole: the one per-group choice the Cull's own
+    /// spill and a reclaim pass both make. Returns whether any group was
+    /// written.
+    fn spill_resident_above(
+        &mut self,
+        node_name: &str,
+        budget: &MemoryArbitrator,
+        spill_root: &std::path::Path,
+        keep: usize,
+        mut evicted: impl FnMut(&Self),
+    ) -> Result<bool, PipelineError> {
+        let soft = budget.spill_threshold_bytes() as usize;
+        let mut wrote = false;
+        while self.resident_bytes > keep {
             let Some(key) = self.largest_resident_group() else {
                 break;
             };
@@ -890,9 +950,10 @@ impl CullGroupBuffer {
             } else {
                 self.spill_group_whole(node_name, budget, spill_root, &key)?;
             }
-            handle.set_bytes(self.unaccounted_resident_bytes as u64);
+            wrote = true;
+            evicted(self);
         }
-        Ok(())
+        Ok(wrote)
     }
 
     /// Key of the resident group holding the most in-memory bytes, or `None`
@@ -921,6 +982,7 @@ impl CullGroupBuffer {
         let freed = std::mem::take(&mut state.resident_bytes);
         self.resident_bytes -= freed;
         self.unaccounted_resident_bytes -= std::mem::take(&mut state.unaccounted_resident_bytes);
+        self.reclaimable_bytes -= std::mem::take(&mut state.reclaimable_bytes);
         let file = write_spill_slice(
             node_name,
             budget,
@@ -960,6 +1022,7 @@ impl CullGroupBuffer {
         let total_bytes = std::mem::take(&mut state.resident_bytes);
         self.resident_bytes -= total_bytes;
         self.unaccounted_resident_bytes -= std::mem::take(&mut state.unaccounted_resident_bytes);
+        self.reclaimable_bytes -= std::mem::take(&mut state.reclaimable_bytes);
 
         let parts_wanted = total_bytes.div_ceil(soft.max(1)).max(2);
         let bits =
@@ -1010,9 +1073,15 @@ impl CullGroupBuffer {
             .iter()
             .map(|row| unaccounted_input_bytes(&row.record, &self.allocation_resources))
             .sum::<usize>();
+        let retained_reclaimable = tail
+            .iter()
+            .map(|row| resident_record_reclaimable_bytes(&row.record))
+            .sum::<u64>();
         state.resident = tail;
         state.unaccounted_resident_bytes = retained_unaccounted;
         self.unaccounted_resident_bytes += retained_unaccounted;
+        state.reclaimable_bytes = retained_reclaimable;
+        self.reclaimable_bytes += retained_reclaimable;
         state.resident_bytes = remaining;
         state.spilled_bytes += spilled_now;
         state.spilled.extend(spilled_files);
@@ -1049,6 +1118,7 @@ impl CullGroupBuffer {
         let state = self.groups.remove(key).expect("group key present in order");
         self.resident_bytes -= state.resident_bytes;
         self.unaccounted_resident_bytes -= state.unaccounted_resident_bytes;
+        self.reclaimable_bytes -= state.reclaimable_bytes;
 
         let group_bytes = (state.resident_bytes + state.spilled_bytes) as u64;
         if hard_limit > 0 && group_bytes > hard_limit {
@@ -1090,6 +1160,11 @@ impl CullGroupBuffer {
 /// A Cull's group buffer as walk-owned state: the buffer, and what spilling
 /// it needs (the Cull's node name, the run's spill root and the handle of
 /// the consumer that charges it).
+///
+/// A reclaim pass that another consumer's request starts spills it
+/// ([`WalkOwnedSpill`]) whenever the Cull is between two of its own
+/// operations on it, which is all the time but one push, one spill or one
+/// take of a group.
 struct CullGroupCell {
     buffer: CullGroupBuffer,
     node_name: String,
@@ -1099,25 +1174,59 @@ struct CullGroupCell {
 }
 
 impl CullGroupCell {
-    /// Mirror the buffer's resident charge onto the consumer's handle.
+    /// Mirror the buffer's resident charge onto the consumer's handle, and
+    /// record there what spilling its resident groups frees now: the
+    /// figure the consumer ranks by as a reclaim victim.
     fn publish(&self) {
         self.handle
             .set_bytes(self.buffer.unaccounted_resident_bytes() as u64);
+        self.handle.set_reclaimable(self.buffer.reclaimable_bytes());
     }
 }
 
-/// A Cull's group buffer in its walk-owned cell.
+impl WalkOwnedSpill for CullGroupCell {
+    /// A pass that elects the Cull's consumer spills every resident group,
+    /// each with the choice the Cull's own spill makes, and records the
+    /// files under the Cull's node. It wrote when any group had rows
+    /// resident. A buffer whose groups are all on disk or taken wrote
+    /// nothing; one that holds no group holds no state. Never reserves.
+    fn spill_owned(
+        &mut self,
+        id: ConsumerId,
+        arbitrator: &MemoryArbitrator,
+    ) -> Result<OwnedSpillResult, PipelineError> {
+        if id != self.consumer || self.buffer.groups.is_empty() {
+            return Ok(OwnedSpillResult::NotHeld);
+        }
+        let spilled =
+            self.buffer
+                .spill_resident_above(&self.node_name, arbitrator, &self.spill_root, 0, |_| {});
+        self.publish();
+        Ok(if spilled? {
+            OwnedSpillResult::Wrote
+        } else {
+            OwnedSpillResult::NothingToWrite
+        })
+    }
+}
+
+/// A Cull's group buffer in its walk-owned cell, registered in the walk
+/// reclaim set under the Cull's consumer for as long as this lives.
 ///
 /// The cell is borrowed only inside one of the methods here (one push, one
 /// spill, one take of a group), never across `partition_key`, the decision
-/// aggregate, a group's sort or the routing of its rows.
+/// aggregate, a group's sort or the routing of its rows, so a pass another
+/// request starts can always spill the groups still resident.
 struct CullGroups {
     cell: Rc<RefCell<CullGroupCell>>,
+    /// Dropped with the cell, on every exit.
+    _registration: WalkOwnedRegistration,
 }
 
 impl CullGroups {
     /// Put `buffer` in a walk-owned cell for node `node_name`, whose consumer
-    /// `consumer` charges it through `handle`.
+    /// `consumer` charges it through `handle`, and register the cell on
+    /// `budget`'s walk.
     ///
     /// # Errors
     ///
@@ -1130,7 +1239,6 @@ impl CullGroups {
         spill_root: &Arc<std::path::Path>,
         buffer: CullGroupBuffer,
     ) -> Result<Self, PipelineError> {
-        let _ = budget;
         let cell = Rc::new(RefCell::new(CullGroupCell {
             buffer,
             node_name: node_name.to_string(),
@@ -1138,7 +1246,11 @@ impl CullGroups {
             consumer,
             handle: Arc::clone(handle),
         }));
-        Ok(Self { cell })
+        let registration = register_walk_owned(budget, consumer, handle, &cell)?;
+        Ok(Self {
+            cell,
+            _registration: registration,
+        })
     }
 
     /// Admit one record into its group.

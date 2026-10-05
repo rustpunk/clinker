@@ -332,14 +332,14 @@ impl WalkReclaimSet {
     ///
     /// Every live cell entered under `id` that is free spills what `id`
     /// charges, synchronously ([`WalkOwnedSpill::spill_owned`]); the victim
-    /// is `Spilled` when at least one of them held state for `id`. A cell
-    /// that is borrowed (its owner is mid-mutation, or is the requester)
-    /// frees nothing now: the consumer's spill request is raised, which the
-    /// owner answers at its next boundary, and the victim is `Busy` when no
-    /// free cell held state for `id`. With no live cell, or none that still
-    /// holds state for `id`, the entry is dropped and the victim is
-    /// `NotOwned`. A spill never reserves memory; past the spill cap it
-    /// fails with E320.
+    /// is `Spilled` only when at least one of them wrote. A cell that holds
+    /// state for `id` but had nothing it could write, and a cell that is
+    /// borrowed (its owner is mid-mutation, or is the requester), free
+    /// nothing now: the consumer's spill request is raised, which the owner
+    /// answers at its next boundary, and the victim is `Busy` when no cell
+    /// wrote. With no live cell, or none that still holds state for `id`,
+    /// the entry is dropped and the victim is `NotOwned`. A spill never
+    /// reserves memory; past the spill cap it fails with E320.
     fn spill_owned_victim(
         &mut self,
         id: ConsumerId,
@@ -358,22 +358,24 @@ impl WalkReclaimSet {
                     .map(|cell| (cell, Arc::clone(&entry.handle)))
             })
             .collect();
-        let mut held = false;
-        let mut busy = Vec::new();
+        let mut wrote = false;
+        let mut unwritten = Vec::new();
         for (cell, handle) in &live {
             match cell.try_borrow_mut() {
-                Ok(mut owner) => {
-                    held |= owner.spill_owned(id, arbitrator)? != OwnedSpillResult::NotHeld;
-                }
-                Err(_) => busy.push(handle),
+                Ok(mut owner) => match owner.spill_owned(id, arbitrator)? {
+                    OwnedSpillResult::Wrote => wrote = true,
+                    OwnedSpillResult::NothingToWrite => unwritten.push(handle),
+                    OwnedSpillResult::NotHeld => {}
+                },
+                Err(_) => unwritten.push(handle),
             }
         }
-        for handle in &busy {
+        for handle in &unwritten {
             handle.request_spill();
         }
-        if held {
+        if wrote {
             Ok(VictimOutcome::Spilled)
-        } else if !busy.is_empty() {
+        } else if !unwritten.is_empty() {
             Ok(VictimOutcome::Busy)
         } else {
             self.owned.remove(&id);
@@ -524,18 +526,19 @@ impl Drop for FrameGuard {
 /// consumer's state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VictimOutcome {
-    /// The walk owns the consumer's state and spilled whatever of it was
-    /// resident, now, on the walk.
+    /// The walk owns the consumer's state and wrote resident state of it to
+    /// disk, now, on the walk.
     Spilled,
     /// The walk holds no spillable state for the consumer: another thread
     /// owns it, or it is not the kind of state a pass spills. Skipped; its
     /// owner is never asked to act.
     NotOwned,
-    /// The walk owns the consumer's state but cannot spill it now: the
-    /// running dispatch arm holds it, or the reclaim set itself is borrowed.
-    /// Frees nothing this pass. When the set could tell which state it is,
-    /// that state's own spill request is raised, so the walk spills it at
-    /// its next safe point.
+    /// The walk owns the consumer's state but wrote none of it now: the
+    /// running dispatch arm holds it, the reclaim set itself is borrowed,
+    /// or nothing of it could be written (it is already on disk, taken out
+    /// for use, or shared with a reader). Frees nothing this pass. When the
+    /// set could tell which state it is, that state's own spill request is
+    /// raised, so the walk spills it at its next safe point.
     Busy,
 }
 
@@ -597,8 +600,11 @@ pub(crate) trait WalkOwnedSpill {
     /// handle and charging any spill file to `arbitrator`'s disk quota.
     /// Runs inside a reclaim pass with the walk reclaim set borrowed.
     ///
-    /// Returns what the spill did ([`OwnedSpillResult`]). One cell may serve
-    /// several consumers and spills only what `id` charges.
+    /// Returns what the spill did ([`OwnedSpillResult`]): `Wrote` only when
+    /// it wrote state to disk and released that state's charge, never for a
+    /// call that found nothing it could write. A pass counts the victim
+    /// spilled from that answer alone. One cell may serve several consumers
+    /// and spills only what `id` charges.
     ///
     /// Never reserves memory, never blocks on another thread and never
     /// touches the walk reclaim set; blocks only on its own spill I/O.
