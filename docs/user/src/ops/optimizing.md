@@ -35,7 +35,9 @@ A hash `Aggregate` holds one entry per distinct group key in memory — fine for
 
 With a matching `sort_order`, the optimizer switches the aggregate to **streaming** — it emits each group as the key advances and holds only one group at a time, regardless of cardinality. To make the requirement explicit (and turn a silent fallback to hash aggregation into a compile error), set `strategy: streaming`. See [Aggregate Nodes → Strategy hint](../nodes/aggregate.md#strategy-hint).
 
-> `sort_order` is **trusted, not verified** — if the data isn't actually sorted, streaming aggregation produces wrong results. Only declare it when you're sure.
+> `sort_order` is checked for each file as it is read. With `on_unsorted: warn` (the default) a file that is out of order is sorted before it is released and a `W307` warning names it; with `on_unsorted: error` the file is rejected. A wrong declaration costs time rather than correctness, but declare it only when the data really is sorted. See [Source Nodes → Sort order](../nodes/source.md#sort-order).
+>
+> The order only reaches the Aggregate if every stage in between keeps it: a Merge, a Combine, `distinct`, or a Transform that writes one of the sort fields (even `emit account_id = account_id`) drops it. The [sort order explainer](../nodes/sort-order-explainer.html) shows which stages keep it.
 
 ## Choose the Combine driver side deliberately
 

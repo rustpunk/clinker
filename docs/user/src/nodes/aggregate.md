@@ -101,7 +101,9 @@ The `strategy:` field controls how aggregation is executed:
 
 ### When to use streaming
 
-If your source declares a `sort_order:` that covers the group-by fields, the optimizer will automatically choose streaming aggregation. Use `strategy: streaming` as an explicit assertion -- it turns a silent fallback to hash aggregation into a compile error, which is useful for catching sort-order regressions.
+The optimizer chooses streaming aggregation automatically when the Aggregate's input is still sorted and the first fields of that order are exactly the `group_by` fields, in any order: take as many fields from the front of the order as there are `group_by` fields, and they must be the same set. Order `[department, day]` streams `group_by: [department]` and `group_by: [day, department]`, but not `group_by: [day]`. An Aggregate with no `group_by` always streams. Use `strategy: streaming` as an explicit assertion -- it turns a silent fallback to hash aggregation into a compile error (`CXL0419`), which is useful for catching sort-order regressions.
+
+The order has to survive every stage between the Source and the Aggregate. A Merge, a Combine, a Reshape or Cull, `distinct`, and a Transform that writes one of the sort fields all drop it. Writing a field back unchanged counts: `emit department = department` drops an order on `department`. A Transform carries every input field through, so there is no need to emit sort fields. The [sort order explainer](sort-order-explainer.html) lets you build a chain and see where the order holds.
 
 ### When to use hash
 

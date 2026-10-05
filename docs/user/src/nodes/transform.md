@@ -17,7 +17,7 @@ Transform nodes apply CXL expressions to each record, producing new fields, filt
 
 The `cxl:` field is required and contains a CXL program. The three core CXL statements for transforms are:
 
-- **`emit`** -- produces an output field. Only emitted fields appear in downstream nodes.
+- **`emit`** -- adds a field to the record, or replaces the field of the same name. The record's other input fields are carried through to downstream nodes without being emitted; a Sink with `include_unmapped: false` is the one place that narrows them (see [Sink Nodes](sink.md)).
 - **`filter`** -- drops records that do not match the boolean condition.
 - **`let`** -- binds a local variable for use in subsequent expressions (not emitted).
 

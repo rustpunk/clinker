@@ -103,9 +103,10 @@ record in statement order; it is not a table query or join planner.
 
 The core statements:
 
-- **`emit name = expr`** -- produce a field in the output record. Only emitted
-  fields appear downstream. If you want to pass a field through unchanged, you
-  must emit it explicitly: `emit id = id`.
+- **`emit name = expr`** -- produce a field in the output record, adding it or
+  replacing the field of the same name. The record's other fields are carried
+  through unchanged, so there is no need to write `emit id = id`; a Sink can
+  narrow what it writes (see [Sink Nodes](../nodes/sink.md)).
 - **`let name = expr`** -- bind a local variable for use in later expressions.
   Local variables do not appear in the output.
 - **`filter condition`** -- discard the record if the condition is false. A

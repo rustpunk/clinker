@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clinker · Is my data still sorted?</title>
+<style>
+:root{
+  --iron:#14110f; --iron2:#1d1915; --iron3:#29231d; --seam:#3a3129;
+  --ash:#b9ab98; --bone:#ece2d0; --dim:#7d705f;
+  --rust:#d0581f; --rust-d:#8f3a13; --brass:#e0a93e; --verd:#4fb0a0;
+  --blood:#e0362c; --steel:#7f97ad; --plum:#b07ac0; --moss:#9bc76b;
+  --disp:"Rajdhani", "Bahnschrift Condensed", "Roboto Condensed", "Arial Narrow", sans-serif;
+  --mono:"Share Tech Mono", "Source Code Pro", Consolas, "Ubuntu Mono", monospace;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--iron);color:var(--bone);font:15px/1.6 var(--mono);
+  background-image:
+   radial-gradient(1100px 560px at 88% -10%, rgba(127,151,173,.13), transparent 60%),
+   radial-gradient(900px 500px at -10% 45%, rgba(155,199,107,.07), transparent 60%),
+   repeating-linear-gradient(0deg, rgba(255,255,255,.012) 0 1px, transparent 1px 4px);}
+a{color:var(--brass)}
+code{font-family:var(--mono);background:var(--iron3);padding:0 .35em;border:1px solid var(--seam);color:var(--brass);font-size:.92em;overflow-wrap:anywhere}
+pre{background:var(--iron);border:1px solid var(--seam);padding:12px 14px;overflow-x:auto;font-size:13px;line-height:1.5;color:var(--ash);max-width:100%;margin:10px 0}
+header.hero{padding:64px 6vw 36px;border-bottom:2px solid var(--seam);position:relative;overflow:hidden}
+header.hero::after{content:"";position:absolute;right:-60px;top:-60px;width:360px;height:360px;
+  background:repeating-linear-gradient(180deg,rgba(127,151,173,.10) 0 10px,transparent 10px 26px);border-radius:50%;pointer-events:none}
+.so-kicker{font:700 12px/1.4 var(--mono);letter-spacing:.24em;text-transform:uppercase;color:var(--steel)}
+.so-kicker a{color:inherit}
+h1{font:700 clamp(46px,9vw,118px)/.88 var(--disp);margin:14px 0 18px;text-transform:uppercase;letter-spacing:-.01em}
+h1 em{font-style:normal;color:var(--steel)}
+.so-lede{max-width:760px;color:var(--ash);font-size:16px}
+nav.so-toc{display:flex;flex-wrap:wrap;margin-top:26px;border:1px solid var(--seam);width:fit-content;max-width:100%}
+nav.so-toc a{padding:10px 14px;text-decoration:none;color:var(--ash);border-right:1px solid var(--seam);font-size:12px;letter-spacing:.12em;text-transform:uppercase}
+nav.so-toc a:last-child{border-right:0}
+nav.so-toc b{color:var(--brass);margin-right:6px}
+@media (hover:hover){nav.so-toc a:hover{background:var(--steel);color:var(--iron)}}
+section{padding:56px 6vw;border-bottom:1px solid var(--seam)}
+section:nth-of-type(even){background:rgba(0,0,0,.18)}
+.so-sechead{display:grid;grid-template-columns:110px 1fr;gap:22px;align-items:end;margin-bottom:24px}
+.so-num{font:700 110px/.8 var(--disp);color:transparent;-webkit-text-stroke:2px var(--rust-d)}
+h2{font:700 clamp(32px,4.6vw,60px)/.95 var(--disp);text-transform:uppercase;margin:0}
+h2 small{display:block;font:400 14px/1.4 var(--mono);text-transform:none;color:var(--dim);margin-top:10px}
+h3{font:700 22px/1.1 var(--disp);text-transform:uppercase;letter-spacing:.04em;color:var(--brass);margin:0 0 10px}
+p{max-width:820px}
+.so-cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.3fr);gap:32px}
+.so-cols>*{min-width:0}
+.so-panel{background:var(--iron2);border:1px solid var(--seam);padding:20px;min-width:0}
+.so-callout{border-left:4px solid var(--rust);background:rgba(208,88,31,.07);padding:12px 16px;margin:16px 0;max-width:820px}
+.so-callout--green{border-color:var(--verd);background:rgba(79,176,160,.07)}
+.so-aside{font-size:13px;color:var(--ash)}
+
+.so-ctlrow{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;margin:4px 0 10px}
+.so-ctlhead{font-size:12px;color:var(--ash);min-width:90px}
+.so-seg{display:inline-flex;border:2px solid var(--seam);flex-wrap:wrap}
+.so-seg button{font:700 12px/1 var(--mono);letter-spacing:.03em;padding:9px 10px;border:0;border-right:1px solid var(--seam);background:transparent;color:var(--ash);cursor:pointer}
+.so-seg button:last-child{border-right:0}
+.so-seg button[aria-pressed=true]{background:var(--steel);color:var(--iron)}
+.so-palette{display:flex;flex-wrap:wrap;gap:6px;margin:4px 0 12px}
+.so-palette button{font:12px/1.2 var(--mono);padding:8px 10px;border:1px dashed var(--seam);background:var(--iron);color:var(--ash);cursor:pointer;text-align:left}
+.so-palette button b{color:var(--bone);font-weight:400}
+
+/* the chain */
+.so-chain{display:flex;flex-direction:column;gap:0}
+.so-node{border:2px solid var(--seam);background:var(--iron);padding:8px 10px;min-width:0}
+.so-node header{display:flex;flex-wrap:wrap;justify-content:space-between;gap:4px 10px;align-items:baseline}
+.so-node header b{font:700 17px/1 var(--disp);letter-spacing:.06em;text-transform:uppercase}
+.so-node header span{font-size:11px;color:var(--dim)}
+.so-node .so-what{font-size:12px;color:var(--ash);margin-top:4px;overflow-wrap:anywhere}
+.so-rm{font:700 14px/1 var(--mono);width:32px;height:28px;border:1px solid var(--seam);background:var(--iron2);color:var(--ash);cursor:pointer}
+.so-edge{margin:0 0 0 18px;padding:8px 0 8px 14px;border-left:3px solid var(--seam);font-size:12px}
+.so-edge.so-sorted{border-color:var(--moss)}
+.so-edge.so-lost{border-color:var(--blood)}
+.so-badge{display:inline-block;padding:2px 8px;border:1px solid currentColor;margin-right:6px;white-space:normal}
+.so-sorted .so-badge{color:var(--moss)} .so-lost .so-badge{color:var(--blood)} .so-none .so-badge{color:var(--dim)}
+.so-edge .so-why{color:var(--ash);display:block;margin-top:3px}
+.so-verdict{margin-top:10px;padding:10px 12px;font:700 22px/1.15 var(--disp);text-transform:uppercase;letter-spacing:.03em}
+.so-verdict--stream{background:var(--moss);color:var(--iron)}
+.so-verdict--hash{background:var(--brass);color:var(--iron)}
+.so-verdict--error{background:var(--blood);color:var(--iron)}
+.so-detail{font-size:13px;color:var(--ash);margin-top:6px}
+
+.so-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,250px),1fr));border:2px solid var(--seam)}
+.so-card{padding:16px 18px;border-right:1px solid var(--seam);border-bottom:1px solid var(--seam);min-width:0}
+.so-card h4{margin:0 0 6px;font:700 20px/1.05 var(--disp);text-transform:uppercase}
+.so-card p{font-size:13px;color:var(--ash);margin:0 0 6px}
+.so-card .so-k{font:700 11px var(--mono);letter-spacing:.12em;text-transform:uppercase}
+.so-k--keep{color:var(--moss)} .so-k--lose{color:var(--blood)}
+footer{padding:36px 6vw;color:var(--dim);font-size:12px}
+
+@media (max-width:980px){.so-cols{grid-template-columns:1fr}}
+@media (max-width:720px){
+  .so-sechead{grid-template-columns:1fr;gap:6px}.so-num{font-size:64px}
+  h2{font-size:clamp(28px,10vw,36px)}
+  section{padding:44px 5vw}
+  header.hero{padding:44px 5vw 28px}
+}
+@media (max-width:720px),(pointer:coarse){
+  .so-aside,.so-card p,footer,.so-ctlhead,.so-edge,.so-node .so-what,.so-detail,.so-palette button{font-size:14px}
+}
+/* 44px targets on touch screens, and on any narrow screen in case the pointer is misreported */
+@media (pointer:coarse),(max-width:720px){
+  .so-seg button,.so-palette button{min-height:44px}
+  .so-rm{width:44px;height:44px}
+  nav.so-toc a{display:flex;align-items:center;min-height:44px}
+  .so-kicker a{display:inline-block;line-height:44px}
+}
+@media (prefers-reduced-motion: reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="so-kicker">Clinker user guide · <a href="aggregate.html">← Aggregate Nodes</a></div>
+  <h1>Is my data<br><em>still sorted?</em></h1>
+  <p class="so-lede">A Source can declare that its rows arrive sorted. The planner follows that promise through every stage and uses it to run an Aggregate in <b>streaming</b> mode, one group at a time, instead of holding every group in memory. Some stages keep the promise and some break it, often without telling you. Build a pipeline and watch where it holds.</p>
+  <nav class="so-toc">
+    <a href="#build"><b>01</b>Follow the order</a>
+    <a href="#rules"><b>02</b>What keeps it</a>
+    <a href="#stream"><b>03</b>When an Aggregate streams</a>
+  </nav>
+</header>
+
+<!-- ============================ 01 ============================ -->
+<section id="build">
+  <div class="so-sechead"><div class="so-num">01</div><h2>Follow the order<small>Set up the Source, add stages, and see what the Aggregate gets</small></h2></div>
+  <div class="so-cols">
+    <div class="so-panel">
+      <h3>Source</h3>
+      <div class="so-ctlrow"><span class="so-ctlhead">sort_order</span><div class="so-seg" data-so-bind="sort"><button data-v="none">none</button><button data-v="dept">[department]</button><button data-v="dept_day">[department, day]</button><button data-v="day_dept">[day, department]</button></div></div>
+      <div class="so-ctlrow"><span class="so-ctlhead">files</span><div class="so-seg" data-so-bind="files"><button data-v="path">path: one file</button><button data-v="glob">glob: many files</button></div></div>
+      <div class="so-ctlrow"><span class="so-ctlhead">correlation_key</span><div class="so-seg" data-so-bind="ck"><button data-v="none">none</button><button data-v="department">department</button><button data-v="account">account</button></div></div>
+      <h3 style="margin-top:14px">Stages in between</h3>
+      <div class="so-aside" style="margin-bottom:6px">Tap to add; remove with ×.</div>
+      <div class="so-palette" data-so-palette></div>
+      <h3 style="margin-top:14px">Aggregate</h3>
+      <div class="so-ctlrow"><span class="so-ctlhead">group_by</span><div class="so-seg" data-so-bind="gb"><button data-v="dept">[department]</button><button data-v="dept_day">[department, day]</button><button data-v="day_dept">[day, department]</button><button data-v="day">[day]</button><button data-v="none">[] (one total)</button></div></div>
+      <div class="so-ctlrow"><span class="so-ctlhead">strategy</span><div class="so-seg" data-so-bind="strategy"><button data-v="auto">auto</button><button data-v="hash">hash</button><button data-v="streaming">streaming</button></div></div>
+    </div>
+    <div class="so-panel">
+      <div class="so-chain" data-so-chain></div>
+      <div data-so-verdict></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ 02 ============================ -->
+<section id="rules">
+  <div class="so-sechead"><div class="so-num">02</div><h2>What keeps it<small>Each stage either passes the order on or drops it</small></h2></div>
+  <div class="so-cards">
+    <div class="so-card"><h4>Transform</h4><p class="so-k so-k--keep">keeps it</p><p>…unless it writes a field the order is on, or uses <code>distinct</code>. <b>Writing the same value back counts:</b> <code>emit department = department</code> drops an order on <code>department</code>, because the planner looks at which fields a Transform writes, not at what it writes into them. Leave sort fields out of your <code>emit</code>s; every input field is carried through anyway.</p></div>
+    <div class="so-card"><h4>Route · composition</h4><p class="so-k so-k--keep">keeps it</p><p>A Route branch keeps its input's order, and so does a composition call.</p></div>
+    <div class="so-card"><h4>Merge</h4><p class="so-k so-k--lose">drops it</p><p>Always, even when every input is sorted the same way: two sorted inputs one after the other are not one sorted stream. It also joins the files of a multi-file Source into one stream.</p></div>
+    <div class="so-card"><h4>Combine · Reshape · Cull</h4><p class="so-k so-k--lose">drops it</p><p>A join's output has no defined order, whichever join method runs. Reshape and Cull reorder rows within each group.</p></div>
+    <div class="so-card"><h4>Correlation key</h4><p class="so-k so-k--keep">adds one</p><p>The Source's rows are sorted by the key first, unless its <code>sort_order</code> already starts with the key, so a later Aggregate grouped by the key can stream.</p></div>
+    <div class="so-card"><h4>Many files</h4><p class="so-k so-k--keep">per file</p><p>With <code>glob:</code>, <code>regex:</code> or <code>paths:</code>, each file is checked and sorted on its own; there is no order across files. An Aggregate can still stream: it works through each file separately.</p></div>
+  </div>
+  <div class="so-callout so-callout--green" style="margin-top:20px"><b>The order is checked.</b> A declared <code>sort_order</code> is verified for each file as it's read. With <code>on_unsorted: warn</code> (the default), a file that is out of order is sorted and a <code>W307</code> warning is written; with <code>error</code> the file is rejected. See <a href="source.html#sort-order">Source Nodes</a>.</div>
+</section>
+
+<!-- ============================ 03 ============================ -->
+<section id="stream">
+  <div class="so-sechead"><div class="so-num">03</div><h2>When an Aggregate streams<small>The first fields of the order must be exactly the group_by</small></h2></div>
+  <div class="so-cols">
+    <div>
+      <p>Take as many fields from the front of the order as there are <code>group_by</code> fields. If they are the same fields, in any order, the Aggregate can stream; its <code>group_by</code> is put in the order's order. Otherwise it uses hash aggregation, which holds every group until its input ends.</p>
+      <ul class="so-aside">
+        <li>Order <code>[department, day]</code> streams <code>group_by: [department]</code> and <code>[day, department]</code>, but not <code>[day]</code>: the first field is <code>department</code>.</li>
+        <li>An Aggregate with no <code>group_by</code> (one total) always streams.</li>
+        <li><code>strategy: auto</code> (the default) falls back to hash quietly. <code>strategy: streaming</code> turns that fallback into an error (<code>CXL0419</code>) when the pipeline is checked, which is how you catch a change that broke the order.</li>
+        <li><code>strategy: hash</code> always uses hash aggregation.</li>
+      </ul>
+    </div>
+    <div class="so-panel">
+<pre data-so-yaml></pre>
+    </div>
+  </div>
+</section>
+
+<footer>The rules on this page follow the planner's order analysis (<code>crates/clinker-plan/src/plan/execution/scheduling.rs</code>) and the streaming test (<code>crates/clinker-plan/src/plan/streaming_eligibility.rs</code>). The page reproduces them in your browser; it does not run the engine.</footer>
+
+<script>
+"use strict";
+const SORTS={none:null,dept:["department"],dept_day:["department","day"],day_dept:["day","department"]};
+const GBS={dept:["department"],dept_day:["department","day"],day_dept:["day","department"],day:["day"],none:[]};
+const STAGES={
+  t_amount:{kind:"Transform",label:"Transform: emit amount_usd = amount * rate",writes:["amount_usd"]},
+  t_ident:{kind:"Transform",label:"Transform: emit department = department",writes:["department"]},
+  t_day:{kind:"Transform",label:"Transform: emit day = day.trim()",writes:["day"]},
+  t_distinct:{kind:"Transform",label:"Transform with distinct",writes:[],distinct:true},
+  route:{kind:"Route",label:"Route (one branch read)"},
+  comp:{kind:"Composition",label:"Composition call"},
+  merge:{kind:"Merge",label:"Merge with another Source"},
+  combine:{kind:"Combine",label:"Combine with a lookup"},
+  reshape:{kind:"Reshape",label:"Reshape"},
+};
+const S={sort:"dept_day",files:"path",ck:"none",stages:["t_amount"],gb:"dept",strategy:"auto"};
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const $=(s,r=document)=>r.querySelector(s);
+const list=a=>"["+a.join(", ")+"]";
+
+/* Port of the per-node order rules (scheduling.rs compute_one). Returns the
+   order after the Source and after each stage. */
+function analyse(){
+  const steps=[];
+  let sort=SORTS[S.sort]?SORTS[S.sort].slice():null, perFile=S.files==="glob", why;
+  why=sort?`declared on the Source`:"the Source declares no sort_order";
+  if(S.ck!=="none"){
+    const ck=[S.ck];
+    if(!(sort&&ck.every((f,i)=>sort[i]===f))){
+      const rest=(sort||[]).filter(f=>!ck.includes(f));
+      sort=ck.concat(rest); why=`the correlation key adds a sort on ${S.ck}${rest.length?", then the rest of sort_order":""}`;
+    } else why+=", and it already starts with the correlation key";
+  }
+  steps.push({name:"source",sort,perFile,why,lost:false});
+  for(const id of S.stages){
+    const st=STAGES[id]; const prev=steps[steps.length-1]; let s=prev.sort, pf=prev.perFile, w, lost=false;
+    if(st.kind==="Transform"){
+      if(st.distinct&&s){ s=null; lost=true; w="distinct drops the order"; }
+      else if(s&&st.writes.some(f=>s.includes(f))){ const hit=st.writes.filter(f=>s.includes(f)); s=null; lost=true; w=`it writes ${hit.join(", ")}, a field the order is on`; }
+      else w=s?"it writes no field the order is on":"no order to keep";
+    } else if(st.kind==="Route"||st.kind==="Composition"){ w=s?"passes the order on":"no order to keep"; }
+    else if(st.kind==="Merge"){ lost=!!s; s=null; pf=false; w="a Merge never keeps an order, and joins the files into one stream"; }
+    else if(st.kind==="Combine"){ lost=!!s; s=null; w="a Combine's output has no defined order"; }
+    else if(st.kind==="Reshape"){ lost=!!s; s=null; w="Reshape reorders rows within groups"; }
+    steps.push({name:st.label,sort:s,perFile:pf,why:w,lost});
+  }
+  return steps;
+}
+/* Port of qualifies_for_streaming + the auto/hash/streaming resolution. */
+function aggregate(input,steps){
+  const gb=GBS[S.gb]; let elig;
+  const lostAt=[...steps].reverse().find(s=>s.lost);
+  if(gb.length===0) elig={ok:true,eff:[],why:"an Aggregate with no group_by always streams"};
+  else if(!input.sort) elig={ok:false,why:lostAt?`the order was lost at "${lostAt.name}": ${lostAt.why}`:"its input has no order"};
+  else if(input.sort.length<gb.length) elig={ok:false,why:`the order ${list(input.sort)} has fewer fields than group_by ${list(gb)}`};
+  else { const pre=input.sort.slice(0,gb.length);
+    const same=pre.length===gb.length&&pre.every(f=>gb.includes(f))&&gb.every(f=>pre.includes(f));
+    elig=same?{ok:true,eff:pre,why:`the first ${gb.length===1?"field":gb.length+" fields"} of the order, ${list(pre)}, ${gb.length===1?"is":"are"} the group_by`}
+             :{ok:false,why:`the first ${gb.length===1?"field":gb.length+" fields"} of the order, ${list(pre)}, ${gb.length===1?"is":"are"} not the group_by ${list(gb)}`}; }
+  if(S.strategy==="hash") return {cls:"hash",title:"hash aggregation",detail:"strategy: hash always holds every group until the input ends."+(elig.ok?" Streaming would have been possible here.":"")};
+  if(elig.ok) return {cls:"stream",title:"streams",detail:`Because ${elig.why}. One group is held at a time.`+(gb.length&&list(elig.eff)!==list(gb)?` Its group_by is used in the order's order: ${list(elig.eff)}.`:"")+(input.perFile&&gb.length?" Each file is aggregated on its own.":"")};
+  if(S.strategy==="streaming") return {cls:"error",title:"rejected: CXL0419",detail:`strategy: streaming requires sorted input, but ${elig.why}. The pipeline fails when it is checked, before any data is read.`};
+  return {cls:"hash",title:"hash aggregation (quietly)",detail:`Because ${elig.why}, auto falls back to hash aggregation without a message. Every group is held until the input ends.`};
+}
+function render(){
+  document.querySelectorAll("[data-so-bind] button").forEach(b=>b.setAttribute("aria-pressed",String(S[b.parentElement.dataset.soBind]===b.dataset.v)));
+  $("[data-so-palette]").innerHTML=Object.entries(STAGES).map(([k,s])=>`<button data-so-add="${k}">+ <b>${esc(s.label)}</b></button>`).join("");
+  const steps=analyse(), last=steps[steps.length-1], v=aggregate(last,steps);
+  const badge=s=>s.sort?`<span class="so-badge">sorted by ${list(s.sort)}${s.perFile?", within each file":""}</span>`:`<span class="so-badge">${s.lost?"order lost":"no order"}</span>`;
+  const ecls=s=>s.sort?"so-sorted":s.lost?"so-lost":"so-none";
+  let html=`<div class="so-node"><header><b>orders</b><span>Source · ${S.files==="glob"?"glob: orders-*.csv":"path: orders.csv"}</span></header><div class="so-what">sort_order: ${SORTS[S.sort]?list(SORTS[S.sort]):"none"}${S.ck!=="none"?` · correlation_key: ${S.ck}`:""}</div></div>`;
+  html+=`<div class="so-edge ${ecls(steps[0])}">${badge(steps[0])}<span class="so-why">${esc(steps[0].why)}</span></div>`;
+  steps.slice(1).forEach((s,i)=>{
+    html+=`<div class="so-node"><header><b>${esc(STAGES[S.stages[i]].kind)}</b><button class="so-rm" data-so-rm="${i}" aria-label="remove stage">×</button></header><div class="so-what">${esc(s.name)}</div></div>`;
+    html+=`<div class="so-edge ${ecls(s)}">${badge(s)}<span class="so-why">${esc(s.why)}</span></div>`;
+  });
+  html+=`<div class="so-node"><header><b>Aggregate</b><span>group_by ${list(GBS[S.gb])} · strategy: ${S.strategy}</span></header></div>`;
+  $("[data-so-chain]").innerHTML=html;
+  $("[data-so-verdict]").innerHTML=`<div class="so-verdict so-verdict--${v.cls}">${esc(v.title)}</div><div class="so-detail">${esc(v.detail)}</div>`;
+  const so=SORTS[S.sort];
+  $("[data-so-yaml]").textContent=`- type: source\n  name: orders\n  config:\n    ${S.files==="glob"?"glob: ./orders-*.csv":"path: ./orders.csv"}\n`+(so?`    sort_order:\n${so.map(f=>`      - { field: ${f}, order: asc }`).join("\n")}\n`:"")+(S.ck!=="none"?`    correlation_key: ${S.ck}\n`:"")+
+    `    …\n\n- type: aggregate\n  name: totals\n  config:\n    group_by: ${list(GBS[S.gb])}\n    strategy: ${S.strategy}\n\n# → ${v.title}`;
+}
+document.addEventListener("click",e=>{
+  const b=e.target.closest("[data-so-bind] button"); if(b){ S[b.parentElement.dataset.soBind]=b.dataset.v; render(); return; }
+  const a=e.target.closest("[data-so-add]"); if(a){ if(S.stages.length<5) S.stages.push(a.dataset.soAdd); render(); return; }
+  const r=e.target.closest("[data-so-rm]"); if(r){ S.stages.splice(+r.dataset.soRm,1); render(); }
+});
+render();
+</script>
+</body>
+</html>

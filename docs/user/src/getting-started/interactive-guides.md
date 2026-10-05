@@ -24,6 +24,12 @@ Where `$doc.*` values come from, how each file becomes its own document with
 its own Aggregate roll-up, and what `dlq_granularity: document` rejects.
 Reference: [Document Envelope Context](../pipelines/envelope-and-doc-context.md).
 
+## [Is my data still sorted?](../nodes/sort-order-explainer.html)
+
+Which stages keep a Source's declared `sort_order` and which drop it, and when
+an Aggregate can stream instead of holding every group. Reference:
+[Aggregate Nodes](../nodes/aggregate.md) and [Source Nodes](../nodes/source.md#sort-order).
+
 ## [Route and Merge](../nodes/route-merge-explainer.html)
 
 Where each record goes when a Route's conditions are true, not true, or fail,
