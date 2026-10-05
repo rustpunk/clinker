@@ -1606,127 +1606,128 @@ fn run_streaming_combine_probe(
     let probe_result: Result<(), PipelineError> = std::thread::scope(|scope| {
         let handle = scope.spawn(|| -> Result<(), PipelineError> {
             let mut probe = || -> Result<(), PipelineError> {
-            let mut probe_keys_buf: Vec<Value> = Vec::with_capacity(kernel.probe_extractor.len());
-            let mut budget_cadence: usize = 0;
-            while let Ok(event) = rx.recv() {
-                let (record, rn) = match event {
-                    StreamEvent::Record(r, rn) => (r, rn),
-                    // Punctuations carry zero record charge (no `sub_bytes`
-                    // discharge, no `input_count` increment), so collect them
-                    // for post-join reconciliation with the build side rather
-                    // than dropping them. The driver's document boundaries
-                    // must reach a downstream per-document consumer.
-                    StreamEvent::Punctuation(p) => {
-                        driver_puncts.push(p);
-                        continue;
-                    }
-                };
-                // Discharge this record's per-row cost — the consume half of
-                // the driver's per-batch admit. The formula matches the
-                // charge so a fully-drained stream nets to zero.
-                charge_handle.sub_bytes(
-                    crate::executor::node_buffer::unaccounted_record_byte_cost(
-                        &record,
-                        &allocation_resources,
-                    ),
-                );
-                input_count += 1;
+                let mut probe_keys_buf: Vec<Value> =
+                    Vec::with_capacity(kernel.probe_extractor.len());
+                let mut budget_cadence: usize = 0;
+                while let Ok(event) = rx.recv() {
+                    let (record, rn) = match event {
+                        StreamEvent::Record(r, rn) => (r, rn),
+                        // Punctuations carry zero record charge (no `sub_bytes`
+                        // discharge, no `input_count` increment), so collect them
+                        // for post-join reconciliation with the build side rather
+                        // than dropping them. The driver's document boundaries
+                        // must reach a downstream per-document consumer.
+                        StreamEvent::Punctuation(p) => {
+                            driver_puncts.push(p);
+                            continue;
+                        }
+                    };
+                    // Discharge this record's per-row cost — the consume half of
+                    // the driver's per-batch admit. The formula matches the
+                    // charge so a fully-drained stream nets to zero.
+                    charge_handle.sub_bytes(
+                        crate::executor::node_buffer::unaccounted_record_byte_cost(
+                            &record,
+                            &allocation_resources,
+                        ),
+                    );
+                    input_count += 1;
 
-                let source_file_arc = source_file_arc_of(&record);
-                let source_name_arc = source_name_arc_of(&record);
+                    let source_file_arc = source_file_arc_of(&record);
+                    let source_name_arc = source_name_arc_of(&record);
 
-                // Operator-entry schema check, mirroring the materialized
-                // driver-side `check_input_schema` loop.
-                if let Err(err) = check_input_schema(
-                    &expected_input,
-                    record.schema(),
-                    name,
-                    "combine",
-                    &upstream_name,
-                ) {
-                    // A schema mismatch is a fatal E314 in both paths; drain
-                    // to disconnect first so the driver `send` cannot
-                    // deadlock, then surface.
-                    drain_probe_channel(&rx, &charge_handle, &allocation_resources);
-                    return Err(err);
-                }
-
-                // Track the driver source on first sight (for the post-join
-                // pre-fold floor capture) and record the cursor advance for
-                // replay.
-                if !effects
-                    .driver_sources
-                    .iter()
-                    .any(|s| Arc::ptr_eq(s, &source_name_arc))
-                {
-                    effects.driver_sources.push(Arc::clone(&source_name_arc));
-                }
-                effects
-                    .cursor_advances
-                    .push((Arc::clone(&source_name_arc), rn));
-
-                // Mid-stream `$source.count` is `None` (the driver total is
-                // unknown until disconnect) — the same defer-emit semantic
-                // the streaming Aggregate ingest uses.
-                let eval_ctx = EvalContext {
-                    stable,
-                    source_file: &source_file_arc,
-                    source_row: rn.ordinal(),
-                    source_path: &source_file_arc,
-                    source_count: None,
-                    source_batch: source_batch_arc,
-                    ingestion_timestamp,
-                    source_name: &source_name_arc,
-                    doc_ctx: record.doc_ctx(),
-                };
-
-                let before = output_records.len();
-                match kernel.probe_row(
-                    &eval_ctx,
-                    &record,
-                    rn,
-                    &mut probe_keys_buf,
-                    ProbeSink {
-                        rows: &mut output_records,
-                        failures: &mut effects.failures,
-                        counters: &mut counters,
-                    },
-                ) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        // Fatal (FailFast surfacing, on_miss::error,
-                        // planner-invariant) — drain to disconnect, then
-                        // surface.
-                        drain_probe_channel(&rx, &charge_handle, &allocation_resources);
-                        return Err(e);
-                    }
-                };
-
-                // The opt-in `max_output_rows` cap (E325) is enforced per-row inside
-                // `kernel.probe_row`; when it trips, `probe_row` returns `Err`, which
-                // the match above already surfaces after draining the channel — so
-                // the streaming path is covered without a separate check here.
-
-                // Charge the failures this driver added before the budget
-                // check, so the check sees them. They are held until the
-                // join, not written as the materialized loop writes its own.
-                let new_failures = effects.charge_new_failures(held, &allocation_resources);
-
-                // Budget check every 10K emitted or failed records, the same
-                // cadence and abort the materialized loop uses.
-                budget_cadence += output_records.len() - before + new_failures;
-                if budget_cadence >= 10_000 && budget.should_abort() {
-                    drain_probe_channel(&rx, &charge_handle, &allocation_resources);
-                    return Err(budget.backstop_refusal(
+                    // Operator-entry schema check, mirroring the materialized
+                    // driver-side `check_input_schema` loop.
+                    if let Err(err) = check_input_schema(
+                        &expected_input,
+                        record.schema(),
                         name,
-                        clinker_plan::runtime_error::MemorySurface::JoinState,
-                    ));
+                        "combine",
+                        &upstream_name,
+                    ) {
+                        // A schema mismatch is a fatal E314 in both paths; drain
+                        // to disconnect first so the driver `send` cannot
+                        // deadlock, then surface.
+                        drain_probe_channel(&rx, &charge_handle, &allocation_resources);
+                        return Err(err);
+                    }
+
+                    // Track the driver source on first sight (for the post-join
+                    // pre-fold floor capture) and record the cursor advance for
+                    // replay.
+                    if !effects
+                        .driver_sources
+                        .iter()
+                        .any(|s| Arc::ptr_eq(s, &source_name_arc))
+                    {
+                        effects.driver_sources.push(Arc::clone(&source_name_arc));
+                    }
+                    effects
+                        .cursor_advances
+                        .push((Arc::clone(&source_name_arc), rn));
+
+                    // Mid-stream `$source.count` is `None` (the driver total is
+                    // unknown until disconnect) — the same defer-emit semantic
+                    // the streaming Aggregate ingest uses.
+                    let eval_ctx = EvalContext {
+                        stable,
+                        source_file: &source_file_arc,
+                        source_row: rn.ordinal(),
+                        source_path: &source_file_arc,
+                        source_count: None,
+                        source_batch: source_batch_arc,
+                        ingestion_timestamp,
+                        source_name: &source_name_arc,
+                        doc_ctx: record.doc_ctx(),
+                    };
+
+                    let before = output_records.len();
+                    match kernel.probe_row(
+                        &eval_ctx,
+                        &record,
+                        rn,
+                        &mut probe_keys_buf,
+                        ProbeSink {
+                            rows: &mut output_records,
+                            failures: &mut effects.failures,
+                            counters: &mut counters,
+                        },
+                    ) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            // Fatal (FailFast surfacing, on_miss::error,
+                            // planner-invariant) — drain to disconnect, then
+                            // surface.
+                            drain_probe_channel(&rx, &charge_handle, &allocation_resources);
+                            return Err(e);
+                        }
+                    };
+
+                    // The opt-in `max_output_rows` cap (E325) is enforced per-row inside
+                    // `kernel.probe_row`; when it trips, `probe_row` returns `Err`, which
+                    // the match above already surfaces after draining the channel — so
+                    // the streaming path is covered without a separate check here.
+
+                    // Charge the failures this driver added before the budget
+                    // check, so the check sees them. They are held until the
+                    // join, not written as the materialized loop writes its own.
+                    let new_failures = effects.charge_new_failures(held, &allocation_resources);
+
+                    // Budget check every 10K emitted or failed records, the same
+                    // cadence and abort the materialized loop uses.
+                    budget_cadence += output_records.len() - before + new_failures;
+                    if budget_cadence >= 10_000 && budget.should_abort() {
+                        drain_probe_channel(&rx, &charge_handle, &allocation_resources);
+                        return Err(budget.backstop_refusal(
+                            name,
+                            clinker_plan::runtime_error::MemorySurface::JoinState,
+                        ));
+                    }
+                    if budget_cadence >= 10_000 {
+                        budget_cadence = 0;
+                    }
                 }
-                if budget_cadence >= 10_000 {
-                    budget_cadence = 0;
-                }
-            }
-            Ok(())
+                Ok(())
             };
             // A governed allocation this worker was refused ends the probe
             // here, on the thread that recorded the refusal's report.

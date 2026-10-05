@@ -2635,29 +2635,30 @@ fn run_grace_arrival_order(
         .tempdir()
         .unwrap();
     let stats_catalog = fresh_stats_catalog();
-    execute_combine_grace_hash(GraceHashExec {
-        name: "grace_arrival_order",
-        build_qualifier: "products",
-        driver_records: drivers,
-        build_records: crate::test_support::with_build_row_ids(builds),
-        decomposed: &decomposed,
-        body_program: None,
-        resolver_mapping: &resolver_mapping,
-        output_schema: Some(&combined_schema),
-        match_mode,
-        on_miss: clinker_plan::config::pipeline_node::OnMiss::Skip,
-        max_output_rows: None,
-        partition_bits: 2,
-        propagate_ck: &clinker_plan::config::pipeline_node::PropagateCkSpec::Driver,
-        ctx: &ctx,
-        budget,
-        spill_dir: dir.path(),
-        spill_compress: true,
-        consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
-        strategy: clinker_plan::config::ErrorStrategy::FailFast,
-        stats_sink: test_stats_sink(&stats_catalog, "products", "products"),
-    },
-    crate::test_support::test_kernel_pool(),
+    execute_combine_grace_hash(
+        GraceHashExec {
+            name: "grace_arrival_order",
+            build_qualifier: "products",
+            driver_records: drivers,
+            build_records: crate::test_support::with_build_row_ids(builds),
+            decomposed: &decomposed,
+            body_program: None,
+            resolver_mapping: &resolver_mapping,
+            output_schema: Some(&combined_schema),
+            match_mode,
+            on_miss: clinker_plan::config::pipeline_node::OnMiss::Skip,
+            max_output_rows: None,
+            partition_bits: 2,
+            propagate_ck: &clinker_plan::config::pipeline_node::PropagateCkSpec::Driver,
+            ctx: &ctx,
+            budget,
+            spill_dir: dir.path(),
+            spill_compress: true,
+            consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
+            strategy: clinker_plan::config::ErrorStrategy::FailFast,
+            stats_sink: test_stats_sink(&stats_catalog, "products", "products"),
+        },
+        crate::test_support::test_kernel_pool(),
     )
     .expect("grace hash arrival-order run")
     .records

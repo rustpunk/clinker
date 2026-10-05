@@ -3771,8 +3771,7 @@ mod tests {
                     report.requester,
                     Some(clinker_plan::runtime_error::ConsumerLabel {
                         node: "route_x".to_string(),
-                        surface:
-                            clinker_plan::runtime_error::MemorySurface::DeadLetteredRowSet,
+                        surface: clinker_plan::runtime_error::MemorySurface::DeadLetteredRowSet,
                     }),
                     "the report names the node that failed the document and its row set"
                 );
