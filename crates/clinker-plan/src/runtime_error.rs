@@ -445,6 +445,17 @@ impl std::fmt::Display for Bytes {
     }
 }
 
+/// A list of node names, each quoted the one way every diagnostic quotes a
+/// name, joined for one line of the report.
+fn quoted_names(names: &[String]) -> String {
+    use clinker_core_types::QuoteName;
+    names
+        .iter()
+        .map(|name| name.as_str().quoted_name().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The section of `clinker explain --code E310` that covers state of this
 /// kind, when there is one.
 fn fix_section(surface: &MemorySurface) -> Option<&'static str> {
@@ -471,12 +482,14 @@ fn fix_section(surface: &MemorySurface) -> Option<&'static str> {
 
 impl std::fmt::Display for MemoryShortfallReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use clinker_core_types::QuoteName;
         self.write_headline(f)?;
         if let Some(first) = &self.group_first_row {
             write!(
                 f,
                 "\n  group: the one whose first row is row {} of source {}",
-                first.row, first.source
+                first.row,
+                first.source.quoted_name()
             )?;
         }
         match self.join_partition_distinct_keys {
@@ -511,7 +524,7 @@ impl std::fmt::Display for MemoryShortfallReport {
                 write!(
                     f,
                     "\n    {}  {}  {}  {}",
-                    holder.node,
+                    holder.node.quoted_name(),
                     holder.surface,
                     Bytes(holder.bytes),
                     holder.state
@@ -553,7 +566,7 @@ impl std::fmt::Display for MemoryShortfallReport {
                     }
                 )?;
                 if !round.holders_asked.is_empty() {
-                    write!(f, " ({})", round.holders_asked.join(", "))?;
+                    write!(f, " ({})", quoted_names(&round.holders_asked))?;
                 }
                 write!(
                     f,
@@ -567,7 +580,7 @@ impl std::fmt::Display for MemoryShortfallReport {
                     }
                 )?;
                 if !round.sources_paused.is_empty() {
-                    write!(f, " ({})", round.sources_paused.join(", "))?;
+                    write!(f, " ({})", quoted_names(&round.sources_paused))?;
                 }
             }
         }
@@ -618,7 +631,7 @@ impl std::fmt::Display for MemoryShortfallReport {
             write!(
                 f,
                 "\n  remedy: {}'s {} holds {} and {}",
-                holder.node,
+                holder.node.quoted_name(),
                 holder.surface,
                 Bytes(holder.bytes),
                 if holder.state == HolderState::CannotSpill {
@@ -635,7 +648,8 @@ impl std::fmt::Display for MemoryShortfallReport {
                 f,
                 "\n  remedy: {}'s {} cannot fit the limit in one piece; see \"{section}\" in \
                  clinker explain --code E310",
-                requester.node, requester.surface
+                requester.node.quoted_name(),
+                requester.surface
             )?;
         }
         // The charged state fills the limit only in the ledger form; under a
@@ -654,9 +668,10 @@ impl std::fmt::Display for MemoryShortfallReport {
 
 impl MemoryShortfallReport {
     fn write_headline(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use clinker_core_types::QuoteName;
         f.write_str("E310")?;
         if let Some(requester) = &self.requester {
-            write!(f, " {}", requester.node)?;
+            write!(f, " {}", requester.node.quoted_name())?;
         }
         f.write_str(": ")?;
         if let LimitReading::ProcessMemory {
@@ -670,7 +685,12 @@ impl MemoryShortfallReport {
                 Bytes(self.limit_bytes)
             )?;
             if let Some(requester) = &self.requester {
-                write!(f, ", while {} held {}", requester.node, requester.surface)?;
+                write!(
+                    f,
+                    ", while {} held {}",
+                    requester.node.quoted_name(),
+                    requester.surface
+                )?;
             }
             return write!(f, "; the run had charged {}", Bytes(self.charged_bytes));
         }
@@ -808,18 +828,18 @@ mod tests {
         let rendered = process_memory_report().to_string();
         assert_eq!(
             rendered,
-            "E310 enrich: process memory peaked at 12.0 MiB resident, over memory.limit \
-             8.0 MiB, while enrich held join build side; the run had charged 3.0 MiB\
+            "E310 \"enrich\": process memory peaked at 12.0 MiB resident, over memory.limit \
+             8.0 MiB, while \"enrich\" held join build side; the run had charged 3.0 MiB\
              \n  charged 3.0 MiB of 8.0 MiB (37%)\
              \n  largest holders:\
-             \n    enrich  join build side  3.0 MiB  cannot spill\
+             \n    \"enrich\"  join build side  3.0 MiB  cannot spill\
              \n  reclaim: none attempted\
              \n  fix: raise the limit to at least 12M — process memory reached 12.0 MiB; \
              later stages may need more\
              \n    pipeline:\
              \n      memory: { limit: \"12M\" }\
              \n    or: --memory-limit 12M\
-             \n  remedy: enrich's join build side holds 3.0 MiB and cannot be spilled; see \
+             \n  remedy: \"enrich\"'s join build side holds 3.0 MiB and cannot be spilled; see \
              \"Join build side\" in clinker explain --code E310\
              \n  See: clinker explain --code E310"
         );
