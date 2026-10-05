@@ -247,3 +247,90 @@ fn port_feeder_over_hard_limit_completes_through_spill() {
         assert!(rows.contains(&format!("id_{i}").as_str()));
     }
 }
+
+/// A composition port whose producer's rows were spilled re-charges them at
+/// the call site when the call takes them into memory. Refused, its E310
+/// names what it was reserving: the rows buffered from the producer into
+/// the call site, not rows collected for a full scan.
+///
+/// The run is held to a 256 KiB test capacity, reading no process memory so
+/// only the charged total can refuse. The Source's 4,000 rows of about
+/// 100 bytes spill as they are buffered for the call, and loading them back
+/// needs more than the whole capacity, so the re-charge itself is refused.
+#[test]
+fn a_composition_port_recharge_shortfall_names_the_rows_it_buffers() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let comp_dir = workspace.path().join("compositions");
+    std::fs::create_dir_all(&comp_dir).expect("mkdir compositions");
+    std::fs::write(comp_dir.join("port_passthrough.comp.yaml"), BODY_YAML)
+        .expect("write composition body fixture");
+    std::fs::create_dir_all(workspace.path().join("pipelines")).expect("mkdir pipelines");
+    let ctx = clinker_plan::config::CompileContext::with_pipeline_dir(
+        workspace.path().to_path_buf(),
+        PathBuf::from("pipelines"),
+    );
+    let config = clinker_plan::config::parse_config(PIPELINE_YAML).expect("parse pipeline YAML");
+    let mut csv = String::from("id\n");
+    for i in 0..4000 {
+        csv.push_str(&format!("id_{i:0100}\n"));
+    }
+    let readers: crate::executor::SourceReaders = HashMap::from([(
+        "src".to_string(),
+        crate::executor::single_file_reader(
+            "src.csv",
+            Box::new(std::io::Cursor::new(csv.into_bytes())),
+        ),
+    )]);
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(SharedBuffer::new()) as Box<dyn std::io::Write + Send>,
+    )]);
+    let capacity = 256 * 1024;
+    let params = PipelineRunParams {
+        execution_id: "composition-port-recharge".to_string(),
+        batch_id: "batch-0".to_string(),
+        memory_test: crate::executor::MemoryTestOverrides::default()
+            .with_ledger_capacity(capacity)
+            .with_no_process_memory(),
+        ..Default::default()
+    };
+
+    let err = PipelineExecutor::run_with_readers_writers_in_context(
+        &config,
+        readers,
+        writers.into(),
+        &params,
+        ctx,
+    )
+    .expect_err("the port's rows cannot be loaded back within the capacity");
+
+    // Refused at the call site, the report is bare: the call-site name is
+    // its requester.
+    let PipelineError::MemoryBudgetExceeded { report } = &err else {
+        panic!("the port re-charge must fail with a bare E310; got {err:?}");
+    };
+    assert_eq!(
+        report.requester,
+        Some(clinker_plan::runtime_error::ConsumerLabel {
+            node: "port_enrich_call".to_string(),
+            surface: clinker_plan::runtime_error::MemorySurface::BufferedRows {
+                from: "src".to_string(),
+                to: vec!["port_enrich_call".to_string()],
+            },
+        }),
+        "the requester names the rows buffered from the producer into the call: {report:?}"
+    );
+    assert!(
+        report.requested_bytes > capacity,
+        "the refused request is the port's re-charge, more than the capacity: {report:?}"
+    );
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("rows buffered between \"src\" and \"port_enrich_call\""),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("rows collected for a full scan"),
+        "the port's rows are not a full scan: {rendered}"
+    );
+}
