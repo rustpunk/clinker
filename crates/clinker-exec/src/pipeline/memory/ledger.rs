@@ -896,6 +896,27 @@ impl MemoryArbitrator {
         }
     }
 
+    /// The one check every hard-limit backstop makes: `node`, holding
+    /// `surface` for `requester`, is about to hold `uncharged` bytes no
+    /// consumer has charged yet (0 for a check made after the fact).
+    pub(crate) fn check_hard_limit(
+        &self,
+        node: &str,
+        surface: MemorySurface,
+        requester: Requester,
+        uncharged: u64,
+    ) -> Result<(), Box<MemoryShortfallReport>> {
+        let _ = requester;
+        if !self.should_abort_local(uncharged) {
+            return Ok(());
+        }
+        Err(if uncharged > 0 {
+            self.refusal_report(node, surface, uncharged)
+        } else {
+            self.backstop_report(node, surface)
+        })
+    }
+
     /// High-water mark of `id`'s handle bytes plus the bytes granted in its
     /// name, raised by every charge to it and never lowered by a release.
     /// `None` when the ledger holds no entry for `id`, as after any
@@ -3652,6 +3673,159 @@ mod walk_pass_tests {
             ),
             "{text}"
         );
+    }
+
+    const GIB: u64 = 1024 * MIB;
+
+    /// The limit the backstop tests run under. The check samples the
+    /// process's resident memory, so its limit sits far above what a test
+    /// process holds; the charges that cross it are handle figures, never
+    /// allocations.
+    const BACKSTOP_LIMIT: u64 = 8 * GIB;
+
+    #[test]
+    fn a_projection_onto_a_ledger_past_its_limit_does_not_fit() {
+        let arbitrator = run(MIB, Box::new(Priority));
+        let (_, handle) = register(&arbitrator, "grown", 0, MIB + KIB);
+        assert!(
+            arbitrator.charged_bytes() > MIB,
+            "an unchecked growth carried the charged total past the limit"
+        );
+        let refused = arbitrator
+            .projection_fits(0, governed())
+            .expect_err("nothing more fits a ledger already past its limit");
+        assert_eq!(refused.requested, 0);
+        assert_eq!(refused.snapshot.charged, MIB + KIB);
+
+        handle.set_bytes(512 * KIB);
+        arbitrator
+            .projection_fits(512 * KIB, governed())
+            .expect("a projection that fits beside the charged total still fits");
+        arbitrator
+            .projection_fits(512 * KIB + 1, governed())
+            .expect_err("one byte past the limit does not fit");
+    }
+
+    #[test]
+    fn a_backstop_on_the_walk_reclaims_before_it_refuses() {
+        let arbitrator = run(BACKSTOP_LIMIT, Box::new(Priority));
+        let (owner, owner_handle) = register(&arbitrator, "owner", 0, 2 * GIB);
+        let (_, grown_handle) = register(&arbitrator, "grown", 0, 7 * GIB);
+        assert_eq!(arbitrator.charged_bytes(), 9 * GIB);
+
+        let set = empty_set();
+        let _walk = walk(&arbitrator, &set);
+        let script = Scripted::default().resident(owner, &owner_handle).shared();
+        scripted(&script, || {
+            arbitrator.check_hard_limit(
+                "enrich",
+                MemorySurface::JoinBuildSide,
+                governed(),
+                0,
+            )
+        })
+        .expect("spilling the walk-owned owner brings the run back within its limit");
+        assert_eq!(script.borrow().spilled, vec![owner]);
+        assert_eq!(owner_handle.bytes(), 0);
+        assert_eq!(arbitrator.charged_bytes(), 7 * GIB);
+        assert!(arbitrator.charged_bytes() <= BACKSTOP_LIMIT);
+        drop(grown_handle);
+    }
+
+    #[test]
+    fn a_backstop_refusal_reports_its_real_request_and_one_floor() {
+        let arbitrator = run(BACKSTOP_LIMIT, Box::new(Priority));
+        register(&arbitrator, "grown", 0, 9 * GIB);
+        let set = empty_set();
+        let _walk = walk(&arbitrator, &set);
+        let script = Scripted::default().shared();
+
+        // Checked after the fact: the run is past its limit and asked for
+        // nothing more.
+        let report = scripted(&script, || {
+            arbitrator.check_hard_limit(
+                "enrich",
+                MemorySurface::JoinBuildSide,
+                governed(),
+                0,
+            )
+        })
+        .expect_err("nothing the walk owns can spill");
+        assert_eq!(report.reading, LimitReading::Charged, "{report:?}");
+        assert_eq!(report.charged_bytes, 9 * GIB);
+        assert_eq!(report.requested_bytes, 0, "no request was made");
+        assert_eq!(
+            report.suggested_limit_bytes,
+            9 * GIB,
+            "the floor is the charged total rounded up, the overage counted once"
+        );
+        assert!(!report.oversized, "no request was measured");
+        let rendered = report.to_string();
+        assert!(
+            rendered.starts_with(
+                "E310 \"enrich\": the run held 9.0 GiB, over memory.limit 8.0 GiB, while \
+                 \"enrich\" held join build side and nothing more could be spilled\n"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("needed"), "{rendered}");
+        assert!(rendered.contains("at least 9G"), "{rendered}");
+
+        // The same check with 2 GiB the site was about to hold.
+        let report = scripted(&script, || {
+            arbitrator.check_hard_limit(
+                "enrich",
+                MemorySurface::JoinBuildSide,
+                governed(),
+                2 * GIB,
+            )
+        })
+        .expect_err("nothing the walk owns can spill");
+        assert_eq!(report.requested_bytes, 2 * GIB);
+        assert_eq!(
+            report.suggested_limit_bytes,
+            11 * GIB,
+            "the charged total plus the request, rounded up"
+        );
+    }
+
+    #[test]
+    fn a_process_memory_trip_reports_process_memory_not_the_ledger() {
+        let arbitrator = run(BACKSTOP_LIMIT, Box::new(Priority));
+        let (_, handle) = register(&arbitrator, "enrich", 0, MIB);
+        let peak = 9 * GIB;
+        arbitrator.set_peak_rss_for_test(peak);
+
+        // The charged total plus the projection fits; only the process's
+        // reading is over the limit.
+        let report = arbitrator
+            .check_hard_limit(
+                "enrich",
+                MemorySurface::JoinBuildSide,
+                governed(),
+                2 * MIB,
+            )
+            .expect_err("the process's memory is over the limit");
+        assert_eq!(
+            report.reading,
+            LimitReading::ProcessMemory {
+                peak_resident_bytes: peak
+            },
+            "{report:?}"
+        );
+        assert_eq!(report.charged_bytes, MIB);
+        assert_eq!(report.suggested_limit_bytes, peak);
+        assert!(!report.oversized);
+        let rendered = report.to_string();
+        assert!(
+            rendered.starts_with(
+                "E310 \"enrich\": process memory peaked at 9.0 GiB resident, over memory.limit \
+                 8.0 GiB, while \"enrich\" held join build side; the run had charged 1.0 MiB"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("needed"), "{rendered}");
+        drop(handle);
     }
 }
 
