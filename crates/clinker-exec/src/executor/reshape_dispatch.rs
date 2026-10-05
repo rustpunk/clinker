@@ -993,9 +993,13 @@ impl WalkOwnedSpill for ReshapeGroupCell {
         if id != self.consumer || self.buffer.groups.is_empty() {
             return Ok(OwnedSpillResult::NotHeld);
         }
-        let spilled =
-            self.buffer
-                .spill_resident_above(&self.node_name, arbitrator, &self.spill_root, 0, |_| {});
+        let spilled = self.buffer.spill_resident_above(
+            &self.node_name,
+            arbitrator,
+            &self.spill_root,
+            0,
+            |_| {},
+        );
         self.publish();
         Ok(if spilled? {
             OwnedSpillResult::Wrote

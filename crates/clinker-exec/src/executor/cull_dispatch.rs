@@ -1198,9 +1198,13 @@ impl WalkOwnedSpill for CullGroupCell {
         if id != self.consumer || self.buffer.groups.is_empty() {
             return Ok(OwnedSpillResult::NotHeld);
         }
-        let spilled =
-            self.buffer
-                .spill_resident_above(&self.node_name, arbitrator, &self.spill_root, 0, |_| {});
+        let spilled = self.buffer.spill_resident_above(
+            &self.node_name,
+            arbitrator,
+            &self.spill_root,
+            0,
+            |_| {},
+        );
         self.publish();
         Ok(if spilled? {
             OwnedSpillResult::Wrote
@@ -1918,10 +1922,7 @@ mod tests {
     }
 
     fn account_schema() -> SharedStorage<Schema> {
-        SharedStorage::from_arc(Arc::new(Schema::new(vec![
-            "account".into(),
-            "note".into(),
-        ])))
+        SharedStorage::from_arc(Arc::new(Schema::new(vec!["account".into(), "note".into()])))
     }
 
     /// [`ROWS`] rows, each with its group key: row `i` belongs to account
