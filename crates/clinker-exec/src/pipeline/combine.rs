@@ -765,9 +765,13 @@ impl CombineHashTable {
     ///   (`MemoryArbitrator::check_hard_limit`) is checked every
     ///   [`MEMORY_CHECK_INTERVAL`] inserts and at the end of build, for
     ///   `node`'s join build side and in `requester`'s name, with the
-    ///   table's bytes so far as the bytes not yet charged. On the walk the
-    ///   check runs a reclaim round before it refuses; a refusal is
-    ///   [`CombineError::MemoryRefused`] carrying the check's E310.
+    ///   table's bytes so far as the bytes not yet charged: `records` are
+    ///   charged to no consumer while the table takes them, and the caller
+    ///   charges the finished table. On the walk the check runs a reclaim
+    ///   round before it refuses; a refusal is
+    ///   [`CombineError::MemoryRefused`] carrying the check's E310. A caller
+    ///   whose records stay charged while they are indexed builds through
+    ///   [`Self::build_from_charged`].
     /// * `estimated_rows` — optional capacity hint. When `Some`, the
     ///   underlying [`HashTable`] is pre-sized via `with_capacity` to avoid
     ///   the resize spike, which can reach 2.25× peak footprint during
@@ -792,6 +796,66 @@ impl CombineHashTable {
         budget: &MemoryArbitrator,
         node: &str,
         requester: Requester,
+        estimated_rows: Option<usize>,
+    ) -> Result<Self, CombineError>
+    where
+        I: IntoIterator<Item = Record>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        Self::build_charging(
+            records,
+            extractor,
+            ctx,
+            BuildBackstop {
+                budget,
+                node,
+                requester,
+                records_charged: false,
+            },
+            estimated_rows,
+        )
+    }
+
+    /// [`Self::build`] over `records` that stay charged to a consumer while
+    /// the table takes them (a grace partition's rows, charged to the grace
+    /// consumer for as long as the partition is in memory). The hard-limit
+    /// check then counts only what the build adds on top of them, the hash
+    /// index, the chains and the key cache, so the records are never counted
+    /// twice.
+    pub fn build_from_charged<I>(
+        records: I,
+        extractor: &KeyExtractor,
+        ctx: &EvalContext<'_>,
+        budget: &MemoryArbitrator,
+        node: &str,
+        requester: Requester,
+        estimated_rows: Option<usize>,
+    ) -> Result<Self, CombineError>
+    where
+        I: IntoIterator<Item = Record>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        Self::build_charging(
+            records,
+            extractor,
+            ctx,
+            BuildBackstop {
+                budget,
+                node,
+                requester,
+                records_charged: true,
+            },
+            estimated_rows,
+        )
+    }
+
+    /// The one build both entry points run; `backstop` says what the
+    /// hard-limit check counts as not yet charged.
+    fn build_charging<I>(
+        records: I,
+        extractor: &KeyExtractor,
+        ctx: &EvalContext<'_>,
+        backstop: BuildBackstop<'_>,
         estimated_rows: Option<usize>,
     ) -> Result<Self, CombineError>
     where
@@ -861,10 +925,9 @@ impl CombineHashTable {
             // the HashTable rehashes, which is the honest figure to gate
             // and report mid-build.
             if (i + 1).is_multiple_of(MEMORY_CHECK_INTERVAL) {
-                let used = partial_memory_bytes(&index, &chain, &arena, &keys_cache);
-                budget
-                    .check_hard_limit(node, MemorySurface::JoinBuildSide, requester, used as u64)
-                    .map_err(CombineError::MemoryRefused)?;
+                let index_bytes = index_memory_bytes(&index, &chain, &keys_cache);
+                let records_bytes = records_memory_bytes(std::mem::size_of_val(&arena[..]), &arena);
+                backstop.check(index_bytes, records_bytes)?;
             }
         }
 
@@ -881,14 +944,7 @@ impl CombineHashTable {
         // finalized table's own bytes as the bytes not yet charged, so a
         // sub-interval build over a tiny budget stops even when RSS cannot
         // be measured.
-        budget
-            .check_hard_limit(
-                node,
-                MemorySurface::JoinBuildSide,
-                requester,
-                table.memory_bytes() as u64,
-            )
-            .map_err(CombineError::MemoryRefused)?;
+        backstop.check(table.index_bytes(), table.records_bytes())?;
 
         Ok(table)
     }
@@ -938,23 +994,24 @@ impl CombineHashTable {
     /// Stable pub API: the executor uses this both for the periodic
     /// `MemoryArbitrator` check and for the `--explain` RSS reporting.
     pub fn memory_bytes(&self) -> usize {
+        self.index_bytes() + self.records_bytes()
+    }
+
+    /// What the table adds on top of its records: the hash index, the
+    /// chains and the key cache.
+    fn index_bytes(&self) -> usize {
         self.index.allocation_size()
             + self.chain.capacity() * std::mem::size_of::<u32>()
-            + self.records.capacity() * std::mem::size_of::<Record>()
-            + self
-                .records
-                .iter()
-                .map(Record::estimated_heap_size)
-                .sum::<usize>()
             + self.keys_cache.capacity() * std::mem::size_of::<Vec<Value>>()
-            + self
-                .keys_cache
-                .iter()
-                .map(|k| {
-                    k.capacity() * std::mem::size_of::<Value>()
-                        + k.iter().map(Value::heap_size).sum::<usize>()
-                })
-                .sum::<usize>()
+            + keys_heap_bytes(&self.keys_cache)
+    }
+
+    /// The table's records: their slots and their heap.
+    fn records_bytes(&self) -> usize {
+        records_memory_bytes(
+            self.records.capacity() * std::mem::size_of::<Record>(),
+            &self.records,
+        )
     }
 
     /// Number of build-side records in the table.
@@ -1009,24 +1066,64 @@ impl<'a> Iterator for ProbeIter<'a> {
 /// Identical formula to [`CombineHashTable::memory_bytes`], broken out so
 /// the error path can report accurate `used` without constructing a
 /// fully-assembled `CombineHashTable`.
-fn partial_memory_bytes(
+fn index_memory_bytes(
     index: &HashTable<(u64, u32, u32)>,
     chain: &[u32],
-    arena: &[Record],
     keys_cache: &[Vec<Value>],
 ) -> usize {
     index.allocation_size()
         + std::mem::size_of_val(chain)
-        + std::mem::size_of_val(arena)
-        + arena.iter().map(Record::estimated_heap_size).sum::<usize>()
         + std::mem::size_of_val(keys_cache)
-        + keys_cache
+        + keys_heap_bytes(keys_cache)
+}
+
+/// Records held in `slot_bytes` of slots, plus their heap.
+fn records_memory_bytes(slot_bytes: usize, records: &[Record]) -> usize {
+    slot_bytes
+        + records
             .iter()
-            .map(|k| {
-                k.capacity() * std::mem::size_of::<Value>()
-                    + k.iter().map(Value::heap_size).sum::<usize>()
-            })
+            .map(Record::estimated_heap_size)
             .sum::<usize>()
+}
+
+/// The key cache's per-key vectors and their values' heap.
+fn keys_heap_bytes(keys_cache: &[Vec<Value>]) -> usize {
+    keys_cache
+        .iter()
+        .map(|k| {
+            k.capacity() * std::mem::size_of::<Value>()
+                + k.iter().map(Value::heap_size).sum::<usize>()
+        })
+        .sum::<usize>()
+}
+
+/// A build's hard-limit check: the node and requester it names, and whether
+/// the records the table takes are already charged to a consumer.
+struct BuildBackstop<'a> {
+    budget: &'a MemoryArbitrator,
+    node: &'a str,
+    requester: Requester,
+    records_charged: bool,
+}
+
+impl BuildBackstop<'_> {
+    /// Check the hard limit with the table's bytes not yet charged: its
+    /// index bytes, plus its records' bytes unless they are already charged.
+    fn check(&self, index_bytes: usize, records_bytes: usize) -> Result<(), CombineError> {
+        let uncharged = if self.records_charged {
+            index_bytes
+        } else {
+            index_bytes + records_bytes
+        };
+        self.budget
+            .check_hard_limit(
+                self.node,
+                MemorySurface::JoinBuildSide,
+                self.requester,
+                uncharged as u64,
+            )
+            .map_err(CombineError::MemoryRefused)
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────

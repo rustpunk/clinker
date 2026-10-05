@@ -627,7 +627,9 @@ impl GraceHashExecutor {
         self.building_bytes = 0;
         self.publish_reclaimable();
         // Each partition's table build checks the hard limit in the grace
-        // consumer's name, so a pass it runs elects that consumer last.
+        // consumer's name, so a pass it runs elects that consumer last. The
+        // partition's rows stay charged to that consumer while the table
+        // takes them, so the check counts only the table's index on top.
         let requester = self.consumer_handle.requester();
         for i in 0..self.partitions.len() {
             let prev = std::mem::replace(&mut self.partitions[i], PartitionState::Done);
@@ -642,7 +644,7 @@ impl GraceHashExecutor {
                         // Empty partition fast-path: still construct an
                         // empty hash table so probe lookups hit the
                         // Ready branch and emit zero matches uniformly.
-                        let table = CombineHashTable::build(
+                        let table = CombineHashTable::build_from_charged(
                             records,
                             extractor,
                             ctx,
@@ -658,7 +660,7 @@ impl GraceHashExecutor {
                         }))
                     } else {
                         let estimated = Some(records.len());
-                        let table = CombineHashTable::build(
+                        let table = CombineHashTable::build_from_charged(
                             records,
                             extractor,
                             ctx,
