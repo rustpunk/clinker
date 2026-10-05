@@ -4,6 +4,9 @@ use std::process::{Command, Output};
 
 use tempfile::TempDir;
 
+const BOOK: (bool, bool) = (true, true);
+const DOCS: (bool, bool) = (true, false);
+const CODE: (bool, bool) = (false, false);
 const ZERO: &str = "0000000000000000000000000000000000000000";
 const ABSENT: &str = "ffffffffffffffffffffffffffffffffffffffff";
 
@@ -16,7 +19,8 @@ fn scope(root: &Path, arguments: &[&str]) -> Output {
         .expect("clinker-release-policy must execute")
 }
 
-fn docs_only(root: &Path, arguments: &[&str]) -> bool {
+/// The classification as `(docs_only, book_only)`.
+fn classify(root: &Path, arguments: &[&str]) -> (bool, bool) {
     let output = scope(root, arguments);
     assert_eq!(
         output.status.code(),
@@ -26,8 +30,9 @@ fn docs_only(root: &Path, arguments: &[&str]) -> bool {
     );
     assert!(output.stderr.is_empty(), "arguments: {arguments:?}");
     match output.stdout.as_slice() {
-        b"docs_only=true\n" => true,
-        b"docs_only=false\n" => false,
+        b"docs_only=true\nbook_only=true\n" => (true, true),
+        b"docs_only=true\nbook_only=false\n" => (true, false),
+        b"docs_only=false\nbook_only=false\n" => (false, false),
         other => panic!(
             "unexpected output for {arguments:?}: {:?}",
             String::from_utf8_lossy(other)
@@ -79,30 +84,55 @@ fn repository() -> TempDir {
 }
 
 #[test]
-fn a_change_under_docs_only_is_documentation_for_push_and_pull_request() {
+fn a_change_confined_to_the_books_is_book_only_for_push_and_pull_request() {
     let root = repository();
     let base = commit(root.path(), &["crates/a/src/lib.rs"], "code");
     commit(
         root.path(),
-        &["docs/user/src/page.md", "docs/engine/src/x-explainer.html"],
-        "docs",
+        &[
+            "docs/user/src/page.md",
+            "docs/engine/src/x-explainer.html",
+            "docs/theme/css/general.css",
+        ],
+        "books",
     );
-    assert!(docs_only(
+    let pull_request = ["--event", "pull_request"];
+    assert_eq!(classify(root.path(), &pull_request), BOOK);
+    assert_eq!(
+        classify(root.path(), &["--event", "pull_request", "--before", ""]),
+        BOOK
+    );
+    assert_eq!(
+        classify(root.path(), &["--event", "push", "--before", &base]),
+        BOOK
+    );
+}
+
+#[test]
+fn docs_the_rust_code_reads_are_docs_only_but_not_book_only() {
+    let root = repository();
+    commit(root.path(), &["crates/a/src/lib.rs"], "code");
+    let pull_request = ["--event", "pull_request"];
+
+    commit(root.path(), &["docs/explain/E200.md"], "explain");
+    assert_eq!(classify(root.path(), &pull_request), DOCS);
+
+    commit(root.path(), &["docs/ai/20_CRATE_MAP.md"], "ai");
+    assert_eq!(classify(root.path(), &pull_request), DOCS);
+
+    commit(
         root.path(),
-        &["--event", "push", "--before", &base]
-    ));
-    assert!(docs_only(root.path(), &["--event", "pull_request"]));
-    assert!(docs_only(
-        root.path(),
-        &["--event", "pull_request", "--before", ""]
-    ));
+        &["docs/user/src/page.md", "docs/explain/E201.md"],
+        "book and explain",
+    );
+    assert_eq!(classify(root.path(), &pull_request), DOCS);
 }
 
 #[test]
 fn every_uncertain_case_runs_the_full_workflow() {
     let root = repository();
     let base = commit(root.path(), &["crates/a/src/lib.rs"], "code");
-    commit(root.path(), &["docs/page.md"], "docs");
+    commit(root.path(), &["docs/user/src/page.md"], "docs");
     for arguments in [
         &["--event", "workflow_dispatch"][..],
         &["--event", "workflow_dispatch", "--before", &base][..],
@@ -113,45 +143,50 @@ fn every_uncertain_case_runs_the_full_workflow() {
         &["--event", "push", "--before", "HEAD^1"][..],
         &["--event", "push", "--before", "not-a-commit"][..],
     ] {
-        assert!(
-            !docs_only(root.path(), arguments),
+        assert_eq!(
+            classify(root.path(), arguments),
+            CODE,
             "arguments: {arguments:?}"
         );
     }
 }
 
 #[test]
-fn code_examples_root_files_renames_and_empty_changes_are_not_documentation() {
+fn code_examples_root_files_renames_and_empty_changes_are_code() {
     let root = repository();
+    let pull_request = ["--event", "pull_request"];
     commit(root.path(), &["crates/a/src/lib.rs", "README.md"], "base");
 
     commit(
         root.path(),
-        &["docs/page.md", "crates/a/src/lib.rs"],
+        &["docs/user/src/page.md", "crates/a/src/lib.rs"],
         "mixed",
     );
-    assert!(!docs_only(root.path(), &["--event", "pull_request"]));
+    assert_eq!(classify(root.path(), &pull_request), CODE);
 
     commit(root.path(), &["examples/pipelines/orders.yaml"], "example");
-    assert!(!docs_only(root.path(), &["--event", "pull_request"]));
+    assert_eq!(classify(root.path(), &pull_request), CODE);
 
     commit(root.path(), &["README.md"], "root readme");
-    assert!(!docs_only(root.path(), &["--event", "pull_request"]));
+    assert_eq!(classify(root.path(), &pull_request), CODE);
 
-    git(root.path(), &["mv", "crates/a/src/lib.rs", "docs/lib.rs"]);
     git(
         root.path(),
-        &["commit", "--quiet", "-m", "move code into docs"],
+        &["mv", "crates/a/src/lib.rs", "docs/user/lib.rs"],
     );
-    assert!(!docs_only(root.path(), &["--event", "pull_request"]));
+    git(
+        root.path(),
+        &["commit", "--quiet", "-m", "move code into the book"],
+    );
+    assert_eq!(classify(root.path(), &pull_request), CODE);
 
     commit(root.path(), &[], "empty");
-    assert!(!docs_only(root.path(), &["--event", "pull_request"]));
+    assert_eq!(classify(root.path(), &pull_request), CODE);
 }
 
 #[test]
-fn a_root_commit_has_no_base_and_is_not_documentation() {
+fn a_root_commit_has_no_base_and_is_code() {
     let root = repository();
-    commit(root.path(), &["docs/page.md"], "first");
-    assert!(!docs_only(root.path(), &["--event", "pull_request"]));
+    commit(root.path(), &["docs/user/src/page.md"], "first");
+    assert_eq!(classify(root.path(), &["--event", "pull_request"]), CODE);
 }

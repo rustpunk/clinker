@@ -377,6 +377,7 @@ fn ci_docs_only_lane_rejects_fail_closed_or_misplaced_guards() {
     const JOB_GUARD: &str = "${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}";
     const JOB_ALWAYS: &str = "${{ !cancelled() }}";
     const STEP_GUARD: &str = "needs.changes.outputs.docs_only != 'true'";
+    const BOOK_STEP_GUARD: &str = "needs.changes.outputs.book_only != 'true'";
     let root = fixture();
     let ci = ci_workflow();
     write_workflow(root.path(), "ci.yml", &ci);
@@ -417,9 +418,9 @@ fn ci_docs_only_lane_rejects_fail_closed_or_misplaced_guards() {
             ),
         ),
         (
-            "Linux test suite skipped",
+            "Linux test suite skipped for explain and AI docs",
             ci.replacen(
-                "      - run: cargo test --workspace\n",
+                &format!("      - run: cargo test --workspace\n        if: {BOOK_STEP_GUARD}\n"),
                 &format!("      - run: cargo test --workspace\n        if: {STEP_GUARD}\n"),
                 1,
             ),
@@ -433,10 +434,26 @@ fn ci_docs_only_lane_rejects_fail_closed_or_misplaced_guards() {
             ),
         ),
         (
-            "macOS AI documentation check skipped",
+            "Linux AI documentation check skipped for book pages",
             ci.replacen(
-                "      - name: Check AI documentation portability\n",
-                &format!("      - name: Check AI documentation portability\n        if: {STEP_GUARD}\n"),
+                "      - name: Check AI documentation\n",
+                &format!("      - name: Check AI documentation\n        if: {BOOK_STEP_GUARD}\n"),
+                1,
+            ),
+        ),
+        (
+            "macOS suite made step-scoped",
+            ci.replacen(
+                &format!("  test-macos:\n    runs-on: macos-latest\n    needs: changes\n    if: {JOB_GUARD}\n"),
+                &format!("  test-macos:\n    runs-on: macos-latest\n    needs: changes\n    if: {JOB_ALWAYS}\n"),
+                1,
+            ),
+        ),
+        (
+            "book scope missing from the outputs",
+            ci.replacen(
+                "      book_only: ${{ steps.scope.outputs.book_only }}\n",
+                "",
                 1,
             ),
         ),

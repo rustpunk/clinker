@@ -207,8 +207,11 @@ fn execute(cli: Cli) -> Result<String, GateError> {
                 .before
                 .as_deref()
                 .filter(|value| !value.is_empty());
-            let docs_only = scope::docs_only(&arguments.event, before)?;
-            Ok(format!("docs_only={docs_only}\n"))
+            let scope = scope::classify(&arguments.event, before)?;
+            Ok(format!(
+                "docs_only={}\nbook_only={}\n",
+                scope.docs_only, scope.book_only
+            ))
         }
         Domain::Workflow(WorkflowDomain {
             operation: WorkflowOperation::Verify,
@@ -882,7 +885,7 @@ struct CiDomain {
 
 #[derive(Debug, Subcommand)]
 enum CiOperation {
-    /// Print `docs_only=true` or `docs_only=false` as a GitHub Actions output.
+    /// Print the `docs_only` and `book_only` GitHub Actions outputs.
     ChangeScope(CiChangeScopeArgs),
 }
 

@@ -23,15 +23,19 @@ permissions: {}
 
 jobs:
   # A pull request or push that touches only files under docs/ skips the work
-  # documentation cannot affect: the Windows suite, the macOS suite, the
-  # cross-target and portability builds, clippy, the bench gates, and
-  # cargo-deny. It still runs everything that reads docs/: the Linux test suite
-  # (tests compile docs/explain/ into the binary and check pages, the book's
-  # SUMMARY.md and the AI docs), both policy jobs, the AI documentation checks on
-  # Linux and macOS, and the filesystem matrix, whose teardown must always run.
+  # documentation cannot affect: the Windows and macOS suites, the cross-target
+  # and portability builds, rustfmt, clippy, the example and scenario smoke
+  # steps, the bench gates, and cargo-deny (`docs_only`). Rust code reads
+  # docs/explain/ (compiled into the binary) and docs/ai/, so a change there
+  # still runs the Linux test suite. A change confined to the books and their
+  # theme (docs/user/, docs/engine/, docs/theme/) skips the Rust toolchain and
+  # test suite as well (`book_only`). Every docs-only change still runs the AI
+  # documentation check, which validates links into the books, both policy
+  # jobs, and the filesystem matrix, whose evidence a release of this exact
+  # commit requires.
   #
-  # Every guard below fails open. A job runs unless the classifier printed
-  # exactly `docs_only=true`, and `!cancelled()` keeps it running if this job
+  # Every guard below fails open. A job or step runs unless the classifier
+  # printed exactly `true` for its flag, and `!cancelled()` keeps it running if this job
   # fails, so a broken classifier costs a full run, never a skipped check. A job
   # skipped by its `if:` reports "skipped", which satisfies a required check.
   # The classifier is `ci change-scope` in tools/release-policy, and the
@@ -44,6 +48,7 @@ jobs:
       contents: read
     outputs:
       docs_only: ${{ steps.scope.outputs.docs_only }}
+      book_only: ${{ steps.scope.outputs.book_only }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -539,21 +544,25 @@ jobs:
       # passes, the test build, and three bench-compile steps) into one shared
       # target/, which can exhaust the hosted runner's root volume mid-link.
       - name: Free disk space
+        if: needs.changes.outputs.book_only != 'true'
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h /
 
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        if: needs.changes.outputs.book_only != 'true'
         with:
           toolchain: "1.91"
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: needs.changes.outputs.book_only != 'true'
 
       - name: Check AI documentation
         run: bash scripts/check-ai-docs.sh
 
       - run: cargo fmt --all --check
+        if: needs.changes.outputs.docs_only != 'true'
       # Two clippy passes. The first omits --all-targets on purpose: with
       # test targets excluded, a pub(crate) item referenced only from
       # #[cfg(test)] code still trips the dead-code lint, so the dead-code
@@ -564,6 +573,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
         if: needs.changes.outputs.docs_only != 'true'
       - run: cargo test --workspace
+        if: needs.changes.outputs.book_only != 'true'
 
       # Example pipelines double as runnable documentation and a smoke-test
       # surface, so every top-level pipeline under examples/pipelines/ must at
@@ -634,7 +644,7 @@ jobs:
   test-macos:
     runs-on: macos-latest
     needs: changes
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     permissions:
       contents: read
     steps:
@@ -646,13 +656,10 @@ jobs:
           bash scripts/check-ai-docs.sh --self-test
           bash scripts/check-ai-docs.sh
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
-        if: needs.changes.outputs.docs_only != 'true'
         with:
           toolchain: "1.91"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        if: needs.changes.outputs.docs_only != 'true'
       - run: cargo test --workspace
-        if: needs.changes.outputs.docs_only != 'true'
 
   # Type-check the non-Linux targets from the ubuntu host. `--all-targets`
   # so test and bench targets compile too — a #[cfg(windows)] /

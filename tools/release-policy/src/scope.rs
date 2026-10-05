@@ -1,9 +1,11 @@
-//! Classify a CI run as documentation-only or not.
+//! Classify the change a CI run is validating.
 //!
 //! `ci.yml` skips the platform, portability, and lint work for a change that
-//! touches only files under `docs/`. Rust tests and both policy tools read
-//! files under `docs/`, so such a change still runs the Linux test suite and
-//! the policy jobs; the workflow trust gate pins which jobs may skip.
+//! touches only files under `docs/`. Rust code reads `docs/explain/` (compiled
+//! into the binary) and `docs/ai/` (the crate map and architecture pages), so a
+//! change there still runs the Linux test suite. A change confined to the books
+//! and their theme (`docs/user/`, `docs/engine/`, `docs/theme/`) skips the Rust
+//! test suite too. The workflow trust gate pins which jobs and steps may skip.
 //!
 //! The classification fails open. Every case it cannot establish reports
 //! `false`, which runs the full workflow; a `git` process that cannot start or
@@ -21,18 +23,37 @@ use crate::limits::MAX_CHILD_OUTPUT_BYTES;
 
 const GIT_DEADLINE: Duration = Duration::from_secs(60);
 const DOCS_ROOT: &[u8] = b"docs/";
+/// Directories under `docs/` that no Rust code reads.
+const BOOK_ROOTS: [&[u8]; 3] = [b"docs/user/", b"docs/engine/", b"docs/theme/"];
 
-/// Report whether the change under test touches only files under `docs/`.
+/// What a change touches, as two GitHub Actions outputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Scope {
+    /// Every path is under `docs/`.
+    pub docs_only: bool,
+    /// Every path is under a book root. Implies `docs_only`.
+    pub book_only: bool,
+}
+
+impl Scope {
+    const CODE: Self = Self {
+        docs_only: false,
+        book_only: false,
+    };
+}
+
+/// Classify the change under test.
 ///
 /// For `pull_request`, HEAD is the merge commit Actions checks out, so its
 /// first parent is the tip of the base branch and the diff is exactly what the
 /// pull request would change. For `push`, `before` is the previous tip of the
 /// branch. Any other event, a missing or all-zero `before`, a base commit that
-/// is not in the checkout, and a diff too large to retain all report `false`.
+/// is not in the checkout, an empty diff, and a diff too large to retain all
+/// report a code change.
 ///
 /// Runs `git` in the current directory and blocks until it exits; the checkout
 /// must hold at least two commits for either base to be present.
-pub fn docs_only(event: &str, before: Option<&str>) -> Result<bool, GateError> {
+pub fn classify(event: &str, before: Option<&str>) -> Result<Scope, GateError> {
     let base = match (event, before) {
         ("pull_request", _) => "HEAD^1".to_owned(),
         ("push", Some(before))
@@ -42,7 +63,7 @@ pub fn docs_only(event: &str, before: Option<&str>) -> Result<bool, GateError> {
         {
             before.to_owned()
         }
-        _ => return Ok(false),
+        _ => return Ok(Scope::CODE),
     };
 
     let verify = git(&[
@@ -52,7 +73,7 @@ pub fn docs_only(event: &str, before: Option<&str>) -> Result<bool, GateError> {
         &format!("{base}^{{commit}}"),
     ])?;
     if verify.termination != Termination::Exited(Some(0)) {
-        return Ok(false);
+        return Ok(Scope::CODE);
     }
 
     let diff = git(&["diff", "--no-renames", "--name-only", "-z", &base, "HEAD"])?;
@@ -63,21 +84,31 @@ pub fn docs_only(event: &str, before: Option<&str>) -> Result<bool, GateError> {
         ));
     }
     if diff.stdout_truncated {
-        return Ok(false);
+        return Ok(Scope::CODE);
     }
-    Ok(paths_are_docs_only(&diff.stdout))
+    Ok(scope_of(&diff.stdout))
 }
 
-/// Report whether a NUL-separated path list is non-empty and every path in it
-/// is a file under `docs/`. `--no-renames` upstream means a file moved into
-/// `docs/` also lists its old path.
-fn paths_are_docs_only(list: &[u8]) -> bool {
-    let mut paths = list
+/// Classify a NUL-separated path list. An empty list is a code change.
+/// `--no-renames` upstream means a file moved into `docs/` also lists its old
+/// path.
+fn scope_of(list: &[u8]) -> Scope {
+    let paths = list
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
-        .peekable();
-    paths.peek().is_some()
-        && paths.all(|path| path.len() > DOCS_ROOT.len() && path.starts_with(DOCS_ROOT))
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return Scope::CODE;
+    }
+    let under = |root: &[u8], path: &[u8]| path.len() > root.len() && path.starts_with(root);
+    let docs_only = paths.iter().all(|path| under(DOCS_ROOT, path));
+    let book_only = paths
+        .iter()
+        .all(|path| BOOK_ROOTS.iter().any(|root| under(root, path)));
+    Scope {
+        docs_only,
+        book_only,
+    }
 }
 
 fn git(arguments: &[&str]) -> Result<child::ChildResult, GateError> {
@@ -98,7 +129,7 @@ fn git(arguments: &[&str]) -> Result<child::ChildResult, GateError> {
 
 #[cfg(test)]
 mod tests {
-    use super::paths_are_docs_only;
+    use super::{Scope, scope_of};
 
     fn list(paths: &[&str]) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -110,42 +141,57 @@ mod tests {
     }
 
     #[test]
-    fn only_paths_under_docs_are_documentation() {
+    fn book_pages_docs_and_code_classify_by_folder() {
+        let book = Scope {
+            docs_only: true,
+            book_only: true,
+        };
+        let docs = Scope {
+            docs_only: true,
+            book_only: false,
+        };
+        let code = Scope {
+            docs_only: false,
+            book_only: false,
+        };
         for (paths, expected) in [
-            (&["docs/user/src/nodes/source.md"][..], true),
+            (&["docs/user/src/nodes/source.md"][..], book),
             (
                 &[
                     "docs/user/src/SUMMARY.md",
                     "docs/engine/src/x-explainer.html",
+                    "docs/theme/css/general.css",
                 ][..],
-                true,
+                book,
             ),
-            (&["docs/odd\nname.md"][..], true),
+            (&["docs/user/src/odd\nname.md"][..], book),
+            (&["docs/explain/E200.md"][..], docs),
+            (&["docs/ai/20_CRATE_MAP.md"][..], docs),
+            (&["docs/user/src/page.md", "docs/explain/E200.md"][..], docs),
+            (&["docs/new-area/page.md"][..], docs),
+            (&["docs/user"][..], docs),
+            (&["docs/user/"][..], docs),
             (
                 &[
                     "docs/user/src/nodes/source.md",
                     "crates/clinker/src/main.rs",
                 ][..],
-                false,
+                code,
             ),
             (
                 &["crates/cxl/src/lib.rs", "docs/ai/20_CRATE_MAP.md"][..],
-                false,
+                code,
             ),
-            (&["examples/pipelines/orders.yaml"][..], false),
-            (&["README.md"][..], false),
-            (&["docsite/index.md"][..], false),
-            (&["docs"][..], false),
-            (&["docs/"][..], false),
-            (&[".github/workflows/ci.yml"][..], false),
-            (&["scripts/x\ndocs/y.md"][..], false),
-            (&[][..], false),
+            (&["examples/pipelines/orders.yaml"][..], code),
+            (&["README.md"][..], code),
+            (&["docsite/index.md"][..], code),
+            (&["docs"][..], code),
+            (&["docs/"][..], code),
+            (&[".github/workflows/ci.yml"][..], code),
+            (&["scripts/x\ndocs/user/y.md"][..], code),
+            (&[][..], code),
         ] {
-            assert_eq!(
-                paths_are_docs_only(&list(paths)),
-                expected,
-                "paths: {paths:?}"
-            );
+            assert_eq!(scope_of(&list(paths)), expected, "paths: {paths:?}");
         }
     }
 }

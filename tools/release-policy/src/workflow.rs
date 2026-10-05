@@ -23,19 +23,23 @@ const SCOPE_JOB_GUARD: &str = "${{ !cancelled() && needs.changes.outputs.docs_on
 const CHANGE_SCOPE_COMMAND: &str = "cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- ci change-scope --event \"${EVENT_NAME}\" --before \"${BEFORE}\" >> \"$GITHUB_OUTPUT\"";
 /// Job guard for a job that always runs but skips some steps.
 const SCOPE_JOB_ALWAYS: &str = "${{ !cancelled() }}";
-/// Step guard that skips a step for a documentation-only change.
+/// Step guard that skips a step for any documentation-only change.
 const SCOPE_STEP_GUARD: &str = "needs.changes.outputs.docs_only != 'true'";
+/// Step guard that skips a step only for a change confined to the books, which
+/// no Rust code reads.
+const SCOPE_BOOK_STEP_GUARD: &str = "needs.changes.outputs.book_only != 'true'";
 /// `ci.yml` jobs that a documentation-only change may skip entirely. Nothing
-/// they run reads `docs/`.
-const SKIPPABLE_CI_JOBS: [&str; 4] = [
+/// they run reads `docs/` in a way the Linux suite does not also cover.
+const SKIPPABLE_CI_JOBS: [&str; 5] = [
     "build-portability",
     "cross-platform",
     "deny",
+    "test-macos",
     "test-windows",
 ];
 /// `ci.yml` jobs that always run but may skip steps for a documentation-only
 /// change. Every other job runs in full for every change.
-const STEP_SCOPED_CI_JOBS: [&str; 2] = ["check", "test-macos"];
+const STEP_SCOPED_CI_JOBS: [&str; 1] = ["check"];
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -620,7 +624,12 @@ fn validate_ci_scope(jobs: &BTreeMap<String, Job>) -> Result<(), GateError> {
         || scope.env.is_some()
         || !exact_value_map(
             scope.outputs.as_ref(),
-            &["docs_only", "${{ steps.scope.outputs.docs_only }}"],
+            &[
+                "docs_only",
+                "${{ steps.scope.outputs.docs_only }}",
+                "book_only",
+                "${{ steps.scope.outputs.book_only }}",
+            ],
         )
         || scope.steps.as_ref().is_none_or(|steps| steps.len() != 4)
     {
@@ -712,17 +721,25 @@ fn validate_ci_scope(jobs: &BTreeMap<String, Job>) -> Result<(), GateError> {
                     "CI job '{job_name}' has a non-string step condition"
                 ))
             })?;
-            if condition == SCOPE_STEP_GUARD {
+            if condition == SCOPE_STEP_GUARD || condition == SCOPE_BOOK_STEP_GUARD {
+                // The Linux test suite reads docs/explain/ and docs/ai/, so only
+                // a book-only change may skip it; the AI documentation check
+                // validates links into the books, so no docs change may.
                 let run = step.run.as_deref().unwrap_or_default();
                 if guard != Some(SCOPE_JOB_ALWAYS)
                     || run.contains("check-ai-docs.sh")
-                    || (job_name == "check" && exact_script(run, "cargo test --workspace"))
+                    || (condition == SCOPE_STEP_GUARD
+                        && job_name == "check"
+                        && exact_script(run, "cargo test --workspace"))
                 {
                     return Err(policy(format!(
-                        "CI job '{job_name}' skips a step that must run for every change"
+                        "CI job '{job_name}' skips a step that must run for this change"
                     )));
                 }
-            } else if condition.contains("needs.") || condition.contains("docs_only") {
+            } else if condition.contains("needs.")
+                || condition.contains("docs_only")
+                || condition.contains("book_only")
+            {
                 return Err(policy(format!(
                     "CI job '{job_name}' has a step condition that is not the reviewed change-scope guard"
                 )));
