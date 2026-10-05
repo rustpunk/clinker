@@ -2992,9 +2992,9 @@ mod walk_pass_tests {
         );
         merge.set_bytes(1536 * KIB);
         let band = ConsumerHandle::new();
-        let band_consumer = Arc::new(crate::pipeline::sort_buffer::SortConsumer::new(
-            Arc::clone(&band),
-        ));
+        let band_consumer = Arc::new(crate::pipeline::sort_buffer::SortConsumer::new(Arc::clone(
+            &band,
+        )));
         arbitrator.register_node_consumer(
             band_consumer.clone(),
             Arc::clone(&band),
