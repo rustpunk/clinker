@@ -962,6 +962,71 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
   exists, and update the Route page's Constraints section.
 - Implementation owner: Planner maintainers.
 
+## Memory attribution findings
+
+### 92. Text a Source admitted stays charged after the Source finishes, but no node is named for it
+
+- Filed: 2026-10-05.
+- Status: Open.
+- Priority: Medium.
+- Evidence: Long text a Source reads is admitted once, in the Source's name,
+  and the admission travels with the allocation to every copy of the row
+  until the last copy drops (`FieldStr::try_new`). A parked cross-region edge
+  therefore does not charge that text again: its charge covers only what its
+  copy allocates itself (`Record::clone_allocation_bytes`). When the Source
+  finishes, its memory consumer is unregistered and its name leaves the
+  ledger, but any text a parked copy still keeps alive stays charged, as an
+  unattributed remainder (`MemoryArbitrator::unregister_consumer`; the ledger
+  test `release_after_the_entry_is_removed_is_unattributed`). The run's total
+  stays exact, so no limit is exceeded unnoticed. Two figures are weaker than
+  they could be: a memory-limit failure (E310) can only report those bytes as
+  memory no node holds, so it cannot name the parked edge that keeps them
+  alive; and the parked edge's reclaimable figure leaves them out, so a
+  reclaim pass underrates what spilling that edge would free.
+- Files/modules involved:
+  `crates/clinker-exec/src/executor/parked_generations.rs` (`park`, the
+  edge's reclaimable figure), `crates/clinker-exec/src/pipeline/memory.rs`
+  (`unregister_consumer`), `crates/clinker-exec/src/pipeline/memory/ledger.rs`
+  (the unattributed remainder and the E310 holder list),
+  `crates/clinker-record/src/field_str.rs` (`try_new`).
+- Suggested way to resolve it: Decide, with the reclaim victim order and the
+  E310 holder report, whether an unregistered Source's surviving admissions
+  are re-attributed to the holder that keeps them alive, or whether the E310
+  reports them as text a finished Source read that a named downstream holder
+  still keeps; then rank a parked edge by what spilling it would actually
+  free, including that text.
+- Implementation owner: Executor maintainers.
+
+### 93. A Combine's build table charges text its Source already holds charged
+
+- Filed: 2026-10-05.
+- Status: Tracked in
+  [#1394](https://github.com/rustpunk/clinker/issues/1394).
+- Priority: Medium.
+- Evidence: A Combine's hash table sizes its build rows with
+  `Record::estimated_heap_size` (`CombineHashTable::memory_bytes`), which
+  counts long shared text at its full size even when the Source that read it
+  already carries its charge. In the cross-region test whose composition
+  body joins a Source's rows (`composition_body_crossing_parks_under_its_body_key`),
+  the build rows' notes are therefore charged twice over the run: once under
+  the Source `dept_lookup` and once under the Combine `enriched`, whose
+  charge rises by exactly the notes' growth when the notes grow. The run's
+  total overstates what is resident, so a limit can be reached, and spilling
+  or refusal begin, earlier than the memory actually held requires. A cross-
+  region park, by contrast, charges only what its copy alone keeps alive
+  (`Record::clone_allocation_bytes`).
+- Files/modules involved:
+  `crates/clinker-exec/src/pipeline/combine.rs` (`memory_bytes` and the
+  other build-side sizing), `crates/clinker-record/src/field_str.rs`
+  (`heap_size` against the run-aware `unaccounted_heap_size`),
+  `crates/clinker-record/src/record/mod.rs` (`clone_allocation_bytes`).
+- Suggested way to resolve it: #1394 decides one charge rule for every
+  consumer that keeps rows — charge what the holder alone keeps alive, or
+  charge in full and document the double count — then audits each such
+  consumer against it and adds a run-wide check that every byte is charged
+  once.
+- Implementation owner: Executor maintainers.
+
 ## Resolved Archive
 
 ### 61. Decoded allocation ownership
