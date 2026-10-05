@@ -786,6 +786,15 @@ impl AggregateStream {
         }
     }
 
+    /// Mark a hash table as taken for its finalize, so it ranks by 0
+    /// ([`HashAggregator::begin_finalize`]). The streaming arm holds no
+    /// table.
+    pub(crate) fn begin_finalize(&mut self) {
+        if let Self::Hash(h) = self {
+            h.begin_finalize();
+        }
+    }
+
     /// The handle a hash table's charge is mirrored onto; `None` for the
     /// streaming arm, which holds no table and charges nothing.
     pub(crate) fn consumer_handle(&self) -> Option<&Arc<crate::pipeline::memory::ConsumerHandle>> {

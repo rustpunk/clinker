@@ -1017,6 +1017,18 @@ pub(crate) struct WindowTables<K> {
     tables: HashMap<K, GroupTable>,
 }
 
+impl<K: 'static> WalkOwnedSpill for WindowTables<K> {
+    /// A pass that elects one window's or session's consumer spills that
+    /// table's resident groups, the way the table's own triggers do.
+    fn spill_owned(
+        &mut self,
+        id: crate::pipeline::memory::ConsumerId,
+        _arbitrator: &crate::pipeline::memory::MemoryArbitrator,
+    ) -> Result<OwnedSpillResult, PipelineError> {
+        spill_elected_table(&mut self.tables, id)
+    }
+}
+
 impl<K: Eq + std::hash::Hash + Clone> KeyedGroupTables for WindowTables<K> {
     type Key = K;
 
@@ -1113,9 +1125,12 @@ impl<T: KeyedGroupTables> WalkGroupTables<T> {
         self.cell.borrow().tables().keys().cloned().collect()
     }
 
-    /// A table leaving the cell leaves the walk reclaim set with it.
-    fn withdraw(&mut self, table: GroupTable) -> GroupTable {
+    /// A table leaving the cell leaves the walk reclaim set with it, and
+    /// ranks by 0 from here on: it is being finalized, and no pass can reach
+    /// it.
+    fn withdraw(&mut self, mut table: GroupTable) -> GroupTable {
         self.registrations.remove(&table.1);
+        table.0.begin_finalize();
         table
     }
 
@@ -1233,13 +1248,13 @@ impl<K: Eq + std::hash::Hash + Clone + 'static> WalkGroupTables<WindowTables<K>>
         )
     }
 
-    /// Add `record` to the table of window or session `key`, building that
-    /// table through `make` when it is the key's first record. Returns the
-    /// add's own result for the caller to route.
+    /// Add `record` to the table of window or session `key`, building and
+    /// registering that table through `make` when it is the key's first
+    /// record. Returns the add's own result for the caller to route.
     ///
     /// # Errors
     ///
-    /// A failed build.
+    /// A failed build or registration.
     pub(crate) fn add_window_record(
         &mut self,
         key: K,
@@ -1250,7 +1265,9 @@ impl<K: Eq + std::hash::Hash + Clone + 'static> WalkGroupTables<WindowTables<K>>
         out: &mut Vec<crate::aggregation::SortRow>,
     ) -> Result<Result<(), crate::aggregation::HashAggError>, PipelineError> {
         let (result, built) = self.add_with(key, make, record, row_num, eval_ctx, out)?;
-        let _ = built;
+        if let Some(built) = built {
+            self.enroll(built)?;
+        }
         Ok(result)
     }
 }
