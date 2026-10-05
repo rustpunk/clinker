@@ -3552,3 +3552,205 @@ mod reclaim_entry_tests {
         assert_eq!(arbitrator.reclaim_rounds() - before, 1);
     }
 }
+
+#[cfg(test)]
+mod candidate_order_tests {
+    use super::walk_pass_tests::{MIB, run};
+    use super::*;
+    use crate::pipeline::memory::{
+        ArbitrationPolicy, BackPressurePreferred, ConsumerHandle, ConsumerSpillError, LargestFirst,
+        Priority,
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// How often a pass read each of one consumer's figures.
+    #[derive(Default)]
+    struct Reads {
+        reclaimable: AtomicU64,
+        priority: AtomicU64,
+        back_pressure: AtomicU64,
+    }
+
+    /// A consumer with fixed figures that counts every read of them.
+    struct Counted {
+        reclaimable: u64,
+        priority: i32,
+        pausable: bool,
+        reads: Arc<Reads>,
+    }
+
+    impl MemoryConsumer for Counted {
+        fn current_usage(&self) -> u64 {
+            self.reclaimable
+        }
+        fn reclaimable_bytes(&self) -> u64 {
+            self.reads.reclaimable.fetch_add(1, Ordering::Relaxed);
+            self.reclaimable
+        }
+        fn spill_priority(&self) -> i32 {
+            self.reads.priority.fetch_add(1, Ordering::Relaxed);
+            self.priority
+        }
+        fn try_spill(&self, _: u64) -> Result<u64, ConsumerSpillError> {
+            Ok(0)
+        }
+        fn can_back_pressure(&self) -> bool {
+            self.reads.back_pressure.fetch_add(1, Ordering::Relaxed);
+            self.pausable
+        }
+    }
+
+    /// One registered consumer of a population and its read counts.
+    struct Member {
+        id: ConsumerId,
+        reads: Arc<Reads>,
+    }
+
+    /// `n` consumers with heavily tied figures: priorities 0 to 2,
+    /// reclaimable bytes 0 to 4, and one in eight able to back-pressure.
+    fn population(arbitrator: &MemoryArbitrator, n: usize) -> Vec<Member> {
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        (0..n)
+            .map(|index| {
+                seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let reads = Arc::new(Reads::default());
+                let id = arbitrator.register_node_consumer(
+                    Arc::new(Counted {
+                        reclaimable: (seed >> 33) % 5,
+                        priority: ((seed >> 20) % 3) as i32,
+                        pausable: (seed >> 50) % 8 == 0,
+                        reads: Arc::clone(&reads),
+                    }),
+                    ConsumerHandle::new(),
+                    ConsumerLabel {
+                        node: format!("c{index}"),
+                        surface: MemorySurface::SortBuffer,
+                    },
+                );
+                Member { id, reads }
+            })
+            .collect()
+    }
+
+    fn shipped_policies() -> Vec<(&'static str, fn() -> Box<dyn ArbitrationPolicy>)> {
+        vec![
+            ("Priority", || Box::new(Priority)),
+            ("LargestFirst", || Box::new(LargestFirst)),
+            ("BackPressurePreferred -> Priority", || {
+                Box::new(BackPressurePreferred::wrapping(Priority))
+            }),
+            ("BackPressurePreferred -> LargestFirst", || {
+                Box::new(BackPressurePreferred::wrapping(LargestFirst))
+            }),
+        ]
+    }
+
+    /// The order a pass asked victims in before candidates were read once:
+    /// the policy asked to select over the remaining candidates in id order
+    /// and in reverse, the lower id taken on a tie, until none is left; the
+    /// requester last when it has reclaimable bytes.
+    fn selection_order(
+        arbitrator: &MemoryArbitrator,
+        policy: &dyn ArbitrationPolicy,
+        requester: Option<ConsumerId>,
+    ) -> Vec<ConsumerId> {
+        let registered = arbitrator.consumers.load();
+        let mut others: Vec<(ConsumerId, &dyn MemoryConsumer)> = registered
+            .iter()
+            .filter(|(id, consumer)| {
+                Some(*id) != requester
+                    && !consumer.can_back_pressure()
+                    && consumer.reclaimable_bytes() > 0
+            })
+            .map(|(id, consumer)| (*id, consumer.as_ref()))
+            .collect();
+        others.sort_by_key(|(id, _)| id.0);
+        let mut order = Vec::with_capacity(others.len() + 1);
+        while !others.is_empty() {
+            let forward = policy.select_victim(&others, 0);
+            let reversed: Vec<(ConsumerId, &dyn MemoryConsumer)> =
+                others.iter().rev().copied().collect();
+            let backward = policy.select_victim(&reversed, 0);
+            let pick = match (forward, backward) {
+                (Some(a), Some(b)) => {
+                    if a.0 <= b.0 {
+                        a
+                    } else {
+                        b
+                    }
+                }
+                (Some(only), None) | (None, Some(only)) => only,
+                (None, None) => break,
+            };
+            order.push(pick);
+            others.retain(|(id, _)| *id != pick);
+        }
+        if let Some(requester) = requester
+            && let Some((_, consumer)) = registered.iter().find(|(id, _)| *id == requester)
+            && !consumer.can_back_pressure()
+            && consumer.reclaimable_bytes() > 0
+        {
+            order.push(requester);
+        }
+        order
+    }
+
+    #[test]
+    fn pass_candidates_read_each_figure_once() {
+        for (name, policy) in shipped_policies() {
+            let arbitrator = run(64 * MIB, policy());
+            let members = population(&arbitrator, 64);
+            let requester = members.get(32).map(|member| member.id);
+
+            let order = arbitrator.pass_candidates(requester, PassKind::Ordinary);
+
+            assert!(!order.is_empty(), "{name}: the population has candidates");
+            let total: u64 = members
+                .iter()
+                .map(|member| member.reads.reclaimable.load(Ordering::Relaxed))
+                .sum();
+            for member in &members {
+                for (figure, reads) in [
+                    ("reclaimable bytes", &member.reads.reclaimable),
+                    ("spill priority", &member.reads.priority),
+                    ("back-pressure", &member.reads.back_pressure),
+                ] {
+                    let reads = reads.load(Ordering::Relaxed);
+                    assert!(
+                        reads <= 1,
+                        "{name}: one pass read consumer {}'s {figure} {reads} times \
+                         ({total} reclaimable-byte reads over {} consumers)",
+                        member.id.0,
+                        members.len()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pass_candidates_order_matches_the_policy_selection() {
+        for n in [16usize, 64, 256] {
+            for (name, policy) in shipped_policies() {
+                let arbitrator = run(64 * MIB, policy());
+                let members = population(&arbitrator, n);
+                for requester in [None, members.get(n / 2).map(|member| member.id)] {
+                    let order = arbitrator.pass_candidates(requester, PassKind::Ordinary);
+                    let oracle = policy();
+                    let expected = selection_order(&arbitrator, oracle.as_ref(), requester);
+                    assert!(
+                        expected.len() > n / 2,
+                        "{name}, n = {n}: the population has many candidates"
+                    );
+                    assert_eq!(
+                        order, expected,
+                        "{name}, n = {n}, requester {requester:?}: the pass asks in the order \
+                         the policy's selection gives"
+                    );
+                }
+            }
+        }
+    }
+}
