@@ -11,6 +11,7 @@ use super::spill::{
 };
 use super::*;
 use crate::pipeline::grace_spill::GraceSpillReader;
+use crate::pipeline::memory::walk::walk_test_support::unregistered_consumer_id;
 
 /// The row id `crate::test_support::with_build_row_ids` gives the build
 /// fixture record at `index`, for fixtures that add or spill build records
@@ -589,7 +590,7 @@ fn combine_driver_identity_survives_grace_hash_partition_pair() {
             spill_dir: dir.path(),
             spill_compress: true,
             consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
-            consumer_id: crate::pipeline::memory::walk::walk_test_support::unregistered_consumer_id(),
+            consumer_id: unregistered_consumer_id(),
             strategy: clinker_plan::config::ErrorStrategy::FailFast,
             stats_sink: test_stats_sink(&stats_catalog, "products", "products"),
         },
@@ -865,7 +866,7 @@ fn execute_grace_hash_spill_then_reload_correct() {
             spill_dir: dir.path(),
             spill_compress: true,
             consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
-            consumer_id: crate::pipeline::memory::walk::walk_test_support::unregistered_consumer_id(),
+            consumer_id: unregistered_consumer_id(),
             strategy: clinker_plan::config::ErrorStrategy::FailFast,
             stats_sink: test_stats_sink(&stats_catalog, "products", "products"),
         },
@@ -1062,7 +1063,7 @@ fn execute_grace_hash_aborts_on_disk_quota_overflow() {
             spill_dir: dir.path(),
             spill_compress: true,
             consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
-            consumer_id: crate::pipeline::memory::walk::walk_test_support::unregistered_consumer_id(),
+            consumer_id: unregistered_consumer_id(),
             strategy: clinker_plan::config::ErrorStrategy::FailFast,
             stats_sink: test_stats_sink(&stats_catalog, "products", "products"),
         },
@@ -2658,7 +2659,7 @@ fn run_grace_arrival_order(
             spill_dir: dir.path(),
             spill_compress: true,
             consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
-            consumer_id: crate::pipeline::memory::walk::walk_test_support::unregistered_consumer_id(),
+            consumer_id: unregistered_consumer_id(),
             strategy: clinker_plan::config::ErrorStrategy::FailFast,
             stats_sink: test_stats_sink(&stats_catalog, "products", "products"),
         },
@@ -2910,7 +2911,7 @@ fn unspilled_join(h: &BnlHarness) -> Vec<Record> {
         .unwrap();
     let partitions = GracePartitions::register(
         &budget,
-        crate::pipeline::memory::walk::walk_test_support::unregistered_consumer_id(),
+        unregistered_consumer_id(),
         GraceHashExecutor::new(
             2,
             dir.path(),
@@ -2935,9 +2936,7 @@ fn partitions_holding_rows(partitions: &GracePartitions) -> Vec<(usize, bool)> {
         .iter()
         .enumerate()
         .filter_map(|(index, state)| match state {
-            PartitionState::Building { records, .. } if !records.is_empty() => {
-                Some((index, false))
-            }
+            PartitionState::Building { records, .. } if !records.is_empty() => Some((index, false)),
             PartitionState::OnDisk { .. } => Some((index, true)),
             _ => None,
         })
