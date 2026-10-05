@@ -3002,6 +3002,11 @@ fn grace_partitions_spill_when_another_walk_request_falls_short() {
             charged_before - building,
             "the charge falls by the spilled partitions' bytes"
         );
+        assert_eq!(
+            handle.reclaimable(),
+            0,
+            "with every partition on disk, a spill frees nothing more"
+        );
         let after = partitions_holding_rows(&partitions);
         assert_eq!(
             after.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
