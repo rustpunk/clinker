@@ -4,6 +4,8 @@ Envelope nodes frame a body stream into per-document documents. An Envelope is a
 
 This page documents the `preserve` and `concat` framing strategies and the orthogonal `header:` / `footer:` synthesis that layers on top of either.
 
+*Interactive companion: [How many documents?](envelope-explainer.html) shows the documents a Sink writes under `preserve` and `concat`, with and without a synthesized footer, how an Aggregate after the Envelope rolls up, and which shapes E347 and E355 reject.*
+
 ## Basic structure
 
 ```yaml
@@ -115,7 +117,7 @@ One consolidated document can carry only **one** envelope header. `concat` deriv
 - **No document carries a header** → the consolidated document is **headerless**.
 - **A headed document and a headerless document** → the single header wins; the headerless document coexists with it (no conflict).
 
-Only documents that contribute body records take part: a document that carries a header but no body records frames nothing once consolidated, so it never enters the comparison. Header identity is **structural** — two documents share a header when they declare the same sections, in the same order, with the same field values (including any raw content the reader preserves). Two files that differ only in an embedded control number therefore count as distinct headers.
+Only documents that contribute body records take part: a document that carries a header but no body records frames nothing once consolidated, so it never enters the comparison. Header identity is **structural** — two documents share a header when they declare the same sections, in the same order, with the same field values. Engine-added fields whose names start with `$` (such as `$raw`, the raw segment text) are ignored, so two files whose headers differ only in raw content fold to one header, and the consolidated document keeps the first document's full header, `$raw` included. A difference in a field you declare (for example an extracted control number) makes the headers distinct.
 
 When the body carries **two or more distinct non-empty headers**, `concat` refuses to silently keep one and drop the rest. The run fails with **E350** (run `clinker explain --code E350` for the full write-up):
 
@@ -127,13 +129,15 @@ upstream, or add a header-folding strategy that declares which header the
 consolidated document keeps.
 ```
 
-To resolve a conflict, either keep the documents separate with `preserve`, make the headers identical upstream (project them to the same sections and values), or use `header:` synthesis (below) to regenerate a fresh consolidated header that does not depend on the source headers agreeing.
+To resolve a conflict, either keep the documents separate with `preserve`, or make the headers identical upstream (project them to the same sections and values). `header:` synthesis (below) does not resolve it: `concat` compares the input headers and raises E350 before any synthesis runs ([#1385](https://github.com/rustpunk/clinker/issues/1385)).
 
 ## Synthesizing a header and footer
 
 `header:` and `footer:` are **orthogonal** to the framing strategy. The strategy decides *how many* output documents there are (`preserve` = one per body grain, `concat` = one consolidated); synthesis decides *what header and footer each of those documents carries*. The node computes a fresh header (declarative scalar expressions) and footer (streaming aggregates over the framed body) **per output document**, stamps them as named sections into the document's envelope, and the same `header_from_doc` / `footer_from_doc` writer path renders them.
 
-Both maps are keyed `section -> field -> CXL expression`. The section name is user-chosen — it is the envelope section a downstream [Sink](sink.md) renders via `header_from_doc` / `footer_from_doc`. The inner field map preserves declaration order, which is the rendered cell order. A synthesized section **overrides** an existing same-named section on the document (a regenerate); other sections ride through untouched.
+Both maps are keyed `section -> field -> CXL expression`. The inner field map preserves declaration order, which is the rendered cell order. A downstream [Sink](sink.md) renders a section through `header_from_doc` / `footer_from_doc`, and those may name only a section that a feeding Source declares (**E346**), so in practice a synthesized section reuses a declared section name.
+
+A synthesized section **replaces** the whole same-named section on the document; it does not add fields to it, so the section's original fields (for example a source's `interchange.tag`) are gone from that document. Other sections ride through untouched. Give `header:` and `footer:` **different** section names: if both name the same section, the header is applied last and replaces the footer, whose fields are lost without an error ([#1388](https://github.com/rustpunk/clinker/issues/1388)).
 
 ```yaml
 - type: envelope
@@ -142,7 +146,7 @@ Both maps are keyed `section -> field -> CXL expression`. The section name is us
   config:
     strategy: concat            # or preserve — synthesis works the same on either
     header:                     # section -> field -> scalar CXL
-      interchange:
+      group:                    # a different section from the footer's
         sender: $vars.sender_id
         created: $pipeline.run_date
     footer:                     # section -> field -> aggregate CXL
@@ -186,7 +190,7 @@ nodes:
   - type: envelope
     name: framed
     body: merged
-    config: { strategy: preserve }
+    config: { strategy: concat }   # preserve here is rejected with E347
   - type: sink
     name: out
     input: framed
@@ -197,7 +201,9 @@ nodes:
       reconstruct_envelope: true
 ```
 
-Placing the Envelope **after** a Combine or Aggregate is the intended use: it declares the document framing for the combined or reduced result, which is exactly where the later consolidation and synthesizing strategies do their work.
+After a Combine, Aggregate or Composition, a Sink with `reconstruct_envelope: true` needs a `concat` Envelope in between: those nodes' rows carry no document of their own, and `concat` frames them as one. A `preserve` Envelope there is rejected with **E347**. For an Aggregate that is right, since its rows would pass through unframed; for a Combine the check is stricter than it needs to be, because the joined rows do keep their driver row's document ([#1384](https://github.com/rustpunk/clinker/issues/1384)).
+
+After a Combine this works: the joined rows keep their driver row's document, and `concat` writes them as one framed document. After an Aggregate it plans without error but does not frame yet: Aggregate rows carry no source file, so the consolidated document has none either, and the Sink writes the rows with no header or footer ([#603](https://github.com/rustpunk/clinker/issues/603)). Reshape output loses its document the same way ([#1317](https://github.com/rustpunk/clinker/issues/1317)).
 
 ## Memory model
 
