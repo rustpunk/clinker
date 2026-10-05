@@ -1526,8 +1526,9 @@ mod walk_owned_tests {
             );
             assert_eq!(
                 spill_victim(&arbitrator, owner.id),
-                VictimOutcome::Spilled,
-                "the owner still holds its consumer's state, now on disk"
+                VictimOutcome::Busy,
+                "the owner still holds its consumer's state, now on disk, so a \
+                 second spill writes nothing"
             );
             drop(grant);
             arbitrator.unregister_consumer(owner.id);
