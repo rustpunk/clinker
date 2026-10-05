@@ -48,7 +48,8 @@ pub struct ExecutionMetrics {
     pub finished_at: DateTime<Utc>,
     /// Duration in milliseconds (`finished_at - started_at`).
     pub duration_ms: i64,
-    /// Process exit code (0 = clean, 1 = config error, 2 = partial, 3 = fatal, 4 = I/O).
+    /// Process exit code (0 = clean, 1 = config error, 2 = partial, 3 = fatal, 4 = I/O,
+    /// 130 = cancelled before publication).
     pub exit_code: u8,
     /// Total records read from the primary source.
     pub records_total: u64,
@@ -88,7 +89,8 @@ pub struct ExecutionMetrics {
     /// DLQ output path, if one was configured and written.
     pub dlq_path: Option<String>,
     /// Top-level error message if the pipeline exited with code 1, 3, or 4.
-    /// `null` on clean success (exit 0) or partial success (exit 2).
+    /// `null` on clean success (exit 0), partial success (exit 2), or
+    /// cancellation (exit 130).
     pub error: Option<String>,
     /// Counters surfaced by the relaxed correlation-key retraction
     /// orchestrator. Strict pipelines emit the default (all zero) shape

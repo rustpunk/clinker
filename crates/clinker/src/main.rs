@@ -61,7 +61,8 @@ EXIT CODES:
   1  Configuration, schema, or CXL compilation error
   2  Pipeline completed but DLQ entries were produced
   3  CXL evaluation error
-  4  Infrastructure failure or retained-attempt cleanup debt"
+  4  Infrastructure failure or retained-attempt cleanup debt
+  130  Cancelled (SIGINT or SIGTERM won before publication)"
 )]
 pub struct Cli {
     #[command(subcommand)]
