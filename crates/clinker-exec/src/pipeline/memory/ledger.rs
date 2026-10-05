@@ -11,7 +11,7 @@
 use super::protocol::Refusal;
 use super::reservation::{LockedLedger, ReservationState};
 use super::walk::{self, BorrowedReclaimSet, ThreadRole, VictimOutcome, WalkReclaim};
-use super::{ConsumerId, MemoryArbitrator, NO_WALK_REQUESTER, ReclaimCandidate};
+use super::{ConsumerId, MemoryArbitrator, MemoryConsumer, NO_WALK_REQUESTER, ReclaimCandidate};
 use clinker_format::FormatError;
 use clinker_format::preparation::{ResourceError, ResourceErrorKind};
 use clinker_plan::error::PipelineError;
@@ -1142,7 +1142,8 @@ impl MemoryArbitrator {
             return requester.into_iter().collect();
         }
         let registered = self.consumers.load();
-        let mut others: Vec<ReclaimCandidate> = Vec::with_capacity(registered.len());
+        let mut others: Vec<(ReclaimCandidate, &dyn MemoryConsumer)> =
+            Vec::with_capacity(registered.len());
         let mut requester_can_spill = false;
         for (id, consumer) in registered.iter() {
             let can_back_pressure = consumer.can_back_pressure();
@@ -1157,15 +1158,23 @@ impl MemoryArbitrator {
                 requester_can_spill = true;
                 continue;
             }
-            others.push(ReclaimCandidate {
+            let candidate = ReclaimCandidate {
                 id: *id,
                 reclaimable_bytes,
                 spill_priority: consumer.spill_priority(),
                 can_back_pressure,
-            });
+            };
+            others.push((candidate, consumer.as_ref()));
         }
-        others.sort_by_key(|candidate| candidate.id.0);
-        let mut order = self.policy.order_candidates(&others);
+        others.sort_by_key(|(candidate, _)| candidate.id.0);
+        let (candidates, consumers): (
+            Vec<ReclaimCandidate>,
+            Vec<(ConsumerId, &dyn MemoryConsumer)>,
+        ) = others
+            .into_iter()
+            .map(|(candidate, consumer)| (candidate, (candidate.id, consumer)))
+            .unzip();
+        let mut order = self.policy.order_candidates(&candidates, &consumers);
         if requester_can_spill && let Some(requester) = requester {
             order.push(requester);
         }
