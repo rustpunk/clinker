@@ -1183,14 +1183,18 @@ where
         let build_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::CombineBuild {
             name: name.clone(),
         });
+        let inline_requester =
+            crate::pipeline::memory::ledger::Requester::for_consumer(inline_consumer_id);
         let hash_table = CombineHashTable::build(
             build_records,
             &build_extractor,
             &hash_table_ctx,
             &budget,
+            name,
+            inline_requester,
             estimated_rows,
         )
-        .map_err(|e| e.into_build_error(name, &budget))?;
+        .map_err(|e| e.into_build_error(name))?;
         let build_identity_bytes = build_row_ids.capacity().saturating_mul(std::mem::size_of::<
             crate::executor::stream_event::SourceRowId,
         >());
@@ -1205,7 +1209,7 @@ where
             .check_hard_limit(
                 name,
                 clinker_plan::runtime_error::MemorySurface::JoinBuildSide,
-                crate::pipeline::memory::ledger::Requester::for_consumer(inline_consumer_id),
+                inline_requester,
                 inline_bytes as u64,
             )
             .map_err(|report| PipelineError::MemoryBudgetExceeded { report })?;
@@ -1342,15 +1346,21 @@ where
                     // check here — this loop only bounds memory.
 
                     // Budget check every 10K emitted records to bound memory under
-                    // fan-out. The build phase polls `should_abort` every 10K
-                    // inserts inside `CombineHashTable::build`; this covers the
-                    // symmetric probe-side risk where a small build × large driver
-                    // fan-out can blow RSS even though the table itself is bounded.
-                    if emitted_since_check >= 10_000 && budget.should_abort() {
-                        return Err(budget.backstop_refusal(
-                            name,
-                            clinker_plan::runtime_error::MemorySurface::JoinState,
-                        ));
+                    // fan-out. The build phase checks every 10K inserts inside
+                    // `CombineHashTable::build`; this covers the symmetric
+                    // probe-side risk where a small build × large driver fan-out
+                    // can blow the limit even though the table itself is bounded.
+                    // Checked after the fact: the walk reclaims other state
+                    // before it refuses.
+                    if emitted_since_check >= 10_000 {
+                        budget
+                            .check_hard_limit(
+                                name,
+                                clinker_plan::runtime_error::MemorySurface::JoinState,
+                                inline_requester,
+                                0,
+                            )
+                            .map_err(|report| PipelineError::MemoryBudgetExceeded { report })?;
                     }
                     if emitted_since_check >= 10_000 {
                         emitted_since_check = 0;
@@ -1582,6 +1592,9 @@ fn run_streaming_combine_probe(
     let source_batch_arc = ctx.source_batch_arc;
     let ingestion_timestamp = ctx.source_ingestion_timestamp;
     let allocation_resources = ctx.allocation_resources.clone();
+    // The hard-limit check names the combine's own consumer, as the
+    // materialized loop's does.
+    let inline_requester = held.requester();
 
     let mut effects = StreamingProbeEffects {
         cursor_advances: Vec::new(),
@@ -1714,12 +1727,18 @@ fn run_streaming_combine_probe(
                     // Budget check every 10K emitted or failed records, the same
                     // cadence and abort the materialized loop uses.
                     budget_cadence += output_records.len() - before + new_failures;
-                    if budget_cadence >= 10_000 && budget.should_abort() {
-                        drain_probe_channel(&rx, &charge_handle, &allocation_resources);
-                        return Err(budget.backstop_refusal(
+                    // The probe thread is off the walk, so the check refuses at
+                    // once, with no reclaim round, when the run is past its limit.
+                    if budget_cadence >= 10_000
+                        && let Err(report) = budget.check_hard_limit(
                             name,
                             clinker_plan::runtime_error::MemorySurface::JoinState,
-                        ));
+                            inline_requester,
+                            0,
+                        )
+                    {
+                        drain_probe_channel(&rx, &charge_handle, &allocation_resources);
+                        return Err(PipelineError::MemoryBudgetExceeded { report });
                     }
                     if budget_cadence >= 10_000 {
                         budget_cadence = 0;

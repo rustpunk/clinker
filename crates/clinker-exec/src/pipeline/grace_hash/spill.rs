@@ -343,9 +343,11 @@ pub(super) fn process_spilled_partition(
         build_extractor,
         ctx,
         budget,
+        name,
+        reload_requester(),
         Some(sp.build_count as usize),
     )
-    .map_err(|e| e.into_build_error(name, budget))?;
+    .map_err(|e| e.into_build_error(name))?;
 
     // Walk every probe-side spill file and emit matches.
     let mut probe_keys_buf: Vec<Value> = Vec::with_capacity(driver_extractor.len());
@@ -474,11 +476,16 @@ pub(super) fn bnl_fallback(
         let chunk_ids: Vec<(RecordOrder, BuildSeq)> =
             chunk.iter().map(|(_, row, seq)| (*row, *seq)).collect();
         let chunk = chunk.into_iter().map(|(record, _, _)| record);
-        let table =
-            CombineHashTable::build(chunk, rc.build_extractor, rc.ctx, budget, Some(chunk_len))
-                .map_err(|e| {
-                    with_partition_distinct_keys(e.into_build_error(name, budget), approx_distinct)
-                })?;
+        let table = CombineHashTable::build(
+            chunk,
+            rc.build_extractor,
+            rc.ctx,
+            budget,
+            name,
+            reload_requester(),
+            Some(chunk_len),
+        )
+        .map_err(|e| with_partition_distinct_keys(e.into_build_error(name), approx_distinct))?;
         stats.peak_chunk_table_bytes = stats.peak_chunk_table_bytes.max(table.memory_bytes());
 
         // Emit matches in 10 K-record batches against this chunk's
@@ -564,6 +571,15 @@ fn combine_e310_partition_aborted(
     );
     report.join_partition_distinct_keys = Some(approx_distinct);
     PipelineError::MemoryBudgetExceeded { report }
+}
+
+/// The requester the reload phase's hard-limit checks name: the run as a
+/// whole. From the end of the build the grace consumer reports nothing
+/// reclaimable, so a pass never elects it either way, and its holder still
+/// reads as the requester because its label is the node's join build side,
+/// the surface these checks name.
+fn reload_requester() -> crate::pipeline::memory::ledger::Requester {
+    crate::pipeline::memory::ledger::Requester::governed()
 }
 
 /// `error` with the stopped partition's approximate distinct-key count on

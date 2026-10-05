@@ -516,6 +516,16 @@ impl ConsumerHandle {
         self.binding.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The requester a check made for this handle's owner names: the
+    /// consumer it is registered under, or the run as a whole when it is not
+    /// registered. Takes the binding lock.
+    pub(crate) fn requester(&self) -> ledger::Requester {
+        match &*self.binding() {
+            Some(binding) => ledger::Requester::for_consumer(binding.id),
+            None => ledger::Requester::governed(),
+        }
+    }
+
     /// The handle's current charge. Lock-free read.
     pub fn bytes(&self) -> u64 {
         self.bytes.load(Ordering::Relaxed)

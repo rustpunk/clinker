@@ -41,10 +41,12 @@ use std::sync::Arc;
 use crate::pipeline::memory::MemoryArbitrator;
 #[cfg(test)]
 use crate::pipeline::memory::NoOpPolicy;
+use crate::pipeline::memory::ledger::Requester;
+use clinker_plan::runtime_error::{MemoryShortfallReport, MemorySurface};
 
 /// Period (measured in records processed) between
-/// [`crate::pipeline::memory::MemoryArbitrator::should_abort`] checks during
-/// `CombineHashTable::build` AND during probe-side fan-out emission.
+/// `MemoryArbitrator::check_hard_limit` checks
+/// during `CombineHashTable::build` AND during probe-side fan-out emission.
 ///
 /// Matches ClickHouse per-block cadence and is the same order of
 /// magnitude as DataFusion's default 8192-row RecordBatch. Per-row RSS
@@ -403,12 +405,12 @@ pub enum CombineError {
     /// back-pressure shutdown).
     ProbeAborted { reason: String },
 
-    /// Memory budget was exhausted while building or probing. `used` is
-    /// the hash table's self-reported footprint at the moment of the
-    /// check; `limit` is the configured budget. Emitted after
-    /// `MemoryArbitrator::should_abort` returns true (checked every
-    /// [`MEMORY_CHECK_INTERVAL`] records to amortize the cost).
-    MemoryLimitExceeded { used: u64, limit: u64 },
+    /// The run's hard-limit backstop refused the build: the table's bytes
+    /// did not fit beside the run's charges after the reclaim round the
+    /// walk ran, or the process's memory was over the limit. The E310
+    /// report is the one the arbitrator's backstop check built (checked
+    /// every [`MEMORY_CHECK_INTERVAL`] records and once more at the end).
+    MemoryRefused(Box<MemoryShortfallReport>),
 
     /// Key-expression evaluation failed. `side` is `"driving"` or
     /// `"build"` so the executor can produce an accurate diagnostic.
@@ -431,9 +433,11 @@ impl std::fmt::Display for CombineError {
             CombineError::ProbeAborted { reason } => {
                 write!(f, "combine probe aborted: {reason}")
             }
-            CombineError::MemoryLimitExceeded { used, limit } => write!(
+            CombineError::MemoryRefused(report) => write!(
                 f,
-                "combine memory limit exceeded: used {used} bytes, limit {limit} bytes"
+                "combine memory refused: requested {} bytes, limit {} bytes",
+                report.requested_bytes,
+                report.limit.bytes()
             ),
             CombineError::KeyEvalFailed { source, side } => {
                 write!(f, "combine {side}-side key evaluation failed: {source}")
@@ -448,27 +452,14 @@ impl std::fmt::Display for CombineError {
 impl CombineError {
     /// This failure of `node`'s hash build as the run's error.
     ///
-    /// A build whose table alone outgrew the limit is the E310 refusal of the
-    /// `used` bytes the table needed for `node`'s join build side; a build
-    /// stopped because the run as a whole was past its limit is the
-    /// backstop's E310 for the same surface. Both report from `budget`'s
-    /// ledger. A build key that failed to evaluate is the same error the
-    /// probe side's key failure is; any other build failure is an internal
-    /// error naming `node`.
-    pub(crate) fn into_build_error(
-        self,
-        node: &str,
-        budget: &MemoryArbitrator,
-    ) -> clinker_plan::error::PipelineError {
+    /// A memory refusal is the E310 the backstop check built, passed
+    /// through unchanged. A build key that failed to evaluate is the same
+    /// error the probe side's key failure is; any other build failure is an
+    /// internal error naming `node`.
+    pub(crate) fn into_build_error(self, node: &str) -> clinker_plan::error::PipelineError {
         use clinker_plan::error::PipelineError;
-        use clinker_plan::runtime_error::MemorySurface;
         match self {
-            CombineError::MemoryLimitExceeded { used, limit } if used > limit => {
-                budget.refusal(node, MemorySurface::JoinBuildSide, used)
-            }
-            CombineError::MemoryLimitExceeded { .. } => {
-                budget.backstop_refusal(node, MemorySurface::JoinBuildSide)
-            }
+            CombineError::MemoryRefused(report) => PipelineError::MemoryBudgetExceeded { report },
             CombineError::KeyEvalFailed { source, .. } => PipelineError::Compilation {
                 transform_name: node.to_string(),
                 messages: vec![format!("combine build key eval error: {source}")],
@@ -770,9 +761,13 @@ impl CombineHashTable {
     ///   conjunct, aligned to the build side's expressions.
     /// * `ctx` — CXL evaluation context, carries the Clock and stable
     ///   context shared across the build walk.
-    /// * `budget` — polled every [`MEMORY_CHECK_INTERVAL`] inserts AND at
-    ///   the end of build. Returns [`CombineError::MemoryLimitExceeded`] if
-    ///   the process RSS exceeds the budget's hard limit.
+    /// * `budget`, `node`, `requester` — the run's hard-limit backstop
+    ///   (`MemoryArbitrator::check_hard_limit`) is checked every
+    ///   [`MEMORY_CHECK_INTERVAL`] inserts and at the end of build, for
+    ///   `node`'s join build side and in `requester`'s name, with the
+    ///   table's bytes so far as the bytes not yet charged. On the walk the
+    ///   check runs a reclaim round before it refuses; a refusal is
+    ///   [`CombineError::MemoryRefused`] carrying the check's E310.
     /// * `estimated_rows` — optional capacity hint. When `Some`, the
     ///   underlying [`HashTable`] is pre-sized via `with_capacity` to avoid
     ///   the resize spike, which can reach 2.25× peak footprint during
@@ -795,6 +790,8 @@ impl CombineHashTable {
         extractor: &KeyExtractor,
         ctx: &EvalContext<'_>,
         budget: &MemoryArbitrator,
+        node: &str,
+        requester: Requester,
         estimated_rows: Option<usize>,
     ) -> Result<Self, CombineError>
     where
@@ -855,26 +852,19 @@ impl CombineHashTable {
             arena.push(rec);
 
             // Periodic budget poll. The build-side table's bytes are not
-            // yet mirrored into the registered consumer handle (the
-            // executor seeds it only after build completes), so RSS is the
-            // only whole-process signal — and RSS is unavailable on
-            // unsupported targets and the wasm build, where an RSS-only
-            // gate never fires and the build grows until the OS OOMs.
-            // `should_abort_local` adds the partial table footprint as an
-            // RSS-independent gate: the build aborts when the in-memory
-            // table alone exceeds the budget regardless of RSS
-            // availability. Partial footprint (arena + chain + keys_cache +
+            // yet charged to any consumer (the executor charges the table
+            // only after the build completes), so the check takes the
+            // partial footprint as the bytes not yet charged: the run must
+            // fit its limit with them, whether or not the process's memory
+            // can be read. Partial footprint (arena + chain + keys_cache +
             // index-so-far) under-reports the finalized table slightly once
             // the HashTable rehashes, which is the honest figure to gate
             // and report mid-build.
             if (i + 1).is_multiple_of(MEMORY_CHECK_INTERVAL) {
                 let used = partial_memory_bytes(&index, &chain, &arena, &keys_cache);
-                if budget.should_abort_local(used as u64) {
-                    return Err(CombineError::MemoryLimitExceeded {
-                        used: used as u64,
-                        limit: budget.limit(),
-                    });
-                }
+                budget
+                    .check_hard_limit(node, MemorySurface::JoinBuildSide, requester, used as u64)
+                    .map_err(CombineError::MemoryRefused)?;
             }
         }
 
@@ -887,15 +877,18 @@ impl CombineHashTable {
         };
 
         // Safety-net final check — catches builds shorter than
-        // MEMORY_CHECK_INTERVAL that slipped past the periodic poll. Gates
-        // on the finalized table's own bytes too, so a sub-interval build
-        // over a tiny budget aborts even when RSS cannot be measured.
-        if budget.should_abort_local(table.memory_bytes() as u64) {
-            return Err(CombineError::MemoryLimitExceeded {
-                used: table.memory_bytes() as u64,
-                limit: budget.limit(),
-            });
-        }
+        // MEMORY_CHECK_INTERVAL that slipped past the periodic poll, with the
+        // finalized table's own bytes as the bytes not yet charged, so a
+        // sub-interval build over a tiny budget stops even when RSS cannot
+        // be measured.
+        budget
+            .check_hard_limit(
+                node,
+                MemorySurface::JoinBuildSide,
+                requester,
+                table.memory_bytes() as u64,
+            )
+            .map_err(CombineError::MemoryRefused)?;
 
         Ok(table)
     }
@@ -1728,10 +1721,16 @@ mod tests {
         // Anchors the Display format and the fact that source() chains
         // for KeyEvalFailed. The executor depends on both (for diagnostic
         // messages and for error-chain walking).
-        let e = CombineError::MemoryLimitExceeded {
-            used: 1024,
-            limit: 512,
-        };
+        let e = CombineError::MemoryRefused(
+            test_budget(512)
+                .check_hard_limit(
+                    "enrich",
+                    clinker_plan::runtime_error::MemorySurface::JoinBuildSide,
+                    Requester::governed(),
+                    1024,
+                )
+                .expect_err("1024 bytes do not fit a 512-byte limit"),
+        );
         let msg = format!("{e}");
         assert!(msg.contains("1024"));
         assert!(msg.contains("512"));
@@ -1750,11 +1749,17 @@ mod tests {
         let budget = test_budget(512);
 
         // The table alone outgrew the limit: the refusal of its bytes.
-        let alone = CombineError::MemoryLimitExceeded {
-            used: 1024,
-            limit: 512,
-        }
-        .into_build_error("enrich", &budget);
+        let alone = CombineError::MemoryRefused(
+            budget
+                .check_hard_limit(
+                    "enrich",
+                    MemorySurface::JoinBuildSide,
+                    Requester::governed(),
+                    1024,
+                )
+                .expect_err("1024 bytes do not fit a 512-byte limit"),
+        )
+        .into_build_error("enrich");
         let PipelineError::MemoryBudgetExceeded { report } = alone else {
             panic!("a table larger than the limit is E310; got {alone:?}");
         };
@@ -1769,12 +1774,23 @@ mod tests {
         assert!(report.oversized);
 
         // The run was past its limit while the table still fit: the backstop.
-        budget.set_peak_rss_for_test(512 + 300);
-        let backstop = CombineError::MemoryLimitExceeded {
-            used: 100,
-            limit: 512,
-        }
-        .into_build_error("enrich", &budget);
+        // The check samples the process's own memory, so this half runs under
+        // a limit far above what the test process holds, with the process's
+        // reading 300 bytes over it.
+        let roomy_limit = 64 * 1024 * 1024 * 1024;
+        let roomy = test_budget(roomy_limit);
+        roomy.set_peak_rss_for_test(roomy_limit + 300);
+        let backstop = CombineError::MemoryRefused(
+            roomy
+                .check_hard_limit(
+                    "enrich",
+                    MemorySurface::JoinBuildSide,
+                    Requester::governed(),
+                    100,
+                )
+                .expect_err("the process's memory is over the limit"),
+        )
+        .into_build_error("enrich");
         let PipelineError::MemoryBudgetExceeded { report } = backstop else {
             panic!("a run past its limit is E310; got {backstop:?}");
         };
@@ -1789,7 +1805,7 @@ mod tests {
             )),
             side: "build",
         }
-        .into_build_error("enrich", &budget);
+        .into_build_error("enrich");
         assert!(
             matches!(&key, PipelineError::Compilation { transform_name, .. } if transform_name == "enrich"),
             "{key:?}"
@@ -1867,8 +1883,16 @@ mod tests {
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
         let budget = test_budget(256 * 1024 * 1024);
 
-        let table =
-            CombineHashTable::build(records, &extractor, &ctx, &budget, Some(1000)).unwrap();
+        let table = CombineHashTable::build(
+            records,
+            &extractor,
+            &ctx,
+            &budget,
+            "enrich",
+            Requester::governed(),
+            Some(1000),
+        )
+        .unwrap();
         assert_eq!(table.len(), 1000);
         assert!(!table.is_empty());
 
@@ -1901,7 +1925,16 @@ mod tests {
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
         let budget = test_budget(256 * 1024 * 1024);
 
-        let table = CombineHashTable::build(records, &extractor, &ctx, &budget, None).unwrap();
+        let table = CombineHashTable::build(
+            records,
+            &extractor,
+            &ctx,
+            &budget,
+            "enrich",
+            Requester::governed(),
+            None,
+        )
+        .unwrap();
 
         let probe = mk_record(&schema, vec![Value::Integer(5), Value::Null]);
         let probe_keys = probe_keys_for(&extractor, &ctx, &probe);
@@ -1931,7 +1964,16 @@ mod tests {
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
         let budget = test_budget(256 * 1024 * 1024);
-        let table = CombineHashTable::build(records, &extractor, &ctx, &budget, None).unwrap();
+        let table = CombineHashTable::build(
+            records,
+            &extractor,
+            &ctx,
+            &budget,
+            "enrich",
+            Requester::governed(),
+            None,
+        )
+        .unwrap();
 
         let probe = mk_record(&schema, vec![Value::Integer(9999)]);
         let probe_keys = probe_keys_for(&extractor, &ctx, &probe);
@@ -1962,7 +2004,16 @@ mod tests {
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
         let budget = test_budget(256 * 1024 * 1024);
-        let table = CombineHashTable::build(records, &extractor, &ctx, &budget, None).unwrap();
+        let table = CombineHashTable::build(
+            records,
+            &extractor,
+            &ctx,
+            &budget,
+            "enrich",
+            Requester::governed(),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             table.len(),
             2,
@@ -2019,7 +2070,16 @@ mod tests {
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
         let budget = test_budget(256 * 1024 * 1024);
-        let table = CombineHashTable::build(records, &extractor, &ctx, &budget, None).unwrap();
+        let table = CombineHashTable::build(
+            records,
+            &extractor,
+            &ctx,
+            &budget,
+            "enrich",
+            Requester::governed(),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             table.len(),
             3,
@@ -2094,8 +2154,16 @@ mod tests {
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
         let budget = test_budget(256 * 1024 * 1024);
-        let table =
-            CombineHashTable::build(records, &extractor, &ctx, &budget, Some(1000)).unwrap();
+        let table = CombineHashTable::build(
+            records,
+            &extractor,
+            &ctx,
+            &budget,
+            "enrich",
+            Requester::governed(),
+            Some(1000),
+        )
+        .unwrap();
 
         // These keys are NOT in the build set.
         for missing_key in [1000i64, 10_000, -1, -999] {
@@ -2143,7 +2211,16 @@ mod tests {
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
         let budget = test_budget(256 * 1024 * 1024);
-        let table = CombineHashTable::build(records, &extractor, &ctx, &budget, Some(100)).unwrap();
+        let table = CombineHashTable::build(
+            records,
+            &extractor,
+            &ctx,
+            &budget,
+            "enrich",
+            Requester::governed(),
+            Some(100),
+        )
+        .unwrap();
 
         let total = table.memory_bytes();
 
@@ -2231,8 +2308,16 @@ mod tests {
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
         let budget = test_budget(256 * 1024 * 1024);
-        let table =
-            CombineHashTable::build(records, &extractor, &ctx, &budget, Some(1000)).unwrap();
+        let table = CombineHashTable::build(
+            records,
+            &extractor,
+            &ctx,
+            &budget,
+            "enrich",
+            Requester::governed(),
+            Some(1000),
+        )
+        .unwrap();
 
         let total = table.memory_bytes();
         let ratio = total as f64 / raw_baseline as f64;
@@ -2300,8 +2385,16 @@ mod tests {
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
         let budget = test_budget(1024 * 1024 * 1024);
-        let table =
-            CombineHashTable::build(records, &extractor, &ctx, &budget, Some(N_RECORDS)).unwrap();
+        let table = CombineHashTable::build(
+            records,
+            &extractor,
+            &ctx,
+            &budget,
+            "enrich",
+            Requester::governed(),
+            Some(N_RECORDS),
+        )
+        .unwrap();
 
         let total = table.memory_bytes();
         let ratio = total as f64 / raw_baseline as f64;
@@ -2338,8 +2431,17 @@ mod tests {
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
         let budget = test_budget(1); // 1 byte — impossibly tight.
 
-        match CombineHashTable::build(records, &extractor, &ctx, &budget, None) {
-            Err(CombineError::MemoryLimitExceeded { used, limit }) => {
+        match CombineHashTable::build(
+            records,
+            &extractor,
+            &ctx,
+            &budget,
+            "enrich",
+            Requester::governed(),
+            None,
+        ) {
+            Err(CombineError::MemoryRefused(report)) => {
+                let (used, limit) = (report.requested_bytes, report.limit.bytes());
                 assert_eq!(limit, 1);
                 // The 10-record table holds far more than 1 byte, so the
                 // local-bytes gate reports a non-zero footprint.
@@ -2348,7 +2450,7 @@ mod tests {
                     "expected a non-trivial table footprint, got {used}"
                 );
             }
-            Err(other) => panic!("expected MemoryLimitExceeded, got {other}"),
+            Err(other) => panic!("expected MemoryRefused, got {other}"),
             Ok(_) => panic!(
                 "build() succeeded under a 1-byte budget — the byte-counted \
                  build-side cap regressed; it must abort even when RSS is \
@@ -2371,7 +2473,7 @@ mod tests {
         // never seeds `peak_rss`, so on a target where `rss_bytes()`
         // returns `None` the only signal is the byte-counted local-bytes
         // gate. A 64-byte budget cannot hold a 5000-record integer-key
-        // table, so the build must fail with MemoryLimitExceeded rather
+        // table, so the build must fail with MemoryRefused rather
         // than succeed and risk an OOM.
         let schema = test_schema(&["k"]);
         let records: Vec<Record> = (0..5000)
@@ -2382,9 +2484,17 @@ mod tests {
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
         let budget = test_budget(64);
 
-        match CombineHashTable::build(records, &extractor, &ctx, &budget, Some(5000)) {
-            Err(CombineError::MemoryLimitExceeded { limit, .. }) => assert_eq!(limit, 64),
-            Err(other) => panic!("expected MemoryLimitExceeded, got {other}"),
+        match CombineHashTable::build(
+            records,
+            &extractor,
+            &ctx,
+            &budget,
+            "enrich",
+            Requester::governed(),
+            Some(5000),
+        ) {
+            Err(CombineError::MemoryRefused(report)) => assert_eq!(report.limit.bytes(), 64),
+            Err(other) => panic!("expected MemoryRefused, got {other}"),
             Ok(_) => panic!(
                 "build() succeeded under a 64-byte budget without a seeded RSS — \
                  the byte-counted backstop did not fire, so the budget is a no-op \
@@ -2409,7 +2519,16 @@ mod tests {
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
         let budget = test_budget(256 * 1024 * 1024);
-        let table = CombineHashTable::build(vec![], &extractor, &ctx, &budget, None).unwrap();
+        let table = CombineHashTable::build(
+            vec![],
+            &extractor,
+            &ctx,
+            &budget,
+            "enrich",
+            Requester::governed(),
+            None,
+        )
+        .unwrap();
         assert!(table.is_empty());
         assert_eq!(table.len(), 0);
 
@@ -2443,8 +2562,16 @@ mod tests {
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
         let budget = test_budget(256 * 1024 * 1024);
-        let table =
-            CombineHashTable::build(records, &extractor, &ctx, &budget, Some(10_000)).unwrap();
+        let table = CombineHashTable::build(
+            records,
+            &extractor,
+            &ctx,
+            &budget,
+            "enrich",
+            Requester::governed(),
+            Some(10_000),
+        )
+        .unwrap();
 
         for key in [0i64, 500, 9999] {
             let probe = mk_record(&schema, vec![Value::Integer(key)]);
@@ -2512,8 +2639,16 @@ mod tests {
                 })
                 .collect();
             let budget = test_budget(256 * 1024 * 1024);
-            let table =
-                CombineHashTable::build(records, &extractor, &ctx, &budget, None).expect("build");
+            let table = CombineHashTable::build(
+                records,
+                &extractor,
+                &ctx,
+                &budget,
+                "enrich",
+                Requester::governed(),
+                None,
+            )
+            .expect("build");
             assert_eq!(table.len(), n);
 
             // For every key in the universe PLUS a few definitely-missing

@@ -626,6 +626,9 @@ impl GraceHashExecutor {
     ) -> Result<(), PipelineError> {
         self.building_bytes = 0;
         self.publish_reclaimable();
+        // Each partition's table build checks the hard limit in the grace
+        // consumer's name, so a pass it runs elects that consumer last.
+        let requester = self.consumer_handle.requester();
         for i in 0..self.partitions.len() {
             let prev = std::mem::replace(&mut self.partitions[i], PartitionState::Done);
             let new_state = match prev {
@@ -639,18 +642,32 @@ impl GraceHashExecutor {
                         // Empty partition fast-path: still construct an
                         // empty hash table so probe lookups hit the
                         // Ready branch and emit zero matches uniformly.
-                        let table =
-                            CombineHashTable::build(records, extractor, ctx, budget, Some(0))
-                                .map_err(|e| e.into_build_error(combine_name, budget))?;
+                        let table = CombineHashTable::build(
+                            records,
+                            extractor,
+                            ctx,
+                            budget,
+                            combine_name,
+                            requester,
+                            Some(0),
+                        )
+                        .map_err(|e| e.into_build_error(combine_name))?;
                         PartitionState::Ready(Rc::new(ReadyPartition {
                             hash_table: table,
                             build_ids,
                         }))
                     } else {
                         let estimated = Some(records.len());
-                        let table =
-                            CombineHashTable::build(records, extractor, ctx, budget, estimated)
-                                .map_err(|e| e.into_build_error(combine_name, budget))?;
+                        let table = CombineHashTable::build(
+                            records,
+                            extractor,
+                            ctx,
+                            budget,
+                            combine_name,
+                            requester,
+                            estimated,
+                        )
+                        .map_err(|e| e.into_build_error(combine_name))?;
                         PartitionState::Ready(Rc::new(ReadyPartition {
                             hash_table: table,
                             build_ids,
