@@ -1898,6 +1898,89 @@ mod tests {
         );
     }
 
+    /// One group of 64 rows, ~5 KiB, numbered from the first ordinal a
+    /// Source mints, admitted against a 512 B soft limit so part of it
+    /// partition-spills: the reload path the finalize's hard limit gates.
+    /// `row` builds each row from its payload. The spill directory is
+    /// returned so it outlives the buffer's spill files.
+    fn oversized_group(
+        schema: &SharedStorage<Schema>,
+        row: impl Fn(String) -> Record,
+    ) -> (CullGroupBuffer, Vec<GroupByKey>, tempfile::TempDir) {
+        use crate::executor::stream_event::SourceRowId;
+        let spill_root = tempfile::tempdir().unwrap();
+        let arb = arbitrator(512);
+        let handle = ConsumerHandle::new();
+        let key = vec![GroupByKey::Str("g".into())];
+        let mut buffer = CullGroupBuffer::new(
+            schema.clone(),
+            true,
+            clinker_format::preparation::MemoryOnlyResources::new(
+                std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+            )
+            .resources()
+            .allocation()
+            .clone(),
+        );
+        for index in 0..64u64 {
+            let payload = format!("{index:063}");
+            buffer.push(
+                key.clone(),
+                row(payload),
+                SourceRowId::new(PlanNodeId::new(0), SourceRowId::FIRST_ORDINAL + index),
+            );
+            handle.set_bytes(buffer.unaccounted_resident_bytes() as u64);
+            if arb.spill_threshold_bytes() < buffer.resident_bytes() as u64 {
+                buffer
+                    .spill_until_under_budget("cl", &arb, spill_root.path(), &handle)
+                    .unwrap();
+            }
+        }
+        assert!(
+            !buffer.groups[&key].spilled.is_empty(),
+            "the oversized group must have partition-spilled for this to test the reload gate"
+        );
+        (buffer, key, spill_root)
+    }
+
+    /// A group whose first row carries no Source stamp (a row the engine
+    /// made rather than read) has no Source to be named by, so its E310
+    /// prints no `group:` line rather than an engine placeholder where the
+    /// Source's name belongs.
+    #[test]
+    fn a_group_with_no_known_source_prints_no_group_line() {
+        let schema: SharedStorage<Schema> =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["account".into()])));
+        let (mut buffer, key, _spill_root) = oversized_group(&schema, |payload| {
+            record(&schema, Value::String(payload.into()))
+        });
+        let limit_in_force = MemoryArbitrator::with_policy(256, 0.80, 0.70, Box::new(NoOpPolicy));
+        let err = buffer
+            .take_group("cl", &key, 256, &limit_in_force)
+            .expect_err("a group exceeding the hard limit must be rejected at finalize");
+
+        let PipelineError::MemoryBudgetExceeded { report } = &err else {
+            panic!("a giant correlation group must surface E310; got {err:?}");
+        };
+        assert_eq!(
+            report.group_first_row, None,
+            "no Source is known for the group's first row, so none is named"
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.starts_with("E310 \"cl\":"),
+            "the refusal still leads with the E310 code and the node: {rendered}"
+        );
+        assert!(
+            !rendered.contains("group:"),
+            "with no Source to name, the report has no group line: {rendered}"
+        );
+        assert!(
+            !rendered.contains(crate::executor::dispatch::MERGED_SOURCE_NAME.as_ref()),
+            "the engine's placeholder is never printed as a Source: {rendered}"
+        );
+    }
+
     /// Text bytes of each row's note.
     const NOTE_BYTES: usize = 1024;
     /// Rows a reclaim test buffers, across [`GROUPS`] groups.
