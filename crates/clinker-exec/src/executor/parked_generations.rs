@@ -71,6 +71,30 @@ pub(crate) struct ParkedGenerations {
     forward: HashMap<ParkedKey, ParkedEdge>,
     /// Rows parked during the running iteration of the commit.
     commit_pass: HashMap<ParkedKey, ParkedEdge>,
+    /// Every resident copy a park made, and the edge's charge when the
+    /// first was made.
+    #[cfg(test)]
+    copies: ParkCopies,
+}
+
+/// The resident copies parks made, kept for tests.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ParkCopies {
+    /// Rows copied into resident segments.
+    pub(crate) rows: u64,
+    /// The edge handle's charge at the moment the first row was copied.
+    pub(crate) charge_at_first_copy: Option<u64>,
+}
+
+/// What parking `rows` charges: the bytes a copy of them allocates or alone
+/// may keep alive.
+fn parked_copy_bytes(rows: &[(Record, SourceRowId)]) -> u64 {
+    rows.iter()
+        .map(|(record, _)| {
+            (std::mem::size_of::<(Record, SourceRowId)>() + record.clone_allocation_bytes()) as u64
+        })
+        .sum()
 }
 
 /// One crossing edge's parked rows and the consumer that charges them.
@@ -213,7 +237,35 @@ impl ParkedGenerations {
             batch_size,
             forward: HashMap::new(),
             commit_pass: HashMap::new(),
+            #[cfg(test)]
+            copies: ParkCopies::default(),
         }
+    }
+
+    /// Note that `rows` rows are being copied into a resident segment while
+    /// the edge is charged `charge`.
+    #[cfg(test)]
+    fn note_copy(&mut self, rows: usize, charge: u64) {
+        self.copies.charge_at_first_copy.get_or_insert(charge);
+        self.copies.rows += rows as u64;
+    }
+
+    /// The resident copies parks have made.
+    #[cfg(test)]
+    pub(crate) fn park_copies(&self) -> ParkCopies {
+        self.copies
+    }
+
+    /// For each segment of edge `key` parked on the forward pass, in order,
+    /// whether it is on disk.
+    #[cfg(test)]
+    pub(crate) fn segments_on_disk(&self, key: &ParkedKey) -> Vec<bool> {
+        self.forward.get(key).map_or_else(Vec::new, |edge| {
+            edge.segments
+                .iter()
+                .map(|segment| matches!(segment.buffer, NodeBuffer::Spilled { .. }))
+                .collect()
+        })
     }
 
     /// Park a copy of `rows` for the crossing edge `key`, from the node named
@@ -253,6 +305,8 @@ impl ParkedGenerations {
         if handle.take_spill_request() {
             store.borrow_mut().spill_edge(generation, &key)?;
         }
+        #[cfg(test)]
+        store.borrow_mut().note_copy(rows.len(), handle.bytes());
         let segment = NodeBuffer::memory_from_records(
             rows.iter()
                 .map(|(record, row)| (record.clone(), *row))
@@ -260,7 +314,7 @@ impl ParkedGenerations {
         );
         // A clone copies every value into storage no other consumer charges,
         // so the copy's resident size is its slots plus its whole payload.
-        let bytes = segment.reclaimable_bytes();
+        let bytes = parked_copy_bytes(rows);
         let charged = if handle.try_grow(bytes).is_ok() {
             bytes
         } else {
@@ -905,5 +959,191 @@ mod tests {
         assert_eq!(read_back(&walk.store, &key), expected);
         assert_eq!(read_back(&walk.store, &key), expected);
         assert!(walk.arbitrator.per_stage_spill_bytes_written().is_empty());
+    }
+
+    /// Rows `first..first + count` of the `rows` fixture's shape, whose
+    /// payload column holds what `payload` builds for each row.
+    fn rows_with_payload(
+        first: u64,
+        count: u64,
+        columns: &[&str],
+        payload: impl Fn(u64) -> Vec<Value>,
+    ) -> Vec<(Record, SourceRowId)> {
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(
+            columns.iter().map(|&column| column.into()).collect(),
+        )));
+        (first..first + count)
+            .map(|row| {
+                // Exactly as many slots as columns, like the `rows` fixture.
+                let payload = payload(row);
+                let mut values = Vec::with_capacity(1 + payload.len());
+                values.push(Value::Integer(row as i64));
+                values.extend(payload);
+                (
+                    Record::new(schema.clone(), values),
+                    SourceRowId::new(clinker_plan::plan::PlanNodeId::new(3), row),
+                )
+            })
+            .collect()
+    }
+
+    /// Park `rows` on edge `key` of `walk`'s store, on the forward pass.
+    fn park_rows(walk: &ParkedWalk, key: ParkedKey, rows: &[(Record, SourceRowId)]) {
+        ParkedGenerations::park(
+            &walk.store,
+            Generation::Forward,
+            key,
+            rows,
+            "lookup",
+            "enriched",
+        )
+        .expect("park");
+    }
+
+    /// With ample memory a park charges the edge exactly what the copy of
+    /// its rows allocates or alone may keep alive, and that charge is in
+    /// place before the first row is copied.
+    #[test]
+    fn a_park_charges_the_rows_before_it_copies_them() {
+        let root = tempfile::tempdir().expect("spill root");
+        let rows = rows(0, 32);
+        let figure = parked_copy_bytes(&rows);
+        let walk = parked_walk(64 * 1024 * 1024, root.path());
+        let key: ParkedKey = (None, EdgeIndex::new(2));
+        park_rows(&walk, key, &rows);
+
+        let (_, handle) = walk.store.borrow().edge_consumer(&key).expect("edge");
+        assert_eq!(handle.bytes(), figure);
+        assert_eq!(
+            walk.store.borrow().park_copies(),
+            ParkCopies {
+                rows: 32,
+                charge_at_first_copy: Some(figure),
+            },
+            "the rows are charged before any of them is copied"
+        );
+        assert_eq!(read_back(&walk.store, &key), (0..32).collect::<Vec<u64>>());
+    }
+
+    /// Below the rows' figure, with nothing to reclaim, a park writes the
+    /// borrowed rows to one spill file and never builds a resident copy;
+    /// the file reads back whole and its bytes count against the producer.
+    #[test]
+    fn a_refused_park_writes_the_rows_without_a_resident_copy() {
+        let root = tempfile::tempdir().expect("spill root");
+        let rows = rows(0, 32);
+        let walk = parked_walk(parked_copy_bytes(&rows) / 2, root.path());
+        let key: ParkedKey = (None, EdgeIndex::new(3));
+        park_rows(&walk, key, &rows);
+
+        assert_eq!(
+            walk.store.borrow().park_copies(),
+            ParkCopies::default(),
+            "a refused park copies no row"
+        );
+        assert_eq!(walk.store.borrow().segments_on_disk(&key), vec![true]);
+        let (_, handle) = walk.store.borrow().edge_consumer(&key).expect("edge");
+        assert_eq!(handle.bytes(), 0);
+        assert_eq!(handle.peak_bytes(), 0, "nothing was ever held charged");
+        assert_eq!(read_back(&walk.store, &key), (0..32).collect::<Vec<u64>>());
+        let written = walk.arbitrator.per_stage_spill_bytes_written()["lookup"];
+        assert!(written > 0);
+        assert_eq!(walk.arbitrator.cumulative_spill_bytes(), written);
+
+        walk.store.borrow_mut().release_all();
+        assert_eq!(walk.arbitrator.cumulative_spill_bytes(), 0);
+    }
+
+    /// Rows whose long text is ungoverned and shared are parked, then the
+    /// originals are dropped: the parked copy alone now keeps that text
+    /// alive, so the edge keeps charging it. The same rows with inline text
+    /// set the baseline.
+    #[test]
+    fn a_park_keeps_charging_payload_only_its_copy_keeps_alive() {
+        let root = tempfile::tempdir().expect("spill root");
+        let long = rows(0, 32);
+        let payload = format!("parked-{:06}", 0).repeat(8).len() as u64;
+        let inline = rows_with_payload(0, 32, &["id", "payload"], |row| {
+            vec![Value::String(format!("short-{row:06}").into())]
+        });
+        let figure = parked_copy_bytes(&long);
+        let walk = parked_walk(64 * 1024 * 1024, root.path());
+        let (long_key, inline_key): (ParkedKey, ParkedKey) =
+            ((None, EdgeIndex::new(5)), (None, EdgeIndex::new(6)));
+        park_rows(&walk, long_key, &long);
+        park_rows(&walk, inline_key, &inline);
+        drop(long);
+        drop(inline);
+
+        let (_, long_handle) = walk.store.borrow().edge_consumer(&long_key).expect("edge");
+        let (_, inline_handle) = walk
+            .store
+            .borrow()
+            .edge_consumer(&inline_key)
+            .expect("edge");
+        assert_eq!(long_handle.bytes(), figure);
+        assert_eq!(
+            long_handle.bytes() - inline_handle.bytes(),
+            32 * payload,
+            "the parked copy is the text's only holder now, so its charge covers it"
+        );
+    }
+
+    /// Rows whose long text a Source reader admitted: the copy of a governed
+    /// unique string is a fresh allocation nothing admitted, so the edge
+    /// charges it; a governed shared string's admission covers every alias,
+    /// so the edge does not charge it again. The same rows with inline text
+    /// set the baseline.
+    #[test]
+    fn a_park_charges_a_governed_unique_copy_and_not_a_governed_shared_alias() {
+        use clinker_format::preparation::MemoryOnlyResources;
+        use clinker_record::FieldStr;
+        use std::num::NonZeroUsize;
+
+        const SHARED: usize = 257;
+        const UNIQUE: usize = 513;
+        let resources = MemoryOnlyResources::new(NonZeroUsize::new(1 << 20).expect("non-zero"));
+        let scope = resources
+            .resources()
+            .allocation()
+            .clone()
+            .scope()
+            .expect("a run scope");
+        let columns = ["id", "shared", "unique"];
+        let governed = rows_with_payload(0, 32, &columns, |_| {
+            vec![
+                Value::String(FieldStr::try_new(&"s".repeat(SHARED), &scope).expect("admitted")),
+                Value::String(
+                    FieldStr::try_new_unique(&"u".repeat(UNIQUE), &scope).expect("admitted"),
+                ),
+            ]
+        });
+        let inline = rows_with_payload(0, 32, &columns, |_| {
+            vec![Value::String("s".into()), Value::String("u".into())]
+        });
+        let figure = parked_copy_bytes(&governed);
+        let root = tempfile::tempdir().expect("spill root");
+        let walk = parked_walk(64 * 1024 * 1024, root.path());
+        let (governed_key, inline_key): (ParkedKey, ParkedKey) =
+            ((None, EdgeIndex::new(7)), (None, EdgeIndex::new(8)));
+        park_rows(&walk, governed_key, &governed);
+        park_rows(&walk, inline_key, &inline);
+
+        let (_, governed_handle) = walk
+            .store
+            .borrow()
+            .edge_consumer(&governed_key)
+            .expect("edge");
+        let (_, inline_handle) = walk
+            .store
+            .borrow()
+            .edge_consumer(&inline_key)
+            .expect("edge");
+        assert_eq!(governed_handle.bytes(), figure);
+        assert_eq!(
+            governed_handle.bytes() - inline_handle.bytes(),
+            32 * UNIQUE as u64,
+            "each governed unique copy is charged its text and no governed shared alias is"
+        );
     }
 }
