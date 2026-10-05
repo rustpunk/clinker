@@ -2275,7 +2275,7 @@ fn decode_header_and_body_refusal_remain_typed() {
         let clinker_plan::error::PipelineError::MemoryBudgetExceeded { report } = error else {
             panic!("decoder allocation must fail with typed budget evidence: {error:?}");
         };
-        let available = report.limit_bytes.saturating_sub(report.charged_bytes);
+        let available = report.limit.bytes().saturating_sub(report.charged_bytes);
         assert_eq!(
             report.requester.as_ref().map(|label| &label.surface),
             Some(&clinker_plan::runtime_error::MemorySurface::RowsRead)

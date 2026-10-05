@@ -968,7 +968,7 @@ mod tests {
                             })
                         );
                         assert_eq!(report.requested_bytes, physical);
-                        assert_eq!(report.limit_bytes, limit);
+                        assert_eq!(report.limit.bytes(), limit);
                         assert_eq!(owner.bytes(), 0);
                         assert_eq!(arb.cumulative_spill_bytes(), 777);
                     }

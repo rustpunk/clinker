@@ -271,9 +271,10 @@ pub struct MemoryShortfallReport {
     pub reading: LimitReading,
     /// Bytes the refused request asked for.
     pub requested_bytes: u64,
-    /// The limit charges are granted against: `memory.limit`, or the smaller
-    /// test capacity a test run was held to.
-    pub limit_bytes: u64,
+    /// The limit charges were granted against, named as the run enforced
+    /// it: `memory.limit`, or the smaller test capacity a test run was held
+    /// to. The headline and the `fix:` line name it.
+    pub limit: EnforcedLimit,
     /// Bytes charged to the run when the request was refused.
     pub charged_bytes: u64,
     /// The process's private memory (memory no other process shares),
@@ -321,6 +322,31 @@ impl MemoryShortfallReport {
                 node: node.to_string(),
                 surface,
             });
+        }
+    }
+}
+
+/// The limit a run's charges were granted against, and which setting it is.
+///
+/// Recorded where the limit is installed, never inferred afterwards by
+/// comparing figures, so a report cannot name a limit the run did not
+/// enforce.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnforcedLimit {
+    /// `memory.limit`: the configured limit, or the default when none is
+    /// configured.
+    MemoryLimit(u64),
+    /// A ledger capacity below `memory.limit` that a test, or a debug build
+    /// run with a test capacity, held the run to. No pipeline author's run
+    /// enforces one.
+    TestCapacity(u64),
+}
+
+impl EnforcedLimit {
+    /// The limit in bytes.
+    pub fn bytes(self) -> u64 {
+        match self {
+            Self::MemoryLimit(bytes) | Self::TestCapacity(bytes) => bytes,
         }
     }
 }
@@ -525,10 +551,10 @@ impl std::fmt::Display for MemoryShortfallReport {
             f,
             "\n  charged {} of {}",
             Bytes(self.charged_bytes),
-            Bytes(self.limit_bytes)
+            Bytes(self.limit.bytes())
         )?;
-        if self.limit_bytes > 0 {
-            let percent = u128::from(self.charged_bytes) * 100 / u128::from(self.limit_bytes);
+        if self.limit.bytes() > 0 {
+            let percent = u128::from(self.charged_bytes) * 100 / u128::from(self.limit.bytes());
             write!(f, " ({percent}%)")?;
         }
         if let Some(private) = self.private_bytes {
@@ -633,7 +659,7 @@ impl std::fmt::Display for MemoryShortfallReport {
                 .and_then(|requester| {
                     fix_section(&requester.surface).map(|section| (requester, section))
                 });
-        let alone_too_large = self.requested_bytes > self.limit_bytes;
+        let alone_too_large = self.requested_bytes > self.limit.bytes();
         let holder_remedy = if alone_too_large && requester_remedy.is_some() {
             None
         } else {
@@ -699,7 +725,7 @@ impl MemoryShortfallReport {
                 f,
                 "process memory peaked at {} resident, over memory.limit {}",
                 Bytes(peak_resident_bytes),
-                Bytes(self.limit_bytes)
+                Bytes(self.limit.bytes())
             )?;
             if let Some(requester) = &self.requester {
                 write!(
@@ -720,9 +746,9 @@ impl MemoryShortfallReport {
                 f,
                 " needs {}, more than memory.limit {} can hold",
                 Bytes(self.requested_bytes),
-                Bytes(self.limit_bytes)
+                Bytes(self.limit.bytes())
             )?;
-            if self.requested_bytes <= self.limit_bytes {
+            if self.requested_bytes <= self.limit.bytes() {
                 write!(
                     f,
                     " beside {} of state that cannot spill",
@@ -738,7 +764,7 @@ impl MemoryShortfallReport {
         write!(
             f,
             ", but memory.limit {} is fully held and nothing more could be spilled",
-            Bytes(self.limit_bytes)
+            Bytes(self.limit.bytes())
         )
     }
 }
@@ -821,7 +847,7 @@ mod tests {
                 peak_resident_bytes: 12 * MIB,
             },
             requested_bytes: 4 * MIB,
-            limit_bytes: 8 * MIB,
+            limit: EnforcedLimit::MemoryLimit(8 * MIB),
             charged_bytes: 3 * MIB,
             private_bytes: None,
             holders: vec![HolderReport {
@@ -864,6 +890,191 @@ mod tests {
         // is full or that the charged state fills it.
         assert!(!rendered.contains("fully held"), "{rendered}");
         assert!(!rendered.contains("fills the limit"), "{rendered}");
+    }
+
+    /// A report whose request did not fit beside the charged total: `totals`
+    /// asked for 2 MiB more group state with 7.3125 MiB charged of an 8 MiB
+    /// `memory.limit`, and no reclaim round ran.
+    fn charged_report() -> MemoryShortfallReport {
+        MemoryShortfallReport {
+            requester: Some(ConsumerLabel {
+                node: "totals".to_string(),
+                surface: MemorySurface::GroupState,
+            }),
+            group_first_row: None,
+            join_partition_distinct_keys: None,
+            reading: LimitReading::Charged,
+            requested_bytes: 2 * MIB,
+            limit: EnforcedLimit::MemoryLimit(8 * MIB),
+            charged_bytes: 7 * MIB + 320 * 1024,
+            private_bytes: None,
+            holders: vec![HolderReport {
+                node: "enrich".to_string(),
+                surface: MemorySurface::JoinBuildSide,
+                bytes: 7 * MIB + 320 * 1024,
+                state: HolderState::CannotSpill,
+            }],
+            other_holders_count: 0,
+            other_holders_bytes: 0,
+            unattributed_bytes: 0,
+            unspillable_bytes: 7 * MIB + 320 * 1024,
+            reclaim: None,
+            suggested_limit_bytes: 10 * MIB,
+            oversized: false,
+        }
+    }
+
+    /// A round that asked one holder to spill and freed nothing.
+    fn fruitless_round() -> ReclaimReport {
+        ReclaimReport {
+            holders_asked: vec!["sorted".to_string()],
+            bytes_freed: 0,
+            sources_paused: Vec::new(),
+        }
+    }
+
+    /// The `fix:` line says what its floor is for, not that the request
+    /// needed the run's whole charge: the request is on the headline and the
+    /// charge on its own line.
+    #[test]
+    fn the_fix_line_states_what_the_floor_is_for() {
+        let rendered = charged_report().to_string();
+        let fix = rendered
+            .split_once("\n  fix: ")
+            .map(|(_, rest)| rest)
+            .unwrap_or_else(|| panic!("a fix line is rendered:\n{rendered}"));
+        assert!(
+            fix.starts_with(
+                "raise the limit to at least 10M — the smallest limit with room for this \
+                 request and what the run already holds; later stages may need more\
+                 \n    pipeline:\
+                 \n      memory: { limit: \"10M\" }\
+                 \n    or: --memory-limit 10M\n"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("this request needed"), "{rendered}");
+    }
+
+    /// A run held to a test capacity is named by that capacity in every
+    /// headline form, and its fix line raises the capacity without the
+    /// `memory.limit` paste lines, which would not lift it.
+    #[test]
+    fn a_test_capacity_is_named_as_the_test_ledger_capacity() {
+        let mut report = charged_report();
+        report.limit = EnforcedLimit::TestCapacity(8 * MIB);
+        let rendered = report.to_string();
+        assert_eq!(
+            rendered.lines().next(),
+            Some(
+                "E310 \"totals\": needed 2.0 MiB more for group state, but only 704.0 KiB of \
+                 the test ledger capacity 8.0 MiB was left"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "\n  fix: raise the test ledger capacity to at least 10M — the smallest capacity \
+                 with room for this request and what the run already holds\n  remedy: "
+            ),
+            "{rendered}"
+        );
+        for absent in ["memory.limit", "pipeline:", "--memory-limit"] {
+            assert!(!rendered.contains(absent), "{absent:?} in:\n{rendered}");
+        }
+
+        report.requested_bytes = 9 * MIB;
+        report.oversized = true;
+        let rendered = report.to_string();
+        assert_eq!(
+            rendered.lines().next(),
+            Some(
+                "E310 \"totals\": one request for group state needs 9.0 MiB, more than the test \
+                 ledger capacity 8.0 MiB can hold — spilling cannot help"
+            ),
+            "{rendered}"
+        );
+
+        let mut report = process_memory_report();
+        report.limit = EnforcedLimit::TestCapacity(8 * MIB);
+        let rendered = report.to_string();
+        assert_eq!(
+            rendered.lines().next(),
+            Some(
+                "E310 \"enrich\": process memory peaked at 12.0 MiB resident, over the test \
+                 ledger capacity 8.0 MiB, while \"enrich\" held join build side; the run had \
+                 charged 3.0 MiB"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "\n  fix: raise the test ledger capacity to at least 12M — process memory \
+                 reached 12.0 MiB\n  remedy: "
+            ),
+            "{rendered}"
+        );
+        for absent in ["memory.limit", "pipeline:", "--memory-limit"] {
+            assert!(!rendered.contains(absent), "{absent:?} in:\n{rendered}");
+        }
+    }
+
+    /// The headline states how much of the limit was left, and says nothing
+    /// more could be spilled only when the report carries the round that
+    /// tried. A refusal made with no round, as every refusal off the run's
+    /// walk is, claims no spill was tried and never that the limit is full.
+    #[test]
+    fn a_report_with_no_reclaim_round_claims_no_spill_was_tried() {
+        let report = charged_report();
+        assert!(report.reclaim.is_none());
+        let rendered = report.to_string();
+        assert_eq!(
+            rendered.lines().next(),
+            Some(
+                "E310 \"totals\": needed 2.0 MiB more for group state, but only 704.0 KiB of \
+                 memory.limit 8.0 MiB was left"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("\n  reclaim: none attempted\n"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("could be spilled"), "{rendered}");
+        assert!(!rendered.contains("fully held"), "{rendered}");
+
+        let mut after_round = charged_report();
+        after_round.reclaim = Some(fruitless_round());
+        let rendered = after_round.to_string();
+        assert_eq!(
+            rendered.lines().next(),
+            Some(
+                "E310 \"totals\": needed 2.0 MiB more for group state, but only 704.0 KiB of \
+                 memory.limit 8.0 MiB was left and nothing more could be spilled"
+            ),
+            "{rendered}"
+        );
+
+        // With the whole limit charged, nothing was left.
+        let mut full = charged_report();
+        full.charged_bytes = 8 * MIB;
+        full.holders[0].bytes = 8 * MIB;
+        full.unspillable_bytes = 8 * MIB;
+        assert_eq!(
+            full.to_string().lines().next(),
+            Some(
+                "E310 \"totals\": needed 2.0 MiB more for group state, but none of memory.limit \
+                 8.0 MiB was left"
+            )
+        );
+        full.reclaim = Some(fruitless_round());
+        assert_eq!(
+            full.to_string().lines().next(),
+            Some(
+                "E310 \"totals\": needed 2.0 MiB more for group state, but none of memory.limit \
+                 8.0 MiB was left and nothing more could be spilled"
+            )
+        );
     }
 
     #[test]

@@ -3981,7 +3981,7 @@ mod tests {
                         surface: clinker_plan::runtime_error::MemorySurface::JoinState,
                     })
                 );
-                assert_eq!(report.limit_bytes, hard);
+                assert_eq!(report.limit.bytes(), hard);
             }
             other => {
                 panic!("the global backstop must surface MemoryBudgetExceeded; got {other:?}")

@@ -7804,8 +7804,8 @@ mod tests {
     fn runtime_failure_classification_distinguishes_policy_from_transience() {
         use clinker_core_types::RetryAdvice;
         use clinker_plan::runtime_error::{
-            ConsumerLabel, LimitReading, MemoryShortfallReport, MemorySurface, SpillError,
-            suggested_limit_floor,
+            ConsumerLabel, EnforcedLimit, LimitReading, MemoryShortfallReport, MemorySurface,
+            SpillError, suggested_limit_floor,
         };
 
         let cases = [
@@ -7820,7 +7820,7 @@ mod tests {
                         join_partition_distinct_keys: None,
                         reading: LimitReading::Charged,
                         requested_bytes: 1,
-                        limit_bytes: 1,
+                        limit: EnforcedLimit::MemoryLimit(1),
                         charged_bytes: 1,
                         private_bytes: None,
                         holders: Vec::new(),

@@ -1966,7 +1966,7 @@ mod tests {
                     report.charged_bytes + report.requested_bytes,
                     hard_limit + 1
                 );
-                assert_eq!(report.limit_bytes, hard_limit);
+                assert_eq!(report.limit.bytes(), hard_limit);
             }
             Ok(_) => panic!("expected pre-allocation E310 NodeBuffer; reservation succeeded"),
             Err(other) => panic!("expected pre-allocation E310 NodeBuffer; got {other:?}"),
@@ -2808,8 +2808,8 @@ mod tests {
                     surface: clinker_plan::runtime_error::MemorySurface::SortBuffer,
                 })
             );
-            assert_eq!(report.limit_bytes, 1);
-            assert!(report.requested_bytes > report.limit_bytes);
+            assert_eq!(report.limit.bytes(), 1);
+            assert!(report.requested_bytes > report.limit.bytes());
             assert!(paths.iter().all(|p| !p.exists()));
             assert_eq!(arb.cumulative_spill_bytes(), 777);
         }

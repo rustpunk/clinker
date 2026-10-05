@@ -745,11 +745,11 @@ fn cull_decision_state_fails_loud_when_group_cardinality_exceeds_budget() {
                  buffer",
             );
             assert!(
-                report.charged_bytes + report.requested_bytes > report.limit_bytes,
+                report.charged_bytes + report.requested_bytes > report.limit.bytes(),
                 "reported use ({} charged + {} requested) must exceed the limit ({})",
                 report.charged_bytes,
                 report.requested_bytes,
-                report.limit_bytes
+                report.limit.bytes()
             );
         }
         other => panic!("expected MemoryBudgetExceeded for the decision state; got {other:?}"),
@@ -808,10 +808,10 @@ fn cull_giant_group_exceeds_budget_fails_loud() {
                 "the diagnostic must name the Cull node and its held group rows"
             );
             assert!(
-                report.oversized && report.requested_bytes > report.limit_bytes,
+                report.oversized && report.requested_bytes > report.limit.bytes(),
                 "the reported group footprint ({}) must exceed the budget ({})",
                 report.requested_bytes,
-                report.limit_bytes
+                report.limit.bytes()
             );
             // Names the offending group by the Source and row number of its
             // first row, the numbering the dead-letter output uses, without

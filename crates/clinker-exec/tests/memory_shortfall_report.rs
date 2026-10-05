@@ -300,7 +300,7 @@ fn report_figures_come_from_one_snapshot() {
             round_up_to_mebibyte(report.charged_bytes + requested)
         );
         assert!(report.suggested_limit_bytes >= report.charged_bytes + requested);
-        assert_eq!(report.limit_bytes, 8 * MIB);
+        assert_eq!(report.limit.bytes(), 8 * MIB);
         assert_eq!(report.requested_bytes, requested);
         assert!(report.reclaim.is_none(), "no round runs off the walk");
         let enrich = report
@@ -535,11 +535,26 @@ nodes:
 /// check cannot refuse first), returning the run's error.
 #[cfg(feature = "test-utils")]
 fn run_source_to_sink_refused(csv: &str, capacity: u64) -> clinker_plan::error::PipelineError {
-    use clinker_exec::executor::{MemoryTestOverrides, PipelineExecutor, PipelineRunParams};
+    run_pipeline_refused(
+        SOURCE_TO_SINK,
+        csv,
+        clinker_exec::executor::MemoryTestOverrides::default().with_ledger_capacity(capacity),
+    )
+}
+
+/// Run `yaml`, a Source `accounts` feeding a Sink `out`, over `csv` with the
+/// memory overrides `memory_test`, returning the run's error.
+#[cfg(feature = "test-utils")]
+fn run_pipeline_refused(
+    yaml: &str,
+    csv: &str,
+    memory_test: clinker_exec::executor::MemoryTestOverrides,
+) -> clinker_plan::error::PipelineError {
+    use clinker_exec::executor::{PipelineExecutor, PipelineRunParams};
     use clinker_plan::config::{CompileContext, parse_config};
     use std::collections::HashMap;
 
-    let config = parse_config(SOURCE_TO_SINK).expect("fixture pipeline must parse");
+    let config = parse_config(yaml).expect("fixture pipeline must parse");
     let plan = config
         .compile(&CompileContext::default())
         .expect("fixture pipeline must compile");
@@ -557,7 +572,7 @@ fn run_source_to_sink_refused(csv: &str, capacity: u64) -> clinker_plan::error::
     let params = PipelineRunParams {
         execution_id: "source-refusal".to_string(),
         batch_id: "source-refusal".to_string(),
-        memory_test: MemoryTestOverrides::default().with_ledger_capacity(capacity),
+        memory_test,
         ..Default::default()
     };
     PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
@@ -594,12 +609,74 @@ fn admission_refusal_is_an_e310_naming_the_source() {
         "the refused request ({}) is larger than the capacity ({capacity})",
         report.requested_bytes
     );
-    assert_eq!(report.limit_bytes, capacity);
+    assert_eq!(report.limit.bytes(), capacity);
     assert!(
         err.to_string()
             .starts_with("E310 \"accounts\": one request for rows read from the source needs "),
         "{err}"
     );
+}
+
+/// A run held to a test ledger capacity below `memory.limit` names that
+/// capacity, not `memory.limit`, as the limit its E310 refused against, and
+/// its fix line raises the capacity without the `memory.limit` paste lines.
+/// The same refusal under a `memory.limit` of the same size names
+/// `memory.limit`.
+#[cfg(feature = "test-utils")]
+#[test]
+fn a_run_held_to_a_test_capacity_reports_it_in_the_headline() {
+    use clinker_exec::executor::MemoryTestOverrides;
+    use clinker_plan::runtime_error::EnforcedLimit;
+
+    let capacity = 64 * KIB;
+    let csv = format!("note\n{}\n", "n".repeat(256 * 1024));
+
+    let err = run_source_to_sink_refused(&csv, capacity);
+    let clinker_plan::error::PipelineError::MemoryBudgetExceeded { report } = &err else {
+        panic!("a row larger than the capacity must fail with E310; got {err:?}");
+    };
+    assert_eq!(report.limit, EnforcedLimit::TestCapacity(capacity));
+    let text = err.to_string();
+    let headline = text.lines().next().unwrap_or_default();
+    assert!(
+        headline.starts_with("E310 \"accounts\": one request for rows read from the source needs ")
+            && headline.ends_with(
+                ", more than the test ledger capacity 64.0 KiB can hold — spilling cannot help"
+            ),
+        "{text}"
+    );
+    assert!(
+        text.contains("\n  fix: raise the test ledger capacity to at least "),
+        "{text}"
+    );
+    for absent in ["memory.limit", "pipeline:", "--memory-limit"] {
+        assert!(!text.contains(absent), "{absent:?} in:\n{text}");
+    }
+
+    // The same pipeline under a `memory.limit` of the capacity's size and no
+    // test capacity. The startup check judges that limit against an
+    // injected baseline it passes, so the run reaches the same refusal.
+    let limited = SOURCE_TO_SINK.replace("limit: \"512M\"", "limit: \"64K\"");
+    assert_ne!(limited, SOURCE_TO_SINK, "the fixture's limit was replaced");
+    let err = run_pipeline_refused(
+        &limited,
+        &csv,
+        MemoryTestOverrides::default().with_baseline_rss(capacity),
+    );
+    let clinker_plan::error::PipelineError::MemoryBudgetExceeded { report } = &err else {
+        panic!("a row larger than memory.limit must fail with E310; got {err:?}");
+    };
+    assert_eq!(report.limit, EnforcedLimit::MemoryLimit(capacity));
+    let text = err.to_string();
+    let headline = text.lines().next().unwrap_or_default();
+    assert!(
+        headline.starts_with("E310 \"accounts\": one request for rows read from the source needs ")
+            && headline
+                .ends_with(", more than memory.limit 64.0 KiB can hold — spilling cannot help"),
+        "{text}"
+    );
+    assert!(!text.contains("test ledger capacity"), "{text}");
+    assert!(text.contains("\n    or: --memory-limit "), "{text}");
 }
 
 /// The E310 a run's refusal produces names nodes, surfaces and byte counts

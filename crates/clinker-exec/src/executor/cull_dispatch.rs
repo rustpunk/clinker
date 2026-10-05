@@ -1820,14 +1820,15 @@ mod tests {
             "the diagnostic must name the Cull node and its held group rows"
         );
         assert_eq!(
-            report.limit_bytes, 256,
+            report.limit.bytes(),
+            256,
             "the limit must be the hard budget in force"
         );
         assert!(
-            report.oversized && report.requested_bytes > report.limit_bytes,
+            report.oversized && report.requested_bytes > report.limit.bytes(),
             "the reported request ({}) must be the group's footprint, above the limit ({})",
             report.requested_bytes,
-            report.limit_bytes
+            report.limit.bytes()
         );
         // The group is named by where its first row came from, never by its
         // key (a record value). These rows carry no Source stamp.

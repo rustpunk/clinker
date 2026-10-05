@@ -3630,7 +3630,7 @@ mod tests {
                     "the collect bound must abort via the strictly-local pre-output gate; got {report:?}"
                 );
                 assert!(
-                    report.oversized && report.requested_bytes > report.limit_bytes,
+                    report.oversized && report.requested_bytes > report.limit.bytes(),
                     "the collect bound must abort via the strictly-local pre-output gate; got {report:?}"
                 );
             }
@@ -4389,7 +4389,7 @@ mod tests {
                     "abort must come from the pre-output gate; got {report:?}"
                 );
                 assert!(
-                    report.oversized && report.requested_bytes > report.limit_bytes,
+                    report.oversized && report.requested_bytes > report.limit.bytes(),
                     "abort must come from the pre-output gate; got {report:?}"
                 );
             }
@@ -4437,7 +4437,7 @@ mod tests {
                     "abort must come from the driver-load gate; got {report:?}"
                 );
                 assert!(
-                    report.oversized && report.requested_bytes > report.limit_bytes,
+                    report.oversized && report.requested_bytes > report.limit.bytes(),
                     "abort must come from the driver-load gate; got {report:?}"
                 );
             }
@@ -4653,7 +4653,7 @@ mod tests {
                     }),
                     "abort must come from the join's deferred-miss finalize backstop"
                 );
-                assert_eq!(report.limit_bytes, hard);
+                assert_eq!(report.limit.bytes(), hard);
             }
             other => {
                 panic!("expected MemoryBudgetExceeded from the finalize backstop; got {other:?}")

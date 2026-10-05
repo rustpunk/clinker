@@ -103,7 +103,8 @@ fn assert_pre_output_abort(err: PipelineError, expected_limit: u64) {
                 "the abort must name the combine node's join state"
             );
             assert_eq!(
-                report.limit_bytes, expected_limit,
+                report.limit.bytes(),
+                expected_limit,
                 "the reported limit must be the hard budget"
             );
             assert!(
@@ -355,7 +356,7 @@ fn file_csv_retention_refuses_tight_budget_and_completes_with_roomy_budget() {
                 "the CSV Source's refused read is reported for its rows"
             );
             assert!(
-                report.requested_bytes > report.limit_bytes.saturating_sub(report.charged_bytes)
+                report.requested_bytes > report.limit.bytes().saturating_sub(report.charged_bytes)
             );
         }
         other => panic!("expected the CSV Source's typed budget refusal; got {other:?}"),
@@ -481,8 +482,8 @@ fn assert_range_output_frontier_abort(
             surface: clinker_plan::runtime_error::MemorySurface::SortBuffer,
         })
     );
-    assert_eq!(report.limit_bytes, expected_limit);
-    assert!(report.requested_bytes > report.limit_bytes);
+    assert_eq!(report.limit.bytes(), expected_limit);
+    assert!(report.requested_bytes > report.limit.bytes());
     assert!(
         arb.per_stage_spill_bytes_written()
             .get("banded")

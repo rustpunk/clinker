@@ -1273,10 +1273,10 @@ fn reshape_giant_group_exceeds_budget_fails_loud() {
                 "the diagnostic must name the Reshape node and its held group rows"
             );
             assert!(
-                report.oversized && report.requested_bytes > report.limit_bytes,
+                report.oversized && report.requested_bytes > report.limit.bytes(),
                 "the reported group footprint ({}) must exceed the budget ({})",
                 report.requested_bytes,
-                report.limit_bytes
+                report.limit.bytes()
             );
             // The offending group is named by the Source and row number of its
             // first row, the numbering the dead-letter output uses, so a

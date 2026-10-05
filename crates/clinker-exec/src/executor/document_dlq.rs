@@ -2964,7 +2964,7 @@ mod tests {
                     }),
                     "the report names the node and the ledger"
                 );
-                assert_eq!(report.limit_bytes, 1024);
+                assert_eq!(report.limit.bytes(), 1024);
             }
             other => panic!("expected E310, got {other:?}"),
         }

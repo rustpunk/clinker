@@ -1908,7 +1908,7 @@ mod tests {
                     report.charged_bytes + report.requested_bytes,
                     hard_limit + 1
                 );
-                assert_eq!(report.limit_bytes, hard_limit);
+                assert_eq!(report.limit.bytes(), hard_limit);
             }
             Ok(_) => panic!("Output materialization must be rejected before allocation"),
             Err(other) => panic!("expected Output E310 NodeBuffer; got {other:?}"),

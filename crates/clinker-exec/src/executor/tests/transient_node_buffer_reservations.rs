@@ -253,7 +253,7 @@ fn composition_materialization_rejects_before_allocation_and_restores_baseline()
                 report.charged_bytes + report.requested_bytes,
                 HARD_LIMIT + 1
             );
-            assert_eq!(report.limit_bytes, HARD_LIMIT);
+            assert_eq!(report.limit.bytes(), HARD_LIMIT);
         }
         other => panic!("expected bare composition-site E310 NodeBuffer; got {other:?}"),
     }
@@ -338,7 +338,7 @@ fn shared_transform_materialization_rejects_before_allocation_and_restores_basel
                 report.charged_bytes + report.requested_bytes,
                 HARD_LIMIT + 1
             );
-            assert_eq!(report.limit_bytes, HARD_LIMIT);
+            assert_eq!(report.limit.bytes(), HARD_LIMIT);
         }
         other => panic!("expected shared-Transform E310 NodeBuffer; got {other:?}"),
     }
@@ -409,7 +409,7 @@ fn shared_output_materialization_rejects_before_allocation_and_restores_baseline
                 report.charged_bytes + report.requested_bytes,
                 HARD_LIMIT + 1
             );
-            assert_eq!(report.limit_bytes, HARD_LIMIT);
+            assert_eq!(report.limit.bytes(), HARD_LIMIT);
         }
         other => panic!("expected shared-Output E310 NodeBuffer; got {other:?}"),
     }
@@ -658,7 +658,7 @@ fn composition_source_canonicalization_overlap_rejects_and_releases_transfer() {
                         report.charged_bytes + report.requested_bytes,
                         HARD_LIMIT + 1
                     );
-                    assert_eq!(report.limit_bytes, HARD_LIMIT);
+                    assert_eq!(report.limit.bytes(), HARD_LIMIT);
                     assert_eq!(
                         report.requester.as_ref().map(|label| &label.surface),
                         Some(&clinker_plan::runtime_error::MemorySurface::ScanMaterialization)

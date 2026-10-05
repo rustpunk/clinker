@@ -357,7 +357,7 @@ nodes:
                 report.requested_bytes > 0,
                 "the reported overshoot ({}) must put the run past the hard limit ({}) at abort",
                 report.requested_bytes,
-                report.limit_bytes,
+                report.limit.bytes(),
             );
         }
         other => panic!(

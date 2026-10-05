@@ -16,8 +16,8 @@ use clinker_format::FormatError;
 use clinker_format::preparation::{ResourceError, ResourceErrorKind};
 use clinker_plan::error::PipelineError;
 use clinker_plan::runtime_error::{
-    ConsumerLabel, HolderReport, HolderState, LimitReading, MemoryShortfallReport, MemorySurface,
-    ReclaimReport, suggested_limit_floor,
+    ConsumerLabel, EnforcedLimit, HolderReport, HolderState, LimitReading, MemoryShortfallReport,
+    MemorySurface, ReclaimReport, suggested_limit_floor,
 };
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -337,7 +337,7 @@ fn build_report(
         join_partition_distinct_keys: None,
         reading: LimitReading::Charged,
         requested_bytes: requested,
-        limit_bytes: snapshot.limit,
+        limit: EnforcedLimit::MemoryLimit(snapshot.limit),
         charged_bytes: snapshot.charged,
         private_bytes: crate::pipeline::sysstats::private_memory_bytes(),
         holders,
@@ -2109,7 +2109,7 @@ mod tests {
             "{report:?}"
         );
         assert_eq!(report.charged_bytes, MIB);
-        assert_eq!(report.limit_bytes, limit);
+        assert_eq!(report.limit.bytes(), limit);
         assert_eq!(
             report.requested_bytes,
             peak - limit,

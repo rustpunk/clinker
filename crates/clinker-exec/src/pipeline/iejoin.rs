@@ -2401,7 +2401,7 @@ mod tests {
             );
             if limit < actual_peak {
                 assert!(
-                    matches!(&result, Err(PipelineError::MemoryBudgetExceeded { report }) if report.requested_bytes == actual_peak && report.limit_bytes == limit && report.requester.as_ref().map(|label| &label.surface) == Some(&clinker_plan::runtime_error::MemorySurface::JoinState))
+                    matches!(&result, Err(PipelineError::MemoryBudgetExceeded { report }) if report.requested_bytes == actual_peak && report.limit.bytes() == limit && report.requester.as_ref().map(|label| &label.surface) == Some(&clinker_plan::runtime_error::MemorySurface::JoinState))
                 );
             } else {
                 result.unwrap();
