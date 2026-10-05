@@ -284,6 +284,13 @@ It keeps `memory.limit` ample and uses the test levers on
   `with_baseline_rss(bytes)` injects another figure; `with_process_memory()`
   measures instead. Without those builds `Default` is
   `MemoryTestOverrides::process()`, which measures and overrides nothing.
+- `with_no_process_memory()` makes the run read no process memory, as on a
+  target where the resident reading is unavailable, so only the charged
+  total can trip a limit (`MemoryArbitrator::read_no_process_memory` sets
+  the same on an arbitrator a test builds). Use it to test what a charged
+  hard-limit check does under a small ledger capacity: an in-process test's
+  resident memory, shared with the harness and sibling tests, otherwise
+  trips the process reading first. It exists only in the builds above.
 - `MemoryArbitrator::force_shortfall_once(matcher, nth)` on an arbitrator a
   test builds itself makes the `nth` (from 1) charge by a requester whose
   label `matcher` accepts fall short, as a real shortage would, and marks
