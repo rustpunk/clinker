@@ -3891,6 +3891,73 @@ mod walk_pass_tests {
         assert!(!rendered.contains("needed"), "{rendered}");
         drop(handle);
     }
+
+    #[test]
+    fn a_backstop_no_pass_can_relieve_refuses_with_its_round() {
+        let arbitrator = run(BACKSTOP_LIMIT, Box::new(Priority));
+        let (held, held_handle) = register(&arbitrator, "held", 0, 9 * GIB);
+        let set = empty_set();
+        let _walk = walk(&arbitrator, &set);
+        // The only walk-owned state is in use, so no pass can free it.
+        let script = Scripted::default().held(held, &held_handle).shared();
+        let rounds = arbitrator.reclaim_rounds();
+        let report = scripted(&script, || {
+            arbitrator.check_hard_limit("enrich", MemorySurface::JoinState, governed(), 0)
+        })
+        .expect_err("nothing could be freed");
+        assert!(
+            arbitrator.reclaim_rounds() > rounds,
+            "the walk ran its passes before refusing"
+        );
+        let round = report
+            .reclaim
+            .as_ref()
+            .expect("the report carries the round the walk ran");
+        assert_eq!(round.holders_asked, vec!["held".to_string()]);
+        assert_eq!(round.bytes_freed, 0);
+        let rendered = report.to_string();
+        assert!(
+            rendered.contains("\n  reclaim: asked 1 holder to spill (\"held\"), freed 0 B;"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("none attempted"), "{rendered}");
+        assert!(
+            rendered.starts_with(
+                "E310 \"enrich\": the run held 9.0 GiB, over memory.limit 8.0 GiB, while \
+                 \"enrich\" held join state and nothing more could be spilled\n"
+            ),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_backstop_off_the_walk_refuses_without_a_round() {
+        let arbitrator = run(BACKSTOP_LIMIT, Box::new(Priority));
+        let (held, held_handle) = register(&arbitrator, "held", 0, 9 * GIB);
+        let rounds = arbitrator.reclaim_rounds();
+        let report = std::thread::scope(|threads| {
+            threads
+                .spawn(|| {
+                    arbitrator.check_hard_limit("enrich", MemorySurface::JoinState, governed(), 0)
+                })
+                .join()
+                .expect("off-walk checker")
+        })
+        .expect_err("off the walk the check refuses at once");
+        assert_eq!(arbitrator.reclaim_rounds(), rounds, "no pass off the walk");
+        assert!(report.reclaim.is_none(), "{report:?}");
+        let rendered = report.to_string();
+        assert!(
+            rendered.contains("\n  reclaim: none attempted"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("nothing more could be spilled"),
+            "{rendered}"
+        );
+        assert_eq!(held_handle.bytes(), 9 * GIB, "nothing spilled");
+        let _ = held;
+    }
 }
 
 #[cfg(test)]
