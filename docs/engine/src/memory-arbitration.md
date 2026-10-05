@@ -78,6 +78,8 @@ On the walk thread a `Shortfall` is not yet a refusal. A `reserve`, a
 walk that does not fit runs a reclaim pass without holding the ledger lock:
 the registered consumers that cannot be paused and hold bytes are taken in the
 run's policy order (ties to the older consumer), the requesting consumer last,
+each consumer's figures read once when the pass begins (the shipped policies
+order them with one sort),
 and each whose state the walk owns is spilled there and then (see "How a
 pass reaches state" below). A consumer whose state the walk
 does not own is skipped and never asked to act; one the running dispatch arm
@@ -131,10 +133,12 @@ Each victim a pass asks ends in one of three outcomes:
   resident, now, on the walk. For walk-owned state, at least one free cell
   held state for the consumer.
 - **Busy.** The walk owns the state but its owner holds it right now (a slot
-  out of its scope, or a cell its owner is mutating or is itself the
-  requester). The pass frees nothing from it and raises the consumer's
-  spill request, which the owner answers at its next push, yield or batch
-  boundary.
+  out of its scope, a slot whose rows a live reader's cursor or view still
+  shares, or a cell its owner is mutating or is itself the requester). The
+  pass frees nothing from it and raises the consumer's spill request, which
+  the owner answers at its next push, yield or batch boundary. A shared
+  slot's spill writes nothing and leaves its figure and charge as they were;
+  the E310 lists it as `in use`, never at its floor.
 - **NotOwned.** The walk holds no spillable state for the consumer: a slot
   its compiled classification keeps in memory, state another thread owns,
   or a registered owner that is gone or no longer holds that consumer. It is
