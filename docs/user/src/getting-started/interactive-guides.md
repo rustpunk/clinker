@@ -24,6 +24,12 @@ Where `$doc.*` values come from, how each file becomes its own document with
 its own Aggregate roll-up, and what `dlq_granularity: document` rejects.
 Reference: [Document Envelope Context](../pipelines/envelope-and-doc-context.md).
 
+## [Which files get read?](../nodes/file-discovery-explainer.html)
+
+How a Source turns `glob:`, `regex:`, `paths:` and its filters into the list of
+files it reads, and in what order. Reference:
+[Source Nodes → Choosing files](../nodes/source.md#choosing-files).
+
 ## [Is my data still sorted?](../nodes/sort-order-explainer.html)
 
 Which stages keep a Source's declared `sort_order` and which drop it, and when

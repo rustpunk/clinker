@@ -157,6 +157,46 @@ A source declaration has two independent layers:
 
 A `file` transport requires **exactly one** file matcher (`path`, `glob`, `regex`, or `paths`). Declaring none fails validation with `E211`; declaring more than one fails with `E210`. Both are reported at config-load time, before any file is opened.
 
+## Choosing files
+
+*Interactive companion: the [file discovery explainer](file-discovery-explainer.html) runs these steps on a sample folder as you change the settings.*
+
+Before reading, a file Source builds its list of files in a fixed order:
+
+1. **Matcher.** Paths are relative to the pipeline file's folder.
+   - `path:` names one file and `paths:` a list. A file that does not exist stops the run with `E216`, whatever `on_no_match` says.
+   - `glob:` matches names inside one folder: `*` does not cross a `/`. Use `**` to include subfolders (`./data/**/*.csv`). A leading dot is not special, so `*.csv` also matches `.draft.csv`. An invalid pattern is `E212`.
+   - `regex:` searches the pipeline's folder and, by default, every subfolder, and matches anywhere in each file's path. That path begins with the folder part of the pipeline path as you typed it (`clinker run pipelines/orders.yaml` gives `pipelines/data/orders_2024-01.csv`), so anchor the end of the path, for example `data/orders_\d{4}-\d{2}\.csv$`. An unanchored pattern can pick up earlier outputs too. An invalid pattern is `E213`.
+2. **`exclude:`** -- a list of glob patterns; a file whose name or full path matches any of them is dropped.
+3. Anything that is not a regular file is dropped.
+4. **`min_size:` / `max_size:`** -- decimal units: `1KB` is 1000 bytes, also `B`, `MB`, `GB`.
+5. **`modified_after:` / `modified_before:`** -- a duration back from the time the pipeline is loaded (`30s`, `15m`, `2h`, `3d`) or an RFC 3339 timestamp (`2024-03-01T00:00:00Z`).
+6. **`files.sort_by:`** `name` (default; the full path), `created` or `modified`, with **`files.sort_order:`** `asc` (default) or `desc`. The files of a `paths:` list are sorted too: the order they are written in is not the reading order.
+7. **`files.take_first:`** or **`files.take_last:`** keeps that many files from the sorted list (setting both is `E218`). With the default ascending name sort, `take_first: 5` keeps the five earliest names.
+8. **`files.on_no_match:`** -- when nothing is left: `error` (default, `E216`), `warn` (log a warning and produce no rows), or `skip` (produce no rows quietly).
+
+`files.recursive:` controls whether `regex:` searches subfolders (`true` by default). It has no effect on `glob:`, which searches subfolders only where the pattern has `**`.
+
+```yaml
+- type: source
+  name: orders
+  config:
+    name: orders
+    type: csv
+    glob: ./data/orders_*.csv
+    exclude: ["*_partial.csv"]
+    modified_after: 30d
+    files:
+      sort_by: name
+      sort_order: desc
+      take_first: 3        # the three latest names
+      on_no_match: warn
+    schema:
+      - { name: order_id, type: string }
+```
+
+With `glob:`, `regex:` or `paths:`, each file is read as its own document: a declared `sort_order` is checked per file, and an Aggregate rolls up per file (see [Sort order](#sort-order) and [One document per file](../pipelines/envelope-and-doc-context.md#one-document-per-file)).
+
 ## Format types
 
 The `type:` field inside `config:` selects the on-disk format. Each format

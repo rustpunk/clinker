@@ -16,14 +16,14 @@ nodes:
       glob: ./data/orders_*.csv
       # Optional discovery filters (uncomment in real pipelines):
       # exclude: ["*.tmp", "*_partial.csv"]
-      # modified_after: 1d            # last 24 hours; ISO 8601 also accepted
+      # modified_after: 1d            # last 24 hours; an RFC 3339 timestamp also works
       # min_size: 1KB
       files:
         sort_by: name                  # name | created | modified
         sort_order: asc                # asc | desc
-        # take_first: 5                # process latest N files
+        # take_first: 5                # first N files in sort order (earliest names with asc)
         # take_last: 5
-        # recursive: true              # default: true if `**` in glob
+        # recursive: true              # regex: only (default true); a glob recurses only with `**`
         on_no_match: warn              # error (default) | warn | skip
       schema:
         - { name: order_id, type: string }
