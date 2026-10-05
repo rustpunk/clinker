@@ -674,7 +674,11 @@ impl std::fmt::Display for MemoryShortfallReport {
             EnforcedLimit::TestCapacity(_) => ("the test ledger capacity", "the smallest capacity"),
         };
         write!(f, "\n  fix: raise {setting} to at least {suggested} — ")?;
+        let held_over_with_no_request = self.held_over_with_no_request();
         match self.reading {
+            LimitReading::Charged if held_over_with_no_request => {
+                write!(f, "{room_for} with room for what the run already holds")?
+            }
             LimitReading::Charged => write!(
                 f,
                 "{room_for} with room for this request and what the run already holds"
@@ -684,9 +688,23 @@ impl std::fmt::Display for MemoryShortfallReport {
             } => write!(f, "process memory reached {}", Bytes(peak_resident_bytes))?,
         }
         if let EnforcedLimit::MemoryLimit(_) = self.limit {
+            // A step that stopped with no request of its own was still
+            // growing, so it is named among what may need more.
+            match self
+                .requester
+                .as_ref()
+                .filter(|_| held_over_with_no_request)
+            {
+                Some(requester) => write!(
+                    f,
+                    "; {} and later stages may need more",
+                    requester.node.quoted_name()
+                )?,
+                None => f.write_str("; later stages may need more")?,
+            }
             write!(
                 f,
-                "; later stages may need more\
+                "\
                  \n    pipeline:\
                  \n      memory: {{ limit: \"{suggested}\" }}\
                  \n    or: --memory-limit {suggested}"
@@ -760,6 +778,16 @@ impl std::fmt::Display for MemoryShortfallReport {
 }
 
 impl MemoryShortfallReport {
+    /// Whether this report is a check that found the run already holding
+    /// more than the limit and asked for nothing more: the charged reading,
+    /// no request, and a charged total past the limit. The headline and the
+    /// fix line both read this one answer, so the two forms cannot disagree.
+    fn held_over_with_no_request(&self) -> bool {
+        self.reading == LimitReading::Charged
+            && self.requested_bytes == 0
+            && self.charged_bytes > self.limit.bytes()
+    }
+
     /// The first line of the E310 text, in one of four forms: the process
     /// reading over the limit; the run already holding more than the limit
     /// with no request of its own (a check made after the fact found the
@@ -797,7 +825,7 @@ impl MemoryShortfallReport {
             }
             return write!(f, "; the run had charged {}", Bytes(self.charged_bytes));
         }
-        if self.requested_bytes == 0 && self.charged_bytes > self.limit.bytes() {
+        if self.held_over_with_no_request() {
             write!(
                 f,
                 "the run held {}, over {}",

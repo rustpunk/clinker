@@ -397,7 +397,9 @@ E310 totals: needed 2.0 MiB more for group state, but only 704.0 KiB of memory.l
   when that cannot make room. Its report states what the run held instead
   of a request: `E310 <node>: the run held H, over memory.limit L, while
   <node> held <what>`, and its suggested limit is what the run held,
-  rounded up.
+  rounded up: `fix: raise the limit to at least N — the smallest limit with
+  room for what the run already holds; "<node>" and later stages may need
+  more`.
 - Below it: the charged total against the limit, the five largest holders
   and why each still held its memory, what the reclaim round asked and
   freed, the smallest limit that would have granted the request in YAML
