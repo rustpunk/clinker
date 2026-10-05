@@ -112,33 +112,38 @@ one of two ways:
   slot.
 - **Walk-owned state** lives in a cell of its own (`Rc<RefCell<_>>`) that is
   registered under the consumer it charges through `register_walk_owned`
-  (`crates/clinker-exec/src/pipeline/memory/walk.rs`). This covers sorts,
-  aggregate tables, grace partitions, join state, output buffers, the run's
-  document dead-letter state, an Output's per-document buckets and the rows
-  parked for a deferred consumer. The registry is run-scoped, outside every
-  frame, and holds only a `Weak` to each cell, so an owner dropped on any
-  exit is never reached. Several cells may register under one consumer; one
-  cell may serve several consumers and spills only what the elected one
-  charges. The owner keeps the registration beside its state, so both drop
-  together. It borrows its cell only for one operation of its own, never
-  across a call that can charge another consumer, a channel wait or a call
-  into another dispatch arm. Its spill never reserves.
+  (`crates/clinker-exec/src/pipeline/memory/walk.rs`). Registered today:
+  the run's document dead-letter state, an Output's per-document buckets,
+  the rows parked for a deferred consumer, and a Cull's and a Reshape's
+  group buffers. Sorts, aggregate tables, grace partitions and join state
+  do not register yet, so a pass skips them as `NotOwned`. The registry is
+  run-scoped, outside every frame, and holds only a `Weak` to each cell, so
+  an owner dropped on any exit is never reached. Several cells may register
+  under one consumer; one cell may serve several consumers and spills only
+  what the elected one charges. The owner keeps the registration beside its
+  state, so both drop together. It borrows its cell only for one operation
+  of its own, never across a call that can charge another consumer, a
+  channel wait or a call into another dispatch arm. Its spill never
+  reserves.
 
 State owned by a thread other than the walk (a Source reader, a streaming
 writer or worker) is not reached by a pass: its consumer is skipped.
 
 Each victim a pass asks ends in one of three outcomes:
 
-- **Spilled.** The walk owns the state and spilled whatever of it was
-  resident, now, on the walk. For walk-owned state, at least one free cell
-  held state for the consumer.
+- **Spilled.** The walk owns the state and wrote resident state of it to
+  disk, now, on the walk. For walk-owned state, at least one free cell
+  reported that it wrote (`OwnedSpillResult::Wrote`); a cell's spill never
+  reports a write it did not make.
 - **Busy.** The walk owns the state but its owner holds it right now (a slot
   out of its scope, a slot whose rows a live reader's cursor or view still
-  shares, or a cell its owner is mutating or is itself the requester). The
-  pass frees nothing from it and raises the consumer's spill request, which
-  the owner answers at its next push, yield or batch boundary. A shared
-  slot's spill writes nothing and leaves its figure and charge as they were;
-  the E310 lists it as `in use`, never at its floor.
+  shares, a cell its owner is mutating or is itself the requester, or a
+  free cell that holds state for the consumer but had nothing it could
+  write: every part already on disk, taken out for use, or shared with a
+  reader). The pass frees nothing from it and raises the consumer's spill
+  request, which the owner answers at its next push, yield or batch
+  boundary. A shared slot's spill writes nothing and leaves its figure and
+  charge as they were; the E310 lists it as `in use`, never at its floor.
 - **NotOwned.** The walk holds no spillable state for the consumer: a slot
   its compiled classification keeps in memory, state another thread owns,
   or a registered owner that is gone or no longer holds that consumer. It is
@@ -146,10 +151,14 @@ Each victim a pass asks ends in one of three outcomes:
 
 Spillable state that no pass can reach is a false E310: a request that does
 not fit is refused while megabytes it could have freed stay resident. So
-every walk-owned spillable state registers through `register_walk_owned`,
-and nothing walk-owned and spillable is `NotOwned`. Registering changes
-none of a consumer's figures (registration with the arbitrator, bytes,
-priority, spill triggers or admission); it only makes the state reachable.
+every walk-owned spillable state must register through
+`register_walk_owned`, and nothing walk-owned and spillable may be
+`NotOwned`; the operators named above as not registered yet are the open
+exceptions. Registering changes none of a consumer's charge, priority,
+spill triggers or admission; it only makes the state reachable. A
+registered group buffer (Cull, Reshape) also records on its consumer's
+handle what spilling its resident groups frees now, which is the figure
+it ranks by.
 
 The execution report samples the arbitrator's spill totals and the ledger's
 charged peak after dispatch has finished and every Source worker has joined. Ordered
@@ -421,7 +430,7 @@ dataset boundary. Raw temporary bytes are internal storage, not a new dataset.
 
 ### Existing consumer attribution
 
-Clinker tracks memory in two layers. RSS (resident set size) is sampled at chunk boundaries and supplies the primary spill / abort signal. Alongside RSS, every memory-touching operator (Source ingest channels, Aggregate hash maps, sort buffers, grace-hash partitions, sort-merge accumulators, IEJoin arrays, inline-Combine hash tables, the Reshape per-group input buffer, `node_buffers` slots and their transient scan materializations, and window-runtime arenas) registers a `MemoryConsumer` wrapper with the pipeline-scoped arbitrator. Each operator owns its live byte counter and updates it on every admit / spill transition; that counter is the consumer handle's charge on the run's one ledger. Victims are ranked by `reclaimable_bytes()`, what a spill of each consumer would free now, which the arbitrator reads per consumer at every policy poll and reclaim pass. A Source ingest channel's handle charges exactly the heap its queued attempts hold outside the run's ledger (foreign-provider or legacy storage, and a rejection's box): each attempt carries that charge from just before it is sent until the walk takes it off the channel, or until it is dropped unconsumed. Its records' admitted bytes are charged when they are allocated, in the Source's name, so no byte is counted twice. This pull-mode attribution lets the policy distinguish *reclaimable* bytes (what an operator can give up right now) from currently-held bytes — a grace-hash with on-disk partitions, for instance, reports only its in-memory portion, and the Reshape buffer reports the live bytes of the groups still resident in memory.
+Clinker tracks memory in two layers. RSS (resident set size) is sampled at chunk boundaries and supplies the primary spill / abort signal. Alongside RSS, every memory-touching operator (Source ingest channels, Aggregate hash maps, sort buffers, grace-hash partitions, sort-merge accumulators, IEJoin arrays, inline-Combine hash tables, the Reshape per-group input buffer, `node_buffers` slots and their transient scan materializations, and window-runtime arenas) registers a `MemoryConsumer` wrapper with the pipeline-scoped arbitrator. Each operator owns its live byte counter and updates it on every admit / spill transition; that counter is the consumer handle's charge on the run's one ledger. Victims are ranked by `reclaimable_bytes()`, what a spill of each consumer would free now, which the arbitrator reads per consumer at every policy poll and reclaim pass. A Source ingest channel's handle charges exactly the heap its queued attempts hold outside the run's ledger (foreign-provider or legacy storage, and a rejection's box): each attempt carries that charge from just before it is sent until the walk takes it off the channel, or until it is dropped unconsumed. Its records' admitted bytes are charged when they are allocated, in the Source's name, so no byte is counted twice. This pull-mode attribution lets the policy distinguish *reclaimable* bytes (what an operator can give up right now) from currently-held bytes — a grace-hash with on-disk partitions, for instance, reports only its in-memory portion, and the Reshape and Cull buffers report what spilling the groups still resident would free, each row counted as a `node_buffers` slot counts it, with rows on disk or taken out for processing counting 0.
 
 Registrations are scoped to the state they mirror, not to the run: each wrapper is unregistered when the state it attributes drains. A Source's ingest-channel consumer is released the moment its receiver disconnects (whichever arm consumed it — the Source arm, a fused `Merge.interleave`, or a fused Transform); a Combine branch's consumer is released when the branch exits — the IEJoin, grace-hash, and sort-merge branches route their clean return and every internal `?` early-return through a single unregister, and the inline-hash branch unregisters at its clean exit; and a `node_buffers` slot's consumer leaves the registry after its final planned reader. A consumer that collects a sequential scan into a resident vector carries an RAII materialization reservation for its complete synchronous use, so normal completion and every error return unregister it. Composition input seeding transfers that same registration into the body-local node-buffer registry without an unregister/register gap or a second charge. While the body Source canonicalizes its seed, the same byte handle first reserves the prospective output in addition to the still-live seed, then drops back to the output estimate when the seed allocation is gone; admission atomically swaps the wrapper under the existing consumer id. Later stages therefore never see charged bytes from state that has already moved downstream, and the registry the policy polls contains live contributors only.
 
