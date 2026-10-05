@@ -392,6 +392,12 @@ E310 totals: needed 2.0 MiB more for group state, but only 704.0 KiB of memory.l
   peaked at P resident, over memory.limit L, while <node> held <what>; the
   run had charged C`, and its suggested limit is that reading rounded up.
   It never claims the limit is fully held.
+- A join, sort-merge or grace fallback that finds the run already over the
+  limit while it works now spills other steps' state first and stops only
+  when that cannot make room. Its report states what the run held instead
+  of a request: `E310 <node>: the run held H, over memory.limit L, while
+  <node> held <what>`, and its suggested limit is what the run held,
+  rounded up.
 - Below it: the charged total against the limit, the five largest holders
   and why each still held its memory, what the reclaim round asked and
   freed, the smallest limit that would have granted the request in YAML
