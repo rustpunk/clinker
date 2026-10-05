@@ -83,6 +83,9 @@ use crate::pipeline::grace_spill::{
 };
 #[cfg(test)]
 use crate::pipeline::memory::NoOpPolicy;
+use crate::pipeline::memory::walk::{
+    OwnedSpillResult, WalkOwnedRegistration, WalkOwnedSpill, register_walk_owned,
+};
 use crate::pipeline::memory::{ConsumerHandle, ConsumerId, MemoryArbitrator};
 use crate::pipeline::spill::{SpillFile, SpillWriter};
 use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
@@ -547,6 +550,38 @@ impl GraceHashExecutor {
         self.consumer_handle.sub_bytes(bytes_estimated as u64);
         charge_grace_spill(budget, &self.name, written)?;
         Ok(())
+    }
+
+    /// Spill every `Building` partition that holds rows, each through
+    /// [`Self::spill_partition`]: a reclaim pass's spill of this table.
+    /// Returns whether any wrote, and otherwise whether the table still
+    /// holds state (partitions on disk, built for the probe or empty) or
+    /// none (every partition done).
+    fn spill_every_building(
+        &mut self,
+        budget: &MemoryArbitrator,
+    ) -> Result<OwnedSpillResult, GraceSpillError> {
+        let mut wrote = false;
+        for idx in 0..self.partitions.len() {
+            if matches!(
+                &self.partitions[idx],
+                PartitionState::Building { records, .. } if !records.is_empty()
+            ) {
+                self.spill_partition(idx, budget)?;
+                wrote = true;
+            }
+        }
+        Ok(if wrote {
+            OwnedSpillResult::Wrote
+        } else if self
+            .partitions
+            .iter()
+            .any(|state| !matches!(state, PartitionState::Done))
+        {
+            OwnedSpillResult::NothingToWrite
+        } else {
+            OwnedSpillResult::NotHeld
+        })
     }
 
     /// Transition every Building partition → Ready by constructing
@@ -1074,12 +1109,40 @@ pub(crate) fn register_grace_consumer(
 }
 
 /// A grace-hash join's partition table as walk-owned state: the executor
-/// that holds the partitions and charges them to its consumer's handle.
+/// that holds the partitions and charges them to consumer `consumer`'s
+/// handle.
+///
+/// A reclaim pass that another consumer's request starts spills its
+/// building partitions ([`WalkOwnedSpill`]) whenever the kernel is between
+/// two executor operations on it.
 struct GracePartitionCell {
     executor: GraceHashExecutor,
+    consumer: ConsumerId,
 }
 
-/// A grace-hash join's partition table in its walk-owned cell.
+impl WalkOwnedSpill for GracePartitionCell {
+    /// A pass that elects the grace consumer spills every `Building`
+    /// partition that holds rows through the executor's own partition spill:
+    /// the same files, disk-quota charge and sketch handover. It wrote when
+    /// any partition spilled. A table whose partitions are all on disk,
+    /// built for the probe or empty wrote nothing; one whose partitions are
+    /// all done holds no state. Never reserves.
+    fn spill_owned(
+        &mut self,
+        id: ConsumerId,
+        arbitrator: &MemoryArbitrator,
+    ) -> Result<OwnedSpillResult, PipelineError> {
+        if id != self.consumer {
+            return Ok(OwnedSpillResult::NotHeld);
+        }
+        self.executor
+            .spill_every_building(arbitrator)
+            .map_err(|e| grace_spill_error(e, &self.executor.name, "reclaim spill failed"))
+    }
+}
+
+/// A grace-hash join's partition table in its walk-owned cell, registered in
+/// the walk reclaim set under the grace consumer for as long as this lives.
 ///
 /// The cell is borrowed only inside one of the methods here, each one
 /// executor operation, never across the build-key extraction, the sketch
@@ -1087,23 +1150,30 @@ struct GracePartitionCell {
 /// the kernel's own memory checks.
 pub(crate) struct GracePartitions {
     cell: Rc<RefCell<GracePartitionCell>>,
+    /// Dropped with the cell, on every exit.
+    _registration: WalkOwnedRegistration,
 }
 
 impl GracePartitions {
     /// Put `executor` in a walk-owned cell for consumer `consumer`, which
-    /// charges it through the executor's handle.
+    /// charges it through the executor's handle, and register the cell on
+    /// `budget`'s walk. On a thread with no walk frame (an executor a test
+    /// builds with no run) it registers nothing.
     ///
     /// # Errors
     ///
-    /// None yet.
+    /// As [`register_walk_owned`].
     pub(crate) fn register(
         budget: &MemoryArbitrator,
         consumer: ConsumerId,
         executor: GraceHashExecutor,
     ) -> Result<Self, PipelineError> {
-        let _ = (budget, consumer);
+        let handle = Arc::clone(&executor.consumer_handle);
+        let cell = Rc::new(RefCell::new(GracePartitionCell { executor, consumer }));
+        let registration = register_walk_owned(budget, consumer, &handle, &cell)?;
         Ok(Self {
-            cell: Rc::new(RefCell::new(GracePartitionCell { executor })),
+            cell,
+            _registration: registration,
         })
     }
 
