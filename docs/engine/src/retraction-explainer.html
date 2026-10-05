@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clinker engine · The retraction loop</title>
+<style>
+:root{
+  --iron:#14110f; --iron2:#1d1915; --iron3:#29231d; --seam:#3a3129;
+  --ash:#b9ab98; --bone:#ece2d0; --dim:#7d705f;
+  --rust:#d0581f; --rust-d:#8f3a13; --brass:#e0a93e; --verd:#4fb0a0;
+  --blood:#e0362c; --steel:#7f97ad; --plum:#b07ac0; --moss:#9bc76b;
+  --disp:"Rajdhani", "Bahnschrift Condensed", "Roboto Condensed", "Arial Narrow", sans-serif;
+  --mono:"Share Tech Mono", "Source Code Pro", Consolas, "Ubuntu Mono", monospace;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--iron);color:var(--bone);font:15px/1.6 var(--mono);
+  background-image:
+   radial-gradient(1000px 520px at 15% -10%, rgba(176,122,192,.12), transparent 60%),
+   radial-gradient(800px 480px at 110% 55%, rgba(224,54,44,.06), transparent 60%),
+   repeating-radial-gradient(circle at 92% 8%, rgba(255,255,255,.018) 0 1px, transparent 1px 18px);}
+a{color:var(--plum)}
+code{font-family:var(--mono);background:var(--iron3);padding:0 .35em;border:1px solid var(--seam);color:var(--brass);font-size:.92em;overflow-wrap:anywhere}
+pre{background:var(--iron);border:1px solid var(--seam);padding:12px 14px;overflow-x:auto;font-size:13px;line-height:1.5;color:var(--ash);max-width:100%;margin:10px 0}
+header.hero{padding:64px 6vw 36px;border-bottom:2px solid var(--seam);position:relative;overflow:hidden}
+header.hero::after{content:"";position:absolute;right:-60px;top:-60px;width:360px;height:360px;border-radius:50%;pointer-events:none;
+  background:repeating-radial-gradient(circle,rgba(176,122,192,.16) 0 2px,transparent 2px 26px)}
+.rt-kicker{font:700 12px/1.4 var(--mono);letter-spacing:.24em;text-transform:uppercase;color:var(--plum)}
+.rt-kicker a{color:inherit}
+h1{font:700 clamp(44px,8.6vw,112px)/.88 var(--disp);margin:14px 0 18px;text-transform:uppercase;letter-spacing:-.01em}
+h1 em{font-style:normal;color:var(--plum)}
+.rt-lede{max-width:820px;color:var(--ash);font-size:16px}
+nav.rt-toc{display:flex;flex-wrap:wrap;margin-top:26px;border:1px solid var(--seam);width:fit-content;max-width:100%}
+nav.rt-toc a{padding:10px 14px;text-decoration:none;color:var(--ash);border-right:1px solid var(--seam);font-size:12px;letter-spacing:.12em;text-transform:uppercase}
+nav.rt-toc a:last-child{border-right:0}
+nav.rt-toc b{color:var(--plum);margin-right:6px}
+@media (hover:hover){nav.rt-toc a:hover{background:var(--plum);color:var(--iron)}}
+section{padding:52px 6vw;border-bottom:1px solid var(--seam)}
+section:nth-of-type(even){background:rgba(0,0,0,.18)}
+.rt-sechead{display:grid;grid-template-columns:110px 1fr;gap:22px;align-items:end;margin-bottom:22px}
+.rt-num{font:700 110px/.8 var(--disp);color:transparent;-webkit-text-stroke:2px #6a4a75}
+h2{font:700 clamp(30px,4.4vw,56px)/.95 var(--disp);text-transform:uppercase;margin:0}
+h2 small{display:block;font:400 14px/1.4 var(--mono);text-transform:none;color:var(--dim);margin-top:10px}
+h3{font:700 19px/1.1 var(--disp);text-transform:uppercase;letter-spacing:.05em;color:var(--plum);margin:0 0 10px}
+p{max-width:840px}
+.rt-aside{font-size:13px;color:var(--ash)}
+.rt-panel{background:var(--iron2);border:1px solid var(--seam);padding:16px;min-width:0}
+.rt-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+.rt-grid>*{min-width:0}
+.rt-callout{border-left:4px solid var(--plum);background:rgba(176,122,192,.07);padding:12px 16px;margin:16px 0;max-width:840px}
+
+/* controls */
+.rt-ctlrow{display:flex;flex-wrap:wrap;gap:10px 18px;align-items:center;margin-bottom:14px}
+.rt-seg{display:inline-flex;border:2px solid var(--seam);flex-wrap:wrap}
+.rt-seg button{font:700 12px/1 var(--mono);padding:9px 10px;border:0;border-right:1px solid var(--seam);background:transparent;color:var(--ash);cursor:pointer}
+.rt-seg button:last-child{border-right:0}
+.rt-seg button[aria-pressed=true]{background:var(--plum);color:var(--iron)}
+.rt-btn{font:700 12px/1 var(--mono);padding:10px 12px;border:2px solid var(--seam);background:var(--iron);color:var(--bone);cursor:pointer;min-height:40px}
+.rt-btn:disabled{opacity:.4;cursor:default}
+.rt-ctlhead{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim)}
+
+/* pipeline strip */
+.rt-pipe{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:4px 0 14px}
+.rt-node{border:2px solid var(--seam);padding:6px 9px;font-size:12px;background:var(--iron)}
+.rt-node small{display:block;font-size:10px;color:var(--dim);letter-spacing:.06em;text-transform:uppercase}
+.rt-node.rt-prod{border-color:var(--brass)}
+.rt-node.rt-member{border-color:var(--plum);border-style:dashed}
+.rt-arrow{color:var(--dim)}
+
+/* timeline */
+.rt-phases{display:flex;flex-wrap:wrap;gap:4px;margin:8px 0}
+.rt-phases span{font-size:11px;padding:4px 6px;border:1px solid var(--seam);color:var(--dim)}
+.rt-phases span.rt-done{color:var(--ash)}
+.rt-phases span.rt-now{border-color:var(--brass);color:var(--iron);background:var(--brass)}
+.rt-narr{font-size:14px;color:var(--bone);border-left:3px solid var(--brass);padding:8px 12px;background:rgba(224,169,62,.06);margin:8px 0 14px}
+
+/* state */
+.rt-group{border:1px solid var(--seam);padding:6px 8px;margin-bottom:6px;font-size:12px}
+.rt-group b{color:var(--brass)}
+.rt-chip{display:inline-block;margin:2px 3px 2px 0;padding:1px 5px;border:1px solid var(--seam);background:var(--iron3);font-size:11px;white-space:nowrap}
+.rt-chip.rt-gone{text-decoration:line-through;color:var(--dim);border-style:dashed}
+.rt-chip.rt-new{border-color:var(--blood);color:var(--blood)}
+.rt-cell{border:1px solid var(--seam);padding:6px 8px;margin-bottom:6px;font-size:12px}
+.rt-cell.rt-dirty{border-color:var(--blood)}
+.rt-cell .rt-key{color:var(--steel)}
+.rt-err{color:var(--blood)}
+.rt-empty{font-size:12px;color:var(--dim)}
+table.rt-t{border-collapse:collapse;font-size:12px;width:100%}
+table.rt-t td,table.rt-t th{border:1px solid var(--seam);padding:5px 7px;text-align:left}
+table.rt-t th{font:700 11px/1.2 var(--disp);letter-spacing:.08em;text-transform:uppercase;color:var(--plum);background:var(--iron)}
+td.rt-ok{color:var(--moss)} td.rt-bad{color:var(--blood)}
+table.rt-t td{overflow-wrap:anywhere;word-break:break-word}
+[data-rt-ctable] td:first-child{word-break:break-all}
+[data-rt-dlq] td:nth-child(-n+2){white-space:nowrap;overflow-wrap:normal;word-break:normal}
+.rt-wrap{overflow-x:auto;max-width:100%}
+.rt-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,270px),1fr));border:2px solid var(--seam)}
+.rt-card{padding:16px 18px;border-right:1px solid var(--seam);border-bottom:1px solid var(--seam);min-width:0}
+.rt-card h4{margin:0 0 6px;font:700 19px/1.1 var(--disp);text-transform:uppercase}
+.rt-card p{font-size:13px;color:var(--ash);margin:0 0 6px}
+footer{padding:36px 6vw;color:var(--dim);font-size:12px}
+
+@media (max-width:900px){.rt-grid{grid-template-columns:1fr}}
+@media (max-width:720px){
+  .rt-sechead{grid-template-columns:1fr;gap:6px}.rt-num{font-size:64px}
+  h2{font-size:clamp(26px,9vw,34px)}
+  section{padding:40px 5vw}
+  header.hero{padding:44px 5vw 28px}
+}
+@media (max-width:720px),(pointer:coarse){
+  .rt-aside,footer,.rt-card p,.rt-group,.rt-cell,table.rt-t{font-size:14px}
+}
+@media (max-width:560px){
+  .rt-ctlrow .rt-seg{display:flex;width:100%}
+  .rt-ctlrow .rt-seg button{flex:1 1 auto}
+}
+@media (pointer:coarse),(max-width:720px){
+  .rt-seg button,.rt-btn{min-height:44px}
+  nav.rt-toc a{display:flex;align-items:center;min-height:44px}
+  .rt-kicker a{display:inline-block;line-height:44px}
+}
+@media (prefers-reduced-motion: reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="rt-kicker">Clinker engine internals · <a href="retraction-protocol.html">← Retraction Protocol</a></div>
+  <h1>The retraction<br><em>loop</em></h1>
+  <p class="rt-lede">When an Aggregate's <code>group_by</code> leaves out a correlation-key field, its output rows no longer belong to one key group, so a failure after it cannot simply dead-letter "the group". The engine instead holds the Aggregate's downstream back, runs it at commit time, traces each failure to the source rows behind it, takes those rows out of the Aggregate, and runs again until nothing new fails. This page replays that loop, phase by phase, on three of the engine's own test pipelines.</p>
+  <nav class="rt-toc">
+    <a href="#when"><b>01</b>When it runs</a>
+    <a href="#loop"><b>02</b>The loop</a>
+    <a href="#gaps"><b>03</b>Known gaps</a>
+  </nav>
+</header>
+
+<section id="when">
+  <div class="rt-sechead"><div class="rt-num">01</div><h2>When it runs<small>Relaxed aggregates and the region held back for commit</small></h2></div>
+  <div class="rt-grid">
+    <div class="rt-panel">
+      <h3>Relaxed or strict</h3>
+      <p class="rt-aside">An Aggregate is <b>relaxed</b> when its <code>group_by</code> omits any field of its input's correlation-key set (<code>group_by_omits_any_ck_field</code>); time-windowed aggregates stay strict in the planner, though the run-time check does not exclude them yet (<a href="https://github.com/rustpunk/clinker/issues/1374">#1374</a>). A relaxed Aggregate stamps a synthetic <code>$ck.aggregate.&lt;name&gt;</code> column holding the group index, and its output key set becomes (input key ∩ <code>group_by</code>) ∪ that column, so everything downstream is keyed by group. With no relaxed Aggregate the run takes the fast path: no loop, all retraction counters stay 0.</p>
+      <p class="rt-aside"><code>sum</code>, <code>count</code>, <code>avg</code>, <code>weighted_avg</code>, <code>collect</code> and <code>any</code> retract by subtracting cached values (lineage mode). <code>min</code> and <code>max</code> keep each group's raw contributions and re-fold what survives (buffer mode). <code>--explain</code> prints a <code>=== Retraction ===</code> block with each relaxed Aggregate's mode and its deferred region.</p>
+    </div>
+    <div class="rt-panel">
+      <h3>The deferred region</h3>
+      <p class="rt-aside">From each relaxed Aggregate (the <b>producer</b>) the planner walks downstream; every node reached is a region <b>member</b> until a Sink, which becomes a region output. On the forward pass the producer runs, keeps its aggregator state for retraction, and parks its output; members and outputs do not run at all. Sinks outside a region write into correlation buffer cells keyed by the row's <code>$ck.*</code> values, and per-record failures are held in those cells. Everything is decided at commit.</p>
+    </div>
+  </div>
+</section>
+
+<section id="loop">
+  <div class="rt-sechead"><div class="rt-num">02</div><h2>The loop<small>Detect → recompute → dispatch → re-detect → expand or stop → flush</small></h2></div>
+  <div class="rt-ctlrow">
+    <span class="rt-ctlhead">Test pipeline</span>
+    <div class="rt-seg" data-rt-scen></div>
+  </div>
+  <p class="rt-aside" data-rt-desc></p>
+  <div class="rt-pipe" data-rt-pipe></div>
+  <div class="rt-ctlrow">
+    <button class="rt-btn" data-rt-step="reset">Reset</button>
+    <button class="rt-btn" data-rt-step="prev">◀ Back</button>
+    <button class="rt-btn" data-rt-step="next">Step ▶</button>
+    <button class="rt-btn" data-rt-step="all">To the end</button>
+    <span class="rt-aside" data-rt-pos></span>
+  </div>
+  <div class="rt-phases" data-rt-phases></div>
+  <p class="rt-narr" data-rt-narr aria-live="polite"></p>
+  <div class="rt-grid">
+    <div class="rt-panel"><h3>Aggregator state</h3><div data-rt-agg></div></div>
+    <div class="rt-panel"><h3>Correlation buffer</h3><div data-rt-buf></div></div>
+    <div class="rt-panel"><h3>Retract set</h3><div data-rt-seen></div></div>
+    <div class="rt-panel"><h3>Counters</h3><div class="rt-wrap" data-rt-counters></div></div>
+  </div>
+  <div class="rt-panel" style="margin-top:14px"><h3>Result</h3><div data-rt-result></div></div>
+</section>
+
+<section id="gaps">
+  <div class="rt-sechead"><div class="rt-num">03</div><h2>Known gaps<small>Paths that do not behave as designed today</small></h2></div>
+  <div class="rt-cards">
+    <div class="rt-card"><h4>Degrade loses the group</h4><p>When an Aggregate cannot be corrected (no retained state, a failed retract, a failed re-emit), its output slot is drained and it is added to a degrade list that nothing reads. The group's rows are lost rather than dead-lettered, and a later node that needed the drained output can stop the run with an internal error (<a data-rt-issue="degrade" href="https://github.com/rustpunk/clinker/issues/1288">#1288</a>).</p></div>
+    <div class="rt-card"><h4>No spilling</h4><p>A relaxed Aggregate whose state spills to disk cannot finalize in place; the run stops with an internal "spill failed" error rather than a budget diagnostic or the degrade path (<a data-rt-issue="spill" href="https://github.com/rustpunk/clinker/issues/1288">#1288</a>).</p></div>
+    <div class="rt-card"><h4>Windows before the Aggregate</h4><p>Windows after the Aggregate are rebuilt from the re-emitted rows on every iteration. Windows before it are never re-evaluated, yet the planner's buffer-mode mark (which <code>--explain</code> counts) lifts the E150 check for them (<a data-rt-issue="windows" href="https://github.com/rustpunk/clinker/issues/1376">#1376</a>).</p></div>
+    <div class="rt-card"><h4><code>correlation_fanout_policy</code></h4><p><code>all</code> and <code>primary</code> are accepted on a Sink or the pipeline but behave like <code>any</code>: the one place collateral sparing is decided passes "full match" and "primary match" as always true, and the Combine-level field is never read (<a data-rt-issue="fanout" href="https://github.com/rustpunk/clinker/issues/1375">#1375</a>).</p></div>
+    <div class="rt-card"><h4>The iteration cap</h4><p>The loop is bounded by plan nodes (composition-body nodes included) + source rows + 1 iterations, since each pass must add at least one source row. Reaching the cap is a <code>panic!</code>, not a typed error (<a data-rt-issue="cap" href="https://github.com/rustpunk/clinker/issues/1378">#1378</a>).</p></div>
+    <div class="rt-card"><h4>Cross-region inputs</h4><p>Rows entering a region from outside it are parked once and removed when first replayed, so a later iteration could miss them; this is tracked, with a fix pending (<a data-rt-issue="crossing" href="https://github.com/rustpunk/clinker/issues/1263">#1263</a>).</p></div>
+  </div>
+</section>
+
+<footer>Algorithm: <code>crates/clinker-exec/src/executor/commit/</code> (<code>mod.rs</code> loop and cap, <code>detect.rs</code>, <code>recompute_agg.rs</code>, <code>dispatch.rs</code>, <code>flush.rs</code>), <code>correlation_dispatch.rs</code> and the retained <code>HashAggregator</code> in <code>aggregation/hash.rs</code>. The three pipelines and their inputs are the engine tests <code>correlated_post_aggregate_retract.rs</code>, <code>correlated_dlq_retract.rs</code> and <code>two_source_aggregate_retract.rs</code>. Clinker engine internals.</footer>
+
+<script>
+(() => {
+"use strict";
+const $ = (s, r = document) => r.querySelector(s);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+const SCEN = {
+  cascade: {
+    label: "cascade (2 iterations)", test: "correlated_post_aggregate_retract.rs",
+    desc: "src (correlation_key: order_id) → dept_totals (group_by: [department], total = sum(amount)) → ratio (1 / (total − 60)) → out. HR totals exactly 60, so ratio divides by zero — but only at commit, because ratio is in the deferred region.",
+    sources: [{ name: "src", rows: [["o1","HR",10],["o2","HR",10],["o3","HR",10],["o4","HR",10],["o5","HR",10],["o6","HR",10],["o7","ENG",100],["o8","ENG",200],["o9","ENG",300]] }],
+    validate: false, ratio: 60, count: false,
+    nodes: [["src","source"],["dept_totals","relaxed aggregate","prod"],["ratio","region member","member"],["out","region output","member"]],
+    asserted: { iterations: 2, groups_recomputed: [">=", 1], dlq: [">=", 1] },
+    expect: { iterations: 2, groups_recomputed: 1, dlq: 1, expanded: 6, lookups: 1, synth: 3, out: ["ENG,600,1/540"] }
+  },
+  upstream: {
+    label: "failure before the aggregate", test: "correlated_dlq_retract.rs",
+    desc: "src (correlation_key: order_id) → validate (amount.to_int()) → dept_totals (group_by: [department], total = sum, n = count(*)) → out. Order O7's amount is BAD, so validate fails on the forward pass, before the Aggregate ever sees it.",
+    sources: [{ name: "src", rows: [["O1","HR","10"],["O2","HR","20"],["O3","HR","30"],["O4","ENG","100"],["O5","ENG","200"],["O6","ENG","300"],["O7","HR","BAD"],["O8","HR","40"],["O9","HR","50"],["O10","ENG","400"],["O11","ENG","500"],["O12","HR","60"]] }],
+    validate: true, ratio: null, count: true,
+    nodes: [["src","source"],["validate","transform"],["dept_totals","relaxed aggregate","prod"],["out","region output","member"]],
+    asserted: { dlq: 1 },
+    expect: { iterations: 1, groups_recomputed: 2, dlq: 1, expanded: 0, lookups: 0, synth: 4, out: ["HR,210,6", "ENG,1500,5"] }
+  },
+  twosource: {
+    label: "two sources", test: "two_source_aggregate_retract.rs",
+    desc: "[src_a, src_b] → merged → dept_totals (group_by: [department], total = sum(amount), n = count(*)) → post_check (ratio = 1 / (total − 60)) → out. HR gets three rows from each source; A1 and B1 share ordinal 1 but are different source rows, so the trace must expand all six.",
+    sources: [{ name: "src_a", rows: [["A1","HR",10],["A2","HR",10],["A3","HR",10],["A4","ENG",100],["A5","ENG",200]] },
+              { name: "src_b", rows: [["B1","HR",10],["B2","HR",10],["B3","HR",10],["B4","ENG",300]] }],
+    validate: false, ratio: 60, count: true, xf: "post_check",
+    nodes: [["src_a / src_b","sources"],["merged","merge"],["dept_totals","relaxed aggregate","prod"],["post_check","region member","member"],["out","region output","member"]],
+    asserted: { groups_recomputed: 1, dlq: 1, expanded: 6 },
+    expect: { iterations: 2, groups_recomputed: 1, dlq: 1, expanded: 6, lookups: 1, synth: 3, out: ["ENG,600,3,1/540"] }
+  }
+};
+
+/* ---------- the engine model ---------- */
+const keyStr = k => "[" + k.map(v => typeof v === "number" ? String(v) : JSON.stringify(v)).join(", ") + "]";
+const clone = o => JSON.parse(JSON.stringify(o));
+
+function run(sc) {
+  const C = { iterations: 0, groups_recomputed: 0, partitions_dispatched: 0, degrade_fallback_count: 0, synth: 0, lookups: 0, expanded: 0 };
+  const frames = [];
+  const rows = sc.sources.flatMap(s => s.rows.map((r, i) => ({ id: r[0], src: s.name, ord: i + 1, dept: r[1], amount: r[2] })));
+  const groups = []; // {dept, idx, members:[id], gone:[id]}
+  let buf = {}; // key -> {key, errors:[{msg, rows}], slots:[row]}
+  let parked = []; // aggregate output in the node buffer
+  const snap = (phase, narr, extra = {}) => frames.push(Object.assign({ phase, narr, groups: clone(groups), buf: clone(buf), parked: clone(parked), C: clone(C) }, extra));
+  const val = r => sc.validate ? Number(r.amount) : r.amount;
+
+  /* forward pass */
+  const failed = [];
+  for (const r of rows) {
+    if (sc.validate && !/^-?\d+$/.test(r.amount)) {
+      const k = keyStr([r.id]);
+      buf[k] = { key: [r.id], errors: [{ msg: `validate: "${r.amount}".to_int() failed`, rows: [r.id] }], slots: [] };
+      failed.push(r.id); continue;
+    }
+    let g = groups.find(x => x.dept === r.dept);
+    if (!g) { g = { dept: r.dept, idx: groups.length, members: [], gone: [] }; groups.push(g); }
+    g.members.push(r.id);
+  }
+  const emit = () => groups.filter(g => g.members.length).map(g => {
+    const mem = rows.filter(r => g.members.includes(r.id));
+    const total = mem.reduce((a, r) => a + val(r), 0);
+    return { dept: g.dept, idx: g.idx, total, n: mem.length, rep: g.members[0] };
+  });
+  parked = emit(); C.synth += parked.length;
+  const baseline = clone(buf);
+  let seen = [];
+  snap("forward", `Forward pass. ${sc.validate ? `validate fails on ${failed.join(", ")} and holds the failure in its key cell; ` : ""}dept_totals folds ${rows.length - failed.length} rows into ${groups.length} groups, keeps its state for retraction and parks ${parked.length} output rows stamped with $ck.aggregate.dept_totals = group index. The region members do not run. This buffer is saved as the baseline.`, { seen: [], delta: [] });
+
+  /* initial detect */
+  for (const cell of Object.values(buf)) for (const e of cell.errors) for (const id of e.rows) if (!seen.includes(id)) seen.push(id);
+  let delta = seen.slice();
+  snap("detect", seen.length ? `Initial detect. Cells with failures are triggers. ${keyStr([seen[0]])} is a source-key cell, so its failing row joins the retract set: {${seen.join(", ")}}.` : "Initial detect. No cell holds a failure yet (the failure, if any, is inside the region and has not run), so the retract set starts empty.", { seen: seen.slice(), delta: delta.slice() });
+
+  let archive = {};
+  for (let guard = 0; guard < 50; guard++) {
+    C.iterations++;
+    /* recompute */
+    if (delta.length) {
+      for (const id of delta) {
+        const g = groups.find(x => x.members.includes(id));
+        if (g) { g.members = g.members.filter(m => m !== id); g.gone.push(id); }
+      }
+      parked = emit(); C.groups_recomputed += parked.length; C.synth += parked.length;
+      const nf = delta.filter(id => !groups.some(g => g.gone.includes(id)));
+      snap("recompute", `Iteration ${C.iterations}: recompute. Retract ${delta.join(", ")} from dept_totals${nf.length ? ` (${nf.join(", ")} never reached the Aggregate, so its retract is a tolerated "not found")` : ""}, then re-emit every non-empty group: ${parked.map(p => p.dept).join(", ") || "none"}. groups_recomputed counts every re-emitted row, not changed groups.`, { seen: seen.slice(), delta: delta.slice() });
+    } else {
+      snap("recompute", `Iteration ${C.iterations}: recompute skipped — this iteration's retract delta is empty, so the parked forward-pass output is used as is.`, { seen: seen.slice(), delta: [] });
+    }
+    /* dispatch */
+    for (const p of parked) {
+      const k = keyStr([p.idx]);
+      buf[k] = buf[k] || { key: [p.idx], errors: [], slots: [] };
+      if (sc.ratio !== null && p.total === sc.ratio) buf[k].errors.push({ msg: `${sc.xf || "ratio"}: division by zero (total ${p.total})`, rows: [], synthetic: p.idx });
+      else buf[k].slots.push([p.dept, p.total].concat(sc.count ? [p.n] : [], sc.ratio !== null ? [`1/${p.total - sc.ratio}`] : []).join(","));
+    }
+    snap("dispatch", `Iteration ${C.iterations}: dispatch. The region members run on the parked rows in topological order. ${sc.ratio !== null ? parked.filter(p => p.total === sc.ratio).map(p => `${p.dept} (total ${p.total}) fails in ${sc.xf || "ratio"} and is held in cell ${keyStr([p.idx])}`).concat(parked.filter(p => p.total !== sc.ratio).map(p => `${p.dept} is buffered in cell ${keyStr([p.idx])}`)).join("; ") : parked.map(p => `${p.dept} is buffered in cell ${keyStr([p.idx])}`).join("; ")}. Output rows are keyed by the synthetic group index, because the Aggregate dropped order_id.`, { seen: seen.slice(), delta: delta.slice() });
+    /* re-detect */
+    const found = [];
+    for (const cell of Object.values(buf)) for (const e of cell.errors) {
+      if (e.synthetic !== undefined) {
+        C.lookups++;
+        const g = groups.find(x => x.idx === e.synthetic);
+        C.expanded += g.members.length;
+        g.members.forEach(id => found.push(id));
+        e.rows = g.members.slice();
+      } else e.rows.forEach(id => found.push(id));
+    }
+    for (const [k, cell] of Object.entries(buf)) if (cell.errors.length) archive[k] = { key: cell.key, errors: clone(cell.errors), slots: [] };
+    const fresh = [...new Set(found)].filter(id => !seen.includes(id));
+    snap("redetect", `Iteration ${C.iterations}: re-detect. ${found.length ? `Trigger cells resolve to source rows: ${[...new Set(found)].join(", ")}${C.lookups ? " (a synthetic cell is looked up through the Aggregate's group → contributing rows)" : ""}.` : "No trigger cell."} New rows not yet in the retract set: ${fresh.length ? fresh.join(", ") : "none"}. Failures are copied to the error archive (messages only, no records).`, { seen: seen.slice(), delta: fresh.slice() });
+    if (!fresh.length) {
+      snap("converge", `Converged after ${C.iterations} iteration${C.iterations === 1 ? "" : "s"}: re-detect added nothing new, so the loop stops without restoring the baseline.`, { seen: seen.slice(), delta: [] });
+      break;
+    }
+    seen = seen.concat(fresh); delta = fresh;
+    buf = clone(baseline);
+    snap("restore", `Expand and restore. The retract set grows to {${seen.join(", ")}}. The live buffer is replaced by the forward-pass baseline, so rows this iteration wrote speculatively are discarded; the next iteration retracts only the new rows.`, { seen: seen.slice(), delta: delta.slice() });
+  }
+  /* merge archive */
+  for (const [k, a] of Object.entries(archive)) {
+    buf[k] = buf[k] || { key: a.key, errors: [], slots: [] };
+    for (const e of a.errors) if (!buf[k].errors.some(x => x.msg === e.msg)) buf[k].errors.push(e);
+  }
+  snap("merge", "Merge the error archive back into the live buffer, so failures found in earlier iterations still reach the dead-letter queue even though their cells were restored away.", { seen: seen.slice(), delta: [] });
+  /* flush */
+  const out = [], dlq = [];
+  for (const k of Object.keys(buf).sort()) {
+    const cell = buf[k];
+    if (cell.errors.length) {
+      cell.errors.forEach(e => dlq.push({ cell: k, kind: "trigger", msg: e.msg }));
+      cell.slots.forEach(s => dlq.push({ cell: k, kind: "collateral", msg: s }));
+    } else cell.slots.forEach(s => out.push(s));
+  }
+  snap("flush", `Flush. Cells are taken in the order of their rendered key text (#1377); a cell with a failure dead-letters each failure as a trigger and any rows it holds as collateral; a clean cell writes its rows. ${seen.filter(id => !rows.some(r => r.id === id && failed.includes(id))).length ? "The retracted contributors themselves are not dead-lettered: they are simply no longer in any group." : ""}`, { seen: seen.slice(), delta: [], out, dlq });
+  return { frames, C, out, dlq };
+}
+
+/* ---------- render ---------- */
+const S = { sc: "cascade", i: 0 };
+const PHASES = ["forward","detect","recompute","dispatch","redetect","restore","converge","merge","flush"];
+const scBar = $("[data-rt-scen]");
+scBar.innerHTML = Object.entries(SCEN).map(([k, s]) => `<button data-v="${k}">${esc(s.label)}</button>`).join("");
+scBar.querySelectorAll("button").forEach(b => b.addEventListener("click", () => { S.sc = b.dataset.v; S.i = 0; render(); }));
+document.querySelectorAll("[data-rt-step]").forEach(b => b.addEventListener("click", () => {
+  const n = cur().frames.length;
+  const a = b.dataset.rtStep;
+  S.i = a === "reset" ? 0 : a === "prev" ? Math.max(0, S.i - 1) : a === "next" ? Math.min(n - 1, S.i + 1) : n - 1;
+  render();
+}));
+let cache = {};
+const cur = () => cache[S.sc] || (cache[S.sc] = run(SCEN[S.sc]));
+
+function render() {
+  const sc = SCEN[S.sc], R = cur(), f = R.frames[S.i];
+  scBar.querySelectorAll("button").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.v === S.sc)));
+  $("[data-rt-desc]").textContent = sc.desc + " (" + sc.test + ")";
+  $("[data-rt-pipe]").innerHTML = sc.nodes.map(([n, role, cls]) => `<span class="rt-node ${cls ? "rt-" + cls : ""}"><small>${esc(role)}</small>${esc(n)}</span>`).join('<span class="rt-arrow">→</span>');
+  $("[data-rt-pos]").textContent = `step ${S.i + 1} / ${R.frames.length}`;
+  document.querySelector('[data-rt-step="prev"]').disabled = S.i === 0;
+  document.querySelector('[data-rt-step="next"]').disabled = S.i === R.frames.length - 1;
+  $("[data-rt-phases]").innerHTML = R.frames.map((fr, j) => `<span class="${j < S.i ? "rt-done" : j === S.i ? "rt-now" : ""}">${esc(fr.phase)}${["recompute","dispatch","redetect"].includes(fr.phase) ? " " + fr.C.iterations : ""}</span>`).join("");
+  $("[data-rt-narr]").textContent = f.narr;
+  $("[data-rt-agg]").innerHTML = f.groups.map(g => `<div class="rt-group"><b>group ${g.idx} · ${esc(g.dept)}</b><br>${g.members.map(m => `<span class="rt-chip">${esc(m)}</span>`).join("")}${g.gone.map(m => `<span class="rt-chip rt-gone">${esc(m)}</span>`).join("")}${g.members.length ? "" : ' <span class="rt-empty">(empty: not re-emitted)</span>'}</div>`).join("") +
+    `<p class="rt-aside">Parked output: ${f.parked.map(p => `${esc(p.dept)} ${p.total}`).join(", ") || "none"}</p>`;
+  const cells = Object.keys(f.buf).sort();
+  $("[data-rt-buf]").innerHTML = cells.length ? cells.map(k => { const c = f.buf[k]; return `<div class="rt-cell ${c.errors.length ? "rt-dirty" : ""}"><span class="rt-key">${esc(k)}</span> ${c.errors.map(e => `<div class="rt-err">✖ ${esc(e.msg)}</div>`).join("")}${c.slots.map(s => `<div>${esc(s)}</div>`).join("")}</div>`; }).join("") : '<p class="rt-empty">empty</p>';
+  $("[data-rt-seen]").innerHTML = `<p class="rt-aside">Retract set (seen): ${f.seen.length ? f.seen.map(id => `<span class="rt-chip">${esc(id)}</span>`).join("") : "empty"}</p><p class="rt-aside">This iteration's delta: ${f.delta.length ? f.delta.map(id => `<span class="rt-chip rt-new">${esc(id)}</span>`).join("") : "empty"}</p>`;
+  const rowsC = [["iterations", f.C.iterations, "iterations"], ["groups_recomputed", f.C.groups_recomputed, "groups_recomputed"], ["synthetic_ck_columns_emitted_total", f.C.synth, null], ["synthetic_ck_fanout_lookups_total", f.C.lookups, null], ["synthetic_ck_fanout_rows_expanded_total", f.C.expanded, "expanded"], ["partitions_dispatched", f.C.partitions_dispatched, null], ["degrade_fallback_count", f.C.degrade_fallback_count, null]];
+  const last = S.i === R.frames.length - 1;
+  $("[data-rt-counters]").innerHTML = `<table class="rt-t" data-rt-ctable><tr><th>Counter</th><th>Value</th><th>Test asserts</th></tr>${rowsC.map(([n, v, a]) => {
+    const as = a && sc.asserted[a] !== undefined ? sc.asserted[a] : null;
+    const txt = as === null ? "" : Array.isArray(as) ? `${as[0]} ${as[1]}` : `== ${as}`;
+    const ok = as === null ? null : Array.isArray(as) ? v >= as[1] : v === as;
+    return `<tr><td>${esc(n)}</td><td data-rt-c="${n}">${v}</td><td class="${!last || ok === null ? "" : ok ? "rt-ok" : "rt-bad"}">${esc(txt)}</td></tr>`;
+  }).join("")}</table>`;
+  $("[data-rt-result]").innerHTML = last
+    ? `<div class="rt-grid"><div><h3>Written to out</h3>${R.out.length ? `<table class="rt-t" data-rt-out>${R.out.map(o => `<tr><td>${esc(o)}</td></tr>`).join("")}</table>` : '<p class="rt-empty">nothing</p>'}</div><div><h3>Dead-letter queue</h3>${R.dlq.length ? `<table class="rt-t" data-rt-dlq>${R.dlq.map(d => `<tr><td>${esc(d.kind)}</td><td>${esc(d.cell)}</td><td>${esc(d.msg)}</td></tr>`).join("")}</table>` : '<p class="rt-empty">empty</p>'}<p class="rt-aside">dlq_count ${R.dlq.length}${R.dlq.length ? "; the run exits with code 2" : ""}.</p></div></div>`
+    : '<p class="rt-empty">Step to the end to see what is written and what is dead-lettered.</p>';
+}
+render();
+window.__rt = { run, SCEN };
+})();
+</script>
+</body>
+</html>

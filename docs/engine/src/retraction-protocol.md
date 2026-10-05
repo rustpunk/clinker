@@ -6,6 +6,8 @@ This page is the protocol itself, woven from three operator surfaces: the aggreg
 
 *User-facing view: the User Guide's "Correlation Keys" / "Aggregate Nodes" pages.*
 
+*Interactive companion: the [retraction-loop explainer](retraction-explainer.html) replays the commit loop phase by phase on three of the engine's test pipelines — the aggregator state, the correlation buffer, the retract set and every retraction counter at each step.*
+
 ## Path selection: strict vs. retraction
 
 The engine inspects each aggregate's `group_by` against the upstream CK lattice (the union of `$ck.*` shadow columns visible at the aggregate's input). Authors do not configure this — the engine inspects the configuration and picks the correct path:
@@ -36,7 +38,7 @@ The engine inspects each aggregate's `group_by` against the upstream CK lattice 
 
 On the strict path, aggregate output rows inherit the correlation meta of the records that fed them. If any input record in a correlation group fails, the surviving records in that group still flow through the aggregator and produce one aggregate row — but that aggregate row is itself DLQ'd as a collateral and never reaches the writer.
 
-On the retraction path, the engine retracts only the failing records and refinalizes affected groups, so the aggregate output row reflects the surviving contributions. Operators downstream of a retraction-mode aggregate run only at commit time on the post-recompute aggregate emits, so non-deterministic CXL builtins (e.g. `now`) evaluate exactly once per output row and need no special-casing.
+On the retraction path, the engine retracts only the failing records and refinalizes affected groups, so the aggregate output row reflects the surviving contributions. Operators downstream of a retraction-mode aggregate run only at commit time, on the post-recompute aggregate emits, and they re-run on every iteration of the commit loop below; only the last iteration's results are written. A non-deterministic CXL builtin such as `now` is therefore evaluated once per iteration, and the written value is the last iteration's.
 
 ## E15Y: streaming incompatibility
 
@@ -52,7 +54,7 @@ The reason is structural: streaming aggregates emit at group-boundary close, bef
 
 The cost of refinalizing a group depends on whether the accumulator can be run in reverse:
 
-- **Reversible accumulators** (`sum`, `count`, `avg`, `weighted_avg`, `collect`, `any`) carry a per-row lineage map `(input_row_id → group_index)` alongside accumulator state. A retract is O(retracted_rows) reverse-op calls plus one `finalize_in_place`. The lineage map costs ~8 bytes/row plus the per-group `input_rows` Vec inline cost. `sum`, `avg` and `weighted_avg` hold exact sums, which subtract exactly, so a retracted group finalizes to the bytes of a fresh fold over the surviving rows, at any memory limit. A `sum` whose every contribution is retracted has no value left and finalizes to null, as a group with no rows does.
+- **Reversible accumulators** (`sum`, `count`, `avg`, `weighted_avg`, `collect`, `any`) carry a per-row lineage map `(input_row_id → group_index)` alongside accumulator state. A retract is O(retracted_rows) reverse-op calls plus one `finalize_in_place`. Per input row the aggregator keeps the row's `SourceRowId` with its group index, plus the row's source name, which retract does not read; `--explain` estimates the lineage at ~8 bytes per row. `sum`, `avg` and `weighted_avg` hold exact sums, which subtract exactly, so a retracted group finalizes to the bytes of a fresh fold over the surviving rows, at any memory limit. A `sum` whose every contribution is retracted has no value left and finalizes to null, as a group with no rows does.
 
 - **BufferRequired accumulators** (`min`, `max`) cannot be unwound by a reverse op — removing the current max, for instance, requires knowing the second-largest value, which the running accumulator never retained. They hold per-group raw contributions until commit and recompute affected groups from `contributions − retracted_rows`.
 
@@ -74,18 +76,32 @@ Retraction handles failures on both sides of the aggregate, via two different li
 
 Both surfaces converge on one recompute pipeline. The end-to-end demo at `examples/pipelines/retract-demo/` runs both surfaces in one pipeline (a Transform failing on an aggregate output row alongside an upstream Transform error).
 
-## Window interaction: buffer-mode and wholesale recompute
+## The commit loop
 
-When a window sits downstream of a relaxed-CK aggregate whose dropped correlation-key fields overlap the window's `group_by`, the planner switches the window from streaming-emit to **buffer-mode**. Streaming windows are structurally incompatible with retraction for the same reason streaming aggregates are: a streaming window emits per-partition as the partition closes, leaving nothing to retract. The plan-time derivation detects the overlap between the aggregate's dropped CK fields and the window's `partition_by` axis and forces buffer mode.
+The deferred region downstream of each relaxed aggregate (its producer) does not run on the forward pass: the producer runs, keeps its aggregator state, and parks its output; Sinks outside a region buffer their rows in correlation cells keyed by the row's `$ck.*` values, holding per-record failures there too. The forward-pass buffer is saved as a baseline. At commit (`executor/commit/mod.rs`):
 
-A buffer-mode window stores per-partition raw row buffers until commit. On retraction, it reruns the configured `$window.*` evaluation over `partition − retracted_rows` and emits per-output deltas through the replay phase. All 13 `$window.*` builtins are covered uniformly by this **wholesale recompute** — there is no per-function reverse op the way Reversible aggregate accumulators have; the window simply re-evaluates the surviving partition end to end. This keeps ranking functions (`row_number`, `rank`, `dense_rank`), positional functions (`lag`, `lead`, `first_value`, `last_value`), and iterable predicates (`any`, `every`, `exists`, `not_exists`) all correct after a retract without bespoke per-builtin unwind logic.
+1. **Detect.** Cells holding failures are triggers. A source-key cell contributes its failing rows; a cell keyed by `$ck.aggregate.<name>` is decoded to the group index and expanded to every contributing `SourceRowId`. The result seeds the retract set.
+2. **Recompute.** This iteration's new rows are retracted from every relaxed aggregate (a row the aggregate never saw is a tolerated "not found"), and every non-empty group is re-emitted in full; a group with no rows left is not emitted. With an empty delta this step is skipped.
+3. **Dispatch.** The region members re-run in topological order on the re-emitted rows; their per-record failures are held in buffer cells, and a failure that goes straight to the dead-letter queue (such as an aggregate finalize failure) is captured with its source row.
+4. **Re-detect and expand.** Detect runs again on the live buffer, its source rows are combined with the captured direct failures, and failures are copied to an error archive (messages only, no records). Rows not already in the retract set are the next iteration's delta. If there are none the loop stops; otherwise the live buffer is replaced by the baseline and the loop repeats.
+5. **Flush.** The archive is merged back into the buffer and the cells are committed: a dirty cell dead-letters each failure as a trigger and its rows as collateral; a clean cell is written. Contributors retracted from a failed aggregate row are not dead-lettered themselves: they are simply no longer in any group.
+
+The loop is bounded by plan nodes (composition-body nodes included) + source rows + 1 iterations, since every iteration must add at least one source row; reaching the bound is currently a `panic!` rather than a typed error ([#1378](https://github.com/rustpunk/clinker/issues/1378)).
+
+## Window interaction
+
+When the pipeline has any relaxed aggregate, the planner marks every windowed Transform whose `partition_by` does not cover the window's correlation-key set as needing a buffered recompute (`requires_buffer_recompute`), and `--explain` counts those windows as buffer-mode windows. What happens at run time: windows rooted at a relaxed aggregate are rebuilt from the re-emitted rows on every iteration of the commit loop, so a window after the aggregate sees the post-retract groups. Windows upstream of the aggregate are never re-evaluated, yet the mark still lifts the E150 check for Source-anchored windows that are never rerun ([#1376](https://github.com/rustpunk/clinker/issues/1376)).
 
 ## Degrade fallback
 
-When retraction's preconditions break at runtime — an aggregate spilled before retract reached it, or a window partition exceeded the memory budget — the orchestrator degrades to "DLQ entire affected group/partition", the same strict-collateral DLQ shape every aggregate uses on the strict path. Each degrade increments `correlation.retract.degrade_fallback_count`; persistent non-zero values point at a tighter memory budget or a smaller correlation-key cardinality. The degrade path and its metrics are detailed in [Operator Retraction Cost Reference](retraction-cost-reference.md).
+The design: when retraction's preconditions break at run time, the orchestrator degrades to dead-lettering the whole affected group, the strict-collateral shape. Today:
+
+- An aggregate whose recompute cannot proceed (no retained state, a failed retract, or a failed re-emit) has its output slot drained and is added to a degrade list, and `degrade_fallback_count` is incremented. Nothing reads the list, so the strict-collateral dead-lettering never happens: the aggregate's groups are lost rather than dead-lettered, and a region member that needed the drained output can stop the run with an internal error ([#1288](https://github.com/rustpunk/clinker/issues/1288)).
+- A relaxed aggregate whose state spills cannot finalize in place; the run stops with an internal "spill failed" error instead of degrading ([#1288](https://github.com/rustpunk/clinker/issues/1288)).
+- There is no window degrade path.
 
 ## See also
 
-- [Correlation Key Lifecycle & Rollback Narrowing](correlation-lifecycle.md) — the `$ck.<field>` shadow columns, `(row_id, source_name)` lineage pairs, and `per_source_rollback_cursors` map this protocol consumes.
-- [Operator Retraction Cost Reference](retraction-cost-reference.md) — the per-operator cost table, the `=== Retraction ===` explain block, and the `correlation.retract.*` counters.
-- [Memory Arbitration & Scheduling](memory-arbitration.md) — the spill thresholds whose breach triggers the degrade fallback.
+- [Correlation Key Lifecycle & Rollback Narrowing](correlation-lifecycle.md) — the `$ck.<field>` shadow columns, `SourceRowId` lineage, and `per_source_rollback_cursors` map this protocol consumes.
+- [Operator Retraction Cost Reference](retraction-cost-reference.md) — the per-operator cost table, the `=== Retraction ===` explain block, and the `retraction` counters.
+- [Memory Arbitration & Scheduling](memory-arbitration.md) — the RSS budget and spill thresholds; a relaxed aggregate that crosses them currently fails the run rather than degrading.
