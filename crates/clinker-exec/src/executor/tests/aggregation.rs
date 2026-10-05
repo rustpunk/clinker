@@ -2544,4 +2544,176 @@ mod walk_owned_tables {
         table.finalize(&ctx, &mut out).expect("finalized");
         assert_eq!(consumer.reclaimable_bytes(), 0);
     }
+
+    /// The same fold under a relaxed key: the correlation commit keeps its
+    /// table to retract rows from and finalize again in place.
+    fn relaxed_program() -> Program {
+        let mut program = program();
+        let mut compiled = (*program.compiled).clone();
+        compiled.set_retraction_flags(true);
+        program.compiled = Arc::new(compiled);
+        program
+    }
+
+    /// The rows a relaxed table no pass ever touches gives, finalized in
+    /// place, over `rows` numbered from `first_row`.
+    fn relaxed_rows(
+        program: &Program,
+        rows: &[Record],
+        first_row: u64,
+        spill_dir: &std::path::Path,
+    ) -> Vec<String> {
+        let arbitrator = arbitrator();
+        let factory = factory(program, &arbitrator, spill_dir);
+        let (mut stream, id) = factory.make_for_retraction().expect("table built");
+        let stable = StableEvalContext::test_default();
+        let ctx = EvalContext::test_default_borrowed(&stable);
+        let mut out = Vec::new();
+        for (offset, record) in rows.iter().enumerate() {
+            stream
+                .add_record(record, first_row + offset as u64, &ctx, &mut out)
+                .expect("record added");
+        }
+        let mut table = stream.into_retained_hash().expect("a hash table");
+        table.finalize_in_place(&ctx, &mut out).expect("finalized");
+        drop(table);
+        arbitrator.unregister_consumer(id);
+        canonical(out)
+    }
+
+    /// The E310 a refused request gives lists the relaxed table as unable
+    /// to spill, and its round, if one ran, never asked it.
+    fn assert_relaxed_table_out_of_reach(
+        shortfall: crate::pipeline::memory::ledger::Shortfall,
+        arbitrator: &MemoryArbitrator,
+        when: &str,
+    ) {
+        let report = shortfall.into_report(arbitrator);
+        if let Some(round) = report.reclaim.as_ref() {
+            assert!(
+                !round.holders_asked.iter().any(|node| node == NODE),
+                "{when}: the round never asks the relaxed table; asked {:?}",
+                round.holders_asked
+            );
+        }
+        let holder = report
+            .holders
+            .iter()
+            .find(|holder| holder.node == NODE)
+            .expect("the relaxed table is a holder");
+        assert_eq!(
+            holder.state,
+            HolderState::CannotSpill,
+            "{when}: the E310 lists the relaxed table as unable to spill, never in use"
+        );
+    }
+
+    /// A relaxed-key Aggregate's table, built as its arm builds it, ranks by
+    /// nothing while it ingests, after its in-place finalize and while the
+    /// commit keeps it: its spill could not be finalized in place or
+    /// retracted from, so a spill would end the run or lose its groups
+    /// rather than free memory. The soft-threshold poll never asks it to
+    /// spill, a request another consumer makes is refused rather than met
+    /// from it, the E310 lists it as unable to spill, and a retract
+    /// afterwards still reads the whole resident table.
+    #[test]
+    fn a_relaxed_aggregate_is_never_elected_by_a_pass() {
+        let spill_root = tempfile::tempdir().expect("spill root");
+        let program = relaxed_program();
+        let rows = input();
+        let expected = relaxed_rows(&program, &rows, 0, spill_root.path());
+        let expected_after_retract = relaxed_rows(&program, &rows[1..], 1, spill_root.path());
+        let arbitrator = arbitrator();
+        let stable = StableEvalContext::test_default();
+        let ctx = EvalContext::test_default_borrowed(&stable);
+        with_test_walk_frame(&arbitrator, || {
+            let factory = factory(&program, &arbitrator, spill_root.path());
+            let (mut stream, id) = factory.make_for_retraction().expect("table built");
+            let mut emitted = Vec::new();
+            for (row, record) in rows.iter().enumerate() {
+                stream
+                    .add_record(record, row as u64, &ctx, &mut emitted)
+                    .expect("record added");
+            }
+            let handle = Arc::clone(stream.consumer_handle().expect("a hash table"));
+            let consumer = AggregateConsumer::new(Arc::clone(&handle));
+            let charge = handle.bytes();
+            assert!(charge > FREE, "the table holds a value heap");
+            assert_eq!(
+                consumer.reclaimable_bytes(),
+                0,
+                "while it ingests, the relaxed table ranks by nothing"
+            );
+
+            // The soft-threshold poll, with more charged than the soft limit.
+            arbitrator
+                .set_limit(arbitrator.charged_bytes())
+                .expect("limit");
+            assert!(arbitrator.should_spill(), "the poll trips");
+            assert!(
+                !handle.take_spill_request(),
+                "the poll never asks the relaxed table to spill"
+            );
+
+            // A request another consumer makes while the table ingests.
+            arbitrator
+                .set_limit(arbitrator.charged_bytes() + FREE)
+                .expect("limit");
+            let shortfall = foreign_walk_request(&arbitrator, FREE + charge / 2)
+                .expect_err("nothing a pass may spill covers the request");
+            assert_relaxed_table_out_of_reach(shortfall, &arbitrator, "while it ingests");
+            assert!(
+                !handle.take_spill_request(),
+                "the pass never asks the relaxed table to spill"
+            );
+
+            let mut table = stream.into_retained_hash().expect("a hash table");
+            let mut first = Vec::new();
+            table
+                .finalize_in_place(&ctx, &mut first)
+                .expect("finalized in place");
+            assert_eq!(canonical(first), expected);
+            assert_eq!(
+                consumer.reclaimable_bytes(),
+                0,
+                "after its in-place finalize, the relaxed table ranks by nothing"
+            );
+            assert_eq!(handle.bytes(), charge, "it stays charged while kept");
+
+            // A request another consumer makes while the commit keeps it.
+            let shortfall = foreign_walk_request(&arbitrator, FREE + charge / 2)
+                .expect_err("nothing a pass may spill covers the request");
+            assert_relaxed_table_out_of_reach(shortfall, &arbitrator, "while it is kept");
+            assert!(
+                table.spill_files().is_empty(),
+                "the kept table's groups are all resident"
+            );
+            assert_eq!(
+                handle.bytes(),
+                charge,
+                "nothing of the kept table was freed"
+            );
+
+            table
+                .retract_row(0u64)
+                .expect("a retract reads the resident table");
+            assert_eq!(
+                consumer.reclaimable_bytes(),
+                0,
+                "a retract leaves the kept table ranking by nothing"
+            );
+            let mut second = Vec::new();
+            table
+                .finalize_in_place(&ctx, &mut second)
+                .expect("finalized again in place");
+            assert_eq!(
+                canonical(second),
+                expected_after_retract,
+                "the re-finalize gives the rows the input without the retracted row gives"
+            );
+            assert_eq!(consumer.reclaimable_bytes(), 0);
+            drop(table);
+            arbitrator.unregister_consumer(id);
+        });
+    }
 }

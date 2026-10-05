@@ -291,60 +291,16 @@ where
         // per-document flush does not apply here — a document-aware
         // relaxed-CK aggregate keeps its single cross-document table.
         //
-        // The single `ConsumerHandle` is shared with the
-        // `AggregateConsumer` the arbitrator holds; its `ConsumerId` is
-        // captured so the wrapper is unregistered the moment the
-        // aggregator's state stops being live. Parking transfers
-        // ownership of the unregister to `RetainedAggregatorState`,
-        // which fires it when the aggregator drops.
-        //
-        // Build the single retained-stream artifacts here, on the branch
-        // that consumes them — the strict path below re-derives its own per
-        // document, so nothing is built-then-dropped on the dominant arm.
-        let evaluator = ProgramEvaluator::with_max_expansion(
-            Arc::clone(typed),
-            has_distinct,
-            cxl::eval::DEFAULT_MAX_EXPANSION,
-        );
-        let spill_schema = aggregate_spill_schema(compiled);
-        let mem_limit = operator_memory_limit(&ctx.memory_budget);
-        // Resolve the spill compression mode against this aggregate's
-        // output-schema width and the run's batch size, so spilled group
-        // state matches what `--explain` projects for the operator: the
-        // explain line resolves the same way against
-        // `stored_output_schema().column_count()`, keeping the reported mode
-        // and the on-disk format in lockstep. `auto` skips LZ4 on
-        // narrow/short aggregates where the per-frame fixed cost outweighs
-        // the savings.
-        let spill_compress = ctx
-            .spill_compress
-            .resolve_for_schema(output_schema.column_count(), ctx.batch_size as u64);
-        let agg_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
-        let agg_consumer_id = ctx.memory_budget.register_node_consumer(
-            Arc::new(crate::aggregation::AggregateConsumer::new(
-                agg_consumer_handle.clone(),
-            )),
-            agg_consumer_handle.clone(),
-            ConsumerLabel {
-                node: name.to_string(),
-                surface: MemorySurface::GroupState,
-            },
-        );
-        let mut stream = crate::aggregation::AggregateStream::for_node(
-            agg_strategy,
-            crate::aggregation::AggregatorConfig {
-                compiled: Arc::clone(compiled),
-                evaluator,
-                output_schema: output_schema.clone(),
-                spill_schema,
-                memory_budget: mem_limit,
-                spill_dir: Some(ctx.spill_root_path.to_path_buf()),
-                spill_compress,
-                transform_name: name.clone(),
-                consumer_handle: agg_consumer_handle,
-                arbitrator: Arc::clone(&ctx.memory_budget),
-            },
-        )?;
+        // The table is built and its `AggregateConsumer` registered the way
+        // every other hash table of this node is: the same evaluator, spill
+        // schema, memory limit, spill directory and compression mode, with
+        // the consumer registered only once the table exists. Its
+        // `ConsumerId` is captured so the wrapper is unregistered the moment
+        // the aggregator's state stops being live. Parking transfers
+        // ownership of the unregister to `RetainedAggregatorState`, which
+        // fires it when the aggregator drops.
+        let factory = DocAggregatorFactory::from_ctx(ctx, &spec)?;
+        let (mut stream, agg_consumer_id) = factory.make_for_retraction()?;
 
         // Per-record accumulator updates + spill I/O. The loop
         // threads `&mut ctx` (cursor advance, DLQ routing) per
@@ -602,6 +558,10 @@ fn finalize_aggregate_emit(
 /// shared arbitrator, so the open document's group bytes count toward the
 /// run's RSS accounting and the existing per-aggregator spill triggers
 /// fire normally.
+///
+/// The relaxed-key arm builds its one cross-document table through the
+/// same factory ([`Self::make_for_retraction`]), so every hash table of an
+/// Aggregate node is built and registered one way.
 pub(crate) struct DocAggregatorFactory {
     strategy: AggregateStrategy,
     compiled: Arc<cxl::plan::CompiledAggregate>,
@@ -731,6 +691,22 @@ impl DocAggregatorFactory {
             },
         );
         Ok((stream, consumer_id))
+    }
+
+    /// Build the relaxed-key arm's one table, which spans every document
+    /// and which the correlation commit keeps to retract rows from and
+    /// finalize again in place, and register its arbitrator consumer as
+    /// [`Self::make`] does.
+    pub(crate) fn make_for_retraction(
+        &self,
+    ) -> Result<
+        (
+            crate::aggregation::AggregateStream,
+            crate::pipeline::memory::ConsumerId,
+        ),
+        PipelineError,
+    > {
+        self.make()
     }
 }
 
