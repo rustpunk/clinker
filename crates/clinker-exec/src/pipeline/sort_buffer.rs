@@ -364,6 +364,15 @@ impl crate::pipeline::memory::MemoryConsumer for SortConsumer {
         self.handle.bytes()
     }
 
+    /// 0: the range join (IEJoin) kernel registers this consumer, and no
+    /// reclaim pass can reach that kernel, which spills on its own
+    /// thresholds, so a pass would elect it and free nothing. A refused
+    /// request's E310 lists it as `cannot spill` and counts its bytes as
+    /// state that cannot spill.
+    fn reclaimable_bytes(&self) -> u64 {
+        0
+    }
+
     fn peak_charged_bytes(&self) -> Option<u64> {
         Some(self.handle.peak_bytes())
     }

@@ -2316,6 +2316,14 @@ impl crate::pipeline::memory::MemoryConsumer for SortMergeConsumer {
         self.handle.bytes()
     }
 
+    /// 0: no reclaim pass can reach the sort-merge kernel that owns this state,
+    /// which spills on its own thresholds, so a pass would elect it and free
+    /// nothing. A refused request's E310 lists it as `cannot spill` and
+    /// counts its bytes as state that cannot spill.
+    fn reclaimable_bytes(&self) -> u64 {
+        0
+    }
+
     fn peak_charged_bytes(&self) -> Option<u64> {
         Some(self.handle.peak_bytes())
     }
