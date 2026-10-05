@@ -44,7 +44,7 @@ The `strategy` config field carries a hint; the planner has final say.
 | `auto` (default) | Planner picks a strategy from the predicate shape. Hash join for equi predicates; IEJoin for pure-range predicates. |
 | `grace_hash` | Force grace hash join (disk-spilling partitioned hash). Applies only to pure-equi predicates; ignored on predicates carrying range conjuncts. |
 
-`grace_hash` is the right hint when build-side inputs are larger than the memory budget but fit on disk after partitioning. It is mostly an explicit performance assertion rather than a behavioral switch: the planner **falls back automatically to grace-hash spill** when an in-memory hash table approaches the RSS soft limit. So `strategy: grace_hash` on a build side that would have spilled anyway changes nothing operationally — it documents the author's intent and pins the strategy regardless of the plan-time size estimate.
+`grace_hash` is the right hint when build-side inputs may be larger than the memory budget but fit on disk after partitioning. It is a behavioral switch, not only an assertion: the hash-versus-grace choice is made once, at plan time (`grace_hash_should_fire` in `clinker-plan/src/plan/combine.rs`), and there is no runtime fallback. An in-memory `HashBuildProbe` build that outgrows the budget returns `CombineError::MemoryLimitExceeded`, which the dispatcher maps straight to `PipelineError::MemoryBudgetExceeded` (`E310`) where it calls `CombineHashTable::build` in `executor/combine_dispatch.rs`; nothing converts the join to grace hash at that point ([#1337](https://github.com/rustpunk/clinker/issues/1337)). `strategy: grace_hash` pins the spilling strategy regardless of the plan-time size estimate.
 
 The choice of in-memory hash versus grace-hash for a pure-equality Combine is driven by the build-side row-count estimate (see [Join-planner statistics](#join-planner-statistics) below): a build side large enough to risk overrunning the memory limit is what tips the planner from the in-memory hash strategy to the disk-spilling grace-hash strategy.
 
@@ -52,7 +52,7 @@ The choice of in-memory hash versus grace-hash for a pure-equality Combine is dr
 
 Build-side inputs are materialized in memory as hash tables keyed by the equi columns. For each non-driving input, plan for roughly **1.5–2× the raw CSV size in heap**. A 50 MB product catalog typically occupies 75–100 MB of hash-table memory — the multiplier covers the per-key `Value` boxing, the bucket array overhead, and the per-entry chaining structure on top of the raw payload bytes.
 
-This heap cost is the quantity the memory arbitrator charges against `pipeline.memory.limit`, and it is what the soft/hard threshold machinery watches when deciding whether to flip a pure-equi Combine to grace-hash spill. See [Memory Arbitration & Scheduling](memory-arbitration.md) for the spill thresholds, the back-pressure knob, and strategy overrides.
+This heap cost is the quantity the memory arbitrator charges against `pipeline.memory.limit`. For an in-memory `HashBuildProbe` Combine, exceeding the limit during build is an `E310` abort; it is not flipped to grace-hash spill at runtime ([#1337](https://github.com/rustpunk/clinker/issues/1337)). See [Memory Arbitration & Scheduling](memory-arbitration.md) for the spill thresholds, the back-pressure knob, and strategy overrides.
 
 ### Block-band IEJoin: bounded on both input axes and the output
 

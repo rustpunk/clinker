@@ -251,7 +251,7 @@ With `drive: products`, the pipeline emits one row per product enriched with a m
 | `auto` (default) | Planner picks a strategy from the predicate shape. Hash join for equi predicates; IEJoin for pure-range predicates. |
 | `grace_hash` | Force grace hash join (disk-spilling partitioned hash). Applies only to pure-equi predicates; ignored on predicates with range conjuncts. |
 
-You rarely need to set this — `auto` already spills a large join to disk when it would otherwise exceed the memory budget. Use `grace_hash` as an explicit assertion when you know the build side is larger than memory but fits on disk after partitioning.
+The choice is made when the pipeline is planned, from an estimate of the inputs' size. Under `auto`, an equal-ids join runs in memory unless that estimate says the build side is too large. If the estimate is low or missing (for example, a `glob:` source whose files are not known in advance) and the build side turns out larger than the memory budget, the run stops with `E310 MemoryBudgetExceeded`; it does not switch to disk partway through ([#1337](https://github.com/rustpunk/clinker/issues/1337)). Set `strategy: grace_hash` when the build side may be larger than the memory budget: it partitions the build side to disk from the start.
 
 ## Correlation-key propagation
 
@@ -316,7 +316,7 @@ If the large result is expected, raise the cap (or omit the field). If it is not
 
 ## Memory considerations
 
-Each non-driving (build-side) input is held in memory while the join runs, so plan for roughly 1.5–2× its file size — a 50 MB lookup table needs about 75–100 MB. If a build side is larger than the memory budget, the join spills to disk automatically rather than failing. Set the budget with `pipeline.memory.limit`; see [Memory Tuning](../ops/memory.md).
+Each non-driving (build-side) input is held in memory while the join runs, so plan for roughly 1.5–2× its file size — a 50 MB lookup table needs about 75–100 MB. An equal-ids join spills its build side to disk only when it runs as a grace hash join, which the planner chooses from its size estimate or which `strategy: grace_hash` forces. An in-memory join whose build side outgrows the budget stops the run with `E310` instead of spilling ([#1337](https://github.com/rustpunk/clinker/issues/1337)). Set the budget with `pipeline.memory.limit`; see [Memory Tuning](../ops/memory.md).
 
 Range and equi+range predicates (the IEJoin block-band strategy) are bounded on **both input axes and the output**: each side is drained into disk-backed, key-sorted blocks, and the emitted rows accumulate in a spillable sort buffer rather than a resident vector. So a range join whose inputs — or whose result — exceed the memory budget spills automatically and completes, rather than failing. Even a single hot key whose block-pair is a near cross product streams through a bounded nested loop instead of materializing the whole candidate set. Use [`max_output_rows`](#output-size-cap-max_output_rows) if you want such a runaway result to *stop* rather than spill.
 
