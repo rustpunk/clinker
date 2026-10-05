@@ -1510,24 +1510,43 @@ pub(crate) fn take_refusal_report_for(error: &ResourceError) -> Option<Box<Memor
 ///
 /// A reader, writer or worker that met the refusal propagates it as an
 /// admission error (`Format(Resource(Budget))`); this recovers the report
-/// the refusal recorded. `requester` names the node and surface of the
-/// thread's work, stamped onto a report whose refusal named none (a request
-/// made for the run as a whole); a report that already names its requester
-/// keeps it. Called on the thread that was refused, where its work returns.
+/// the refusal recorded. The refusal may already be wrapped by the time it
+/// returns: inside `CompositionBodyError` the inner error converts and the
+/// wrapper keeps its composition name, and inside `Multiple` each member
+/// converts, the rest kept as they are. `requester` names the node and
+/// surface of the thread's work, stamped onto a report whose refusal named
+/// none (a request made for the run as a whole); a report that already
+/// names its requester keeps it. Called on the thread that was refused,
+/// where its work returns.
 pub(crate) fn governed_refusal_error(
     error: PipelineError,
     requester: Option<(&str, MemorySurface)>,
 ) -> PipelineError {
-    let PipelineError::Format(FormatError::Resource(resource)) = &error else {
-        return error;
-    };
-    let Some(mut report) = take_refusal_report_for(resource) else {
-        return error;
-    };
-    if let Some((node, surface)) = requester {
-        report.attribute_if_unnamed(node, surface);
+    match error {
+        PipelineError::CompositionBodyError {
+            composition_name,
+            inner,
+        } => PipelineError::CompositionBodyError {
+            composition_name,
+            inner: Box::new(governed_refusal_error(*inner, requester)),
+        },
+        PipelineError::Multiple(errors) => PipelineError::Multiple(
+            errors
+                .into_iter()
+                .map(|error| governed_refusal_error(error, requester.clone()))
+                .collect(),
+        ),
+        PipelineError::Format(FormatError::Resource(resource)) => {
+            let Some(mut report) = take_refusal_report_for(&resource) else {
+                return PipelineError::Format(FormatError::Resource(resource));
+            };
+            if let Some((node, surface)) = requester {
+                report.attribute_if_unnamed(node, surface);
+            }
+            PipelineError::MemoryBudgetExceeded { report }
+        }
+        other => other,
     }
-    PipelineError::MemoryBudgetExceeded { report }
 }
 
 /// [`governed_refusal_error`] over a thread's result, naming `node` and
