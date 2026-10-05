@@ -298,10 +298,12 @@ where
         // is built kept for retraction, which makes it rank by 0, and it is
         // not registered in the walk reclaim set.
         //
-        // The table is built and its `AggregateConsumer` registered the way
-        // every other hash table of this node is: the same evaluator, spill
-        // schema, memory limit, spill directory and compression mode, with
-        // the consumer registered only once the table exists. Its
+        // The table is built and its `AggregateConsumer` registered through
+        // the per-document factory the untimed arms use: the same evaluator,
+        // spill schema, memory limit, spill directory and compression mode,
+        // with the consumer registered only once the table exists. (The
+        // time-windowed arm still builds its tables inline and registers
+        // each consumer before its table exists; see #1403.) Its
         // `ConsumerId` is captured so the wrapper is unregistered the moment
         // the aggregator's state stops being live. Parking transfers
         // ownership of the unregister to `RetainedAggregatorState`, which
@@ -567,8 +569,10 @@ fn finalize_aggregate_emit(
 /// fire normally.
 ///
 /// The relaxed-key arm builds its one cross-document table through the
-/// same factory ([`Self::make_for_retraction`]), so every hash table of an
-/// Aggregate node is built and registered one way.
+/// same factory ([`Self::make_for_retraction`]), so the untimed arms build
+/// and register their hash tables one way. The time-windowed arm does not
+/// yet: `WindowedAggContext::make_stream` builds its table inline and
+/// registers the consumer before the table exists (#1403).
 pub(crate) struct DocAggregatorFactory {
     strategy: AggregateStrategy,
     compiled: Arc<cxl::plan::CompiledAggregate>,
