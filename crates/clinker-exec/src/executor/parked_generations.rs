@@ -41,7 +41,9 @@ use petgraph::graph::EdgeIndex;
 use crate::executor::node_buffer::{NodeBuffer, ReReadableNodeBuffer};
 use crate::executor::node_buffer_spill::spill_borrowed_rows;
 use crate::executor::stream_event::SourceRowId;
-use crate::pipeline::memory::walk::{WalkOwnedRegistration, WalkOwnedSpill, register_walk_owned};
+use crate::pipeline::memory::walk::{
+    OwnedSpillResult, WalkOwnedRegistration, WalkOwnedSpill, register_walk_owned,
+};
 use crate::pipeline::memory::{ConsumerHandle, ConsumerId, ConsumerSpillError, MemoryArbitrator};
 
 /// A crossing edge: the composition body whose graph the edge belongs to
@@ -679,13 +681,19 @@ impl ParkedGenerations {
 impl WalkOwnedSpill for ParkedGenerations {
     /// A pass that elects a parked edge's consumer spills that edge's
     /// resident segments ([`ParkedGenerations::spill_consumer`]); a consumer
-    /// whose edge was released is not held here.
+    /// whose edge was released is not held here. It wrote when the edge's
+    /// charge fell; an edge whose segments are all on disk, or all shared
+    /// with an open cursor, wrote nothing.
     fn spill_owned(
         &mut self,
         id: ConsumerId,
         _arbitrator: &MemoryArbitrator,
-    ) -> Result<bool, PipelineError> {
-        Ok(self.spill_consumer(id)?.is_some())
+    ) -> Result<OwnedSpillResult, PipelineError> {
+        Ok(match self.spill_consumer(id)? {
+            None => OwnedSpillResult::NotHeld,
+            Some(0) => OwnedSpillResult::NothingToWrite,
+            Some(_) => OwnedSpillResult::Wrote,
+        })
     }
 }
 

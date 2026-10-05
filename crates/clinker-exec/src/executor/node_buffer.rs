@@ -56,6 +56,17 @@ pub(crate) fn record_byte_cost(column_count: usize) -> u64 {
         as u64
 }
 
+/// What spilling one resident row frees, as a reclaim victim's figure
+/// counts it: the row's slot cost ([`record_byte_cost`]) plus its own heap
+/// payload. A node-buffer slot and every operator buffer that ranks its
+/// rows against a slot count a row through this one function, so the same
+/// row ranks the same wherever it is held. A ranking figure only; never
+/// charged.
+pub(crate) fn resident_record_reclaimable_bytes(record: &Record) -> u64 {
+    record_byte_cost(record.schema().column_count())
+        .saturating_add(record.legacy_estimated_heap_size() as u64)
+}
+
 /// Existing logical-slot estimate for the actual row, excluding only a values
 /// backing already charged to the supplied run. Nested payloads are outside
 /// this fixed-row heuristic; shared allocation owners account for them.
@@ -544,9 +555,9 @@ impl NodeBuffer {
     pub(crate) fn reclaimable_bytes(&self) -> u64 {
         self.resident_events()
             .fold(0u64, |bytes, event| match event {
-                StreamEvent::Record(record, _) => bytes
-                    .saturating_add(record_byte_cost(record.schema().column_count()))
-                    .saturating_add(record.legacy_estimated_heap_size() as u64),
+                StreamEvent::Record(record, _) => {
+                    bytes.saturating_add(resident_record_reclaimable_bytes(record))
+                }
                 StreamEvent::Punctuation(_) => bytes,
             })
     }

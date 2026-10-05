@@ -58,7 +58,9 @@
 //! first row, rather than risking an out-of-memory crash on reload.
 
 use clinker_record::owned_storage::SharedStorage;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use clinker_record::{GroupByKey, Record, Schema, SchemaBuilder, Value};
@@ -76,7 +78,7 @@ use crate::executor::giant_group_error;
 use crate::executor::node_buffer::unaccounted_record_byte_cost;
 use crate::executor::stream_event::SourceRowId;
 use crate::pipeline::memory::{
-    ConsumerHandle, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
+    ConsumerHandle, ConsumerId, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
 };
 use crate::pipeline::sort_key::compare_authored_keys;
 use crate::pipeline::spill::{SpillFile, SpillWriter};
@@ -264,15 +266,7 @@ where
 
     // Register the group buffer with the arbitrator only after the
     // empty-input guard, so the no-work path never leaks a consumer.
-    let handle = ConsumerHandle::new();
-    let consumer_id = ctx.memory_budget.register_node_consumer(
-        Arc::new(CullConsumer::new(handle.clone())),
-        handle.clone(),
-        ConsumerLabel {
-            node: name.to_string(),
-            surface: MemorySurface::CullGroups,
-        },
-    );
+    let (consumer_id, handle) = register_cull_consumer(&ctx.memory_budget, name);
 
     // Every exit path past this point must deregister `consumer_id`, so the
     // grouping/finalize work runs inside a helper whose result is matched
@@ -292,11 +286,30 @@ where
         typed,
         input,
         input_puncts,
+        consumer_id,
         &handle,
         &order_fields,
     );
     ctx.memory_budget.unregister_consumer(consumer_id);
     result
+}
+
+/// Register the consumer that charges node `name`'s group buffer, as a
+/// Cull's held group rows.
+fn register_cull_consumer(
+    budget: &MemoryArbitrator,
+    name: &str,
+) -> (ConsumerId, Arc<ConsumerHandle>) {
+    let handle = ConsumerHandle::new();
+    let consumer_id = budget.register_node_consumer(
+        Arc::new(CullConsumer::new(handle.clone())),
+        handle.clone(),
+        ConsumerLabel {
+            node: name.to_string(),
+            surface: MemorySurface::CullGroups,
+        },
+    );
+    (consumer_id, handle)
 }
 
 /// Group the drained input, spilling resident groups to disk under memory
@@ -319,6 +332,7 @@ fn run_cull_grouped(
     typed: &Arc<cxl::typecheck::TypedProgram>,
     input: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
     input_puncts: Vec<crate::executor::stream_event::Punctuation>,
+    consumer_id: ConsumerId,
     handle: &Arc<ConsumerHandle>,
     order_fields: &[SortField],
 ) -> Result<(), PipelineError> {
@@ -343,15 +357,24 @@ fn run_cull_grouped(
     let budget = Arc::clone(&ctx.memory_budget);
     let spill_root = Arc::clone(&ctx.spill_root_path);
 
-    let mut buffer = CullGroupBuffer::new(
-        input_schema.clone(),
-        spill_compress,
-        ctx.allocation_resources.clone(),
-    );
+    // The buffer lives in a walk-owned cell, borrowed only inside one push,
+    // one spill or one take of a group; every other step below runs with it
+    // free.
+    let groups = CullGroups::register(
+        &budget,
+        consumer_id,
+        handle,
+        name,
+        &spill_root,
+        CullGroupBuffer::new(
+            input_schema.clone(),
+            spill_compress,
+            ctx.allocation_resources.clone(),
+        ),
+    )?;
     for (record, row_num) in input {
         let key = partition_key(name, &record, &config.partition_by)?;
-        buffer.push(key, record, row_num);
-        handle.set_bytes(buffer.unaccounted_resident_bytes() as u64);
+        groups.push(key, record, row_num);
         // Poll for self-spill pressure at every admission. `should_spill_self`
         // updates the peak and reports the soft-threshold crossing WITHOUT
         // running the pausing arbitration round: Cull relieves pressure by
@@ -361,8 +384,7 @@ fn run_cull_grouped(
         // same way. `take_spill_request` still honors a spill nudge another
         // stage's arbitration round set on this consumer.
         if budget.should_spill_self() || handle.take_spill_request() {
-            buffer.spill_until_under_budget(name, &budget, &spill_root, handle)?;
-            handle.set_bytes(buffer.unaccounted_resident_bytes() as u64);
+            groups.spill_until_under_budget(&budget)?;
         }
     }
 
@@ -374,10 +396,9 @@ fn run_cull_grouped(
     let hard_limit = budget.hard_limit();
     let mut kept: Vec<(Record, crate::executor::stream_event::SourceRowId)> = Vec::new();
     let mut removed: Vec<(Record, crate::executor::stream_event::SourceRowId)> = Vec::new();
-    let group_order = buffer.take_group_order();
+    let group_order = groups.take_group_order();
     for key in group_order {
-        let mut group = buffer.take_group(name, &key, hard_limit, &budget)?;
-        handle.set_bytes(buffer.unaccounted_resident_bytes() as u64);
+        let mut group = groups.take_group(&key, hard_limit, &budget)?;
         if !order_fields.is_empty() {
             // The Sort node's order, so a group's rows arrive in the same
             // order a Sink `sort_order` would write them, with the authored
@@ -404,6 +425,9 @@ fn run_cull_grouped(
             kept.append(&mut group);
         }
     }
+    // Every group is taken: the buffer and its registration leave before
+    // the rows are routed.
+    drop(groups);
 
     emit_ports(
         ctx,
@@ -1063,6 +1087,117 @@ impl CullGroupBuffer {
     }
 }
 
+/// A Cull's group buffer as walk-owned state: the buffer, and what spilling
+/// it needs (the Cull's node name, the run's spill root and the handle of
+/// the consumer that charges it).
+struct CullGroupCell {
+    buffer: CullGroupBuffer,
+    node_name: String,
+    spill_root: Arc<std::path::Path>,
+    consumer: ConsumerId,
+    handle: Arc<ConsumerHandle>,
+}
+
+impl CullGroupCell {
+    /// Mirror the buffer's resident charge onto the consumer's handle.
+    fn publish(&self) {
+        self.handle
+            .set_bytes(self.buffer.unaccounted_resident_bytes() as u64);
+    }
+}
+
+/// A Cull's group buffer in its walk-owned cell.
+///
+/// The cell is borrowed only inside one of the methods here (one push, one
+/// spill, one take of a group), never across `partition_key`, the decision
+/// aggregate, a group's sort or the routing of its rows.
+struct CullGroups {
+    cell: Rc<RefCell<CullGroupCell>>,
+}
+
+impl CullGroups {
+    /// Put `buffer` in a walk-owned cell for node `node_name`, whose consumer
+    /// `consumer` charges it through `handle`.
+    ///
+    /// # Errors
+    ///
+    /// As [`register_walk_owned`].
+    fn register(
+        budget: &MemoryArbitrator,
+        consumer: ConsumerId,
+        handle: &Arc<ConsumerHandle>,
+        node_name: &str,
+        spill_root: &Arc<std::path::Path>,
+        buffer: CullGroupBuffer,
+    ) -> Result<Self, PipelineError> {
+        let _ = budget;
+        let cell = Rc::new(RefCell::new(CullGroupCell {
+            buffer,
+            node_name: node_name.to_string(),
+            spill_root: Arc::clone(spill_root),
+            consumer,
+            handle: Arc::clone(handle),
+        }));
+        Ok(Self { cell })
+    }
+
+    /// Admit one record into its group.
+    fn push(
+        &self,
+        key: Vec<GroupByKey>,
+        record: Record,
+        row_num: crate::executor::stream_event::SourceRowId,
+    ) {
+        let mut cell = self.cell.borrow_mut();
+        cell.buffer.push(key, record, row_num);
+        cell.publish();
+    }
+
+    /// The Cull's own spill: evict resident groups until the buffer is back
+    /// under the soft threshold.
+    ///
+    /// # Errors
+    ///
+    /// A failed spill, including E320 past the spill cap.
+    fn spill_until_under_budget(&self, budget: &MemoryArbitrator) -> Result<(), PipelineError> {
+        let mut cell = self.cell.borrow_mut();
+        let cell = &mut *cell;
+        let spilled = cell.buffer.spill_until_under_budget(
+            &cell.node_name,
+            budget,
+            &cell.spill_root,
+            &cell.handle,
+        );
+        cell.publish();
+        spilled
+    }
+
+    /// Take the first-seen group order for the routing drain.
+    fn take_group_order(&self) -> Vec<Vec<GroupByKey>> {
+        self.cell.borrow_mut().buffer.take_group_order()
+    }
+
+    /// Take group `key` out of the buffer, reloaded whole in arrival order.
+    ///
+    /// # Errors
+    ///
+    /// As [`CullGroupBuffer::take_group`].
+    fn take_group(
+        &self,
+        key: &[GroupByKey],
+        hard_limit: u64,
+        budget: &MemoryArbitrator,
+    ) -> Result<Vec<(Record, crate::executor::stream_event::SourceRowId)>, PipelineError> {
+        let mut cell = self.cell.borrow_mut();
+        let cell = &mut *cell;
+        let group = cell
+            .buffer
+            .take_group(&cell.node_name, key, hard_limit, budget);
+        cell.publish();
+        group
+    }
+}
+
 /// Write one input-record slice to a fresh spill file, charging its on-disk
 /// byte size against the arbitrator's per-stage and pipeline-wide spill
 /// totals so `--explain` calibration and the disk-spill cap both see it.
@@ -1644,6 +1779,264 @@ mod tests {
                 && remedy.contains("changes which rows are removed"),
             "the remedy must warn that narrowing partition_by changes the result set: {remedy}"
         );
+    }
+
+    /// Text bytes of each row's note.
+    const NOTE_BYTES: usize = 1024;
+    /// Rows a reclaim test buffers, across [`GROUPS`] groups.
+    const ROWS: u64 = 48;
+    const GROUPS: u64 = 4;
+    /// What is free beside the buffered rows when the foreign request is
+    /// made.
+    const FREE: u64 = 4 * 1024;
+
+    /// A run's allocation provider over `arbitrator`, so text admitted
+    /// through it is charged to the run's ledger as a Source's text is.
+    fn run_provider(
+        arbitrator: &Arc<MemoryArbitrator>,
+    ) -> crate::executor::preparation::ExecutorResources {
+        crate::executor::preparation::ExecutorResources::new(
+            Arc::clone(arbitrator),
+            crate::pipeline::shutdown::ShutdownToken::detached(),
+            None,
+            std::num::NonZeroUsize::MIN,
+            None,
+        )
+        .expect("a run provider")
+    }
+
+    fn account_schema() -> SharedStorage<Schema> {
+        SharedStorage::from_arc(Arc::new(Schema::new(vec![
+            "account".into(),
+            "note".into(),
+        ])))
+    }
+
+    /// [`ROWS`] rows, each with its group key: row `i` belongs to account
+    /// `3i mod GROUPS`, so the groups are first seen out of key order, and
+    /// carries a [`NOTE_BYTES`] note admitted under `resources`, so the run
+    /// holds the note charged until the row's last copy drops.
+    fn admitted_rows(
+        schema: &SharedStorage<Schema>,
+        resources: &clinker_record::owned_storage::AllocationResources,
+    ) -> Vec<(Vec<GroupByKey>, Record, SourceRowId)> {
+        let scope = resources.scope().expect("an allocation scope");
+        (0..ROWS)
+            .map(|i| {
+                let mut values =
+                    clinker_record::owned_storage::OwnedValues::try_with_capacity(2, &scope)
+                        .expect("values admitted");
+                values
+                    .try_push(Value::Integer(((3 * i) % GROUPS) as i64), &scope)
+                    .expect("account admitted");
+                let note = clinker_record::FieldStr::try_new(&format!("{i:0>NOTE_BYTES$}"), &scope)
+                    .expect("note admitted");
+                values
+                    .try_push(Value::String(note), &scope)
+                    .expect("note admitted");
+                let record =
+                    Record::from_owned_values(schema.clone(), values).expect("record built");
+                let key = partition_key("culled", &record, &["account".to_string()])
+                    .expect("a group key");
+                (key, record, SourceRowId::new(PlanNodeId::new(0), i))
+            })
+            .collect()
+    }
+
+    /// Node `culled`'s consumer and its group buffer, registered as
+    /// [`dispatch_cull`] and [`run_cull_grouped`] register them.
+    fn registered_groups(
+        arbitrator: &Arc<MemoryArbitrator>,
+        root: &std::path::Path,
+        schema: &SharedStorage<Schema>,
+        resources: &clinker_record::owned_storage::AllocationResources,
+    ) -> (ConsumerId, Arc<ConsumerHandle>, CullGroups) {
+        let (id, handle) = register_cull_consumer(arbitrator, "culled");
+        let groups = CullGroups::register(
+            arbitrator,
+            id,
+            &handle,
+            "culled",
+            &Arc::from(root),
+            CullGroupBuffer::new(schema.clone(), false, resources.clone()),
+        )
+        .expect("registered");
+        (id, handle, groups)
+    }
+
+    /// Every group, taken in first-seen order, as row ordinals and values.
+    fn take_every_group(
+        take_order: Vec<Vec<GroupByKey>>,
+        mut take: impl FnMut(&[GroupByKey]) -> Vec<(Record, SourceRowId)>,
+    ) -> Vec<(u64, Vec<Value>)> {
+        take_order
+            .iter()
+            .flat_map(|key| take(key))
+            .map(|(record, row)| (row.ordinal(), record.values().to_vec()))
+            .collect()
+    }
+
+    /// A walk request another consumer makes for more than is free, while a
+    /// Cull holds its groups resident, is granted by spilling those groups:
+    /// the Cull's figure falls to 0, every group is on disk, the spill is
+    /// recorded under the Cull's node, and taking every group yields the
+    /// rows an unspilled buffer of the same input yields, in the same order.
+    #[test]
+    fn cull_groups_spill_when_another_walk_request_falls_short() {
+        use crate::pipeline::memory::walk::walk_test_support::{
+            foreign_walk_request, with_test_walk_frame,
+        };
+        let root = tempfile::tempdir().expect("spill root");
+        let arbitrator = Arc::new(MemoryArbitrator::with_policy(
+            64 * 1024 * 1024,
+            0.80,
+            0.70,
+            Box::new(crate::pipeline::memory::Priority),
+        ));
+        with_test_walk_frame(&arbitrator, || {
+            let provider = run_provider(&arbitrator);
+            let resources = provider.allocation();
+            let schema = account_schema();
+            let (id, handle, groups) =
+                registered_groups(&arbitrator, root.path(), &schema, &resources);
+            for (key, record, row) in admitted_rows(&schema, &resources) {
+                groups.push(key, record, row);
+            }
+            let notes = ROWS * NOTE_BYTES as u64;
+            arbitrator
+                .set_limit(arbitrator.charged_bytes() + FREE)
+                .expect("limit");
+            let spilled_before = arbitrator
+                .per_stage_spill_bytes()
+                .get("culled")
+                .copied()
+                .unwrap_or(0);
+
+            let grant = foreign_walk_request(&arbitrator, FREE + notes / 2)
+                .expect("the pass spills the Cull's groups and the request fits");
+            assert_eq!(
+                handle.reclaimable(),
+                0,
+                "nothing the Cull holds is resident"
+            );
+            assert!(
+                groups
+                    .cell
+                    .borrow()
+                    .buffer
+                    .groups
+                    .values()
+                    .all(|group| group.resident.is_empty() && !group.spilled.is_empty()),
+                "every group is on disk"
+            );
+            assert!(
+                arbitrator
+                    .per_stage_spill_bytes()
+                    .get("culled")
+                    .copied()
+                    .unwrap_or(0)
+                    > spilled_before,
+                "the spill is recorded under the Cull's node"
+            );
+            drop(grant);
+
+            let spilled = take_every_group(groups.take_group_order(), |key| {
+                groups
+                    .take_group(key, u64::MAX, &arbitrator)
+                    .expect("group reloads")
+            });
+            let mut unspilled = CullGroupBuffer::new(schema.clone(), false, resources.clone());
+            for (key, record, row) in admitted_rows(&schema, &resources) {
+                unspilled.push(key, record, row);
+            }
+            let expected = take_every_group(unspilled.take_group_order(), |key| {
+                unspilled
+                    .take_group("culled", key, u64::MAX, &arbitrator)
+                    .expect("group taken")
+            });
+            assert_eq!(spilled.len(), ROWS as usize);
+            assert_eq!(
+                spilled, expected,
+                "spilled groups come back as an unspilled buffer gives them"
+            );
+            drop(groups);
+            arbitrator.unregister_consumer(id);
+        });
+    }
+
+    /// The Cull's figure is what spilling its resident groups frees now,
+    /// counted per row as a slot counts it, and a group taken out for
+    /// routing leaves it; once every group is taken the Cull is never asked
+    /// by a pass another request starts.
+    #[test]
+    fn cull_groups_taken_for_routing_are_not_reclaimable() {
+        use crate::executor::node_buffer::resident_record_reclaimable_bytes;
+        use crate::pipeline::memory::walk::walk_test_support::{
+            TestWalkOwned, foreign_walk_request, with_test_walk_frame,
+        };
+        let root = tempfile::tempdir().expect("spill root");
+        let arbitrator = Arc::new(MemoryArbitrator::with_policy(
+            64 * 1024 * 1024,
+            0.80,
+            0.70,
+            Box::new(crate::pipeline::memory::Priority),
+        ));
+        with_test_walk_frame(&arbitrator, || {
+            let provider = run_provider(&arbitrator);
+            let resources = provider.allocation();
+            let schema = account_schema();
+            let (id, handle, groups) =
+                registered_groups(&arbitrator, root.path(), &schema, &resources);
+            let consumer = CullConsumer::new(Arc::clone(&handle));
+            let mut per_group: HashMap<Vec<GroupByKey>, u64> = HashMap::new();
+            for (key, record, row) in admitted_rows(&schema, &resources) {
+                *per_group.entry(key.clone()).or_default() +=
+                    resident_record_reclaimable_bytes(&record);
+                groups.push(key, record, row);
+            }
+            let mut resident: u64 = per_group.values().sum();
+            assert!(resident > 0);
+            assert_eq!(
+                consumer.reclaimable_bytes(),
+                resident,
+                "the figure counts every resident row as a slot counts it"
+            );
+
+            let mut taken = Vec::new();
+            for key in groups.take_group_order() {
+                taken.extend(
+                    groups
+                        .take_group(&key, u64::MAX, &arbitrator)
+                        .expect("group taken"),
+                );
+                resident -= per_group[&key];
+                assert_eq!(
+                    consumer.reclaimable_bytes(),
+                    resident,
+                    "a group taken for routing leaves the figure"
+                );
+            }
+            assert_eq!(consumer.reclaimable_bytes(), 0);
+
+            let other = TestWalkOwned::register(&arbitrator, "other", (0..64).collect(), FREE);
+            arbitrator
+                .set_limit(arbitrator.charged_bytes() + FREE)
+                .expect("limit");
+            let shortfall = foreign_walk_request(&arbitrator, 3 * FREE)
+                .expect_err("spilling the other owner leaves too little room");
+            let report = shortfall.into_report(&arbitrator);
+            let round = report.reclaim.as_ref().expect("the walk ran a round");
+            assert_eq!(
+                round.holders_asked,
+                vec!["other".to_string()],
+                "the round asks the other owner and never the Cull"
+            );
+            assert_eq!(taken.len(), ROWS as usize, "the routed rows stay held");
+            drop(taken);
+            drop(groups);
+            arbitrator.unregister_consumer(other.id);
+            arbitrator.unregister_consumer(id);
+        });
     }
 
     // The disk-spill cap must abort the spill instead of writing past

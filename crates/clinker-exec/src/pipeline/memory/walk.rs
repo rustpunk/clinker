@@ -362,7 +362,9 @@ impl WalkReclaimSet {
         let mut busy = Vec::new();
         for (cell, handle) in &live {
             match cell.try_borrow_mut() {
-                Ok(mut owner) => held |= owner.spill_owned(id, arbitrator)?,
+                Ok(mut owner) => {
+                    held |= owner.spill_owned(id, arbitrator)? != OwnedSpillResult::NotHeld;
+                }
                 Err(_) => busy.push(handle),
             }
         }
@@ -595,10 +597,8 @@ pub(crate) trait WalkOwnedSpill {
     /// handle and charging any spill file to `arbitrator`'s disk quota.
     /// Runs inside a reclaim pass with the walk reclaim set borrowed.
     ///
-    /// Returns whether this owner holds state for `id`: `true` when it does,
-    /// whether or not any of it was resident; `false` when it no longer does
-    /// (the state left the owner before its registration dropped). One cell
-    /// may serve several consumers and spills only what `id` charges.
+    /// Returns what the spill did ([`OwnedSpillResult`]). One cell may serve
+    /// several consumers and spills only what `id` charges.
     ///
     /// Never reserves memory, never blocks on another thread and never
     /// touches the walk reclaim set; blocks only on its own spill I/O.
@@ -611,7 +611,22 @@ pub(crate) trait WalkOwnedSpill {
         &mut self,
         id: ConsumerId,
         arbitrator: &MemoryArbitrator,
-    ) -> Result<bool, PipelineError>;
+    ) -> Result<OwnedSpillResult, PipelineError>;
+}
+
+/// What one walk-owned cell's spill did for the consumer a pass elected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnedSpillResult {
+    /// It wrote state it holds for the consumer to disk, releasing that
+    /// state's charge.
+    Wrote,
+    /// It holds state for the consumer but had nothing it could write now:
+    /// every part of it is already on disk, taken out for use, or shared
+    /// with a reader that keeps it resident.
+    NothingToWrite,
+    /// It holds no state for the consumer: the state left the owner before
+    /// its registration dropped, or the cell never held any for it.
+    NotHeld,
 }
 
 /// Keeps a walk-owned cell entered in the walk reclaim set, under the
@@ -1336,12 +1351,12 @@ pub(crate) mod walk_test_support {
             &mut self,
             id: ConsumerId,
             _arbitrator: &MemoryArbitrator,
-        ) -> Result<bool, PipelineError> {
+        ) -> Result<OwnedSpillResult, PipelineError> {
             if id != self.consumer {
-                return Ok(false);
+                return Ok(OwnedSpillResult::NotHeld);
             }
             self.spill();
-            Ok(true)
+            Ok(OwnedSpillResult::Wrote)
         }
     }
 
@@ -1567,6 +1582,90 @@ mod walk_owned_tests {
             assert_eq!(spill_victim(&arbitrator, id), VictimOutcome::NotOwned);
             assert!(cell.borrow().is_resident(), "nothing reached the state");
             arbitrator.unregister_consumer(id);
+        });
+    }
+
+    /// A stand-in owner whose spill does nothing but report `result` for
+    /// its consumer, counting how often it was asked.
+    struct ReportingOwner {
+        consumer: ConsumerId,
+        result: OwnedSpillResult,
+        asked: usize,
+    }
+
+    impl WalkOwnedSpill for ReportingOwner {
+        fn spill_owned(
+            &mut self,
+            id: ConsumerId,
+            _arbitrator: &MemoryArbitrator,
+        ) -> Result<OwnedSpillResult, PipelineError> {
+            self.asked += 1;
+            Ok(if id == self.consumer {
+                self.result
+            } else {
+                OwnedSpillResult::NotHeld
+            })
+        }
+    }
+
+    /// A pass counts an owned victim spilled only when one of its cells
+    /// wrote. A cell that holds state for the consumer but wrote nothing is
+    /// `Busy`, with the consumer's spill request raised; a cell that wrote
+    /// is `Spilled`, also beside one that wrote nothing; a cell that holds no
+    /// state is `NotOwned`, and its entry is pruned.
+    #[test]
+    fn an_owned_victim_that_writes_nothing_is_busy() {
+        use OwnedSpillResult::{NotHeld, NothingToWrite, Wrote};
+        let arbitrator = arbitrator();
+        with_test_walk_frame(&arbitrator, || {
+            for (results, expected) in [
+                (vec![NothingToWrite], VictimOutcome::Busy),
+                (vec![Wrote], VictimOutcome::Spilled),
+                (vec![NothingToWrite, Wrote], VictimOutcome::Spilled),
+                (vec![NotHeld], VictimOutcome::NotOwned),
+            ] {
+                let (id, handle) = sort_consumer(&arbitrator);
+                let owners: Vec<_> = results
+                    .iter()
+                    .map(|&result| {
+                        let cell = Rc::new(RefCell::new(ReportingOwner {
+                            consumer: id,
+                            result,
+                            asked: 0,
+                        }));
+                        let registration = register_walk_owned(&arbitrator, id, &handle, &cell)
+                            .expect("registered");
+                        (cell, registration)
+                    })
+                    .collect();
+
+                assert_eq!(
+                    spill_victim(&arbitrator, id),
+                    expected,
+                    "cells reporting {results:?}"
+                );
+                for (cell, _) in &owners {
+                    assert_eq!(cell.borrow().asked, 1, "every free cell is asked once");
+                }
+                if expected == VictimOutcome::Busy {
+                    assert!(
+                        handle.take_spill_request(),
+                        "a cell that wrote nothing has its spill request raised"
+                    );
+                }
+                let entries = if expected == VictimOutcome::NotOwned {
+                    0
+                } else {
+                    results.len()
+                };
+                assert_eq!(
+                    owned_cells(&arbitrator, id),
+                    entries,
+                    "only a victim that holds no state loses its entries"
+                );
+                drop(owners);
+                arbitrator.unregister_consumer(id);
+            }
         });
     }
 

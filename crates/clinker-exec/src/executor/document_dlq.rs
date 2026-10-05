@@ -75,7 +75,9 @@ use crate::executor::sink_dispatch::OrderedWriterBoundary;
 use crate::executor::stream_event::{SourceRowId, StreamEvent};
 use crate::executor::structured_output_guard::StructuredOutputDocumentGuard;
 use crate::executor::{DlqEntry, DlqFailureStamp, build_format_writer};
-use crate::pipeline::memory::walk::{WalkOwnedRegistration, WalkOwnedSpill, register_walk_owned};
+use crate::pipeline::memory::walk::{
+    OwnedSpillResult, WalkOwnedRegistration, WalkOwnedSpill, register_walk_owned,
+};
 use crate::pipeline::memory::{
     ConsumerHandle, ConsumerId, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
 };
@@ -774,16 +776,23 @@ impl WalkOwnedSpill for DocumentDlqState {
     /// state is itself the requester admitting a row; a pass then finds it
     /// busy, and the requester flushes its own tails if its request falls
     /// short.
+    ///
+    /// It wrote when the flush released resident bytes. With no held tail
+    /// resident it wrote nothing, though it still holds the state's exact
+    /// index and ledgers for the consumer.
     fn spill_owned(
         &mut self,
         id: ConsumerId,
         arbitrator: &MemoryArbitrator,
-    ) -> Result<bool, PipelineError> {
+    ) -> Result<OwnedSpillResult, PipelineError> {
         if id != self.consumer_id {
-            return Ok(false);
+            return Ok(OwnedSpillResult::NotHeld);
         }
-        self.spill_held_rows(arbitrator)?;
-        Ok(true)
+        Ok(if self.spill_held_rows(arbitrator)? > 0 {
+            OwnedSpillResult::Wrote
+        } else {
+            OwnedSpillResult::NothingToWrite
+        })
     }
 }
 
@@ -1546,7 +1555,8 @@ impl DocumentBuckets {
     }
 
     /// Spill the bucket whose consumer is `id`, because a reclaim pass
-    /// elected it. Returns `false` when no bucket here has that consumer.
+    /// elected it. Returns the bytes its charge fell by, or `None` when no
+    /// bucket here has that consumer.
     ///
     /// # Errors
     ///
@@ -1555,14 +1565,15 @@ impl DocumentBuckets {
         &mut self,
         id: ConsumerId,
         arbitrator: &MemoryArbitrator,
-    ) -> Result<bool, PipelineError> {
+    ) -> Result<Option<u64>, PipelineError> {
         let Some(bucket) = self
             .buckets
             .values_mut()
             .find(|bucket| bucket.consumer_id == id)
         else {
-            return Ok(false);
+            return Ok(None);
         };
+        let before = bucket.handle.bytes();
         spill_resident_bucket(
             bucket,
             arbitrator,
@@ -1571,7 +1582,7 @@ impl DocumentBuckets {
             self.spill_compress,
             self.batch_size,
         )?;
-        Ok(true)
+        Ok(Some(before.saturating_sub(bucket.handle.bytes())))
     }
 
     /// Take bucket `key` out for its decision. Its entry in the walk reclaim
@@ -1586,13 +1597,18 @@ impl DocumentBuckets {
 impl WalkOwnedSpill for DocumentBuckets {
     /// A pass that elects a bucket's consumer spills that bucket
     /// ([`DocumentBuckets::spill_consumer`]); an id whose bucket has left
-    /// this cell is not held here.
+    /// this cell is not held here. It wrote when the bucket's charge fell; a
+    /// bucket with nothing resident wrote nothing.
     fn spill_owned(
         &mut self,
         id: ConsumerId,
         arbitrator: &MemoryArbitrator,
-    ) -> Result<bool, PipelineError> {
-        self.spill_consumer(id, arbitrator)
+    ) -> Result<OwnedSpillResult, PipelineError> {
+        Ok(match self.spill_consumer(id, arbitrator)? {
+            None => OwnedSpillResult::NotHeld,
+            Some(0) => OwnedSpillResult::NothingToWrite,
+            Some(_) => OwnedSpillResult::Wrote,
+        })
     }
 }
 
