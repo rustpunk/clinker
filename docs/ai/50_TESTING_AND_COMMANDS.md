@@ -424,6 +424,7 @@ cargo test -p clinker --test output_containment --locked --offline
 cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- workflow verify
 cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- boundary audit --scope rust-only --root .
 cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- filesystem self-test
+cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- ci change-scope --event pull_request
 ```
 
 Status: **Verified.** The Rust-only audit checks the real repository as well as
@@ -875,6 +876,19 @@ the CLI (`cargo build --locked -p clinker`) and runs each
 (`.github/workflows/ci.yml`, "Smoke-check example pipelines" step). If a change
 touches example pipelines, plan/config validation, or CLI explain behavior,
 run that smoke pass locally before pushing.
+
+A pull request or push that changes only files under `docs/` takes a shorter
+path. The `changes` job runs `ci change-scope` from `tools/release-policy`; when
+it reports `docs_only=true`, CI skips `test-windows`, `cross-platform`,
+`deny`, `Build portability`, the macOS test suite, and the `check` job's
+clippy, example-smoke, scenario, and bench steps. It still runs
+`cargo test --workspace` on Linux, the AI documentation checks on Linux and
+macOS, both policy jobs, and the filesystem matrix, because tests and both
+policy tools read files under `docs/`. Any other path, including root Markdown
+files and `examples/`, runs the full workflow, as does a manual dispatch or any
+case the classifier cannot establish. The workflow trust gate pins the guard
+expressions and which jobs may skip. A documentation change that only Windows or
+macOS would reject is therefore caught by the next full run, not its own.
 
 Status: **Inferred from CI for the exact online forms.** Locked/offline variants of all Rust compile/test/bench commands above were verified where practical; `cargo deny check` was verified outside the filesystem sandbox.
 
