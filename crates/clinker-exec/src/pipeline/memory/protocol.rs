@@ -1,5 +1,6 @@
 //! The memory ledger's synchronized core: the charged total and its peak, the
 //! bytes charged in each consumer's name with their high-water mark, the
+//! rows a Source read that are still charged after it finished reading, the
 //! release epoch, the progress of a reclaim pass in flight, and the disk and
 //! descriptor counts that share its lock.
 //!
@@ -90,12 +91,14 @@ pub(crate) trait AdmissionGate<L> {
 
 impl<L> AdmissionGate<L> for () {}
 
-/// What a consumer leaving the ledger was.
+/// What a consumer leaving the ledger was, which decides what becomes of the
+/// bytes still granted in its name.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Departure {
-    /// A Source: the bytes granted in its name are the rows it read.
+    /// A Source: the bytes granted in its name are the rows it read, and they
+    /// stay identifiable as a finished Source's until the last of them drops.
     Source,
-    /// Any other consumer.
+    /// Any other consumer: its live grants become memory no consumer holds.
     Other,
 }
 
@@ -104,12 +107,19 @@ pub(crate) enum Departure {
 /// `handle` is what the consumer's own handle has charged and `attributed`
 /// what grants made for it hold now; `mark` is the largest their sum has
 /// reached. An entry is created by the first charge to its id and removed
-/// only when its consumer unregisters.
+/// when its consumer unregisters, with one exception: a Source that
+/// unregisters while grants in its name are live leaves its entry behind,
+/// unlabelled and marked `retired_source`, holding only those grants' bytes
+/// (the rows it read, still alive downstream). Such an entry is never a
+/// holder and every per-consumer reading treats it as absent; it is dropped
+/// when its bytes reach 0. Nothing is re-charged: the bytes stay where they
+/// were charged, only identifiable.
 struct ConsumerEntry<L> {
     handle: u64,
     attributed: u64,
     mark: u64,
     label: Option<L>,
+    retired_source: bool,
 }
 
 impl<L> ConsumerEntry<L> {
@@ -119,6 +129,7 @@ impl<L> ConsumerEntry<L> {
             attributed: 0,
             mark: 0,
             label: None,
+            retired_source: false,
         }
     }
 
@@ -129,6 +140,16 @@ impl<L> ConsumerEntry<L> {
     fn raise_mark(&mut self) {
         self.mark = self.mark.max(self.current());
     }
+}
+
+/// Consumer `id`'s entry in `consumers`, or `None` when it has none or its
+/// entry is a finished Source's. Behind [`LedgerState::live`]; the admission
+/// gate calls it directly so the lookup borrows only the entries.
+fn live_entry<L>(
+    consumers: &BTreeMap<u32, ConsumerEntry<L>>,
+    id: u32,
+) -> Option<&ConsumerEntry<L>> {
+    consumers.get(&id).filter(|entry| !entry.retired_source)
 }
 
 /// What the ledger records about a reclaim pass while the walk runs one.
@@ -228,6 +249,9 @@ impl<L, A> LedgerState<L, A> {
     /// the peak and, when attributed, the consumer's attributed bytes and
     /// mark.
     ///
+    /// A charge attributed to a Source that has finished reading while its
+    /// rows are still charged adds to those rows: the entry stays a finished
+    /// Source's, never a holder, and is still dropped when its bytes reach 0.
     /// A charge attributed to a consumer the ledger holds no entry for (one
     /// already unregistered, reached through a later lease from its view or
     /// a grant's growth) creates an unlabelled entry for it, which nothing
@@ -261,13 +285,25 @@ impl<L, A> LedgerState<L, A> {
         A: AdmissionGate<L>,
     {
         self.admit(bytes, Some(id))?;
+        let entry = self.handle_entry(id);
+        entry.handle = entry.handle.saturating_add(bytes);
+        entry.raise_mark();
+        Ok(())
+    }
+
+    /// Consumer `id`'s entry for a charge to its handle, created empty when
+    /// absent. A finished Source's entry is never reached: its handle was
+    /// unbound when it unregistered, and consumer ids are never reused.
+    fn handle_entry(&mut self, id: u32) -> &mut ConsumerEntry<L> {
         let entry = self
             .consumers
             .entry(id)
             .or_insert_with(ConsumerEntry::empty);
-        entry.handle = entry.handle.saturating_add(bytes);
-        entry.raise_mark();
-        Ok(())
+        debug_assert!(
+            !entry.retired_source,
+            "a handle charge reached consumer {id}, a Source that has finished reading"
+        );
+        entry
     }
 
     /// The check both charge kinds share: refuse, or add `bytes` to the
@@ -291,7 +327,7 @@ impl<L, A> LedgerState<L, A> {
             });
         }
         if A::CAN_REFUSE
-            && let Some(entry) = requester.and_then(|id| self.consumers.get(&id))
+            && let Some(entry) = requester.and_then(|id| live_entry(&self.consumers, id))
             && let Some(label) = &entry.label
             && self.attachment.force_refusal(label, entry.current())
         {
@@ -329,13 +365,14 @@ impl<L, A> LedgerState<L, A> {
     /// Release `bytes` charged with attribution `attribution`.
     ///
     /// Lowers the charged total and, whenever the attributed consumer has an
-    /// entry, its attributed bytes. That entry may be one a later charge
-    /// recreated after the consumer unregistered (see [`Self::try_charge`]),
-    /// and the release then lowers it too. Only when no entry exists (its
-    /// consumer unregistered while a grant in its name was still live, and
-    /// nothing charged in its name since) are the per-consumer figures
-    /// untouched: those bytes were unattributed from the removal on.
-    /// Advances the release epoch.
+    /// entry, its attributed bytes. That entry may be a finished Source's,
+    /// which the release that takes its bytes to 0 drops: the last row it
+    /// read is gone. It may be one a later charge recreated after the
+    /// consumer unregistered (see [`Self::try_charge`]), and the release then
+    /// lowers it too. Only when no entry exists (its consumer unregistered
+    /// while a grant in its name was still live, and nothing charged in its
+    /// name since) are the per-consumer figures untouched: those bytes were
+    /// unattributed from the removal on. Advances the release epoch.
     pub(crate) fn release(&mut self, bytes: u64, attribution: Option<u32>) {
         if bytes == 0 {
             return;
@@ -346,6 +383,9 @@ impl<L, A> LedgerState<L, A> {
             && let Some(entry) = self.consumers.get_mut(&id)
         {
             entry.attributed = entry.attributed.saturating_sub(bytes);
+            if entry.retired_source && entry.attributed == 0 {
+                self.consumers.remove(&id);
+            }
         }
     }
 
@@ -424,10 +464,7 @@ impl<L, A> LedgerState<L, A> {
         self.charged = self.charged.saturating_add(bytes);
         self.peak_charged = self.peak_charged.max(self.charged);
         self.note_charge(bytes);
-        let entry = self
-            .consumers
-            .entry(id)
-            .or_insert_with(ConsumerEntry::empty);
+        let entry = self.handle_entry(id);
         entry.label = Some(label);
         entry.handle = entry.handle.saturating_add(bytes);
         entry.raise_mark();
@@ -437,10 +474,7 @@ impl<L, A> LedgerState<L, A> {
     /// charge it replaced. A rise raises the peak and the mark; a fall is a
     /// release.
     pub(crate) fn set_handle(&mut self, id: u32, bytes: u64) -> u64 {
-        let entry = self
-            .consumers
-            .entry(id)
-            .or_insert_with(ConsumerEntry::empty);
+        let entry = self.handle_entry(id);
         let previous = entry.handle;
         entry.handle = bytes;
         entry.raise_mark();
@@ -469,10 +503,7 @@ impl<L, A> LedgerState<L, A> {
             .handle_bytes(from)
             .saturating_add(self.handle_bytes(to));
         for (id, bytes) in [(from, from_bytes), (to, to_bytes)] {
-            let entry = self
-                .consumers
-                .entry(id)
-                .or_insert_with(ConsumerEntry::empty);
+            let entry = self.handle_entry(id);
             entry.handle = bytes;
             entry.raise_mark();
         }
@@ -486,51 +517,76 @@ impl<L, A> LedgerState<L, A> {
         }
     }
 
+    /// Consumer `id`'s entry, or `None` when it has none or its entry is a
+    /// finished Source's. The one lookup every per-consumer reading goes
+    /// through, so a Source that has finished reading reads as absent
+    /// everywhere, exactly as a consumer whose entry was removed.
+    fn live(&self, id: u32) -> Option<&ConsumerEntry<L>> {
+        live_entry(&self.consumers, id)
+    }
+
     /// Consumer `id`'s handle charge now.
     pub(crate) fn handle_bytes(&self, id: u32) -> u64 {
-        self.consumers.get(&id).map_or(0, |entry| entry.handle)
+        self.live(id).map_or(0, |entry| entry.handle)
     }
 
     /// Consumer `id`'s own charge now: its handle's bytes plus the bytes
     /// granted in its name.
     pub(crate) fn consumer_charged(&self, id: u32) -> u64 {
-        self.consumers.get(&id).map_or(0, ConsumerEntry::current)
+        self.live(id).map_or(0, ConsumerEntry::current)
     }
 
     /// Remove consumer `id`'s entry, releasing its remaining handle charge,
-    /// and return its mark. Bytes still granted in its name stay charged and
-    /// are unattributed from here on. `departure` says what the consumer
-    /// was.
+    /// and return its mark; `None` when it has no entry, or its entry is
+    /// already a finished Source's.
+    ///
+    /// Bytes still granted in its name stay charged. For a Source
+    /// (`departure` is [`Departure::Source`]) they are the rows it read,
+    /// still alive downstream: its entry stays, unlabelled and marked as a
+    /// finished Source's, until the last of them drops (see
+    /// [`Self::release`]), so they stay identifiable inside the remainder
+    /// [`Self::holders`] reports. For any other consumer the entry goes and
+    /// those bytes are unattributed from here on. Either way nothing is
+    /// re-charged and every per-consumer reading treats the consumer as
+    /// absent.
     pub(crate) fn remove_consumer(&mut self, id: u32, departure: Departure) -> Option<u64> {
-        let _ = departure;
-        let entry = self.consumers.remove(&id)?;
+        self.live(id)?;
+        let mut entry = self.consumers.remove(&id)?;
         if entry.handle > 0 {
             self.discharge(entry.handle);
         }
-        Some(entry.mark)
+        let mark = entry.mark;
+        if departure == Departure::Source && entry.attributed > 0 {
+            entry.handle = 0;
+            entry.label = None;
+            entry.retired_source = true;
+            self.consumers.insert(id, entry);
+        }
+        Some(mark)
     }
 
     /// The label consumer `id` was recorded under, or `None` when the ledger
     /// holds no labelled entry for it.
     pub(crate) fn label(&self, id: u32) -> Option<&L> {
-        self.consumers
-            .get(&id)
-            .and_then(|entry| entry.label.as_ref())
+        self.live(id).and_then(|entry| entry.label.as_ref())
     }
 
     /// `id`'s high-water mark of handle plus attributed bytes, or `None`
-    /// when the ledger holds no entry for it.
+    /// when the ledger holds no entry for it (a finished Source's counts as
+    /// none).
     pub(crate) fn consumer_mark(&self, id: u32) -> Option<u64> {
-        self.consumers.get(&id).map(|entry| entry.mark)
+        self.live(id).map(|entry| entry.mark)
     }
 
     /// Every labelled consumer holding bytes now, with its current handle
-    /// plus attributed bytes, largest first (ties by id); and the charged
-    /// bytes none of them holds.
+    /// plus attributed bytes, largest first (ties by id); the charged bytes
+    /// none of them holds; and the part of those that rows Sources read still
+    /// hold after the Sources finished reading.
     ///
     /// The remainder is what grants made in no consumer's name hold, plus
-    /// what consumers without a label hold, so the holders' figures and the
-    /// remainder add up to the charged total.
+    /// what consumers without a label hold (a finished Source's rows among
+    /// them), so the holders' figures and the remainder add up to the charged
+    /// total. The finished Sources' figure is always inside the remainder.
     pub(crate) fn holders(&self) -> (Vec<(u32, &L, u64)>, u64, u64) {
         let mut holders: Vec<(u32, &L, u64)> = self
             .consumers
@@ -547,6 +603,16 @@ impl<L, A> LedgerState<L, A> {
         let held = holders
             .iter()
             .fold(0u64, |sum, holder| sum.saturating_add(holder.2));
-        (holders, self.charged.saturating_sub(held), 0)
+        let remainder = self.charged.saturating_sub(held);
+        let retired_source = self
+            .consumers
+            .values()
+            .filter(|entry| entry.retired_source)
+            .fold(0u64, |sum, entry| sum.saturating_add(entry.current()));
+        debug_assert!(
+            retired_source <= remainder,
+            "a finished Source's {retired_source} bytes exceed the {remainder} no holder holds"
+        );
+        (holders, remainder, retired_source)
     }
 }

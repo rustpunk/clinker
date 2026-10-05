@@ -762,6 +762,11 @@ impl ConsumerHandle {
     /// End consumer `id`'s binding: release the handle's remaining charge,
     /// remove the consumer's ledger entry, and keep its final mark as the
     /// handle's own. A no-op when the handle is not bound for `id`.
+    ///
+    /// `departure` says whether the consumer was a Source. A Source's bytes
+    /// still granted in its name are the rows it read: they stay
+    /// identifiable as a finished Source's until their grants release them,
+    /// and are never re-charged.
     fn unbind(&self, id: ConsumerId, departure: protocol::Departure) {
         let mut binding = self.binding();
         if binding.as_ref().is_none_or(|binding| binding.id != id) {
@@ -2049,7 +2054,14 @@ impl MemoryArbitrator {
     /// handle's remaining charge is released (advancing the ledger's release
     /// epoch when nonzero), its ledger entry is removed and its handle keeps
     /// the final mark. Bytes still granted in its name stay charged until
-    /// their grants release them.
+    /// their grants release them. When the consumer is a Source (it can be
+    /// paused, [`MemoryConsumer::can_back_pressure`], read once here) those
+    /// bytes are the rows it read: they stay identifiable as a finished
+    /// Source's until the last of them drops, so a memory report never counts
+    /// them as state that cannot spill. A Source must therefore unregister
+    /// here while the handle it registered with is still bound to the ledger,
+    /// since only that path marks its entry. Lock order is unchanged: the
+    /// owner map, then the ledger.
     ///
     /// Clones the snapshot minus the removed entry and swaps it in.
     /// The `id` lookup is a linear scan, acceptable because the

@@ -290,7 +290,13 @@ fn build_report(
             }
         };
 
-    let mut unspillable_bytes = snapshot.unattributed;
+    // Memory no node holds counts as state that cannot spill, except the rows
+    // a Source read that are still charged after it finished reading: the
+    // same rule as for a listed Source, decided by the one predicate,
+    // `can_back_pressure`, recorded once when the Source unregistered.
+    let mut unspillable_bytes = snapshot
+        .unattributed
+        .saturating_sub(snapshot.retired_source);
     let mut holders = Vec::with_capacity(snapshot.holders.len());
     for holder in &snapshot.holders {
         let registered = consumer(holder.consumer).map(|consumer| consumer.as_ref());
@@ -892,10 +898,12 @@ impl MemoryArbitrator {
 
     /// High-water mark of `id`'s handle bytes plus the bytes granted in its
     /// name, raised by every charge to it and never lowered by a release.
-    /// `None` when the ledger holds no entry for `id`. A charge in the name of
-    /// a consumer that has already unregistered recreates an unlabelled entry
-    /// for it, and this then returns that entry's partial mark rather than
-    /// `None`; only tests read the figure today.
+    /// `None` when the ledger holds no entry for `id`, as after any
+    /// unregistration, a Source's included even while the rows it read stay
+    /// charged. A charge in the name of a consumer that has already
+    /// unregistered (for a Source, once its rows have all dropped) recreates
+    /// an unlabelled entry for it, and this then returns that entry's partial
+    /// mark rather than `None`; only tests read the figure today.
     pub fn consumer_peak_charged_bytes(&self, id: ConsumerId) -> Option<u64> {
         self.admission.ledger.lock().consumer_mark(id.0)
     }

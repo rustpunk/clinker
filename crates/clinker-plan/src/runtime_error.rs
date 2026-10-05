@@ -294,14 +294,16 @@ pub struct MemoryShortfallReport {
     /// Bytes the holders beyond `holders` hold together.
     pub other_holders_bytes: u64,
     /// Charged bytes no single node holds: memory the run holds as a whole,
-    /// such as output staging.
+    /// such as output staging, and rows a Source that has finished reading
+    /// still has charged while later steps hold them.
     pub unattributed_bytes: u64,
     /// Charged bytes no spill the engine could make would free when the
     /// request was made: what the holders listed as
     /// [`HolderState::CannotSpill`] hold (listed by name or not), plus
-    /// `unattributed_bytes`. A Source's bytes are never counted: they are the
-    /// rows it has read, which spilling the steps that hold them, or a higher
-    /// limit, relieves.
+    /// `unattributed_bytes` less the rows a Source that has finished reading
+    /// still has charged. A Source's bytes are never counted, while it reads
+    /// or after it has finished: they are the rows it has read, which
+    /// spilling the steps that hold them, or a higher limit, relieves.
     pub unspillable_bytes: u64,
     /// What the reclaim round did before the refusal; `None` when the request
     /// was refused without one: a request made where the run's state cannot
