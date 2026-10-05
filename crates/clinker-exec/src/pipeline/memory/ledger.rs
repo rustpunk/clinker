@@ -208,15 +208,19 @@ impl Shortfall {
     /// borrows cannot change in between.
     ///
     /// Holder states, first match wins: the request's own consumer is
-    /// [`HolderState::Requester`]; a paused Source is
-    /// [`HolderState::PausedSource`]; a holder no spill can free (it reports
-    /// nothing reclaimable, can only be paused, or is no longer registered)
-    /// is [`HolderState::CannotSpill`]; a spillable holder the round asked
-    /// to spill and did not find in use is [`HolderState::AtFloor`] (it
-    /// spilled what it could); any other spillable holder is
-    /// [`HolderState::InUse`]: the round found it in use, could not reach it,
-    /// or did not run at all (the thread that asked cannot spill the walk's
-    /// state).
+    /// [`HolderState::Requester`]; a Source (a consumer that can be paused)
+    /// is [`HolderState::PausedSource`] when paused and
+    /// [`HolderState::ActiveSource`] otherwise, and its bytes never count as
+    /// state that cannot spill; a holder the engine had no way to spill for
+    /// the request (it reports nothing reclaimable, or is no longer
+    /// registered) is [`HolderState::CannotSpill`], and only those holders'
+    /// bytes, with the memory no single node holds, count as state that
+    /// cannot spill; a
+    /// spillable holder the round asked to spill and did not find in use is
+    /// [`HolderState::AtFloor`] (it spilled what it could); any other
+    /// spillable holder is [`HolderState::InUse`]: the round found it in use,
+    /// could not reach it, or did not run at all (the thread that asked cannot
+    /// spill the walk's state).
     pub fn into_report(self, arbitrator: &MemoryArbitrator) -> Box<MemoryShortfallReport> {
         let mut snapshot = self.snapshot;
         let requester = snapshot.requester_label.take().map(|label| *label);
@@ -267,23 +271,36 @@ fn build_report(
         None => requester.as_ref() == Some(&holder.label),
     };
 
+    // Whether the engine had no way to spill this holder's memory for the
+    // request: it is no longer registered, or a spill would free nothing from
+    // it now. This one answer decides both the holder's state and whether its
+    // bytes count as state that cannot spill, so the two never disagree. A
+    // Source is never such a holder: its bytes are the rows it has read, which
+    // spilling the steps that hold them, or a higher limit, relieves.
+    let no_spill_could_free = |registered: Option<&dyn MemoryConsumer>| match registered {
+        None => true,
+        Some(consumer) if consumer.can_back_pressure() => false,
+        Some(consumer) => consumer.reclaimable_bytes() == 0,
+    };
+
     let mut unspillable_bytes = snapshot.unattributed;
     let mut holders = Vec::with_capacity(snapshot.holders.len());
     for holder in &snapshot.holders {
-        let registered = consumer(holder.consumer);
-        let spillable = registered.is_some_and(|consumer| {
-            !consumer.can_back_pressure() && consumer.reclaimable_bytes() > 0
-        });
-        if !spillable {
+        let registered = consumer(holder.consumer).map(|consumer| consumer.as_ref());
+        let cannot_spill = no_spill_could_free(registered);
+        if cannot_spill {
             unspillable_bytes = unspillable_bytes.saturating_add(holder.charged);
         }
+        let source = registered.filter(|consumer| consumer.can_back_pressure());
         let state = if is_requester(holder) {
             HolderState::Requester
-        } else if registered
-            .is_some_and(|consumer| consumer.can_back_pressure() && consumer.is_paused())
-        {
-            HolderState::PausedSource
-        } else if !spillable {
+        } else if let Some(source) = source {
+            if source.is_paused() {
+                HolderState::PausedSource
+            } else {
+                HolderState::ActiveSource
+            }
+        } else if cannot_spill {
             HolderState::CannotSpill
         } else if spilled_what_it_could(holder.consumer) {
             HolderState::AtFloor

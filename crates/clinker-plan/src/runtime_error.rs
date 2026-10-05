@@ -249,7 +249,7 @@ pub struct ConsumerLabel {
 /// then the charged total, the largest holders, what the reclaim round did, the
 /// smallest limit with room for the request (in both the YAML and the CLI
 /// spelling when `memory.limit` was the limit enforced), and a remedy keyed
-/// to the largest holder that cannot spill.
+/// to the largest holder that cannot spill, never a Source.
 /// When [`LimitReading::ProcessMemory`] was the reading over the limit, the
 /// headline and the limit line state the process reading instead of a
 /// request, and nothing claims the charged state fills the limit.
@@ -292,8 +292,12 @@ pub struct MemoryShortfallReport {
     /// Charged bytes no single node holds: memory the run holds as a whole,
     /// such as output staging.
     pub unattributed_bytes: u64,
-    /// Charged bytes no spill could free: what the holders that cannot spill
-    /// hold (listed or not), plus `unattributed_bytes`.
+    /// Charged bytes no spill the engine could make would free when the
+    /// request was made: what the holders listed as
+    /// [`HolderState::CannotSpill`] hold (listed by name or not), plus
+    /// `unattributed_bytes`. A Source's bytes are never counted: they are the
+    /// rows it has read, which spilling the steps that hold them, or a higher
+    /// limit, relieves.
     pub unspillable_bytes: u64,
     /// What the reclaim round did before the refusal; `None` when the request
     /// was refused without one: a request made where the run's state cannot
@@ -413,7 +417,10 @@ pub struct HolderReport {
 /// request was refused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum HolderState {
-    /// Its memory cannot be written to disk.
+    /// The engine had no way to spill its memory when the request was made.
+    /// Some state never spills; other state cannot be spilled at some points
+    /// in the run, such as an Aggregate's group state while it produces its
+    /// results.
     CannotSpill,
     /// It spilled what it could and holds the least it can work with.
     AtFloor,
@@ -689,14 +696,18 @@ impl std::fmt::Display for MemoryShortfallReport {
                     fix_section(&requester.surface).map(|section| (requester, section))
                 });
         let alone_too_large = self.requested_bytes > self.limit.bytes();
+        // A Source is never the remedy, whatever state it is listed in: the
+        // rows it has read are relieved by spilling the steps that hold them
+        // or by the limit, which the fix line already gives.
         let holder_remedy = if alone_too_large && requester_remedy.is_some() {
             None
         } else {
             self.holders.iter().find(|holder| {
-                matches!(
-                    holder.state,
-                    HolderState::CannotSpill | HolderState::AtFloor
-                )
+                holder.surface != MemorySurface::RowsRead
+                    && matches!(
+                        holder.state,
+                        HolderState::CannotSpill | HolderState::AtFloor
+                    )
             })
         };
         if let Some(holder) = holder_remedy {
@@ -707,7 +718,7 @@ impl std::fmt::Display for MemoryShortfallReport {
                 holder.surface,
                 Bytes(holder.bytes),
                 if holder.state == HolderState::CannotSpill {
-                    "cannot be spilled"
+                    "could not be spilled"
                 } else {
                     "could not be spilled further"
                 }
@@ -731,7 +742,8 @@ impl std::fmt::Display for MemoryShortfallReport {
             && self.unspillable_bytes >= self.charged_bytes
         {
             f.write_str(
-                "\n  spilling cannot help: the state that fills the limit cannot be written to disk",
+                "\n  spilling cannot help: the state that fills the limit could not be spilled when \
+                 the request was made",
             )?;
         }
         f.write_str("\n  See: clinker explain --code E310")
@@ -924,7 +936,7 @@ mod tests {
              \n    pipeline:\
              \n      memory: { limit: \"12M\" }\
              \n    or: --memory-limit 12M\
-             \n  remedy: \"enrich\"'s join build side holds 3.0 MiB and cannot be spilled; see \
+             \n  remedy: \"enrich\"'s join build side holds 3.0 MiB and could not be spilled; see \
              \"Join build side\" in clinker explain --code E310\
              \n  See: clinker explain --code E310"
         );

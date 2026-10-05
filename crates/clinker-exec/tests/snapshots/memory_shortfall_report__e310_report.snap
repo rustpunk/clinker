@@ -17,5 +17,5 @@ E310 "totals": needed 2.0 MiB more for group state, but only 704.0 KiB of memory
     pipeline:
       memory: { limit: "10M" }
     or: --memory-limit 10M
-  remedy: "enrich"'s join build side holds 3.5 MiB and cannot be spilled; see "Join build side" in clinker explain --code E310
+  remedy: "enrich"'s join build side holds 3.5 MiB and could not be spilled; see "Join build side" in clinker explain --code E310
   See: clinker explain --code E310

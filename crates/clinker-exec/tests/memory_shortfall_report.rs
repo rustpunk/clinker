@@ -454,13 +454,14 @@ fn oversized_request_says_spilling_cannot_help() {
     );
     assert!(
         text.contains(
-            "\n  spilling cannot help: the state that fills the limit cannot be written to disk"
+            "\n  spilling cannot help: the state that fills the limit could not be spilled when \
+             the request was made"
         ),
         "every holder is unspillable:\n{text}"
     );
     assert!(
         text.contains(
-            "\n  remedy: \"enrich\"'s join build side holds 3.0 MiB and cannot be spilled; \
+            "\n  remedy: \"enrich\"'s join build side holds 3.0 MiB and could not be spilled; \
              see \"Join build side\" in clinker explain --code E310"
         ),
         "{text}"
