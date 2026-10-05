@@ -833,7 +833,11 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
 ### 68. A relaxed Aggregate keeps a condemned group's clean rows that a Sink on the same input dead-letters
 
 - Filed: 2026-10-04.
-- Status: Open.
+- Status: Decided 2026-10-05, not yet implemented. One verdict, one survivor
+  set: when a group is condemned, every relaxed Aggregate and window drops all
+  of its rows, matching the Sink. Tracked in
+  [#1390](https://github.com/rustpunk/clinker/issues/1390); the related sibling-Aggregate retraction is
+  [#1391](https://github.com/rustpunk/clinker/issues/1391).
 - Priority: Medium.
 - Evidence: An `orders` Source with `correlation_key: order_id` feeds a
   validating Transform, which feeds both a Sink and an Aggregate with
