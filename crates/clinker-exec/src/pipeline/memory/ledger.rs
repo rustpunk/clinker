@@ -212,15 +212,15 @@ impl Shortfall {
     /// is [`HolderState::PausedSource`] when paused and
     /// [`HolderState::ActiveSource`] otherwise, and its bytes never count as
     /// state that cannot spill; a holder the engine had no way to spill for
-    /// the request (it reports nothing reclaimable, or is no longer
-    /// registered) is [`HolderState::CannotSpill`], and only those holders'
-    /// bytes, with the memory no single node holds, count as state that
-    /// cannot spill; a
+    /// the request (it reports nothing reclaimable, is no longer registered,
+    /// or the round elected it and found the walk does not own it) is
+    /// [`HolderState::CannotSpill`], and only those holders' bytes, with the
+    /// memory no single node holds, count as state that cannot spill; a
     /// spillable holder the round asked to spill and did not find in use is
     /// [`HolderState::AtFloor`] (it spilled what it could); any other
     /// spillable holder is [`HolderState::InUse`]: the round found it in use,
-    /// could not reach it, or did not run at all (the thread that asked cannot
-    /// spill the walk's state).
+    /// or did not run at all (the thread that asked cannot spill the walk's
+    /// state).
     pub fn into_report(self, arbitrator: &MemoryArbitrator) -> Box<MemoryShortfallReport> {
         let mut snapshot = self.snapshot;
         let requester = snapshot.requester_label.take().map(|label| *label);
@@ -272,22 +272,29 @@ fn build_report(
     };
 
     // Whether the engine had no way to spill this holder's memory for the
-    // request: it is no longer registered, or a spill would free nothing from
-    // it now. This one answer decides both the holder's state and whether its
-    // bytes count as state that cannot spill, so the two never disagree. A
-    // Source is never such a holder: its bytes are the rows it has read, which
-    // spilling the steps that hold them, or a higher limit, relieves.
-    let no_spill_could_free = |registered: Option<&dyn MemoryConsumer>| match registered {
-        None => true,
-        Some(consumer) if consumer.can_back_pressure() => false,
-        Some(consumer) => consumer.reclaimable_bytes() == 0,
-    };
+    // request: it is no longer registered, a spill would free nothing from it
+    // now, or the round elected it and found it out of the walk's reach. This
+    // one answer decides both the holder's state and whether its bytes count
+    // as state that cannot spill, so the two never disagree. A Source is never
+    // such a holder: its bytes are the rows it has read, which spilling the
+    // steps that hold them, or a higher limit, relieves.
+    let no_spill_could_free =
+        |id: ConsumerId, registered: Option<&dyn MemoryConsumer>| match registered {
+            None => true,
+            Some(consumer) if consumer.can_back_pressure() => false,
+            Some(consumer) => {
+                consumer.reclaimable_bytes() == 0
+                    || round
+                        .as_ref()
+                        .is_some_and(|round| round.found_not_owned(id))
+            }
+        };
 
     let mut unspillable_bytes = snapshot.unattributed;
     let mut holders = Vec::with_capacity(snapshot.holders.len());
     for holder in &snapshot.holders {
         let registered = consumer(holder.consumer).map(|consumer| consumer.as_ref());
-        let cannot_spill = no_spill_could_free(registered);
+        let cannot_spill = no_spill_could_free(holder.consumer, registered);
         if cannot_spill {
             unspillable_bytes = unspillable_bytes.saturating_add(holder.charged);
         }
@@ -506,6 +513,10 @@ pub(crate) struct PassOutcome {
     /// spilled and those it found in use. A victim the walk does not own was
     /// never asked and is not here.
     pub(crate) asked: Vec<AskedVictim>,
+    /// The victims the pass elected and found the walk does not own, in the
+    /// order it elected them. Never asked to act, so a report never names
+    /// them as asked; it lists them as unable to spill.
+    pub(crate) not_owned: Vec<ConsumerId>,
 }
 
 /// A victim a reclaim pass asked to spill.
@@ -525,6 +536,10 @@ pub(crate) struct RoundRecord {
     /// Each victim asked in any pass, once, in the order first asked; `busy`
     /// is what the last pass that asked it found.
     asked: Vec<AskedVictim>,
+    /// Each victim the last pass to elect it found the walk does not own,
+    /// once: the round's evidence that no spill it could make would free
+    /// that consumer's bytes.
+    not_owned: Vec<ConsumerId>,
     /// Bytes the round's victims released themselves, over every pass.
     freed: u64,
 }
@@ -533,6 +548,7 @@ impl RoundRecord {
     fn absorb(&mut self, pass: PassOutcome) {
         self.freed = self.freed.saturating_add(pass.freed);
         for victim in pass.asked {
+            self.not_owned.retain(|id| *id != victim.consumer);
             match self
                 .asked
                 .iter_mut()
@@ -542,6 +558,17 @@ impl RoundRecord {
                 None => self.asked.push(victim),
             }
         }
+        for id in pass.not_owned {
+            if !self.not_owned.contains(&id) {
+                self.not_owned.push(id);
+            }
+        }
+    }
+
+    /// Whether the last pass of the round to elect `id` found the walk does
+    /// not own it.
+    fn found_not_owned(&self, id: ConsumerId) -> bool {
+        self.not_owned.contains(&id)
     }
 }
 
@@ -1143,7 +1170,9 @@ impl MemoryArbitrator {
             if spilled == VictimOutcome::Spilled {
                 pass.outcome.victims_spilled += 1;
             }
-            if spilled != VictimOutcome::NotOwned {
+            if spilled == VictimOutcome::NotOwned {
+                pass.outcome.not_owned.push(id);
+            } else {
                 pass.outcome.asked.push(AskedVictim {
                     consumer: id,
                     node,

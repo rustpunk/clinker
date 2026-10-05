@@ -156,7 +156,12 @@ Each victim a pass asks ends in one of three outcomes:
 - **NotOwned.** The walk holds no spillable state for the consumer: a slot
   its compiled classification keeps in memory, state another thread owns,
   or a registered owner that is gone or no longer holds that consumer. It is
-  skipped and never asked to act.
+  skipped and never asked to act. The round keeps it as evidence that no
+  spill the walk could make would free that consumer's bytes: a refused
+  request's E310 lists it as `cannot spill`, counts its bytes as state that
+  cannot spill, and never names it as asked. A report with no round has no
+  such evidence, so a consumer another thread owns still lists as `in use`
+  there.
 
 Spillable state that no pass can reach is a false E310: a request that does
 not fit is refused while megabytes it could have freed stay resident. So
