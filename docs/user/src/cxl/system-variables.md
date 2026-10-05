@@ -29,17 +29,21 @@ $ cxl eval -e 'emit name = $pipeline.name' \
 
 ### Counters
 
-| Variable | Type | Description |
-|----------|------|-------------|
-| `$pipeline.total_count` | Int | Total records processed so far |
-| `$pipeline.ok_count` | Int | Records that passed successfully |
-| `$pipeline.dlq_count` | Int | Records sent to dead-letter queue |
+These members exist, but nothing updates them while a pipeline runs, so each
+one reads `0` in every expression ([#1346](https://github.com/rustpunk/clinker/issues/1346)).
+Do not use them to count progress: a condition such as
+`$pipeline.total_count % 10000 == 0` is true for every record. The run's real
+counts are reported when it ends, on the summary line and in the metrics file;
+see [Where did my rows go?](../ops/row-accounting-explainer.html) and
+[Metrics & Monitoring](../ops/metrics.md).
+
+| Variable | Type | Names the count of |
+|----------|------|--------------------|
+| `$pipeline.total_count` | Int | Records read |
+| `$pipeline.ok_count` | Int | Records that reached an output |
+| `$pipeline.dlq_count` | Int | Records sent to the dead-letter queue |
 | `$pipeline.filtered_count` | Int | Records excluded by `filter` statements |
 | `$pipeline.distinct_count` | Int | Records excluded by `distinct` statements |
-
-```
-trace info if $pipeline.total_count % 10000 == 0 then "processed ".concat($pipeline.total_count.to_string(), " records")
-```
 
 ## $source.* -- Per-record source lineage
 

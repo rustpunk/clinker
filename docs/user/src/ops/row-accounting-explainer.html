@@ -1,0 +1,526 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clinker · Where did my rows go?</title>
+<style>
+:root{
+  --iron:#14110f; --iron2:#1d1915; --iron3:#29231d; --seam:#3a3129;
+  --ash:#b9ab98; --bone:#ece2d0; --dim:#7d705f;
+  --rust:#d0581f; --rust-d:#8f3a13; --brass:#e0a93e; --verd:#4fb0a0;
+  --blood:#e0362c; --steel:#7f97ad; --plum:#b07ac0; --moss:#9bc76b;
+  --disp:"Rajdhani", "Bahnschrift Condensed", "Roboto Condensed", "Arial Narrow", sans-serif;
+  --mono:"Share Tech Mono", "Source Code Pro", Consolas, "Ubuntu Mono", monospace;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--iron);color:var(--bone);font:15px/1.6 var(--mono);
+  background-image:
+   radial-gradient(1100px 560px at 12% -10%, rgba(155,199,107,.10), transparent 60%),
+   radial-gradient(900px 500px at 110% 40%, rgba(224,54,44,.06), transparent 60%),
+   repeating-linear-gradient(0deg, rgba(255,255,255,.012) 0 1px, transparent 1px 4px);}
+a{color:var(--brass)}
+code{font-family:var(--mono);background:var(--iron3);padding:0 .35em;border:1px solid var(--seam);color:var(--brass);font-size:.92em;overflow-wrap:anywhere}
+pre{background:var(--iron);border:1px solid var(--seam);padding:12px 14px;overflow-x:auto;font-size:13px;line-height:1.5;color:var(--ash);max-width:100%;margin:10px 0}
+header.hero{padding:64px 6vw 36px;border-bottom:2px solid var(--seam);position:relative;overflow:hidden}
+header.hero::after{content:"";position:absolute;right:-40px;top:-20px;width:320px;height:360px;
+  background:repeating-linear-gradient(180deg,rgba(155,199,107,.10) 0 2px,transparent 2px 22px);pointer-events:none;
+  clip-path:polygon(20% 0,100% 0,100% 100%,0 100%)}
+.rw-kicker{font:700 12px/1.4 var(--mono);letter-spacing:.24em;text-transform:uppercase;color:var(--moss)}
+.rw-kicker a{color:inherit}
+h1{font:700 clamp(46px,9vw,118px)/.88 var(--disp);margin:14px 0 18px;text-transform:uppercase;letter-spacing:-.01em}
+h1 em{font-style:normal;color:var(--moss)}
+.rw-lede{max-width:780px;color:var(--ash);font-size:16px}
+nav.rw-toc{display:flex;flex-wrap:wrap;margin-top:26px;border:1px solid var(--seam);width:fit-content;max-width:100%}
+nav.rw-toc a{padding:10px 14px;text-decoration:none;color:var(--ash);border-right:1px solid var(--seam);font-size:12px;letter-spacing:.12em;text-transform:uppercase}
+nav.rw-toc a:last-child{border-right:0}
+nav.rw-toc b{color:var(--moss);margin-right:6px}
+@media (hover:hover){nav.rw-toc a:hover{background:var(--moss);color:var(--iron)}}
+section{padding:56px 6vw;border-bottom:1px solid var(--seam)}
+section:nth-of-type(even){background:rgba(0,0,0,.18)}
+.rw-sechead{display:grid;grid-template-columns:110px 1fr;gap:22px;align-items:end;margin-bottom:24px}
+.rw-num{font:700 110px/.8 var(--disp);color:transparent;-webkit-text-stroke:2px #4c6a35}
+h2{font:700 clamp(32px,4.6vw,60px)/.95 var(--disp);text-transform:uppercase;margin:0}
+h2 small{display:block;font:400 14px/1.4 var(--mono);text-transform:none;color:var(--dim);margin-top:10px}
+h3{font:700 22px/1.1 var(--disp);text-transform:uppercase;letter-spacing:.04em;color:var(--moss);margin:0 0 10px}
+p{max-width:820px}
+.rw-cols{display:grid;grid-template-columns:minmax(0,.9fr) minmax(0,1.4fr);gap:32px}
+.rw-cols--cases{grid-template-areas:"pick result" "yaml result";align-items:start}
+.rw-cols--cases>[data-rw-area=pick]{grid-area:pick}
+.rw-cols--cases>[data-rw-area=result]{grid-area:result}
+.rw-cols--cases>[data-rw-area=yaml]{grid-area:yaml}
+.rw-cols>*{min-width:0}
+.rw-panel{background:var(--iron2);border:1px solid var(--seam);padding:20px;min-width:0}
+.rw-callout{border-left:4px solid var(--moss);background:rgba(155,199,107,.07);padding:12px 16px;margin:16px 0;max-width:820px}
+.rw-callout--red{border-color:var(--blood);background:rgba(224,54,44,.07)}
+.rw-aside{font-size:13px;color:var(--ash)}
+
+/* 01: the summary line */
+.rw-term{background:#0c0a09;border:1px solid var(--seam);padding:14px 16px;font-size:14px;line-height:1.9}
+.rw-term .rw-ts{color:var(--dim)}
+.rw-term .rw-lvl{color:var(--moss)}
+.rw-term button{white-space:nowrap;font:inherit;background:transparent;color:var(--bone);border:0;border-bottom:2px dotted var(--brass);padding:0 1px;cursor:pointer}
+.rw-term button[aria-pressed=true]{background:var(--brass);color:var(--iron);border-bottom-color:var(--brass)}
+.rw-decode{margin-top:12px;border:1px solid var(--seam);background:var(--iron2);padding:14px 16px;min-height:120px}
+.rw-decode h4{margin:0 0 6px;font:700 20px/1.1 var(--disp);text-transform:uppercase;color:var(--brass)}
+.rw-decode p{margin:0 0 6px;font-size:14px;color:var(--ash)}
+
+/* 02: cases */
+.rw-cases{display:flex;flex-direction:column;gap:6px;margin:4px 0 14px}
+.rw-cases button{font:13px/1.25 var(--mono);text-align:left;padding:9px 10px;border:1px solid var(--seam);background:var(--iron);color:var(--ash);cursor:pointer}
+.rw-cases button b{color:var(--bone);font-weight:400}
+.rw-cases button[aria-pressed=true]{border-color:var(--moss);background:rgba(155,199,107,.12);color:var(--bone)}
+.rw-ctlrow{display:grid;grid-template-columns:7rem auto;justify-content:start;gap:6px 12px;align-items:center;margin:4px 0 10px}
+.rw-ctlhead{font-size:12px;color:var(--ash)}
+.rw-seg{display:inline-flex;border:2px solid var(--seam);flex-wrap:wrap}
+.rw-seg button{font:700 12px/1 var(--mono);letter-spacing:.03em;padding:9px 10px;border:0;border-right:1px solid var(--seam);background:transparent;color:var(--ash);cursor:pointer}
+.rw-seg button:last-child{border-right:0}
+.rw-seg button[aria-pressed=true]{background:var(--moss);color:var(--iron)}
+.rw-blurb{font-size:14px;color:var(--ash);margin:0 0 10px}
+
+.rw-rows{display:flex;flex-direction:column;gap:6px;margin:10px 0}
+.rw-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.25fr);gap:10px;align-items:start;border:1px solid var(--seam);background:var(--iron);padding:8px 10px;font-size:13px;cursor:pointer;text-align:left;color:var(--bone);font-family:var(--mono);width:100%}
+.rw-row[aria-expanded=true]{border-color:var(--brass)}
+.rw-row .rw-data{overflow-wrap:anywhere}
+.rw-row .rw-data small{display:block;color:var(--dim);font-size:11px;letter-spacing:.08em;text-transform:uppercase}
+.rw-fates{display:flex;flex-wrap:wrap;gap:4px}
+.rw-tag{display:inline-block;font:700 11px/1 var(--mono);letter-spacing:.06em;padding:5px 7px;border:1px solid;text-transform:uppercase;white-space:nowrap}
+.rw-tag--write{color:var(--moss);border-color:var(--moss)}
+.rw-tag--filter{color:var(--steel);border-color:var(--steel)}
+.rw-tag--dup{color:var(--plum);border-color:var(--plum)}
+.rw-tag--dlq{color:var(--blood);border-color:var(--blood)}
+.rw-tag--nulldrop{color:var(--brass);border-color:var(--brass)}
+.rw-tag--silent{color:var(--rust);border-color:var(--rust);border-style:dashed}
+.rw-story[hidden]{display:none}
+.rw-story{display:block;grid-column:1/-1;font-size:13px;color:var(--ash);border-top:1px dashed var(--seam);padding-top:6px;margin:0}
+
+.rw-board{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));border:2px solid var(--seam);margin-top:14px}
+.rw-cell{padding:10px 12px;border-right:1px solid var(--seam);min-width:0}
+.rw-cell:last-child{border-right:0}
+.rw-cell b{display:block;font:700 34px/1 var(--disp);color:var(--bone)}
+.rw-cell span{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim)}
+.rw-hidden{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));border:1px dashed var(--seam);border-top:0}
+.rw-hidden .rw-cell b{font-size:24px;color:var(--ash)}
+.rw-line{font-size:13px;background:#0c0a09;border:1px solid var(--seam);border-top:0;padding:8px 12px;overflow-wrap:anywhere;color:var(--ash)}
+.rw-reck{border:2px solid var(--moss);background:var(--iron);padding:12px 14px;margin-top:12px}
+.rw-reck.rw-off{border-color:var(--rust)}
+.rw-reck h5{margin:0 0 6px;font:700 18px/1.1 var(--disp);letter-spacing:.04em;text-transform:uppercase}
+.rw-reck ul{margin:4px 0 0;padding-left:20px;font-size:13px;color:var(--ash)}
+.rw-reck p{margin:0 0 4px;font-size:13px;color:var(--ash)}
+
+/* 03 / 04 */
+.rw-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));border:2px solid var(--seam)}
+.rw-card{padding:16px 18px;border-right:1px solid var(--seam);border-bottom:1px solid var(--seam);min-width:0}
+.rw-card h4{margin:0 0 6px;font:700 20px/1.05 var(--disp);text-transform:uppercase}
+.rw-card p{font-size:13px;color:var(--ash);margin:0 0 6px}
+.rw-card .rw-fix{color:var(--bone)}
+.rw-wrap{overflow-x:auto;max-width:100%}
+table.rw-where{border-collapse:collapse;font-size:13px;min-width:620px}
+table.rw-where th,table.rw-where td{border:1px solid var(--seam);padding:8px 10px;text-align:left;vertical-align:top}
+table.rw-where th{font:700 13px/1.2 var(--disp);letter-spacing:.08em;text-transform:uppercase;color:var(--moss);background:var(--iron2)}
+table.rw-where td.rw-no{color:var(--dim)}
+footer{padding:36px 6vw;color:var(--dim);font-size:12px}
+
+@media (max-width:980px){.rw-cols{grid-template-columns:1fr}.rw-cols--cases{grid-template-areas:"pick" "result" "yaml"}}
+@media (max-width:720px){
+  .rw-sechead{grid-template-columns:1fr;gap:6px}.rw-num{font-size:64px}
+  h2{font-size:clamp(28px,10vw,36px)}
+  section{padding:44px 5vw}
+  header.hero{padding:44px 5vw 28px}
+  .rw-board{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .rw-board .rw-cell:nth-child(2){border-right:0}
+  .rw-board .rw-cell:nth-child(-n+2){border-bottom:1px solid var(--seam)}
+}
+@media (max-width:720px),(pointer:coarse){
+  .rw-aside,.rw-card p,footer,.rw-ctlhead,.rw-row,.rw-cases button,.rw-reck ul,.rw-reck p,.rw-decode p,.rw-blurb,.rw-story{font-size:14px}
+}
+/* phones: rows stack, every label on its own line, every button group full width */
+@media (max-width:560px){
+  .rw-row{grid-template-columns:1fr}
+  .rw-ctlrow{grid-template-columns:1fr}
+  .rw-ctlrow .rw-seg{display:flex}
+  .rw-ctlrow .rw-seg button{flex:1 1 auto}
+  .rw-term .rw-pre{display:block}
+  .rw-hidden{grid-template-columns:1fr}
+  .rw-hidden .rw-cell{border-right:0;border-bottom:1px dashed var(--seam)}
+  .rw-hidden .rw-cell:last-child{border-bottom:0}
+}
+/* 44px targets on touch screens, and on any narrow screen in case the pointer is misreported */
+@media (pointer:coarse),(max-width:720px){
+  .rw-seg button,.rw-cases button,.rw-row,.rw-term button{min-height:44px}
+  nav.rw-toc a{display:flex;align-items:center;min-height:44px}
+  .rw-kicker a{display:inline-block;line-height:44px}
+}
+@media (prefers-reduced-motion: reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="rw-kicker">Clinker user guide · <a href="metrics.html#metrics-schema">← Metrics &amp; Monitoring</a></div>
+  <h1>Where did<br>my <em>rows go?</em></h1>
+  <p class="rw-lede">Every run ends with one line: how many rows were read, how many made it out, how many copies were written, how many went to the dead-letter file. The numbers often do not add up, and that is not a bug. Pick a pipeline below, see what happened to every row, and see which number each one landed in, or why it is in none.</p>
+  <nav class="rw-toc">
+    <a href="#summary"><b>01</b>The summary line</a>
+    <a href="#cases"><b>02</b>Follow the rows</a>
+    <a href="#silent"><b>03</b>Rows no number shows</a>
+    <a href="#where"><b>04</b>Where each number appears</a>
+  </nav>
+</header>
+
+<!-- ============================ 01 ============================ -->
+<section id="summary">
+  <div class="rw-sechead"><div class="rw-num">01</div><h2>The summary line<small>Tap a number to see what it counts</small></h2></div>
+  <div class="rw-term" data-rw-term>
+    <span class="rw-pre"><span class="rw-ts">2026-10-05T09:14:02.481Z</span> <span class="rw-lvl">INFO</span> <span class="rw-ts">clinker:</span></span> Pipeline complete: <button data-rw-n="total">50 total</button>, <button data-rw-n="ok">45 ok</button>, <button data-rw-n="written">47 written</button>, <button data-rw-n="dlq">1 dlq</button>
+  </div>
+  <div class="rw-decode" data-rw-decode aria-live="polite"></div>
+  <div class="rw-callout">
+    <p style="margin:0">Here 45 ok + 1 dlq = 46, so <b>4 rows are in neither</b>. Nothing on this line says where they went. Section 02 shows the usual answers: a <code>filter</code>, a <code>distinct</code>, an Aggregate folding rows together, a Combine that skipped a row, or a Route branch nothing reads.</p>
+  </div>
+  <p class="rw-aside">The line is a log message, so it appears on the terminal by default (log level <code>info</code>). When <code>--machine</code> or another option uses standard output for data, log lines move to standard error. A run whose output could not be published prints an error instead of this line.</p>
+</section>
+
+<!-- ============================ 02 ============================ -->
+<section id="cases">
+  <div class="rw-sechead"><div class="rw-num">02</div><h2>Follow the rows<small>Ten small pipelines. Tap a row to read its story.</small></h2></div>
+  <div class="rw-cols rw-cols--cases">
+    <div class="rw-panel" data-rw-area="pick">
+      <h3>Pipeline</h3>
+      <div class="rw-cases" data-rw-cases></div>
+      <div data-rw-variant></div>
+    </div>
+    <div class="rw-panel" data-rw-area="yaml">
+      <h3>The YAML</h3>
+      <pre data-rw-yaml style="margin:0"></pre>
+    </div>
+    <div class="rw-panel" data-rw-area="result">
+      <h3>What happened</h3>
+      <p class="rw-blurb" data-rw-blurb></p>
+      <div class="rw-rows" data-rw-rows></div>
+      <div class="rw-board" data-rw-board></div>
+      <div class="rw-hidden" data-rw-hidden></div>
+      <div class="rw-line" data-rw-line></div>
+      <div class="rw-reck" data-rw-reck></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ 03 ============================ -->
+<section id="silent">
+  <div class="rw-sechead"><div class="rw-num">03</div><h2>Rows no number shows<small>How to find them, and how to keep them if you meant to</small></h2></div>
+  <div class="rw-cards">
+    <div class="rw-card"><h4>Filtered or duplicate</h4><p>Clinker counts rows a <code>filter</code> rejects and rows a <code>distinct</code> drops, but shows neither count on the summary line or in the metrics file.</p><p class="rw-fix">To check: preview a sample with <code>--dry-run -n 100</code>, which reads the first 100 rows of each Source and prints the rows that reach each output, and compare them with those input rows.</p></div>
+    <div class="rw-card"><h4>Route branch nothing reads</h4><p>A branch with no node reading it is allowed. Its rows are dropped and counted nowhere.</p><p class="rw-fix"><code>--explain</code> marks the branch <code>(unconsumed)</code>. Wire it to a Sink to keep those rows.</p></div>
+    <div class="rw-card"><h4>Combine skips</h4><p>With <code>on_miss: skip</code>, a driver row with no match is dropped and counted nowhere.</p><p class="rw-fix">Use <code>on_miss: null_fields</code> to keep it with empty lookup fields, or <code>error</code> to stop the run.</p></div>
+    <div class="rw-card"><h4>Lookup rows in a Combine</h4><p>Rows of the other inputs (the lookup side) are read, so they are in <code>total</code>, but they never count as ok themselves. The output row counts as its driver row.</p><p class="rw-fix">The metrics file's <code>per_source_record_counts</code> shows how many rows each Source read.</p></div>
+    <div class="rw-card"><h4>Aggregate groups</h4><p>An Aggregate turns many rows into one per group. <code>ok</code> counts one row for each group written, not every row that went into it.</p><p class="rw-fix">Compare <code>total</code> with the number of output rows, not with <code>ok</code>.</p></div>
+    <div class="rw-card"><h4>Null sort keys dropped</h4><p>A Sink sort field with <code>null_order: drop</code> leaves those rows out. This one is reported: an extra line, <code>N record(s) excluded by null_order: drop</code>, and <code>records_null_dropped</code> in the metrics file.</p><p class="rw-fix">Use <code>null_order: last</code> (the default) to keep them.</p></div>
+  </div>
+  <div class="rw-callout rw-callout--red">
+    <p style="margin:0"><b>A Combine's own <code>filter</code> and <code>distinct</code></b>: rows they reject inside a Combine's <code>cxl:</code> body are counted only when the Combine runs as an in-memory hash join, and not under the other join strategies (<a href="https://github.com/rustpunk/clinker/issues/1347">#1347</a>). Since filtered and duplicate counts are not shown anyway, this changes nothing you can see today.</p>
+  </div>
+</section>
+
+<!-- ============================ 04 ============================ -->
+<section id="where">
+  <div class="rw-sechead"><div class="rw-num">04</div><h2>Where each number appears<small>The summary line, the metrics file, and CXL</small></h2></div>
+  <div class="rw-wrap">
+  <table class="rw-where">
+    <thead><tr><th>Number</th><th>Summary line</th><th>Metrics file</th><th>CXL during the run</th></tr></thead>
+    <tbody>
+      <tr><td>Rows read, from every Source</td><td><code>N total</code></td><td><code>records_total</code>, and <code>per_source_record_counts</code> by Source</td><td><code>$pipeline.total_count</code> reads 0 today</td></tr>
+      <tr><td>Rows that reached an output</td><td><code>N ok</code></td><td><code>records_ok</code></td><td><code>$pipeline.ok_count</code> reads 0 today</td></tr>
+      <tr><td>Copies written to all Sinks</td><td><code>N written</code></td><td><code>records_written</code></td><td class="rw-no">not available</td></tr>
+      <tr><td>Dead-letter entries</td><td><code>N dlq</code>, and the exit code is 2</td><td><code>records_dlq</code>, and <code>per_source_dlq_counts</code> by Source</td><td><code>$pipeline.dlq_count</code> reads 0 today</td></tr>
+      <tr><td>Dropped by <code>null_order: drop</code></td><td>its own line, only when above 0</td><td><code>records_null_dropped</code></td><td class="rw-no">not available</td></tr>
+      <tr><td>Rejected by <code>filter</code></td><td class="rw-no">not shown</td><td class="rw-no">not shown</td><td><code>$pipeline.filtered_count</code> reads 0 today</td></tr>
+      <tr><td>Dropped by <code>distinct</code></td><td class="rw-no">not shown</td><td class="rw-no">not shown</td><td><code>$pipeline.distinct_count</code> reads 0 today</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="rw-aside">The metrics file is written only when metrics are enabled (<code>--metrics-spool-dir</code>, <code>CLINKER_METRICS_SPOOL_DIR</code>, or <code>pipeline.metrics.spool_dir</code>); see <a href="metrics.html">Metrics &amp; Monitoring</a>. The <code>$pipeline.*_count</code> members exist in CXL but are never updated during a run, so they always read 0 (<a href="https://github.com/rustpunk/clinker/issues/1346">#1346</a>). A preview run (<code>--dry-run -n</code>) reads only part of each Source and prints no summary line.</p>
+</section>
+
+<footer>Counts follow the engine's own accounting: <code>crates/clinker-record/src/counters.rs</code> and the executor that updates it. The ten pipelines in 02 match the engine's tests where one exists. Clinker user guide.</footer>
+
+<script>
+(() => {
+"use strict";
+const $ = (s, r = document) => r.querySelector(s);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+/* ---------- 01: decoder ---------- */
+const DECODE = {
+  total: ["total — rows read", "Every row read from every Source, including rows that failed while being read (a value that does not fit its declared type) and lookup rows a Combine reads. It is not just the first Source."],
+  ok: ["ok — source rows that reached an output", "A row counts once when at least one copy of it is written to a Sink, however many Sinks or branches it reached. A row an Aggregate folded into a group counts only if it is the row that stands for the group (section 02 shows which)."],
+  written: ["written — copies written", "One for every row written to every Sink. A row sent down two Route branches, or into two Sinks, counts twice. That is why written can be larger than ok."],
+  dlq: ["dlq — dead-letter entries", "One for every entry in the dead-letter file. With a correlation key, the other rows of a failed group are entries too. When this is above 0 the run exits with code 2, not 0, even though everything else was written."]
+};
+const term = $("[data-rw-term]"), decode = $("[data-rw-decode]");
+function showDecode(k) {
+  term.querySelectorAll("button").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.rwN === k)));
+  const [h, p] = DECODE[k];
+  decode.innerHTML = `<h4>${esc(h)}</h4><p>${esc(p)}</p>`;
+}
+term.querySelectorAll("button").forEach(b => b.addEventListener("click", () => showDecode(b.dataset.rwN)));
+showDecode("total");
+
+/* ---------- 02: cases ----------
+ Each row lists what happened to it, as events:
+   w  written to a Sink (one event per copy)    f  rejected by filter
+   d  dropped by distinct                       q  dead-letter entry
+   n  dropped by null_order: drop               s  no counter (silent)
+ A row with "made: true" did not come from a Source (an Aggregate made it). */
+const SINKDOTS = "    # path, type, ...";
+const CASES = [
+ { id: "filter", title: "Filter and distinct",
+   blurb: "One Transform keeps active staff and one row per department. Rows it rejects are counted, but neither count is shown.",
+   variants: null,
+   v: () => ({
+     yaml: `- type: transform\n  name: pick\n  input: staff\n  config:\n    cxl: |\n      filter status == "active"\n      distinct by dept\n      emit out_name = name\n- type: sink\n  name: out\n  input: pick\n  config:\n${SINKDOTS}`,
+     rows: [
+       { d: "A · active · Eng", e: [["w","out"]], story: "Passes the filter and is the first Eng row, so it is written." },
+       { d: "B · inactive · Eng", e: [["f","pick"]], story: "The filter is false, so the row stops at pick." },
+       { d: "C · active · Eng", e: [["d","pick"]], story: "Passes the filter, but A already used dept Eng, so distinct drops it." },
+       { d: "D · active · Sales", e: [["w","out"]], story: "First Sales row that passes the filter. Written." },
+       { d: "E · inactive · Sales", e: [["f","pick"]], story: "The filter is false. B and E are filtered before distinct sees them." }
+     ],
+     expect: { total: 5, ok: 2, written: 2, dlq: 0, filtered: 2, distinct: 1, nulldrop: 0 }
+   }) },
+ { id: "badread", title: "A value that will not read",
+   blurb: "The schema says amount is an int. One row has 12x. The row fails while it is read, before any node sees it.",
+   variants: null,
+   v: () => ({
+     yaml: `error_handling:\n  strategy: continue\n  dlq:\n    path: rejected.csv\nnodes:\n- type: source\n  name: orders\n  config:\n    path: orders.csv\n    type: csv\n    schema:\n      - { name: order_id, type: string }\n      - { name: amount, type: int }\n- type: sink\n  name: out\n  input: orders\n  config:\n${SINKDOTS}`,
+     rows: [
+       { d: "o1 · 120", e: [["w","out"]], story: "Reads and is written." },
+       { d: "o2 · 45", e: [["w","out"]], story: "Reads and is written." },
+       { d: "o3 · 12x", e: [["q","amount is not an int"]], story: "12x is not an int. The row is still counted in total, and goes to rejected.csv as one dead-letter entry. Because dlq is above 0, the run exits with code 2." },
+       { d: "o4 · 80", e: [["w","out"]], story: "Reads and is written." },
+       { d: "o5 · 9", e: [["w","out"]], story: "Reads and is written." }
+     ],
+     expect: { total: 5, ok: 4, written: 4, dlq: 1, filtered: 0, distinct: 0, nulldrop: 0 }
+   }) },
+ { id: "corr", title: "One bad row in a group",
+   blurb: "A Transform converts value to an int, and one row says bad. With a correlation key, the whole employee's group goes to the dead-letter file.",
+   variants: { label: "correlation_key", opts: [["key","employee_id"],["none","not set"]] },
+   v: (o) => {
+     const key = o === "key";
+     return {
+       yaml: `error_handling:\n  strategy: continue\n  dlq:\n    path: rejected.csv\nnodes:\n- type: source\n  name: payroll\n  config:\n${key ? "    correlation_key: employee_id\n" : ""}    # path, type, schema ...\n- type: transform\n  name: validate\n  input: payroll\n  config:\n    cxl: |\n      emit emp_id = employee_id\n      emit val = value.to_int()\n- type: sink\n  name: out\n  input: validate\n  config:\n${SINKDOTS}`,
+       rows: key ? [
+         { d: "A · 100", e: [["q","same group as a failed row"]], story: "Converts fine, but employee A has a failed row, so the whole group is held back and written to the dead-letter file." },
+         { d: "A · bad", e: [["q","bad is not an int"]], story: "value.to_int() fails. This is the row that caused the group to fail." },
+         { d: "A · 300", e: [["q","same group as a failed row"]], story: "Also in group A, so it goes to the dead-letter file too." },
+         { d: "B · 400", e: [["w","out"]], story: "Group B has no failures, so it is written." }
+       ] : [
+         { d: "A · 100", e: [["w","out"]], story: "Without a correlation key each row stands alone. Written." },
+         { d: "A · bad", e: [["q","bad is not an int"]], story: "value.to_int() fails. Only this row goes to the dead-letter file." },
+         { d: "A · 300", e: [["w","out"]], story: "Written." },
+         { d: "B · 400", e: [["w","out"]], story: "Written." }
+       ],
+       expect: key ? { total: 4, ok: 1, written: 1, dlq: 3, filtered: 0, distinct: 0, nulldrop: 0 }
+                   : { total: 4, ok: 3, written: 3, dlq: 1, filtered: 0, distinct: 0, nulldrop: 0 }
+     };
+   } },
+ { id: "twosinks", title: "Two outputs",
+   blurb: "The same Transform feeds a CSV file and a JSON file. Every row is written twice.",
+   variants: { label: "Sinks", opts: [["two","two"],["one","one"]] },
+   v: (o) => {
+     const two = o === "two";
+     const w = two ? [["w","csv_out"],["w","json_out"]] : [["w","csv_out"]];
+     return {
+       yaml: `- type: transform\n  name: clean\n  input: customers\n  config:\n    cxl: |\n      emit name = name.trim()\n- type: sink\n  name: csv_out\n  input: clean\n  config:\n${SINKDOTS}` + (two ? `\n- type: sink\n  name: json_out\n  input: clean\n  config:\n${SINKDOTS}` : ""),
+       rows: ["c1 · Ann","c2 · Bo","c3 · Cy"].map(d => ({ d, e: w.slice(), story: two ? "Written to both Sinks: two copies, but one ok row." : "Written once." })),
+       expect: two ? { total: 3, ok: 3, written: 6, dlq: 0, filtered: 0, distinct: 0, nulldrop: 0 }
+                   : { total: 3, ok: 3, written: 3, dlq: 0, filtered: 0, distinct: 0, nulldrop: 0 }
+     };
+   } },
+ { id: "inclusive", title: "A row in two branches",
+   blurb: "An inclusive Route sends a row down every branch whose condition is true. Each branch has its own Sink.",
+   variants: null,
+   v: () => ({
+     yaml: `- type: route\n  name: classify\n  input: orders\n  config:\n    mode: inclusive\n    conditions:\n      over_50: "amount > 50"\n      over_100: "amount > 100"\n    default: low\n- type: sink\n  name: over_50_out\n  input: classify.over_50\n  config:\n${SINKDOTS}\n# over_100_out reads classify.over_100,\n# low_out reads classify.low`,
+     rows: [
+       { d: "id 1 · 200", e: [["w","over_50_out"],["w","over_100_out"]], story: "Both conditions are true, so the row goes down both branches: two copies written, one ok row." },
+       { d: "id 2 · 50", e: [["w","low_out"]], story: "Neither condition is true (50 is not over 50), so it takes the default branch." },
+       { d: "id 3 · 75", e: [["w","over_50_out"]], story: "Only over_50 is true." }
+     ],
+     expect: { total: 3, ok: 3, written: 4, dlq: 0, filtered: 0, distinct: 0, nulldrop: 0 }
+   }) },
+ { id: "unread", title: "A branch nothing reads",
+   blurb: "An exclusive Route splits refunds from sales, but only the sales branch is wired to a Sink.",
+   variants: { label: "refunds", opts: [["none","nothing reads it"],["sink","has a Sink"]] },
+   v: (o) => {
+     const wired = o === "sink";
+     return {
+       yaml: `- type: route\n  name: split\n  input: payments\n  config:\n    mode: exclusive\n    conditions:\n      refunds: "amount < 0"\n    default: sales\n- type: sink\n  name: sales_out\n  input: split.sales\n  config:\n${SINKDOTS}` + (wired ? `\n- type: sink\n  name: refunds_out\n  input: split.refunds\n  config:\n${SINKDOTS}` : `\n# nothing reads split.refunds`),
+       rows: [
+         { d: "p1 · 120", e: [["w","sales_out"]], story: "Not a refund, so it takes the default branch to sales_out." },
+         { d: "p2 · -30", e: wired ? [["w","refunds_out"]] : [["s","split.refunds has no reader"]], story: wired ? "A refund, written to refunds_out." : "A refund. The refunds branch has no reader, so the row is dropped without a trace. --explain shows the branch as (unconsumed)." },
+         { d: "p3 · 45", e: [["w","sales_out"]], story: "Default branch, written." },
+         { d: "p4 · 60", e: [["w","sales_out"]], story: "Default branch, written." }
+       ],
+       expect: wired ? { total: 4, ok: 4, written: 4, dlq: 0, filtered: 0, distinct: 0, nulldrop: 0 }
+                     : { total: 4, ok: 3, written: 3, dlq: 0, filtered: 0, distinct: 0, nulldrop: 0 }
+     };
+   } },
+ { id: "agg", title: "Rows folded into groups",
+   blurb: "An Aggregate makes one output row per department. ok counts one row for each group, not every row that went in.",
+   variants: null,
+   v: () => ({
+     yaml: `- type: aggregate\n  name: by_dept\n  input: staff\n  config:\n    group_by: [dept]\n    cxl: |\n      emit total = sum(amount)\n- type: sink\n  name: out\n  input: by_dept\n  config:\n${SINKDOTS}`,
+     rows: [
+       { d: "row 1 · Eng · 10", e: [["w","out (as group Eng)"]], story: "The Eng group's output row (total 30) is written. It counts as ok through row 1, the first row read into the group." },
+       { d: "row 2 · Eng · 20", e: [["s","folded into group Eng"]], story: "Its amount is in the Eng total, but the output row already counts as row 1, so this row is in no number." },
+       { d: "row 3 · Sales · 5", e: [["w","out (as group Sales)"]], story: "Sales has one row, so it stands for its group. Written." }
+     ],
+     expect: { total: 3, ok: 2, written: 2, dlq: 0, filtered: 0, distinct: 0, nulldrop: 0 }
+   }) },
+ { id: "emptyagg", title: "A total over nothing",
+   blurb: "A whole-file Aggregate (group_by: []) always writes one row, even when the file has no rows. Then ok is larger than total.",
+   variants: null,
+   v: () => ({
+     yaml: `- type: aggregate\n  name: summary\n  input: orders\n  config:\n    group_by: []\n    cxl: |\n      emit record_count = count(*)\n- type: sink\n  name: out\n  input: summary\n  config:\n${SINKDOTS}`,
+     rows: [
+       { d: "(no rows: the file is just a header)", made: true, e: [["w","out"]], story: "The Aggregate writes its one row (record_count 0) anyway. That row counts as ok although nothing was read, so the line says 0 total, 1 ok." }
+     ],
+     expect: { total: 0, ok: 1, written: 1, dlq: 0, filtered: 0, distinct: 0, nulldrop: 0 }
+   }) },
+ { id: "combine", title: "A lookup with misses",
+   blurb: "Orders are matched to products. Order o4 names a product that does not exist. Both files are read, so both are in total.",
+   variants: { label: "on_miss", opts: [["skip","skip"],["null_fields","null_fields"]] },
+   v: (o) => {
+     const skip = o === "skip";
+     return {
+       yaml: `- type: combine\n  name: enrich\n  input:\n    orders: orders\n    products: products\n  config:\n    where: "orders.product_id == products.product_id"\n    match: first\n    on_miss: ${o}\n    cxl: |\n      emit order_id = orders.order_id\n      emit product_name = products.product_name\n- type: sink\n  name: out\n  input: enrich\n  config:\n${SINKDOTS}`,
+       rows: [
+         { d: "orders · o1 · p1", e: [["w","out"]], story: "Matches p1. The output row counts as this order." },
+         { d: "orders · o2 · p2", e: [["w","out"]], story: "Matches p2. Written." },
+         { d: "orders · o3 · p1", e: [["w","out"]], story: "Matches p1. Written." },
+         { d: "orders · o4 · p9", e: skip ? [["s","no match, on_miss: skip"]] : [["w","out"]], story: skip ? "No product p9, and on_miss: skip drops the order without a trace." : "No product p9. on_miss: null_fields writes the order with an empty product_name." },
+         { d: "products · p1", e: [["s","lookup row"]], story: "Read, so it is in total, but a lookup row never counts as ok itself: the output rows count as their orders." },
+         { d: "products · p2", e: [["s","lookup row"]], story: "Read and used for o2, and in no number other than total." }
+       ],
+       expect: skip ? { total: 6, ok: 3, written: 3, dlq: 0, filtered: 0, distinct: 0, nulldrop: 0 }
+                    : { total: 6, ok: 4, written: 4, dlq: 0, filtered: 0, distinct: 0, nulldrop: 0 }
+     };
+   } },
+ { id: "nulldrop", title: "A null sort key",
+   blurb: "The Sink sorts by region. One row has no region.",
+   variants: { label: "null_order", opts: [["drop","drop"],["last","last"]] },
+   v: (o) => {
+     const drop = o === "drop";
+     return {
+       yaml: `- type: sink\n  name: out\n  input: customers\n  config:\n    # path, type, ...\n    sort_order:\n      - { field: region, null_order: ${o} }`,
+       rows: [
+         { d: "c1 · north", e: [["w","out"]], story: "Written." },
+         { d: "c2 · (null)", e: drop ? [["n","out"]] : [["w","out"]], story: drop ? "The sort key is null and null_order is drop, so the row is left out. A separate line reports it." : "null_order: last keeps it and writes it after the others." },
+         { d: "c3 · south", e: [["w","out"]], story: "Written." },
+         { d: "c4 · east", e: [["w","out"]], story: "Written." }
+       ],
+       expect: drop ? { total: 4, ok: 3, written: 3, dlq: 0, filtered: 0, distinct: 0, nulldrop: 1 }
+                    : { total: 4, ok: 4, written: 4, dlq: 0, filtered: 0, distinct: 0, nulldrop: 0 }
+     };
+   } }
+];
+
+const TAGS = { w: ["write","written"], f: ["filter","filtered"], d: ["dup","duplicate"], q: ["dlq","dead-letter"], n: ["nulldrop","null dropped"], s: ["silent","no number"] };
+
+/* Count exactly the way the engine does. */
+function tally(rows) {
+  const c = { total: 0, ok: 0, written: 0, dlq: 0, filtered: 0, distinct: 0, nulldrop: 0, silent: [] };
+  for (const r of rows) {
+    if (!r.made) c.total++;
+    const kinds = r.e.map(e => e[0]);
+    if (kinds.includes("w")) c.ok++;
+    for (const k of kinds) {
+      if (k === "w") c.written++;
+      else if (k === "q") c.dlq++;
+      else if (k === "f") c.filtered++;
+      else if (k === "d") c.distinct++;
+      else if (k === "n") c.nulldrop++;
+    }
+    if (kinds.every(k => k === "s")) c.silent.push(r);
+  }
+  return c;
+}
+
+const S = { c: "filter", v: {} };
+const elCases = $("[data-rw-cases]"), elVar = $("[data-rw-variant]"), elYaml = $("[data-rw-yaml]"),
+      elBlurb = $("[data-rw-blurb]"), elRows = $("[data-rw-rows]"), elBoard = $("[data-rw-board]"),
+      elHidden = $("[data-rw-hidden]"), elLine = $("[data-rw-line]"), elReck = $("[data-rw-reck]");
+
+elCases.innerHTML = CASES.map((k, i) => `<button data-rw-case="${k.id}"><b>${String(i + 1).padStart(2, "0")}</b> · ${esc(k.title)}</button>`).join("");
+elCases.querySelectorAll("button").forEach(b => b.addEventListener("click", () => { S.c = b.dataset.rwCase; render(); }));
+
+function plural(n, one, many) { return `${n} ${n === 1 ? one : many}`; }
+
+function render() {
+  const k = CASES.find(x => x.id === S.c);
+  elCases.querySelectorAll("button").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.rwCase === S.c)));
+  if (k.variants && !S.v[k.id]) S.v[k.id] = k.variants.opts[0][0];
+  const opt = k.variants ? S.v[k.id] : null;
+  elVar.innerHTML = k.variants
+    ? `<div class="rw-ctlrow"><span class="rw-ctlhead">${esc(k.variants.label)}</span><div class="rw-seg">${k.variants.opts.map(([v, l]) => `<button data-rw-v="${v}" aria-pressed="${v === opt}">${esc(l)}</button>`).join("")}</div></div>`
+    : "";
+  elVar.querySelectorAll("button").forEach(b => b.addEventListener("click", () => { S.v[k.id] = b.dataset.rwV; render(); }));
+
+  const d = k.v(opt);
+  elYaml.textContent = d.yaml;
+  elBlurb.textContent = k.blurb;
+  elRows.innerHTML = d.rows.map((r, i) => {
+    const tags = r.e.map(([t, at]) => `<span class="rw-tag rw-tag--${TAGS[t][0]}" title="${esc(at)}">${esc(TAGS[t][1])}${t === "w" || t === "n" ? " · " + esc(at) : ""}</span>`).join("");
+    const why = r.e.filter(([t]) => t !== "w" && t !== "n").map(([, at]) => at);
+    return `<button class="rw-row" data-rw-row="${i}" aria-expanded="false"><span class="rw-data">${r.made ? "<small>made by the node</small>" : "<small>source row</small>"}${esc(r.d)}</span><span class="rw-fates">${tags}${why.length ? `<span class="rw-tag" style="border-color:var(--seam);color:var(--dim)">${esc(why.join("; "))}</span>` : ""}</span><span class="rw-story" hidden>${esc(r.story)}</span></button>`;
+  }).join("");
+  elRows.querySelectorAll(".rw-row").forEach(b => b.addEventListener("click", () => {
+    const open = b.getAttribute("aria-expanded") !== "true";
+    b.setAttribute("aria-expanded", String(open));
+    b.querySelector(".rw-story").hidden = !open;
+  }));
+
+  const c = tally(d.rows);
+  const cells = [["total", c.total], ["ok", c.ok], ["written", c.written], ["dlq", c.dlq]];
+  elBoard.innerHTML = cells.map(([n, v]) => `<div class="rw-cell" data-rw-count="${n}"><b>${v}</b><span>${n}</span></div>`).join("");
+  elHidden.innerHTML = [["filtered", c.filtered], ["duplicate", c.distinct], ["no number", c.silent.length]]
+    .map(([n, v]) => `<div class="rw-cell" data-rw-count="${n === "duplicate" ? "distinct" : n === "no number" ? "silent" : n}"><b>${v}</b><span>${n} · not shown</span></div>`).join("");
+  let line = `Pipeline complete: ${c.total} total, ${c.ok} ok, ${c.written} written, ${c.dlq} dlq`;
+  if (c.nulldrop > 0) line += `\n${c.nulldrop} record(s) excluded by null_order: drop`;
+  line += `\nexit code ${c.dlq > 0 ? 2 : 0}`;
+  elLine.innerHTML = esc(line).replace(/\n/g, "<br>");
+
+  /* reckoning */
+  const gap = c.total - c.ok - c.dlq;
+  const parts = [];
+  if (c.filtered) parts.push(`${plural(c.filtered, "row", "rows")} rejected by a filter (counted, not shown)`);
+  if (c.distinct) parts.push(`${plural(c.distinct, "duplicate", "duplicates")} dropped by distinct (counted, not shown)`);
+  if (c.nulldrop) parts.push(`${plural(c.nulldrop, "row", "rows")} dropped by null_order: drop (reported on its own line)`);
+  for (const r of c.silent) parts.push(`${r.d}: ${r.e.map(e => e[1]).join("; ")} (no counter)`);
+  let html;
+  if (gap === 0) {
+    html = `<h5>Every row is accounted for</h5><p>${c.ok} ok + ${c.dlq} dlq = ${c.total} total.</p>`;
+  } else if (gap > 0) {
+    html = `<h5>${plural(gap, "row is", "rows are")} in neither ok nor dlq</h5><p>${c.total} total − ${c.ok} ok − ${c.dlq} dlq = ${gap}. They are:</p><ul>${parts.map(p => `<li>${esc(p)}</li>`).join("")}</ul>`;
+  } else {
+    html = `<h5>ok is larger than total</h5><p>${c.ok} ok + ${c.dlq} dlq is ${-gap} more than ${c.total} total. ok counts rows that reached an output, and a row the pipeline made itself (here, the Aggregate's one row) reaches an output without having been read.</p>`;
+    if (parts.length) html += `<ul>${parts.map(p => `<li>${esc(p)}</li>`).join("")}</ul>`;
+  }
+  if (c.written > c.ok) html += `<p>written is ${c.written - c.ok} more than ok: written counts every copy, ok counts each row once.</p>`;
+  if (c.dlq > 0) html += `<p>Because dlq is above 0, the run exits with code 2.</p>`;
+  elReck.innerHTML = html;
+  elReck.classList.toggle("rw-off", gap !== 0);
+  elReck.dataset.rwGap = String(gap);
+
+  /* the expectations come from the engine's tests and code; the page must agree with them */
+  const bad = Object.keys(d.expect).filter(n => d.expect[n] !== c[n]);
+  elBoard.dataset.rwConsistent = String(bad.length === 0);
+  if (bad.length) console.error("row-accounting: case", k.id, opt, "disagrees on", bad);
+}
+render();
+})();
+</script>
+</body>
+</html>

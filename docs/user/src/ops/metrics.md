@@ -2,6 +2,8 @@
 
 Clinker writes per-execution metrics as JSON files to a spool directory. These files can be collected into an NDJSON archive for ingestion into monitoring systems.
 
+*Interactive companion: [Where did my rows go?](row-accounting-explainer.html) follows every row of ten small pipelines into the end-of-run counters, and shows which rows are in no counter at all.*
+
 ## Enabling metrics
 
 There are three ways to enable metrics collection, listed from highest to lowest priority:
@@ -82,8 +84,8 @@ schema bump means draining the spool first.
 | `finished_at` | string | ISO 8601 UTC timestamp |
 | `duration_ms` | integer | Wall-clock duration in milliseconds |
 | `exit_code` | integer | Process exit code (see [Exit Codes](exit-codes.md)) |
-| `records_total` | integer | Total records read from the primary source |
-| `records_ok` | integer | Distinct source records that reached at least one output. Under inclusive Route fan-out one input matching N branches counts once |
+| `records_total` | integer | Records read from every Source, including records rejected while being read (for example a value that does not fit its declared type) and the lookup inputs of a Combine. `per_source_record_counts` splits it by Source |
+| `records_ok` | integer | Distinct source records that reached at least one output. Under inclusive Route fan-out one input matching N branches counts once. An Aggregate output row counts as one record of its group (the first one read), so the other records of the group are not counted; a Combine output row counts as its driver record, so lookup records are not counted; a whole-input Aggregate (`group_by: []`) over no records still writes one row and counts 1 |
 | `records_written` | integer | Total writes across all sinks. Equals `records_ok` for single-output exclusive pipelines; exceeds it under inclusive Route fan-out or multiple Sinks |
 | `records_dlq` | integer | Rows written to the dead-letter queue, collateral rows included. A source row counts once for each failure it took part in, with or without a correlation key |
 | `records_null_dropped` | integer | Records excluded by a Sink `null_order: drop` sort field (see [Sort order](../nodes/sink.md#sort-order)). Counts exclusions, not distinct source records: like `records_written`, one source record dropped at two Sinks counts twice. Absent from spool files written before this counter existed, where it reads as `0` |

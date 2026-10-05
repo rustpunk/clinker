@@ -54,6 +54,13 @@ Which rows of a partition each `$window.*` function reads, and why
 `$window.sum` is a partition total while `$window.cumulative_sum` is the
 running total. Reference: [Window Functions](../cxl/windows.md).
 
+## [Where did my rows go?](../ops/row-accounting-explainer.html)
+
+What the end-of-run line `N total, N ok, N written, N dlq` counts, why the
+numbers often don't add up, and which rows are in no number at all: filtered
+and duplicate rows, rows folded into Aggregate groups, Combine misses and Route
+branches nothing reads. Reference: [Metrics & Monitoring](../ops/metrics.md).
+
 ## [Streaming vs. blocking](../ops/streaming-vs-blocking-explainer.html)
 
 Which stages stream and which hold their output in a buffer, for several
