@@ -5366,14 +5366,34 @@ pub(crate) struct ResidentSlotSpill<'a> {
     pub(crate) batch_size: usize,
 }
 
+/// What spilling one node-buffer slot did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SlotSpillResult {
+    /// The slot's rows went to one spill file of this many bytes.
+    Written(u64),
+    /// Nothing was written and the slot's rows stay in memory: a live
+    /// cursor or view shares their backing, so they stay where its reader
+    /// holds them and a spill could free none of them.
+    StillShared,
+    /// Nothing was written because the slot holds no rows in memory: it is
+    /// absent, already on disk, or holds only document boundaries.
+    NothingResident,
+}
+
 impl ResidentSlotSpill<'_> {
     /// Spill the slot at `key` to one file now, if it is resident, and
     /// release its in-memory charge: the slot's residue through `handle`,
     /// and its records' own allocations as they drop once written. Charges
     /// the file to `node_name` against the disk quota, failing with the
     /// spill-cap error (E320) past it. A slot that is not resident, or is
-    /// absent, is left as it is. Returns the file's bytes (0 when nothing
-    /// was written).
+    /// absent, is left as it is.
+    ///
+    /// Reports what it did. A slot whose rows a live cursor or view still
+    /// shares writes nothing and keeps them; its handle's reclaimable figure
+    /// and its charge are left exactly as they were, so a view published
+    /// with nothing reclaimable still reports nothing reclaimable after a
+    /// sweep. Otherwise the figure is re-set to what the slot still holds in
+    /// memory.
     ///
     /// Blocks on the file write. Never reserves memory, so a reclaim may call
     /// it while it holds the reclaim set.
@@ -5383,9 +5403,9 @@ impl ResidentSlotSpill<'_> {
         key: &NodeBufferKey,
         handle: &crate::pipeline::memory::ConsumerHandle,
         node_name: &str,
-    ) -> Result<u64, PipelineError> {
+    ) -> Result<SlotSpillResult, PipelineError> {
         let Some(buffer) = node_buffers.remove(key) else {
-            return Ok(0);
+            return Ok(SlotSpillResult::NothingResident);
         };
         // Resolve the compression mode against this slot's schema width and
         // the run's batch size, matching the admission path so the on-disk
@@ -5396,21 +5416,27 @@ impl ResidentSlotSpill<'_> {
             .resolve_for_schema(column_count, self.batch_size as u64);
         let (spilled, file_bytes) =
             buffer.spill_resident_memory(Some(self.spill_root), compress)?;
-        handle.set_reclaimable(spilled.reclaimable_bytes());
-        node_buffers.insert(key.clone(), spilled);
-        if file_bytes > 0 {
-            // Rows are on disk now; the slot's in-memory charge is zero.
-            handle.shrink(handle.bytes());
-            if self.arbitrator.record_spill_bytes(node_name, file_bytes) {
-                return Err(PipelineError::spill_cap_exceeded(
-                    node_name,
-                    self.arbitrator.max_spill_bytes(),
-                    file_bytes,
-                    self.arbitrator.cumulative_spill_bytes(),
-                ));
-            }
+        let still_resident = spilled.reclaimable_bytes();
+        if file_bytes == 0 && still_resident > 0 {
+            node_buffers.insert(key.clone(), spilled);
+            return Ok(SlotSpillResult::StillShared);
         }
-        Ok(file_bytes)
+        handle.set_reclaimable(still_resident);
+        node_buffers.insert(key.clone(), spilled);
+        if file_bytes == 0 {
+            return Ok(SlotSpillResult::NothingResident);
+        }
+        // Rows are on disk now; the slot's in-memory charge is zero.
+        handle.shrink(handle.bytes());
+        if self.arbitrator.record_spill_bytes(node_name, file_bytes) {
+            return Err(PipelineError::spill_cap_exceeded(
+                node_name,
+                self.arbitrator.max_spill_bytes(),
+                file_bytes,
+                self.arbitrator.cumulative_spill_bytes(),
+            ));
+        }
+        Ok(SlotSpillResult::Written(file_bytes))
     }
 }
 

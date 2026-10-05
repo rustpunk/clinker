@@ -29,7 +29,9 @@ use clinker_plan::error::PipelineError;
 
 use super::reservation::ReservationState;
 use super::{ConsumerHandle, ConsumerId, MemoryArbitrator};
-use crate::executor::dispatch::{NodeBufferKey, NodeBufferReaderLedger, ResidentSlotSpill};
+use crate::executor::dispatch::{
+    NodeBufferKey, NodeBufferReaderLedger, ResidentSlotSpill, SlotSpillResult,
+};
 use crate::executor::node_buffer::NodeBuffer;
 
 /// Where the calling thread stands relative to one run's walk.
@@ -177,8 +179,11 @@ impl NodeBufferSlots {
     /// A resident slot spills through the same core as the walk's
     /// spill-request sweep (`service_pending_node_buffer_spills`). A
     /// registered slot whose buffer is out of the scope is held by a running
-    /// arm: its spill request is raised and it is `Busy`. A slot its compiled
-    /// classification keeps in memory is `NotOwned`.
+    /// arm: its spill request is raised and it is `Busy`. A slot whose rows a
+    /// live cursor or view still shares is `Busy` too: the spill writes
+    /// nothing and its rows stay where the reader holds them, so its spill
+    /// request is raised for the sweep to answer once the reader lets go. A
+    /// slot its compiled classification keeps in memory is `NotOwned`.
     fn spill_registered(
         &mut self,
         id: ConsumerId,
@@ -204,13 +209,17 @@ impl NodeBufferSlots {
             return Ok(Some(VictimOutcome::Busy));
         }
         let node_name = spill.node_name.clone();
-        ResidentSlotSpill {
+        let spilled = ResidentSlotSpill {
             arbitrator,
             spill_root: spill_settings.spill_root.as_ref(),
             spill_compress: spill_settings.spill_compress,
             batch_size: spill_settings.batch_size,
         }
         .spill_slot(&mut self.buffers, &key, &handle, &node_name)?;
+        if spilled == SlotSpillResult::StillShared {
+            handle.request_spill();
+            return Ok(Some(VictimOutcome::Busy));
+        }
         Ok(Some(VictimOutcome::Spilled))
     }
 }

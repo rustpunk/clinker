@@ -455,7 +455,10 @@ fn a_sweep_that_writes_nothing_leaves_a_views_figure_at_zero() {
     let s = schema();
     let mut owner = NodeBuffer::memory_from_records(rows(&s));
     let view = owner.reread().expect("a resident slot re-reads");
-    assert!(view.reclaimable_bytes() > 0, "the premise: the view has rows");
+    assert!(
+        view.reclaimable_bytes() > 0,
+        "the premise: the view has rows"
+    );
     let arbitrator = arbitrator(64 * 1024 * 1024);
     let spill_dir = tempfile::tempdir().expect("spill dir");
     let set = reclaim_set(spill_dir.path());
