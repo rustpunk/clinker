@@ -337,7 +337,7 @@ fn build_report(
         join_partition_distinct_keys: None,
         reading: LimitReading::Charged,
         requested_bytes: requested,
-        limit: EnforcedLimit::MemoryLimit(snapshot.limit),
+        limit: snapshot.limit,
         charged_bytes: snapshot.charged,
         private_bytes: crate::pipeline::sysstats::private_memory_bytes(),
         holders,
@@ -347,7 +347,8 @@ fn build_report(
         unspillable_bytes,
         reclaim,
         suggested_limit_bytes: suggested_limit_floor(snapshot.charged, requested),
-        oversized: oversized || requested.saturating_add(unspillable_bytes) > snapshot.limit,
+        oversized: oversized
+            || requested.saturating_add(unspillable_bytes) > snapshot.limit.bytes(),
     })
 }
 
@@ -363,7 +364,10 @@ impl std::fmt::Display for Shortfall {
         write!(
             f,
             "memory request of {} bytes does not fit: {} bytes free of the {}-byte limit ({} charged)",
-            self.requested, self.available, self.snapshot.limit, self.snapshot.charged
+            self.requested,
+            self.available,
+            self.snapshot.limit.bytes(),
+            self.snapshot.charged
         )?;
         if self.oversized {
             f.write_str("; the request is larger than the whole limit")?;
@@ -381,8 +385,9 @@ impl std::error::Error for Shortfall {}
 /// `charged` exactly.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LedgerSnapshot {
-    /// The limit charges are admitted against.
-    pub limit: u64,
+    /// The limit charges are admitted against, and whether it is
+    /// `memory.limit` or a test capacity, read together under the lock.
+    pub limit: EnforcedLimit,
     /// Bytes charged to the ledger.
     pub charged: u64,
     /// Bytes the request that took the snapshot asked for.
@@ -419,7 +424,11 @@ fn snapshot(
 ) -> LedgerSnapshot {
     let (holders, unattributed) = ledger.holders();
     LedgerSnapshot {
-        limit: ledger.limit(),
+        limit: if ledger.attachment.test_capacity {
+            EnforcedLimit::TestCapacity(ledger.limit())
+        } else {
+            EnforcedLimit::MemoryLimit(ledger.limit())
+        },
         charged: ledger.charged(),
         requested,
         requester,
@@ -767,7 +776,7 @@ impl MemoryArbitrator {
         node: &str,
         surface: MemorySurface,
     ) -> Box<MemoryShortfallReport> {
-        let oversized = snapshot.requested > snapshot.limit;
+        let oversized = snapshot.requested > snapshot.limit.bytes();
         build_report(
             self,
             snapshot,
@@ -1824,7 +1833,7 @@ mod tests {
             .reserve(40 * KIB, Requester::for_consumer(groups))
             .expect_err("40 KiB does not fit beside 32 KiB under 64 KiB");
         let snapshot = &short.snapshot;
-        assert_eq!(snapshot.limit, 64 * KIB);
+        assert_eq!(snapshot.limit.bytes(), 64 * KIB);
         assert_eq!(snapshot.charged, 32 * KIB);
         assert_eq!(snapshot.requested, 40 * KIB);
         assert_eq!(snapshot.requester, Some(groups));

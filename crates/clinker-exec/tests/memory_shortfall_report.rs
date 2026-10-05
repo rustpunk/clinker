@@ -391,7 +391,10 @@ fn suggested_limit_rounds_up_to_whole_mebibytes() {
     assert!(text.contains("memory: { limit: \"4M\" }"), "{text}");
     assert!(text.contains("or: --memory-limit 4M"), "{text}");
     assert!(
-        text.contains("fix: raise the limit to at least 4M — this request needed 3.0 MiB"),
+        text.contains(
+            "fix: raise the limit to at least 4M — the smallest limit with room for this request \
+             and what the run already holds"
+        ),
         "{text}"
     );
 }
@@ -468,8 +471,8 @@ fn oversized_request_says_spilling_cannot_help() {
     assert!(!report.oversized);
     assert!(
         report.to_string().starts_with(
-            "E310 \"totals\": needed 2.0 MiB more for group state, but memory.limit 8.0 MiB is \
-             fully held and nothing more could be spilled\n"
+            "E310 \"totals\": needed 2.0 MiB more for group state, but only 704.0 KiB of \
+             memory.limit 8.0 MiB was left\n"
         ),
         "{report}"
     );

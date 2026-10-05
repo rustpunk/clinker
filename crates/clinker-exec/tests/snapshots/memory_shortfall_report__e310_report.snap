@@ -2,7 +2,7 @@
 source: crates/clinker-exec/tests/memory_shortfall_report.rs
 expression: text
 ---
-E310 "totals": needed 2.0 MiB more for group state, but memory.limit 8.0 MiB is fully held and nothing more could be spilled
+E310 "totals": needed 2.0 MiB more for group state, but only 704.0 KiB of memory.limit 8.0 MiB was left
   charged 7.3 MiB of 8.0 MiB (91%) · private memory 200.0 MiB
   largest holders:
     "enrich"  join build side  3.5 MiB  cannot spill
@@ -13,7 +13,7 @@ E310 "totals": needed 2.0 MiB more for group state, but memory.limit 8.0 MiB is 
     +2 more holders  192.0 KiB
     not held by any one node  640.0 KiB
   reclaim: none attempted
-  fix: raise the limit to at least 10M — this request needed 9.3 MiB; later stages may need more
+  fix: raise the limit to at least 10M — the smallest limit with room for this request and what the run already holds; later stages may need more
     pipeline:
       memory: { limit: "10M" }
     or: --memory-limit 10M

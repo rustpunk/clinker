@@ -1613,7 +1613,7 @@ impl MemoryArbitrator {
     /// use this to drive deterministic overflow scenarios without spawning
     /// processes of the requested RSS size.
     pub fn set_limit(&self, n: u64) -> Result<(), ResourceError> {
-        self.set_runtime_limit(n)?;
+        self.set_runtime_limit(n, false)?;
         self.configured_limit.store(n, Ordering::Relaxed);
         Ok(())
     }
@@ -1621,11 +1621,22 @@ impl MemoryArbitrator {
     /// Hold the runtime limit to `capacity`, never above the configured
     /// limit. Refused, leaving the limit unchanged, when more than the new
     /// limit is already charged.
+    ///
+    /// Records which of the two the run then enforces, for the E310 report
+    /// to name: the test capacity when it is below `memory.limit`, else
+    /// `memory.limit`, which a capacity at or above it leaves in force.
     pub(crate) fn cap_runtime_limit(&self, capacity: u64) -> Result<(), ResourceError> {
-        self.set_runtime_limit(capacity.min(self.configured_limit()))
+        let configured = self.configured_limit();
+        if capacity < configured {
+            self.set_runtime_limit(capacity, true)
+        } else {
+            self.set_runtime_limit(configured, false)
+        }
     }
 
-    fn set_runtime_limit(&self, n: u64) -> Result<(), ResourceError> {
+    /// Install `n` as the runtime limit, recording under the ledger lock
+    /// whether it is a test capacity (`test_capacity`) or `memory.limit`.
+    fn set_runtime_limit(&self, n: u64, test_capacity: bool) -> Result<(), ResourceError> {
         let mut ledger = self.admission.ledger.lock();
         if let Err(charged) = ledger.set_limit(n) {
             return Err(ResourceError::new(
@@ -1634,6 +1645,7 @@ impl MemoryArbitrator {
                 n as usize,
             ));
         }
+        ledger.attachment.test_capacity = test_capacity;
         self.limit.store(n, Ordering::Relaxed);
         Ok(())
     }

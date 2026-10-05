@@ -40,10 +40,16 @@ pub struct WriterResourceUsage {
 /// Test builds also keep an armed forced shortfall here: it is the ledger's
 /// [`AdmissionGate`], so every charge counts and fires it in the same step
 /// as its own check.
+///
+/// It also records which setting the ledger's limit is, written with the
+/// limit under this lock so a snapshot reads the two together.
 #[derive(Default)]
 pub(super) struct WriterBinding {
     pub handle: Option<Arc<ConsumerHandle>>,
     pub consumer_id: Option<ConsumerId>,
+    /// Whether the ledger's limit is a test capacity the run was held to,
+    /// below `memory.limit`, rather than `memory.limit` itself.
+    pub test_capacity: bool,
     #[cfg(any(test, feature = "test-utils"))]
     pub forced_shortfall: Option<super::ledger::ArmedShortfall>,
 }

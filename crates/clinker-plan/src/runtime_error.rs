@@ -246,9 +246,10 @@ pub struct ConsumerLabel {
 /// record value.
 ///
 /// Its [`Display`](std::fmt::Display) is the E310 text: a greppable headline,
-/// then the charged total, the largest holders, what the reclaim round did, a
-/// limit that would have granted the request in both the YAML and the CLI
-/// spelling, and a remedy keyed to the largest holder that cannot spill.
+/// then the charged total, the largest holders, what the reclaim round did, the
+/// smallest limit with room for the request (in both the YAML and the CLI
+/// spelling when `memory.limit` was the limit enforced), and a remedy keyed
+/// to the largest holder that cannot spill.
 /// When [`LimitReading::ProcessMemory`] was the reading over the limit, the
 /// headline and the limit line state the process reading instead of a
 /// request, and nothing claims the charged state fills the limit.
@@ -295,12 +296,15 @@ pub struct MemoryShortfallReport {
     /// hold (listed or not), plus `unattributed_bytes`.
     pub unspillable_bytes: u64,
     /// What the reclaim round did before the refusal; `None` when the request
-    /// was refused without one (a thread that cannot spill the run's state).
+    /// was refused without one: a request made where the run's state cannot
+    /// be spilled, or a check that refuses without a round. The one record
+    /// of whether a round ran: the headline says nothing more could be
+    /// spilled only when this holds a round.
     pub reclaim: Option<ReclaimReport>,
-    /// The smallest limit that would have granted this request beside what
-    /// was charged: `charged_bytes + requested_bytes` rounded up to a whole
-    /// MiB (see [`suggested_limit_floor`]). A floor, not a recommendation:
-    /// later stages may need more.
+    /// The smallest limit with room for this request and what was charged:
+    /// `charged_bytes + requested_bytes` rounded up to a whole MiB (see
+    /// [`suggested_limit_floor`]). A floor, not a recommendation: later
+    /// stages may need more.
     pub suggested_limit_bytes: u64,
     /// No spill could make the request fit: it is larger than the limit on
     /// its own, or larger than what is left of it beside
@@ -347,6 +351,17 @@ impl EnforcedLimit {
     pub fn bytes(self) -> u64 {
         match self {
             Self::MemoryLimit(bytes) | Self::TestCapacity(bytes) => bytes,
+        }
+    }
+}
+
+/// The limit named with its figure, as the E310 headline names it:
+/// `memory.limit 8.0 MiB` or `the test ledger capacity 8.0 MiB`.
+impl std::fmt::Display for EnforcedLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MemoryLimit(bytes) => write!(f, "memory.limit {}", Bytes(*bytes)),
+            Self::TestCapacity(bytes) => write!(f, "the test ledger capacity {}", Bytes(*bytes)),
         }
     }
 }
@@ -628,25 +643,35 @@ impl std::fmt::Display for MemoryShortfallReport {
             }
         }
 
+        // The fix line says what its floor is for, not how it was summed:
+        // the request is on the headline and the charge on its own line.
+        // Under a test capacity it raises that capacity, and the
+        // `memory.limit` paste lines are left out because they would not
+        // lift it.
         let suggested = suggested_limit_text(self.suggested_limit_bytes);
-        write!(f, "\n  fix: raise the limit to at least {suggested} — ")?;
+        let (setting, room_for) = match self.limit {
+            EnforcedLimit::MemoryLimit(_) => ("the limit", "the smallest limit"),
+            EnforcedLimit::TestCapacity(_) => ("the test ledger capacity", "the smallest capacity"),
+        };
+        write!(f, "\n  fix: raise {setting} to at least {suggested} — ")?;
         match self.reading {
             LimitReading::Charged => write!(
                 f,
-                "this request needed {}",
-                Bytes(self.charged_bytes.saturating_add(self.requested_bytes))
+                "{room_for} with room for this request and what the run already holds"
             )?,
             LimitReading::ProcessMemory {
                 peak_resident_bytes,
             } => write!(f, "process memory reached {}", Bytes(peak_resident_bytes))?,
         }
-        write!(
-            f,
-            "; later stages may need more\
-             \n    pipeline:\
-             \n      memory: {{ limit: \"{suggested}\" }}\
-             \n    or: --memory-limit {suggested}"
-        )?;
+        if let EnforcedLimit::MemoryLimit(_) = self.limit {
+            write!(
+                f,
+                "; later stages may need more\
+                 \n    pipeline:\
+                 \n      memory: {{ limit: \"{suggested}\" }}\
+                 \n    or: --memory-limit {suggested}"
+            )?;
+        }
 
         // An oversized request's remedy is the one for what the requester was
         // holding. When it is larger than the whole limit it fits beside
@@ -710,6 +735,14 @@ impl std::fmt::Display for MemoryShortfallReport {
 }
 
 impl MemoryShortfallReport {
+    /// The first line of the E310 text, in one of three forms: the process
+    /// reading over the limit; one request no spill can make room for; or
+    /// the ordinary form, which states the request and how much of the limit
+    /// was left (`limit − charged`, from the same reading). The ordinary
+    /// form adds that nothing more could be spilled only when
+    /// [`Self::reclaim`] holds the round that tried; a report with no round
+    /// claims no spill was tried. Every form names the limit the run
+    /// enforced.
     fn write_headline(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use clinker_core_types::QuoteName;
         f.write_str("E310")?;
@@ -723,9 +756,9 @@ impl MemoryShortfallReport {
         {
             write!(
                 f,
-                "process memory peaked at {} resident, over memory.limit {}",
+                "process memory peaked at {} resident, over {}",
                 Bytes(peak_resident_bytes),
-                Bytes(self.limit.bytes())
+                self.limit
             )?;
             if let Some(requester) = &self.requester {
                 write!(
@@ -744,9 +777,9 @@ impl MemoryShortfallReport {
             }
             write!(
                 f,
-                " needs {}, more than memory.limit {} can hold",
+                " needs {}, more than {} can hold",
                 Bytes(self.requested_bytes),
-                Bytes(self.limit.bytes())
+                self.limit
             )?;
             if self.requested_bytes <= self.limit.bytes() {
                 write!(
@@ -761,11 +794,16 @@ impl MemoryShortfallReport {
         if let Some(requester) = &self.requester {
             write!(f, " for {}", requester.surface)?;
         }
-        write!(
-            f,
-            ", but memory.limit {} is fully held and nothing more could be spilled",
-            Bytes(self.limit.bytes())
-        )
+        match self.limit.bytes().checked_sub(self.charged_bytes) {
+            Some(left) if left > 0 => {
+                write!(f, ", but only {} of {} was left", Bytes(left), self.limit)?
+            }
+            _ => write!(f, ", but none of {} was left", self.limit)?,
+        }
+        if self.reclaim.is_some() {
+            f.write_str(" and nothing more could be spilled")?;
+        }
+        Ok(())
     }
 }
 
