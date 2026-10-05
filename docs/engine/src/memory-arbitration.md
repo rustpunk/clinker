@@ -63,7 +63,18 @@ of either, can never together pass the limit; the older `set_bytes` /
 carries a snapshot taken under the same lock: the limit, the charged total, each labelled holder's
 current bytes under its node name and an author-vocabulary surface, and the
 bytes no labelled holder owns, so
-the holders and that remainder add up to the charged total. A reserve made for
+the holders and that remainder add up to the charged total. A Source's
+consumer unregisters once the Source has finished reading, and the drain arm
+hands its rows on only after that, so the rows it read can still be charged
+in its name once its consumer is gone. `unregister_consumer` reads
+`can_back_pressure` once (the predicate that makes a listed holder a
+Source), and for a Source whose grants are still live the ledger keeps its
+entry, unlabelled and marked as a finished Source's, until the last of those
+bytes drops; the snapshot reports them as `retired_source`, always inside the
+remainder. Nothing is re-charged. An E310 shows them as memory not held by
+any one node and never counts them as state that cannot spill, the same rule
+as for a Source still listed; bytes granted in no consumer's name, or in the
+name of another consumer that has unregistered, still count. A reserve made for
 a consumer is attributed to it for the life of the grant, and the ledger keeps
 each consumer's high-water mark over its handle bytes plus its attributed
 bytes; attribution never changes what is admitted. Every release advances a

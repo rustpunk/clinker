@@ -967,7 +967,10 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
 ### 92. Text a Source admitted stays charged after the Source finishes, but no node is named for it
 
 - Filed: 2026-10-05.
-- Status: Open.
+- Status: Open. The cannot-spill count is resolved: an E310 no longer counts
+  a finished Source's surviving rows as state that cannot spill. Naming the
+  step that keeps them alive, and the parked edge's reclaimable figure, stay
+  open.
 - Priority: Medium.
 - Evidence: Long text a Source reads is admitted once, in the Source's name,
   and the admission travels with the allocation to every copy of the row
@@ -975,27 +978,58 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
   therefore does not charge that text again: its charge covers only what its
   copy allocates itself (`Record::clone_allocation_bytes`). When the Source
   finishes, its memory consumer is unregistered and its name leaves the
-  ledger, but any text a parked copy still keeps alive stays charged, as an
-  unattributed remainder (`MemoryArbitrator::unregister_consumer`; the ledger
-  test `release_after_the_entry_is_removed_is_unattributed`). The run's total
-  stays exact, so no limit is exceeded unnoticed. Two figures are weaker than
-  they could be: a memory-limit failure (E310) can only report those bytes as
-  memory no node holds, so it cannot name the parked edge that keeps them
-  alive; and the parked edge's reclaimable figure leaves them out, so a
-  reclaim pass underrates what spilling that edge would free.
+  ledger; the plain Source arm unregisters before it hands its rows to the
+  slot downstream (`dispatch_source`), so this is the common case, not a
+  residue. Bytes still granted in the Source's name stay charged, and the
+  ledger now keeps them identifiable as a finished Source's inside the
+  unattributed remainder until the last of them drops
+  (`LedgerState::remove_consumer`; the snapshot's `retired_source`; the
+  ledger test
+  `a_finished_sources_rows_stay_identifiable_until_their_last_byte_drops`).
+  An E310 never counts them as state that cannot spill, the same rule as for
+  a Source still listed (`build_report`; the test
+  `rows_a_finished_source_read_never_count_as_state_that_cannot_spill`). The
+  run's total stays exact, so no limit is exceeded unnoticed. Two figures
+  are still weaker than they could be: an E310 can only report those bytes
+  as memory not held by any one node, so it cannot name the step (a parked
+  edge, a buffered slot) that keeps them alive; and the parked edge's
+  reclaimable figure leaves them out, so a reclaim pass underrates what
+  spilling that edge would free.
+- Charges made in a finished Source's name: on the walk, governed
+  allocations are charged to the dispatching node's first registered
+  consumer (`dispatch_plan_node`), and the plain Source arm unregisters its
+  consumer before it builds node-rooted windows, parks cross-region copies
+  and admits its slot, so whatever those steps allocate through the walk's
+  governed view is charged in the finished Source's name. While the
+  Source's rows are still charged, those bytes join the finished Source's
+  figure; when the Source unregistered with nothing granted in its name,
+  they create an unlabelled entry and count as state that cannot spill, as
+  they did before. Which of those steps allocate through that view was not
+  confirmed.
+- Unconfirmed general case: a consumer that is not a Source and unregisters
+  while rows granted in its name on the walk stay resident downstream leaves
+  those rows as memory not held by any one node, still counted as state that
+  cannot spill. Walk allocations are attributed to the dispatching node's
+  first consumer (`dispatch_plan_node`), so any node whose first consumer
+  unregisters before its output drops would show this; no production
+  consumer was confirmed to do so.
 - Files/modules involved:
   `crates/clinker-exec/src/executor/parked_generations.rs` (`park`, the
-  edge's reclaimable figure), `crates/clinker-exec/src/pipeline/memory.rs`
-  (`unregister_consumer`), `crates/clinker-exec/src/pipeline/memory/ledger.rs`
-  (the unattributed remainder and the E310 holder list),
+  edge's reclaimable figure), `crates/clinker-exec/src/executor/source_dispatch.rs`
+  (`dispatch_source`), `crates/clinker-exec/src/executor/dispatch.rs`
+  (`dispatch_plan_node`, `release_source_consumer`),
+  `crates/clinker-exec/src/pipeline/memory.rs` (`unregister_consumer`),
+  `crates/clinker-exec/src/pipeline/memory/protocol.rs` (the finished
+  Source's entry), `crates/clinker-exec/src/pipeline/memory/ledger.rs` (the
+  unattributed remainder, `retired_source` and the E310 holder list),
   `crates/clinker-record/src/field_str.rs` (`try_new`).
 - Suggested way to resolve it: Decide, with the reclaim victim order and the
-  E310 holder report, whether an unregistered Source's surviving admissions
-  are re-attributed to the holder that keeps them alive, or whether the E310
-  reports them as text a finished Source read that a named downstream holder
-  still keeps; then rank a parked edge by what spilling it would actually
-  free, including that text.
-- Implementation owner: Executor maintainers.
+  E310 holder report, how an E310 names the step that keeps a finished
+  Source's rows alive (by what that step alone keeps alive, or by handing
+  the charge over to it); then rank a parked edge by what spilling it would
+  actually free, including that text.
+- Implementation owner: Executor maintainers, with the input-cursor work that
+  hands rows over to the step that keeps them.
 
 ### 93. A Combine's build table charges text its Source already holds charged
 

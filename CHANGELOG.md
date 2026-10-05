@@ -397,8 +397,8 @@ E310 totals: needed 2.0 MiB more for group state, but only 704.0 KiB of memory.l
   freed, the smallest limit that would have granted the request in YAML
   and `--memory-limit` form, and a remedy keyed to the largest holder that
   cannot spill. A Source still reading is listed as `active source`; a
-  Source's rows, paused or active, never count as state that cannot spill,
-  and a Source is never the remedy.
+  Source's rows, paused, active or after it has finished reading, never count
+  as state that cannot spill, and a Source is never the remedy.
 - A Reshape or Cull group too large to hold whole is identified by where its
   first row came from (`group: the one whose first row is row 4812 of source
   orders`, the row number the dead-letter output writes in
