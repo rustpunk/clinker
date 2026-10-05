@@ -3696,7 +3696,8 @@ impl PlannedNodeBufferReaders {
     }
 
     /// The label a slot's charge is reported under: the rows `producer`
-    /// buffered for the nodes that read the slot. A successor-local slot is
+    /// buffered for the nodes that read the slot, every distinct planned
+    /// reader named on its own in planned order. A successor-local slot is
     /// read by the node it is keyed on; a slot with no planned reader (a
     /// composition body's terminal output) is read by the composition.
     pub(crate) fn slot_label(
@@ -3705,14 +3706,16 @@ impl PlannedNodeBufferReaders {
         key: &NodeBufferKey,
         composition_call_sites: &[String],
     ) -> clinker_plan::runtime_error::ConsumerLabel {
-        let mut readers: Vec<&str> = Vec::new();
+        // One entry per reading edge, so a node reading the slot over two
+        // edges appears twice; the report names it once.
+        let mut readers: Vec<String> = Vec::new();
         for name in self.readers.get(key).into_iter().flatten() {
-            if !readers.contains(&&**name) {
-                readers.push(name);
+            if !readers.iter().any(|reader| reader.as_str() == &**name) {
+                readers.push(name.to_string());
             }
         }
         let to = if !readers.is_empty() {
-            vec![readers.join(", ")]
+            readers
         } else if let Some(keyed) = self.node_names.get(&key.node)
             && &**keyed != producer
         {
