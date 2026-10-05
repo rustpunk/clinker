@@ -1368,8 +1368,17 @@ pub(crate) mod walk_test_support {
             if id != self.consumer {
                 return Ok(OwnedSpillResult::NotHeld);
             }
-            self.spill();
-            Ok(OwnedSpillResult::Wrote)
+            // Report what the spill did: it writes only resident values, so
+            // state already on disk has nothing to write, and a cell that
+            // holds no values holds no state.
+            if self.is_resident() {
+                self.spill();
+                Ok(OwnedSpillResult::Wrote)
+            } else if !self.on_disk.is_empty() {
+                Ok(OwnedSpillResult::NothingToWrite)
+            } else {
+                Ok(OwnedSpillResult::NotHeld)
+            }
         }
     }
 
