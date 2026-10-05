@@ -294,6 +294,13 @@ pub(crate) struct GraceStatsSink<'a> {
 /// than each operator). Public surface is constructed and driven by
 /// [`execute_combine_grace_hash`]; the type itself is `pub(crate)` so
 /// unit tests in this module can assert on the transition lifecycle.
+///
+/// The kernel keeps it in a walk-owned cell ([`GracePartitions`]), so a
+/// reclaim pass another request starts on the walk spills its `Building`
+/// partitions between two of the kernel's operations on it. Only those
+/// can be spilled: a partition already on disk has nothing left to write,
+/// and from [`Self::finish_build`] on the probe holds every in-memory
+/// partition, so the consumer's reclaimable figure is 0 from then on.
 pub(crate) struct GraceHashExecutor {
     assigner: PartitionAssigner,
     partitions: Vec<PartitionState>,
@@ -310,6 +317,12 @@ pub(crate) struct GraceHashExecutor {
     /// `bytes_estimated`. On-disk partitions don't count against
     /// `handle.bytes` — Velox's "reclaimable ≠ held" point.
     consumer_handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
+    /// Bytes of the `Building` partitions' rows: what a spill of this table
+    /// frees now. Recorded on `consumer_handle` as the consumer's
+    /// reclaimable figure after every insert and every spill, and 0 from
+    /// [`Self::finish_build`] on, when the probe holds every in-memory
+    /// partition (and a reloaded partition is held by its own probe).
+    building_bytes: u64,
     /// Whether partition spill files are LZ4-compressed. Resolved by the
     /// dispatcher from the workspace `[storage.spill] compress` knob against
     /// this combine's output-schema width and the run's batch size, so the
@@ -371,8 +384,14 @@ impl GraceHashExecutor {
             hash_state: RandomState::new(),
             name: name.to_string(),
             consumer_handle,
+            building_bytes: 0,
             spill_compress,
         }
+    }
+
+    /// Record on the consumer's handle what a spill of this table frees now.
+    fn publish_reclaimable(&self) {
+        self.consumer_handle.set_reclaimable(self.building_bytes);
     }
 
     /// Path of the spill directory hosting per-partition files.
@@ -440,6 +459,8 @@ impl GraceHashExecutor {
                     // handle so the arbitrator's policy sees this
                     // partition's contribution at poll time.
                     self.consumer_handle.add_bytes(bytes as u64);
+                    self.building_bytes = self.building_bytes.saturating_add(bytes as u64);
+                    self.publish_reclaimable();
                 }
             }
             Some(hash_bits) => {
@@ -548,6 +569,8 @@ impl GraceHashExecutor {
         // operator's live state without wrapping if estimate drift
         // ever exceeds the running total.
         self.consumer_handle.sub_bytes(bytes_estimated as u64);
+        self.building_bytes = self.building_bytes.saturating_sub(bytes_estimated as u64);
+        self.publish_reclaimable();
         charge_grace_spill(budget, &self.name, written)?;
         Ok(())
     }
@@ -590,6 +613,10 @@ impl GraceHashExecutor {
     /// at this transition: in-memory partitions complete probing
     /// against the live `CombineHashTable` and never reach the BNL
     /// branch where the sketch would be consulted.
+    ///
+    /// From here on the probe holds every in-memory partition, so the
+    /// consumer's reclaimable figure is 0: a pass can spill nothing of this
+    /// table, though its partitions stay charged until they drop.
     pub(crate) fn finish_build(
         &mut self,
         extractor: &KeyExtractor,
@@ -597,6 +624,8 @@ impl GraceHashExecutor {
         budget: &MemoryArbitrator,
         combine_name: &str,
     ) -> Result<(), PipelineError> {
+        self.building_bytes = 0;
+        self.publish_reclaimable();
         for i in 0..self.partitions.len() {
             let prev = std::mem::replace(&mut self.partitions[i], PartitionState::Done);
             let new_state = match prev {
@@ -1258,6 +1287,15 @@ impl GracePartitions {
 /// `add_build_record` polls and elects the largest building partition
 /// to spill via `GraceSpillWriter`.
 ///
+/// A reclaim pass on the walk spills the partition table directly while
+/// the build runs: the kernel registers the table as walk-owned state
+/// under this consumer, and a pass that elects it spills every building
+/// partition. `reclaimable_bytes` is the figure the executor records: the
+/// building partitions' bytes during the build, and 0 from the end of the
+/// build on, because the probe then holds every in-memory partition (and a
+/// reloaded partition is held by its own probe), so no pass can spill any
+/// of it.
+///
 /// `spill_priority = 10`: grace-hash partition spill is cheaper than
 /// sort (each partition writes through `GraceSpillWriter` without
 /// run-merge fixup) and far cheaper than hash-aggregation rebuilds.
@@ -1278,6 +1316,12 @@ impl GraceHashConsumer {
 impl crate::pipeline::memory::MemoryConsumer for GraceHashConsumer {
     fn current_usage(&self) -> u64 {
         self.handle.bytes()
+    }
+
+    /// What spilling the building partitions frees now, as the executor
+    /// last recorded it: 0 once the probe holds the partitions.
+    fn reclaimable_bytes(&self) -> u64 {
+        self.handle.reclaimable()
     }
 
     fn peak_charged_bytes(&self) -> Option<u64> {

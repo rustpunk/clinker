@@ -3103,7 +3103,10 @@ fn grace_partitions_after_the_build_are_not_reclaimable() {
         arbitrator
             .set_limit(arbitrator.charged_bytes() + FOREIGN_FREE)
             .expect("limit");
-        let shortfall = foreign_walk_request(&arbitrator, 3 * FOREIGN_FREE)
+        // Within the limit, so a round runs, but more than the free room and
+        // the other owner's state together: only the grace partitions could
+        // make up the rest, and the probe holds them.
+        let shortfall = foreign_walk_request(&arbitrator, 2 * FOREIGN_FREE + building / 2)
             .expect_err("spilling the other owner leaves too little room");
         let report = shortfall.into_report(&arbitrator);
         let round = report.reclaim.as_ref().expect("the walk ran a round");
