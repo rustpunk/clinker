@@ -842,18 +842,10 @@ where
             // priority 10) and the GraceHashExecutor that
             // mirrors its in-memory partition `bytes_estimated`
             // sum into the handle's counter on every admit /
-            // spill_partition transition.
-            let grace_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
-            let grace_consumer_id = ctx.memory_budget.register_node_consumer(
-                Arc::new(crate::pipeline::grace_hash::GraceHashConsumer::new(
-                    grace_consumer_handle.clone(),
-                )),
-                grace_consumer_handle.clone(),
-                ConsumerLabel {
-                    node: name.to_string(),
-                    surface: MemorySurface::JoinBuildSide,
-                },
-            );
+            // spill_partition transition. The kernel registers its
+            // partition table as walk-owned state under the same id.
+            let (grace_consumer_id, grace_consumer_handle) =
+                crate::pipeline::grace_hash::register_grace_consumer(&ctx.memory_budget, name);
             // Every exit past this registration must unregister the
             // consumer, so the kernel-install-through-admit body runs
             // inside a closure whose Result is captured: the clean return
@@ -925,6 +917,7 @@ where
                         spill_dir: ctx.spill_root_path.as_ref(),
                         spill_compress: grace_spill_compress,
                         consumer_handle: grace_consumer_handle,
+                        consumer_id: grace_consumer_id,
                         strategy: ctx.strategy,
                         stats_sink: crate::pipeline::grace_hash::GraceStatsSink {
                             catalog: std::sync::Arc::clone(&ctx.runtime_statistics),

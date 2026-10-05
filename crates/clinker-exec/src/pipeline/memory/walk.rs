@@ -1262,6 +1262,13 @@ pub(crate) mod walk_test_support {
         result
     }
 
+    /// A consumer id no arbitrator issued, for an operator a test builds
+    /// with no run: with no walk frame on the thread, nothing registers
+    /// under it.
+    pub(crate) fn unregistered_consumer_id() -> ConsumerId {
+        ConsumerId(u32::MAX)
+    }
+
     /// The consumer a foreign request is made in the name of: charged only
     /// through its grants, with nothing a spill could free.
     struct ForeignProbe {

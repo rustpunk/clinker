@@ -589,6 +589,7 @@ fn combine_driver_identity_survives_grace_hash_partition_pair() {
             spill_dir: dir.path(),
             spill_compress: true,
             consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
+            consumer_id: crate::pipeline::memory::walk::walk_test_support::unregistered_consumer_id(),
             strategy: clinker_plan::config::ErrorStrategy::FailFast,
             stats_sink: test_stats_sink(&stats_catalog, "products", "products"),
         },
@@ -864,6 +865,7 @@ fn execute_grace_hash_spill_then_reload_correct() {
             spill_dir: dir.path(),
             spill_compress: true,
             consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
+            consumer_id: crate::pipeline::memory::walk::walk_test_support::unregistered_consumer_id(),
             strategy: clinker_plan::config::ErrorStrategy::FailFast,
             stats_sink: test_stats_sink(&stats_catalog, "products", "products"),
         },
@@ -1060,6 +1062,7 @@ fn execute_grace_hash_aborts_on_disk_quota_overflow() {
             spill_dir: dir.path(),
             spill_compress: true,
             consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
+            consumer_id: crate::pipeline::memory::walk::walk_test_support::unregistered_consumer_id(),
             strategy: clinker_plan::config::ErrorStrategy::FailFast,
             stats_sink: test_stats_sink(&stats_catalog, "products", "products"),
         },
@@ -2655,6 +2658,7 @@ fn run_grace_arrival_order(
             spill_dir: dir.path(),
             spill_compress: true,
             consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
+            consumer_id: crate::pipeline::memory::walk::walk_test_support::unregistered_consumer_id(),
             strategy: clinker_plan::config::ErrorStrategy::FailFast,
             stats_sink: test_stats_sink(&stats_catalog, "products", "products"),
         },
@@ -2727,4 +2731,300 @@ fn grace_hash_candidates_follow_build_arrival_order_resident_and_spilled() {
             "spilled: all emits key {key}'s build rows in arrival order"
         );
     }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// The partition table as walk-owned state
+// ──────────────────────────────────────────────────────────────────
+
+/// Free capacity a foreign request is made short of, past the charged total.
+const FOREIGN_FREE: u64 = 4 * 1024;
+
+/// Build rows keyed `0..GRACE_ORDER_KEYS`, [`GRACE_ORDER_PER_KEY`] per key,
+/// delivered interleaved across keys, and one driver per key.
+fn reclaim_join_inputs(h: &BnlHarness) -> (Vec<Record>, Vec<(Record, RecordOrder)>) {
+    let builds = (0..GRACE_ORDER_PER_KEY)
+        .flat_map(|n| (0..GRACE_ORDER_KEYS).map(move |k| (k, n)))
+        .map(|(k, n)| keyed_build(h, k, n as usize))
+        .collect();
+    let drivers = (0..GRACE_ORDER_KEYS)
+        .map(|k| (keyed_probe(h, k), (k as u64).into()))
+        .collect();
+    (builds, drivers)
+}
+
+/// Node `joined`'s grace consumer and its partition table, registered as
+/// the Combine dispatch and [`execute_combine_grace_hash`] register them.
+fn registered_partitions(
+    arbitrator: &MemoryArbitrator,
+    dir: &std::path::Path,
+) -> (
+    crate::pipeline::memory::ConsumerId,
+    Arc<crate::pipeline::memory::ConsumerHandle>,
+    GracePartitions,
+) {
+    let (id, handle) = register_grace_consumer(arbitrator, "joined");
+    let partitions = GracePartitions::register(
+        arbitrator,
+        id,
+        GraceHashExecutor::new(2, dir, Arc::clone(&handle), true, "joined"),
+    )
+    .expect("registered");
+    (id, handle, partitions)
+}
+
+/// Add `builds` to `partitions` in arrival order, each placed by the hash
+/// of its join key as the kernel's build loop places it.
+fn add_builds(
+    partitions: &GracePartitions,
+    h: &BnlHarness,
+    builds: &[Record],
+    budget: &MemoryArbitrator,
+) {
+    let ctx = EvalContext::test_with_file(&h.stable, &h.source_file, 0);
+    let hash_state = partitions.hash_state();
+    for (index, record) in builds.iter().enumerate() {
+        let keys = h.build_extractor.extract(&ctx, record).unwrap();
+        partitions
+            .add_build_record(
+                record.clone(),
+                build_row(index),
+                crate::pipeline::combine::BuildSeq(index as u64),
+                hash_composite_key(&keys, &hash_state),
+                budget,
+            )
+            .expect("build row added");
+    }
+}
+
+/// Finish `partitions`' build, probe `drivers` and reload every spilled
+/// partition, as [`execute_combine_grace_hash`] does from its build on.
+/// Returns the output records in emitted order.
+fn finish_and_probe(
+    partitions: &GracePartitions,
+    h: &BnlHarness,
+    drivers: Vec<(Record, RecordOrder)>,
+    budget: &MemoryArbitrator,
+) -> Vec<Record> {
+    let ctx = EvalContext::test_with_file(&h.stable, &h.source_file, 0);
+    partitions
+        .finish_build(&h.build_extractor, &ctx, budget, &h.emit.name)
+        .expect("build finished");
+    let emit = EmitArgs {
+        name: &h.emit.name,
+        decomposed: &h.decomposed,
+        resolver_mapping: &h.resolver_mapping,
+        output_schema: Some(&h.emit.output_schema),
+        match_mode: h.emit.match_mode,
+        on_miss: h.emit.on_miss,
+        build_qualifier: &h.emit.build_qualifier,
+        propagate_ck: &clinker_plan::config::pipeline_node::PropagateCkSpec::Driver,
+        strategy: clinker_plan::config::ErrorStrategy::FailFast,
+    };
+    let hash_state = partitions.hash_state();
+    let mut records: Vec<(Record, RecordOrder)> = Vec::new();
+    let mut failures = Vec::new();
+    let mut keys: Vec<Value> = Vec::new();
+    for (driver, rn) in drivers {
+        let row_ctx = ctx.with_row(rn.ordinal());
+        let resolver = CombineResolver::new(&h.resolver_mapping, &driver, None);
+        keys.clear();
+        h.driver_extractor
+            .extract_into(&row_ctx, &resolver, &mut keys)
+            .expect("probe key");
+        let hash = hash_composite_key(&keys, &hash_state);
+        let outcome = partitions
+            .probe_record(&driver, rn, &keys, hash)
+            .expect("probe routed");
+        if let ProbeOutcome::InMemory(probe) = outcome {
+            emit_for_probe(
+                &emit,
+                &driver,
+                rn,
+                probe.matches(),
+                None,
+                &row_ctx,
+                &mut GraceEmitSink {
+                    records: &mut records,
+                    failures: &mut failures,
+                    name: &h.emit.name,
+                    max_output_rows: None,
+                },
+            )
+            .expect("matches emitted");
+        }
+    }
+    partitions
+        .finalize_probe_spills(budget)
+        .expect("probe spills finalized");
+    let spill_dir = partitions.spill_dir_path();
+    let rc = ReloadContext {
+        name: &h.emit.name,
+        build_extractor: &h.build_extractor,
+        driver_extractor: &h.driver_extractor,
+        emit: &emit,
+        ctx: &ctx,
+        build_schema: h.build_schema.clone(),
+        spill_dir: &spill_dir,
+        spill_compress: true,
+        hash_state: &hash_state,
+    };
+    let mut body_eval: Option<ProgramEvaluator> = None;
+    for sp in partitions.drain_spilled() {
+        process_spilled_partition(
+            &rc,
+            sp,
+            &mut body_eval,
+            budget,
+            &mut GraceEmitSink {
+                records: &mut records,
+                failures: &mut failures,
+                name: &h.emit.name,
+                max_output_rows: None,
+            },
+        )
+        .expect("spilled partition reloaded");
+    }
+    assert!(failures.is_empty(), "no output row failed");
+    records.into_iter().map(|(record, _)| record).collect()
+}
+
+/// The join of [`reclaim_join_inputs`] through a partition table nothing
+/// spills and no pass can reach: what an unspilled run emits.
+fn unspilled_join(h: &BnlHarness) -> Vec<Record> {
+    let budget =
+        MemoryArbitrator::with_policy(10 * 1024 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
+    let dir = tempfile::Builder::new()
+        .prefix("gh-unspilled-")
+        .tempdir()
+        .unwrap();
+    let partitions = GracePartitions::register(
+        &budget,
+        crate::pipeline::memory::walk::walk_test_support::unregistered_consumer_id(),
+        GraceHashExecutor::new(
+            2,
+            dir.path(),
+            crate::pipeline::memory::ConsumerHandle::new(),
+            true,
+            "joined",
+        ),
+    )
+    .expect("an operator built with no run registers nothing");
+    let (builds, drivers) = reclaim_join_inputs(h);
+    add_builds(&partitions, h, &builds, &budget);
+    finish_and_probe(&partitions, h, drivers, &budget)
+}
+
+/// Each partition holding build rows, by index, and whether it is on disk.
+fn partitions_holding_rows(partitions: &GracePartitions) -> Vec<(usize, bool)> {
+    partitions
+        .cell
+        .borrow()
+        .executor
+        .partitions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, state)| match state {
+            PartitionState::Building { records, .. } if !records.is_empty() => {
+                Some((index, false))
+            }
+            PartitionState::OnDisk { .. } => Some((index, true)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A walk request another consumer makes for more than is free, while a
+/// grace-hash Combine's build holds partitions resident, is granted by
+/// spilling those partitions: the grace consumer's charge falls by their
+/// bytes, each is on disk, the spill is recorded under the Combine's node,
+/// and finishing the build and probing yields the rows an unspilled run
+/// yields, each driver's in the same order.
+#[test]
+fn grace_partitions_spill_when_another_walk_request_falls_short() {
+    use crate::pipeline::memory::walk::walk_test_support::{
+        foreign_walk_request, with_test_walk_frame,
+    };
+    let h = build_bnl_harness();
+    let expected = unspilled_join(&h);
+    let resident_limit = 10 * 1024 * 1024 * 1024;
+    let arbitrator = Arc::new(MemoryArbitrator::with_policy(
+        resident_limit,
+        0.80,
+        0.70,
+        Box::new(crate::pipeline::memory::Priority),
+    ));
+    let dir = tempfile::Builder::new()
+        .prefix("gh-foreign-")
+        .tempdir()
+        .unwrap();
+    with_test_walk_frame(&arbitrator, || {
+        let (id, handle, partitions) = registered_partitions(&arbitrator, dir.path());
+        let (builds, drivers) = reclaim_join_inputs(&h);
+        add_builds(&partitions, &h, &builds, &arbitrator);
+        let holding = partitions_holding_rows(&partitions);
+        assert!(
+            !holding.is_empty() && holding.iter().all(|(_, on_disk)| !on_disk),
+            "the build holds its partitions resident: {holding:?}"
+        );
+        let building: u64 = partitions
+            .cell
+            .borrow()
+            .executor
+            .partitions
+            .iter()
+            .map(|state| state.building_bytes() as u64)
+            .sum();
+        let charged_before = handle.bytes();
+        assert_eq!(charged_before, building);
+        arbitrator
+            .set_limit(arbitrator.charged_bytes() + FOREIGN_FREE)
+            .expect("limit");
+        let spilled_before = arbitrator
+            .per_stage_spill_bytes()
+            .get("joined")
+            .copied()
+            .unwrap_or(0);
+
+        let grant = foreign_walk_request(&arbitrator, FOREIGN_FREE + building / 2)
+            .expect("the pass spills the build's partitions and the request fits");
+        assert_eq!(
+            handle.bytes(),
+            charged_before - building,
+            "the charge falls by the spilled partitions' bytes"
+        );
+        let after = partitions_holding_rows(&partitions);
+        assert_eq!(
+            after.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            holding.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            "the same partitions hold the build rows"
+        );
+        assert!(
+            after.iter().all(|(_, on_disk)| *on_disk),
+            "every partition that held rows is on disk: {after:?}"
+        );
+        assert!(
+            arbitrator
+                .per_stage_spill_bytes()
+                .get("joined")
+                .copied()
+                .unwrap_or(0)
+                > spilled_before,
+            "the spill is recorded under the Combine's node"
+        );
+        drop(grant);
+        arbitrator.set_limit(resident_limit).expect("limit");
+
+        let joined = finish_and_probe(&partitions, &h, drivers, &arbitrator);
+        let expected_pairs = grace_pairs_by_driver(&expected);
+        assert_eq!(expected_pairs.len(), GRACE_ORDER_KEYS as usize);
+        assert_eq!(joined.len(), expected.len());
+        assert_eq!(
+            grace_pairs_by_driver(&joined),
+            expected_pairs,
+            "a build a pass spilled joins as an unspilled build does"
+        );
+        drop(partitions);
+        arbitrator.unregister_consumer(id);
+    });
 }

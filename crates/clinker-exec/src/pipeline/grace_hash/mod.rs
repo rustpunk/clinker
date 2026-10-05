@@ -60,7 +60,9 @@ mod build;
 mod probe;
 mod spill;
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use ahash::RandomState;
@@ -79,16 +81,17 @@ use crate::pipeline::combine::{
 use crate::pipeline::grace_spill::{
     GraceSpillError, GraceSpillWriter, SpillFilePath, grace_spill_error,
 };
-use crate::pipeline::memory::MemoryArbitrator;
 #[cfg(test)]
 use crate::pipeline::memory::NoOpPolicy;
+use crate::pipeline::memory::{ConsumerHandle, ConsumerId, MemoryArbitrator};
 use crate::pipeline::spill::{SpillFile, SpillWriter};
 use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::combine::DecomposedPredicate;
+use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface};
 
 use build::{GraceHll, PartitionAssigner, estimated_build_entry_bytes};
-use probe::{EmitArgs, GraceEmitSink, ProbeMatches, ProbeOutcome, emit_for_probe};
+use probe::{EmitArgs, GraceEmitSink, InMemoryProbe, ProbeMatches, ProbeOutcome, emit_for_probe};
 use spill::{ReloadContext, SpilledPartition, process_spilled_partition};
 
 /// Period (matches emitted) between [`MemoryArbitrator::should_abort`] polls
@@ -163,16 +166,32 @@ enum PartitionState {
         hash_bits: u8,
         distinct_sketch: GraceHll,
     },
-    /// In-memory hash table built; ready for probe. `build_ids[i]` is the
-    /// row id and [`BuildSeq`] of the build record the table reports at
-    /// `ProbeCandidate.index == i`: the table keeps insertion order, and
-    /// both are built from the same pairs in the same order.
-    Ready {
-        hash_table: CombineHashTable,
-        build_ids: Vec<(RecordOrder, BuildSeq)>,
-    },
+    /// In-memory hash table built; ready for probe. Held by its own `Rc`,
+    /// so a probe's matches are emitted from it with no borrow of the
+    /// executor live.
+    Ready(Rc<ReadyPartition>),
     /// Fully processed; resources released.
     Done,
+}
+
+/// A partition built in memory. `build_ids[i]` is the row id and
+/// [`BuildSeq`] of the build record the table reports at
+/// `ProbeCandidate.index == i`: the table keeps insertion order, and both
+/// are built from the same pairs in the same order.
+pub(crate) struct ReadyPartition {
+    hash_table: CombineHashTable,
+    build_ids: Vec<(RecordOrder, BuildSeq)>,
+}
+
+impl ReadyPartition {
+    /// The candidates `probe_keys` finds in this partition, with the row id
+    /// and arrival position of every build row the table holds.
+    fn matches<'a>(&'a self, probe_keys: &'a [Value]) -> ProbeMatches<'a> {
+        ProbeMatches {
+            candidates: self.hash_table.probe(probe_keys),
+            build_ids: &self.build_ids,
+        }
+    }
 }
 
 impl PartitionState {
@@ -231,6 +250,10 @@ pub(crate) struct GraceHashExec<'a> {
     /// partition bytes mirror into the arbitrator's pull-mode
     /// `current_usage` surface.
     pub consumer_handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
+    /// The id the `GraceHashConsumer` sharing `consumer_handle` was
+    /// registered under ([`register_grace_consumer`]): the kernel registers
+    /// its partition table as walk-owned state under it.
+    pub consumer_id: ConsumerId,
     /// Error strategy governing output-stage eval failures. Under
     /// `FailFast` a residual / body eval error propagates immediately;
     /// under `Continue` the failing row is deferred to the dispatcher via
@@ -555,19 +578,19 @@ impl GraceHashExecutor {
                         let table =
                             CombineHashTable::build(records, extractor, ctx, budget, Some(0))
                                 .map_err(|e| e.into_build_error(combine_name, budget))?;
-                        PartitionState::Ready {
+                        PartitionState::Ready(Rc::new(ReadyPartition {
                             hash_table: table,
                             build_ids,
-                        }
+                        }))
                     } else {
                         let estimated = Some(records.len());
                         let table =
                             CombineHashTable::build(records, extractor, ctx, budget, estimated)
                                 .map_err(|e| e.into_build_error(combine_name, budget))?;
-                        PartitionState::Ready {
+                        PartitionState::Ready(Rc::new(ReadyPartition {
                             hash_table: table,
                             build_ids,
-                        }
+                        }))
                     }
                 }
                 other => other,
@@ -577,26 +600,26 @@ impl GraceHashExecutor {
         Ok(())
     }
 
-    /// Probe one record. Returns matches collected from the partition's
-    /// hash table when `Ready`, or routes the record to the partition's
-    /// probe-side spill file when `OnDisk` and returns an empty Vec.
+    /// Probe one record. Returns the partition built in memory, which the
+    /// caller asks for the record's matches, when `Ready`, or routes the
+    /// record to the partition's probe-side spill file when `OnDisk`.
+    ///
+    /// The in-memory outcome holds the partition by its own `Rc`, so it
+    /// keeps no borrow of the executor.
     ///
     /// Caller must have invoked [`Self::finish_build`] before this.
-    pub(crate) fn probe_record<'a>(
-        &'a mut self,
+    pub(crate) fn probe_record<'k>(
+        &mut self,
         record: &Record,
         row_id: RecordOrder,
-        probe_keys: &'a [Value],
+        probe_keys: &'k [Value],
         hash: u64,
-    ) -> Result<ProbeOutcome<'a>, GraceSpillError> {
+    ) -> Result<ProbeOutcome<'k>, GraceSpillError> {
         let p = self.assigner.partition_for(hash) as usize;
         match &mut self.partitions[p] {
-            PartitionState::Ready {
-                hash_table,
-                build_ids,
-            } => Ok(ProbeOutcome::InMemory(ProbeMatches {
-                candidates: hash_table.probe(probe_keys),
-                build_ids,
+            PartitionState::Ready(partition) => Ok(ProbeOutcome::InMemory(InMemoryProbe {
+                partition: Rc::clone(partition),
+                probe_keys,
             })),
             PartitionState::OnDisk {
                 probe_writer,
@@ -724,6 +747,7 @@ pub(crate) fn execute_combine_grace_hash(
         spill_dir,
         spill_compress,
         consumer_handle,
+        consumer_id,
         strategy,
         stats_sink,
     } = args;
@@ -783,13 +807,20 @@ pub(crate) fn execute_combine_grace_hash(
         .map(|(r, _)| r.schema().clone())
         .or_else(|| output_schema.cloned())
         .unwrap_or_else(|| SharedStorage::from_arc(Arc::new(Schema::new(Vec::new()))));
-    let mut executor = GraceHashExecutor::new(
-        partition_bits,
-        spill_dir,
-        consumer_handle,
-        spill_compress,
-        name,
-    );
+    // The partition table lives in a walk-owned cell registered under the
+    // grace consumer, so a reclaim pass another request starts can spill its
+    // building partitions; the registration drops with it on every exit.
+    let partitions = GracePartitions::register(
+        budget,
+        consumer_id,
+        GraceHashExecutor::new(
+            partition_bits,
+            spill_dir,
+            consumer_handle,
+            spill_compress,
+            name,
+        ),
+    )?;
 
     // ── Build phase ────────────────────────────────────────────────────
     //
@@ -803,7 +834,7 @@ pub(crate) fn execute_combine_grace_hash(
     // and spill timing are byte-identical to a sequential build. The
     // hash seed is cloned out of the executor first; `RandomState::clone`
     // preserves the seed, so every worker hashes identically.
-    let build_hash_state = executor.hash_state().clone();
+    let build_hash_state = partitions.hash_state();
     // Each build row's arrival position, minted here where the Combine
     // receives its build input, before partitioning moves rows apart.
     let hashed_build: Vec<(Record, RecordOrder, BuildSeq, u64)> = pool.install(|| {
@@ -865,7 +896,7 @@ pub(crate) fn execute_combine_grace_hash(
                 .map(|keys| representative_key_value(&keys))
                 .unwrap_or(Value::Null)
         });
-        executor
+        partitions
             .add_build_record(record, row, seq, hash, budget)
             .map_err(|e| grace_spill_error(e, name, "build add failed"))?;
     }
@@ -892,7 +923,7 @@ pub(crate) fn execute_combine_grace_hash(
             );
         }
     }
-    executor.finish_build(&build_extractor, ctx, budget, name)?;
+    partitions.finish_build(&build_extractor, ctx, budget, name)?;
 
     // ── Probe phase ───────────────────────────────────────────────────
     let mut output_records: Vec<(Record, RecordOrder)> = Vec::new();
@@ -917,6 +948,7 @@ pub(crate) fn execute_combine_grace_hash(
         strategy,
     };
 
+    let probe_hash_state = partitions.hash_state();
     for (probe_record, rn) in driver_records {
         let row_ctx = ctx.with_row(rn.ordinal());
         let probe_resolver = CombineResolver::new(resolver_mapping, &probe_record, None);
@@ -927,19 +959,19 @@ pub(crate) fn execute_combine_grace_hash(
                 transform_name: name.to_string(),
                 messages: vec![format!("grace hash probe key eval error: {e}")],
             })?;
-        let hash = hash_composite_key(&probe_keys_buf, executor.hash_state());
+        let hash = hash_composite_key(&probe_keys_buf, &probe_hash_state);
 
-        let outcome = executor
+        let outcome = partitions
             .probe_record(&probe_record, rn, &probe_keys_buf, hash)
             .map_err(|e| grace_spill_error(e, name, "probe failed"))?;
 
         match outcome {
-            ProbeOutcome::InMemory(matches) => {
+            ProbeOutcome::InMemory(probe) => {
                 emit_for_probe(
                     &emit_args,
                     &probe_record,
                     rn,
-                    matches,
+                    probe.matches(),
                     body_evaluator.as_mut(),
                     &row_ctx,
                     &mut GraceEmitSink {
@@ -970,7 +1002,7 @@ pub(crate) fn execute_combine_grace_hash(
         }
     }
 
-    executor
+    partitions
         .finalize_probe_spills(budget)
         .map_err(|e| grace_spill_error(e, name, "probe finalize failed"))?;
 
@@ -978,9 +1010,9 @@ pub(crate) fn execute_combine_grace_hash(
     // Process every spilled partition pair. A reloaded partition that
     // still exceeds soft_limit after its hash table is built triggers
     // recursive repartition via PartitionAssigner::double.
-    let spill_dir_path = executor.spill_dir_path().to_path_buf();
-    let hash_state = executor.hash_state().clone();
-    let spilled = executor.drain_spilled();
+    let spill_dir_path = partitions.spill_dir_path();
+    let hash_state = probe_hash_state;
+    let spilled = partitions.drain_spilled();
     let rc = ReloadContext {
         name,
         build_extractor: &build_extractor,
@@ -1009,12 +1041,142 @@ pub(crate) fn execute_combine_grace_hash(
 
     // Keep the executor alive until reload finishes — its TempDir owns
     // every spill file path threaded through the reload loop.
-    drop(executor);
+    drop(partitions);
 
     Ok(CombineKernelOutput {
         records: output_records,
         output_eval_failures,
     })
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// The partition table as walk-owned state
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Register node `name`'s grace-hash consumer on `budget`: the consumer the
+/// Combine's partition table charges through the returned handle, under the
+/// id [`execute_combine_grace_hash`] registers that table as walk-owned
+/// state. The caller unregisters it once the kernel has returned.
+pub(crate) fn register_grace_consumer(
+    budget: &MemoryArbitrator,
+    name: &str,
+) -> (ConsumerId, Arc<ConsumerHandle>) {
+    let handle = ConsumerHandle::new();
+    let id = budget.register_node_consumer(
+        Arc::new(GraceHashConsumer::new(Arc::clone(&handle))),
+        Arc::clone(&handle),
+        ConsumerLabel {
+            node: name.to_string(),
+            surface: MemorySurface::JoinBuildSide,
+        },
+    );
+    (id, handle)
+}
+
+/// A grace-hash join's partition table as walk-owned state: the executor
+/// that holds the partitions and charges them to its consumer's handle.
+struct GracePartitionCell {
+    executor: GraceHashExecutor,
+}
+
+/// A grace-hash join's partition table in its walk-owned cell.
+///
+/// The cell is borrowed only inside one of the methods here, each one
+/// executor operation, never across the build-key extraction, the sketch
+/// observation, a probe's match emission, a spilled partition's reload or
+/// the kernel's own memory checks.
+pub(crate) struct GracePartitions {
+    cell: Rc<RefCell<GracePartitionCell>>,
+}
+
+impl GracePartitions {
+    /// Put `executor` in a walk-owned cell for consumer `consumer`, which
+    /// charges it through the executor's handle.
+    ///
+    /// # Errors
+    ///
+    /// None yet.
+    pub(crate) fn register(
+        budget: &MemoryArbitrator,
+        consumer: ConsumerId,
+        executor: GraceHashExecutor,
+    ) -> Result<Self, PipelineError> {
+        let _ = (budget, consumer);
+        Ok(Self {
+            cell: Rc::new(RefCell::new(GracePartitionCell { executor })),
+        })
+    }
+
+    /// The hash state every partition is placed by.
+    pub(crate) fn hash_state(&self) -> RandomState {
+        self.cell.borrow().executor.hash_state().clone()
+    }
+
+    /// The spill directory the partitions' files are written to.
+    pub(crate) fn spill_dir_path(&self) -> PathBuf {
+        self.cell.borrow().executor.spill_dir_path().to_path_buf()
+    }
+
+    /// As [`GraceHashExecutor::add_build_record`].
+    pub(crate) fn add_build_record(
+        &self,
+        record: Record,
+        row: RecordOrder,
+        seq: BuildSeq,
+        hash: u64,
+        budget: &MemoryArbitrator,
+    ) -> Result<(), GraceSpillError> {
+        self.cell
+            .borrow_mut()
+            .executor
+            .add_build_record(record, row, seq, hash, budget)
+    }
+
+    /// As [`GraceHashExecutor::finish_build`].
+    pub(crate) fn finish_build(
+        &self,
+        extractor: &KeyExtractor,
+        ctx: &EvalContext<'_>,
+        budget: &MemoryArbitrator,
+        combine_name: &str,
+    ) -> Result<(), PipelineError> {
+        self.cell
+            .borrow_mut()
+            .executor
+            .finish_build(extractor, ctx, budget, combine_name)
+    }
+
+    /// As [`GraceHashExecutor::probe_record`]. The in-memory outcome holds
+    /// its partition by its own `Rc`, so no borrow of the cell is live
+    /// while the caller emits the matches.
+    pub(crate) fn probe_record<'k>(
+        &self,
+        record: &Record,
+        row_id: RecordOrder,
+        probe_keys: &'k [Value],
+        hash: u64,
+    ) -> Result<ProbeOutcome<'k>, GraceSpillError> {
+        self.cell
+            .borrow_mut()
+            .executor
+            .probe_record(record, row_id, probe_keys, hash)
+    }
+
+    /// As [`GraceHashExecutor::finalize_probe_spills`].
+    pub(crate) fn finalize_probe_spills(
+        &self,
+        budget: &MemoryArbitrator,
+    ) -> Result<(), GraceSpillError> {
+        self.cell
+            .borrow_mut()
+            .executor
+            .finalize_probe_spills(budget)
+    }
+
+    /// As [`GraceHashExecutor::drain_spilled`].
+    pub(crate) fn drain_spilled(&self) -> Vec<SpilledPartition> {
+        self.cell.borrow_mut().executor.drain_spilled()
+    }
 }
 
 /// `MemoryConsumer` wrapper for a `GraceHashExecutor`. Holds an
