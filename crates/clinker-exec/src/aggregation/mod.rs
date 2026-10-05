@@ -772,6 +772,15 @@ impl AggregateStream {
         }
     }
 
+    /// The handle a hash table's charge is mirrored onto; `None` for the
+    /// streaming arm, which holds no table and charges nothing.
+    pub(crate) fn consumer_handle(&self) -> Option<&Arc<crate::pipeline::memory::ConsumerHandle>> {
+        match self {
+            Self::Hash(h) => Some(h.consumer_handle()),
+            Self::Streaming(_) => None,
+        }
+    }
+
     /// Convert the stream into a boxed [`HashAggregator`] owning the
     /// in-memory state, plus a snapshot of the Hash-arm group-by indices.
     /// Returns `None` for the `Streaming` arm — that path is rejected

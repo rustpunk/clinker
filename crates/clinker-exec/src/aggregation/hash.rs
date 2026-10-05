@@ -442,6 +442,12 @@ impl HashAggregator {
         &self.spill_files
     }
 
+    /// The handle this table's charge is mirrored onto, shared with its
+    /// [`AggregateConsumer`]: what a walk arm registers the table under.
+    pub(crate) fn consumer_handle(&self) -> &Arc<crate::pipeline::memory::ConsumerHandle> {
+        &self.consumer_handle
+    }
+
     /// Borrow the disk-spill-cap arbitrator so a test can seed a finite
     /// `max_spill_bytes` and drive the aggregate's own spill-cap path in
     /// isolation, without an upstream node-buffer racing it to a shared cap.

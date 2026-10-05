@@ -2070,3 +2070,273 @@ mod group_boundary_sort_order {
         );
     }
 }
+
+// ===========================================================================
+// Walk-owned group tables: a reclaim pass another request starts reaches the
+// strict per-document and time-windowed arms' hash tables
+// ===========================================================================
+
+mod walk_owned_tables {
+    use std::sync::Arc;
+
+    use clinker_record::owned_storage::{OwnedKey, SharedStorage};
+    use clinker_record::{DocumentId, Record, Schema, Value};
+    use cxl::eval::{EvalContext, StableEvalContext};
+    use cxl::parser::Parser;
+    use cxl::plan::{CompiledAggregate, extract_aggregates};
+    use cxl::resolve::pass::resolve_program;
+    use cxl::typecheck::pass::{AggregateMode, type_check_with_mode};
+    use cxl::typecheck::types::Type;
+    use cxl::typecheck::{QualifiedField, Row, TypedProgram};
+    use indexmap::IndexMap;
+
+    use crate::aggregation::{AggregateStream, SortRow};
+    use crate::executor::aggregate_dispatch::{
+        AggregateSpec, DocAggregatorFactory, WalkGroupTables,
+    };
+    use crate::pipeline::memory::MemoryArbitrator;
+    use crate::pipeline::memory::walk::walk_test_support::{
+        foreign_walk_request, with_test_walk_frame,
+    };
+    use clinker_plan::plan::types::AggregateStrategy;
+
+    /// The Aggregate's node name: its tables' consumers and spills are
+    /// recorded under it.
+    const NODE: &str = "notes_by_key";
+    /// Room left free beside the tables before a foreign request.
+    const FREE: u64 = 4 * 1024;
+    /// Rows aggregated into one table: 4 groups of 32.
+    const ROWS: u64 = 128;
+
+    /// A grouped fold whose table grows a value heap as it ingests: each
+    /// group collects its rows' notes.
+    struct Program {
+        typed: Arc<TypedProgram>,
+        compiled: Arc<CompiledAggregate>,
+        output_schema: SharedStorage<Schema>,
+    }
+
+    fn program() -> Program {
+        let fields = [("k", Type::String), ("note", Type::String)];
+        let parsed = Parser::parse("emit k = k\nemit n = count(*)\nemit notes = collect(note)");
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
+        let names: Vec<&str> = fields.iter().map(|(n, _)| *n).collect();
+        let resolved = resolve_program(parsed.ast, &names, parsed.node_count).expect("resolve");
+        let schema_map: IndexMap<QualifiedField, Type> = fields
+            .iter()
+            .map(|(n, t)| (QualifiedField::bare(*n), t.clone()))
+            .collect();
+        let row = Row::closed(schema_map, cxl::lexer::Span::new(0, 0));
+        let mode = AggregateMode::GroupBy {
+            group_by_fields: ["k".to_string()].into_iter().collect(),
+        };
+        let typed = type_check_with_mode(resolved, &row, mode).expect("typecheck");
+        let schema_names: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
+        let compiled = Arc::new(
+            extract_aggregates(&typed, &["k".to_string()], &schema_names)
+                .expect("extract_aggregates"),
+        );
+        let output_schema = SharedStorage::from_arc(Arc::new(Schema::new(
+            compiled
+                .emits
+                .iter()
+                .map(|e| OwnedKey::from_box(e.output_name.clone()))
+                .collect::<Vec<OwnedKey>>(),
+        )));
+        Program {
+            typed: Arc::new(typed),
+            compiled,
+            output_schema,
+        }
+    }
+
+    /// The per-table factory the strict arm builds for this Aggregate,
+    /// spilling under `spill_dir`.
+    fn factory(
+        program: &Program,
+        arbitrator: &Arc<MemoryArbitrator>,
+        spill_dir: &std::path::Path,
+    ) -> DocAggregatorFactory {
+        DocAggregatorFactory::new(
+            &AggregateSpec {
+                name: NODE,
+                typed: &program.typed,
+                compiled: &program.compiled,
+                output_schema: &program.output_schema,
+                strategy: AggregateStrategy::Hash,
+                has_distinct: false,
+            },
+            Arc::clone(arbitrator),
+            spill_dir.to_path_buf(),
+            false,
+        )
+    }
+
+    fn arbitrator() -> Arc<MemoryArbitrator> {
+        Arc::new(MemoryArbitrator::with_policy(
+            64 * 1024 * 1024,
+            0.80,
+            0.70,
+            Box::new(crate::pipeline::memory::Priority),
+        ))
+    }
+
+    /// `ROWS` rows over four keys, each with a 40-character note.
+    fn input() -> Vec<Record> {
+        let schema =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["k".into(), "note".into()])));
+        (0..ROWS)
+            .map(|i| {
+                Record::new(
+                    schema.clone(),
+                    vec![
+                        Value::String(format!("g{}", i % 4).into()),
+                        Value::String(format!("{i:040}").into()),
+                    ],
+                )
+            })
+            .collect()
+    }
+
+    /// Finalized rows as comparable text, sorted, with each collected list
+    /// sorted too: a hash Aggregate's row order is not canonical.
+    fn canonical(rows: Vec<SortRow>) -> Vec<String> {
+        let mut rendered: Vec<String> = rows
+            .into_iter()
+            .map(|(record, _)| {
+                record
+                    .values()
+                    .iter()
+                    .map(|value| match value {
+                        Value::Array(items) => {
+                            let mut items: Vec<String> =
+                                items.iter().map(|item| format!("{item:?}")).collect();
+                            items.sort();
+                            items.join(",")
+                        }
+                        other => format!("{other:?}"),
+                    })
+                    .collect::<Vec<String>>()
+                    .join("|")
+            })
+            .collect();
+        rendered.sort();
+        rendered
+    }
+
+    /// The rows the same input finalizes to through one table no pass ever
+    /// touches.
+    fn unspilled_rows(
+        program: &Program,
+        rows: &[Record],
+        spill_dir: &std::path::Path,
+    ) -> Vec<String> {
+        let arbitrator = arbitrator();
+        let factory = factory(program, &arbitrator, spill_dir);
+        let (mut stream, id) = factory.make().expect("table built");
+        let stable = StableEvalContext::test_default();
+        let ctx = EvalContext::test_default_borrowed(&stable);
+        let mut out = Vec::new();
+        for (row, record) in rows.iter().enumerate() {
+            stream
+                .add_record(record, row as u64, &ctx, &mut out)
+                .expect("record added");
+        }
+        stream.finalize(&ctx, &mut out).expect("finalized");
+        arbitrator.unregister_consumer(id);
+        canonical(out)
+    }
+
+    /// The spill bytes recorded under the Aggregate's node so far.
+    fn spilled_bytes(arbitrator: &MemoryArbitrator) -> u64 {
+        arbitrator
+            .per_stage_spill_bytes()
+            .get(NODE)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// A walk request another consumer makes for more than is free, while
+    /// the strict arm holds a document's group table resident, is granted by
+    /// spilling that table, and the document's flush finalizes the rows an
+    /// unspilled table gives.
+    #[test]
+    fn group_state_spills_when_another_walk_request_falls_short() {
+        let spill_root = tempfile::tempdir().expect("spill root");
+        let program = program();
+        let rows = input();
+        let expected = unspilled_rows(&program, &rows, spill_root.path());
+        let arbitrator = arbitrator();
+        with_test_walk_frame(&arbitrator, || {
+            let factory = factory(&program, &arbitrator, spill_root.path());
+            let mut tables = WalkGroupTables::for_documents(&arbitrator);
+            let doc = DocumentId::next();
+            let stable = StableEvalContext::test_default();
+            let ctx = EvalContext::test_default_borrowed(&stable);
+            let mut emitted = Vec::new();
+            for (row, record) in rows.iter().enumerate() {
+                tables
+                    .add_document_record(
+                        doc,
+                        &factory,
+                        record,
+                        (row as u64).into(),
+                        &ctx,
+                        &mut emitted,
+                    )
+                    .expect("table built")
+                    .expect("record added");
+            }
+            let handle = tables
+                .inspect(&doc, |stream| {
+                    Arc::clone(stream.consumer_handle().expect("a hash table"))
+                })
+                .expect("the document's table");
+            let charge = handle.bytes();
+            assert!(charge > FREE, "the table holds a value heap");
+            arbitrator
+                .set_limit(arbitrator.charged_bytes() + FREE)
+                .expect("limit");
+            let spilled_before = spilled_bytes(&arbitrator);
+
+            let grant = foreign_walk_request(&arbitrator, FREE + charge / 2)
+                .expect("the pass spills the table and the request fits");
+            assert_eq!(
+                handle.bytes(),
+                0,
+                "the table's handle falls by its whole resident charge"
+            );
+            assert!(
+                tables
+                    .inspect(&doc, |stream| match stream {
+                        AggregateStream::Hash(table) => !table.spill_files().is_empty(),
+                        _ => false,
+                    })
+                    .expect("the document's table"),
+                "the table's groups are on disk"
+            );
+            assert!(
+                spilled_bytes(&arbitrator) > spilled_before,
+                "the spill is recorded under the Aggregate's node"
+            );
+            drop(grant);
+
+            let (stream, id) = tables
+                .take_closing_document(doc, &factory)
+                .expect("the close takes the table")
+                .expect("the document's table");
+            let mut out = Vec::new();
+            stream.finalize(&ctx, &mut out).expect("finalized");
+            arbitrator.unregister_consumer(id);
+            assert_eq!(
+                canonical(out),
+                expected,
+                "a table a foreign pass spilled finalizes the rows an unspilled one gives"
+            );
+        });
+    }
+}
