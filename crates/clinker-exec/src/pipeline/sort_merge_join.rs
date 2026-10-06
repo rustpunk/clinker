@@ -4463,6 +4463,90 @@ mod tests {
         assert_eq!(budget.charged_bytes(), 0);
     }
 
+    /// A join that fails while both inputs are still charged releases each
+    /// input's charge once and returns its own consumer to the figure it
+    /// held before it ran. The driver side's Phase A sort spills past a
+    /// one-byte disk cap before either side's rows pass to the join, so both
+    /// input charges are outstanding at the failure. Another holder's charge
+    /// stays on the ledger throughout, so a release of anything beyond the
+    /// inputs would show.
+    #[test]
+    fn a_join_that_fails_releases_each_input_charge_once() {
+        let drivers_schema = schema_with(&["k", "pad"]);
+        let builds_schema = schema_with(&["k"]);
+        let pad = "x".repeat(1024);
+        let (budget, handle, charges) =
+            ledger_with_input_charges(1024 * 1024, 256 * 1024, 128 * 1024);
+        budget.set_max_spill_bytes(1).unwrap();
+        let other = crate::executor::node_buffer::reserve_node_buffer_materialization(
+            64 * 1024,
+            &budget,
+            "other",
+        )
+        .expect("the other holder's charge fits");
+        handle.add_bytes(777);
+        let held_before_inputs = 64 * 1024 + 777;
+        assert_eq!(
+            budget.charged_bytes(),
+            held_before_inputs + 256 * 1024 + 128 * 1024
+        );
+        assert_eq!(budget.consumer_count(), 4, "join, two inputs, other holder");
+        // Descending keys, so the driver side runs through the sort buffer,
+        // which passes the spill threshold well before its last row.
+        let err = run_kernel_on(
+            RunKernel {
+                driver_records: (0..1_000i64)
+                    .map(|i| {
+                        (
+                            rec(
+                                &drivers_schema,
+                                vec![
+                                    Value::Integer(1_000 - i),
+                                    Value::String(pad.as_str().into()),
+                                ],
+                            ),
+                            RecordOrder::from(i as u64),
+                        )
+                    })
+                    .collect(),
+                build_records: vec![rec(&builds_schema, vec![Value::Integer(5_000)])],
+                decomposed: drivers_below_builds(),
+                driver_qual: "drivers",
+                build_qual: "builds",
+                driver_schema: &drivers_schema,
+                build_schema: &builds_schema,
+                match_mode: MatchMode::First,
+                on_miss: OnMiss::Skip,
+                presorted: false,
+                body_program: None,
+                budget_bytes: None,
+            },
+            None,
+            &test_allocation_resources(),
+            &budget,
+            charges,
+        )
+        .map(|(records, _)| records.len())
+        .expect_err("the driver side's spill passes the one-byte disk cap");
+        assert!(
+            matches!(err, PipelineError::SpillCapExceeded { .. }),
+            "expected the disk cap's refusal, got {err:?}"
+        );
+        assert_eq!(handle.bytes(), 777, "the join returns to its baseline");
+        assert_eq!(
+            budget.charged_bytes(),
+            held_before_inputs,
+            "each input's charge is released once and nothing else is"
+        );
+        assert_eq!(
+            budget.consumer_count(),
+            2,
+            "both inputs' consumers are gone; the join and the other holder remain"
+        );
+        drop(other);
+        assert_eq!(budget.charged_bytes(), 777);
+    }
+
     /// Build `n` phase A driver pairs whose sort key `k` is an Integer and
     /// whose wide `pad` column pushes the accumulated buffer past the phase A
     /// 16 KiB spill-threshold floor after a handful of records. Shape is the
