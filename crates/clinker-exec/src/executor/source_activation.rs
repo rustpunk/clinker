@@ -27,7 +27,7 @@ const SOURCE_LIFECYCLE_SCOPE: &str = "source";
 struct ActiveGroupRuntime {
     scope: BodyScopeId,
     group: ActiveActivationGroup,
-    workers: Vec<std::thread::JoinHandle<Result<IngestTaskOutcome, PipelineError>>>,
+    workers: Vec<super::ingest::SourceWorker>,
 }
 
 /// Receivers and memory registrations produced by one atomic group activation.
@@ -162,10 +162,13 @@ impl SourceActivationController {
             let worker_shutdown = shutdown.clone();
             let lifecycle_telemetry = telemetry.cloned();
             let source_runtime = self.source_runtime.clone();
+            let stream_end = stream.end(&logical_source_name);
             let spawn = std::thread::Builder::new()
                 .name(format!("clinker-body-source-{source_name}"))
                 .spawn(move || {
-                    observe_source(lifecycle_telemetry.as_ref(), || {
+                    // The stream's last event reports how the read ended,
+                    // after the reader has released what it held.
+                    stream_end.finish(observe_source(lifecycle_telemetry.as_ref(), || {
                         // A governed allocation this Source was refused
                         // ends its ingest here, on the thread that recorded
                         // the refusal's report.
@@ -184,7 +187,7 @@ impl SourceActivationController {
                             )?;
                         outcome.source_name = logical_source_name;
                         Ok(outcome)
-                    })
+                    }))
                 });
             match spawn {
                 Ok(worker) => workers.push(worker),
@@ -195,9 +198,7 @@ impl SourceActivationController {
                         handle.set_bytes(0);
                         memory.unregister_consumer(id);
                     }
-                    for worker in workers {
-                        let _ = worker.join();
-                    }
+                    super::ingest::join_source_workers_after_failure(workers, "body-source-thread");
                     return Err(PipelineError::Internal {
                         op: "body-source-spawn",
                         node: String::new(),
@@ -219,9 +220,14 @@ impl SourceActivationController {
     }
 
     /// Join and close every active group in `scope` after its receivers drop.
+    ///
+    /// `walk_failed` says the body's walk failed (other than by an
+    /// interruption): its error then stands as the run's, and a reader
+    /// failure it never reached is logged rather than returned.
     pub(super) fn finish_scope(
         &mut self,
         scope: BodyScopeId,
+        walk_failed: bool,
     ) -> Result<Vec<IngestTaskOutcome>, PipelineError> {
         let group_ids: Vec<_> = self
             .active
@@ -235,6 +241,14 @@ impl SourceActivationController {
                 .active
                 .remove(&id)
                 .expect("active group id was collected from the same map");
+            if walk_failed {
+                super::ingest::join_source_workers_after_failure(
+                    runtime.workers.drain(..).rev(),
+                    "body-source-thread",
+                );
+                drop(runtime.group);
+                continue;
+            }
             match super::ingest::join_source_workers(
                 runtime.workers.drain(..).rev(),
                 "body-source-thread",
@@ -255,9 +269,10 @@ impl SourceActivationController {
 impl Drop for SourceActivationController {
     fn drop(&mut self) {
         while let Some((_, mut runtime)) = self.active.pop_last() {
-            while let Some(worker) = runtime.workers.pop() {
-                let _ = worker.join();
-            }
+            super::ingest::join_source_workers_after_failure(
+                runtime.workers.drain(..).rev(),
+                "body-source-thread",
+            );
             drop(runtime.group);
         }
     }

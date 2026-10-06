@@ -538,22 +538,39 @@ impl IngestTaskOutcome {
     }
 }
 
-/// Join every finite worker before returning a genuine failure or all progress.
-/// The caller must drop receivers and release paused consumers before entry.
+/// A Source reader's thread: its outcome, or the failure it also sent as its
+/// stream's last event.
+pub(super) type SourceWorker = std::thread::JoinHandle<
+    Result<IngestTaskOutcome, crate::executor::source_stream::SourceReadFailure>,
+>;
+
+/// Join every finite worker after a walk that completed, before returning a
+/// genuine failure or all progress. The caller must drop receivers and
+/// release paused consumers before entry.
+///
+/// A completed walk took every Source's `Ended`, so a reader failure here is
+/// one no walk reached: a Source the walk stopped reading early. A failure
+/// the walk did take, yet completed anyway, is an invariant violation.
 pub(super) fn join_source_workers(
-    workers: impl IntoIterator<Item = std::thread::JoinHandle<Result<IngestTaskOutcome, PipelineError>>>,
+    workers: impl IntoIterator<Item = SourceWorker>,
     op: &'static str,
 ) -> Result<Vec<IngestTaskOutcome>, PipelineError> {
     let mut outcomes = Vec::new();
     let mut first_error = None;
     for worker in workers {
-        let result = worker.join().unwrap_or_else(|_| {
-            Err(PipelineError::Internal {
+        let result = match worker.join() {
+            Ok(Ok(outcome)) => Ok(outcome),
+            Ok(Err(failure)) => Err(failure.take().unwrap_or_else(|| PipelineError::Internal {
+                op,
+                node: failure.source().to_string(),
+                detail: "the walk completed after it took the Source's reader failure".to_string(),
+            })),
+            Err(_) => Err(PipelineError::Internal {
                 op,
                 node: String::new(),
                 detail: "source ingest thread panicked".to_string(),
-            })
-        });
+            }),
+        };
         match result {
             Ok(outcome) => outcomes.push(outcome),
             Err(error) if first_error.is_none() => first_error = Some(error),
@@ -563,6 +580,42 @@ pub(super) fn join_source_workers(
     match first_error {
         Some(error) => Err(error),
         None => Ok(outcomes),
+    }
+}
+
+/// Join every finite worker after the walk failed, keeping the walk's error
+/// as the run's. The caller must drop receivers and release paused consumers
+/// before entry.
+///
+/// The walk reads each Source's events in order and fails at the first
+/// failure it meets, a reader's included, so its error is the first cause in
+/// data order. A reader failure the walk never reached came later in its
+/// Source's data, or on a Source the walk had not reached: it is logged as a
+/// further failure of the run, never dropped silently, and never reported in
+/// place of the walk's. A failure the walk took is already its error.
+pub(super) fn join_source_workers_after_failure(
+    workers: impl IntoIterator<Item = SourceWorker>,
+    op: &'static str,
+) {
+    for worker in workers {
+        match worker.join() {
+            Ok(Ok(_)) => {}
+            Ok(Err(failure)) => {
+                if let Some(error) = failure.take() {
+                    tracing::warn!(
+                        source = failure.source(),
+                        error = %error,
+                        "the Source's reader also failed after the run had already failed; \
+                         the run reports its first failure"
+                    );
+                }
+            }
+            Err(_) => tracing::warn!(
+                op,
+                "a Source's reader panicked after the run had already failed; \
+                 the run reports its first failure"
+            ),
+        }
     }
 }
 
@@ -750,8 +803,11 @@ fn ingest_source_body_inner(
 /// file and non-file ingest arms — see [`ingest_source`].
 ///
 /// `stream` is dropped last, on every return: the reader and everything else
-/// this body holds in the Source's name are released before its sender, so a
-/// walk that sees the channel disconnect sees the Source's charge settled.
+/// this body holds in the Source's name are released before its sender. The
+/// stream's terminal event is sent through its
+/// [`SourceStreamEnd`](crate::executor::source_stream::SourceStreamEnd) only
+/// after this returns, so a walk that takes it sees the Source's charge
+/// settled.
 fn drive_record_source(
     src_cfg: clinker_plan::config::SourceConfig,
     physical_columns: &[Column],
@@ -1539,9 +1595,8 @@ fn drive_record_source(
         // On interruption the still-open ordered barrier is deliberately not
         // closed: dropping `stream` aborts it, removes partial spill files,
         // and balances its arbitrator charges without releasing partial data.
-        // `stream` drops on return, after this block's locals: then the
-        // dispatch-side `recv` returns `Err` (channel disconnected) once the
-        // channel drains.
+        // `stream` drops on return, after this block's locals; the caller
+        // then ends the stream through its `SourceStreamEnd`.
         Ok(())
     }
 }
@@ -3166,9 +3221,10 @@ nodes:
         let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_dropped = dropped.clone();
         let failure = std::thread::spawn(|| {
-            Err(PipelineError::Io(std::io::Error::other(
-                "original reader failure",
-            )))
+            Err(crate::executor::source_stream::SourceReadFailure::new(
+                "failing",
+                PipelineError::Io(std::io::Error::other("original reader failure")),
+            ))
         });
         let remaining = std::thread::spawn(move || {
             entered_tx.send(()).unwrap();
@@ -3255,6 +3311,10 @@ nodes:
                 }
                 crate::executor::source_stream::SourceStreamEvent::Population(population) => {
                     panic!("unexpected ordered population in envelope fixture: {population:?}")
+                }
+                crate::executor::source_stream::SourceStreamEvent::Ended
+                | crate::executor::source_stream::SourceStreamEvent::Failed(_) => {
+                    panic!("the driver sends no terminal event; its caller ends the stream")
                 }
             })
             .collect()

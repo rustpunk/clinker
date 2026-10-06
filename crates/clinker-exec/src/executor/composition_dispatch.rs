@@ -591,8 +591,10 @@ fn execute_composition_body(
         handle.set_bytes(0);
         ctx.memory_budget.unregister_consumer(id);
     }
+    let walk_failed =
+        matches!(&walk_and_harvest, Err(error) if !matches!(error, PipelineError::Interrupted));
     let activation_cleanup = match ctx.source_activation.as_mut() {
-        Some(controller) => controller.finish_scope(bound_body.body_scope),
+        Some(controller) => controller.finish_scope(bound_body.body_scope, walk_failed),
         None => Ok(Vec::new()),
     };
     let activation_cleanup = activation_cleanup.and_then(|outcomes| {
