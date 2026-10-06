@@ -1111,6 +1111,32 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
   model and its error says which reading tripped.
 - Implementation owner: CLI maintainers.
 
+### 95. A grace-hash join's output order depends on which partitions spilled
+
+- Filed: 2026-10-06.
+- Status: Open.
+- Priority: Medium.
+- Evidence: A grace-hash join emits the matches of its in-memory partitions
+  in driver order during the probe, then each spilled partition's matches as
+  that partition is read back, and the dispatcher admits those rows as they
+  come. Which partitions spill depends on the memory limit, so the same input
+  joined under two limits produces the same rows in different orders. The
+  sort-merge and range joins realise one order whatever the limit. The grace
+  join tests that run under several limits compare sorted rows for this
+  reason (`grace_reload_run` in
+  `crates/clinker-exec/src/executor/tests/combine_consumer_lifecycle.rs`,
+  and `crates/clinker-exec/tests/combine_match_first_body_skip.rs`).
+- Files/modules involved:
+  `crates/clinker-exec/src/pipeline/grace_hash/mod.rs` (the probe and reload
+  phases), `crates/clinker-exec/src/executor/combine_dispatch.rs` (the grace
+  arm's output admission).
+- Suggested way to resolve it: Route the grace join's output through the
+  payload-ordered sort the range joins use, keyed on driver order, or record
+  that a hash join's output order is unspecified; decide alongside
+  byte-identical output across memory limits
+  ([#1250](https://github.com/rustpunk/clinker/issues/1250)).
+- Implementation owner: Executor maintainers.
+
 ## Resolved Archive
 
 ### 61. Decoded allocation ownership
