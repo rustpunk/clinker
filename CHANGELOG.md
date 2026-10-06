@@ -368,21 +368,28 @@ the engine refused, read from one account of the run's charged memory at the
 refusal:
 
 ```
-E310 totals: needed 2.0 MiB more for group state, but only 704.0 KiB of memory.limit 8.0 MiB was left
+E310 "totals": needed 2.0 MiB more for group state, but only 704.0 KiB of memory.limit 8.0 MiB was left
   charged 7.3 MiB of 8.0 MiB (91%) · private memory 200.0 MiB
   largest holders:
-    enrich  join build side  3.5 MiB  cannot spill
-    ...
+    "enrich"  join build side  3.5 MiB  cannot spill
+    "totals"  group state  1.0 MiB  requester
+    "sorted"  rows buffered between "orders" and "sorted"  1.0 MiB  in use
+    "orders"  rows read from the source  768.0 KiB  paused source
+    "dedupe"  decision state  256.0 KiB  cannot spill
+    +2 more holders  192.0 KiB
+    not held by any one node  640.0 KiB
   reclaim: none attempted
   fix: raise the limit to at least 10M — the smallest limit with room for this request and what the run already holds; later stages may need more
     pipeline:
       memory: { limit: "10M" }
     or: --memory-limit 10M
-  remedy: enrich's join build side holds 3.5 MiB and could not be spilled; see "Join build side" in clinker explain --code E310
+  remedy: "enrich"'s join build side holds 3.5 MiB and could not be spilled; see "Join build side" in clinker explain --code E310
+  See: clinker explain --code E310
 ```
 
-- The headline keeps the greppable `E310 <node>:` prefix and names what the
-  memory was for in pipeline terms and how much of the limit was left. It
+- The headline keeps the greppable `E310 "<node>":` prefix, the node's name
+  now in double quotes as every node name in the report is, and names what
+  the memory was for in pipeline terms and how much of the limit was left. It
   adds `and nothing more could be spilled` only after the engine tried to
   spill; a report whose reclaim line says `none attempted` does not claim
   it. A request larger than the limit on its
@@ -390,29 +397,39 @@ E310 totals: needed 2.0 MiB more for group state, but only 704.0 KiB of memory.l
   `one request ... needs N, more than memory.limit L can hold — spilling
   cannot help`.
 - A step that stops because the process's own memory passed the limit,
-  rather than the charged total, says so: `E310 <node>: process memory
-  peaked at P resident, over memory.limit L, while <node> held <what>; the
+  rather than the charged total, says so: `E310 "<node>": process memory
+  peaked at P resident, over memory.limit L, while "<node>" held <what>; the
   run had charged C`, and its suggested limit is that reading rounded up.
   It never claims the limit is fully held.
 - A join, sort-merge or grace fallback that finds the run already over the
   limit while it works now spills other steps' state first and stops only
   when that cannot make room. Its report states what the run held instead
-  of a request: `E310 <node>: the run held H, over memory.limit L, while
-  <node> held <what>`, and its suggested limit is what the run held,
+  of a request: `E310 "<node>": the run held H, over memory.limit L, while
+  "<node>" held <what>`, adding `and nothing more could be spilled` only
+  after a round, and its suggested limit is what the run held,
   rounded up: `fix: raise the limit to at least N — the smallest limit with
   room for what the run already holds; "<node>" and later stages may need
-  more`.
+  more`. If the round makes room but the process's own memory is still over
+  the limit, the report takes the process-memory form above.
+- An in-memory hash join no longer counts its build rows twice near the
+  limit once its table holds them. The text inside those rows can still be
+  counted twice ([#1394](https://github.com/rustpunk/clinker/issues/1394)).
 - Below it: the charged total against the limit, the five largest holders
   and why each still held its memory, what the reclaim round asked and
   freed, the smallest limit that would have granted the request in YAML
   and `--memory-limit` form, and a remedy keyed to the largest holder that
   cannot spill. A Source still reading is listed as `active source`; a
   Source's rows, paused, active or after it has finished reading, never count
-  as state that cannot spill, and a Source is never the remedy.
+  as state that cannot spill, and a Source is never the remedy. Rows read by
+  several nodes name each of them: `rows buffered between "split" and "a",
+  "b"`. An Aggregate whose `group_by` leaves out a correlation-key field keeps
+  its groups in memory for the whole run, and its group state is listed as
+  `cannot spill`.
 - A Reshape or Cull group too large to hold whole is identified by where its
   first row came from (`group: the one whose first row is row 4812 of source
-  orders`, the row number the dead-letter output writes in
-  `_cxl_dlq_source_row`). The report no longer prints the group's key: it
+  "orders"`, the row number the dead-letter output writes in
+  `_cxl_dlq_source_row`); a group whose first row was not read from a Source
+  gets no `group:` line. The report no longer prints the group's key: it
   names nodes, surfaces and byte counts only, never a record value.
 - A join that stops while matching a part of its build side it could not
   split further says about how many distinct join keys that part held
@@ -421,7 +438,9 @@ E310 totals: needed 2.0 MiB more for group state, but only 704.0 KiB of memory.l
   no key is printed.
 - A Source, writer or worker whose own allocation the memory limit refuses
   now fails the run with this E310, naming that node, instead of an
-  I/O-shaped budget error.
+  I/O-shaped budget error, including inside a composition body (the message
+  is prefixed with the composition's name) and when it is reported together
+  with other errors.
 - A Combine build key that fails to evaluate now fails with the same error a
   probe key does, not E310.
 

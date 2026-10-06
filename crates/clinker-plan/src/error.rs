@@ -175,6 +175,12 @@ pub enum PipelineError {
     /// want to catch every composition-involved failure must match
     /// both this variant and the bare inner-variant form.
     ///
+    /// `inner` can itself be a [`PipelineError::Multiple`] or another
+    /// `CompositionBodyError` (a composition used inside a body), so code
+    /// looking for one kind of failure, such as an E310
+    /// [`PipelineError::MemoryBudgetExceeded`], walks `inner` recursively
+    /// and through `Multiple` rather than matching one level.
+    ///
     /// The wrapper is purely diagnostic attribution, not a separate
     /// enforcement path: body operators share the same `MemoryArbitrator`
     /// instance as the parent pipeline and admit through the same
@@ -220,6 +226,15 @@ pub enum PipelineError {
     /// body-internal node. The limit itself is shared across the whole run —
     /// body operators charge the same memory account the parent pipeline
     /// uses.
+    ///
+    /// Code that matches only this variant catches the boundary shape and
+    /// misses the wrapped one; code that matches only
+    /// [`CompositionBodyError`] catches the wrapped shape and misses the
+    /// boundary one. To catch every E310 a run can return, match this variant
+    /// and also look inside [`CompositionBodyError`]'s `inner` and each member
+    /// of [`PipelineError::Multiple`], recursively: a refusal on a Source,
+    /// writer or worker thread converts to this variant inside either wrapper
+    /// and keeps the wrapper.
     ///
     /// [`CompositionBodyError`]: PipelineError::CompositionBodyError
     MemoryBudgetExceeded {
