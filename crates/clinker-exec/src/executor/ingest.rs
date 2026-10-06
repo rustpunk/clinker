@@ -3213,6 +3213,148 @@ nodes:
         assert_eq!(resource_memory.writer_resource_usage().memory, 0);
     }
 
+    /// What a reader's `Drop` saw on its Source's channel.
+    #[derive(Debug, PartialEq, Eq)]
+    enum ChannelAtReaderDrop {
+        /// Still open, with no terminal event: the walk cannot yet take the
+        /// Source as finished.
+        Open,
+        /// Its senders were gone.
+        Closed,
+        /// The terminal event had already been sent.
+        Ended,
+    }
+
+    /// A reader that reads one row, then ends or fails, and records on drop
+    /// what its channel showed.
+    struct DropObservingReader {
+        schema: SharedStorage<Schema>,
+        read: bool,
+        fail: bool,
+        receiver: crossbeam_channel::Receiver<crate::executor::source_stream::SourceStreamEvent>,
+        seen: Arc<std::sync::Mutex<Option<ChannelAtReaderDrop>>>,
+    }
+
+    impl crate::source::RecordSource for DropObservingReader {
+        fn schema(&mut self) -> Result<SharedStorage<Schema>, clinker_format::FormatError> {
+            Ok(self.schema.clone())
+        }
+
+        fn next_record(
+            &mut self,
+        ) -> Result<Option<clinker_record::Record>, clinker_format::FormatError> {
+            if !std::mem::replace(&mut self.read, true) {
+                return Ok(Some(clinker_record::Record::new(
+                    self.schema.clone(),
+                    vec![Value::Integer(1)],
+                )));
+            }
+            if self.fail {
+                return Err(clinker_format::FormatError::Io(std::io::Error::other(
+                    "reader failure",
+                )));
+            }
+            Ok(None)
+        }
+    }
+
+    impl Drop for DropObservingReader {
+        fn drop(&mut self) {
+            let seen = loop {
+                match self.receiver.try_recv() {
+                    Ok(
+                        crate::executor::source_stream::SourceStreamEvent::Ended
+                        | crate::executor::source_stream::SourceStreamEvent::Failed(_),
+                    ) => break ChannelAtReaderDrop::Ended,
+                    Ok(_) => {}
+                    Err(crossbeam_channel::TryRecvError::Empty) => break ChannelAtReaderDrop::Open,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        break ChannelAtReaderDrop::Closed;
+                    }
+                }
+            };
+            *self.seen.lock().unwrap() = Some(seen);
+        }
+    }
+
+    /// The reader, and everything else the ingest body holds in the Source's
+    /// name, is released before the body lets go of the Source's channel, on
+    /// a successful read and on a failed one; and the stream's terminal
+    /// event, the walk's signal that the Source has finished, is sent only
+    /// after that, as the channel's last event.
+    #[test]
+    fn a_reader_is_released_before_its_channel_closes_and_before_its_stream_ends() {
+        for fail in [false, true] {
+            for with_end in [false, true] {
+                let (stream, receiver) = crate::executor::source_stream::SourceIngestChannel::new(
+                    8,
+                    crate::pipeline::memory::ConsumerHandle::new(),
+                    <clinker_plan::plan::PlanNodeId as clinker_plan::plan::EntityRef>::new(0),
+                    clinker_format::preparation::MemoryOnlyResources::new(
+                        std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+                    )
+                    .resources()
+                    .allocation()
+                    .clone(),
+                );
+                let end = with_end.then(|| stream.end("edi"));
+                let seen = Arc::new(std::sync::Mutex::new(None));
+                let result = ingest_source_body(
+                    pathless_source_body(),
+                    crate::source::SourceInput::Records(Box::new(DropObservingReader {
+                        schema: SchemaBuilder::with_capacity(1).with_field("id").build(),
+                        read: false,
+                        fail,
+                        receiver: receiver.clone(),
+                        seen: seen.clone(),
+                    })),
+                    stream,
+                    None,
+                    None,
+                    SourceRuntimePolicy::new(crate::executor::RunPolicy::new(
+                        std::num::NonZeroUsize::MIN,
+                        crate::executor::PreviewPolicy::Disabled,
+                    )),
+                );
+                assert_eq!(result.is_err(), fail);
+                assert_eq!(
+                    seen.lock().unwrap().take(),
+                    Some(ChannelAtReaderDrop::Open),
+                    "fail={fail} with_end={with_end}: the reader was dropped after its \
+                     channel closed or its stream ended"
+                );
+                let Some(end) = end else {
+                    continue;
+                };
+                let finished = end.finish(result);
+                assert_eq!(finished.is_err(), fail);
+                let terminal = receiver
+                    .try_recv()
+                    .expect("the stream's terminal event follows the reader's release");
+                assert!(
+                    matches!(
+                        (&terminal, fail),
+                        (
+                            crate::executor::source_stream::SourceStreamEvent::Ended,
+                            false
+                        ) | (
+                            crate::executor::source_stream::SourceStreamEvent::Failed(_),
+                            true
+                        )
+                    ),
+                    "fail={fail}: {terminal:?}"
+                );
+                assert!(
+                    matches!(
+                        receiver.try_recv(),
+                        Err(crossbeam_channel::TryRecvError::Disconnected)
+                    ),
+                    "the terminal event is the channel's last"
+                );
+            }
+        }
+    }
+
     #[test]
     fn worker_failure_waits_for_every_reader_before_returning() {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();

@@ -1000,8 +1000,9 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
   holder keeps the last copy of that text alive and a spill would free it.
   That covers a node-buffer slot, Output's per-document bucket and the Cull
   and Reshape group buffers (`resident_record_reclaimable_bytes`) and a
-  parked edge (its resident segments' charge). A node-buffer slot often holds the only copy, since
-  rows move rather than copy, so it is the common case, not the parked edge.
+  parked edge (its resident segments' charge). A node-buffer slot often
+  holds the only copy, since rows move rather than copy, so it is the
+  common case, not the parked edge.
   The effect is victim order only: a pass can spill a holder whose figure is
   larger, find its target not yet met, and spill the next, which costs extra
   spill I/O. It never causes a refusal: a pass keeps electing until what it
