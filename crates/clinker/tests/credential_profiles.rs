@@ -769,6 +769,159 @@ fn bounds_memory_overshoot_is_rejected_before_provider_allocation() {
     );
 }
 
+/// One registry over a single `release` profile whose provider's lease
+/// declares `lease_bytes`, under a run limit of `limit` bytes.
+fn overshoot_fixture() -> FixtureProvider {
+    provider(
+        vec![CredentialCapability::AuthenticateRequest],
+        vec![CredentialLifetime::Run],
+        true,
+        true,
+        2,
+    )
+}
+
+#[test]
+fn bounds_lease_admission_ignores_the_process_memory_reading() {
+    // The process's peak resident reading stands over the limit while the
+    // charged total has ample room. Admission is a charged-ledger decision:
+    // the lease is granted, and the process reading decides nothing.
+    let provider = overshoot_fixture();
+    let providers: [&dyn CredentialProvider; 1] = [&provider];
+    let profiles = [CredentialProfile::new(
+        CredentialProfileName::parse("release").expect("valid explicit profile"),
+        &providers,
+    )];
+    let catalog = CredentialProfileCatalog::admit(&profiles, profile_limits(1, 1, usize::MAX, 2))
+        .expect("bounded profile catalog");
+    let limit = 1024 * 1024 * 1024;
+    let arbitrator = memory_arbitrator(limit);
+    arbitrator.set_peak_rss_for_test(limit + 1);
+    let mut registry =
+        CredentialHandleRegistry::new(&arbitrator, &catalog).expect("register handle owner");
+    let selected = CredentialProfileName::parse("release").expect("valid explicit profile");
+    let requirement = requirement(vec![CredentialCapability::AuthenticateRequest]);
+
+    registry
+        .acquire(&selected, &requirement)
+        .expect("a lease that fits the charged total is granted whatever the process reads");
+
+    assert_eq!(registry.live_handle_count(), 1);
+    assert_eq!(provider.resolve_calls.load(Ordering::SeqCst), 1);
+    assert!(arbitrator.charged_bytes() <= limit);
+}
+
+#[test]
+fn bounds_refused_lease_never_raises_the_run_peak_past_the_limit() {
+    // A refused lease charges nothing, so the run's highest charged total
+    // never records bytes that were refused and never allocated.
+    let provider = overshoot_fixture();
+    let providers: [&dyn CredentialProvider; 1] = [&provider];
+    let profiles = [CredentialProfile::new(
+        CredentialProfileName::parse("release").expect("valid explicit profile"),
+        &providers,
+    )];
+    let catalog = CredentialProfileCatalog::admit(&profiles, profile_limits(1, 1, usize::MAX, 2))
+        .expect("bounded profile catalog");
+    let arbitrator = memory_arbitrator(u64::MAX);
+    let mut registry =
+        CredentialHandleRegistry::new(&arbitrator, &catalog).expect("register handle owner");
+    let selected = CredentialProfileName::parse("release").expect("valid explicit profile");
+    let requirement = requirement(vec![CredentialCapability::AuthenticateRequest]);
+    registry
+        .acquire(&selected, &requirement)
+        .expect("first handle fits the run budget");
+    provider
+        .declared_lease_bytes
+        .store(128 * 1024 * 1024, Ordering::SeqCst);
+    let limit = 64 * 1024 * 1024;
+    arbitrator.set_limit(limit).unwrap();
+    let peak_before = arbitrator.peak_charged_bytes();
+
+    let error = registry
+        .acquire(&selected, &requirement)
+        .expect_err("prospective retained bytes exceed the run budget");
+
+    assert_eq!(
+        error.kind(),
+        CredentialRegistryErrorKind::MemoryLimitExceeded
+    );
+    assert_eq!(
+        arbitrator.peak_charged_bytes(),
+        peak_before,
+        "a refused lease must not move the run's peak charged total"
+    );
+    assert!(arbitrator.peak_charged_bytes() <= limit);
+}
+
+#[test]
+fn bounds_refused_lease_reports_the_credential_registry_as_an_e310() {
+    let provider = overshoot_fixture();
+    let providers: [&dyn CredentialProvider; 1] = [&provider];
+    let profiles = [CredentialProfile::new(
+        CredentialProfileName::parse("release").expect("valid explicit profile"),
+        &providers,
+    )];
+    let catalog = CredentialProfileCatalog::admit(&profiles, profile_limits(1, 1, usize::MAX, 2))
+        .expect("bounded profile catalog");
+    let arbitrator = memory_arbitrator(u64::MAX);
+    let mut registry =
+        CredentialHandleRegistry::new(&arbitrator, &catalog).expect("register handle owner");
+    let selected = CredentialProfileName::parse("release").expect("valid explicit profile");
+    let requirement = requirement(vec![CredentialCapability::AuthenticateRequest]);
+    registry
+        .acquire(&selected, &requirement)
+        .expect("first handle fits the run budget");
+    let charged_before = arbitrator.charged_bytes();
+    let lease_bytes = 128 * 1024 * 1024;
+    provider
+        .declared_lease_bytes
+        .store(lease_bytes, Ordering::SeqCst);
+    let limit = 64 * 1024 * 1024;
+    arbitrator.set_limit(limit).unwrap();
+
+    let error = registry
+        .acquire(&selected, &requirement)
+        .expect_err("prospective retained bytes exceed the run budget");
+
+    assert_eq!(
+        error.kind(),
+        CredentialRegistryErrorKind::MemoryLimitExceeded
+    );
+    let report = error
+        .memory_report()
+        .expect("a memory refusal carries the run's E310 report");
+    assert_eq!(
+        report.requester,
+        Some(clinker_plan::runtime_error::ConsumerLabel {
+            node: "credentials".to_string(),
+            surface: clinker_plan::runtime_error::MemorySurface::CredentialRegistry,
+        })
+    );
+    assert_eq!(
+        report.reading,
+        clinker_plan::runtime_error::LimitReading::Charged
+    );
+    assert!(
+        report.requested_bytes >= lease_bytes,
+        "the request is the refused lease's bytes, got {}",
+        report.requested_bytes
+    );
+    assert_eq!(report.charged_bytes, charged_before);
+    assert_eq!(
+        error.to_string(),
+        "credential handle bytes exceed the run memory budget",
+        "the message stays static; the report is a separate field"
+    );
+    let rendered = format!("{error:?}");
+    for secret_or_name in ["lease-secret-must-not-escape", "release", "orders.api"] {
+        assert!(
+            !rendered.contains(secret_or_name),
+            "the refusal must not carry {secret_or_name:?}: {rendered}"
+        );
+    }
+}
+
 #[test]
 fn bounds_successful_lease_bytes_are_reported_before_provider_allocation() {
     let arbitrator = Arc::new(memory_arbitrator(u64::MAX));

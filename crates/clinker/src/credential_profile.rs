@@ -22,6 +22,7 @@ use clinker_plan::credentials::{
     CredentialCapability, CredentialHandleUnits, CredentialLifetime, CredentialProviderKind,
     CredentialRenewal, CredentialRequirement, CredentialRequirementName, CredentialRevocation,
 };
+use clinker_plan::runtime_error::MemoryShortfallReport;
 
 /// An explicitly selected deployment credential profile name.
 ///
@@ -1199,7 +1200,8 @@ mod memory_consumer_contract_tests {
 ///
 /// The registry preallocates a fixed handle table, registers exactly one
 /// [`MemoryConsumer`], and charges each provider-declared lease plus its
-/// secret-free handle metadata before the provider may allocate it. Credential
+/// secret-free handle metadata through the run's memory ledger, checked against
+/// the limit, before the provider may allocate it. Credential
 /// state is never written to spill. The consumer reports zero bytes freed when
 /// the arbitrator requests a spill, then the registry revokes and releases the
 /// complete preflight set at its next owned memory-signal checkpoint.
@@ -1315,7 +1317,10 @@ where
     ///
     /// Returns a sanitized resolution, capacity, memory, accounting, or
     /// provider error. Every error leaves zero live handles and no registered
-    /// consumer.
+    /// consumer. A lease that does not fit beside what the run has charged is
+    /// refused before the provider allocates it, with
+    /// [`CredentialRegistryErrorKind::MemoryLimitExceeded`] carrying the E310
+    /// report; the process's memory reading takes no part in that decision.
     pub fn acquire(
         &mut self,
         selected: &CredentialProfileName,
@@ -1360,9 +1365,12 @@ where
             return Err(self.fail_and_close(CredentialRegistryErrorKind::RetainedBytesOverflow));
         };
 
-        self.memory_handle.set_bytes(prospective_bytes);
-        if self.arbitrator.should_abort_local(prospective_bytes) {
-            return Err(self.fail_and_close(CredentialRegistryErrorKind::MemoryLimitExceeded));
+        // The lease is charged before the provider allocates it, checked
+        // against the run's charged total under the ledger lock. A refusal
+        // charges nothing, so the run's peak never records a refused lease.
+        if let Err(shortfall) = self.memory_handle.try_resize(prospective_bytes) {
+            let report = shortfall.into_report(self.arbitrator);
+            return Err(self.fail_and_close_with_report(report));
         }
 
         let mut lease = match provider.resolve(requirement) {
@@ -1475,6 +1483,18 @@ where
         CredentialRegistryError::new(kind)
     }
 
+    /// Fail closed on a memory refusal, carrying its E310 report. The report
+    /// is built by the caller before cleanup, while the registry is still a
+    /// registered holder of the ledger the refusal read.
+    fn fail_and_close_with_report(
+        &mut self,
+        report: Box<MemoryShortfallReport>,
+    ) -> CredentialRegistryError {
+        let mut error = self.fail_and_close(CredentialRegistryErrorKind::MemoryLimitExceeded);
+        error.report = Some(report);
+        error
+    }
+
     fn release_all(&mut self) -> bool {
         let mut cleanup_failed = false;
         while let Some(mut handle) = self.handles.pop() {
@@ -1512,7 +1532,8 @@ pub enum CredentialRegistryErrorKind {
     Resolution(CredentialResolutionErrorKind),
     /// The fixed handle-entry ceiling was reached.
     HandleLimitExceeded,
-    /// Prospective retained bytes exceeded the run memory budget.
+    /// The run's memory ledger refused the lease's bytes: the E310 refusal,
+    /// whose report [`CredentialRegistryError::memory_report`] carries.
     MemoryLimitExceeded,
     /// The arbitrator requested release before another acquisition.
     SpillRequested,
@@ -1532,19 +1553,32 @@ pub enum CredentialRegistryErrorKind {
 }
 
 /// A sanitized credential-registry failure.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// The message is a static string per [`CredentialRegistryErrorKind`]. A
+/// memory refusal also carries the run's E310 report as a separate field,
+/// read through [`Self::memory_report`]; it holds byte figures and the run's
+/// holder labels, never a credential value, profile or requirement name.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CredentialRegistryError {
     kind: CredentialRegistryErrorKind,
+    report: Option<Box<MemoryShortfallReport>>,
 }
 
 impl CredentialRegistryError {
     const fn new(kind: CredentialRegistryErrorKind) -> Self {
-        Self { kind }
+        Self { kind, report: None }
     }
 
     /// Stable failure category.
-    pub const fn kind(self) -> CredentialRegistryErrorKind {
+    pub const fn kind(&self) -> CredentialRegistryErrorKind {
         self.kind
+    }
+
+    /// The E310 report of a [`CredentialRegistryErrorKind::MemoryLimitExceeded`]
+    /// refusal: the run's memory ledger as the refused lease found it, naming
+    /// the credential registry as the requester. `None` for every other kind.
+    pub fn memory_report(&self) -> Option<&MemoryShortfallReport> {
+        self.report.as_deref()
     }
 }
 
