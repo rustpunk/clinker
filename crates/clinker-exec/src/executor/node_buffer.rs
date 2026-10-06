@@ -56,12 +56,15 @@ pub(crate) fn record_byte_cost(column_count: usize) -> u64 {
         as u64
 }
 
-/// What spilling one resident row frees, as a reclaim victim's figure
-/// counts it: the row's slot cost ([`record_byte_cost`]) plus its own heap
-/// payload. A node-buffer slot and every operator buffer that ranks its
-/// rows against a slot count a row through this one function, so the same
-/// row ranks the same wherever it is held. A ranking figure only; never
-/// charged.
+/// One resident row's share of a reclaim victim's ranking figure: the row's
+/// slot cost ([`record_byte_cost`]) plus the heap payload no Source has
+/// charged (computed strings, lists, record variables). Text a Source read
+/// is governed and charged to that Source, so it is left out even when a
+/// spill would drop its last copy and free it; the figure then understates
+/// what the spill frees (open question 92). A node-buffer slot and every
+/// operator buffer that ranks its rows against a slot count a row through
+/// this one function, so the same row ranks the same wherever it is held.
+/// A ranking figure only; never charged.
 pub(crate) fn resident_record_reclaimable_bytes(record: &Record) -> u64 {
     record_byte_cost(record.schema().column_count())
         .saturating_add(record.legacy_estimated_heap_size() as u64)
@@ -547,11 +550,12 @@ impl NodeBuffer {
             })
     }
 
-    /// Bytes a spill of this slot would free now: each resident record's
-    /// slot cost plus its own heap payload (strings, lists, record
-    /// variables). The payload counts even when another consumer is charged
-    /// for it, because the spill drops it. Rows already on disk count 0.
-    /// What the slot's consumer ranks by as a reclaim victim; never charged.
+    /// The slot's ranking figure as a reclaim victim: each resident record's
+    /// slot cost plus the heap payload no Source has charged
+    /// ([`resident_record_reclaimable_bytes`]). Text a Source read is left
+    /// out, though a spill that drops its last copy frees it, so the figure
+    /// can understate what the spill frees; the pass measures what each
+    /// spill actually frees. Rows already on disk count 0. Never charged.
     pub(crate) fn reclaimable_bytes(&self) -> u64 {
         self.resident_events()
             .fold(0u64, |bytes, event| match event {

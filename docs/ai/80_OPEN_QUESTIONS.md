@@ -969,8 +969,8 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
 - Filed: 2026-10-05.
 - Status: Open. The cannot-spill count is resolved: an E310 no longer counts
   a finished Source's surviving rows as state that cannot spill. Naming the
-  step that keeps them alive, and the parked edge's reclaimable figure, stay
-  open.
+  step that keeps them alive stays open, and so does the ranking figure of
+  every holder that keeps such rows; the ranking-figure decision is pending.
 - Priority: Medium.
 - Evidence: Long text a Source reads is admitted once, in the Source's name,
   and the admission travels with the allocation to every copy of the row
@@ -992,9 +992,27 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
   run's total stays exact, so no limit is exceeded unnoticed. Two figures
   are still weaker than they could be: an E310 can only report those bytes
   as memory not held by any one node, so it cannot name the step (a parked
-  edge, a buffered slot) that keeps them alive; and the parked edge's
-  reclaimable figure leaves them out, so a reclaim pass underrates what
-  spilling that edge would free.
+  edge, a buffered slot) that keeps them alive; and every holder that keeps
+  such rows leaves them out of its ranking figure (below).
+- Ranking figure (open, decision pending): every row holder on the walk
+  ranks as a reclaim victim by its rows' own charge, which leaves out text a
+  Source read and is charged for, even when the holder keeps the last copy
+  of that text alive and a spill would free it. That covers a node-buffer
+  slot, Output's per-document bucket and the Cull and Reshape group buffers
+  (`resident_record_reclaimable_bytes`) and a parked edge (its resident
+  segments' charge). A node-buffer slot often holds the only copy, since
+  rows move rather than copy, so it is the common case, not the parked edge.
+  The effect is victim order only: a pass can spill a holder whose figure is
+  larger, find its target not yet met, and spill the next, which costs extra
+  spill I/O. It never causes a refusal: a pass keeps electing until what it
+  measured covers its target, and a resident row always has a figure above
+  0. Grace partitions and a hash Aggregate count the text in full, the
+  opposite error, which the #1394 rule removes; under `memory.backpressure:
+  both` their figures outrank row holders across priority tiers. The #1394
+  rule sets each holder's ranking figure equal to its charge, which keeps
+  this text out; whether the figure should also count the text a holder
+  alone keeps alive is a memory-model decision not yet taken. The code
+  comments and the engine page state the figure as it is.
 - Charges made in a finished Source's name (resolved): on the walk,
   governed allocations are charged to the dispatching node's first
   registered consumer (`dispatch_plan_node`), and the plain Source arm
@@ -1014,7 +1032,8 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
   consumer was confirmed to do so.
 - Files/modules involved:
   `crates/clinker-exec/src/executor/parked_generations.rs` (`park`, the
-  edge's reclaimable figure), `crates/clinker-exec/src/executor/source_dispatch.rs`
+  edge's reclaimable figure), `crates/clinker-exec/src/executor/node_buffer.rs`
+  (`resident_record_reclaimable_bytes`), `crates/clinker-exec/src/executor/source_dispatch.rs`
   (`dispatch_source`), `crates/clinker-exec/src/executor/dispatch.rs`
   (`dispatch_plan_node`, `release_source_consumer`),
   `crates/clinker-exec/src/pipeline/memory.rs` (`unregister_consumer`),
@@ -1025,8 +1044,10 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
 - Suggested way to resolve it: Decide, with the reclaim victim order and the
   E310 holder report, how an E310 names the step that keeps a finished
   Source's rows alive (by what that step alone keeps alive, or by handing
-  the charge over to it); then rank a parked edge by what spilling it would
-  actually free, including that text.
+  the charge over to it). Separately, decide whether a row holder's ranking
+  figure counts the text it alone keeps alive (which needs a read-time check
+  that the holder keeps every copy) and apply the answer to every row holder
+  at once, so holders of one priority rank in one unit.
 - Related finding (spill read-back): rows read back from a spill file come
   back with text the run never admitted (`Value`'s deserializer builds it
   with `FieldStr::from`, `crates/clinker-record/src/value.rs`), so no
@@ -1085,43 +1106,23 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
   that every byte is charged once.
 - Implementation owner: Executor maintainers.
 
-### 94. The credential preflight refuses on process memory with its own error
-
-- Filed: 2026-10-06.
-- Status: Open.
-- Priority: Low.
-- Evidence: The memory budget checklist forbids pairing `should_abort` or
-  `should_abort_local` with a refusal of one's own: a hard-limit backstop
-  goes through `MemoryArbitrator::check_hard_limit`, which reclaims on the
-  walk first and reports the reading that tripped as an E310. The credential
-  handle registry's acquisition (`CredentialHandleRegistry::acquire`) is the
-  one site that still pairs them: it charges a credential's retained bytes
-  and then refuses with its own credential memory error when
-  `should_abort_local` trips. That check also trips on the process's peak
-  resident reading, so memory the process holds for other reasons can fail
-  a credential acquisition with "credential handle bytes exceed the run
-  memory budget". The acquisition is a preflight step outside the walk and
-  raises no E310; no production caller in the CLI calls it yet.
-- Files/modules involved: `crates/clinker/src/credential_profile.rs`
-  (`acquire_attempt`, `CredentialRegistryErrorKind::MemoryLimitExceeded`),
-  `crates/clinker-exec/src/pipeline/memory.rs` (`should_abort_local`).
-- Suggested way to resolve it: Decide whether the acquisition's growth
-  becomes a checked charge (`try_grow` on its handle, refusing on the
-  charged total only), or whether the preflight stays outside the E310
-  model and its error says which reading tripped.
-- Implementation owner: CLI maintainers.
-
 ### 95. A grace-hash join's output order depends on which partitions spilled
 
 - Filed: 2026-10-06.
-- Status: Open.
+- Status: Decided 2026-09-29, not yet implemented
+  ([#1228](https://github.com/rustpunk/clinker/issues/1228)): the grace join
+  emits in driver order at every memory limit. Until that change lands the
+  order depends on which partitions spilled, as it always has.
 - Priority: Medium.
 - Evidence: A grace-hash join emits the matches of its in-memory partitions
   in driver order during the probe, then each spilled partition's matches as
   that partition is read back, and the dispatcher admits those rows as they
   come. Which partitions spill depends on the memory limit, so the same input
-  joined under two limits produces the same rows in different orders. The
-  sort-merge and range joins realise one order whatever the limit. The grace
+  joined under two limits produces the same rows in different orders, and the
+  dead letters of its output step follow the same order. The sort-merge and
+  range joins sort their own output (by the driver row's identity), so they
+  realise one order whatever the limit; the inline hash join emits in driver
+  arrival order. The grace
   join tests that run under several limits compare sorted rows for this
   reason (`grace_reload_run` in
   `crates/clinker-exec/src/executor/tests/combine_consumer_lifecycle.rs`,
@@ -1130,11 +1131,14 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
   `crates/clinker-exec/src/pipeline/grace_hash/mod.rs` (the probe and reload
   phases), `crates/clinker-exec/src/executor/combine_dispatch.rs` (the grace
   arm's output admission).
-- Suggested way to resolve it: Route the grace join's output through the
-  payload-ordered sort the range joins use, keyed on driver order, or record
-  that a hash join's output order is unspecified; decide alongside
-  byte-identical output across memory limits
-  ([#1250](https://github.com/rustpunk/clinker/issues/1250)).
+- Decision: the grace join's output goes through an ordered, spillable
+  buffer keyed on each driver row's arrival, so its order is the inline hash
+  join's at every limit. The buffer is charged and replaces the uncharged
+  output vector #1228 reports. Recording the order as unspecified was
+  rejected: the Combine page promises one order for every strategy and
+  offers no ordering option of its own. Byte-identical output across memory
+  limits is asserted under
+  [#1250](https://github.com/rustpunk/clinker/issues/1250).
 - Implementation owner: Executor maintainers.
 
 ## Resolved Archive
@@ -1167,6 +1171,26 @@ the branches and the fix (`crates/cxl/src/typecheck/pass.rs`), so the mix
 reaches an aggregate only through a value typecheck cannot see (an untyped
 column, a `numeric` result such as `decimal.clamp(lo, hi)`), where the
 run-time error is the backstop. See `docs/user/src/cxl/aggregates.md`.
+
+### 94. The credential preflight refused on process memory with its own error
+
+Resolved 2026-10-06 by maintainer decision (the credential registry grows
+through a checked charge, like every other consumer). A credential lease is
+charged with `ConsumerHandle::try_resize` on the registry's handle before the
+provider allocates it, checked against the run's charged total under the
+ledger lock; the process's memory reading takes no part. A lease that does not
+fit is refused with `CredentialRegistryErrorKind::MemoryLimitExceeded`, whose
+message stays static and whose E310 report, naming the credential registry,
+is a separate field (`CredentialRegistryError::memory_report`); the report
+holds byte figures and holder labels, never a credential or profile name. A
+refusal charges nothing, so the run's peak charged total never records a
+refused lease. `MemoryArbitrator::should_abort_local` had no caller left and
+was removed (`crates/clinker/src/credential_profile.rs`,
+`acquire_attempt`; the tests
+`bounds_lease_admission_ignores_the_process_memory_reading`,
+`bounds_refused_lease_never_raises_the_run_peak_past_the_limit` and
+`bounds_refused_lease_reports_the_credential_registry_as_an_e310` in
+`crates/clinker/tests/credential_profiles.rs`).
 
 Numbers are never reused. One line per entry: the answer and its evidence.
 

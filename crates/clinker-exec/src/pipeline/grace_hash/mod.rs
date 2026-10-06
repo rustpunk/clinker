@@ -812,9 +812,14 @@ impl GraceHashExecutor {
 /// function constructs the grace executor, partitions inputs, runs the
 /// probe phase, and reloads spilled partition pairs.
 ///
-/// Output preserves driver order across the in-memory probe phase and
-/// emits reloaded matches after the in-memory matches; downstream sort
-/// is the caller's responsibility (matches the IEJoin contract).
+/// Output order depends on which partitions spilled: matches against
+/// partitions still in memory are emitted in driver order during the probe,
+/// then each spilled partition's matches are appended as it is reloaded, so
+/// a driver whose partition spilled comes after drivers that follow it. A
+/// different memory limit can therefore change the order of the output (and
+/// of its dead letters), though never its rows. Unlike the IEJoin and
+/// sort-merge kernels, which sort their own output, this kernel does not yet
+/// restore driver order; #1228 tracks it.
 ///
 /// Runs on the calling thread, so its budget checks and spills run there;
 /// only the per-record build-key extraction runs on `pool`.

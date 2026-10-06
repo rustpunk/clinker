@@ -933,14 +933,19 @@ pub trait MemoryConsumer: Send + Sync {
     /// consumer's handle charges; this figure is not summed into it.
     fn current_usage(&self) -> u64;
 
-    /// What a spill of this consumer would free now. Used only to rank
-    /// victims: a reclaim pass and the victim policies order candidates by
-    /// it, and a consumer reporting 0 is never elected, however much it has
-    /// charged. The default is [`Self::current_usage`], for a consumer whose
-    /// every charged byte a spill releases. A consumer whose charge a spill
-    /// cannot free (charged-only state, a pause-only producer, a fixed
-    /// staging floor) reports 0; one that can free only part of it reports
-    /// that part. Read every arbitration round; must be cheap.
+    /// An estimate of what a spill of this consumer would free now. Used
+    /// only to rank victims: a reclaim pass and the victim policies order
+    /// candidates by it, and a consumer reporting 0 is never elected,
+    /// however much it has charged. A pass counts what each spill actually
+    /// releases, not this figure, toward its target. The default is
+    /// [`Self::current_usage`], for a consumer whose every charged byte a
+    /// spill releases. A consumer whose charge a spill cannot free
+    /// (charged-only state, a pause-only producer, a fixed staging floor)
+    /// reports 0; one that can free only part of it reports that part. A row
+    /// holder counts its rows' own charge and leaves out text a Source read
+    /// and is charged for, even when the spill would drop that text's last
+    /// copy, so its figure can understate what the spill frees (open
+    /// question 92). Read every arbitration round; must be cheap.
     fn reclaimable_bytes(&self) -> u64 {
         self.current_usage()
     }
