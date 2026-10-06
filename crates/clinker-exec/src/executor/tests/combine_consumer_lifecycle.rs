@@ -954,3 +954,190 @@ fn an_inline_join_build_over_the_limit_spills_other_state_and_completes() {
         "spilling another node's rows to make room must not change any Output's bytes"
     );
 }
+
+/// A two-Source inline join and nothing else: no state any reclaim pass
+/// could spill while the join builds, so whether its table fits depends
+/// only on how the ledger counts its build rows.
+const INLINE_HANDOVER_YAML: &str = r#"
+pipeline:
+  name: inline_build_handover
+  memory: { limit: "512M", backpressure: spill }
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    type: csv
+    path: orders.csv
+    schema:
+      - { name: order_id, type: string }
+      - { name: product_id, type: string }
+- type: source
+  name: products
+  config:
+    name: products
+    type: csv
+    path: products.csv
+    schema:
+      - { name: product_id, type: string }
+      - { name: name, type: string }
+- type: combine
+  name: enriched
+  input:
+    orders: orders
+    products: products
+  config:
+    where: "orders.product_id == products.product_id"
+    drive: orders
+    match: first
+    on_miss: null_fields
+    cxl: |
+      emit order_id = orders.order_id
+      emit name = products.name
+    propagate_ck: driver
+- type: sink
+  name: out
+  input: enriched
+  config:
+    name: out
+    type: csv
+    path: out.csv
+"#;
+
+/// Driver rows: few, so the join's output fits beside its table at the low
+/// capacity and the probe loop's 10,000-row check never runs.
+const HANDOVER_ORDERS: usize = 300;
+/// Build rows; short text, so each row's input charge is its fixed slot cost.
+const HANDOVER_PRODUCTS: usize = 6_000;
+
+/// Run the two-Source join held to `capacity` bytes of ledger (ample when
+/// `None`), reading no process memory; return its report and the Output's
+/// bytes.
+fn inline_handover_run(capacity: Option<u64>) -> Result<(ExecutionReport, String), PipelineError> {
+    let config = clinker_plan::config::parse_config(INLINE_HANDOVER_YAML).expect("parse");
+    let plan = config
+        .compile(&clinker_plan::config::CompileContext::default())
+        .expect("compile");
+    let readers: crate::executor::SourceReaders = HashMap::from([
+        (
+            "orders".to_string(),
+            crate::executor::single_file_reader(
+                "orders.csv",
+                GeneratedCsv::reader("order_id,product_id\n", HANDOVER_ORDERS, |i| {
+                    format!("o{i},p{}\n", (i * 3) % HANDOVER_PRODUCTS)
+                }),
+            ),
+        ),
+        (
+            "products".to_string(),
+            crate::executor::single_file_reader(
+                "products.csv",
+                GeneratedCsv::reader("product_id,name\n", HANDOVER_PRODUCTS, |i| {
+                    format!("p{i},n{i}\n")
+                }),
+            ),
+        ),
+    ]);
+    let buffer = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buffer.clone()) as Box<dyn std::io::Write + Send>,
+    )]);
+    let memory_test = match capacity {
+        Some(bytes) => crate::executor::MemoryTestOverrides::default().with_ledger_capacity(bytes),
+        None => crate::executor::MemoryTestOverrides::default(),
+    }
+    .with_no_process_memory();
+    let params = PipelineRunParams {
+        execution_id: "inline-build-handover".to_string(),
+        batch_id: "batch-0".to_string(),
+        memory_test,
+        ..Default::default()
+    };
+    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)?;
+    Ok((report, buffer.as_string()))
+}
+
+/// The ledger capacity the low two-Source run is held to: enough for the
+/// driver rows beside the finished table once the build rows' input charge
+/// has moved to the table, not enough with that charge counted beside it.
+const HANDOVER_CAPACITY: u64 = 2_600_000;
+
+/// Once the inline join's table holds its build rows, the build input's
+/// charge for those rows moves to the table: the ample run's charged total
+/// never holds the build input's charge beside the table's.
+#[test]
+fn an_inline_join_charges_its_build_rows_once_its_table_holds_them() {
+    assert!(
+        matches!(
+            compiled_combine_strategy(INLINE_HANDOVER_YAML, "enriched"),
+            CombineStrategy::HashBuildProbe
+        ),
+        "the pure-equi join must run the inline HashBuildProbe branch"
+    );
+    let (ample, _) = inline_handover_run(None).expect("the ample run completes");
+    let peak = |node: &str| {
+        ample
+            .per_node_peak_charged_bytes
+            .get(node)
+            .copied()
+            .unwrap_or_else(|| panic!("the ample run charges {node}"))
+    };
+    let both_held = peak("orders") + peak("products") + peak("enriched");
+    assert!(
+        ample.peak_consumer_usage_bytes < both_held,
+        "the build rows' input charge ({}) must move to the table ({}) rather than stay \
+         charged beside it: the run's charged peak {} reaches the driver's, the build \
+         input's and the table's charges together ({both_held})",
+        peak("products"),
+        peak("enriched"),
+        ample.peak_consumer_usage_bytes
+    );
+}
+
+/// With nothing any reclaim pass could spill while the join builds, a
+/// capacity that holds the driver rows and the finished table, but not the
+/// build rows' input charge beside them, completes with the ample run's
+/// output and never charges past the capacity: the build's check counts the
+/// rows once, as the ledger does after the table takes them over.
+#[test]
+fn an_inline_join_whose_table_fits_once_its_rows_are_counted_once_completes() {
+    let (ample, ample_output) = inline_handover_run(None).expect("the ample run completes");
+    let peak = |node: &str| {
+        ample
+            .per_node_peak_charged_bytes
+            .get(node)
+            .copied()
+            .unwrap_or_else(|| panic!("the ample run charges {node}"))
+    };
+    let counted_once = peak("orders") + peak("enriched");
+    let counted_twice = counted_once + peak("products");
+    assert!(
+        HANDOVER_CAPACITY >= counted_once,
+        "the capacity {HANDOVER_CAPACITY} must hold the driver rows beside the finished \
+         table ({counted_once})"
+    );
+    assert!(
+        HANDOVER_CAPACITY < counted_twice,
+        "the capacity {HANDOVER_CAPACITY} must not hold the build rows' input charge beside \
+         them as well ({counted_twice})"
+    );
+
+    let (low, low_output) = inline_handover_run(Some(HANDOVER_CAPACITY))
+        .expect("the table fits once its build rows are counted once");
+    assert!(
+        low.peak_consumer_usage_bytes <= HANDOVER_CAPACITY,
+        "the charged total must never pass the capacity: peak {} against {HANDOVER_CAPACITY}",
+        low.peak_consumer_usage_bytes
+    );
+    assert!(
+        !low.per_stage_spill_bytes_written.contains_key("orders")
+            && !low.per_stage_spill_bytes_written.contains_key("products"),
+        "neither join input is spilled to make room: {:?}",
+        low.per_stage_spill_bytes_written
+    );
+    assert!(
+        low_output == ample_output,
+        "counting the build rows once must not change the Output's bytes"
+    );
+}
