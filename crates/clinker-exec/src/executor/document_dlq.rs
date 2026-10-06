@@ -3602,7 +3602,11 @@ mod tests {
         let arbitrator = electing_arbitrator(1 << 30);
         let mut state = held_state(&arbitrator, root.path(), usize::MAX);
         let (rejected, holding) = (doc_key(0), doc_key(1));
-        for ordinal in 1..=8 {
+        hold_row(&mut state, &holding, 1).expect("hold");
+        // What one row charges when held into an empty tail. Rows 1 and 9
+        // encode to frames of one length.
+        let lone_row = state.held.resident_bytes();
+        for ordinal in 2..=8 {
             hold_row(&mut state, &holding, ordinal).expect("hold");
         }
         state.insert_failed(Arc::clone(&rejected), DlqFailureStamp::now(), "validate");
@@ -3622,14 +3626,24 @@ mod tests {
         );
         let resident_before = state.held.resident_bytes();
         assert!(resident_before > 0);
+        let charged_before = state.charged_bytes();
 
         // The hold answers the request before it appends, so the eight rows
         // already held move to disk and only the new row stays resident.
         hold_row(&mut state, &holding, 9).expect("hold");
         assert_eq!(files_in(root.path()), 1, "the held rows moved to one file");
-        assert!(
-            state.held.resident_bytes() < resident_before,
-            "the rows held before the request left memory"
+        // The elected spill writes out every tail resident before the hold;
+        // the new row is then admitted into an empty tail, as row 1 was.
+        let spilled = resident_before;
+        assert_eq!(
+            state.held.resident_bytes(),
+            resident_before - spilled + lone_row,
+            "only the row held after the spill stays resident"
+        );
+        assert_eq!(
+            state.charged_bytes(),
+            charged_before - spilled + lone_row,
+            "the charge fell by the spill and rose by the row admitted"
         );
         assert!(
             !state.handle.take_spill_request(),
