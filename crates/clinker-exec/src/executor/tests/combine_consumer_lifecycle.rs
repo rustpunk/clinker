@@ -1398,3 +1398,216 @@ fn an_inline_join_whose_table_fits_once_its_rows_are_counted_once_completes() {
         "counting the build rows once must not change the Output's bytes"
     );
 }
+
+/// A two-Source `grace_hash` join and nothing else: no state any reclaim
+/// pass could spill outside the join, so whether a reloaded partition's
+/// table fits depends only on what the ledger still counts beside it.
+const GRACE_RELOAD_YAML: &str = r#"
+pipeline:
+  name: grace_reload_input_charge
+  memory: { limit: "512M", backpressure: spill }
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    type: csv
+    path: orders.csv
+    schema:
+      - { name: order_id, type: string }
+      - { name: product_id, type: string }
+- type: source
+  name: products
+  config:
+    name: products
+    type: csv
+    path: products.csv
+    schema:
+      - { name: product_id, type: string }
+      - { name: name, type: string }
+- type: combine
+  name: enriched
+  input:
+    orders: orders
+    products: products
+  config:
+    where: "orders.product_id == products.product_id"
+    drive: orders
+    match: first
+    on_miss: null_fields
+    strategy: grace_hash
+    cxl: |
+      emit order_id = orders.order_id
+      emit name = products.name
+    propagate_ck: driver
+- type: sink
+  name: out
+  input: enriched
+  config:
+    name: out
+    type: csv
+    path: out.csv
+"#;
+
+/// Driver rows: three times the build rows, so the driver's input charge
+/// is most of what both inputs hold together.
+const GRACE_ORDERS: usize = 60_000;
+/// Build rows.
+const GRACE_PRODUCTS: usize = 20_000;
+/// Build rows sharing the one key `hot`, with long text: one partition no
+/// split can divide, whose reloaded table counts that text, which the build
+/// input's charge does not, so the table is larger than the whole build
+/// input's charge.
+const GRACE_HOT: usize = 18_000;
+
+/// Run the grace fixture held to `capacity` bytes of ledger (ample when
+/// `None`), reading no process memory and recording every hard-limit check
+/// that runs a reclaim round in `reclaims`; return its report and the
+/// Output's header followed by its data rows sorted. A grace join emits a
+/// reloaded partition's matches after the in-memory ones, and which
+/// partitions spill depends on the limit, so only the sorted rows compare.
+fn grace_reload_run(
+    capacity: Option<u64>,
+    reclaims: &crate::executor::HardLimitReclaims,
+) -> Result<(ExecutionReport, Vec<String>), PipelineError> {
+    let config = clinker_plan::config::parse_config(GRACE_RELOAD_YAML).expect("parse");
+    let plan = config
+        .compile(&clinker_plan::config::CompileContext::default())
+        .expect("compile");
+    let readers: crate::executor::SourceReaders = HashMap::from([
+        (
+            "orders".to_string(),
+            crate::executor::single_file_reader(
+                "orders.csv",
+                GeneratedCsv::reader("order_id,product_id\n", GRACE_ORDERS, |i| {
+                    if i % 4 == 0 {
+                        format!("o{i},hot\n")
+                    } else {
+                        format!("o{i},p{}\n", i / 3)
+                    }
+                }),
+            ),
+        ),
+        (
+            "products".to_string(),
+            crate::executor::single_file_reader(
+                "products.csv",
+                GeneratedCsv::reader("product_id,name\n", GRACE_PRODUCTS, |i| {
+                    if i < GRACE_HOT {
+                        format!("hot,n{i:0>120}\n")
+                    } else {
+                        format!("p{i},n{i}\n")
+                    }
+                }),
+            ),
+        ),
+    ]);
+    let buffer = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buffer.clone()) as Box<dyn std::io::Write + Send>,
+    )]);
+    let memory_test = match capacity {
+        Some(bytes) => crate::executor::MemoryTestOverrides::default().with_ledger_capacity(bytes),
+        None => crate::executor::MemoryTestOverrides::default(),
+    }
+    .with_no_process_memory()
+    .with_hard_limit_reclaims(reclaims.clone());
+    let params = PipelineRunParams {
+        execution_id: "grace-reload-input-charge".to_string(),
+        batch_id: "batch-0".to_string(),
+        memory_test,
+        ..Default::default()
+    };
+    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)?;
+    let output = buffer.as_string();
+    let mut lines = output.lines();
+    let mut rows = vec![lines.next().unwrap_or_default().to_string()];
+    let mut data: Vec<String> = lines.map(str::to_string).collect();
+    data.sort();
+    rows.extend(data);
+    Ok((report, rows))
+}
+
+/// The grace fixture's ample run, which every low run compares against,
+/// with the input charges its Sources' slots peaked at:
+/// `(report, sorted rows, driver input charge, build input charge)`.
+fn grace_reload_ample() -> (ExecutionReport, Vec<String>, u64, u64) {
+    assert!(
+        matches!(
+            compiled_combine_strategy(GRACE_RELOAD_YAML, "enriched"),
+            CombineStrategy::GraceHash { .. }
+        ),
+        "the `strategy: grace_hash` hint must select the grace branch"
+    );
+    let reclaims = crate::executor::HardLimitReclaims::default();
+    let (ample, rows) = grace_reload_run(None, &reclaims).expect("the ample run completes");
+    assert!(
+        ample.per_stage_spill_bytes_written.is_empty(),
+        "ample memory spills nothing: {:?}",
+        ample.per_stage_spill_bytes_written
+    );
+    assert_eq!(rows.len(), GRACE_ORDERS + 1, "one row per driver row");
+    let peak = |node: &str| {
+        ample
+            .per_node_peak_charged_bytes
+            .get(node)
+            .copied()
+            .unwrap_or_else(|| panic!("the ample run charges {node}"))
+    };
+    let (orders, products) = (peak("orders"), peak("products"));
+    (ample, rows, orders, products)
+}
+
+/// Run the grace fixture at `capacity` and check it completes within it,
+/// spilling and reloading the join's partitions, with the ample run's rows,
+/// and with no hard-limit check of the join needing a reclaim round.
+fn assert_grace_reload_completes(capacity: u64, ample_rows: &[String]) {
+    let reclaims = crate::executor::HardLimitReclaims::default();
+    let (low, rows) = grace_reload_run(Some(capacity), &reclaims).unwrap_or_else(|e| {
+        panic!("at {capacity} the reloaded partitions' tables fit and the join completes: {e}")
+    });
+    assert!(
+        low.per_stage_spill_bytes_written
+            .get("enriched")
+            .is_some_and(|&bytes| bytes > 0),
+        "at {capacity} the join spills partitions and reloads them: {:?}",
+        low.per_stage_spill_bytes_written
+    );
+    assert!(
+        low.peak_consumer_usage_bytes <= capacity,
+        "at {capacity} the charged total never passes the capacity: peak {}",
+        low.peak_consumer_usage_bytes
+    );
+    let join_reclaims: Vec<_> = reclaims
+        .checks()
+        .into_iter()
+        .filter(|check| check.node == "enriched")
+        .collect();
+    assert!(
+        join_reclaims.is_empty(),
+        "at {capacity} no check of the join needs room made: {join_reclaims:?}"
+    );
+    assert!(
+        rows == ample_rows,
+        "at {capacity} spilling and reloading partitions must not change the joined rows"
+    );
+}
+
+/// Once a grace join's build loop has moved every build row into a
+/// partition, the build input's charge ends: the partitions charge each row
+/// at its full figure, and rows already written to disk hold no memory. The
+/// capacity holds the driver's charge beside the hot partition's reloaded
+/// table, and both inputs together when they are collected, but not the
+/// build input's charge beside the reloaded table as well. Counting that
+/// charge until the join returns refuses the reload with E310 for the
+/// join's build side.
+#[test]
+fn a_grace_join_reloading_spilled_partitions_does_not_count_its_build_input() {
+    let (_, ample_rows, orders, products) = grace_reload_ample();
+    // Room for the driver's charge and twice the build input's: the hot
+    // partition's table, larger than the build input's charge, fits beside
+    // the driver's, and the inputs fit together with room to spare.
+    let capacity = orders + 2 * products;
+    assert_grace_reload_completes(capacity, &ample_rows);
+}

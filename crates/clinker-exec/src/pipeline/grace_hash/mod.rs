@@ -74,6 +74,7 @@ use cxl::typecheck::TypedProgram;
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 
 use crate::executor::combine::{CombineResolver, CombineResolverMapping};
+use crate::executor::node_buffer::TransientNodeBufferReservation;
 use crate::pipeline::combine::{
     BuildSeq, CombineHashTable, CombineKernelOutput, CombineOutputEvalFailure, KeyExtractor,
     hash_composite_key,
@@ -271,6 +272,11 @@ pub(crate) struct GraceHashExec<'a> {
     /// node, or the run's own reporting, sees measured figures that
     /// supersede the plan-time row-count guess.
     pub stats_sink: GraceStatsSink<'a>,
+    /// The charge the build input's rows carried into the join, `None` when
+    /// they arrived uncharged. The kernel owns it: the partitions charge
+    /// each row at its full figure as the build loop moves it in, and the
+    /// charge ends when that loop has freed the input vector.
+    pub build_input_charge: Option<TransientNodeBufferReservation>,
 }
 
 /// Where the grace-hash join records its build-side sketch results: the
@@ -833,6 +839,7 @@ pub(crate) fn execute_combine_grace_hash(
         consumer_id,
         strategy,
         stats_sink,
+        build_input_charge,
     } = args;
 
     if decomposed.equalities.is_empty() {
@@ -983,6 +990,10 @@ pub(crate) fn execute_combine_grace_hash(
             .add_build_record(record, row, seq, hash, budget)
             .map_err(|e| grace_spill_error(e, name, "build add failed"))?;
     }
+    // Every build row is now in a partition, charged there at its full
+    // figure or written to the partition's file, and the input vector is
+    // freed: the input's charge stands for nothing from here.
+    drop(build_input_charge);
 
     let crate::sketch::BuildKeySketchSummary {
         distinct,

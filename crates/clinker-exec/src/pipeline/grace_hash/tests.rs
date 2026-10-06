@@ -595,6 +595,7 @@ fn combine_driver_identity_survives_grace_hash_partition_pair() {
             consumer_id: unregistered_consumer_id(),
             strategy: clinker_plan::config::ErrorStrategy::FailFast,
             stats_sink: test_stats_sink(&stats_catalog, "products", "products"),
+            build_input_charge: None,
         },
         crate::test_support::test_kernel_pool(),
     )
@@ -871,6 +872,7 @@ fn execute_grace_hash_spill_then_reload_correct() {
             consumer_id: unregistered_consumer_id(),
             strategy: clinker_plan::config::ErrorStrategy::FailFast,
             stats_sink: test_stats_sink(&stats_catalog, "products", "products"),
+            build_input_charge: None,
         },
         crate::test_support::test_kernel_pool(),
     )
@@ -1068,6 +1070,7 @@ fn execute_grace_hash_aborts_on_disk_quota_overflow() {
             consumer_id: unregistered_consumer_id(),
             strategy: clinker_plan::config::ErrorStrategy::FailFast,
             stats_sink: test_stats_sink(&stats_catalog, "products", "products"),
+            build_input_charge: None,
         },
         crate::test_support::test_kernel_pool(),
     );
@@ -2664,6 +2667,7 @@ fn run_grace_arrival_order(
             consumer_id: unregistered_consumer_id(),
             strategy: clinker_plan::config::ErrorStrategy::FailFast,
             stats_sink: test_stats_sink(&stats_catalog, "products", "products"),
+            build_input_charge: None,
         },
         crate::test_support::test_kernel_pool(),
     )

@@ -924,6 +924,7 @@ where
                             node: build_upstream,
                             column: &build_qualifier,
                         },
+                        build_input_charge: build_clone_reservation,
                     },
                     &ctx.kernel_pool,
                 )?;
