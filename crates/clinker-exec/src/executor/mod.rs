@@ -1157,7 +1157,7 @@ impl PipelineExecutor {
                         node: src_cfg.name.clone(),
                         surface: clinker_plan::runtime_error::MemorySurface::RowsRead,
                     },
-                );
+                )?;
                 let source_allocation = writer_provider.attributed_allocation(
                     crate::pipeline::memory::ledger::Requester::for_consumer(source_consumer_id),
                 );
@@ -1650,7 +1650,7 @@ impl PipelineExecutor {
                             .batch_size
                             .unwrap_or(crate::executor::batch_handoff::DEFAULT_BATCH_SIZE),
                     },
-                ),
+                )?,
             )))
         } else {
             None
@@ -1853,7 +1853,7 @@ impl PipelineExecutor {
                         ),
                     },
                 },
-            );
+            )?;
             let writer_charge_handle = charge_handle.clone();
             let telemetry_producer = params.telemetry_producer.clone();
             let sink_shutdown_token = params.shutdown_token.clone();

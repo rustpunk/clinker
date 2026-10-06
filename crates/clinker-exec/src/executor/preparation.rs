@@ -528,16 +528,20 @@ impl ExecutorResources {
     ) -> Result<Self, ResourceError> {
         let handle = ConsumerHandle::new();
         arbitrator.attach_writer_handle(handle.clone())?;
-        let id = arbitrator.register_consumer(
-            Arc::new(WriterResourceConsumer {
-                handle: handle.clone(),
-            }),
-            handle.clone(),
-            clinker_plan::runtime_error::ConsumerLabel {
-                node: "output".to_string(),
-                surface: clinker_plan::runtime_error::MemorySurface::OutputStaging,
-            },
-        );
+        // A refused registration is a second binding of the writer's handle,
+        // the same authority conflict a second attachment reports.
+        let id = arbitrator
+            .register_consumer(
+                Arc::new(WriterResourceConsumer {
+                    handle: handle.clone(),
+                }),
+                handle.clone(),
+                clinker_plan::runtime_error::ConsumerLabel {
+                    node: "output".to_string(),
+                    surface: clinker_plan::runtime_error::MemorySurface::OutputStaging,
+                },
+            )
+            .map_err(|_| ResourceError::new(ResourceErrorKind::Authority, 1, 0))?;
         arbitrator.bind_writer_consumer(id)?;
         let release = Arc::new(ReleaseAuthority {
             state: arbitrator.writer_reservation_state(),
@@ -1662,27 +1666,31 @@ mod tests {
         let writer = Arc::new(WriterResourceConsumer {
             handle: writer_handle.clone(),
         });
-        arbitrator.register_consumer(
-            writer.clone(),
-            writer_handle.clone(),
-            ConsumerLabel {
-                node: "output".to_string(),
-                surface: MemorySurface::OutputStaging,
-            },
-        );
+        arbitrator
+            .register_consumer(
+                writer.clone(),
+                writer_handle.clone(),
+                ConsumerLabel {
+                    node: "output".to_string(),
+                    surface: MemorySurface::OutputStaging,
+                },
+            )
+            .expect("a fresh handle registers");
         writer_handle.set_bytes(64 * KIB);
         let slot_handle = ConsumerHandle::new();
-        let slot = arbitrator.register_node_consumer(
-            Arc::new(Slot(slot_handle.clone())),
-            slot_handle.clone(),
-            ConsumerLabel {
-                node: "rows".to_string(),
-                surface: MemorySurface::BufferedRows {
-                    from: "rows".to_string(),
-                    to: clinker_plan::runtime_error::NonEmptyReaders::one("output".to_string()),
+        let slot = arbitrator
+            .register_node_consumer(
+                Arc::new(Slot(slot_handle.clone())),
+                slot_handle.clone(),
+                ConsumerLabel {
+                    node: "rows".to_string(),
+                    surface: MemorySurface::BufferedRows {
+                        from: "rows".to_string(),
+                        to: clinker_plan::runtime_error::NonEmptyReaders::one("output".to_string()),
+                    },
                 },
-            },
-        );
+            )
+            .expect("a fresh handle registers");
         slot_handle.set_bytes(MIB);
         assert_eq!(
             arbitrator.charged_bytes(),

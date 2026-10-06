@@ -63,13 +63,15 @@ fn should_abort_trips_when_rss_exceeds_hard_limit() {
 
     let handle = ConsumerHandle::new();
     handle.set_bytes(64 * 1024);
-    arbitrator.register_consumer(
-        Arc::new(StuckAggregate {
-            handle: handle.clone(),
-        }),
-        handle.clone(),
-        label("stuck_totals"),
-    );
+    arbitrator
+        .register_consumer(
+            Arc::new(StuckAggregate {
+                handle: handle.clone(),
+            }),
+            handle.clone(),
+            label("stuck_totals"),
+        )
+        .expect("a fresh handle registers");
 
     // Push peak RSS just over the hard limit.
     arbitrator.set_peak_rss_for_test(HARD_LIMIT + 1024);
@@ -88,13 +90,15 @@ fn soft_limit_arbitration_runs_before_hard_limit_aborts() {
 
     let handle = ConsumerHandle::new();
     handle.set_bytes(64 * 1024);
-    arbitrator.register_consumer(
-        Arc::new(StuckAggregate {
-            handle: handle.clone(),
-        }),
-        handle.clone(),
-        label("stuck_totals"),
-    );
+    arbitrator
+        .register_consumer(
+            Arc::new(StuckAggregate {
+                handle: handle.clone(),
+            }),
+            handle.clone(),
+            label("stuck_totals"),
+        )
+        .expect("a fresh handle registers");
 
     // Peak RSS above soft limit (50 GiB) but below hard limit (100 GiB).
     arbitrator.set_peak_rss_for_test(75 * 1024 * 1024 * 1024);

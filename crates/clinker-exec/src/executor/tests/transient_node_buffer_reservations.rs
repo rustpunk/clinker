@@ -51,14 +51,16 @@ fn register_pinned(
 ) -> crate::pipeline::memory::ConsumerId {
     let handle = crate::pipeline::memory::ConsumerHandle::new();
     handle.set_bytes(bytes);
-    arbitrator.register_consumer(
-        Arc::new(PinnedUsage(bytes)),
-        handle,
-        clinker_plan::runtime_error::ConsumerLabel {
-            node: "pinned".to_string(),
-            surface: clinker_plan::runtime_error::MemorySurface::GroupState,
-        },
-    )
+    arbitrator
+        .register_consumer(
+            Arc::new(PinnedUsage(bytes)),
+            handle,
+            clinker_plan::runtime_error::ConsumerLabel {
+                node: "pinned".to_string(),
+                surface: clinker_plan::runtime_error::MemorySurface::GroupState,
+            },
+        )
+        .expect("a fresh handle registers")
 }
 
 fn quiet_arbitrator() -> Arc<crate::pipeline::memory::MemoryArbitrator> {

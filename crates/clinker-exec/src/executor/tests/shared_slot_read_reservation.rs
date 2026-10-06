@@ -103,17 +103,19 @@ fn publish_shared_slot(
     charge: u64,
 ) -> Arc<ConsumerHandle> {
     let handle = ConsumerHandle::new();
-    let id = arbitrator.register_node_consumer(
-        Arc::new(NodeBufferConsumer::new(handle.clone())),
-        handle.clone(),
-        ConsumerLabel {
-            node: PRODUCER.to_string(),
-            surface: MemorySurface::BufferedRows {
-                from: PRODUCER.to_string(),
-                to: clinker_plan::runtime_error::NonEmptyReaders::one(READER.to_string()),
+    let id = arbitrator
+        .register_node_consumer(
+            Arc::new(NodeBufferConsumer::new(handle.clone())),
+            handle.clone(),
+            ConsumerLabel {
+                node: PRODUCER.to_string(),
+                surface: MemorySurface::BufferedRows {
+                    from: PRODUCER.to_string(),
+                    to: clinker_plan::runtime_error::NonEmptyReaders::one(READER.to_string()),
+                },
             },
-        },
-    );
+        )
+        .expect("a fresh handle registers");
     handle.try_grow(charge).expect("the slot itself fits");
     let mut set = set.borrow_mut();
     let slots = set.slots_mut();
@@ -242,14 +244,16 @@ impl crate::pipeline::memory::MemoryConsumer for Held {
 
 fn register_held(arbitrator: &MemoryArbitrator, bytes: u64) -> (ConsumerId, Arc<ConsumerHandle>) {
     let handle = ConsumerHandle::new();
-    let id = arbitrator.register_consumer(
-        Arc::new(Held(handle.clone())),
-        handle.clone(),
-        ConsumerLabel {
-            node: "held".to_string(),
-            surface: MemorySurface::GroupState,
-        },
-    );
+    let id = arbitrator
+        .register_consumer(
+            Arc::new(Held(handle.clone())),
+            handle.clone(),
+            ConsumerLabel {
+                node: "held".to_string(),
+                surface: MemorySurface::GroupState,
+            },
+        )
+        .expect("a fresh handle registers");
     handle.try_grow(bytes).expect("the held bytes fit");
     (id, handle)
 }

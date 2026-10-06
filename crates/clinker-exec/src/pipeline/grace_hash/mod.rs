@@ -1145,7 +1145,7 @@ pub(crate) fn execute_combine_grace_hash(
 pub(crate) fn register_grace_consumer(
     budget: &MemoryArbitrator,
     name: &str,
-) -> (ConsumerId, Arc<ConsumerHandle>) {
+) -> Result<(ConsumerId, Arc<ConsumerHandle>), PipelineError> {
     let handle = ConsumerHandle::new();
     let id = budget.register_node_consumer(
         Arc::new(GraceHashConsumer::new(Arc::clone(&handle))),
@@ -1154,8 +1154,8 @@ pub(crate) fn register_grace_consumer(
             node: name.to_string(),
             surface: MemorySurface::JoinBuildSide,
         },
-    );
-    (id, handle)
+    )?;
+    Ok((id, handle))
 }
 
 /// A grace-hash join's partition table as walk-owned state: the executor

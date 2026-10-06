@@ -146,7 +146,7 @@ impl SourceActivationController {
                     node: source_name.clone(),
                     surface: clinker_plan::runtime_error::MemorySurface::RowsRead,
                 },
-            );
+            )?;
             let (stream, receiver) = SourceIngestChannel::new(
                 SourceIngestChannel::DEFAULT_CAPACITY,
                 Arc::clone(&handle),

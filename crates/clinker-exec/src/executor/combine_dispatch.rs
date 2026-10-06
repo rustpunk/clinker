@@ -680,7 +680,7 @@ where
                     node: name.to_string(),
                     surface: MemorySurface::JoinState,
                 },
-            );
+            )?;
             // Every exit past this registration must unregister the
             // consumer, so the kernel-install-through-admit body runs
             // inside a closure whose Result is captured: the clean return
@@ -845,7 +845,7 @@ where
             // spill_partition transition. The kernel registers its
             // partition table as walk-owned state under the same id.
             let (grace_consumer_id, grace_consumer_handle) =
-                crate::pipeline::grace_hash::register_grace_consumer(&ctx.memory_budget, name);
+                crate::pipeline::grace_hash::register_grace_consumer(&ctx.memory_budget, name)?;
             // Every exit past this registration must unregister the
             // consumer, so the kernel-install-through-admit body runs
             // inside a closure whose Result is captured: the clean return
@@ -987,7 +987,7 @@ where
                     node: name.to_string(),
                     surface: MemorySurface::JoinState,
                 },
-            );
+            )?;
             // Every exit past this registration must unregister the
             // consumer, so the kernel-install-through-admit body runs
             // inside a closure whose Result is captured: the clean return
@@ -1137,7 +1137,7 @@ where
             node: name.to_string(),
             surface: MemorySurface::JoinBuildSide,
         },
-    );
+    )?;
     // Every exit past this registration must unregister the
     // consumer, so the hash-build-through-admit body runs inside a
     // closure whose Result is captured: the clean return, the
@@ -1594,7 +1594,7 @@ fn run_streaming_combine_probe(
         producer_idx,
         current_dag.graph[producer_idx].name(),
         name,
-    );
+    )?;
 
     // Copy the stable-context references out of `ctx` before the scope so
     // the probe thread borrows `&'a StableEvalContext` directly (shared,
@@ -2975,7 +2975,7 @@ fn adopt_spilled_runs_into_node_buffer(
         Arc::new(NodeBufferConsumer::new(handle.clone())),
         handle.clone(),
         label,
-    );
+    )?;
     ctx.walk_reclaim.borrow_mut().slots_mut().register(
         slot_key.clone(),
         (consumer_id, handle),

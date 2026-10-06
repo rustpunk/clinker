@@ -308,7 +308,7 @@ where
     // empty-input guard, so the no-work path never leaks a consumer. The
     // handle's byte counter tracks live resident-group bytes; the wrapper
     // reads it on every arbitration round.
-    let (consumer_id, handle) = register_reshape_consumer(&ctx.memory_budget, name);
+    let (consumer_id, handle) = register_reshape_consumer(&ctx.memory_budget, name)?;
 
     // Every exit path past this point must deregister `consumer_id`, so the
     // grouping/finalize work runs inside a closure whose result is matched
@@ -340,7 +340,7 @@ where
 fn register_reshape_consumer(
     budget: &MemoryArbitrator,
     name: &str,
-) -> (ConsumerId, Arc<ConsumerHandle>) {
+) -> Result<(ConsumerId, Arc<ConsumerHandle>), PipelineError> {
     let handle = ConsumerHandle::new();
     let consumer_id = budget.register_node_consumer(
         Arc::new(ReshapeConsumer::new(handle.clone())),
@@ -349,8 +349,8 @@ fn register_reshape_consumer(
             node: name.to_string(),
             surface: MemorySurface::ReshapeGroups,
         },
-    );
-    (consumer_id, handle)
+    )?;
+    Ok((consumer_id, handle))
 }
 
 /// Group the drained input, spilling resident groups to disk under memory
@@ -2037,7 +2037,8 @@ mod tests {
         ));
         with_test_walk_frame(&arbitrator, || {
             let schema = schema();
-            let (id, handle) = register_reshape_consumer(&arbitrator, "reshaped");
+            let (id, handle) = register_reshape_consumer(&arbitrator, "reshaped")
+                .expect("a fresh handle registers");
             let groups = ReshapeGroups::register(
                 &arbitrator,
                 id,

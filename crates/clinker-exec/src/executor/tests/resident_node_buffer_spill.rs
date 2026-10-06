@@ -58,6 +58,7 @@ fn register(arb: &MemoryArbitrator, handle: &Arc<ConsumerHandle>) -> ConsumerId 
             },
         },
     )
+    .expect("a fresh handle registers")
 }
 
 #[test]

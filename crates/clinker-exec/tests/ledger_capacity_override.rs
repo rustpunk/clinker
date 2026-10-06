@@ -354,14 +354,16 @@ fn register(arbitrator: &MemoryArbitrator, node: &str) -> ConsumerId {
 /// Register a consumer for `node` and keep its handle, so a test can grow it.
 fn register_handle(arbitrator: &MemoryArbitrator, node: &str) -> (ConsumerId, Arc<ConsumerHandle>) {
     let handle = ConsumerHandle::new();
-    let id = arbitrator.register_node_consumer(
-        Arc::new(HandleConsumer(Arc::clone(&handle))),
-        Arc::clone(&handle),
-        ConsumerLabel {
-            node: node.to_string(),
-            surface: MemorySurface::GroupState,
-        },
-    );
+    let id = arbitrator
+        .register_node_consumer(
+            Arc::new(HandleConsumer(Arc::clone(&handle))),
+            Arc::clone(&handle),
+            ConsumerLabel {
+                node: node.to_string(),
+                surface: MemorySurface::GroupState,
+            },
+        )
+        .expect("a fresh handle registers");
     (id, handle)
 }
 

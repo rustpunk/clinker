@@ -1013,7 +1013,7 @@ pub(crate) fn reserve_node_buffer_materialization(
             node: node.to_string(),
             surface: surface.clone(),
         },
-    );
+    )?;
     let reservation = TransientNodeBufferReservation {
         budget: std::sync::Arc::clone(budget),
         consumer_id,
@@ -2443,14 +2443,16 @@ mod tests {
     ) -> crate::pipeline::memory::ConsumerId {
         let handle = crate::pipeline::memory::ConsumerHandle::new();
         handle.set_bytes(bytes);
-        budget.register_consumer(
-            Arc::new(FixedUsageConsumer(bytes)),
-            handle,
-            clinker_plan::runtime_error::ConsumerLabel {
-                node: "baseline".to_string(),
-                surface: clinker_plan::runtime_error::MemorySurface::GroupState,
-            },
-        )
+        budget
+            .register_consumer(
+                Arc::new(FixedUsageConsumer(bytes)),
+                handle,
+                clinker_plan::runtime_error::ConsumerLabel {
+                    node: "baseline".to_string(),
+                    surface: clinker_plan::runtime_error::MemorySurface::GroupState,
+                },
+            )
+            .expect("a fresh handle registers")
     }
 
     impl crate::pipeline::memory::MemoryConsumer for FixedUsageConsumer {
@@ -2524,17 +2526,19 @@ mod tests {
         );
         let handle = ConsumerHandle::new();
         let consumer = Arc::new(NodeBufferConsumer::new(handle.clone()));
-        let id = arbitrator.register_node_consumer(
-            consumer.clone(),
-            handle.clone(),
-            clinker_plan::runtime_error::ConsumerLabel {
-                node: "rows".to_string(),
-                surface: clinker_plan::runtime_error::MemorySurface::BufferedRows {
-                    from: "rows".to_string(),
-                    to: clinker_plan::runtime_error::NonEmptyReaders::one("next".to_string()),
+        let id = arbitrator
+            .register_node_consumer(
+                consumer.clone(),
+                handle.clone(),
+                clinker_plan::runtime_error::ConsumerLabel {
+                    node: "rows".to_string(),
+                    surface: clinker_plan::runtime_error::MemorySurface::BufferedRows {
+                        from: "rows".to_string(),
+                        to: clinker_plan::runtime_error::NonEmptyReaders::one("next".to_string()),
+                    },
                 },
-            },
-        );
+            )
+            .expect("a fresh handle registers");
         // The handle charges only the slot's residue; the payload is charged
         // to whoever allocated it.
         handle.set_bytes(16);

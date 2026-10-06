@@ -90,14 +90,16 @@ fn hold(
     if matches!(kind, Kind::PausedSource) {
         holder.pause();
     }
-    let id = arbitrator.register_node_consumer(
-        holder,
-        Arc::clone(&handle),
-        ConsumerLabel {
-            node: node.to_string(),
-            surface,
-        },
-    );
+    let id = arbitrator
+        .register_node_consumer(
+            holder,
+            Arc::clone(&handle),
+            ConsumerLabel {
+                node: node.to_string(),
+                surface,
+            },
+        )
+        .expect("a fresh handle registers");
     handle.set_bytes(bytes);
     (id, handle)
 }
@@ -521,20 +523,22 @@ fn a_source_holder_never_counts_as_state_that_cannot_spill() {
         Kind::ActiveSource,
     );
     let slot = ConsumerHandle::new();
-    arbitrator.register_node_consumer(
-        Arc::new(SlotOfSourceRows {
-            handle: Arc::clone(&slot),
-            payload: 3 * MIB,
-        }),
-        Arc::clone(&slot),
-        ConsumerLabel {
-            node: "sorted".to_string(),
-            surface: MemorySurface::BufferedRows {
-                from: "orders".to_string(),
-                to: clinker_plan::runtime_error::NonEmptyReaders::one("sorted".to_string()),
+    arbitrator
+        .register_node_consumer(
+            Arc::new(SlotOfSourceRows {
+                handle: Arc::clone(&slot),
+                payload: 3 * MIB,
+            }),
+            Arc::clone(&slot),
+            ConsumerLabel {
+                node: "sorted".to_string(),
+                surface: MemorySurface::BufferedRows {
+                    from: "orders".to_string(),
+                    to: clinker_plan::runtime_error::NonEmptyReaders::one("sorted".to_string()),
+                },
             },
-        },
-    );
+        )
+        .expect("a fresh handle registers");
     let (totals, _totals_handle) = hold(
         &arbitrator,
         "totals",
@@ -597,20 +601,22 @@ fn rows_a_finished_source_read_never_count_as_state_that_cannot_spill() {
         .reserve(3 * MIB, Requester::for_consumer(orders))
         .expect("fits");
     let slot = ConsumerHandle::new();
-    arbitrator.register_node_consumer(
-        Arc::new(SlotOfSourceRows {
-            handle: Arc::clone(&slot),
-            payload: 3 * MIB,
-        }),
-        Arc::clone(&slot),
-        ConsumerLabel {
-            node: "sorted".to_string(),
-            surface: MemorySurface::BufferedRows {
-                from: "orders".to_string(),
-                to: clinker_plan::runtime_error::NonEmptyReaders::one("sorted".to_string()),
+    arbitrator
+        .register_node_consumer(
+            Arc::new(SlotOfSourceRows {
+                handle: Arc::clone(&slot),
+                payload: 3 * MIB,
+            }),
+            Arc::clone(&slot),
+            ConsumerLabel {
+                node: "sorted".to_string(),
+                surface: MemorySurface::BufferedRows {
+                    from: "orders".to_string(),
+                    to: clinker_plan::runtime_error::NonEmptyReaders::one("sorted".to_string()),
+                },
             },
-        },
-    );
+        )
+        .expect("a fresh handle registers");
     let (totals, _totals_handle) = hold(
         &arbitrator,
         "totals",

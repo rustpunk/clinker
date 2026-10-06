@@ -4564,14 +4564,16 @@ mod tests {
         let budget = arbitrator(hard);
         let pinned = crate::pipeline::memory::ConsumerHandle::new();
         pinned.set_bytes(hard + 1);
-        budget.register_consumer(
-            Arc::new(PinnedConsumer { bytes: hard + 1 }),
-            pinned,
-            clinker_plan::runtime_error::ConsumerLabel {
-                node: "pinned".to_string(),
-                surface: clinker_plan::runtime_error::MemorySurface::JoinState,
-            },
-        );
+        budget
+            .register_consumer(
+                Arc::new(PinnedConsumer { bytes: hard + 1 }),
+                pinned,
+                clinker_plan::runtime_error::ConsumerLabel {
+                    node: "pinned".to_string(),
+                    surface: clinker_plan::runtime_error::MemorySurface::JoinState,
+                },
+            )
+            .expect("a fresh handle registers");
         assert!(
             budget.sum_consumer_usage() > budget.hard_limit(),
             "test invariant: the pinned consumer must arm the byte-counted abort arm"

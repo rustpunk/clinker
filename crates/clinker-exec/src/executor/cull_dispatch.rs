@@ -286,7 +286,7 @@ where
 
     // Register the group buffer with the arbitrator only after the
     // empty-input guard, so the no-work path never leaks a consumer.
-    let (consumer_id, handle) = register_cull_consumer(&ctx.memory_budget, name);
+    let (consumer_id, handle) = register_cull_consumer(&ctx.memory_budget, name)?;
 
     // Every exit path past this point must deregister `consumer_id`, so the
     // grouping/finalize work runs inside a helper whose result is matched
@@ -319,7 +319,7 @@ where
 fn register_cull_consumer(
     budget: &MemoryArbitrator,
     name: &str,
-) -> (ConsumerId, Arc<ConsumerHandle>) {
+) -> Result<(ConsumerId, Arc<ConsumerHandle>), PipelineError> {
     let handle = ConsumerHandle::new();
     let consumer_id = budget.register_node_consumer(
         Arc::new(CullConsumer::new(handle.clone())),
@@ -328,8 +328,8 @@ fn register_cull_consumer(
             node: name.to_string(),
             surface: MemorySurface::CullGroups,
         },
-    );
-    (consumer_id, handle)
+    )?;
+    Ok((consumer_id, handle))
 }
 
 /// Group the drained input, spilling resident groups to disk under memory
@@ -2028,7 +2028,8 @@ mod tests {
         schema: &SharedStorage<Schema>,
         resources: &clinker_record::owned_storage::AllocationResources,
     ) -> (ConsumerId, Arc<ConsumerHandle>, CullGroups) {
-        let (id, handle) = register_cull_consumer(arbitrator, "culled");
+        let (id, handle) =
+            register_cull_consumer(arbitrator, "culled").expect("a fresh handle registers");
         let groups = CullGroups::register(
             arbitrator,
             id,

@@ -784,14 +784,16 @@ nodes:
         let run = provider.allocation();
         let handle = ConsumerHandle::new();
         let consumer = Arc::new(SourceConsumer::new(handle.clone()));
-        let id = arb.register_node_consumer(
-            consumer.clone(),
-            handle.clone(),
-            ConsumerLabel {
-                node: "events".to_string(),
-                surface: MemorySurface::RowsRead,
-            },
-        );
+        let id = arb
+            .register_node_consumer(
+                consumer.clone(),
+                handle.clone(),
+                ConsumerLabel {
+                    node: "events".to_string(),
+                    surface: MemorySurface::RowsRead,
+                },
+            )
+            .expect("a fresh handle registers");
         let view = provider.attributed_allocation(Requester::for_consumer(id));
         assert_eq!(view.identity(), run.identity());
         let (mut channel, rx) =
@@ -879,14 +881,16 @@ nodes:
         .unwrap();
         let foreign = MemoryOnlyResources::new(NonZeroUsize::new(1024 * 1024).unwrap());
         let handle = ConsumerHandle::new();
-        let id = arb.register_node_consumer(
-            Arc::new(SourceConsumer::new(handle.clone())),
-            handle.clone(),
-            ConsumerLabel {
-                node: "rows".to_string(),
-                surface: MemorySurface::RowsRead,
-            },
-        );
+        let id = arb
+            .register_node_consumer(
+                Arc::new(SourceConsumer::new(handle.clone())),
+                handle.clone(),
+                ConsumerLabel {
+                    node: "rows".to_string(),
+                    surface: MemorySurface::RowsRead,
+                },
+            )
+            .expect("a fresh handle registers");
         (arb, provider, foreign, handle, id)
     }
 

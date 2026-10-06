@@ -2681,14 +2681,16 @@ mod tests {
         if let Some(bytes) = pinned_consumer_bytes {
             let pinned = crate::pipeline::memory::ConsumerHandle::new();
             pinned.add_bytes(bytes);
-            budget.register_consumer(
-                Arc::new(SortMergeConsumer::new(pinned.clone())),
-                pinned,
-                clinker_plan::runtime_error::ConsumerLabel {
-                    node: "pinned".to_string(),
-                    surface: clinker_plan::runtime_error::MemorySurface::JoinState,
-                },
-            );
+            budget
+                .register_consumer(
+                    Arc::new(SortMergeConsumer::new(pinned.clone())),
+                    pinned,
+                    clinker_plan::runtime_error::ConsumerLabel {
+                        node: "pinned".to_string(),
+                        surface: clinker_plan::runtime_error::MemorySurface::JoinState,
+                    },
+                )
+                .expect("a fresh handle registers");
         }
         let dir = tempfile::Builder::new()
             .prefix("sm-test-")

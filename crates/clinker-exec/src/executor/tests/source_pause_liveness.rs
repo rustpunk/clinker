@@ -84,7 +84,8 @@ fn pinned_arbitrator() -> Arc<crate::pipeline::memory::MemoryArbitrator> {
             node: "pinned".to_string(),
             surface: clinker_plan::runtime_error::MemorySurface::JoinState,
         },
-    );
+    )
+    .expect("a fresh handle registers");
     arb
 }
 

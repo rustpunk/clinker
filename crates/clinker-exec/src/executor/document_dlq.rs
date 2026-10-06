@@ -472,11 +472,15 @@ impl DocumentDlqState {
     /// source names, registering the one consumer it is charged through with
     /// `arbitrator`. Empty: the first marked failure populates it. The held
     /// log creates no file until the arbitrator first asks it to spill.
+    ///
+    /// # Errors
+    ///
+    /// [`PipelineError::Internal`] when the consumer cannot be registered.
     pub(crate) fn new(
         doc_sources: HashSet<Arc<str>>,
         arbitrator: Arc<MemoryArbitrator>,
         held: HeldLogConfig,
-    ) -> Self {
+    ) -> Result<Self, PipelineError> {
         let handle = ConsumerHandle::new();
         let log = ExtentLog::new(held.spill_root, held.compress, Arc::clone(&handle));
         let consumer_id = arbitrator.register_consumer(
@@ -489,8 +493,8 @@ impl DocumentDlqState {
                 node: "dead letters".to_string(),
                 surface: MemorySurface::HeldFailingRows,
             },
-        );
-        Self {
+        )?;
+        Ok(Self {
             doc_sources,
             failed: HashMap::new(),
             held: log,
@@ -502,7 +506,7 @@ impl DocumentDlqState {
             arbitrator,
             consumer_id,
             handle,
-        }
+        })
     }
 
     /// Make the state in `state` a victim every reclaim pass on its
@@ -1479,7 +1483,7 @@ impl DocumentBuckets {
                         node: self.output_name.clone(),
                         surface: MemorySurface::OpenDocumentRows,
                     },
-                );
+                )?;
                 let reclaim = match register_walk_owned(arbitrator, consumer_id, &handle, &cell) {
                     Ok(reclaim) => reclaim,
                     Err(error) => {
@@ -2491,13 +2495,15 @@ mod tests {
     /// victim-selection snapshot can name.
     fn register_fresh(arbitrator: &MemoryArbitrator) -> ConsumerId {
         let handle = ConsumerHandle::new();
-        arbitrator.register_consumer(
-            Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
-                handle.clone(),
-            )),
-            handle,
-            test_label("out"),
-        )
+        arbitrator
+            .register_consumer(
+                Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                    handle.clone(),
+                )),
+                handle,
+                test_label("out"),
+            )
+            .expect("a fresh handle registers")
     }
     use clinker_record::owned_storage::SharedStorage;
     use clinker_record::{
@@ -2559,7 +2565,8 @@ mod tests {
             HashSet::from([Arc::clone(&source_name)]),
             Arc::clone(&arbitrator),
             held_config(&std::env::temp_dir()),
-        );
+        )
+        .expect("a fresh handle registers");
         let trigger = HeldRow {
             source_row: trigger_row,
             source_name: &source_name,
@@ -2582,13 +2589,15 @@ mod tests {
         );
 
         let handle = ConsumerHandle::new();
-        let consumer_id = arbitrator.register_consumer(
-            Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+        let consumer_id = arbitrator
+            .register_consumer(
+                Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                    handle.clone(),
+                )),
                 handle.clone(),
-            )),
-            handle.clone(),
-            test_label("out"),
-        );
+                test_label("out"),
+            )
+            .expect("a fresh handle registers");
         let mut buffer = NodeBuffer::Memory(Vec::new());
         buffer.push(trigger_record, trigger_row);
         buffer.push(collateral_record, collateral_row);
@@ -2778,7 +2787,8 @@ mod tests {
             HashSet::from([Arc::from("orders")]),
             Arc::clone(arbitrator),
             held_config(&std::env::temp_dir()),
-        );
+        )
+        .expect("a fresh handle registers");
         state.failed.insert(
             Arc::clone(&key),
             FailedDocument {
@@ -3051,13 +3061,15 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
 
         let handle = crate::pipeline::memory::ConsumerHandle::new();
-        let consumer_id = arbitrator.register_consumer(
-            Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+        let consumer_id = arbitrator
+            .register_consumer(
+                Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                    handle.clone(),
+                )),
                 handle.clone(),
-            )),
-            handle.clone(),
-            test_label("out"),
-        );
+                test_label("out"),
+            )
+            .expect("a fresh handle registers");
         let mut bucket = DocBucket {
             buffer: NodeBuffer::Memory(Vec::new()),
             consumer_id,
@@ -3140,13 +3152,15 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
 
         let handle = crate::pipeline::memory::ConsumerHandle::new();
-        let consumer_id = arbitrator.register_consumer(
-            Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+        let consumer_id = arbitrator
+            .register_consumer(
+                Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                    handle.clone(),
+                )),
                 handle.clone(),
-            )),
-            handle.clone(),
-            test_label("out"),
-        );
+                test_label("out"),
+            )
+            .expect("a fresh handle registers");
         let mut bucket = DocBucket {
             buffer: NodeBuffer::Memory(Vec::new()),
             consumer_id,
@@ -3193,13 +3207,15 @@ mod tests {
         ));
         let tmp = tempfile::tempdir().expect("tempdir");
         let handle = crate::pipeline::memory::ConsumerHandle::new();
-        let consumer_id = arbitrator.register_consumer(
-            Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+        let consumer_id = arbitrator
+            .register_consumer(
+                Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                    handle.clone(),
+                )),
                 handle.clone(),
-            )),
-            handle.clone(),
-            test_label("out"),
-        );
+                test_label("out"),
+            )
+            .expect("a fresh handle registers");
         let mut bucket = DocBucket {
             buffer: NodeBuffer::Memory(Vec::new()),
             consumer_id,
@@ -3272,6 +3288,7 @@ mod tests {
                 batch_size,
             },
         )
+        .expect("a fresh handle registers")
     }
 
     /// Hold row `ordinal` of document `doc` as a failure at `validate`.
@@ -4035,7 +4052,8 @@ mod tests {
             HashSet::from([Arc::from("orders")]),
             Arc::clone(arbitrator),
             held_config(&std::env::temp_dir()),
-        );
+        )
+        .expect("a fresh handle registers");
         state.failed.insert(
             Arc::clone(&key),
             FailedDocument {
@@ -4371,13 +4389,15 @@ mod tests {
     /// spill.
     fn probe(arbitrator: &MemoryArbitrator) -> Arc<ConsumerHandle> {
         let handle = ConsumerHandle::new();
-        arbitrator.register_consumer(
-            Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+        arbitrator
+            .register_consumer(
+                Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                    Arc::clone(&handle),
+                )),
                 Arc::clone(&handle),
-            )),
-            Arc::clone(&handle),
-            test_label("probe"),
-        );
+                test_label("probe"),
+            )
+            .expect("a fresh handle registers");
         handle
     }
 
@@ -4486,19 +4506,21 @@ mod tests {
         Arc<ConsumerHandle>,
     ) {
         let handle = ConsumerHandle::new();
-        let id = arbitrator.register_node_consumer(
-            Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+        let id = arbitrator
+            .register_node_consumer(
+                Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                    Arc::clone(&handle),
+                )),
                 Arc::clone(&handle),
-            )),
-            Arc::clone(&handle),
-            clinker_plan::runtime_error::ConsumerLabel {
-                node: node.to_string(),
-                surface: clinker_plan::runtime_error::MemorySurface::BufferedRows {
-                    from: node.to_string(),
-                    to: clinker_plan::runtime_error::NonEmptyReaders::one("out".to_string()),
+                clinker_plan::runtime_error::ConsumerLabel {
+                    node: node.to_string(),
+                    surface: clinker_plan::runtime_error::MemorySurface::BufferedRows {
+                        from: node.to_string(),
+                        to: clinker_plan::runtime_error::NonEmptyReaders::one("out".to_string()),
+                    },
                 },
-            },
-        );
+            )
+            .expect("a fresh handle registers");
         handle.try_grow(charge).expect("the slot's charge fits");
         let s = schema();
         let records: Vec<(Record, SourceRowId)> = (0..rows)

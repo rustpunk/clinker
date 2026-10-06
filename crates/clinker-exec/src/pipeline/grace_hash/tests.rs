@@ -307,14 +307,16 @@ fn spill_activates_on_charged_bytes_without_rss() {
     // its charged bytes flow into `sum_consumer_usage`.
     let budget =
         MemoryArbitrator::with_policy(1024 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
-    budget.register_consumer(
-        Arc::new(GraceHashConsumer::new(consumer_handle.clone())),
-        consumer_handle.clone(),
-        clinker_plan::runtime_error::ConsumerLabel {
-            node: "grace_test".to_string(),
-            surface: clinker_plan::runtime_error::MemorySurface::JoinBuildSide,
-        },
-    );
+    budget
+        .register_consumer(
+            Arc::new(GraceHashConsumer::new(consumer_handle.clone())),
+            consumer_handle.clone(),
+            clinker_plan::runtime_error::ConsumerLabel {
+                node: "grace_test".to_string(),
+                surface: clinker_plan::runtime_error::MemorySurface::JoinBuildSide,
+            },
+        )
+        .expect("a fresh handle registers");
     let soft = budget.soft_limit();
     assert!(
         budget.peak_rss().is_none_or(|rss| rss < soft),
@@ -2764,7 +2766,8 @@ fn registered_partitions(
     Arc<crate::pipeline::memory::ConsumerHandle>,
     GracePartitions,
 ) {
-    let (id, handle) = register_grace_consumer(arbitrator, "joined");
+    let (id, handle) =
+        register_grace_consumer(arbitrator, "joined").expect("a fresh handle registers");
     let partitions = GracePartitions::register(
         arbitrator,
         id,
@@ -3198,7 +3201,8 @@ fn a_grace_partition_build_near_the_limit_does_not_count_its_records_twice() {
     // the records part to spare: counting the records again would carry the
     // run past the limit.
     let room = added + records_part / 2;
-    let (filler, filler_handle) = register_grace_consumer(&arbitrator, "elsewhere");
+    let (filler, filler_handle) =
+        register_grace_consumer(&arbitrator, "elsewhere").expect("a fresh handle registers");
     filler_handle.set_bytes(limit - arbitrator.charged_bytes() - room);
     assert_eq!(arbitrator.charged_bytes(), limit - room);
 

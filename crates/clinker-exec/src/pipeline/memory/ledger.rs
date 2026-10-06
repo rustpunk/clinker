@@ -2301,11 +2301,13 @@ mod tests {
         node: &str,
     ) -> (Arc<ConsumerHandle>, ConsumerId) {
         let handle = ConsumerHandle::new();
-        let id = arbitrator.register_node_consumer(
-            Arc::new(HandleConsumer(Arc::clone(&handle))),
-            Arc::clone(&handle),
-            label(node, MemorySurface::GroupState),
-        );
+        let id = arbitrator
+            .register_node_consumer(
+                Arc::new(HandleConsumer(Arc::clone(&handle))),
+                Arc::clone(&handle),
+                label(node, MemorySurface::GroupState),
+            )
+            .expect("a fresh handle registers");
         (handle, id)
     }
 
@@ -2582,11 +2584,13 @@ mod tests {
     fn a_finished_sources_rows_stay_identifiable_until_their_last_byte_drops() {
         let arbitrator = arbitrator(MIB);
         let handle = ConsumerHandle::new();
-        let source = arbitrator.register_node_consumer(
-            Arc::new(ReadingSource(Arc::clone(&handle))),
-            Arc::clone(&handle),
-            label("orders", MemorySurface::RowsRead),
-        );
+        let source = arbitrator
+            .register_node_consumer(
+                Arc::new(ReadingSource(Arc::clone(&handle))),
+                Arc::clone(&handle),
+                label("orders", MemorySurface::RowsRead),
+            )
+            .expect("a fresh handle registers");
         let first = arbitrator
             .reserve(4 * KIB, Requester::for_consumer(source))
             .expect("fits");
@@ -2746,21 +2750,23 @@ mod walk_pass_tests {
         pausable: bool,
     ) -> (ConsumerId, Arc<ConsumerHandle>) {
         let handle = ConsumerHandle::new();
-        let id = arbitrator.register_node_consumer(
-            Arc::new(Held {
-                handle: Arc::clone(&handle),
-                priority,
-                pausable,
-            }),
-            Arc::clone(&handle),
-            ConsumerLabel {
-                node: node.to_string(),
-                surface: MemorySurface::BufferedRows {
-                    from: node.to_string(),
-                    to: clinker_plan::runtime_error::NonEmptyReaders::one("next".to_string()),
+        let id = arbitrator
+            .register_node_consumer(
+                Arc::new(Held {
+                    handle: Arc::clone(&handle),
+                    priority,
+                    pausable,
+                }),
+                Arc::clone(&handle),
+                ConsumerLabel {
+                    node: node.to_string(),
+                    surface: MemorySurface::BufferedRows {
+                        from: node.to_string(),
+                        to: clinker_plan::runtime_error::NonEmptyReaders::one("next".to_string()),
+                    },
                 },
-            },
-        );
+            )
+            .expect("a fresh handle registers");
         handle.set_bytes(bytes);
         (id, handle)
     }
@@ -3237,16 +3243,18 @@ mod walk_pass_tests {
         bytes: u64,
     ) -> (ConsumerId, Arc<ConsumerHandle>) {
         let handle = ConsumerHandle::new();
-        let id = arbitrator.register_node_consumer(
-            Arc::new(crate::aggregation::AggregateConsumer::new(Arc::clone(
-                &handle,
-            ))),
-            Arc::clone(&handle),
-            ConsumerLabel {
-                node: node.to_string(),
-                surface: MemorySurface::GroupState,
-            },
-        );
+        let id = arbitrator
+            .register_node_consumer(
+                Arc::new(crate::aggregation::AggregateConsumer::new(Arc::clone(
+                    &handle,
+                ))),
+                Arc::clone(&handle),
+                ConsumerLabel {
+                    node: node.to_string(),
+                    surface: MemorySurface::GroupState,
+                },
+            )
+            .expect("a fresh handle registers");
         handle.set_bytes(bytes);
         handle.set_reclaimable(bytes);
         (id, handle)
@@ -3320,27 +3328,31 @@ mod walk_pass_tests {
         let merge_consumer = Arc::new(crate::pipeline::sort_merge_join::SortMergeConsumer::new(
             Arc::clone(&merge),
         ));
-        arbitrator.register_node_consumer(
-            merge_consumer.clone(),
-            Arc::clone(&merge),
-            ConsumerLabel {
-                node: "matched".to_string(),
-                surface: MemorySurface::JoinState,
-            },
-        );
+        arbitrator
+            .register_node_consumer(
+                merge_consumer.clone(),
+                Arc::clone(&merge),
+                ConsumerLabel {
+                    node: "matched".to_string(),
+                    surface: MemorySurface::JoinState,
+                },
+            )
+            .expect("a fresh handle registers");
         merge.set_bytes(1536 * KIB);
         let band = ConsumerHandle::new();
         let band_consumer = Arc::new(crate::pipeline::sort_buffer::SortConsumer::new(Arc::clone(
             &band,
         )));
-        arbitrator.register_node_consumer(
-            band_consumer.clone(),
-            Arc::clone(&band),
-            ConsumerLabel {
-                node: "banded".to_string(),
-                surface: MemorySurface::JoinState,
-            },
-        );
+        arbitrator
+            .register_node_consumer(
+                band_consumer.clone(),
+                Arc::clone(&band),
+                ConsumerLabel {
+                    node: "banded".to_string(),
+                    surface: MemorySurface::JoinState,
+                },
+            )
+            .expect("a fresh handle registers");
         band.set_bytes(MIB);
         assert_eq!(merge_consumer.reclaimable_bytes(), 0);
         assert_eq!(band_consumer.reclaimable_bytes(), 0);
@@ -3666,16 +3678,18 @@ mod walk_pass_tests {
     fn charged_only_consumers_are_never_elected() {
         let arbitrator = run(11 * MIB, Box::new(Priority));
         let build_handle = ConsumerHandle::new();
-        let build = arbitrator.register_node_consumer(
-            Arc::new(crate::pipeline::combine::CombineHashConsumer::new(
+        let build = arbitrator
+            .register_node_consumer(
+                Arc::new(crate::pipeline::combine::CombineHashConsumer::new(
+                    Arc::clone(&build_handle),
+                )),
                 Arc::clone(&build_handle),
-            )),
-            Arc::clone(&build_handle),
-            ConsumerLabel {
-                node: "join".to_string(),
-                surface: MemorySurface::JoinBuildSide,
-            },
-        );
+                ConsumerLabel {
+                    node: "join".to_string(),
+                    surface: MemorySurface::JoinBuildSide,
+                },
+            )
+            .expect("a fresh handle registers");
         build_handle.set_bytes(10 * MIB);
         let (slot, slot_handle) = register(&arbitrator, "slot", 0, MIB);
         assert_eq!(arbitrator.charged_bytes(), 11 * MIB, "the ledger is full");
@@ -3721,14 +3735,16 @@ mod walk_pass_tests {
         let arbitrator = run(MIB + 256 * KIB, Box::new(Priority));
         let source_handle = ConsumerHandle::new();
         let source_consumer = Arc::new(SourceConsumer::new(Arc::clone(&source_handle)));
-        let source = arbitrator.register_consumer(
-            source_consumer.clone(),
-            Arc::clone(&source_handle),
-            ConsumerLabel {
-                node: "orders".to_string(),
-                surface: MemorySurface::RowsRead,
-            },
-        );
+        let source = arbitrator
+            .register_consumer(
+                source_consumer.clone(),
+                Arc::clone(&source_handle),
+                ConsumerLabel {
+                    node: "orders".to_string(),
+                    surface: MemorySurface::RowsRead,
+                },
+            )
+            .expect("a fresh handle registers");
         source_handle.set_bytes(256 * KIB);
         let (slot, slot_handle) = register(&arbitrator, "slot", 0, MIB);
         assert_eq!(
@@ -4151,21 +4167,23 @@ mod reclaim_entry_tests {
         pausable: bool,
     ) -> Arc<ConsumerHandle> {
         let handle = ConsumerHandle::new();
-        arbitrator.register_node_consumer(
-            Arc::new(Flagged {
-                name,
-                handle: Arc::clone(&handle),
-                priority,
-                reclaimable,
-                pausable,
-                calls: Arc::clone(calls),
-            }),
-            Arc::clone(&handle),
-            ConsumerLabel {
-                node: name.to_string(),
-                surface: MemorySurface::GroupState,
-            },
-        );
+        arbitrator
+            .register_node_consumer(
+                Arc::new(Flagged {
+                    name,
+                    handle: Arc::clone(&handle),
+                    priority,
+                    reclaimable,
+                    pausable,
+                    calls: Arc::clone(calls),
+                }),
+                Arc::clone(&handle),
+                ConsumerLabel {
+                    node: name.to_string(),
+                    surface: MemorySurface::GroupState,
+                },
+            )
+            .expect("a fresh handle registers");
         handle.set_bytes(charged);
         handle
     }
@@ -4387,19 +4405,21 @@ mod candidate_order_tests {
                     .wrapping_mul(6_364_136_223_846_793_005)
                     .wrapping_add(1_442_695_040_888_963_407);
                 let reads = Arc::new(Reads::default());
-                let id = arbitrator.register_node_consumer(
-                    Arc::new(Counted {
-                        reclaimable: (seed >> 33) % 5,
-                        priority: ((seed >> 20) % 3) as i32,
-                        pausable: (seed >> 50).is_multiple_of(8),
-                        reads: Arc::clone(&reads),
-                    }),
-                    ConsumerHandle::new(),
-                    ConsumerLabel {
-                        node: format!("c{index}"),
-                        surface: MemorySurface::SortBuffer,
-                    },
-                );
+                let id = arbitrator
+                    .register_node_consumer(
+                        Arc::new(Counted {
+                            reclaimable: (seed >> 33) % 5,
+                            priority: ((seed >> 20) % 3) as i32,
+                            pausable: (seed >> 50).is_multiple_of(8),
+                            reads: Arc::clone(&reads),
+                        }),
+                        ConsumerHandle::new(),
+                        ConsumerLabel {
+                            node: format!("c{index}"),
+                            surface: MemorySurface::SortBuffer,
+                        },
+                    )
+                    .expect("a fresh handle registers");
                 Member { id, reads }
             })
             .collect()

@@ -55,7 +55,10 @@ consumer (`register_consumer` for run-scoped state, `register_node_consumer`
 for a node's state, each with the consumer's `ConsumerHandle` and a label)
 binds the handle to the same ledger: from then until the consumer
 unregisters, every charge through the handle is a ledger charge under that
-lock, and unregistering releases what the handle still holds.
+lock, and unregistering releases what the handle still holds. A handle charges
+for one consumer at a time: registering a second consumer through a handle
+still bound to the first is an internal error that registers nothing, and the
+caller returns it.
 `ConsumerHandle::try_grow` and `try_resize` check a growth against the limit
 with every other charge, so a handle growth and a governed allocation, or two
 of either, can never together pass the limit; the older `set_bytes` /

@@ -700,7 +700,7 @@ impl DocAggregatorFactory {
                 node: self.transform_name.clone(),
                 surface: MemorySurface::GroupState,
             },
-        );
+        )?;
         Ok((stream, consumer_id))
     }
 
@@ -1634,7 +1634,7 @@ fn run_streaming_aggregate_ingest(
     // change. The scoped thread's per-record `sub_bytes` discharge below
     // nets the producer's per-batch charge to zero.
     let (rx, charge_handle, charge_consumer_id) =
-        ctx.install_streaming_ingest_channel(producer_idx, &upstream_name, name);
+        ctx.install_streaming_ingest_channel(producer_idx, &upstream_name, name)?;
 
     // Copy the stable-context reference out of `ctx` *before* the scope so
     // the scoped thread borrows `&'a StableEvalContext` directly (shared,
@@ -1953,7 +1953,7 @@ impl WindowedAggContext<'_> {
                 node: self.name.to_string(),
                 surface: MemorySurface::GroupState,
             },
-        );
+        )?;
         // Resolve the spill compression mode against this aggregate's
         // output-schema width and the run's batch size, matching the
         // `--explain` projection for the Aggregation node so each window's

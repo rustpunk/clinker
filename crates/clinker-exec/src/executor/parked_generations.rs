@@ -313,7 +313,7 @@ impl ParkedGenerations {
         from: &str,
         to: &str,
     ) -> Result<(), PipelineError> {
-        let (handle, registered) = store.borrow_mut().edge_handle(generation, key, from, to);
+        let (handle, registered) = store.borrow_mut().edge_handle(generation, key, from, to)?;
         if let Some(consumer) = registered {
             let arbitrator = Arc::clone(&store.borrow().arbitrator);
             let walk_entry = register_walk_owned(&arbitrator, consumer, &handle, store)?;
@@ -373,16 +373,17 @@ impl ParkedGenerations {
 
     /// The consumer handle of edge `key` in `generation`, registering the
     /// edge on first use; the consumer is returned beside it when this call
-    /// registered it.
+    /// registered it. A consumer that cannot be registered is an internal
+    /// error and leaves the edge unregistered.
     fn edge_handle(
         &mut self,
         generation: Generation,
         key: ParkedKey,
         from: &str,
         to: &str,
-    ) -> (Arc<ConsumerHandle>, Option<ConsumerId>) {
+    ) -> Result<(Arc<ConsumerHandle>, Option<ConsumerId>), PipelineError> {
         if let Some(edge) = self.edges(generation).get(&key) {
-            return (Arc::clone(&edge.handle), None);
+            return Ok((Arc::clone(&edge.handle), None));
         }
         let handle = ConsumerHandle::new();
         let reclaim = Arc::new(ParkedEdgeConsumer {
@@ -399,7 +400,7 @@ impl ParkedGenerations {
                     to: to.to_string(),
                 },
             },
-        );
+        )?;
         self.edges_mut(generation).insert(
             key,
             ParkedEdge {
@@ -411,7 +412,7 @@ impl ParkedGenerations {
                 walk_entry: None,
             },
         );
-        (handle, Some(consumer))
+        Ok((handle, Some(consumer)))
     }
 
     /// Keep edge `key`'s walk reclaim registration with the edge.

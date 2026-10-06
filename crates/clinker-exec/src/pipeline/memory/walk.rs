@@ -1042,17 +1042,19 @@ mod frame_tests {
         charge: u64,
     ) -> (NodeBufferKey, ConsumerId, Arc<ConsumerHandle>) {
         let handle = ConsumerHandle::new();
-        let id = arbitrator.register_node_consumer(
-            Arc::new(NodeBufferConsumer::new(Arc::clone(&handle))),
-            Arc::clone(&handle),
-            ConsumerLabel {
-                node: node.to_string(),
-                surface: MemorySurface::BufferedRows {
-                    from: node.to_string(),
-                    to: clinker_plan::runtime_error::NonEmptyReaders::one("next".to_string()),
+        let id = arbitrator
+            .register_node_consumer(
+                Arc::new(NodeBufferConsumer::new(Arc::clone(&handle))),
+                Arc::clone(&handle),
+                ConsumerLabel {
+                    node: node.to_string(),
+                    surface: MemorySurface::BufferedRows {
+                        from: node.to_string(),
+                        to: clinker_plan::runtime_error::NonEmptyReaders::one("next".to_string()),
+                    },
                 },
-            },
-        );
+            )
+            .expect("a fresh handle registers");
         handle.set_bytes(charge);
         let schema =
             SharedStorage::from_arc(Arc::new(Schema::new(vec!["id".into(), "payload".into()])));
@@ -1251,16 +1253,18 @@ pub(crate) mod walk_test_support {
         bytes: u64,
     ) -> Result<Grant, Shortfall> {
         let handle = ConsumerHandle::new();
-        let probe = arbitrator.register_consumer(
-            Arc::new(ForeignProbe {
-                handle: Arc::clone(&handle),
-            }),
-            handle,
-            ConsumerLabel {
-                node: "foreign request".to_string(),
-                surface: MemorySurface::ScanMaterialization,
-            },
-        );
+        let probe = arbitrator
+            .register_consumer(
+                Arc::new(ForeignProbe {
+                    handle: Arc::clone(&handle),
+                }),
+                handle,
+                ConsumerLabel {
+                    node: "foreign request".to_string(),
+                    surface: MemorySurface::ScanMaterialization,
+                },
+            )
+            .expect("a fresh handle registers");
         let result = arbitrator.reserve(bytes, Requester::for_consumer(probe));
         arbitrator.unregister_consumer(probe);
         result
@@ -1406,14 +1410,16 @@ pub(crate) mod walk_test_support {
             bytes: u64,
         ) -> Self {
             let handle = ConsumerHandle::new();
-            let id = arbitrator.register_node_consumer(
-                Arc::new(NodeBufferConsumer::new(Arc::clone(&handle))),
-                Arc::clone(&handle),
-                ConsumerLabel {
-                    node: node.to_string(),
-                    surface: MemorySurface::SortBuffer,
-                },
-            );
+            let id = arbitrator
+                .register_node_consumer(
+                    Arc::new(NodeBufferConsumer::new(Arc::clone(&handle))),
+                    Arc::clone(&handle),
+                    ConsumerLabel {
+                        node: node.to_string(),
+                        surface: MemorySurface::SortBuffer,
+                    },
+                )
+                .expect("a fresh handle registers");
             let cell = TestOwnedState::charged(id, &handle, values, bytes);
             let registration =
                 register_walk_owned(arbitrator, id, &handle, &cell).expect("registered");
@@ -1470,14 +1476,16 @@ mod walk_owned_tests {
     /// A node consumer named `sorted` over a fresh handle.
     fn sort_consumer(arbitrator: &MemoryArbitrator) -> (ConsumerId, Arc<ConsumerHandle>) {
         let handle = ConsumerHandle::new();
-        let id = arbitrator.register_node_consumer(
-            Arc::new(NodeBufferConsumer::new(Arc::clone(&handle))),
-            Arc::clone(&handle),
-            ConsumerLabel {
-                node: "sorted".to_string(),
-                surface: MemorySurface::SortBuffer,
-            },
-        );
+        let id = arbitrator
+            .register_node_consumer(
+                Arc::new(NodeBufferConsumer::new(Arc::clone(&handle))),
+                Arc::clone(&handle),
+                ConsumerLabel {
+                    node: "sorted".to_string(),
+                    surface: MemorySurface::SortBuffer,
+                },
+            )
+            .expect("a fresh handle registers");
         (id, handle)
     }
 

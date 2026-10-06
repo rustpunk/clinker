@@ -2284,7 +2284,8 @@ impl<'a> ExecutorContext<'a> {
     /// consumer, key the sender by the producer index so its dispatch arm
     /// streams into the channel via the shared `take_streaming_sender`
     /// path, and return the receiver, the charge handle, and the charge
-    /// consumer's id for later unregistration.
+    /// consumer's id for later unregistration. A charge consumer that cannot
+    /// be registered is an internal error and installs nothing.
     ///
     /// Shared by the streaming-ingest consumers (Aggregate ingest, Combine
     /// probe): both move a producer's emit onto a back-pressured channel a
@@ -2299,11 +2300,14 @@ impl<'a> ExecutorContext<'a> {
         producer_idx: NodeIndex,
         producer_name: &str,
         reader_name: &str,
-    ) -> (
-        crossbeam_channel::Receiver<crate::executor::stream_event::StreamEvent>,
-        Arc<crate::pipeline::memory::ConsumerHandle>,
-        crate::pipeline::memory::ConsumerId,
-    ) {
+    ) -> Result<
+        (
+            crossbeam_channel::Receiver<crate::executor::stream_event::StreamEvent>,
+            Arc<crate::pipeline::memory::ConsumerHandle>,
+            crate::pipeline::memory::ConsumerId,
+        ),
+        PipelineError,
+    > {
         let (tx, rx) =
             crossbeam_channel::bounded::<crate::executor::stream_event::StreamEvent>(256);
         let charge_handle = crate::pipeline::memory::ConsumerHandle::new();
@@ -2319,11 +2323,11 @@ impl<'a> ExecutorContext<'a> {
                     to: clinker_plan::runtime_error::NonEmptyReaders::one(reader_name.to_string()),
                 },
             },
-        );
+        )?;
         self.streaming_output_senders.insert(producer_idx, tx);
         self.streaming_charge_consumers
             .insert(producer_idx, (charge_consumer_id, charge_handle.clone()));
-        (rx, charge_handle, charge_consumer_id)
+        Ok((rx, charge_handle, charge_consumer_id))
     }
 
     /// Build the [`crate::executor::batch_handoff::StreamingChargeHandle`]
@@ -2707,7 +2711,7 @@ pub(crate) fn publish_node_buffer_view(
             node: reader.to_string(),
             surface: clinker_plan::runtime_error::MemorySurface::ScanMaterialization,
         },
-    );
+    )?;
     let mut set = ctx.walk_reclaim.borrow_mut();
     let slots = set.slots_mut();
     slots.register(key.clone(), (consumer, Arc::clone(&handle)), slot_spill);
@@ -3937,7 +3941,7 @@ fn admit_node_buffer_inner(
             )),
             handle.clone(),
             label,
-        );
+        )?;
         let admitted = owned.charge_to(&handle, bytes);
         (consumer_id, handle, admitted)
     };
@@ -4308,7 +4312,7 @@ pub(crate) fn finalize_node_rooted_windows(
                 node: current_dag.graph[upstream_idx].name().to_string(),
                 surface: clinker_plan::runtime_error::MemorySurface::WindowIndex,
             },
-        );
+        )?;
         ctx.window_arena_consumer_ids
             .insert(idx, (arena_consumer_id, arena_handle));
 
@@ -6003,13 +6007,15 @@ mod output_admission_ownership_tests {
                 Box::new(NoOpPolicy),
             ));
             let prior_handle = ConsumerHandle::new();
-            let prior_id = budget.register_consumer(
-                Arc::new(crate::pipeline::sort_buffer::SortConsumer::new(
+            let prior_id = budget
+                .register_consumer(
+                    Arc::new(crate::pipeline::sort_buffer::SortConsumer::new(
+                        prior_handle.clone(),
+                    )),
                     prior_handle.clone(),
-                )),
-                prior_handle.clone(),
-                test_label("sorted"),
-            );
+                    test_label("sorted"),
+                )
+                .expect("a fresh handle registers");
             // This unrelated portion must survive release of the output token.
             prior_handle.add_bytes(7);
             let schema = SharedStorage::from_arc(Arc::new(clinker_record::Schema::new(vec![
@@ -6029,13 +6035,15 @@ mod output_admission_ownership_tests {
                 drop(owned);
             } else {
                 let next = ConsumerHandle::new();
-                let next_id = budget.register_consumer(
-                    Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                let next_id = budget
+                    .register_consumer(
+                        Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                            next.clone(),
+                        )),
                         next.clone(),
-                    )),
-                    next.clone(),
-                    test_label("output"),
-                );
+                        test_label("output"),
+                    )
+                    .expect("a fresh handle registers");
                 owned.charge_to(&next, bytes);
                 owned.release_prior();
                 assert_eq!(next.bytes(), bytes);

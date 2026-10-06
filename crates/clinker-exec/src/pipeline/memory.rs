@@ -749,24 +749,24 @@ impl ConsumerHandle {
     }
 
     /// Bind this handle to `state`'s ledger for consumer `id` under `label`,
-    /// charging the bytes it already holds. Returns `false`, changing
-    /// nothing, when the handle is already bound.
+    /// charging the bytes it already holds. When the handle is already
+    /// bound, changes nothing and returns the consumer it charges for.
     fn bind(
         &self,
         state: Arc<reservation::ReservationState>,
         id: ConsumerId,
         label: ConsumerLabel,
-    ) -> bool {
+    ) -> Result<(), ConsumerId> {
         let mut binding = self.binding();
-        if binding.is_some() {
-            return false;
+        if let Some(bound) = &*binding {
+            return Err(bound.id);
         }
         state
             .ledger
             .lock()
             .bind_handle(id.0, label, self.bytes.load(Ordering::Relaxed));
         *binding = Some(HandleBinding { state, id });
-        true
+        Ok(())
     }
 
     /// End consumer `id`'s binding: release the handle's remaining charge,
@@ -2004,12 +2004,19 @@ impl MemoryArbitrator {
     /// atomically swaps it in. `O(N)` in the registry size, but
     /// registration is a once-per-operator-lifetime event, so the cost
     /// is off the per-batch hot path readers traverse.
+    ///
+    /// # Errors
+    ///
+    /// [`PipelineError::Internal`](clinker_plan::error::PipelineError::Internal)
+    /// when `handle` already charges for a registered consumer: a handle
+    /// charges for one consumer at a time. Nothing is registered and the
+    /// handle stays with its consumer.
     pub fn register_consumer(
         &self,
         consumer: Arc<dyn MemoryConsumer>,
         handle: Arc<ConsumerHandle>,
         label: ConsumerLabel,
-    ) -> ConsumerId {
+    ) -> Result<ConsumerId, clinker_plan::error::PipelineError> {
         self.register_owned_consumer(false, consumer, handle, label)
     }
 
@@ -2036,12 +2043,16 @@ impl MemoryArbitrator {
     /// [`Self::register_consumer`] only for state no single node owns (writer
     /// output staging, the credential registry, the document dead-letter
     /// state).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::register_consumer`].
     pub fn register_node_consumer(
         &self,
         consumer: Arc<dyn MemoryConsumer>,
         handle: Arc<ConsumerHandle>,
         label: ConsumerLabel,
-    ) -> ConsumerId {
+    ) -> Result<ConsumerId, clinker_plan::error::PipelineError> {
         self.register_owned_consumer(true, consumer, handle, label)
     }
 
@@ -2055,28 +2066,35 @@ impl MemoryArbitrator {
         consumer: Arc<dyn MemoryConsumer>,
         handle: Arc<ConsumerHandle>,
         label: ConsumerLabel,
-    ) -> ConsumerId {
+    ) -> Result<ConsumerId, clinker_plan::error::PipelineError> {
         let id = ConsumerId(self.next_consumer_id.fetch_add(1, Ordering::Relaxed));
         {
             let mut owners = self
                 .consumer_owners
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if node_owned {
-                owners.live.insert(id, label.node.clone());
-            }
+            let node = label.node.clone();
             // Bound before the consumer enters the snapshot, so its bytes are
-            // charged by the time any reader can see it. A second binding of
-            // one handle is a caller bug: its charges keep going to the first
-            // consumer, and this consumer's unregistration leaves them alone.
-            let bound = handle.bind(Arc::clone(&self.admission), id, label);
-            debug_assert!(
-                bound,
-                "a handle charges for one registered consumer at a time"
-            );
-            if bound {
-                owners.handles.insert(id, handle);
+            // charged by the time any reader can see it. A handle charges for
+            // one consumer: a second binding would leave this consumer's
+            // charges with the first and its unregistration releasing none of
+            // them, so it registers nothing. The owner lock is held across the
+            // bind, so no reader sees the binding before the owner.
+            if let Err(bound_to) = handle.bind(Arc::clone(&self.admission), id, label) {
+                return Err(clinker_plan::error::PipelineError::Internal {
+                    op: "memory consumer registration",
+                    node,
+                    detail: format!(
+                        "its handle already charges for consumer {}; a handle charges for one \
+                         registered consumer at a time",
+                        bound_to.0
+                    ),
+                });
             }
+            if node_owned {
+                owners.live.insert(id, node);
+            }
+            owners.handles.insert(id, handle);
         }
         self.consumers.rcu(|current| {
             let mut next = Vec::with_capacity(current.len() + 1);
@@ -2084,7 +2102,7 @@ impl MemoryArbitrator {
             next.push((id, Arc::clone(&consumer)));
             next
         });
-        id
+        Ok(id)
     }
 
     /// Atomically replace the wrapper stored under an existing consumer id.
@@ -3304,6 +3322,65 @@ mod tests {
         assert_eq!(handle.peak_bytes(), 55);
     }
 
+    /// A handle charges for one registered consumer at a time. Registering a
+    /// second consumer through a handle still bound to the first is an
+    /// internal error that registers nothing: the second consumer never
+    /// enters the registry or the node attribution, and the handle's charge
+    /// stays the first consumer's, released when that one leaves.
+    #[test]
+    fn registering_a_second_consumer_through_a_bound_handle_is_an_internal_error() {
+        use crate::pipeline::arena::ArenaConsumer;
+        let arbitrator =
+            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
+        let handle = ConsumerHandle::new();
+        let first = arbitrator
+            .register_node_consumer(
+                Arc::new(ArenaConsumer::new(handle.clone())),
+                handle.clone(),
+                test_label("first"),
+            )
+            .expect("a fresh handle registers");
+        handle.set_bytes(4_096);
+        let registered_before = arbitrator.consumers.load().len();
+
+        let second = arbitrator.register_node_consumer(
+            Arc::new(ArenaConsumer::new(handle.clone())),
+            handle.clone(),
+            test_label("second"),
+        );
+
+        match second {
+            Err(clinker_plan::error::PipelineError::Internal { node, detail, .. }) => {
+                assert_eq!(node, "second", "the error names the refused consumer");
+                assert!(
+                    detail.contains("one registered consumer at a time"),
+                    "the error names the invariant: {detail}"
+                );
+            }
+            other => panic!("a second binding of one handle must be refused: {other:?}"),
+        }
+        assert_eq!(
+            arbitrator.consumers.load().len(),
+            registered_before,
+            "the refused consumer never enters the registry"
+        );
+        assert!(
+            !arbitrator
+                .per_node_peak_charged_bytes()
+                .contains_key("second"),
+            "the refused consumer is attributed to no node"
+        );
+        assert_eq!(arbitrator.charged_bytes(), 4_096);
+        handle.set_bytes(0);
+        arbitrator.unregister_consumer(first);
+        handle.set_bytes(1_024);
+        assert_eq!(
+            arbitrator.charged_bytes(),
+            0,
+            "the handle was the first consumer's alone, so it charges nothing once that one leaves"
+        );
+    }
+
     #[test]
     fn node_peak_is_each_nodes_own_high_water_mark() {
         use crate::pipeline::arena::ArenaConsumer;
@@ -3314,16 +3391,20 @@ mod tests {
         // consumer's, never the sum across nodes.
         let small = ConsumerHandle::new();
         let large = ConsumerHandle::new();
-        let small_id = arbitrator.register_node_consumer(
-            Arc::new(ArenaConsumer::new(small.clone())),
-            small.clone(),
-            test_label("sort_by_amount"),
-        );
-        let large_id = arbitrator.register_node_consumer(
-            Arc::new(ArenaConsumer::new(large.clone())),
-            large.clone(),
-            test_label("dept_totals"),
-        );
+        let small_id = arbitrator
+            .register_node_consumer(
+                Arc::new(ArenaConsumer::new(small.clone())),
+                small.clone(),
+                test_label("sort_by_amount"),
+            )
+            .expect("a fresh handle registers");
+        let large_id = arbitrator
+            .register_node_consumer(
+                Arc::new(ArenaConsumer::new(large.clone())),
+                large.clone(),
+                test_label("dept_totals"),
+            )
+            .expect("a fresh handle registers");
         small.set_bytes(100);
         large.set_bytes(900);
         small.set_bytes(20);
@@ -3331,11 +3412,13 @@ mod tests {
         // A consumer no node owns is charged but attributed to no node.
         let run_scoped = ConsumerHandle::new();
         run_scoped.set_bytes(5_000);
-        let run_scoped_id = arbitrator.register_consumer(
-            Arc::new(ArenaConsumer::new(run_scoped.clone())),
-            run_scoped.clone(),
-            test_label("run"),
-        );
+        let run_scoped_id = arbitrator
+            .register_consumer(
+                Arc::new(ArenaConsumer::new(run_scoped.clone())),
+                run_scoped.clone(),
+                test_label("run"),
+            )
+            .expect("a fresh handle registers");
 
         let peaks = arbitrator.per_node_peak_charged_bytes();
         assert_eq!(peaks.get("sort_by_amount"), Some(&100));
@@ -3354,11 +3437,13 @@ mod tests {
         // A node that registers again later reports the larger of its two
         // consumers' marks, not their sum.
         let again = ConsumerHandle::new();
-        let again_id = arbitrator.register_node_consumer(
-            Arc::new(ArenaConsumer::new(again.clone())),
-            again.clone(),
-            test_label("dept_totals"),
-        );
+        let again_id = arbitrator
+            .register_node_consumer(
+                Arc::new(ArenaConsumer::new(again.clone())),
+                again.clone(),
+                test_label("dept_totals"),
+            )
+            .expect("a fresh handle registers");
         again.set_bytes(300);
         assert_eq!(
             arbitrator.per_node_peak_charged_bytes().get("dept_totals"),
@@ -3432,7 +3517,9 @@ mod tests {
     ) -> ConsumerId {
         let handle = ConsumerHandle::new();
         handle.set_bytes(consumer.current_usage());
-        arbitrator.register_consumer(consumer, handle, test_label("test"))
+        arbitrator
+            .register_consumer(consumer, handle, test_label("test"))
+            .expect("a fresh handle registers")
     }
 
     /// Minimal `MemoryConsumer` used to exercise the trait surface
@@ -3611,11 +3698,13 @@ mod tests {
         let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
         let handle = ConsumerHandle::new();
         handle.set_bytes(100);
-        let id = arbitrator.register_consumer(
-            Arc::new(MockConsumer::new(100, 40, 0)),
-            handle.clone(),
-            test_label("test"),
-        );
+        let id = arbitrator
+            .register_consumer(
+                Arc::new(MockConsumer::new(100, 40, 0)),
+                handle.clone(),
+                test_label("test"),
+            )
+            .expect("a fresh handle registers");
         assert_eq!(arbitrator.consumer_count(), 1);
         assert_eq!(arbitrator.sum_consumer_usage(), 100);
 
@@ -3684,11 +3773,13 @@ mod tests {
         // does: a fresh handle seeded to the arena's measured bytes.
         let handle = ConsumerHandle::new();
         handle.set_bytes(ARENA_BYTES);
-        let id = arbitrator.register_consumer(
-            Arc::new(ArenaConsumer::new(handle.clone())),
-            handle.clone(),
-            test_label("rolling"),
-        );
+        let id = arbitrator
+            .register_consumer(
+                Arc::new(ArenaConsumer::new(handle.clone())),
+                handle.clone(),
+                test_label("rolling"),
+            )
+            .expect("a fresh handle registers");
 
         // Attribution: the arena's bytes now flow through pull-mode.
         assert_eq!(arbitrator.sum_consumer_usage(), ARENA_BYTES);
@@ -3733,11 +3824,13 @@ mod tests {
         arena_handle.set_bytes(512 * 1024 * 1024);
         // The arena is far larger than the spillable; only the priority
         // ordering keeps it from being elected, which is the point.
-        arbitrator.register_consumer(
-            Arc::new(ArenaConsumer::new(arena_handle.clone())),
-            arena_handle,
-            test_label("rolling"),
-        );
+        arbitrator
+            .register_consumer(
+                Arc::new(ArenaConsumer::new(arena_handle.clone())),
+                arena_handle,
+                test_label("rolling"),
+            )
+            .expect("a fresh handle registers");
         let spillable = Arc::new(ReclaimableMock::new(1024, 10));
         register_charged(&arbitrator, spillable.clone());
 
@@ -4284,7 +4377,8 @@ mod tests {
             Arc::new(SourceConsumer::new(handle.clone())),
             handle.clone(),
             test_label("orders"),
-        );
+        )
+        .expect("a fresh handle registers");
 
         // Above soft: pause. Repeated polls stay paused (single victim,
         // idempotent) — no per-poll thrash.
@@ -4345,13 +4439,15 @@ mod tests {
             Arc::new(SourceConsumer::new(source.clone())),
             source.clone(),
             test_label("orders"),
-        );
+        )
+        .expect("a fresh handle registers");
         let slot = ConsumerHandle::new();
         arb.register_node_consumer(
             Arc::new(NodeBufferConsumer::new(slot.clone())),
             slot.clone(),
             test_label("orders_slot"),
-        );
+        )
+        .expect("a fresh handle registers");
 
         slot.set_bytes(mib / 2);
         arb.reconcile_backpressure();
@@ -4399,7 +4495,8 @@ mod tests {
             Arc::new(SourceConsumer::new(handle.clone())),
             handle.clone(),
             test_label("orders"),
-        );
+        )
+        .expect("a fresh handle registers");
 
         handle.set_active();
         handle.set_bytes(60 * gib); // above soft
@@ -4433,7 +4530,8 @@ mod tests {
             Arc::new(SourceConsumer::new(source_handle.clone())),
             source_handle.clone(),
             test_label("orders"),
-        );
+        )
+        .expect("a fresh handle registers");
         let reclaimable = Arc::new(ReclaimableMock::new(60 * gib, 0));
         register_charged(&arb, reclaimable.clone());
 
@@ -4466,7 +4564,8 @@ mod tests {
             Arc::new(SourceConsumer::new(source_handle.clone())),
             source_handle.clone(),
             test_label("orders"),
-        );
+        )
+        .expect("a fresh handle registers");
         let reclaimable = Arc::new(ReclaimableMock::new(4096, 0));
         register_charged(&arb, reclaimable.clone());
 

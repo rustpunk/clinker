@@ -1140,14 +1140,16 @@ mod memory_consumer_contract_tests {
         let consumer = Arc::new(CredentialRegistryConsumer::new(Arc::clone(&handle)));
         let arbitrator =
             MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, MemoryArbitrator::default_policy());
-        let consumer_id = arbitrator.register_consumer(
-            consumer.clone(),
-            Arc::clone(&handle),
-            clinker_plan::runtime_error::ConsumerLabel {
-                node: "credentials".to_string(),
-                surface: clinker_plan::runtime_error::MemorySurface::CredentialRegistry,
-            },
-        );
+        let consumer_id = arbitrator
+            .register_consumer(
+                consumer.clone(),
+                Arc::clone(&handle),
+                clinker_plan::runtime_error::ConsumerLabel {
+                    node: "credentials".to_string(),
+                    surface: clinker_plan::runtime_error::MemorySurface::CredentialRegistry,
+                },
+            )
+            .expect("a fresh handle registers");
 
         let result = consumer.try_spill(2_048);
 
@@ -1174,14 +1176,16 @@ mod memory_consumer_contract_tests {
         let consumer = Arc::new(CredentialRegistryConsumer::new(Arc::clone(&handle)));
         let arbitrator =
             MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, MemoryArbitrator::default_policy());
-        let consumer_id = arbitrator.register_consumer(
-            consumer.clone(),
-            Arc::clone(&handle),
-            clinker_plan::runtime_error::ConsumerLabel {
-                node: "credentials".to_string(),
-                surface: clinker_plan::runtime_error::MemorySurface::CredentialRegistry,
-            },
-        );
+        let consumer_id = arbitrator
+            .register_consumer(
+                consumer.clone(),
+                Arc::clone(&handle),
+                clinker_plan::runtime_error::ConsumerLabel {
+                    node: "credentials".to_string(),
+                    surface: clinker_plan::runtime_error::MemorySurface::CredentialRegistry,
+                },
+            )
+            .expect("a fresh handle registers");
         handle.set_bytes(4_096);
 
         assert_eq!(consumer.reclaimable_bytes(), 0);
@@ -1227,7 +1231,9 @@ where
     ///
     /// Returns [`CredentialRegistryErrorKind::AllocationFailed`] when the
     /// fixed handle table cannot be reserved or its byte size cannot be
-    /// represented by the memory consumer.
+    /// represented by the memory consumer, and
+    /// [`CredentialRegistryErrorKind::RegistrationFailed`] when the arbitrator
+    /// refuses to register that consumer.
     pub fn new(
         arbitrator: &'catalog MemoryArbitrator,
         catalog: &'catalog CredentialProfileCatalog<'run>,
@@ -1244,8 +1250,7 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`CredentialRegistryErrorKind::AllocationFailed`] under the
-    /// same fixed-table conditions as [`Self::new`].
+    /// As [`Self::new`].
     pub fn new_with_telemetry(
         arbitrator: &'catalog MemoryArbitrator,
         catalog: &'catalog CredentialProfileCatalog<'run>,
@@ -1275,14 +1280,18 @@ where
         let memory_handle = ConsumerHandle::new();
         memory_handle.set_bytes(table_bytes);
         let consumer = Arc::new(CredentialRegistryConsumer::new(Arc::clone(&memory_handle)));
-        let consumer_id = arbitrator.register_consumer(
-            consumer.clone(),
-            Arc::clone(&memory_handle),
-            clinker_plan::runtime_error::ConsumerLabel {
-                node: "credentials".to_string(),
-                surface: clinker_plan::runtime_error::MemorySurface::CredentialRegistry,
-            },
-        );
+        let consumer_id = arbitrator
+            .register_consumer(
+                consumer.clone(),
+                Arc::clone(&memory_handle),
+                clinker_plan::runtime_error::ConsumerLabel {
+                    node: "credentials".to_string(),
+                    surface: clinker_plan::runtime_error::MemorySurface::CredentialRegistry,
+                },
+            )
+            .map_err(|_| {
+                CredentialRegistryError::new(CredentialRegistryErrorKind::RegistrationFailed)
+            })?;
         Ok(Self {
             arbitrator,
             catalog,
@@ -1515,6 +1524,9 @@ pub enum CredentialRegistryErrorKind {
     CleanupFailed,
     /// The fixed handle table could not be allocated or represented.
     AllocationFailed,
+    /// The registry's memory consumer could not be registered with the run's
+    /// memory arbitrator.
+    RegistrationFailed,
     /// An acquisition was attempted after the registry closed.
     Closed,
 }
@@ -1562,6 +1574,9 @@ impl fmt::Display for CredentialRegistryError {
             }
             CredentialRegistryErrorKind::AllocationFailed => {
                 "credential handle registry could not allocate its fixed table"
+            }
+            CredentialRegistryErrorKind::RegistrationFailed => {
+                "credential handle registry could not register its memory consumer"
             }
             CredentialRegistryErrorKind::Closed => "credential handle registry is already closed",
         };
