@@ -248,17 +248,31 @@ fn port_feeder_over_hard_limit_completes_through_spill() {
     }
 }
 
-/// A composition port whose producer's rows were spilled re-charges them at
-/// the call site when the call takes them into memory. Refused, its E310
-/// names what it was reserving: the rows buffered from the producer into
-/// the call site, not rows collected for a full scan.
+/// Rows the Source reads for the re-charge test.
+const RECHARGE_ROWS: u64 = 4_000;
+
+/// Columns of each row the call site re-charges: `id` plus the four
+/// engine-stamped `$source` columns every Source row carries. The ample run
+/// below checks it: the body's Transform holds exactly the re-charge.
+const PORT_COLUMNS: usize = 5;
+
+/// The most the Source holds while it reads the re-charge test's rows.
 ///
-/// The run is held to a 256 KiB test capacity, reading no process memory so
-/// only the charged total can refuse. The Source's 4,000 rows of about
-/// 100 bytes spill as they are buffered for the call, and loading them back
-/// needs more than the whole capacity, so the re-charge itself is refused.
-#[test]
-fn a_composition_port_recharge_shortfall_names_the_rows_it_buffers() {
+/// Each id is 11 bytes, within the 23 bytes a row's text holds inline, so
+/// the rows' text is charged nothing and the read peak does not grow with
+/// the input. What remains is the rows queued on the Source's channel, each
+/// charged about 256 bytes while queued (measured): at most 1,025 of them (a
+/// full 1,024-row channel and one waiting to send), plus 600 bytes of run
+/// state, is 263,000 bytes, plus the rows between decoding and sending.
+/// Measured on one CPU, a ledger of 264,000 bytes still refused the reader
+/// in 5 of 240 runs and one of 280,000 bytes in none.
+const SOURCE_READ_BOUND: u64 = 280_000;
+
+fn recharge_fixture() -> (
+    tempfile::TempDir,
+    clinker_plan::config::CompileContext,
+    PipelineConfig,
+) {
     let workspace = tempfile::tempdir().expect("tempdir");
     let comp_dir = workspace.path().join("compositions");
     std::fs::create_dir_all(&comp_dir).expect("mkdir compositions");
@@ -270,9 +284,20 @@ fn a_composition_port_recharge_shortfall_names_the_rows_it_buffers() {
         PathBuf::from("pipelines"),
     );
     let config = clinker_plan::config::parse_config(PIPELINE_YAML).expect("parse pipeline YAML");
+    (workspace, ctx, config)
+}
+
+/// Run the re-charge fixture against `memory`.
+fn run_recharge(
+    memory_test: crate::executor::MemoryTestOverrides,
+) -> (
+    Result<ExecutionReport, PipelineError>,
+    Arc<crate::pipeline::memory::MemoryArbitrator>,
+) {
+    let (_workspace, ctx, config) = recharge_fixture();
     let mut csv = String::from("id\n");
-    for i in 0..4000 {
-        csv.push_str(&format!("id_{i:0100}\n"));
+    for i in 0..RECHARGE_ROWS {
+        csv.push_str(&format!("id_{i:08}\n"));
     }
     let readers: crate::executor::SourceReaders = HashMap::from([(
         "src".to_string(),
@@ -285,24 +310,77 @@ fn a_composition_port_recharge_shortfall_names_the_rows_it_buffers() {
         "out".to_string(),
         Box::new(SharedBuffer::new()) as Box<dyn std::io::Write + Send>,
     )]);
-    let capacity = 256 * 1024;
+    let memory = Arc::new(
+        crate::executor::util::build_arbitrator_from_config(&config, &memory_test)
+            .expect("the test arbitrator builds"),
+    );
     let params = PipelineRunParams {
         execution_id: "composition-port-recharge".to_string(),
         batch_id: "batch-0".to_string(),
-        memory_test: crate::executor::MemoryTestOverrides::default()
-            .with_ledger_capacity(capacity)
-            .with_no_process_memory(),
+        memory_test,
         ..Default::default()
     };
-
-    let err = PipelineExecutor::run_with_readers_writers_in_context(
+    let result = PipelineExecutor::run_with_readers_writers_with_arbitrator(
         &config,
         readers,
         writers.into(),
         &params,
         ctx,
-    )
-    .expect_err("the port's rows cannot be loaded back within the capacity");
+        Arc::clone(&memory),
+    );
+    (result, memory)
+}
+
+/// A composition port whose producer's rows were spilled re-charges them at
+/// the call site when the call takes them into memory. Refused, its E310
+/// names what it was reserving: the rows buffered from the producer into
+/// the call site, not rows collected for a full scan.
+///
+/// The runs read no process memory, so only the charged total can refuse.
+/// The capacity is half the re-charge, `RECHARGE_ROWS` rows at
+/// `record_byte_cost(PORT_COLUMNS)` each: above what the Source holds while
+/// it reads (`SOURCE_READ_BOUND`), so the reader reads its whole input, and
+/// below the re-charge, so the rows spill as they are buffered for the call
+/// and loading them back is refused. The refused request is the whole
+/// re-charge, which a run on a part of the input cannot request.
+#[test]
+fn a_composition_port_recharge_shortfall_names_the_rows_it_buffers() {
+    let recharge = RECHARGE_ROWS * crate::executor::node_buffer::record_byte_cost(PORT_COLUMNS);
+    let capacity = recharge / 2;
+    assert!(
+        capacity > SOURCE_READ_BOUND,
+        "the capacity ({capacity} bytes) must hold the Source's read ({SOURCE_READ_BOUND} bytes)"
+    );
+
+    let (ample, ample_memory) =
+        run_recharge(crate::executor::MemoryTestOverrides::default().with_no_process_memory());
+    let ample = ample.expect("the fixture completes with ample memory");
+    assert_eq!(
+        ample.per_node_peak_charged_bytes.get("add_tag").copied(),
+        Some(recharge),
+        "the body's Transform holds exactly the re-charge: {:?}",
+        ample.per_node_peak_charged_bytes
+    );
+    assert!(
+        ample_memory.peak_charged_bytes() > capacity,
+        "the ample run's charged peak ({} bytes) is not above the capacity ({capacity} bytes)",
+        ample_memory.peak_charged_bytes()
+    );
+
+    let (low, low_memory) = run_recharge(
+        crate::executor::MemoryTestOverrides::default()
+            .with_ledger_capacity(capacity)
+            .with_no_process_memory(),
+    );
+    let err = low.expect_err("the port's rows cannot be loaded back within the capacity");
+    assert!(
+        low_memory
+            .per_stage_spill_bytes_written()
+            .get("src")
+            .is_some_and(|bytes| *bytes > 0),
+        "the rows buffered for the call spilled before the call loaded them back: {:?}",
+        low_memory.per_stage_spill_bytes_written()
+    );
 
     // Refused at the call site, the report is bare: the call-site name is
     // its requester.
@@ -325,6 +403,10 @@ fn a_composition_port_recharge_shortfall_names_the_rows_it_buffers() {
     assert!(
         report.requested_bytes > capacity,
         "the refused request is the port's re-charge, more than the capacity: {report:?}"
+    );
+    assert_eq!(
+        report.requested_bytes, recharge,
+        "the refused request is the whole input's re-charge: {report:?}"
     );
     let rendered = err.to_string();
     assert!(
