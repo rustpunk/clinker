@@ -52,7 +52,7 @@ register classifies it that way.
 
 | Contract | Audience | Status | Observed now | Locked target | Requirement | Owner | Compatibility / reversibility | Evidence | Last verified |
 |---|---|---|---|---|---|---|---|---|---|
-| D-00 | Maintainers and campaign coordinators | external-mutable | Milestone 21 is the live campaign container; its prose and issue state can change independently of this checkout. | Refresh live issue and pull-request state, map every workstream to a v1 requirement and phase or an approved deferral, and treat cross-host resume and exactly-once publication as v2. | CONT-07, CONT-08 | CONT-07 campaign crosswalk; later writes require maintainer authorization | Additive local mapping; external state must be re-read before use or mutation. | GitHub milestone 21 live state | 2026-07-29 |
+| D-00 | Maintainers and campaign coordinators | external-mutable | The campaign is split across milestone 21 (qualification gate and programme exit) and outcome milestones 22 (correctness), 23 (windowing), 24 (memory contract), 25 (endpoints), 26 (authoring), 27 (Klinx preview), 28 (agent interface) and 29 (restart and replay, deferred past v1 parity); their prose and issue state can change independently of this checkout. | Refresh live issue and pull-request state, map every workstream to a v1 requirement and phase or an approved deferral, and treat cross-host resume and exactly-once publication as v2. | CONT-07, CONT-08 | CONT-07 campaign crosswalk; later writes require maintainer authorization | Additive local mapping; external state must be re-read before use or mutation. | GitHub milestones 21-29 live state | 2026-10-06 |
 
 ## Stored-plan execution and cache identity
 
