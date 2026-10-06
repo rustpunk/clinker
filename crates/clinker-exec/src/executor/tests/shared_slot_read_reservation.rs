@@ -110,7 +110,7 @@ fn publish_shared_slot(
             node: PRODUCER.to_string(),
             surface: MemorySurface::BufferedRows {
                 from: PRODUCER.to_string(),
-                to: vec![READER.to_string()],
+                to: clinker_plan::runtime_error::NonEmptyReaders::one(READER.to_string()),
             },
         },
     );

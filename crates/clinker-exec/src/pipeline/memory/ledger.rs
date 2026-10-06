@@ -1671,7 +1671,7 @@ mod tests {
             MemorySurface::RowsRead,
             MemorySurface::BufferedRows {
                 from: "orders".to_string(),
-                to: vec!["totals".to_string()],
+                to: clinker_plan::runtime_error::NonEmptyReaders::one("totals".to_string()),
             },
             MemorySurface::GroupState,
             MemorySurface::SortBuffer,
@@ -2075,7 +2075,7 @@ mod tests {
         assert_eq!(
             MemorySurface::BufferedRows {
                 from: "orders".to_string(),
-                to: vec!["totals".to_string()],
+                to: clinker_plan::runtime_error::NonEmptyReaders::one("totals".to_string()),
             }
             .to_string(),
             "rows buffered between \"orders\" and \"totals\""
@@ -2757,7 +2757,7 @@ mod walk_pass_tests {
                 node: node.to_string(),
                 surface: MemorySurface::BufferedRows {
                     from: node.to_string(),
-                    to: vec!["next".to_string()],
+                    to: clinker_plan::runtime_error::NonEmptyReaders::one("next".to_string()),
                 },
             },
         );

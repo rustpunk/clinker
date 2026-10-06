@@ -1679,7 +1679,7 @@ mod tests {
                 node: "rows".to_string(),
                 surface: MemorySurface::BufferedRows {
                     from: "rows".to_string(),
-                    to: vec!["output".to_string()],
+                    to: clinker_plan::runtime_error::NonEmptyReaders::one("output".to_string()),
                 },
             },
         );

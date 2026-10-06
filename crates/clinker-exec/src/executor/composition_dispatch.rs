@@ -314,7 +314,7 @@ fn collect_port_records(
         // What the call reserves here: the rows its producer buffered for it.
         let port_rows = clinker_plan::runtime_error::MemorySurface::BufferedRows {
             from: parent_dag.graph[edge.source()].name().to_string(),
-            to: vec![composition_name.to_string()],
+            to: clinker_plan::runtime_error::NonEmptyReaders::one(composition_name.to_string()),
         };
         let reservation = match reservation {
             Some(reservation) => {

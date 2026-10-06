@@ -315,7 +315,9 @@ fn a_composition_port_recharge_shortfall_names_the_rows_it_buffers() {
             node: "port_enrich_call".to_string(),
             surface: clinker_plan::runtime_error::MemorySurface::BufferedRows {
                 from: "src".to_string(),
-                to: vec!["port_enrich_call".to_string()],
+                to: clinker_plan::runtime_error::NonEmptyReaders::one(
+                    "port_enrich_call".to_string()
+                ),
             },
         }),
         "the requester names the rows buffered from the producer into the call: {report:?}"

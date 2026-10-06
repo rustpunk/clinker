@@ -598,7 +598,9 @@ fn recurse_into_body(
                     parent_dag.graph[composition_idx].name(),
                     clinker_plan::runtime_error::MemorySurface::BufferedRows {
                         from: body_dag.graph[*body_out_idx].name().to_string(),
-                        to: vec![parent_dag.graph[composition_idx].name().to_string()],
+                        to: clinker_plan::runtime_error::NonEmptyReaders::one(
+                            parent_dag.graph[composition_idx].name().to_string(),
+                        ),
                     },
                 )?;
             }

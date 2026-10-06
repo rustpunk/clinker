@@ -1049,7 +1049,7 @@ mod frame_tests {
                 node: node.to_string(),
                 surface: MemorySurface::BufferedRows {
                     from: node.to_string(),
-                    to: vec!["next".to_string()],
+                    to: clinker_plan::runtime_error::NonEmptyReaders::one("next".to_string()),
                 },
             },
         );

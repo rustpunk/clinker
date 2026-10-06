@@ -145,10 +145,10 @@ pub enum MemorySurface {
     RowsRead,
     /// Rows waiting between two nodes: `from` is the author-given name of the
     /// node that buffered them, and `to` holds the author-given name of every
-    /// node that reads them, one name per element. Each reader prints as its
-    /// own quoted name, so a slot read by several nodes can never be mistaken
-    /// for one node whose name contains a comma.
-    BufferedRows { from: String, to: Vec<String> },
+    /// node that reads them, one name per element and never none. Each reader
+    /// prints as its own quoted name, so a slot read by several nodes can
+    /// never be mistaken for one node whose name contains a comma.
+    BufferedRows { from: String, to: NonEmptyReaders },
     /// Per-group accumulators of an Aggregate.
     GroupState,
     /// Rows collected for sorting.
@@ -188,6 +188,37 @@ pub enum MemorySurface {
     ParkedCrossRegionRows { from: String, to: String },
 }
 
+/// The author-given names of the nodes that read a buffer, one name per
+/// element, in the order they were given. Holds at least one name: rows
+/// buffered for no reader would print a holder line that names nobody, so
+/// every constructor takes a reader.
+///
+/// ```compile_fail
+/// use clinker_plan::runtime_error::NonEmptyReaders;
+/// // The list is private: an empty list cannot be built around the
+/// // constructors.
+/// let _ = NonEmptyReaders(Vec::new());
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct NonEmptyReaders(Vec<String>);
+
+impl NonEmptyReaders {
+    /// A buffer read by one node.
+    pub fn one(reader: impl Into<String>) -> Self {
+        Self(vec![reader.into()])
+    }
+
+    /// `readers`, when it names at least one node; `None` when it is empty.
+    pub fn from_vec(readers: Vec<String>) -> Option<Self> {
+        (!readers.is_empty()).then_some(Self(readers))
+    }
+
+    /// The readers, in the order they were given; never empty.
+    pub fn as_slice(&self) -> &[String] {
+        &self.0
+    }
+}
+
 impl std::fmt::Display for MemorySurface {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use clinker_core_types::QuoteName;
@@ -198,7 +229,7 @@ impl std::fmt::Display for MemorySurface {
                     f,
                     "rows buffered between {} and {}",
                     from.as_str().quoted_name(),
-                    quoted_names(to)
+                    quoted_names(to.as_slice())
                 )
             }
             Self::GroupState => f.write_str("group state"),
@@ -1313,7 +1344,10 @@ mod tests {
         let buffered = |readers: &[&str]| {
             MemorySurface::BufferedRows {
                 from: "split".to_string(),
-                to: readers.iter().map(|reader| reader.to_string()).collect(),
+                to: NonEmptyReaders::from_vec(
+                    readers.iter().map(|reader| reader.to_string()).collect(),
+                )
+                .expect("at least one reader"),
             }
             .to_string()
         };
@@ -1336,6 +1370,25 @@ mod tests {
             buffered(&["totals"]),
             "rows buffered between \"split\" and \"totals\"",
             "one reader reads as one quoted name"
+        );
+    }
+
+    /// A buffer's reader list names at least one node: an empty list has no
+    /// value of the type, and every constructor yields a reader.
+    #[test]
+    fn a_reader_list_names_at_least_one_reader() {
+        assert_eq!(
+            NonEmptyReaders::from_vec(Vec::new()),
+            None,
+            "an empty list is not a reader list"
+        );
+        let readers =
+            NonEmptyReaders::from_vec(vec!["a".to_string(), "b".to_string()]).expect("two readers");
+        assert_eq!(readers.as_slice(), ["a", "b"], "readers keep their order");
+        assert_eq!(
+            NonEmptyReaders::one("totals").as_slice(),
+            ["totals"],
+            "one reader is a list of one"
         );
     }
 

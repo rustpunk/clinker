@@ -153,7 +153,7 @@ fn example() -> Example {
         "sorted",
         MemorySurface::BufferedRows {
             from: "orders".to_string(),
-            to: vec!["sorted".to_string()],
+            to: clinker_plan::runtime_error::NonEmptyReaders::one("sorted".to_string()),
         },
         MIB,
         Kind::Spillable,
@@ -253,7 +253,7 @@ fn report_figures_come_from_one_snapshot() {
                 &format!("step{index}"),
                 MemorySurface::BufferedRows {
                     from: format!("step{index}"),
-                    to: vec!["next".to_string()],
+                    to: clinker_plan::runtime_error::NonEmptyReaders::one("next".to_string()),
                 },
                 64 * KIB,
                 Kind::Spillable,
@@ -531,7 +531,7 @@ fn a_source_holder_never_counts_as_state_that_cannot_spill() {
             node: "sorted".to_string(),
             surface: MemorySurface::BufferedRows {
                 from: "orders".to_string(),
-                to: vec!["sorted".to_string()],
+                to: clinker_plan::runtime_error::NonEmptyReaders::one("sorted".to_string()),
             },
         },
     );
@@ -607,7 +607,7 @@ fn rows_a_finished_source_read_never_count_as_state_that_cannot_spill() {
             node: "sorted".to_string(),
             surface: MemorySurface::BufferedRows {
                 from: "orders".to_string(),
-                to: vec!["sorted".to_string()],
+                to: clinker_plan::runtime_error::NonEmptyReaders::one("sorted".to_string()),
             },
         },
     );

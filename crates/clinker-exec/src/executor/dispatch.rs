@@ -2316,7 +2316,7 @@ impl<'a> ExecutorContext<'a> {
                 node: producer_name.to_string(),
                 surface: clinker_plan::runtime_error::MemorySurface::BufferedRows {
                     from: producer_name.to_string(),
-                    to: vec![reader_name.to_string()],
+                    to: clinker_plan::runtime_error::NonEmptyReaders::one(reader_name.to_string()),
                 },
             },
         );
@@ -3240,7 +3240,11 @@ mod required_node_buffer_tests {
             label.surface,
             MemorySurface::BufferedRows {
                 from: "split".to_string(),
-                to: vec!["b".to_string(), "a".to_string()],
+                to: clinker_plan::runtime_error::NonEmptyReaders::from_vec(vec![
+                    "b".to_string(),
+                    "a".to_string()
+                ])
+                .expect("at least one reader"),
             },
             "every distinct reader, in planned order"
         );
@@ -3715,17 +3719,19 @@ impl PlannedNodeBufferReaders {
                 readers.push(name.to_string());
             }
         }
-        let to = if !readers.is_empty() {
-            readers
-        } else if let Some(keyed) = self.node_names.get(&key.node)
-            && &**keyed != producer
-        {
-            vec![keyed.to_string()]
-        } else if let Some(call_site) = composition_call_sites.last() {
-            vec![call_site.clone()]
-        } else {
-            vec![producer.to_string()]
-        };
+        let to =
+            clinker_plan::runtime_error::NonEmptyReaders::from_vec(readers).unwrap_or_else(|| {
+                let reader = if let Some(keyed) = self.node_names.get(&key.node)
+                    && &**keyed != producer
+                {
+                    keyed.to_string()
+                } else if let Some(call_site) = composition_call_sites.last() {
+                    call_site.clone()
+                } else {
+                    producer.to_string()
+                };
+                clinker_plan::runtime_error::NonEmptyReaders::one(reader)
+            });
         clinker_plan::runtime_error::ConsumerLabel {
             node: producer.to_string(),
             surface: clinker_plan::runtime_error::MemorySurface::BufferedRows {

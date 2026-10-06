@@ -1848,7 +1848,9 @@ impl PipelineExecutor {
                     node: spec.producer_name.clone(),
                     surface: clinker_plan::runtime_error::MemorySurface::BufferedRows {
                         from: spec.producer_name.clone(),
-                        to: vec![spec.output_name.clone()],
+                        to: clinker_plan::runtime_error::NonEmptyReaders::one(
+                            spec.output_name.clone(),
+                        ),
                     },
                 },
             );
