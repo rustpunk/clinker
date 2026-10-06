@@ -968,9 +968,9 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
 
 - Filed: 2026-10-05.
 - Status: Open. The cannot-spill count is resolved: an E310 no longer counts
-  a finished Source's surviving rows as state that cannot spill. Naming the
-  step that keeps them alive stays open, and so does the ranking figure of
-  every holder that keeps such rows; the ranking-figure decision is pending.
+  a finished Source's surviving rows as state that cannot spill, and the
+  ranking figure of every holder that keeps such rows is decided (below).
+  Naming the step that keeps them alive stays open.
 - Priority: Medium.
 - Evidence: Long text a Source reads is admitted once, in the Source's name,
   and the admission travels with the allocation to every copy of the row
@@ -994,13 +994,13 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
   as memory not held by any one node, so it cannot name the step (a parked
   edge, a buffered slot) that keeps them alive; and every holder that keeps
   such rows leaves them out of its ranking figure (below).
-- Ranking figure (open, decision pending): every row holder on the walk
-  ranks as a reclaim victim by its rows' own charge, which leaves out text a
-  Source read and is charged for, even when the holder keeps the last copy
-  of that text alive and a spill would free it. That covers a node-buffer
-  slot, Output's per-document bucket and the Cull and Reshape group buffers
-  (`resident_record_reclaimable_bytes`) and a parked edge (its resident
-  segments' charge). A node-buffer slot often holds the only copy, since
+- Ranking figure (decided 2026-10-06, delivered with #1394): every row
+  holder on the walk ranks as a reclaim victim by its rows' own charge,
+  which leaves out text a Source read and is charged for, even when the
+  holder keeps the last copy of that text alive and a spill would free it.
+  That covers a node-buffer slot, Output's per-document bucket and the Cull
+  and Reshape group buffers (`resident_record_reclaimable_bytes`) and a
+  parked edge (its resident segments' charge). A node-buffer slot often holds the only copy, since
   rows move rather than copy, so it is the common case, not the parked edge.
   The effect is victim order only: a pass can spill a holder whose figure is
   larger, find its target not yet met, and spill the next, which costs extra
@@ -1008,10 +1008,14 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
   measured covers its target, and a resident row always has a figure above
   0. Grace partitions and a hash Aggregate count the text in full, the
   opposite error, which the #1394 rule removes; under `memory.backpressure:
-  both` their figures outrank row holders across priority tiers. The #1394
-  rule sets each holder's ranking figure equal to its charge, which keeps
-  this text out; whether the figure should also count the text a holder
-  alone keeps alive is a memory-model decision not yet taken. The code
+  both` their figures outrank row holders across priority tiers. Decided: a
+  holder ranks by its charge, derived from the same per-row charge function
+  so its ranking figure and its charge cannot disagree. The figure is the
+  charged bytes a spill releases; a spill can free more, which the pass
+  measures. It stays a lower bound, so a figure of 0 still means there is
+  nothing to spill. The #1394 rule delivers it for every holder at once.
+  Counting the text a holder alone keeps alive returns as its own change
+  only if a benchmark shows spills chosen in the wrong order. The code
   comments and the engine page state the figure as it is.
 - Charges made in a finished Source's name (resolved): on the walk,
   governed allocations are charged to the dispatching node's first
@@ -1044,10 +1048,7 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
 - Suggested way to resolve it: Decide, with the reclaim victim order and the
   E310 holder report, how an E310 names the step that keeps a finished
   Source's rows alive (by what that step alone keeps alive, or by handing
-  the charge over to it). Separately, decide whether a row holder's ranking
-  figure counts the text it alone keeps alive (which needs a read-time check
-  that the holder keeps every copy) and apply the answer to every row holder
-  at once, so holders of one priority rank in one unit.
+  the charge over to it). The ranking figure is decided (above).
 - Related finding (spill read-back): rows read back from a spill file come
   back with text the run never admitted (`Value`'s deserializer builds it
   with `FieldStr::from`, `crates/clinker-record/src/value.rs`), so no
