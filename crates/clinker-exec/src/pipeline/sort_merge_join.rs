@@ -4367,6 +4367,100 @@ mod tests {
             "every miss dispatched, the pile is discharged"
         );
         assert_eq!(budget.charged_bytes(), 0);
+
+        // The peak is reached when the pile's share passes to the join, so it
+        // cannot show the share stays. The walk emits one row short of the
+        // memory check's interval, so the check first runs as the first miss
+        // is dispatched. The limit is the pile's text alone, which the walk's
+        // rows do not reach: the check refuses only if the pile is still
+        // charged when its misses are dispatched.
+        let big_pad = "y".repeat(256 * 1024);
+        let pile_rows = 64usize;
+        let keyed_rows = MEMORY_CHECK_INTERVAL - 1;
+        let mut big_pile_text = 0u64;
+        // Collect mode emits a row per miss; its array lands in `builds`.
+        let collect_schema = schema_with(&["k", "pad", "builds"]);
+        let driver_records: Vec<(Record, RecordOrder)> = (0..pile_rows + keyed_rows)
+            .map(|i| {
+                let record = if i < pile_rows {
+                    big_pile_text += big_pad.len() as u64;
+                    rec(
+                        &collect_schema,
+                        vec![
+                            Value::Null,
+                            Value::String(big_pad.as_str().into()),
+                            Value::Null,
+                        ],
+                    )
+                } else {
+                    rec(
+                        &collect_schema,
+                        vec![
+                            Value::Integer(i as i64),
+                            Value::String("".into()),
+                            Value::Null,
+                        ],
+                    )
+                };
+                (record, RecordOrder::from(i as u64))
+            })
+            .collect();
+        let (budget, handle, charges) =
+            ledger_with_input_charges(big_pile_text, 1024 * 1024, 64 * 1024);
+        let err = run_kernel_on(
+            RunKernel {
+                driver_records,
+                build_records: vec![rec(&builds_schema, vec![Value::Integer(1_000_000)])],
+                decomposed: drivers_below_builds(),
+                driver_qual: "drivers",
+                build_qual: "builds",
+                driver_schema: &collect_schema,
+                build_schema: &builds_schema,
+                match_mode: MatchMode::Collect,
+                on_miss: OnMiss::Skip,
+                presorted: true,
+                body_program: None,
+                budget_bytes: None,
+            },
+            None,
+            &test_allocation_resources(),
+            &budget,
+            charges,
+        )
+        .map(|(records, _)| records.len())
+        .expect_err("the check at the first miss counts the pile, which passes the limit");
+        let report = match err {
+            PipelineError::MemoryBudgetExceeded { report } => report,
+            other => panic!("expected E310 at the miss dispatch's check, got {other:?}"),
+        };
+        assert_eq!(
+            report.requester,
+            Some(clinker_plan::runtime_error::ConsumerLabel {
+                node: "sm_test".to_string(),
+                surface: clinker_plan::runtime_error::MemorySurface::JoinState,
+            })
+        );
+        assert_eq!(
+            report.requested_bytes, 0,
+            "the refusal is the emitted-row check, made after the fact"
+        );
+        let join_bytes = report
+            .holders
+            .iter()
+            .find(|holder| holder.node == "sm_test")
+            .map(|holder| holder.bytes)
+            .expect("the join holds charged bytes at the refusal");
+        assert!(
+            join_bytes > big_pile_text,
+            "at the first miss's dispatch the join's charge ({join_bytes}) must still \
+             cover the null-key pile ({big_pile_text} bytes of text)"
+        );
+        assert_eq!(
+            handle.bytes(),
+            0,
+            "the refused join returns to its baseline"
+        );
+        assert_eq!(budget.charged_bytes(), 0);
     }
 
     /// Build `n` phase A driver pairs whose sort key `k` is an Integer and
