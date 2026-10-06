@@ -186,8 +186,10 @@ impl NodeBufferSlots {
     /// nothing and its rows stay where the reader holds them, and its spill
     /// request is raised. The walk's sweep at the next node dispatch clears
     /// that request and writes nothing while the reader still shares the
-    /// rows; the next pass that elects the slot raises it again. A slot its
-    /// compiled classification keeps in memory is `NotOwned`.
+    /// rows; the next pass that elects the slot raises it again. A slot that
+    /// holds no rows in memory writes nothing and is `Busy`, with no request
+    /// raised. A slot its compiled classification keeps in memory is
+    /// `NotOwned`.
     fn spill_registered(
         &mut self,
         id: ConsumerId,
@@ -220,11 +222,14 @@ impl NodeBufferSlots {
             batch_size: spill_settings.batch_size,
         }
         .spill_slot(&mut self.buffers, &key, &handle, &node_name)?;
-        if spilled == SlotSpillResult::StillShared {
-            handle.request_spill();
-            return Ok(Some(VictimOutcome::Busy));
-        }
-        Ok(Some(VictimOutcome::Spilled))
+        Ok(Some(match spilled {
+            SlotSpillResult::Written(_) => VictimOutcome::Spilled,
+            SlotSpillResult::StillShared => {
+                handle.request_spill();
+                VictimOutcome::Busy
+            }
+            SlotSpillResult::NothingResident => VictimOutcome::Busy,
+        }))
     }
 }
 
@@ -1158,6 +1163,43 @@ mod frame_tests {
         );
         assert_eq!(arbitrator.consumer_count(), consumers_before);
         assert_eq!(parent_handle.bytes(), 2 * KIB, "the parent's charge stands");
+    }
+
+    /// A registered slot that holds no rows in memory writes nothing when it
+    /// is elected, so it is `Busy`, never `Spilled`: a victim counts as
+    /// spilled only when it wrote. Its charge stands and no spill file is
+    /// recorded.
+    #[test]
+    fn an_elected_slot_with_no_resident_rows_is_busy() {
+        let root = tempfile::tempdir().expect("spill root");
+        let arbitrator = arbitrator(256 * KIB);
+        let set = reclaim_set(root.path());
+        let (_, id, handle) = {
+            let mut guard = set.borrow_mut();
+            publish_slot(&arbitrator, guard.slots_mut(), "no_rows", 0, KIB)
+        };
+
+        let outcome = set
+            .borrow_mut()
+            .spill_victim(id, &arbitrator)
+            .expect("a slot with nothing to write does not fail");
+
+        assert_eq!(
+            outcome,
+            VictimOutcome::Busy,
+            "a slot that wrote nothing is not reported as spilled"
+        );
+        assert_eq!(
+            arbitrator.cumulative_spill_bytes(),
+            0,
+            "no file was written"
+        );
+        assert_eq!(
+            handle.bytes(),
+            KIB,
+            "nothing left memory, so the charge stands"
+        );
+        assert!(arbitrator.unregister_consumer(id).is_some());
     }
 
     /// While a body's frame is on top, the body sees none of its parent's

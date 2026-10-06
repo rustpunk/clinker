@@ -5514,7 +5514,7 @@ impl ResidentSlotSpill<'_> {
 /// While the arm runs, governed allocations on the walk are charged to the
 /// node's own first registered consumer when it has one, so a reclaim they
 /// start elects that node's state last; the previous walk requester is
-/// restored afterwards. A spill a reclaim pass could not complete during the
+/// restored afterwards, unless it unregistered while the arm ran. A spill a reclaim pass could not complete during the
 /// arm fails the node with that spill's error, ahead of whatever the arm
 /// returned, since the request that met it saw only a shortfall.
 pub(crate) fn dispatch_plan_node(

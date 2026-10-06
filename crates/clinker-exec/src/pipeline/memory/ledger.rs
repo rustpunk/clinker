@@ -1001,9 +1001,24 @@ impl MemoryArbitrator {
     /// consumer's charged figure and mark, and it releases against that same
     /// consumer whatever the walk requester is when it drops. A reclaim pass
     /// the allocation starts elects that consumer last.
+    ///
+    /// A consumer that is no longer registered is never named: the walk then
+    /// requests in no consumer's name, as unregistering would have left it.
+    /// So restoring the requester an outer arm saved never brings back a
+    /// consumer that left while a nested arm ran. Takes the owner map's lock,
+    /// the lock unregistering clears the requester under, so the two cannot
+    /// interleave.
     pub(crate) fn set_walk_requester(&self, requester: Option<ConsumerId>) -> Option<ConsumerId> {
-        let raw = requester.map_or(NO_WALK_REQUESTER, |id| u64::from(id.0));
-        match self.walk_requester.swap(raw, Ordering::Relaxed) {
+        let owners = self
+            .consumer_owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let raw = requester
+            .filter(|id| owners.handles.contains_key(id))
+            .map_or(NO_WALK_REQUESTER, |id| u64::from(id.0));
+        let previous = self.walk_requester.swap(raw, Ordering::Relaxed);
+        drop(owners);
+        match previous {
             NO_WALK_REQUESTER => None,
             previous => Some(ConsumerId(previous as u32)),
         }
@@ -3572,6 +3587,41 @@ mod walk_pass_tests {
 
         drop((later, rows_read));
         arbitrator.set_walk_requester(previous);
+        drop(walk_frame);
+    }
+
+    /// An outer arm's requester that unregisters while a nested arm runs is
+    /// not restored when the nested arm ends: the walk then requests in no
+    /// consumer's name, so a later walk allocation is never charged to a
+    /// consumer that has left.
+    #[test]
+    fn a_departed_consumer_is_not_restored_as_the_walk_requester() {
+        let arbitrator = run(64 * MIB, Box::new(Priority));
+        let (outer, _outer_handle) = register(&arbitrator, "outer", 0, 0);
+        let (nested, _nested_handle) = register(&arbitrator, "nested", 0, 0);
+        let set = empty_set();
+        let walk_frame = walk(&arbitrator, &set);
+
+        let before_outer = arbitrator.set_walk_requester(Some(outer));
+        let before_nested = arbitrator.set_walk_requester(Some(nested));
+        assert_eq!(before_nested, Some(outer));
+        arbitrator
+            .unregister_consumer(outer)
+            .expect("the outer consumer was registered");
+        arbitrator.set_walk_requester(before_nested);
+        assert_eq!(
+            arbitrator.walk_requester(),
+            None,
+            "a consumer that has left is never the walk's requester again"
+        );
+
+        arbitrator.set_walk_requester(Some(nested));
+        assert_eq!(
+            arbitrator.walk_requester(),
+            Some(nested),
+            "a registered consumer still becomes the requester"
+        );
+        arbitrator.set_walk_requester(before_outer);
         drop(walk_frame);
     }
 
