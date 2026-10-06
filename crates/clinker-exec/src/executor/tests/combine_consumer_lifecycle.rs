@@ -1611,3 +1611,20 @@ fn a_grace_join_reloading_spilled_partitions_does_not_count_its_build_input() {
     let capacity = orders + 2 * products;
     assert_grace_reload_completes(capacity, &ample_rows);
 }
+
+/// Once a grace join's probe loop has emitted or written to disk every
+/// driver row, the driver input's charge ends as well: no driver row is in
+/// memory and the input vector is freed. The capacity holds both inputs
+/// together when they are collected, and the hot partition's reloaded
+/// table, but not the driver input's charge beside that table. Counting
+/// that charge until the join returns refuses the reload with E310 for the
+/// join's build side.
+#[test]
+fn a_grace_join_reloading_spilled_partitions_does_not_count_its_driver_input() {
+    let (_, ample_rows, orders, products) = grace_reload_ample();
+    // Both inputs with a fifth of the build input's charge to spare: the
+    // hot partition's table, larger than the build input's charge, does not
+    // fit beside the driver's charge.
+    let capacity = orders + products + products / 5;
+    assert_grace_reload_completes(capacity, &ample_rows);
+}

@@ -491,7 +491,7 @@ where
     // below), so this drains nothing and the driver records (and their
     // punctuations) arrive on the channel instead, to be reconciled with the
     // retained `build_puncts` after the probe joins.
-    let (driver_buf, driver_puncts, _driver_clone_reservation): (
+    let (driver_buf, driver_puncts, driver_clone_reservation): (
         Vec<(Record, crate::executor::stream_event::SourceRowId)>,
         Vec<crate::executor::stream_event::Punctuation>,
         Option<crate::executor::node_buffer::TransientNodeBufferReservation>,
@@ -739,7 +739,7 @@ where
                 // driver_idx, build_idx)` the output sort returns, not pool
                 // scheduling.
                 let kernel = consume_materialized_inputs(
-                    [_driver_clone_reservation, build_clone_reservation],
+                    [driver_clone_reservation, build_clone_reservation],
                     || {
                         let kernel = execute_combine_iejoin(
                             IEJoinExec {
@@ -925,6 +925,7 @@ where
                             column: &build_qualifier,
                         },
                         build_input_charge: build_clone_reservation,
+                        driver_input_charge: driver_clone_reservation,
                     },
                     &ctx.kernel_pool,
                 )?;

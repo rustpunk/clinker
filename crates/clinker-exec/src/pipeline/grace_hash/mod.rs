@@ -277,6 +277,11 @@ pub(crate) struct GraceHashExec<'a> {
     /// each row at its full figure as the build loop moves it in, and the
     /// charge ends when that loop has freed the input vector.
     pub build_input_charge: Option<TransientNodeBufferReservation>,
+    /// The charge the driver input's rows carried into the join, `None` when
+    /// they arrived uncharged. The kernel owns it and ends it when the probe
+    /// loop has emitted from, or written to disk, every driver row and freed
+    /// the input vector.
+    pub driver_input_charge: Option<TransientNodeBufferReservation>,
 }
 
 /// Where the grace-hash join records its build-side sketch results: the
@@ -840,6 +845,7 @@ pub(crate) fn execute_combine_grace_hash(
         strategy,
         stats_sink,
         build_input_charge,
+        driver_input_charge,
     } = args;
 
     if decomposed.equalities.is_empty() {
@@ -1097,6 +1103,11 @@ pub(crate) fn execute_combine_grace_hash(
                 .map_err(|report| PipelineError::MemoryBudgetExceeded { report })?;
         }
     }
+    // Every driver row was probed against an in-memory partition and
+    // dropped, or written to its spilled partition's probe file, and the
+    // input vector is freed: the input's charge stands for nothing from
+    // here, through the reload and the output's admission.
+    drop(driver_input_charge);
 
     partitions
         .finalize_probe_spills(budget)
