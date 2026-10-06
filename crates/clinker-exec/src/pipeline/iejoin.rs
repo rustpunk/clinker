@@ -2114,16 +2114,15 @@ fn pwmj_numeric_state_bytes(n_left: usize, n_right: usize) -> usize {
     index_arrays.saturating_add(sort_scratch)
 }
 
-/// Build the typed pre-output budget-abort error, shared by both dispatch
-/// shapes. On the equi+range path it fires when the resident partition and
-/// per-group sort arrays exceed the budget (gated through the arbitrator's
-/// `should_abort_local`, since that path holds its inputs resident with no
-/// spill). On the block-band path it is a strictly LOCAL last resort — the one
-/// loaded block-pair's resident bytes plus kernel aux exceed the hard limit
-/// even alone — gated by a direct `peak > hard_limit` comparison, never by
-/// global process pressure, because that path answers pressure by spilling.
-/// Either way it is the E310 refusal of the `peak` bytes the join's state
-/// needed, reported from `budget`'s ledger as every other refusal is.
+/// Build the typed pre-output budget-abort error for the block-band kernel,
+/// which serves pure-range and equi+range combines alike. It is a strictly
+/// LOCAL last resort: a gate compares the `peak` bytes it measured — one
+/// loaded block-pair's resident bytes plus kernel aux, or a hot collect
+/// value's held candidates — directly against the hard limit, never against
+/// the process's memory, because the kernel answers pressure by spilling.
+/// It is the E310 refusal of the `peak` bytes the join's state needed,
+/// reported from `budget`'s ledger as every other refusal is, but it does
+/// not pass through [`MemoryArbitrator::check_hard_limit`].
 fn pre_output_budget_error(budget: &MemoryArbitrator, name: &str, peak: u64) -> PipelineError {
     budget.refusal(
         name,
@@ -2558,23 +2557,9 @@ mod tests {
         // pre-output abort trip earlier on wider inputs.
         assert!(iejoin_numeric_state_bytes(1_000, 1_000) > iejoin_numeric_state_bytes(100, 100));
 
-        // The estimate for a non-trivial group must exceed a 1-byte budget,
-        // so `should_abort_local` short-circuits on the local arm WITHOUT
-        // consulting RSS — the RSS-blind backstop the gate exists to
-        // provide. Uses `NoOpPolicy` so no victim selection interferes.
-        let budget = MemoryArbitrator::with_policy(
-            1,
-            0.8,
-            0.70,
-            Box::new(crate::pipeline::memory::NoOpPolicy),
-        );
+        // A non-trivial group estimates a working set larger than one byte.
         let est = iejoin_numeric_state_bytes(500, 500) as u64;
         assert!(est > 1);
-        assert!(
-            budget.should_abort_local(est),
-            "a {est}-byte working-set estimate must trip a 1-byte budget on the \
-             local arm regardless of RSS availability"
-        );
 
         // Per-pair charge cadence (block-band path). The block scheduler
         // charges this estimator with BLOCK-sized arguments once per surviving

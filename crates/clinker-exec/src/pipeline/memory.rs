@@ -892,9 +892,9 @@ impl ConsumerHandle {
 /// through the arbitrator: a shortfall from [`MemoryArbitrator::reserve`],
 /// `try_grow` or `try_resize`, or, for a hard-limit backstop, the one check
 /// [`MemoryArbitrator::check_hard_limit`] given the bytes the site is about
-/// to hold that no consumer has charged yet. Never pair `should_abort` or
-/// `should_abort_local` with a refusal of the consumer's own, and never
-/// refuse on its own RSS reading or a limit of its own. A growth charged on the
+/// to hold that no consumer has charged yet. Never pair `should_abort` with
+/// a refusal of the consumer's own, and never refuse on its own RSS reading
+/// or a limit of its own. A growth charged on the
 /// walk through `reserve`, `try_grow` or `try_resize` runs a reclaim pass
 /// before it is refused: the walk spills the state the pass elects, the
 /// requesting consumer last, and retries, and a refusal comes only after a
@@ -1796,7 +1796,7 @@ impl MemoryArbitrator {
 
     /// True when EITHER the process's peak resident reading or the
     /// pull-mode charged-byte sum exceeds the hard limit: the soft poll's
-    /// mirror against the hard `limit`, read by [`Self::should_abort_local`].
+    /// mirror against the hard `limit`.
     ///
     /// It reclaims nothing and builds no report, so it is not a hard-limit
     /// backstop: an operator that must stop at the limit checks through
@@ -1807,20 +1807,6 @@ impl MemoryArbitrator {
         self.observe();
         let hard = self.limit.load(Ordering::Relaxed);
         self.peak_rss.load(Ordering::Relaxed) > hard || self.sum_consumer_usage() > hard
-    }
-
-    /// True when the hard limit is breached by the process's peak resident
-    /// reading, by the pull-mode charged-byte sum, or by a caller-supplied
-    /// `local_bytes` estimate of state no consumer handle charges yet.
-    ///
-    /// Its one caller is the credential handle registry's acquisition, a
-    /// preflight step off the walk that refuses with its own credential
-    /// memory error rather than an E310 (open question 94 in
-    /// `docs/ai/80_OPEN_QUESTIONS.md`). Every operator's hard-limit backstop
-    /// checks through [`Self::check_hard_limit`] instead, which reclaims on
-    /// the walk before it refuses.
-    pub fn should_abort_local(&self, local_bytes: u64) -> bool {
-        local_bytes > self.limit.load(Ordering::Relaxed) || self.should_abort()
     }
 
     /// Peak RSS observed so far, or `None` on platforms where
@@ -3084,32 +3070,6 @@ mod tests {
         assert!(
             arbitrator.should_abort(),
             "charged bytes over the hard limit must trip should_abort via the RSS-independent arm"
-        );
-    }
-
-    #[test]
-    fn should_abort_local_trips_on_operator_bytes_without_rss() {
-        // The combine build loop's gate: in-progress bytes that are not yet
-        // in any registered consumer handle must still abort the build when
-        // they exceed the hard limit, independent of RSS. The registry is
-        // empty here (the build's handle is zero-seeded until build
-        // completes) and the 100 GiB limit keeps the RSS arm inert, so only
-        // the `local_bytes` arm can fire.
-        let arbitrator = MemoryArbitrator::with_policy(
-            100 * 1024 * 1024 * 1024,
-            0.80,
-            0.70,
-            Box::new(NoOpPolicy),
-        );
-        let hard = arbitrator.hard_limit();
-        assert_eq!(arbitrator.sum_consumer_usage(), 0);
-        assert!(
-            !arbitrator.should_abort_local(hard),
-            "local bytes at exactly the limit must not abort"
-        );
-        assert!(
-            arbitrator.should_abort_local(hard + 1),
-            "local bytes over the hard limit must abort with the RSS arm inert and no registered consumer"
         );
     }
 

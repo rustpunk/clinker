@@ -998,12 +998,10 @@ fn block_band_output_explosion_refuses_insufficient_frontier_budget() {
 }
 
 /// An equi+range predicate (one equality conjunct plus one range conjunct) so
-/// the planner selects `CombineStrategy::HashPartitionIEJoin`, which holds its
-/// hash partitions and per-group sort arrays resident with no spill path. Its
-/// pre-output gate is the RSS-independent `should_abort_local` check on the
-/// partition / group state — the coverage the deleted test guarded and that no
-/// block-band test can exercise (the block-band path spills instead of
-/// aborting under input pressure).
+/// the planner selects `CombineStrategy::HashPartitionIEJoin`. It runs on the
+/// same block-band kernel as a pure-range join, with the equality hash as an
+/// extra prune axis, so its inputs spill under pressure and its pre-output
+/// gate is the same strictly-local per-pair check.
 const EQUI_RANGE_YAML: &str = r#"
 pipeline:
   name: iejoin_equi_range
