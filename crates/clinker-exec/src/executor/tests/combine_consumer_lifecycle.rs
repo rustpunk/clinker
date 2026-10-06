@@ -1067,6 +1067,11 @@ fn an_inline_join_build_over_the_limit_spills_other_state_and_completes() {
 /// in-build check interval and short of two, so the build checks once while
 /// it still holds its whole input beside the partial table.
 const MID_BUILD_PRODUCTS: usize = 12_000;
+const _: () = assert!(
+    crate::pipeline::combine::MEMORY_CHECK_INTERVAL < MID_BUILD_PRODUCTS
+        && MID_BUILD_PRODUCTS < 2 * crate::pipeline::combine::MEMORY_CHECK_INTERVAL,
+    "the build checks the limit once, mid-build"
+);
 
 /// The fixture whose join's in-build check runs once, mid-build: every
 /// driver row names its own build row, and `widened` holds enough rows that
@@ -1089,11 +1094,6 @@ const MID_BUILD_ROWS: ReclaimRows = ReclaimRows {
 #[test]
 fn an_inline_join_mid_build_check_spills_other_state_and_completes() {
     use crate::pipeline::combine::MEMORY_CHECK_INTERVAL;
-    assert!(
-        MEMORY_CHECK_INTERVAL < MID_BUILD_PRODUCTS
-            && MID_BUILD_PRODUCTS < 2 * MEMORY_CHECK_INTERVAL,
-        "the build checks the limit once, mid-build"
-    );
     assert!(
         matches!(
             compiled_combine_strategy(INLINE_RECLAIM_YAML, "enriched"),
