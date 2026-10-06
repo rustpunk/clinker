@@ -145,6 +145,8 @@ memory pressure, instead of being checked only against the process's
 resident memory. A Route or Cull that feeds a deferred step no longer stops
 the run with an E310 naming its process memory.
 
+Closes [#1263](https://github.com/rustpunk/clinker/issues/1263).
+
 ### Changed — null_order: drop is accepted only on a Sink sort_order
 
 `null_order: drop` excludes records whose key is null, which only a Sink's

@@ -145,7 +145,7 @@ footer{padding:36px 6vw;color:var(--dim);font-size:12px}
     </div>
     <div class="rt-panel">
       <h3>The deferred region</h3>
-      <p class="rt-aside">From each relaxed Aggregate (the <b>producer</b>) the planner walks downstream; every node reached is a region <b>member</b> until a Sink, which becomes a region output. On the forward pass the producer runs, keeps its aggregator state for retraction, and parks its output; members and outputs do not run at all. Sinks outside a region write into correlation buffer cells keyed by the row's <code>$ck.*</code> values, and per-record failures are held in those cells. Everything is decided at commit.</p>
+      <p class="rt-aside">From each relaxed Aggregate (the <b>producer</b>) the planner walks downstream; every node reached is a region <b>member</b> until a Sink, which becomes a region output. On the forward pass the producer runs, keeps its aggregator state for retraction, and parks its output; members and outputs do not run at all. Sinks outside a region write into correlation buffer cells keyed by the row's <code>$ck.*</code> values, and per-record failures are held in those cells. Rows a member reads from outside the region (another input of a Combine, a Route branch, a Cull port, a composition body's input) are parked once on the forward pass, charged against the memory limit and spillable, and every iteration of the loop reads them again in arrival order. Everything is decided at commit.</p>
     </div>
   </div>
 </section>
@@ -184,7 +184,6 @@ footer{padding:36px 6vw;color:var(--dim);font-size:12px}
     <div class="rt-card"><h4>Windows before the Aggregate</h4><p>Windows after the Aggregate are rebuilt from the re-emitted rows on every iteration. Windows before it are never re-evaluated, yet the planner's buffer-mode mark (which <code>--explain</code> counts) lifts the E150 check for them (<a data-rt-issue="windows" href="https://github.com/rustpunk/clinker/issues/1376">#1376</a>).</p></div>
     <div class="rt-card"><h4><code>correlation_fanout_policy</code></h4><p><code>all</code> and <code>primary</code> are accepted on a Sink or the pipeline but behave like <code>any</code>: the one place collateral sparing is decided passes "full match" and "primary match" as always true, and the Combine-level field is never read (<a data-rt-issue="fanout" href="https://github.com/rustpunk/clinker/issues/1375">#1375</a>).</p></div>
     <div class="rt-card"><h4>The iteration cap</h4><p>The loop is bounded by plan nodes (composition-body nodes included) + source rows + 1 iterations, since each pass must add at least one source row. Reaching the cap is a <code>panic!</code>, not a typed error (<a data-rt-issue="cap" href="https://github.com/rustpunk/clinker/issues/1378">#1378</a>).</p></div>
-    <div class="rt-card"><h4>Cross-region inputs</h4><p>Rows entering a region from outside it are parked once and removed when first replayed, so a later iteration could miss them; this is tracked, with a fix pending (<a data-rt-issue="crossing" href="https://github.com/rustpunk/clinker/issues/1263">#1263</a>).</p></div>
   </div>
 </section>
 
