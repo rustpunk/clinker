@@ -86,6 +86,7 @@ use indexmap::IndexMap;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use crate::executor::combine::{CombineResolver, CombineResolverMapping};
+use crate::executor::node_buffer::TransientNodeBufferReservation;
 use crate::executor::widen_record_to_schema;
 use crate::pipeline::combine::{
     CombineOutputEvalFailure, KeyExtractor, MatchedBuildFailure, canonical_key_bytes,
@@ -583,6 +584,13 @@ pub(crate) struct IEJoinExec<'a> {
     /// under `Continue` the failing row is deferred to the dispatcher via
     /// [`BlockBandOutput::output_eval_failures`].
     pub strategy: clinker_plan::config::ErrorStrategy,
+    /// The charge the driver input's rows carried into the join, `None` when
+    /// they arrived uncharged. The kernel owns it and ends it once its drain
+    /// has moved every driver row into a charged buffer, onto disk, or out.
+    pub driver_input_charge: Option<TransientNodeBufferReservation>,
+    /// The charge the build input's rows carried into the join, `None` when
+    /// they arrived uncharged; ended once the build drain has consumed them.
+    pub build_input_charge: Option<TransientNodeBufferReservation>,
 }
 
 /// Runs on the calling thread, so its budget checks and spills run there;
@@ -612,6 +620,8 @@ pub(crate) fn execute_combine_iejoin(
         spill_dir,
         spill_compress,
         strategy,
+        driver_input_charge,
+        build_input_charge,
     } = args;
     if decomposed.ranges.is_empty() {
         return Err(PipelineError::Internal {
@@ -845,6 +855,8 @@ pub(crate) fn execute_combine_iejoin(
             spill_compress,
             strategy,
             options: block::BlockBandOptions::default(),
+            driver_input_charge,
+            build_input_charge,
         },
         pool,
     )

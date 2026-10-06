@@ -45,62 +45,9 @@ use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface};
 /// and aligns with DataFusion's collect-list bound.
 const COLLECT_PER_GROUP_CAP: usize = 10_000;
 
-/// Keep source materialization charged through a kernel that consumes its
-/// owned inputs. Its returned output has a separate drain owner; freed input
-/// vectors must not remain reported throughout that later drain.
-fn consume_materialized_inputs<T>(
-    reservations: [Option<crate::executor::node_buffer::TransientNodeBufferReservation>; 2],
-    kernel: impl FnOnce() -> Result<T, PipelineError>,
-) -> Result<T, PipelineError> {
-    let result = kernel();
-    drop(reservations);
-    result
-}
-
 #[cfg(test)]
 mod output_ownership_tests {
     use clinker_record::owned_storage::SharedStorage;
-    #[test]
-    fn input_materialization_charge_ends_after_consuming_kernel() {
-        use crate::executor::node_buffer::reserve_node_buffer_materialization;
-        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
-        let budget = std::sync::Arc::new(MemoryArbitrator::with_policy(
-            4096,
-            0.8,
-            0.7,
-            Box::new(NoOpPolicy),
-        ));
-        let first = reserve_node_buffer_materialization(100, &budget, "join").unwrap();
-        let second = reserve_node_buffer_materialization(200, &budget, "join").unwrap();
-        let result = super::consume_materialized_inputs([Some(first), Some(second)], || {
-            assert_eq!(
-                budget.sum_consumer_usage(),
-                300,
-                "inputs remain charged throughout kernel execution"
-            );
-            Ok(17)
-        })
-        .unwrap();
-        assert_eq!(result, 17);
-        assert_eq!(
-            budget.sum_consumer_usage(),
-            0,
-            "input storage is gone before output drain"
-        );
-        assert_eq!(budget.consumer_count(), 0);
-        let input = reserve_node_buffer_materialization(100, &budget, "join").unwrap();
-        let failed: Result<(), _> = super::consume_materialized_inputs([Some(input), None], || {
-            assert_eq!(budget.sum_consumer_usage(), 100);
-            Err(clinker_plan::error::PipelineError::Interrupted)
-        });
-        assert!(failed.is_err());
-        assert_eq!(
-            budget.consumer_count(),
-            0,
-            "kernel errors release input guards too"
-        );
-    }
-
     #[test]
     fn output_drain_excludes_only_local_grants_and_retains_vector_capacity() {
         use clinker_format::preparation::MemoryOnlyResources;
@@ -737,42 +684,42 @@ where
                 // its key scan and comparator sorts go to the run's kernel
                 // pool. Row order is the deterministic `(driver order,
                 // driver_idx, build_idx)` the output sort returns, not pool
-                // scheduling.
-                let kernel = consume_materialized_inputs(
-                    [driver_clone_reservation, build_clone_reservation],
-                    || {
-                        let kernel = execute_combine_iejoin(
-                            IEJoinExec {
-                                allocation_resources: &ctx.allocation_resources,
-                                name,
-                                build_qualifier: &build_qualifier,
-                                driver_records: driver_buf,
-                                build_records: build_buf,
-                                decomposed,
-                                body_program: body_typed,
-                                resolver_mapping: &resolver_mapping,
-                                output_schema: combine_output_schema_arc.as_ref(),
-                                match_mode: *match_mode,
-                                on_miss: *on_miss,
-                                max_output_rows,
-                                propagate_ck,
-                                ctx: &iejoin_ctx,
-                                budget: &ctx.memory_budget,
-                                consumer: &ie_consumer_handle,
-                                spill_dir: ctx.spill_root_path.as_ref(),
-                                spill_compress: ie_spill_compress,
-                                strategy: ctx.strategy,
-                            },
-                            &ctx.kernel_pool,
-                        )?;
-                        let prior = crate::executor::batch_handoff::StreamingReservation::retain(
-                            ie_consumer_handle.clone(),
-                            sorted_output_retained_bytes(&kernel.sorted, &ctx.allocation_resources)
-                                as u64,
-                        );
-                        Ok(OwnedKernelOutput { kernel, prior })
-                    },
-                )?;
+                // scheduling. The kernel owns both inputs' charges and ends
+                // each once its drain has consumed the side.
+                let kernel = {
+                    let kernel = execute_combine_iejoin(
+                        IEJoinExec {
+                            allocation_resources: &ctx.allocation_resources,
+                            name,
+                            build_qualifier: &build_qualifier,
+                            driver_records: driver_buf,
+                            build_records: build_buf,
+                            decomposed,
+                            body_program: body_typed,
+                            resolver_mapping: &resolver_mapping,
+                            output_schema: combine_output_schema_arc.as_ref(),
+                            match_mode: *match_mode,
+                            on_miss: *on_miss,
+                            max_output_rows,
+                            propagate_ck,
+                            ctx: &iejoin_ctx,
+                            budget: &ctx.memory_budget,
+                            consumer: &ie_consumer_handle,
+                            spill_dir: ctx.spill_root_path.as_ref(),
+                            spill_compress: ie_spill_compress,
+                            strategy: ctx.strategy,
+                            driver_input_charge: driver_clone_reservation,
+                            build_input_charge: build_clone_reservation,
+                        },
+                        &ctx.kernel_pool,
+                    )?;
+                    let prior = crate::executor::batch_handoff::StreamingReservation::retain(
+                        ie_consumer_handle.clone(),
+                        sorted_output_retained_bytes(&kernel.sorted, &ctx.allocation_resources)
+                            as u64,
+                    );
+                    OwnedKernelOutput { kernel, prior }
+                };
                 // Route each deferred output-stage eval failure through the same
                 // `combine_output_row` path the inline arm uses. This MUST run
                 // before the snapshot is dropped below —
