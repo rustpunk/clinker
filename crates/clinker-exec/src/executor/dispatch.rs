@@ -2431,8 +2431,9 @@ impl<'a> ExecutorContext<'a> {
     /// charged total — memory that has already moved downstream keeps
     /// influencing spill victim selection and abort checks. Call only after
     /// `recv` reports disconnect: the producer has dropped its sender by
-    /// then, so zeroing cannot race a concurrent charge. The `remove` makes
-    /// the release single-shot; a repeat call for the same source is a
+    /// then, and released everything else it held in the Source's name
+    /// before it, so zeroing cannot race a concurrent charge. The `remove`
+    /// makes the release single-shot; a repeat call for the same source is a
     /// no-op.
     pub(crate) fn release_source_consumer(&mut self, source_name: &str) {
         if let Some((id, handle)) = self.source_consumers.remove(source_name) {

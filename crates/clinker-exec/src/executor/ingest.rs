@@ -748,11 +748,15 @@ fn ingest_source_body_inner(
 /// tail columns, emitting document-boundary punctuation, observing
 /// event-time watermarks, and pushing into `stream`. Shared by both the
 /// file and non-file ingest arms — see [`ingest_source`].
+///
+/// `stream` is dropped last, on every return: the reader and everything else
+/// this body holds in the Source's name are released before its sender, so a
+/// walk that sees the channel disconnect sees the Source's charge settled.
 fn drive_record_source(
     src_cfg: clinker_plan::config::SourceConfig,
     physical_columns: &[Column],
     src_reader: Box<dyn crate::source::RecordSource>,
-    stream: crate::executor::source_stream::SourceIngestChannel,
+    mut stream: crate::executor::source_stream::SourceIngestChannel,
     shutdown_token: Option<crate::pipeline::shutdown::ShutdownToken>,
     source_runtime: SourceRuntimePolicy,
     outcome: &mut IngestTaskOutcome,
@@ -863,7 +867,6 @@ fn drive_record_source(
         };
 
         let preserve_empty_physical_files = stream.has_order_barrier();
-        let mut stream = stream;
         let mut read_attempts: u64 = 0;
         // First successfully decoded body record for the current physical
         // file, kept together with the exact identity minted for it. A
@@ -1536,9 +1539,9 @@ fn drive_record_source(
         // On interruption the still-open ordered barrier is deliberately not
         // closed: dropping `stream` aborts it, removes partial spill files,
         // and balances its arbitrator charges without releasing partial data.
-        // Drop the sender so the dispatch-side `recv` returns `Err`
-        // (channel disconnected) once the channel drains.
-        drop(stream);
+        // `stream` drops on return, after this block's locals: then the
+        // dispatch-side `recv` returns `Err` (channel disconnected) once the
+        // channel drains.
         Ok(())
     }
 }
