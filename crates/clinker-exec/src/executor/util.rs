@@ -393,6 +393,10 @@ pub(crate) fn build_arbitrator_from_config(
     if overrides.reads_no_process_memory() {
         arbitrator.read_no_process_memory();
     }
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(record) = overrides.hard_limit_reclaims() {
+        arbitrator.record_hard_limit_reclaims(record.clone());
+    }
     Ok(arbitrator)
 }
 

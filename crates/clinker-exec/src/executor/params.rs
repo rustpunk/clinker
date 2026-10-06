@@ -167,6 +167,8 @@ pub struct MemoryTestOverrides {
     forced_shortfall: Option<ForcedShortfall>,
     #[cfg(any(test, feature = "test-utils"))]
     no_process_memory: bool,
+    #[cfg(any(test, feature = "test-utils"))]
+    hard_limit_reclaims: Option<HardLimitReclaims>,
 }
 
 impl MemoryTestOverrides {
@@ -180,6 +182,8 @@ impl MemoryTestOverrides {
             forced_shortfall: None,
             #[cfg(any(test, feature = "test-utils"))]
             no_process_memory: false,
+            #[cfg(any(test, feature = "test-utils"))]
+            hard_limit_reclaims: None,
         }
     }
 
@@ -279,6 +283,52 @@ impl MemoryTestOverrides {
     /// Whether the run reads no process memory.
     pub(crate) fn reads_no_process_memory(&self) -> bool {
         self.no_process_memory
+    }
+
+    /// Record in `record` every hard-limit check of the run that runs a
+    /// reclaim round. For an in-process test that must tell which of several
+    /// checks on one node and surface made room, which the spill figures
+    /// and the charged peaks cannot: the same victims spill whichever check
+    /// asks.
+    pub fn with_hard_limit_reclaims(mut self, record: HardLimitReclaims) -> Self {
+        self.hard_limit_reclaims = Some(record);
+        self
+    }
+
+    /// The record to keep the run's reclaiming hard-limit checks in, if any.
+    pub(crate) fn hard_limit_reclaims(&self) -> Option<&HardLimitReclaims> {
+        self.hard_limit_reclaims.as_ref()
+    }
+}
+
+/// The hard-limit checks of a run that ran a reclaim round, in the order
+/// they ran. Every clone shares the one record, so a test keeps a clone
+/// before handing the value to a run through
+/// [`MemoryTestOverrides::with_hard_limit_reclaims`]. It grows by one entry
+/// per reclaiming check and is for in-process tests only.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone, Debug, Default)]
+pub struct HardLimitReclaims(std::sync::Arc<std::sync::Mutex<Vec<HardLimitReclaim>>>);
+
+/// One hard-limit check that ran a reclaim round: the node and surface it
+/// named and the bytes it counted as not yet charged.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HardLimitReclaim {
+    pub node: String,
+    pub surface: clinker_plan::runtime_error::MemorySurface,
+    pub uncharged: u64,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl HardLimitReclaims {
+    /// The checks recorded so far, in the order they ran.
+    pub fn checks(&self) -> Vec<HardLimitReclaim> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub(crate) fn record(&self, check: HardLimitReclaim) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).push(check);
     }
 }
 

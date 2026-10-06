@@ -817,8 +817,12 @@ const RECLAIM_EVENTS: usize = 1_000;
 
 /// Run the fixture held to `capacity` bytes of ledger (ample when `None`),
 /// reading no process memory so only the charged total can trip a limit;
-/// return its report and every Output's bytes.
-fn inline_reclaim_run(capacity: Option<u64>) -> Result<(ExecutionReport, String), PipelineError> {
+/// return its report and every Output's bytes. Every hard-limit check that
+/// runs a reclaim round is recorded in `reclaims`.
+fn inline_reclaim_run(
+    capacity: Option<u64>,
+    reclaims: &crate::executor::HardLimitReclaims,
+) -> Result<(ExecutionReport, String), PipelineError> {
     let config = clinker_plan::config::parse_config(INLINE_RECLAIM_YAML).expect("parse");
     let plan = config
         .compile(&clinker_plan::config::CompileContext::default())
@@ -869,7 +873,8 @@ fn inline_reclaim_run(capacity: Option<u64>) -> Result<(ExecutionReport, String)
         Some(bytes) => crate::executor::MemoryTestOverrides::default().with_ledger_capacity(bytes),
         None => crate::executor::MemoryTestOverrides::default(),
     }
-    .with_no_process_memory();
+    .with_no_process_memory()
+    .with_hard_limit_reclaims(reclaims.clone());
     let params = PipelineRunParams {
         execution_id: "inline-build-reclaim".to_string(),
         batch_id: "batch-0".to_string(),
@@ -893,7 +898,9 @@ fn inline_reclaim_run(capacity: Option<u64>) -> Result<(ExecutionReport, String)
 /// one where only the arm's check, which also counts the build rows'
 /// identities, does. Without that reclaim the low runs stop with E310 for
 /// the join's build side, or hold the table beside `widened` past their
-/// capacity.
+/// capacity. Each low run's record of reclaiming checks names the check
+/// that made room by the bytes it counted: the build's final check counts
+/// the table without the identities, the arm's check with them.
 #[test]
 fn an_inline_join_build_over_the_limit_spills_other_state_and_completes() {
     assert!(
@@ -903,7 +910,14 @@ fn an_inline_join_build_over_the_limit_spills_other_state_and_completes() {
         ),
         "the pure-equi join must run the inline HashBuildProbe branch"
     );
-    let (ample, ample_output) = inline_reclaim_run(None).expect("the ample run completes");
+    let ample_reclaims = crate::executor::HardLimitReclaims::default();
+    let (ample, ample_output) =
+        inline_reclaim_run(None, &ample_reclaims).expect("the ample run completes");
+    assert!(
+        ample_reclaims.checks().is_empty(),
+        "ample memory runs no reclaim round at a hard-limit check: {:?}",
+        ample_reclaims.checks()
+    );
     assert!(
         ample.per_stage_spill_bytes_written.is_empty(),
         "ample memory spills nothing: {:?}",
@@ -953,13 +967,23 @@ fn an_inline_join_build_over_the_limit_spills_other_state_and_completes() {
 
     let final_band = fits_without_widened + (final_check_trips - fits_without_widened) / 2;
     let arm_band = final_check_trips + (beside_widened - final_check_trips) / 2;
-    for capacity in [final_band, arm_band] {
+    // What each check counts as not yet charged: the table less its build
+    // input's charge (the build rows' slots, `products`' figure), which the
+    // table takes over. The build's final check counts the table without its
+    // build rows' identities; the arm's check counts them too.
+    let final_check_uncharged = table - identities - products;
+    let arm_check_uncharged = table - products;
+    for (capacity, reclaiming_check, other_check) in [
+        (final_band, final_check_uncharged, arm_check_uncharged),
+        (arm_band, arm_check_uncharged, final_check_uncharged),
+    ] {
         assert!(
             capacity < ample.peak_consumer_usage_bytes,
             "the capacity {capacity} must sit below the ample charged peak {}",
             ample.peak_consumer_usage_bytes
         );
-        let (low, low_output) = inline_reclaim_run(Some(capacity)).unwrap_or_else(|e| {
+        let reclaims = crate::executor::HardLimitReclaims::default();
+        let (low, low_output) = inline_reclaim_run(Some(capacity), &reclaims).unwrap_or_else(|e| {
             panic!(
                 "at {capacity} the join's check makes room by spilling other state and the \
                  run completes: {e}"
@@ -995,6 +1019,25 @@ fn an_inline_join_build_over_the_limit_spills_other_state_and_completes() {
             low_output == ample_output,
             "at {capacity} spilling another node's rows to make room must not change any \
              Output's bytes"
+        );
+        let join_reclaims: Vec<u64> = reclaims
+            .checks()
+            .into_iter()
+            .filter(|check| check.node == "enriched")
+            .map(|check| {
+                assert_eq!(
+                    check.surface,
+                    clinker_plan::runtime_error::MemorySurface::JoinBuildSide,
+                    "at {capacity} the join reclaims for its build side"
+                );
+                check.uncharged
+            })
+            .collect();
+        assert_eq!(
+            join_reclaims,
+            vec![reclaiming_check],
+            "at {capacity} exactly one of the join's checks makes room, the one counting \
+             {reclaiming_check} bytes not yet charged; the other ({other_check}) finds room"
         );
     }
 }

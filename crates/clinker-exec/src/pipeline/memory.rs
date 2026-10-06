@@ -1443,6 +1443,11 @@ pub struct MemoryArbitrator {
     /// [`crate::executor::MemoryTestOverrides::with_no_process_memory`].
     #[cfg(any(test, feature = "test-utils"))]
     process_memory_unread: std::sync::atomic::AtomicBool,
+    /// Where [`Self::check_hard_limit`] records each check that runs a
+    /// reclaim round, when a test asked for it. Set once, before the run, by
+    /// [`crate::executor::MemoryTestOverrides::with_hard_limit_reclaims`].
+    #[cfg(any(test, feature = "test-utils"))]
+    hard_limit_reclaims: Mutex<Option<crate::executor::HardLimitReclaims>>,
 }
 
 /// [`MemoryArbitrator::walk_requester`]'s "no consumer" value.
@@ -1508,6 +1513,8 @@ impl MemoryArbitrator {
             reclaim_failure: Mutex::new(None),
             #[cfg(any(test, feature = "test-utils"))]
             process_memory_unread: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-utils"))]
+            hard_limit_reclaims: Mutex::new(None),
         }
     }
 
@@ -1555,6 +1562,38 @@ impl MemoryArbitrator {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn read_no_process_memory(&self) {
         self.process_memory_unread.store(true, Ordering::Relaxed);
+    }
+
+    /// Record in `record`, for the rest of this run, every hard-limit check
+    /// that runs a reclaim round.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn record_hard_limit_reclaims(&self, record: crate::executor::HardLimitReclaims) {
+        *self
+            .hard_limit_reclaims
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(record);
+    }
+
+    /// Note that the hard-limit check naming `node` and `surface` with
+    /// `uncharged` bytes ran a reclaim round, if a test asked for the record.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn note_hard_limit_reclaim(
+        &self,
+        node: &str,
+        surface: &clinker_plan::runtime_error::MemorySurface,
+        uncharged: u64,
+    ) {
+        let record = self
+            .hard_limit_reclaims
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(record) = record.as_ref() {
+            record.record(crate::executor::HardLimitReclaim {
+                node: node.to_string(),
+                surface: surface.clone(),
+                uncharged,
+            });
+        }
     }
 
     /// True when EITHER current RSS or the pull-mode charged-byte sum

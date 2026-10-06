@@ -915,10 +915,17 @@ impl MemoryArbitrator {
     ) -> Result<(), Box<MemoryShortfallReport>> {
         self.observe();
         let limit = self.hard_limit();
-        if self.charged_bytes().saturating_add(uncharged) > limit
-            && let Err(shortfall) = self.reclaim_before_abort(requester, uncharged)
-        {
-            return Err(self.backstop_shortfall_report(shortfall, node, surface));
+        if self.charged_bytes().saturating_add(uncharged) > limit {
+            #[cfg(any(test, feature = "test-utils"))]
+            let rounds_before = self.reclaim_rounds();
+            let reclaimed = self.reclaim_before_abort(requester, uncharged);
+            #[cfg(any(test, feature = "test-utils"))]
+            if self.reclaim_rounds() > rounds_before {
+                self.note_hard_limit_reclaim(node, &surface, uncharged);
+            }
+            if let Err(shortfall) = reclaimed {
+                return Err(self.backstop_shortfall_report(shortfall, node, surface));
+            }
         }
         match self.peak_rss().filter(|peak| *peak > limit) {
             Some(peak) => Err(self.process_memory_report(
