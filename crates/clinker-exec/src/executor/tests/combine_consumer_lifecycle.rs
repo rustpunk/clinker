@@ -668,7 +668,10 @@ nodes:
 /// and only `tagged`, which reads `enriched`'s output, reads `widened`. So
 /// `widened`'s rows stay resident and spillable across `enriched`'s build.
 /// `enriched` also feeds `enriched_out`, so it is not `tagged`'s streaming
-/// driver and runs, whole, before `tagged`.
+/// driver and runs, whole, before `tagged`. `enriched` joins on three
+/// columns: each key column adds a value slot per build row to the table
+/// beyond the rows its build input already charges, so what the table adds
+/// at its checks outgrows the room the soft threshold leaves.
 const INLINE_RECLAIM_YAML: &str = r#"
 pipeline:
   name: inline_build_reclaim
@@ -683,6 +686,8 @@ nodes:
     schema:
       - { name: order_id, type: string }
       - { name: product_id, type: string }
+      - { name: k2, type: string }
+      - { name: k3, type: string }
 - type: source
   name: products
   config:
@@ -692,6 +697,8 @@ nodes:
     schema:
       - { name: product_id, type: string }
       - { name: name, type: string }
+      - { name: k2, type: string }
+      - { name: k3, type: string }
 - type: source
   name: events
   config:
@@ -714,7 +721,7 @@ nodes:
     orders: orders
     products: products
   config:
-    where: "orders.product_id == products.product_id"
+    where: "orders.product_id == products.product_id and orders.k2 == products.k2 and orders.k3 == products.k3"
     drive: orders
     match: first
     on_miss: null_fields
@@ -796,20 +803,17 @@ impl std::io::Read for GeneratedCsv {
     }
 }
 
-/// Driver rows: at least the probe loop's 10,000-row check cadence, so a run
-/// the build left past its limit meets the probe loop's check.
-const RECLAIM_ORDERS: usize = 12_000;
-/// Build rows; short text, so each row's charge is its fixed slot cost.
+/// Driver rows: few, so the rows the run holds at the first join's build
+/// stay under the soft threshold and the driver stays resident.
+const RECLAIM_ORDERS: usize = 300;
+/// Build rows; short text, so each row's charge is its fixed slot cost and
+/// what the table adds is its index and key slots. Under the in-build
+/// check's cadence, so the build's checks are its final one and the arm's.
 const RECLAIM_PRODUCTS: usize = 6_000;
-/// Rows of the third branch, buffered in `widened` across the first join.
-const RECLAIM_EVENTS: usize = 6_000;
-
-/// The ledger capacity the low run is held to. The first join's finished
-/// table does not fit beside the orders, products and `widened` rows the
-/// run holds at its build (8.6 MB with the table), so it fits only by
-/// spilling `widened`; once that join's state is released the second join
-/// fits (7.0 MB at its peak). Below the ample run's charged peak, 10.8 MB.
-const RECLAIM_CAPACITY: u64 = 8_400_000;
+/// Rows of the third branch, buffered in `widened` across the first join:
+/// more than the build rows' identities the arm's check adds to the build's
+/// final check, so a capacity lies between the two checks' limits.
+const RECLAIM_EVENTS: usize = 1_000;
 
 /// Run the fixture held to `capacity` bytes of ledger (ample when `None`),
 /// reading no process memory so only the charged total can trip a limit;
@@ -824,8 +828,9 @@ fn inline_reclaim_run(capacity: Option<u64>) -> Result<(ExecutionReport, String)
             "orders".to_string(),
             crate::executor::single_file_reader(
                 "orders.csv",
-                GeneratedCsv::reader("order_id,product_id\n", RECLAIM_ORDERS, |i| {
-                    format!("o{i},p{}\n", i % RECLAIM_PRODUCTS)
+                GeneratedCsv::reader("order_id,product_id,k2,k3\n", RECLAIM_ORDERS, |i| {
+                    let p = i % RECLAIM_PRODUCTS;
+                    format!("o{i},p{p},a{p},b{p}\n")
                 }),
             ),
         ),
@@ -833,8 +838,8 @@ fn inline_reclaim_run(capacity: Option<u64>) -> Result<(ExecutionReport, String)
             "products".to_string(),
             crate::executor::single_file_reader(
                 "products.csv",
-                GeneratedCsv::reader("product_id,name\n", RECLAIM_PRODUCTS, |i| {
-                    format!("p{i},n{i}\n")
+                GeneratedCsv::reader("product_id,name,k2,k3\n", RECLAIM_PRODUCTS, |i| {
+                    format!("p{i},n{i},a{i},b{i}\n")
                 }),
             ),
         ),
@@ -883,9 +888,12 @@ fn inline_reclaim_run(capacity: Option<u64>) -> Result<(ExecutionReport, String)
 
 /// The first join's finished table does not fit beside what the run holds,
 /// while `widened`'s rows are resident and spillable: the join's hard-limit
-/// check spills them on the walk and the run completes with the ample run's
-/// output. Without that reclaim the run stops with E310 at the join's probe
-/// loop, past its limit, `reclaim: none attempted`.
+/// checks spill them on the walk and the run completes with the ample run's
+/// output. One run sits where the build's final check needs that room and
+/// one where only the arm's check, which also counts the build rows'
+/// identities, does. Without that reclaim the low runs stop with E310 for
+/// the join's build side, or hold the table beside `widened` past their
+/// capacity.
 #[test]
 fn an_inline_join_build_over_the_limit_spills_other_state_and_completes() {
     assert!(
@@ -901,14 +909,10 @@ fn an_inline_join_build_over_the_limit_spills_other_state_and_completes() {
         "ample memory spills nothing: {:?}",
         ample.per_stage_spill_bytes_written
     );
-    assert!(
-        RECLAIM_CAPACITY < ample.peak_consumer_usage_bytes,
-        "the capacity {RECLAIM_CAPACITY} must sit below the ample charged peak {}",
-        ample.peak_consumer_usage_bytes
-    );
-    // The window the capacity must sit in, from the ample run's figures:
-    // what the run holds once the first join's table is charged does not
-    // fit, and fits once `widened`'s rows are gone.
+    // The capacities, from the ample run's figures. The first join's table
+    // takes over its build input's charge, so at its checks the run holds
+    // the driver, the build input and `widened`'s rows, and the table
+    // counts what it adds beyond its input.
     let peak = |node: &str| {
         ample
             .per_node_peak_charged_bytes
@@ -916,43 +920,83 @@ fn an_inline_join_build_over_the_limit_spills_other_state_and_completes() {
             .copied()
             .unwrap_or_else(|| panic!("the ample run charges {node}"))
     };
-    let at_build = peak("orders") + peak("products") + peak("widened") + peak("enriched");
-    assert!(
-        RECLAIM_CAPACITY < at_build,
-        "the capacity {RECLAIM_CAPACITY} must not hold the first join's table beside \
-         everything else the run holds ({at_build})"
+    let (orders, products, widened, table) = (
+        peak("orders"),
+        peak("products"),
+        peak("widened"),
+        peak("enriched"),
     );
+    let identities = (std::mem::size_of::<crate::executor::stream_event::SourceRowId>()
+        * RECLAIM_PRODUCTS) as u64;
+    // The table fits once `widened`'s rows are gone.
+    let fits_without_widened = orders + table;
+    // Below this the build's final check, which counts the table without
+    // its build rows' identities, needs room.
+    let final_check_trips = orders + widened + table - identities;
+    // Below this the arm's check, which counts the whole table, needs room:
+    // what the run holds once the table is charged beside `widened`.
+    let beside_widened = orders + widened + table;
     assert!(
-        RECLAIM_CAPACITY >= at_build - peak("widened"),
-        "the capacity {RECLAIM_CAPACITY} must hold the first join's table once `widened`'s \
-         rows are spilled ({})",
-        at_build - peak("widened")
+        fits_without_widened < final_check_trips && final_check_trips < beside_widened,
+        "the window must hold a band for each check: {fits_without_widened} < \
+         {final_check_trips} < {beside_widened}"
+    );
+    // The soft threshold, 80% of the capacity, lies above the inputs the
+    // run holds at the build at every capacity in the window, so the driver
+    // and the build input stay resident at their admissions.
+    assert!(
+        (orders + products + widened) * 5 <= fits_without_widened * 4,
+        "the inputs ({}) must stay under the soft threshold of the window's \
+         lowest capacity ({fits_without_widened})",
+        orders + products + widened
     );
 
-    let (low, low_output) = inline_reclaim_run(Some(RECLAIM_CAPACITY))
-        .expect("the join's check makes room by spilling other state and the run completes");
-    assert!(
-        low.per_stage_spill_bytes_written
-            .get("widened")
-            .is_some_and(|&bytes| bytes > 0),
-        "`widened`'s resident rows must be spilled to make room: {:?}",
-        low.per_stage_spill_bytes_written
-    );
-    assert!(
-        !low.per_stage_spill_bytes_written.contains_key("orders"),
-        "room is made from `widened`, not by spilling the join's driver rows earlier: {:?}",
-        low.per_stage_spill_bytes_written
-    );
-    assert!(
-        low.peak_consumer_usage_bytes < at_build,
-        "`widened`'s rows were spilled before the table was charged beside them: peak {} \
-         against {at_build}",
-        low.peak_consumer_usage_bytes
-    );
-    assert!(
-        low_output == ample_output,
-        "spilling another node's rows to make room must not change any Output's bytes"
-    );
+    let final_band = fits_without_widened + (final_check_trips - fits_without_widened) / 2;
+    let arm_band = final_check_trips + (beside_widened - final_check_trips) / 2;
+    for capacity in [final_band, arm_band] {
+        assert!(
+            capacity < ample.peak_consumer_usage_bytes,
+            "the capacity {capacity} must sit below the ample charged peak {}",
+            ample.peak_consumer_usage_bytes
+        );
+        let (low, low_output) = inline_reclaim_run(Some(capacity)).unwrap_or_else(|e| {
+            panic!(
+                "at {capacity} the join's check makes room by spilling other state and the \
+                 run completes: {e}"
+            )
+        });
+        assert!(
+            low.per_stage_spill_bytes_written
+                .get("widened")
+                .is_some_and(|&bytes| bytes > 0),
+            "at {capacity} `widened`'s resident rows must be spilled to make room: {:?}",
+            low.per_stage_spill_bytes_written
+        );
+        for input in ["orders", "products"] {
+            assert!(
+                !low.per_stage_spill_bytes_written.contains_key(input),
+                "at {capacity} room is made from `widened`, not by spilling the join's \
+                 input `{input}`: {:?}",
+                low.per_stage_spill_bytes_written
+            );
+        }
+        assert!(
+            low.peak_consumer_usage_bytes <= capacity,
+            "at {capacity} the run's charged peak {} stays within its capacity",
+            low.peak_consumer_usage_bytes
+        );
+        assert!(
+            low.peak_consumer_usage_bytes < beside_widened,
+            "at {capacity} `widened`'s rows were spilled before the table was charged beside \
+             them: peak {} against {beside_widened}",
+            low.peak_consumer_usage_bytes
+        );
+        assert!(
+            low_output == ample_output,
+            "at {capacity} spilling another node's rows to make room must not change any \
+             Output's bytes"
+        );
+    }
 }
 
 /// A two-Source inline join and nothing else: no state any reclaim pass
