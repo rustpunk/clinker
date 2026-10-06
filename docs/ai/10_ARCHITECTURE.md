@@ -284,7 +284,7 @@ Verified facts:
 - CPU-heavy kernels such as sort, grace-hash, IEJoin, and sort-merge run under one run-scoped Rayon `ThreadPool`, sized by `pipeline.concurrency.threads` when configured.
 - Streaming output and some streaming producer/consumer paths use bounded crossbeam channels plus `std::thread::JoinHandle`s.
 - Shutdown uses per-run `ShutdownToken` values backed by `Arc<AtomicBool>`. A process-wide `ctrlc` handler broadcasts to registered live tokens through a `Weak` registry.
-- Memory arbitration is concurrent but centralized. Registered consumers expose usage/pause/spill hooks; operators poll `should_spill` / `should_abort` at chunk boundaries, and the resume controller un-pauses paused producers once usage falls back below the configured `resume_threshold` fraction of the budget.
+- Memory arbitration is concurrent but centralized. Registered consumers expose usage/pause/spill hooks; operators poll `should_spill` at chunk boundaries, every hard-limit backstop goes through the one check `MemoryArbitrator::check_hard_limit` (which reclaims on the walk before it refuses), and the resume controller un-pauses paused producers once usage falls back below the configured `resume_threshold` fraction of the budget.
 
 Current guidance:
 

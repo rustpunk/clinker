@@ -16,9 +16,12 @@
 //!
 //! `MemoryArbitrator` is the single seat that governs every spill / abort
 //! decision in the executor. Each spill-capable operator (Aggregate, sort,
-//! grace-hash, sort-merge join, IEJoin, inter-stage `node_buffers`) polls
-//! the same arbitrator instance and trusts its `should_spill` /
-//! `should_abort` answer. The trait surface (`MemoryConsumer`,
+//! grace-hash, sort-merge join, IEJoin, inter-stage `node_buffers`) charges
+//! the same arbitrator instance, spills when it asks (a reclaim pass on the
+//! walk, a spill request, or the `should_spill` soft-threshold poll), and is
+//! refused only by it: a shortfall from a reservation or a handle's growth,
+//! or the one hard-limit backstop, `check_hard_limit`, which reclaims on the
+//! walk before it refuses. The trait surface (`MemoryConsumer`,
 //! `ArbitrationPolicy`) lets policies pick a victim across operators
 //! instead of reacting independently. Production paths install a policy
 //! chosen by the pipeline-level `memory.backpressure` knob:
@@ -887,9 +890,11 @@ impl ConsumerHandle {
 /// it spills walk-owned victims now; with no walk frame it raises their
 /// spill requests. Refuse growth only
 /// through the arbitrator: a shortfall from [`MemoryArbitrator::reserve`],
-/// `try_grow` or `try_resize`, or the remaining limit checks
-/// (`should_abort`, `should_abort_local`) for bytes not yet charged, never
-/// on its own RSS reading or a limit of its own. A growth charged on the
+/// `try_grow` or `try_resize`, or, for a hard-limit backstop, the one check
+/// [`MemoryArbitrator::check_hard_limit`] given the bytes the site is about
+/// to hold that no consumer has charged yet. Never pair `should_abort` or
+/// `should_abort_local` with a refusal of the consumer's own, and never
+/// refuse on its own RSS reading or a limit of its own. A growth charged on the
 /// walk through `reserve`, `try_grow` or `try_resize` runs a reclaim pass
 /// before it is refused: the walk spills the state the pass elects, the
 /// requesting consumer last, and retries, and a refusal comes only after a
@@ -1337,8 +1342,10 @@ pub fn build_policy(knob: clinker_plan::config::BackpressureKnob) -> Box<dyn Arb
 /// `should_spill` is the single polling entry used by every spill-
 /// capable operator. It updates `peak_rss`, consults the registered
 /// `ArbitrationPolicy`, and reports whether the soft threshold has
-/// been crossed. `should_abort` mirrors the same check against the
-/// hard `limit`.
+/// been crossed. A hard-limit backstop goes through
+/// [`Self::check_hard_limit`], which reclaims on the walk before it
+/// refuses; `should_abort` only mirrors the soft check against the hard
+/// `limit` and refuses nothing.
 ///
 /// `max_spill_bytes` is a disk-spill quota distinct from the RSS
 /// envelope: even when RSS is fine, an unbounded stream of spill
@@ -1534,9 +1541,9 @@ impl MemoryArbitrator {
     }
 
     /// Poll current RSS and update `peak_rss` if it exceeds the
-    /// recorded peak. Called at chunk boundaries by every spill-
-    /// capable operator; also called from `should_spill()` and
-    /// `should_abort()`. Lock-free `fetch_max`.
+    /// recorded peak. Called from `should_spill()`, `should_spill_self()`,
+    /// `should_abort()` and [`Self::check_hard_limit`]. Lock-free
+    /// `fetch_max`.
     pub fn observe(&self) {
         if let Some(rss) = self.process_resident_bytes() {
             self.peak_rss.fetch_max(rss, Ordering::Relaxed);
@@ -1787,36 +1794,31 @@ impl MemoryArbitrator {
         self.hard_limit() - self.soft_limit()
     }
 
-    /// True when EITHER RSS or the pull-mode charged-byte sum exceeds the
-    /// hard limit. Check periodically in probe loops (every 10K output
-    /// records) to prevent unbounded fan-out from blowing the ceiling
-    /// between spill polls.
+    /// True when EITHER the process's peak resident reading or the
+    /// pull-mode charged-byte sum exceeds the hard limit: the soft poll's
+    /// mirror against the hard `limit`, read by [`Self::should_abort_local`].
     ///
-    /// The charged-byte arm is the RSS-independent backstop: see
-    /// [`Self::should_spill`]. Without it the hard-abort gate is
-    /// permanently false whenever `rss_bytes()` returns `None`, so a join
-    /// or aggregate grows unbounded until the OS kills the process instead
-    /// of aborting cleanly under the configured budget.
+    /// It reclaims nothing and builds no report, so it is not a hard-limit
+    /// backstop: an operator that must stop at the limit checks through
+    /// [`Self::check_hard_limit`], which reclaims on the walk before it
+    /// refuses and reports the reading that tripped. Never pair this with a
+    /// refusal of the caller's own.
     pub fn should_abort(&self) -> bool {
         self.observe();
         let hard = self.limit.load(Ordering::Relaxed);
         self.peak_rss.load(Ordering::Relaxed) > hard || self.sum_consumer_usage() > hard
     }
 
-    /// True when the hard limit is breached by RSS, by the pull-mode
-    /// charged-byte sum, or by an operator-supplied `local_bytes`
-    /// estimate of in-progress state that is not yet reflected in a
-    /// registered consumer handle.
+    /// True when the hard limit is breached by the process's peak resident
+    /// reading, by the pull-mode charged-byte sum, or by a caller-supplied
+    /// `local_bytes` estimate of state no consumer handle charges yet.
     ///
-    /// The combine equi-join build loop registers its `MemoryConsumer`
-    /// wrapper with a zero-seeded handle and only mirrors the table's
-    /// footprint into it *after* the build completes, so the build loop's
-    /// growing bytes are invisible to [`Self::sum_consumer_usage`] while
-    /// the build runs. Passing the running `partial_memory_bytes` here is
-    /// the RSS-independent gate for that window — it aborts the build when
-    /// the in-memory table alone exceeds the budget, even on a target
-    /// where `rss_bytes()` returns `None`. Mirrors the arena's own
-    /// `local_bytes_used > hard_limit` self-trigger.
+    /// Its one caller is the credential handle registry's acquisition, a
+    /// preflight step off the walk that refuses with its own credential
+    /// memory error rather than an E310 (open question 94 in
+    /// `docs/ai/80_OPEN_QUESTIONS.md`). Every operator's hard-limit backstop
+    /// checks through [`Self::check_hard_limit`] instead, which reclaims on
+    /// the walk before it refuses.
     pub fn should_abort_local(&self, local_bytes: u64) -> bool {
         local_bytes > self.limit.load(Ordering::Relaxed) || self.should_abort()
     }

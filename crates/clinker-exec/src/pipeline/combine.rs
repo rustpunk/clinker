@@ -766,10 +766,13 @@ impl CombineHashTable {
     ///   [`MEMORY_CHECK_INTERVAL`] inserts and at the end of build, for
     ///   `node`'s join build side and in `requester`'s name, with the
     ///   table's bytes so far, its records included, as the bytes not yet
-    ///   charged; the caller charges the finished table. That is exact for
-    ///   `records` charged to no consumer while the table takes them (rows
-    ///   reloaded from a spill file). On the walk the check runs a reclaim
-    ///   round before it refuses; a refusal is
+    ///   charged. That is exact for `records` charged to no consumer while
+    ///   the table takes them (rows reloaded from a spill file). Charging
+    ///   the finished table is the caller's, and its two callers do not:
+    ///   the grace reload of a spilled partition and the grace chunked
+    ///   fallback both probe against a table no consumer charges, so the run's
+    ///   charged total leaves it out while they probe (#1394). On the walk
+    ///   the check runs a reclaim round before it refuses; a refusal is
     ///   [`CombineError::MemoryRefused`] carrying the check's E310. A caller
     ///   whose records stay charged while they are indexed, and that does
     ///   not charge them a second time, builds through
