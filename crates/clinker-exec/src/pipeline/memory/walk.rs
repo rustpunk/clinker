@@ -16,7 +16,9 @@
 //! also reaches every walk-owned state registered through
 //! [`register_walk_owned`] (the document dead-letter state's held rows, an
 //! Output's per-document buckets, the rows parked for a deferred consumer,
-//! an operator's sorts and tables), which any pass can spill in place.
+//! a Cull's or Reshape's group buffers, a grace-hash join's build partitions
+//! and a hash Aggregate's group tables), which any pass can spill in place.
+//! No sort registers: a sort spills on a threshold of its own.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -181,9 +183,11 @@ impl NodeBufferSlots {
     /// registered slot whose buffer is out of the scope is held by a running
     /// arm: its spill request is raised and it is `Busy`. A slot whose rows a
     /// live cursor or view still shares is `Busy` too: the spill writes
-    /// nothing and its rows stay where the reader holds them, so its spill
-    /// request is raised for the sweep to answer once the reader lets go. A
-    /// slot its compiled classification keeps in memory is `NotOwned`.
+    /// nothing and its rows stay where the reader holds them, and its spill
+    /// request is raised. The walk's sweep at the next node dispatch clears
+    /// that request and writes nothing while the reader still shares the
+    /// rows; the next pass that elects the slot raises it again. A slot its
+    /// compiled classification keeps in memory is `NotOwned`.
     fn spill_registered(
         &mut self,
         id: ConsumerId,

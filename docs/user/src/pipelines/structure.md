@@ -59,7 +59,7 @@ The `pipeline:` block carries global settings that apply to the entire run.
 | Field | Required | Description |
 |-------|----------|-------------|
 | `name` | Yes | Pipeline identifier. Used in logs and metrics. |
-| `memory` | No | Memory-arbitrator tuning. Nested fields: `limit` (RSS budget, `K`/`M`/`G` suffixes, default `512M`) and `backpressure` (`spill`/`pause`/`both`, default `pause`). See [Memory Tuning](../ops/memory.md). |
+| `memory` | No | Memory-arbitrator tuning. Nested fields: `limit` (the memory the run's state may hold, `K`/`M`/`G` suffixes, default `512M`) and `backpressure` (`spill`/`pause`/`both`, default `pause`). See [Memory Tuning](../ops/memory.md). |
 | `vars` | No | Typed static configuration accessible in CXL via `$vars.*`. Each key declares `type` and an optional `default`; see [Scoped Variables](variables.md). |
 | `date_formats` | No | List of `strftime`-style patterns for date parsing. |
 | `rules_path` | No | Directory for CXL `use` module resolution. |

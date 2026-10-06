@@ -153,7 +153,7 @@ pub enum PipelineError {
     },
     /// Wraps an error that surfaced inside a composition body's
     /// recursive walk so the rendered diagnostic carries the
-    /// composition's name. Lets users see "in composition '<name>'"
+    /// composition's name. Lets users see `in composition "<name>"`
     /// in failure messages instead of an opaque inner error.
     ///
     /// # Two-path model for composition-involved errors

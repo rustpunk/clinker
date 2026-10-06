@@ -500,7 +500,7 @@ fn execute_composition_body(
     // Walk the body's topo through the same dispatcher the top-level
     // walker uses. Errors from within the body are wrapped with the
     // composition's name for diagnosability — the user sees
-    // "in composition '<name>': <inner>" instead of an opaque
+    // `in composition "<name>": <inner>` instead of an opaque
     // inner-only message.
     //
     // Body-interior E310 errors name a body-internal operator (for example

@@ -150,7 +150,7 @@ one of two ways:
     directory.
 
   These seven are every production caller of `register_walk_owned`. A pass
-  does not reach the following state on this branch:
+  does not reach the following state today:
   - the sort-merge and IEJoin kernels' state, which spills on thresholds of
     its own. Their consumers report 0 reclaimable, so no pass elects them,
     and a refused request's E310 lists them as `cannot spill`. The
@@ -226,8 +226,9 @@ Spillable state that no pass can reach is a false E310: a request that does
 not fit is refused while megabytes it could have freed stay resident. So
 every walk-owned spillable state must register through
 `register_walk_owned`, and nothing walk-owned and spillable may be
-`NotOwned`; the state listed above as not reached by a pass is the open
-exception. Registering changes none of a consumer's charge, priority,
+`NotOwned`; the spillable state listed above as not reached by a pass is
+the open exception (the inline hash join's table is listed there too, but
+it never spills, so no pass could free it). Registering changes none of a consumer's charge, priority,
 spill triggers or admission; it only makes the state reachable. A
 registered group buffer (Cull, Reshape) also records on its consumer's
 handle what spilling its resident groups frees now, which is the figure
@@ -600,7 +601,7 @@ the row spool and reattaches that exact allocation to every repaired record on
 release. This preserves pointer identity without retaining one extra context per
 row and without replaying the source.
 
-The soft-threshold poll (`MemoryArbitrator::should_spill`, called at batch boundaries) trips when the charged total or the process's peak resident reading crosses the soft threshold (80 % of `limit`), and then takes two separate steps. Under a pausing policy (`pause`, `both`), `reconcile_backpressure` reads only the charged total: above the soft threshold it pauses one back-pressureable consumer that is not the Source being drained (its producer's hot loop parks on a `Condvar` until `resume`), and below the resume watermark it resumes every paused one. The spill arm (`poll_arbitration`) asks the active policy for one victim among the consumers that can be paused or have reclaimable bytes and, when that victim cannot be paused, calls its `try_spill`, which raises its spill request for the operator to read at its next batch boundary. The poll runs no reclaim round and frees nothing itself, and a pause frees no charged bytes. A request that does not fit beside the charged total is refused with E310 only after the reclaim round described above, and the hard-limit backstops (below) also refuse when the process's peak resident reading passes the limit.
+The soft-threshold poll (`MemoryArbitrator::should_spill`, called at batch boundaries) trips when the charged total or the process's peak resident reading crosses the soft threshold (80 % of `limit`), and then takes two separate steps. Under a pausing policy (`pause`, `both`), `reconcile_backpressure` reads only the charged total: above the soft threshold it pauses one back-pressureable consumer that is not the Source being drained (its producer's hot loop parks on a `Condvar` until `resume`), and below the resume watermark it resumes every paused one. The spill arm (`poll_arbitration`) asks the active policy for one victim among the consumers that can be paused or have reclaimable bytes and, when that victim cannot be paused, calls its `try_spill`, which raises its spill request for the operator to read at its next batch boundary. The poll runs no reclaim round and frees nothing itself, and a pause frees no charged bytes. A request on the walk that does not fit beside the charged total is refused with E310 only after the reclaim round described above. Three refusals run no round: a request made off the walk, a request larger than the whole limit, and Cull's per-group decision checks. The hard-limit backstops (below) also refuse at once when the process's peak resident reading passes the limit.
 
 This means:
 
