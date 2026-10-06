@@ -815,11 +815,34 @@ const RECLAIM_PRODUCTS: usize = 6_000;
 /// final check, so a capacity lies between the two checks' limits.
 const RECLAIM_EVENTS: usize = 1_000;
 
-/// Run the fixture held to `capacity` bytes of ledger (ample when `None`),
-/// reading no process memory so only the charged total can trip a limit;
-/// return its report and every Output's bytes. Every hard-limit check that
-/// runs a reclaim round is recorded in `reclaims`.
+/// How many rows each of the inline-reclaim fixture's Sources reads, and the
+/// driver's rows, each naming the build row it matches.
+#[derive(Clone, Copy)]
+struct ReclaimRows {
+    orders: usize,
+    order_line: fn(usize) -> String,
+    products: usize,
+    events: usize,
+}
+
+/// The fixture whose join builds fewer rows than the in-build check's
+/// cadence, so its build's checks are its final one and the arm's.
+const FINISHED_TABLE_ROWS: ReclaimRows = ReclaimRows {
+    orders: RECLAIM_ORDERS,
+    order_line: |i| {
+        let p = i % RECLAIM_PRODUCTS;
+        format!("o{i},p{p},a{p},b{p}\n")
+    },
+    products: RECLAIM_PRODUCTS,
+    events: RECLAIM_EVENTS,
+};
+
+/// Run the fixture with `rows`, held to `capacity` bytes of ledger (ample
+/// when `None`), reading no process memory so only the charged total can
+/// trip a limit; return its report and every Output's bytes. Every
+/// hard-limit check that runs a reclaim round is recorded in `reclaims`.
 fn inline_reclaim_run(
+    rows: ReclaimRows,
     capacity: Option<u64>,
     reclaims: &crate::executor::HardLimitReclaims,
 ) -> Result<(ExecutionReport, String), PipelineError> {
@@ -832,17 +855,14 @@ fn inline_reclaim_run(
             "orders".to_string(),
             crate::executor::single_file_reader(
                 "orders.csv",
-                GeneratedCsv::reader("order_id,product_id,k2,k3\n", RECLAIM_ORDERS, |i| {
-                    let p = i % RECLAIM_PRODUCTS;
-                    format!("o{i},p{p},a{p},b{p}\n")
-                }),
+                GeneratedCsv::reader("order_id,product_id,k2,k3\n", rows.orders, rows.order_line),
             ),
         ),
         (
             "products".to_string(),
             crate::executor::single_file_reader(
                 "products.csv",
-                GeneratedCsv::reader("product_id,name,k2,k3\n", RECLAIM_PRODUCTS, |i| {
+                GeneratedCsv::reader("product_id,name,k2,k3\n", rows.products, |i| {
                     format!("p{i},n{i},a{i},b{i}\n")
                 }),
             ),
@@ -851,7 +871,7 @@ fn inline_reclaim_run(
             "events".to_string(),
             crate::executor::single_file_reader(
                 "events.csv",
-                GeneratedCsv::reader("event_id,payload\n", RECLAIM_EVENTS, |i| {
+                GeneratedCsv::reader("event_id,payload\n", rows.events, |i| {
                     format!("o{i},x{i}\n")
                 }),
             ),
@@ -911,8 +931,8 @@ fn an_inline_join_build_over_the_limit_spills_other_state_and_completes() {
         "the pure-equi join must run the inline HashBuildProbe branch"
     );
     let ample_reclaims = crate::executor::HardLimitReclaims::default();
-    let (ample, ample_output) =
-        inline_reclaim_run(None, &ample_reclaims).expect("the ample run completes");
+    let (ample, ample_output) = inline_reclaim_run(FINISHED_TABLE_ROWS, None, &ample_reclaims)
+        .expect("the ample run completes");
     assert!(
         ample_reclaims.checks().is_empty(),
         "ample memory runs no reclaim round at a hard-limit check: {:?}",
@@ -983,12 +1003,13 @@ fn an_inline_join_build_over_the_limit_spills_other_state_and_completes() {
             ample.peak_consumer_usage_bytes
         );
         let reclaims = crate::executor::HardLimitReclaims::default();
-        let (low, low_output) = inline_reclaim_run(Some(capacity), &reclaims).unwrap_or_else(|e| {
-            panic!(
-                "at {capacity} the join's check makes room by spilling other state and the \
+        let (low, low_output) = inline_reclaim_run(FINISHED_TABLE_ROWS, Some(capacity), &reclaims)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "at {capacity} the join's check makes room by spilling other state and the \
                  run completes: {e}"
-            )
-        });
+                )
+            });
         assert!(
             low.per_stage_spill_bytes_written
                 .get("widened")
@@ -1040,6 +1061,155 @@ fn an_inline_join_build_over_the_limit_spills_other_state_and_completes() {
              {reclaiming_check} bytes not yet charged; the other ({other_check}) finds room"
         );
     }
+}
+
+/// Build rows of the fixture whose join checks the limit mid-build: past one
+/// in-build check interval and short of two, so the build checks once while
+/// it still holds its whole input beside the partial table.
+const MID_BUILD_PRODUCTS: usize = 12_000;
+
+/// The fixture whose join's in-build check runs once, mid-build: every
+/// driver row names its own build row, and `widened` holds enough rows that
+/// a capacity lies between what the check needs with and without them.
+const MID_BUILD_ROWS: ReclaimRows = ReclaimRows {
+    orders: RECLAIM_ORDERS,
+    order_line: |i| format!("o{i},p{i},a{i},b{i}\n"),
+    products: MID_BUILD_PRODUCTS,
+    events: 6_000,
+};
+
+/// The first join's in-build check, made after the first interval of build
+/// rows, counts the partial table beside the whole build input, whose rows
+/// the table has not yet taken over. At a capacity where that does not fit
+/// beside `widened`'s resident rows but fits without them, the check spills
+/// `widened` on the walk and the run completes with the ample run's output.
+/// The record of reclaiming checks names that check by the bytes it
+/// counted: a partial table, more than either finished-table check counts.
+/// Without that reclaim the run stops with E310 for the join's build side.
+#[test]
+fn an_inline_join_mid_build_check_spills_other_state_and_completes() {
+    use crate::pipeline::combine::MEMORY_CHECK_INTERVAL;
+    assert!(
+        MEMORY_CHECK_INTERVAL < MID_BUILD_PRODUCTS
+            && MID_BUILD_PRODUCTS < 2 * MEMORY_CHECK_INTERVAL,
+        "the build checks the limit once, mid-build"
+    );
+    assert!(
+        matches!(
+            compiled_combine_strategy(INLINE_RECLAIM_YAML, "enriched"),
+            CombineStrategy::HashBuildProbe
+        ),
+        "the pure-equi join must run the inline HashBuildProbe branch"
+    );
+    let ample_reclaims = crate::executor::HardLimitReclaims::default();
+    let (ample, ample_output) =
+        inline_reclaim_run(MID_BUILD_ROWS, None, &ample_reclaims).expect("the ample run completes");
+    assert!(
+        ample_reclaims.checks().is_empty(),
+        "ample memory runs no reclaim round at a hard-limit check: {:?}",
+        ample_reclaims.checks()
+    );
+    assert!(
+        ample.per_stage_spill_bytes_written.is_empty(),
+        "ample memory spills nothing: {:?}",
+        ample.per_stage_spill_bytes_written
+    );
+    let peak = |node: &str| {
+        ample
+            .per_node_peak_charged_bytes
+            .get(node)
+            .copied()
+            .unwrap_or_else(|| panic!("the ample run charges {node}"))
+    };
+    let (orders, products, widened) = (peak("orders"), peak("products"), peak("widened"));
+    let identities = (std::mem::size_of::<crate::executor::stream_event::SourceRowId>()
+        * MID_BUILD_PRODUCTS) as u64;
+    // The finished table without its build rows' identities: what the
+    // build's own checks count of it.
+    let table = peak("enriched") - identities;
+    // The table's index is sized for every build row before the first one
+    // arrives, and each row then adds the same bytes, so the partial table
+    // at the check holds at least the checked rows' share of the finished
+    // table and at most all of it.
+    let partial_floor = table * MEMORY_CHECK_INTERVAL as u64 / MID_BUILD_PRODUCTS as u64;
+    // At the check the run holds the driver, the build input and `widened`.
+    // The check fits once `widened` is gone at any capacity from here...
+    let fits_without_widened = orders + products + table;
+    // ...and needs room beside `widened` at any capacity below this.
+    let trips_beside_widened = orders + products + widened + partial_floor;
+    assert!(
+        fits_without_widened < trips_beside_widened,
+        "the window must hold a capacity: {fits_without_widened} < {trips_beside_widened}"
+    );
+    let capacity = fits_without_widened + (trips_beside_widened - fits_without_widened) / 2;
+    // The soft threshold, 80% of the capacity, lies above the inputs, so
+    // the driver and the build input stay resident at their admissions and
+    // `widened` is still resident when the check runs.
+    assert!(
+        (orders + products + widened) * 5 <= capacity * 4,
+        "the inputs ({}) must stay under the soft threshold of {capacity}",
+        orders + products + widened
+    );
+
+    let reclaims = crate::executor::HardLimitReclaims::default();
+    let (low, low_output) = inline_reclaim_run(MID_BUILD_ROWS, Some(capacity), &reclaims)
+        .unwrap_or_else(|e| {
+            panic!(
+                "at {capacity} the join's mid-build check makes room by spilling other state \
+                 and the run completes: {e}"
+            )
+        });
+    assert!(
+        low.per_stage_spill_bytes_written
+            .get("widened")
+            .is_some_and(|&bytes| bytes > 0),
+        "at {capacity} `widened`'s resident rows must be spilled to make room: {:?}",
+        low.per_stage_spill_bytes_written
+    );
+    for input in ["orders", "products"] {
+        assert!(
+            !low.per_stage_spill_bytes_written.contains_key(input),
+            "at {capacity} room is made from `widened`, not by spilling the join's input \
+             `{input}`: {:?}",
+            low.per_stage_spill_bytes_written
+        );
+    }
+    assert!(
+        low.peak_consumer_usage_bytes <= capacity,
+        "at {capacity} the run's charged peak {} stays within its capacity",
+        low.peak_consumer_usage_bytes
+    );
+    assert!(
+        low_output == ample_output,
+        "at {capacity} spilling another node's rows to make room must not change any Output's \
+         bytes"
+    );
+    let join_reclaims: Vec<u64> = reclaims
+        .checks()
+        .into_iter()
+        .filter(|check| check.node == "enriched")
+        .map(|check| {
+            assert_eq!(
+                check.surface,
+                clinker_plan::runtime_error::MemorySurface::JoinBuildSide,
+                "at {capacity} the join reclaims for its build side"
+            );
+            check.uncharged
+        })
+        .collect();
+    let [mid_build] = join_reclaims[..] else {
+        panic!("at {capacity} exactly one of the join's checks makes room: {join_reclaims:?}");
+    };
+    // The finished-table checks count the table less its build input's
+    // charge, which it takes over; the mid-build check counts the partial
+    // table whole, beside the input still charged.
+    let final_check = table - products;
+    let arm_check = table + identities - products;
+    assert!(
+        (partial_floor..table).contains(&mid_build) && mid_build > arm_check,
+        "at {capacity} the reclaiming check counted a partial table ({partial_floor}..{table}), \
+         not a finished-table check's figure ({final_check} or {arm_check}): {mid_build}"
+    );
 }
 
 /// A two-Source inline join and nothing else: no state any reclaim pass
