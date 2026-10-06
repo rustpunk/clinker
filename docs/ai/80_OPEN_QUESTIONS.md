@@ -1027,14 +1027,23 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
   Source's rows alive (by what that step alone keeps alive, or by handing
   the charge over to it); then rank a parked edge by what spilling it would
   actually free, including that text.
+- Related finding (spill read-back): rows read back from a spill file come
+  back with text the run never admitted (`Value`'s deserializer builds it
+  with `FieldStr::from`, `crates/clinker-record/src/value.rs`), so no
+  admission travels with it and it is under-charged until a consumer charges
+  it itself. This is not a regression, and the charge rule decided in
+  #1394 (question 93) covers it: a consumer that keeps such rows charges
+  what it alone keeps alive.
 - Implementation owner: Executor maintainers, with the input-cursor work that
   hands rows over to the step that keeps them.
 
 ### 93. A Combine's build table charges text its Source already holds charged
 
 - Filed: 2026-10-05.
-- Status: Tracked in
-  [#1394](https://github.com/rustpunk/clinker/issues/1394).
+- Status: Decided in
+  [#1394](https://github.com/rustpunk/clinker/issues/1394), not yet
+  implemented: until that change lands, the text double below is still
+  charged.
 - Priority: Medium.
 - Evidence: A Combine's hash table sizes its build rows with
   `Record::estimated_heap_size` (`CombineHashTable::memory_bytes`), which
@@ -1064,12 +1073,43 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
   `crates/clinker-record/src/field_str.rs`
   (`heap_size` against the run-aware `unaccounted_heap_size`),
   `crates/clinker-record/src/record/mod.rs` (`clone_allocation_bytes`).
-- Suggested way to resolve it: #1394 decides one charge rule for every
-  consumer that keeps rows — charge what the holder alone keeps alive, or
-  charge in full and document the double count — then audits each such
-  consumer against it and adds a run-wide check that every byte is charged
-  once.
+- Decision (#1394): every consumer that keeps rows charges exactly what it
+  alone keeps alive, through one function each: held rows by their run-aware
+  heap size (`unaccounted_heap_size`), copies about to be made by what the
+  copy allocates (`clone_allocation_bytes`). Text the run admitted is
+  charged once, by the Source that read it, until its last copy drops, and
+  the record-level estimate (`Record::estimated_heap_size`) leaves every
+  charge, ranking figure and private spill trigger. The change lands in a
+  pull request of its own after the strict-memory-limits change: it audits
+  each consumer that keeps rows against the rule and adds a run-wide check
+  that every byte is charged once.
 - Implementation owner: Executor maintainers.
+
+### 94. The credential preflight refuses on process memory with its own error
+
+- Filed: 2026-10-06.
+- Status: Open.
+- Priority: Low.
+- Evidence: The memory budget checklist forbids pairing `should_abort` or
+  `should_abort_local` with a refusal of one's own: a hard-limit backstop
+  goes through `MemoryArbitrator::check_hard_limit`, which reclaims on the
+  walk first and reports the reading that tripped as an E310. The credential
+  handle registry's acquisition (`CredentialHandleRegistry::acquire`) is the
+  one site that still pairs them: it charges a credential's retained bytes
+  and then refuses with its own credential memory error when
+  `should_abort_local` trips. That check also trips on the process's peak
+  resident reading, so memory the process holds for other reasons can fail
+  a credential acquisition with "credential handle bytes exceed the run
+  memory budget". The acquisition is a preflight step outside the walk and
+  raises no E310; no production caller in the CLI calls it yet.
+- Files/modules involved: `crates/clinker/src/credential_profile.rs`
+  (`acquire_attempt`, `CredentialRegistryErrorKind::MemoryLimitExceeded`),
+  `crates/clinker-exec/src/pipeline/memory.rs` (`should_abort_local`).
+- Suggested way to resolve it: Decide whether the acquisition's growth
+  becomes a checked charge (`try_grow` on its handle, refusing on the
+  charged total only), or whether the preflight stays outside the E310
+  model and its error says which reading tripped.
+- Implementation owner: CLI maintainers.
 
 ## Resolved Archive
 
