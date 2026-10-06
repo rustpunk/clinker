@@ -34,11 +34,15 @@ explicit non-goals.
 
 - **Single binary, zero dependencies.** No JVM, no Python, no package manager.
   Linux, macOS, and Windows are all tested in CI.
-- **Bounded memory.** A run is charged against a configurable RSS budget
-  (default 512 MB). Non-fused stage boundaries buffer against that same
-  envelope; blocking operators (Aggregate, sort, grace-hash Combine) spill to
-  disk under memory pressure and fail fast with `E310 MemoryBudgetExceeded` at
-  the hard limit rather than OOM-killing the process.
+- **Bounded memory.** Every buffer, table and group a run holds counts
+  against one configurable limit, `memory.limit` (default 512 MB). Non-fused
+  stage boundaries buffer within that same limit, and blocking operators
+  (Aggregate, sort, grace-hash Combine) spill to disk under memory pressure.
+  When a request would pass the limit, the engine first spills what it can,
+  and only when that frees nothing does the run stop, with `E310`, rather
+  than being killed for running out of memory. The `E310` report names the
+  node that needed memory, who holds it, and the smallest limit that would
+  have granted that request.
 - **Reproducible output.** Given the same input and pipeline, Clinker produces
   byte-identical output across runs.
 - **Operability first.** Per-stage metrics, dead-letter queues for failed
