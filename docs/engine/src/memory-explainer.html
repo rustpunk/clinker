@@ -357,6 +357,7 @@ footer{padding:40px 6vw;color:var(--dim);font-size:12px}
         <select id="s_preset" style="grid-column:1/-1">
           <option value="default">Default: pause, 512M</option>
           <option value="tight">Tight budget: pause, 256M</option>
+          <option value="resume">Paused reader resumes: pause, 320M</option>
           <option value="spill">Spill policy, 256M</option>
           <option value="both">Both policy, 256M</option>
           <option value="cap">Disk cap too small (E320)</option>
@@ -391,7 +392,7 @@ footer{padding:40px 6vw;color:var(--dim);font-size:12px}
       <div class="logbox" id="s_log" style="height:220px"></div>
     </div>
   </div>
-  <div class="callout b" style="margin-top:22px"><b>Things to try.</b> On <i>Default</i>, watch <b>refs</b> get paused while the walk is busy with orders, and resumed after a reclaim spill when its turn arrives. Switch to <i>Spill policy</i>: nothing is ever paused, and the arbitrator now elects buffer slots and the build directly. <i>Both</i> stays close to <i>Tight budget</i> here, because it only differs from <code>pause</code> once no Source is registered; from then on it picks the biggest holder whatever its priority. Section 03 shows the difference directly. <i>Oversized group</i> shows the one shape spill can't fix.</div>
+  <div class="callout b" style="margin-top:22px"><b>Things to try.</b> On <i>Default</i>, nothing is paused: the RSS peak trips the spill poll first, the slot spills at admission, and the charged total never reaches the soft limit, which is the only reading that pauses. On <i>Paused reader resumes</i>, a large Aggregate pushes the charged total past the soft limit, so <b>refs</b> is paused while the walk is busy with orders. When its turn arrives, one reclaim pass spills first, aimed at how far the larger of process memory and the charged total sits above the soft limit, and then it resumes. Switch to <i>Spill policy</i>: nothing is ever paused, and the arbitrator now elects buffer slots and the build directly. <i>Both</i> stays close to <i>Tight budget</i> here, because it only differs from <code>pause</code> once no Source is registered; from then on it picks the biggest holder whatever its priority. Section 03 shows the difference directly. <i>Oversized group</i> shows the one shape spill can't fix: its request runs a reclaim pass and then a final pass, both free nothing, and only then is it refused.</div>
 </section>
 
 <!-- ============================ 06 SCHEDULER ============================ -->
@@ -614,6 +615,7 @@ const Sim=(function(){
   const PRESETS={
     default:{pol:"pause",lim:512,res:.7,osz:700,rate:14,walk:10,cap:24,card:.45,grp:10,disk:4000,ovh:.08},
     tight:{pol:"pause",lim:256,res:.7,osz:700,rate:14,walk:10,cap:24,card:.45,grp:10,disk:4000,ovh:.08},
+    resume:{pol:"pause",lim:320,res:.3,osz:700,rate:14,walk:10,cap:64,card:.45,grp:40,disk:4000,ovh:.08},
     spill:{pol:"spill",lim:256,res:.7,osz:700,rate:14,walk:10,cap:24,card:.45,grp:10,disk:4000,ovh:.08},
     both:{pol:"both",lim:256,res:.7,osz:700,rate:14,walk:10,cap:24,card:.45,grp:10,disk:4000,ovh:.08},
     cap:{pol:"spill",lim:192,res:.7,osz:1100,rate:14,walk:10,cap:24,card:.6,grp:10,disk:250,ovh:.08},
@@ -850,7 +852,7 @@ const Sim=(function(){
         if(!q.ok){ refuseRequest("totals","agg",g,SURF.agg,q.round); return; } }
       S.aggIn+=m; S.mem.agg+=g;
       shouldSpill();
-      if(S.mem.agg>p.lim*.6){ log(`hash Aggregate reached ~60% of its budget (group-count check), so it spills on its own`,"w"); spill("agg","self-threshold"); if(S.err) return; }
+      if(S.mem.agg>p.lim*.6){ if(reclaimable("agg")>=0.5) log(`hash Aggregate reached ~60% of its budget (group-count check), so it spills on its own`,"w"); spill("agg","self-threshold"); if(S.err) return; }
       if(S.mem.slot<=0.001&&S.dsk.slot<=0.001){ unregister("slot"); S.phase=3; }
     } else if(S.phase===3){ activate("refs"); if(S.err) return; register("build"); S.phase=4; }
     else if(S.phase===4){ // drain refs -> build
