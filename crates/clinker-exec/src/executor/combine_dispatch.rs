@@ -1380,6 +1380,10 @@ where
                         emitted_since_check = 0;
                     }
                 }
+                // Every driver row was probed and dropped, and the input
+                // vector is freed: the input's charge stands for nothing from
+                // here, through the output's hand-off or admission.
+                drop(driver_clone_reservation);
 
                 // Fold the probe kernel's `distinct` / `filtered` skip counts into
                 // the run counters — applied after the loop, the same place the

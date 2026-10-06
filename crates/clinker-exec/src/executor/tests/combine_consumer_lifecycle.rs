@@ -1628,3 +1628,93 @@ fn a_grace_join_reloading_spilled_partitions_does_not_count_its_driver_input() {
     let capacity = orders + products + products / 5;
     assert_grace_reload_completes(capacity, &ample_rows);
 }
+
+/// Driver rows of the fixture whose join's output outlives its driver:
+/// enough that the driver input's charge is larger than the room the
+/// output's admission has to spare, and past the probe loop's check cadence.
+const DRIVER_HEAVY_ORDERS: usize = 20_000;
+
+/// The inline-reclaim fixture with a driver larger than its build input.
+const DRIVER_HEAVY_ROWS: ReclaimRows = ReclaimRows {
+    orders: DRIVER_HEAVY_ORDERS,
+    order_line: |i| {
+        let p = i % RECLAIM_PRODUCTS;
+        format!("o{i},p{p},a{p},b{p}\n")
+    },
+    products: RECLAIM_PRODUCTS,
+    events: RECLAIM_EVENTS,
+};
+
+/// Once an inline join's materialised probe loop has consumed its driver
+/// rows, the driver input's charge ends: the rows are dropped and the input
+/// vector is freed before the output is admitted. The capacity holds the
+/// driver, the table and `widened`'s rows at the join's build, and the
+/// output beside the table and `widened` once the driver is gone, but not
+/// the output beside the driver's charge as well. Counting that charge
+/// until the join returns refuses the output's admission, whose reclaim
+/// spills `widened`, a branch the join never reads.
+#[test]
+fn an_inline_join_admits_its_output_without_counting_its_consumed_driver() {
+    assert!(
+        matches!(
+            compiled_combine_strategy(INLINE_RECLAIM_YAML, "enriched"),
+            CombineStrategy::HashBuildProbe
+        ),
+        "the pure-equi join must run the inline HashBuildProbe branch"
+    );
+    let ample_reclaims = crate::executor::HardLimitReclaims::default();
+    let (ample, ample_output) = inline_reclaim_run(DRIVER_HEAVY_ROWS, None, &ample_reclaims)
+        .expect("the ample run completes");
+    assert!(
+        ample.per_stage_spill_bytes_written.is_empty(),
+        "ample memory spills nothing: {:?}",
+        ample.per_stage_spill_bytes_written
+    );
+    let peak = |node: &str| {
+        ample
+            .per_node_peak_charged_bytes
+            .get(node)
+            .copied()
+            .unwrap_or_else(|| panic!("the ample run charges {node}"))
+    };
+    let (orders, products, widened, output) = (
+        peak("orders"),
+        peak("products"),
+        peak("widened"),
+        peak("enriched_out"),
+    );
+    assert!(
+        orders > output,
+        "the driver's charge ({orders}) must be larger than the output's ({output})"
+    );
+    // The driver, `widened` and twice the build input's charge (the table
+    // holds the build rows and an index no larger than them), with a
+    // quarter of the output's charge to spare: the table fits at its build
+    // beside the driver and `widened`, and the output fits beside the table
+    // and `widened`, but not beside the driver's charge as well.
+    let capacity = orders + widened + 2 * products + output / 4;
+
+    let reclaims = crate::executor::HardLimitReclaims::default();
+    let (low, low_output) = inline_reclaim_run(DRIVER_HEAVY_ROWS, Some(capacity), &reclaims)
+        .unwrap_or_else(|e| panic!("at {capacity} the join completes: {e}"));
+    assert!(
+        !low.per_stage_spill_bytes_written.contains_key("widened"),
+        "at {capacity} `widened`'s rows must stay resident: nothing the join counts needs \
+         their room: {:?}",
+        low.per_stage_spill_bytes_written
+    );
+    assert!(
+        reclaims.checks().is_empty(),
+        "at {capacity} no hard-limit check needs room made: {:?}",
+        reclaims.checks()
+    );
+    assert!(
+        low.peak_consumer_usage_bytes <= capacity,
+        "at {capacity} the charged total never passes the capacity: peak {}",
+        low.peak_consumer_usage_bytes
+    );
+    assert!(
+        low_output == ample_output,
+        "at {capacity} the Outputs' bytes match the ample run's"
+    );
+}
