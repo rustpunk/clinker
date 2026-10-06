@@ -169,6 +169,8 @@ pub struct MemoryTestOverrides {
     no_process_memory: bool,
     #[cfg(any(test, feature = "test-utils"))]
     hard_limit_reclaims: Option<HardLimitReclaims>,
+    #[cfg(any(test, feature = "test-utils"))]
+    source_drain_charges: Option<SourceDrainCharges>,
 }
 
 impl MemoryTestOverrides {
@@ -184,6 +186,8 @@ impl MemoryTestOverrides {
             no_process_memory: false,
             #[cfg(any(test, feature = "test-utils"))]
             hard_limit_reclaims: None,
+            #[cfg(any(test, feature = "test-utils"))]
+            source_drain_charges: None,
         }
     }
 
@@ -299,6 +303,23 @@ impl MemoryTestOverrides {
     pub(crate) fn hard_limit_reclaims(&self) -> Option<&HardLimitReclaims> {
         self.hard_limit_reclaims.as_ref()
     }
+
+    /// Record in `record` each Source's charge at the moment the walk has
+    /// drained its input, before the Source leaves the memory registry. For
+    /// an in-process test that compares what a Source holds charged across
+    /// runs: its charged peak also counts the rows queued in its channel at
+    /// that instant, which depends on how far its reader ran ahead of the
+    /// walk, while once the input is drained nothing is queued and the
+    /// reader has stopped charging.
+    pub fn with_source_drain_charges(mut self, record: SourceDrainCharges) -> Self {
+        self.source_drain_charges = Some(record);
+        self
+    }
+
+    /// The record to keep the run's Source drain charges in, if any.
+    pub(crate) fn source_drain_charges(&self) -> Option<&SourceDrainCharges> {
+        self.source_drain_charges.as_ref()
+    }
 }
 
 /// The hard-limit checks of a run that ran a reclaim round, in the order
@@ -329,6 +350,47 @@ impl HardLimitReclaims {
 
     pub(crate) fn record(&self, check: HardLimitReclaim) {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).push(check);
+    }
+}
+
+/// Each Source's charge when the walk finished draining its input, in the
+/// order the Sources drained. Every clone shares the one record, so a test
+/// keeps a clone before handing the value to a run through
+/// [`MemoryTestOverrides::with_source_drain_charges`]. It grows by one entry
+/// per drained Source and is for in-process tests only.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone, Debug, Default)]
+pub struct SourceDrainCharges(std::sync::Arc<std::sync::Mutex<Vec<SourceDrainCharge>>>);
+
+/// One Source's charge, read from the run's ledger in one step after its
+/// channel reported that its reader had finished and before its
+/// registration was released.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceDrainCharge {
+    /// The Source's node name.
+    pub node: String,
+    /// Bytes granted in the Source's name: the admitted text of the rows it
+    /// read that are still alive.
+    pub granted: u64,
+    /// The Source's own handle charge: what its queued rows hold outside the
+    /// ledger (nothing is queued once the input is drained) plus an ordered
+    /// Source's barrier figure.
+    pub handle: u64,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl SourceDrainCharges {
+    /// The drain charges recorded so far, in the order the Sources drained.
+    pub fn charges(&self) -> Vec<SourceDrainCharge> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub(crate) fn record(&self, charge: SourceDrainCharge) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(charge);
     }
 }
 

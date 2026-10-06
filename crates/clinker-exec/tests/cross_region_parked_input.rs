@@ -12,7 +12,10 @@ use std::collections::HashMap;
 use std::io::Write;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_exec::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams, SourceReaders};
+use clinker_exec::executor::{
+    ExecutionReport, MemoryTestOverrides, PipelineExecutor, PipelineRunParams, SourceDrainCharge,
+    SourceDrainCharges, SourceReaders,
+};
 use clinker_plan::config::{CompileContext, PipelineConfig};
 use clinker_plan::error::PipelineError;
 
@@ -121,11 +124,13 @@ const LOOKUP_CSV: &str = "department,budget\nHR,100\nENG,500\n";
 /// is the trigger.
 type DeadLetterFacts<'a> = (Option<&'a str>, Option<&'a str>, Option<&'a str>, bool);
 
-/// One finished run: its report, its Outputs' bytes and its dead-letter rows.
+/// One finished run: its report, its Outputs' bytes, its dead-letter rows
+/// and each Source's charge once the walk drained its input.
 struct Run {
     report: ExecutionReport,
     output: String,
     dead_letters: Vec<dlq_sink::DlqRow>,
+    source_drains: Vec<SourceDrainCharge>,
 }
 
 /// Run `yaml` over the given `(source, csv)` inputs, compiled against the
@@ -168,9 +173,12 @@ fn run_in(
             )
         })
         .collect();
+    let source_drains = SourceDrainCharges::default();
     let params = PipelineRunParams {
         execution_id: "cross-region-parked-input".to_string(),
         batch_id: "batch-0".to_string(),
+        memory_test: MemoryTestOverrides::default()
+            .with_source_drain_charges(source_drains.clone()),
         ..Default::default()
     };
     let sink = dlq_sink::CollectingDlqSink::new();
@@ -194,6 +202,7 @@ fn run_in(
         report,
         output,
         dead_letters: sink.rows(),
+        source_drains: source_drains.charges(),
     })
 }
 
@@ -487,6 +496,9 @@ const WIDER_NOTE_BYTES: usize = 8 * NOTE_BYTES;
 /// The columns a build-side row is authored with: department, budget, note.
 const AUTHORED_LOOKUP_COLUMNS: u64 = 3;
 
+/// The rows `dept_lookup` reads: HR, ENG and the filler departments.
+const LOOKUP_ROWS: u64 = 2 + LOOKUP_FILLER_ROWS as u64;
+
 /// HR and ENG, then the filler departments, each with a `note_bytes`-character
 /// note; every seventh filler has a negative budget (the rows Route `split`
 /// sends to `unwanted` and Cull `trim` removes).
@@ -550,7 +562,7 @@ fn peak(run: &Run, node: &str) -> u64 {
 /// was, since its parked copy shares the notes and is not charged again.
 fn assert_notes_charged_once(narrow: &Run, wide: &Run, producer: &str, parked_rows: u64) {
     assert_parked_and_source_charges(narrow, producer, parked_rows);
-    source_rise_covers_note_growth(narrow, wide, NOTE_BYTES, WIDE_NOTE_BYTES, parked_rows);
+    drained_charge_rises_by_note_growth(narrow, wide, NOTE_BYTES, WIDE_NOTE_BYTES);
     assert_producer_charge_unchanged(producer, narrow, &[wide]);
 }
 
@@ -572,25 +584,51 @@ fn assert_parked_and_source_charges(narrow: &Run, producer: &str, parked_rows: u
     );
 }
 
+/// `dept_lookup`'s charge in `run` once the walk had drained its input: the
+/// bytes granted in its name plus its handle's charge, read in one step
+/// before it left the memory registry.
+fn drained_charge(run: &Run) -> u64 {
+    let mut drains = run
+        .source_drains
+        .iter()
+        .filter(|charge| charge.node == "dept_lookup");
+    let drain = drains
+        .next()
+        .expect("`dept_lookup` records its charge when its input is drained");
+    assert!(
+        drains.next().is_none(),
+        "`dept_lookup` is drained once per run: {:?}",
+        run.source_drains
+    );
+    drain.granted + drain.handle
+}
+
 /// From `shorter` to `longer`, whose notes are `shorter_bytes` and
-/// `longer_bytes` characters long, `dept_lookup`'s charge rises by at least
-/// the notes' growth over `parked_rows` rows. Returns the rise.
-fn source_rise_covers_note_growth(
+/// `longer_bytes` characters long, `dept_lookup`'s charge once its input is
+/// drained rises by exactly the notes' growth over every row it read: each
+/// note is charged once, under the Source.
+///
+/// The charge is read at the drain, not at its peak. When the walk has
+/// drained the Source's channel nothing is queued in it and the reader has
+/// released everything it held, so the figure is the same on every
+/// interleaving; the peak also counts the rows queued in the channel at that
+/// instant, which depends on how far the reader ran ahead of the walk. Every
+/// row read is still alive at the drain, parked or not: the walk hands the
+/// Source's rows on only once it has drained them all.
+fn drained_charge_rises_by_note_growth(
     shorter: &Run,
     longer: &Run,
     shorter_bytes: usize,
     longer_bytes: usize,
-    parked_rows: u64,
-) -> u64 {
-    let rise = peak(longer, "dept_lookup").saturating_sub(peak(shorter, "dept_lookup"));
-    assert!(
-        rise >= parked_rows * (longer_bytes - shorter_bytes) as u64,
-        "notes of {longer_bytes} bytes instead of {shorter_bytes} are charged to \
-         `dept_lookup` (peak {} against {})",
-        peak(longer, "dept_lookup"),
-        peak(shorter, "dept_lookup")
+) {
+    let growth = LOOKUP_ROWS * (longer_bytes - shorter_bytes) as u64;
+    assert_eq!(
+        drained_charge(longer),
+        drained_charge(shorter) + growth,
+        "notes of {longer_bytes} bytes instead of {shorter_bytes} are charged once to \
+         `dept_lookup`, which holds every row it read when its input is drained \
+         ({LOOKUP_ROWS} rows; growth {growth})"
     );
-    rise
 }
 
 /// `producer`'s charge in every run of `others` is exactly its charge in
@@ -836,25 +874,15 @@ fn composition_body_crossing_parks_under_its_body_key() {
     assert!(converged.report.per_stage_spill_bytes_written.is_empty());
     // `dept_lookup` has a second holder besides the reader that holds the
     // notes: the buffer handing its rows to the body, charged the same per
-    // row whatever the notes' length. A node's figure is its largest single
-    // holder, and with `NOTE_BYTES` notes that buffer is the larger, so the
-    // notes' growth is measured between two widths where their holder leads.
+    // row whatever the notes' length. A node's peak is its largest single
+    // holder, which with `NOTE_BYTES` notes is that buffer, so the notes'
+    // growth is read from the reader's own charge once its input is drained,
+    // which no other holder enters, here between the two wider runs.
     let parked_rows = 2 + LOOKUP_FILLER_ROWS as u64;
     assert_parked_and_source_charges(&converged, "lookup", parked_rows);
     let wide = run_body(true, WIDE_NOTE_BYTES);
     let wider = run_body(true, WIDER_NOTE_BYTES);
-    let rise = source_rise_covers_note_growth(
-        &wide,
-        &wider,
-        WIDE_NOTE_BYTES,
-        WIDER_NOTE_BYTES,
-        parked_rows,
-    );
-    let growth = parked_rows * (WIDER_NOTE_BYTES - WIDE_NOTE_BYTES) as u64;
-    assert!(
-        rise < 2 * growth,
-        "`dept_lookup` charges the notes once, not twice (rise {rise} against growth {growth})"
-    );
+    drained_charge_rises_by_note_growth(&wide, &wider, WIDE_NOTE_BYTES, WIDER_NOTE_BYTES);
     assert_producer_charge_unchanged("lookup", &converged, &[&wide, &wider]);
     assert_eq!(
         sorted_lines(&converged.output),

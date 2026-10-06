@@ -397,6 +397,10 @@ pub(crate) fn build_arbitrator_from_config(
     if let Some(record) = overrides.hard_limit_reclaims() {
         arbitrator.record_hard_limit_reclaims(record.clone());
     }
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(record) = overrides.source_drain_charges() {
+        arbitrator.record_source_drain_charges(record.clone());
+    }
     Ok(arbitrator)
 }
 

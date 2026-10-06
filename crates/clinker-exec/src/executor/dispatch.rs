@@ -2437,6 +2437,8 @@ impl<'a> ExecutorContext<'a> {
     /// no-op.
     pub(crate) fn release_source_consumer(&mut self, source_name: &str) {
         if let Some((id, handle)) = self.source_consumers.remove(source_name) {
+            #[cfg(any(test, feature = "test-utils"))]
+            self.memory_budget.note_source_drain(source_name, id);
             // Resume before unregister: a prior arbitration round may have
             // paused this source's ingest thread, and once the wrapper leaves
             // the registry nothing else can unpark it — the thread would sit

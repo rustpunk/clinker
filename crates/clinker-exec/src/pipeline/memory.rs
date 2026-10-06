@@ -1460,6 +1460,11 @@ pub struct MemoryArbitrator {
     /// [`crate::executor::MemoryTestOverrides::with_hard_limit_reclaims`].
     #[cfg(any(test, feature = "test-utils"))]
     hard_limit_reclaims: Mutex<Option<crate::executor::HardLimitReclaims>>,
+    /// Where [`Self::note_source_drain`] records each drained Source's
+    /// charge, when a test asked for it. Set once, before the run, by
+    /// [`crate::executor::MemoryTestOverrides::with_source_drain_charges`].
+    #[cfg(any(test, feature = "test-utils"))]
+    source_drain_charges: Mutex<Option<crate::executor::SourceDrainCharges>>,
 }
 
 /// [`MemoryArbitrator::walk_requester`]'s "no consumer" value.
@@ -1527,6 +1532,8 @@ impl MemoryArbitrator {
             process_memory_unread: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "test-utils"))]
             hard_limit_reclaims: Mutex::new(None),
+            #[cfg(any(test, feature = "test-utils"))]
+            source_drain_charges: Mutex::new(None),
         }
     }
 
@@ -1584,6 +1591,40 @@ impl MemoryArbitrator {
             .hard_limit_reclaims
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(record);
+    }
+
+    /// Record in `record`, for the rest of this run, each Source's charge
+    /// once the walk has drained its input.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn record_source_drain_charges(&self, record: crate::executor::SourceDrainCharges) {
+        *self
+            .source_drain_charges
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(record);
+    }
+
+    /// Note the charge of Source `node`, registered as `id`, if a test asked
+    /// for the record: the bytes granted in its name and its handle's charge,
+    /// read in one ledger step. The caller has seen the Source's channel
+    /// report that its reader finished and has not yet released the
+    /// registration.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn note_source_drain(&self, node: &str, id: ConsumerId) {
+        let record = self
+            .source_drain_charges
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(record) = record.as_ref() {
+            let (charged, handle) = {
+                let ledger = self.admission.ledger.lock();
+                (ledger.consumer_charged(id.0), ledger.handle_bytes(id.0))
+            };
+            record.record(crate::executor::SourceDrainCharge {
+                node: node.to_string(),
+                granted: charged.saturating_sub(handle),
+                handle,
+            });
+        }
     }
 
     /// Note that the hard-limit check naming `node` and `surface` with

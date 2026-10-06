@@ -70,7 +70,10 @@ pub use params::{
     ExecutionReport, MemoryTestOverrides, PipelineRunParams, PreviewPolicy, RunPolicy,
 };
 #[cfg(any(test, feature = "test-utils"))]
-pub use params::{ForcedShortfall, HardLimitReclaim, HardLimitReclaims, IN_PROCESS_BASELINE_BYTES};
+pub use params::{
+    ForcedShortfall, HardLimitReclaim, HardLimitReclaims, IN_PROCESS_BASELINE_BYTES,
+    SourceDrainCharge, SourceDrainCharges,
+};
 pub use registry::WriterRegistry;
 pub(crate) use registry::build_format_writer;
 pub(crate) use route::CompiledRoute;
