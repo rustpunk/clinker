@@ -1048,17 +1048,15 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
   or refusal begin, earlier than the memory actually held requires. A cross-
   region park, by contrast, charges only what its copy alone keeps alive
   (`Record::clone_allocation_bytes`).
-- Evidence (the inline hash join's build rows): the inline join's build rows
-  stay charged under the build input's reservation until the join's arm
-  exits, and its join build side handle charges the whole finished table,
-  rows included, on top. Its hard-limit check counts the rows twice too, so
-  it agrees with what the ledger holds once the handle takes the table on.
-  Counting the rows once in the check alone, without removing the second
-  charge, moves the failure rather than the limit: in a two-Source join
-  probe (2,000 driver rows, 6,000 build rows) every capacity from 2.7 MB to
-  4.0 MB still failed, but with an E310 that names the Output's 504-byte
-  staging request instead of the join's build side. The check and the
-  charge have to change together.
+- Evidence (the inline hash join's build rows): the inline join's build
+  input's reservation charges each build row's slot, and the finished table
+  charges the same rows again in its own figure. Once the table is built the
+  reservation's charge is handed to the table's handle in one ledger step,
+  and the table's finished-build checks count the table less that charge,
+  so the slots are charged once and the check agrees with the ledger after
+  the hand-over. The table's figure still counts each row's text at full
+  size while the Source that read it charges it too, so near the limit an
+  inline join can still be refused for text that is resident once.
 - Files/modules involved:
   `crates/clinker-exec/src/pipeline/combine.rs` (`memory_bytes` and the
   other build-side sizing), `crates/clinker-exec/src/executor/combine_dispatch.rs`

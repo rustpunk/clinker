@@ -516,7 +516,7 @@ where
         build_upstream,
         build_port.as_deref(),
     )?;
-    let (build_input, _build_clone_reservation) =
+    let (build_input, build_clone_reservation) =
         build_input.into_materialized_parts(&ctx.memory_budget, name)?;
     let (build_buf, build_puncts): (
         Vec<(Record, crate::executor::stream_event::SourceRowId)>,
@@ -739,7 +739,7 @@ where
                 // driver_idx, build_idx)` the output sort returns, not pool
                 // scheduling.
                 let kernel = consume_materialized_inputs(
-                    [_driver_clone_reservation, _build_clone_reservation],
+                    [_driver_clone_reservation, build_clone_reservation],
                     || {
                         let kernel = execute_combine_iejoin(
                             IEJoinExec {
@@ -1185,7 +1185,14 @@ where
         });
         let inline_requester =
             crate::pipeline::memory::ledger::Requester::for_consumer(inline_consumer_id);
-        let hash_table = CombineHashTable::build(
+        // The build rows stay charged under the build input's reservation
+        // until the finished table takes them over below, so that charge is
+        // what the table's checks count as already charged.
+        let build_input_charge = build_clone_reservation.as_ref().map_or(
+            0,
+            crate::executor::node_buffer::TransientNodeBufferReservation::bytes,
+        );
+        let hash_table = CombineHashTable::build_from_reserved(
             build_records,
             &build_extractor,
             &hash_table_ctx,
@@ -1193,6 +1200,7 @@ where
             name,
             inline_requester,
             estimated_rows,
+            build_input_charge,
         )
         .map_err(|e| e.into_build_error(name))?;
         let build_identity_bytes = build_row_ids.capacity().saturating_mul(std::mem::size_of::<
@@ -1200,32 +1208,31 @@ where
         >());
         let inline_bytes = hash_table
             .memory_bytes()
-            .saturating_add(build_identity_bytes);
+            .saturating_add(build_identity_bytes) as u64;
         // The finished table is not charged yet: the backstop makes room for
-        // it beside the run's charges (spilling other state on the walk)
-        // before the handle takes it on below, or refuses naming the reading
-        // that tripped. Its rows are also still charged under the build
-        // input's reservation, so the check counts them twice, as the ledger
-        // will once the handle takes the table on (#1394). Counting them
-        // once here alone would pass a table the charge below then puts over
-        // the limit, and the next request, however small, would be refused
-        // in its place.
+        // what it adds beyond the build input's charge (spilling other state
+        // on the walk), or refuses naming the reading that tripped. The
+        // hand-over below then moves the input's charge to the table in one
+        // ledger step, so the ledger holds what this check found fits and
+        // each build row's slot is charged once. A row's text its Source
+        // read stays charged under the Source as well as in the table's
+        // figure (#1394).
         budget
             .check_hard_limit(
                 name,
                 clinker_plan::runtime_error::MemorySurface::JoinBuildSide,
                 inline_requester,
-                inline_bytes as u64,
+                inline_bytes.saturating_sub(build_input_charge),
             )
             .map_err(|report| PipelineError::MemoryBudgetExceeded { report })?;
         let build_records_out = hash_table.len() as u64;
-        // Mirror the freshly-built table's footprint into the
-        // consumer handle so the arbitrator's pull-mode
-        // `current_usage` reads the inline-combine's in-memory
-        // bytes for the duration of the probe loop. The probe
-        // loop is read-only on the table so no further updates
-        // are needed; arm exit below unregisters the consumer.
-        inline_consumer_handle.set_bytes(inline_bytes as u64);
+        // The table's footprint is charged to the inline consumer for the
+        // probe loop, which only reads the table; arm exit below
+        // unregisters the consumer.
+        match build_clone_reservation {
+            Some(reservation) => reservation.hand_over_to(&inline_consumer_handle, inline_bytes),
+            None => inline_consumer_handle.set_bytes(inline_bytes),
+        }
         ctx.collector
             .record(build_timer.finish(build_records_in, build_records_out));
 

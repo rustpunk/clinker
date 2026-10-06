@@ -768,15 +768,14 @@ impl CombineHashTable {
     ///   table's bytes so far, its records included, as the bytes not yet
     ///   charged; the caller charges the finished table. That is exact for
     ///   `records` charged to no consumer while the table takes them (rows
-    ///   reloaded from a spill file). The inline hash join's build rows stay
-    ///   charged under the build input's reservation while it builds, so for
-    ///   it the check counts them twice, matching the second charge it makes
-    ///   when its handle takes on the finished table (#1394). On the walk
-    ///   the check runs a reclaim round before it refuses; a refusal is
+    ///   reloaded from a spill file). On the walk the check runs a reclaim
+    ///   round before it refuses; a refusal is
     ///   [`CombineError::MemoryRefused`] carrying the check's E310. A caller
     ///   whose records stay charged while they are indexed, and that does
     ///   not charge them a second time, builds through
-    ///   [`Self::build_from_charged`].
+    ///   [`Self::build_from_charged`]; a caller whose build input a
+    ///   reservation charges, handed to the finished table, builds through
+    ///   [`Self::build_from_reserved`].
     /// * `estimated_rows` — optional capacity hint. When `Some`, the
     ///   underlying [`HashTable`] is pre-sized via `with_capacity` to avoid
     ///   the resize spike, which can reach 2.25× peak footprint during
@@ -815,7 +814,7 @@ impl CombineHashTable {
                 budget,
                 node,
                 requester,
-                records_charged: false,
+                charged: BuildCharge::Input(0),
             },
             estimated_rows,
         )
@@ -848,13 +847,51 @@ impl CombineHashTable {
                 budget,
                 node,
                 requester,
-                records_charged: true,
+                charged: BuildCharge::Records,
             },
             estimated_rows,
         )
     }
 
-    /// The one build both entry points run; `backstop` says what the
+    /// [`Self::build`] over `records` whose build input a reservation
+    /// charges at `input_charge` bytes until the caller hands that charge to
+    /// the finished table's consumer (the inline hash join's build rows,
+    /// charged under the build input's reservation). The periodic checks
+    /// count the whole partial table, because the input vector and the table
+    /// coexist until the build has consumed the last record. The final check
+    /// counts the finished table less `input_charge`, because the input is
+    /// gone by then and its charge moves to the table; the ledger after the
+    /// hand-over then holds what the check found fits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_from_reserved<I>(
+        records: I,
+        extractor: &KeyExtractor,
+        ctx: &EvalContext<'_>,
+        budget: &MemoryArbitrator,
+        node: &str,
+        requester: Requester,
+        estimated_rows: Option<usize>,
+        input_charge: u64,
+    ) -> Result<Self, CombineError>
+    where
+        I: IntoIterator<Item = Record>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        Self::build_charging(
+            records,
+            extractor,
+            ctx,
+            BuildBackstop {
+                budget,
+                node,
+                requester,
+                charged: BuildCharge::Input(input_charge),
+            },
+            estimated_rows,
+        )
+    }
+
+    /// The one build every entry point runs; `backstop` says what the
     /// hard-limit check counts as not yet charged.
     fn build_charging<I>(
         records: I,
@@ -932,7 +969,7 @@ impl CombineHashTable {
             if (i + 1).is_multiple_of(MEMORY_CHECK_INTERVAL) {
                 let index_bytes = index_memory_bytes(&index, &chain, &keys_cache);
                 let records_bytes = records_memory_bytes(std::mem::size_of_val(&arena[..]), &arena);
-                backstop.check(index_bytes, records_bytes)?;
+                backstop.check(index_bytes, records_bytes, false)?;
             }
         }
 
@@ -946,10 +983,11 @@ impl CombineHashTable {
 
         // Safety-net final check — catches builds shorter than
         // MEMORY_CHECK_INTERVAL that slipped past the periodic poll, with the
-        // finalized table's own bytes as the bytes not yet charged, so a
-        // sub-interval build over a tiny budget stops even when RSS cannot
-        // be measured.
-        backstop.check(table.index_bytes(), table.records_bytes())?;
+        // finished table's bytes no consumer charges as the bytes not yet
+        // charged, so a sub-interval build over a tiny budget stops even when
+        // RSS cannot be measured. The input is gone by now, so its charge
+        // counts as the table's.
+        backstop.check(table.index_bytes(), table.records_bytes(), true)?;
 
         Ok(table)
     }
@@ -1102,30 +1140,54 @@ fn keys_heap_bytes(keys_cache: &[Vec<Value>]) -> usize {
         .sum::<usize>()
 }
 
-/// A build's hard-limit check: the node and requester it names, and whether
-/// the records the table takes are already charged to a consumer.
+/// What a consumer already charges of the table a build makes.
+#[derive(Clone, Copy)]
+enum BuildCharge {
+    /// Every record, for as long as the table holds it.
+    Records,
+    /// This many bytes of the build input, which coexists with the table
+    /// until the build has consumed it and whose charge then moves to the
+    /// finished table; 0 for records charged to no one.
+    Input(u64),
+}
+
+/// A build's hard-limit check: the node and requester it names, and what of
+/// the table a consumer already charges.
 struct BuildBackstop<'a> {
     budget: &'a MemoryArbitrator,
     node: &'a str,
     requester: Requester,
-    records_charged: bool,
+    charged: BuildCharge,
 }
 
 impl BuildBackstop<'_> {
     /// Check the hard limit with the table's bytes not yet charged: its
-    /// index bytes, plus its records' bytes unless they are already charged.
-    fn check(&self, index_bytes: usize, records_bytes: usize) -> Result<(), CombineError> {
-        let uncharged = if self.records_charged {
-            index_bytes
-        } else {
-            index_bytes + records_bytes
+    /// index bytes, plus its records' bytes unless a consumer charges every
+    /// record. The input's charge counts as the table's only once the table
+    /// is `finished`; before that the input and the partial table coexist.
+    fn check(
+        &self,
+        index_bytes: usize,
+        records_bytes: usize,
+        finished: bool,
+    ) -> Result<(), CombineError> {
+        let uncharged = match self.charged {
+            BuildCharge::Records => index_bytes as u64,
+            BuildCharge::Input(input) => {
+                let table = (index_bytes + records_bytes) as u64;
+                if finished {
+                    table.saturating_sub(input)
+                } else {
+                    table
+                }
+            }
         };
         self.budget
             .check_hard_limit(
                 self.node,
                 MemorySurface::JoinBuildSide,
                 self.requester,
-                uncharged as u64,
+                uncharged,
             )
             .map_err(CombineError::MemoryRefused)
     }

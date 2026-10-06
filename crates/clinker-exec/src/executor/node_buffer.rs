@@ -955,6 +955,18 @@ impl TransientNodeBufferReservation {
         );
     }
 
+    /// Hand the reserved rows to the consumer that now holds them: release
+    /// this reservation's whole charge and charge `bytes` to `to` in one
+    /// ledger step ([`ConsumerHandle::take_over`]), unchecked, then remove
+    /// the registration. The rows are charged to exactly one owner at every
+    /// instant, so the caller must already have checked the hard limit for
+    /// `bytes` less this reservation's charge.
+    ///
+    /// [`ConsumerHandle::take_over`]: crate::pipeline::memory::ConsumerHandle::take_over
+    pub(crate) fn hand_over_to(self, to: &crate::pipeline::memory::ConsumerHandle, bytes: u64) {
+        to.take_over(&self.handle, self.handle.bytes(), bytes);
+    }
+
     /// Transfer ownership of the live registration to a node-buffer registry.
     pub(crate) fn into_registration(
         mut self,
