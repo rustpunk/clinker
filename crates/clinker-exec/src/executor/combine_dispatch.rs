@@ -1070,6 +1070,8 @@ where
                         spill_compress: sm_spill_compress,
                         consumer_handle: sm_consumer_handle,
                         strategy: ctx.strategy,
+                        driver_input_charge: driver_clone_reservation,
+                        build_input_charge: build_clone_reservation,
                     },
                     &ctx.kernel_pool,
                 )?;
