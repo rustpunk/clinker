@@ -425,7 +425,7 @@ nodes:
 }
 
 #[test]
-fn nested_modes_invalid_second_physical_file_fails_with_no_rows_written() {
+fn nested_modes_invalid_second_physical_file_preserves_first_file_prefix() {
     use clinker_exec::source::{SourceInput, multi_file::FileSlot};
     for format in ["json", "xml"] {
         for failure in ["bom", "utf8", "declaration-or-bom32"] {

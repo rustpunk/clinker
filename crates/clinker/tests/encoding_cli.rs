@@ -1929,7 +1929,7 @@ nodes:
 }
 
 #[test]
-fn physical_cli_malformed_files_fail_with_an_empty_retained_attempt() {
+fn physical_cli_malformed_files_preserve_exact_successful_prefixes() {
     for format in ["fixed_width", "swift"] {
         for variant in [
             "utf8",
