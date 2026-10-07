@@ -428,8 +428,9 @@ pub(crate) struct HeldLogConfig {
 /// leave memory only on the arbitrator's signals (see
 /// [`crate::executor::extent_log`]): the consumer's election by a pass that
 /// found the state busy or by a round without the walk, polled on every
-/// append, at every decision and at every ledger admission; the soft
-/// threshold, polled every `batch_size` appends and at every decision; and
+/// append and at every decision (a ledger admission leaves it pending);
+/// the soft threshold, polled every `batch_size` appends and at every
+/// decision; and
 /// the state's own growth (a held row, a ledger admission) when the walk's
 /// reclaim leaves it short, which flushes the tails and retries once before
 /// it refuses with E310. Each growth is charged once, when it is admitted.
@@ -1755,9 +1756,7 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
         record: Record,
         source_row: SourceRowId,
     ) -> Result<(), PipelineError> {
-        let column_count = record.schema().column_count();
-        let reclaimable = crate::executor::node_buffer::record_byte_cost(column_count)
-            .saturating_add(record.legacy_estimated_heap_size() as u64);
+        let reclaimable = crate::executor::node_buffer::resident_record_reclaimable_bytes(&record);
         let residue = crate::executor::node_buffer::unaccounted_record_byte_cost(
             &record,
             &self.allocation_resources,
