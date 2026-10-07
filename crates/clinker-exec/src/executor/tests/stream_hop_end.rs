@@ -9,6 +9,15 @@
 //! A producer that fails delivers the rows it emitted before its failure,
 //! then reports its own error.
 //!
+//! A step fed over a streaming hop finishes its work only on its producer's
+//! end, which the producer's driver sends once the producer has finished
+//! without failing. A streaming Aggregate whose producer failed or was
+//! stopped finalizes no group over the rows it was given. Because each step
+//! meets its rows in data order, the run reports the first failure in that
+//! order: a step's failure on an earlier row stands over its producer's
+//! later failure, and over a later cancellation, and the later failure is
+//! logged on the walk's thread.
+//!
 //! The writers are raw in-memory buffers, so anything a step finished is
 //! visible here even though a production run would leave it staged and
 //! unpublished.
@@ -45,10 +54,11 @@ fn run_with(
             )
         })
         .collect();
+    let memory_test = params.memory_test.with_no_process_memory();
     let params = PipelineRunParams {
         execution_id: "stream-hop-end".to_string(),
         batch_id: "batch-0".to_string(),
-        memory_test: crate::executor::MemoryTestOverrides::default().with_no_process_memory(),
+        memory_test,
         ..params
     };
     let result = match policy {
@@ -459,22 +469,46 @@ nodes:
 /// convert.
 const SUM_OF_IDS: &str = "sum(id.to_int())";
 
-/// Run `yaml` with `src` read by `reader`, its one Sink `agg_out`, under
-/// `token` when given, keeping every warning logged on the walk's thread.
+/// One run of [`run_scripted`]: its result and outputs, every warning logged
+/// on the walk's thread, and how each streaming consumer stopped.
+struct ScriptedRun {
+    run: Run,
+    warnings: Vec<String>,
+    ends: Vec<crate::executor::StreamingEnd>,
+}
+
+/// Run `yaml` with `src` read by `reader`, writing each of `sinks`, under
+/// `token` when given.
 fn run_scripted(
     yaml: &str,
     reader: ScriptedRows,
+    sinks: &[&'static str],
     token: Option<&crate::pipeline::shutdown::ShutdownToken>,
-) -> (Run, Vec<String>) {
+) -> ScriptedRun {
     let readers: crate::executor::SourceReaders = HashMap::from([(
         "src".to_string(),
         crate::source::SourceInput::Records(Box::new(reader)),
     )]);
+    let ends = crate::executor::StreamingEnds::default();
     let params = PipelineRunParams {
         shutdown_token: token.cloned(),
+        memory_test: crate::executor::MemoryTestOverrides::default()
+            .with_streaming_ends(ends.clone()),
         ..PipelineRunParams::default()
     };
-    super::capture_warnings(|| run_with(yaml, readers, &["agg_out"], params, None))
+    let (run, warnings) = super::capture_warnings(|| run_with(yaml, readers, sinks, params, None));
+    ScriptedRun {
+        run,
+        warnings,
+        ends: ends.ends(),
+    }
+}
+
+/// The one streaming consumer end `ends` records, for `node`.
+fn only_end(ends: &[crate::executor::StreamingEnd], node: &str) -> crate::executor::StreamingEnd {
+    let mine: Vec<_> = ends.iter().filter(|end| end.node == node).collect();
+    assert_eq!(mine.len(), 1, "{node} streams and stops once: {ends:?}");
+    mine[0].clone()
 }
 
 /// The run fails with the Aggregate's own conversion error, the first
@@ -501,23 +535,35 @@ fn lines_naming_totals(warnings: &[String]) -> Vec<&String> {
         .collect()
 }
 
+/// The Aggregate `totals` failed on its own row, before its input ended.
+fn assert_the_aggregate_failed_first(ends: &[crate::executor::StreamingEnd]) {
+    assert_eq!(
+        only_end(ends, "totals").input,
+        crate::executor::StreamingInputEnd::ConsumerFailed,
+        "the Aggregate streams and fails on its own row"
+    );
+}
+
 /// The Aggregate fails on its first row; the reader feeding its producer
 /// fails later, past the producer's first batch. The run reports the
 /// Aggregate's failure, and the reader's, which came later in data order, is
 /// logged once on the walk's thread naming the Aggregate.
 #[test]
 fn a_streaming_aggregates_earlier_failure_beats_a_later_reader_failure() {
-    let (run, warnings) = run_scripted(
+    let scripted = run_scripted(
         &fused_chain_into_aggregate(SUM_OF_IDS),
         ScriptedRows::new(6000).bad_id_at(1).fail_after(3000),
+        &["agg_out"],
         None,
     );
-    assert_the_aggregates_failure(&run);
-    let lines = lines_naming_totals(&warnings);
+    assert_the_aggregates_failure(&scripted.run);
+    assert_the_aggregate_failed_first(&scripted.ends);
+    let lines = lines_naming_totals(&scripted.warnings);
     assert_eq!(
         lines.len(),
         1,
-        "the later failure is logged once: {warnings:?}"
+        "the later failure is logged once: {:?}",
+        scripted.warnings
     );
     assert!(
         lines[0].contains(READ_FAILURE),
@@ -530,17 +576,20 @@ fn a_streaming_aggregates_earlier_failure_beats_a_later_reader_failure() {
 /// Transform's.
 #[test]
 fn a_streaming_aggregates_earlier_failure_beats_its_producers_later_failure() {
-    let (run, warnings) = run_scripted(
+    let scripted = run_scripted(
         &fused_chain_into_aggregate(SUM_OF_IDS),
         ScriptedRows::new(6000).bad_id_at(1).bad_v_at(5001),
+        &["agg_out"],
         None,
     );
-    assert_the_aggregates_failure(&run);
-    let lines = lines_naming_totals(&warnings);
+    assert_the_aggregates_failure(&scripted.run);
+    assert_the_aggregate_failed_first(&scripted.ends);
+    let lines = lines_naming_totals(&scripted.warnings);
     assert_eq!(
         lines.len(),
         1,
-        "the later failure is logged once: {warnings:?}"
+        "the later failure is logged once: {:?}",
+        scripted.warnings
     );
     assert!(
         lines[0].contains(&format!("cannot convert '{TRANSFORM_BAD_V}'")),
@@ -554,12 +603,14 @@ fn a_streaming_aggregates_earlier_failure_beats_its_producers_later_failure() {
 /// failing row and the run reports it.
 #[test]
 fn a_streaming_aggregate_failing_on_the_row_before_its_producer_fails_reports_its_own_error() {
-    let (run, _) = run_scripted(
+    let scripted = run_scripted(
         &fused_chain_into_aggregate(SUM_OF_IDS),
         ScriptedRows::new(6000).bad_id_at(4999).bad_v_at(5000),
+        &["agg_out"],
         None,
     );
-    assert_the_aggregates_failure(&run);
+    assert_the_aggregates_failure(&scripted.run);
+    assert_the_aggregate_failed_first(&scripted.ends);
 }
 
 /// The Aggregate fails on its first row; the run is cancelled at row 3,000.
@@ -568,34 +619,94 @@ fn a_streaming_aggregate_failing_on_the_row_before_its_producer_fails_reports_it
 #[test]
 fn a_streaming_aggregates_failure_stands_when_the_run_is_cancelled_after_it() {
     let token = crate::pipeline::shutdown::ShutdownToken::detached();
-    let (run, warnings) = run_scripted(
+    let scripted = run_scripted(
         &fused_chain_into_aggregate(SUM_OF_IDS),
         ScriptedRows::new(6000).bad_id_at(1).cancel_at(3000, &token),
+        &["agg_out"],
         Some(&token),
     );
     assert!(
         token.is_requested(),
         "the reader requested the cancellation"
     );
-    assert_the_aggregates_failure(&run);
+    assert_the_aggregates_failure(&scripted.run);
+    assert_the_aggregate_failed_first(&scripted.ends);
     assert_eq!(
-        lines_naming_totals(&warnings),
+        lines_naming_totals(&scripted.warnings),
         Vec::<&String>::new(),
         "a cancellation is not a failure to log"
     );
 }
 
+/// A streaming Aggregate whose producer fails or is stopped never finalizes
+/// a group over the rows it was given: its input closed without its
+/// producer's end. Three ways the producer stops: its reader fails, its
+/// reader cancels the run, the Transform itself fails.
+#[test]
+fn a_streaming_aggregate_never_finalizes_without_its_producers_end() {
+    let counting = fused_chain_into_aggregate("count(*)");
+    let token = crate::pipeline::shutdown::ShutdownToken::detached();
+    let cases = [
+        (
+            "the reader fails",
+            ScriptedRows::new(6000).fail_after(3000),
+            None,
+        ),
+        (
+            "the reader cancels the run",
+            ScriptedRows::new(6000).cancel_at(3000, &token),
+            Some(&token),
+        ),
+        (
+            "the Transform fails",
+            ScriptedRows::new(6000).bad_v_at(3000),
+            None,
+        ),
+    ];
+    for (case, reader, token) in cases {
+        let scripted = run_scripted(&counting, reader, &["agg_out"], token);
+        assert_eq!(
+            only_end(&scripted.ends, "totals"),
+            crate::executor::StreamingEnd {
+                node: "totals".to_string(),
+                input: crate::executor::StreamingInputEnd::Incomplete,
+                finished: false,
+            },
+            "{case}: the Aggregate's input closed without its producer's end, and it \
+             finalized nothing"
+        );
+        assert_eq!(
+            scripted.run.outputs["agg_out"], "",
+            "{case}: nothing written"
+        );
+    }
+}
+
 /// A complete read through the fused chain into the streaming Aggregate
-/// writes every group's total over every row.
+/// ends the Aggregate's input, and it writes every group's total over every
+/// row.
 #[test]
 fn a_complete_fused_chain_into_a_streaming_aggregate_writes_every_total() {
-    let (run, _) = run_scripted(
+    let scripted = run_scripted(
         &fused_chain_into_aggregate(SUM_OF_IDS),
         ScriptedRows::new(6000),
+        &["agg_out"],
         None,
     );
-    run.result.as_ref().expect("a complete read succeeds");
-    let mut lines: Vec<&str> = run.outputs["agg_out"].lines().collect();
+    scripted
+        .run
+        .result
+        .as_ref()
+        .expect("a complete read succeeds");
+    assert_eq!(
+        only_end(&scripted.ends, "totals"),
+        crate::executor::StreamingEnd {
+            node: "totals".to_string(),
+            input: crate::executor::StreamingInputEnd::Ended,
+            finished: true,
+        }
+    );
+    let mut lines: Vec<&str> = scripted.run.outputs["agg_out"].lines().collect();
     lines.sort_unstable();
     // Group g is every row r <= 6000 with r % 4 == g: 1,500 rows each.
     assert_eq!(

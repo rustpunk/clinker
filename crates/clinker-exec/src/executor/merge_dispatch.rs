@@ -188,9 +188,7 @@ where
     let merge_batch_size = ctx.batch_size;
     // Held only on the non-fused streaming path; the fused path
     // consumes its sender inside `merge_fused_interleave`.
-    let mut nonfused_sender: Option<
-        crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>,
-    > = None;
+    let mut nonfused_sender: Option<crate::executor::stream_hop::HopSender> = None;
     // Shared-input materialization reservations belong to the complete Merge
     // arm, not only the input-conversion block: collected records remain live through
     // boundary reconciliation, window finalization, and output admission.

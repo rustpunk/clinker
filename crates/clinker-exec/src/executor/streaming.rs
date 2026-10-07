@@ -324,12 +324,16 @@ pub(super) trait StreamingConsumer {
 /// finalizes the consumer. Both paths preserve any unrelated reservation on
 /// the shared counter; exact discharge is never replaced by a reset.
 pub(super) fn drain_streaming_channel<C: StreamingConsumer>(
-    rx: &crossbeam_channel::Receiver<StreamEvent>,
+    rx: &super::stream_hop::HopReceiver,
     charge_handle: &Arc<crate::pipeline::memory::ConsumerHandle>,
     consumer: &mut C,
     resources: &clinker_record::owned_storage::AllocationResources,
 ) {
-    while let Ok(event) = rx.recv() {
+    loop {
+        let event = match rx.recv() {
+            Ok(super::stream_hop::HopMessage::Event(event)) => event,
+            Ok(super::stream_hop::HopMessage::End) | Err(_) => break,
+        };
         let (record, rn) = match event {
             StreamEvent::Record(r, rn) => (r, rn),
             StreamEvent::Punctuation(p) => {
@@ -357,15 +361,7 @@ pub(super) fn drain_streaming_channel<C: StreamingConsumer>(
             // otherwise the producer blocks forever on a full bounded
             // channel. The consumer is not finalized: a fatal `on_record`
             // already abandoned its work.
-            while let Ok(event) = rx.recv() {
-                if let StreamEvent::Record(record, _) = event {
-                    charge_handle.sub_bytes(
-                        crate::executor::node_buffer::unaccounted_record_byte_cost(
-                            &record, resources,
-                        ),
-                    );
-                }
-            }
+            super::stream_hop::discard_until_closed(rx, charge_handle, resources);
             return;
         }
     }
@@ -650,7 +646,7 @@ pub(super) struct StreamingSinkResources {
 /// counters. See [`StreamingSinkSpec`] for the eligibility predicate and
 /// https://github.com/rustpunk/clinker/issues/72 for the rationale.
 pub(super) fn streaming_sink(
-    rx: crossbeam_channel::Receiver<StreamEvent>,
+    rx: super::stream_hop::HopReceiver,
     raw_writer: Box<dyn Write + Send>,
     spec: StreamingSinkSpec,
     charge_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
@@ -727,10 +723,28 @@ mod tests {
     use super::*;
     use crate::executor::node_buffer::record_byte_cost;
     use crate::executor::stream_event::PunctuationKind;
+    use crate::executor::stream_hop::HopMessage;
     use crate::pipeline::memory::ConsumerHandle;
     use clinker_record::{Schema, Value, synthetic_document_context};
     #[cfg(test)]
     use std::sync::Arc;
+
+    /// Sends a producer's event onto a hop channel, as a producer arm does.
+    trait SendEvent {
+        fn send_event(
+            &self,
+            event: StreamEvent,
+        ) -> Result<(), crossbeam_channel::SendError<HopMessage>>;
+    }
+
+    impl SendEvent for crossbeam_channel::Sender<HopMessage> {
+        fn send_event(
+            &self,
+            event: StreamEvent,
+        ) -> Result<(), crossbeam_channel::SendError<HopMessage>> {
+            self.send(HopMessage::Event(event))
+        }
+    }
 
     /// One-column record used to size the per-record discharge against
     /// `record_byte_cost(1)`.
@@ -870,9 +884,10 @@ mod tests {
             let total = baseline + costs.iter().sum::<u64>();
             let charge = ConsumerHandle::new();
             charge.add_bytes(total);
-            let (tx, rx) = crossbeam_channel::unbounded();
+            let (tx, rx) = crossbeam_channel::unbounded::<HopMessage>();
             for (i, record) in rows.into_iter().enumerate() {
-                tx.send(StreamEvent::record(record, i as u64)).unwrap();
+                tx.send_event(StreamEvent::record(record, i as u64))
+                    .unwrap();
             }
             drop(tx);
             let mut consumer = Observe {
@@ -904,7 +919,7 @@ mod tests {
 
     #[test]
     fn full_drain_nets_charge_to_zero_and_preserves_order() {
-        let (tx, rx) = crossbeam_channel::unbounded::<StreamEvent>();
+        let (tx, rx) = crossbeam_channel::unbounded::<HopMessage>();
         let charge = ConsumerHandle::new();
         let n = 4u64;
         // Mirror the producer's per-batch admit: charge the whole stream
@@ -912,7 +927,8 @@ mod tests {
         // drains.
         charge.add_bytes(record_byte_cost(1) * n);
         for rn in 0..n {
-            tx.send(StreamEvent::record(rec(rn as i64), rn)).unwrap();
+            tx.send_event(StreamEvent::record(rec(rn as i64), rn))
+                .unwrap();
         }
         drop(tx);
 
@@ -935,12 +951,13 @@ mod tests {
 
     #[test]
     fn break_drains_channel_zeroes_charge_and_skips_close() {
-        let (tx, rx) = crossbeam_channel::unbounded::<StreamEvent>();
+        let (tx, rx) = crossbeam_channel::unbounded::<HopMessage>();
         let charge = ConsumerHandle::new();
         let n = 5u64;
         charge.add_bytes(record_byte_cost(1) * n);
         for rn in 0..n {
-            tx.send(StreamEvent::record(rec(rn as i64), rn)).unwrap();
+            tx.send_event(StreamEvent::record(rec(rn as i64), rn))
+                .unwrap();
         }
         drop(tx);
 
@@ -973,17 +990,17 @@ mod tests {
 
     #[test]
     fn punctuations_route_without_discharge_in_arrival_order() {
-        let (tx, rx) = crossbeam_channel::unbounded::<StreamEvent>();
+        let (tx, rx) = crossbeam_channel::unbounded::<HopMessage>();
         let charge = ConsumerHandle::new();
         // Charge only the single record; punctuations contribute nothing.
         charge.add_bytes(record_byte_cost(1));
         let doc = synthetic_document_context();
-        tx.send(StreamEvent::punctuation(Punctuation::document_open(
+        tx.send_event(StreamEvent::punctuation(Punctuation::document_open(
             doc.clone(),
         )))
         .unwrap();
-        tx.send(StreamEvent::record(rec(0), 0)).unwrap();
-        tx.send(StreamEvent::punctuation(Punctuation::document_close(
+        tx.send_event(StreamEvent::record(rec(0), 0)).unwrap();
+        tx.send_event(StreamEvent::punctuation(Punctuation::document_close(
             doc.clone(),
         )))
         .unwrap();
@@ -1019,7 +1036,7 @@ mod tests {
 
     #[test]
     fn disconnect_fires_close_once_then_zeroes_charge() {
-        let (tx, rx) = crossbeam_channel::unbounded::<StreamEvent>();
+        let (tx, rx) = crossbeam_channel::unbounded::<HopMessage>();
         let charge = ConsumerHandle::new();
         // Empty stream: no records charged, immediate disconnect.
         drop(tx);

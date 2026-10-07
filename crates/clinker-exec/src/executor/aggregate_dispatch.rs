@@ -1637,9 +1637,16 @@ fn run_streaming_aggregate_ingest(
     // Install the bounded streaming-ingest channel keyed by the producer's
     // index, so its dispatch arm streams into it with no producer-side
     // change. The scoped thread's per-record `sub_bytes` discharge below
-    // nets the producer's per-batch charge to zero.
-    let (rx, charge_handle, charge_consumer_id) =
-        ctx.install_streaming_ingest_channel(producer_idx, &upstream_name, name)?;
+    // nets the producer's per-batch charge to zero. This arm is the hop's
+    // driver: it holds the hop's end and sends End only once the producer's
+    // redispatch below returned `Ok`.
+    let crate::executor::stream_hop::StreamingIngestHop {
+        rx,
+        end: hop_end,
+        charge_handle,
+        charge_consumer_id,
+    } = ctx.install_streaming_ingest_channel(producer_idx, &upstream_name, name)?;
+    let hop_ends = ctx.hop_ends.clone();
 
     // Copy the stable-context reference out of `ctx` *before* the scope so
     // the scoped thread borrows `&'a StableEvalContext` directly (shared,
@@ -1667,24 +1674,30 @@ fn run_streaming_aggregate_ingest(
 
     // Run the ingest recv loop and the producer concurrently. The scoped
     // thread owns the document-flush aggregator and drains the channel; the
-    // main thread redispatches the producer (which streams into the channel
-    // and drops its sender at clean exit, disconnecting the channel). The
-    // producer's `?` error and the ingest thread's error both surface; the
-    // ingest thread always drains to disconnect first so a producer `send`
-    // can never deadlock on a dead consumer.
+    // main thread redispatches the producer, which streams into the channel,
+    // and then ends the hop if the producer returned `Ok`. The ingest
+    // thread finalizes only on that End: a channel that closes without it
+    // means the producer failed or was stopped, and the Aggregate finalizes
+    // nothing. Both results are settled together by `settle_hop`; the ingest
+    // thread drains to disconnect on every error exit so neither a producer
+    // `send` nor the End can block on a dead consumer.
     let finalize_ctx = ctx.merged_eval_ctx();
     let ingest_result: Result<(), PipelineError> = std::thread::scope(|scope| {
-        let handle = scope.spawn(|| -> Result<(), PipelineError> {
+        let handle = scope.spawn(|| {
+            // The thread owns the receiver, so a panic on it drops the
+            // receiver and a producer's next `send` fails instead of blocking.
+            let rx = rx;
+            let mut finalized = false;
             // The recv body is a single fallible closure so EVERY error exit
-            // funnels through the one drain-then-return site below. `rx` lives
-            // in the outer function frame, not in this closure, so an early
-            // `?` return would NOT disconnect the channel — a producer blocked
-            // on the bounded `send` would then deadlock and the join would
-            // hang forever. Draining `rx` to disconnect before propagating any
-            // error closes that gap structurally: no `?` site inside the
-            // closure can reintroduce the non-draining asymmetry.
-            let mut drive = || -> Result<(), PipelineError> {
-                while let Ok(event) = rx.recv() {
+            // funnels through the one drain-then-return site below: an early
+            // `?` inside it would otherwise leave the channel undrained, and a
+            // producer blocked on the bounded `send` would deadlock the join.
+            let mut drive = || -> Result<crate::executor::stream_hop::HopVerdict, PipelineError> {
+                let verdict = loop {
+                    let event = match crate::executor::stream_hop::next_event(&rx) {
+                        std::ops::ControlFlow::Continue(event) => event,
+                        std::ops::ControlFlow::Break(verdict) => break verdict,
+                    };
                     let (record, rn) = match event {
                         StreamEvent::Record(r, rn) => (r, rn),
                         StreamEvent::Punctuation(p) => {
@@ -1789,17 +1802,23 @@ fn run_streaming_aggregate_ingest(
                             }
                         },
                     }
+                };
+                if verdict == crate::executor::stream_hop::HopVerdict::UpstreamIncomplete {
+                    // The producer failed or was stopped: these rows are a
+                    // prefix of its output, so no group is finalized over them.
+                    return Ok(verdict);
                 }
-                // Channel disconnected — every sender dropped at the producer
-                // arm's clean exit. A completely empty stream (no records, no
-                // forwarded close) opened no bucket; a global fold still owes
-                // one defaulted row, so `drain_with_empty_sentinel` forces the
-                // sentinel bucket open before draining every surviving bucket
-                // in ascending `DocumentId` order (SYNTHETIC id 0 sorts first):
+                // The producer's End: its whole output has arrived. A
+                // completely empty stream (no records, no forwarded close)
+                // opened no bucket; a global fold still owes one defaulted
+                // row, so `drain_with_empty_sentinel` forces the sentinel
+                // bucket open before draining every surviving bucket in
+                // ascending `DocumentId` order (SYNTHETIC id 0 sorts first):
                 // the sentinel for no-document / unreconciled records, plus any
                 // document whose close never arrived. A finalize error
                 // propagates as a hard error through the drain-then-return site
                 // below.
+                finalized = true;
                 tables.drain_with_empty_sentinel(
                     input_count == 0,
                     &factory,
@@ -1807,7 +1826,7 @@ fn run_streaming_aggregate_ingest(
                     &mut out_rows,
                     |result| result.map_err(Into::into),
                 )?;
-                Ok(())
+                Ok(verdict)
             };
             // A governed allocation this worker was refused ends the ingest
             // here, on the thread that recorded the refusal's report.
@@ -1817,22 +1836,19 @@ fn run_streaming_aggregate_ingest(
                 clinker_plan::runtime_error::MemorySurface::GroupState,
             );
             if result.is_err() {
-                // Drain to disconnect before surfacing the error so a producer
-                // blocked on the bounded `send` cannot deadlock the join. The
-                // streaming-ingest arm aborts on any ingest error (schema
-                // mismatch, FailFast `add_record`, finalize failure) with no
-                // DLQ fallback, matching the prior single-stream behavior.
-                while let Ok(event) = rx.recv() {
-                    if let StreamEvent::Record(record, _) = event {
-                        charge_handle.sub_bytes(
-                            crate::executor::node_buffer::unaccounted_record_byte_cost(
-                                &record,
-                                &allocation_resources,
-                            ),
-                        );
-                    }
-                }
+                // Drain to disconnect before surfacing the error so neither a
+                // producer blocked on the bounded `send` nor the End can
+                // deadlock the join. The streaming-ingest arm aborts on any
+                // ingest error (schema mismatch, FailFast `add_record`,
+                // finalize failure) with no DLQ fallback, matching the prior
+                // single-stream behavior.
+                crate::executor::stream_hop::discard_until_closed(
+                    &rx,
+                    &charge_handle,
+                    &allocation_resources,
+                );
             }
+            hop_ends.record(name, &result, finalized);
             result
         });
 
@@ -1840,22 +1856,31 @@ fn run_streaming_aggregate_ingest(
         // entry first so the dispatcher's streaming-ingest short-circuit
         // (which made the producer's own topo turn a no-op) does not fire
         // again here — this is the one turn the producer must actually run.
-        // It takes the sender we installed and streams into the channel,
-        // dropping it at clean exit.
+        // It takes the sender we installed and streams into the channel.
         ctx.streaming_aggregate_ingest_edges.remove(&producer_idx);
         let producer_result =
             crate::executor::dispatch::dispatch_plan_node(ctx, current_dag, producer_idx);
-        // Belt-and-suspenders: ensure the channel disconnects even if a
-        // producer error left a sender lingering on `ctx`, so the ingest
-        // thread's `recv` returns `Err` and the join below cannot hang.
+        // Belt-and-suspenders: a producer error may leave its sender on
+        // `ctx`; remove it so only the hop's end still holds the channel.
         ctx.streaming_output_senders.remove(&producer_idx);
+        // The producer's whole output is on the channel only when it returned
+        // `Ok`. Otherwise the end is dropped unsent, and the channel closes
+        // without End once the last sender is gone, so the join below cannot
+        // wait on a channel that stays open.
+        if producer_result.is_ok() {
+            hop_end.end();
+        } else {
+            drop(hop_end);
+        }
 
-        let ingest = handle.join().map_err(|_| PipelineError::Internal {
-            op: "aggregation",
-            node: name.to_string(),
-            detail: "streaming aggregate ingest thread panicked".to_string(),
-        })?;
-        producer_result.and(ingest)
+        let ingest = handle.join().unwrap_or_else(|_| {
+            Err(PipelineError::Internal {
+                op: "aggregation",
+                node: name.to_string(),
+                detail: "streaming aggregate ingest thread panicked".to_string(),
+            })
+        });
+        crate::executor::stream_hop::settle_hop(name, &upstream_name, ingest, producer_result)
     });
 
     // Charge bookkeeping is complete: the producer charged each batch and

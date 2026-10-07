@@ -2026,8 +2026,10 @@ pub(crate) struct ExecutorContext<'a> {
     /// don't match the topology — every other Output stays on the
     /// buffered path. See
     /// https://github.com/rustpunk/clinker/issues/72.
-    pub(crate) streaming_output_senders:
-        HashMap<NodeIndex, crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>>,
+    pub(crate) streaming_output_senders: HashMap<NodeIndex, crate::executor::stream_hop::HopSender>,
+    /// How each streaming consumer stopped, recorded only for an in-process
+    /// test that asks for it; production records nothing.
+    pub(crate) hop_ends: crate::executor::stream_hop::HopEndLog,
     /// Per-streaming-producer-slot arbitrator registration. One
     /// `NodeBufferConsumer` is registered per logical streaming slot at
     /// executor entry (keyed by the producer's `NodeIndex`); its shared
@@ -2310,7 +2312,7 @@ impl<'a> ExecutorContext<'a> {
     pub(crate) fn take_streaming_sender(
         &mut self,
         node_idx: NodeIndex,
-    ) -> Option<crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>> {
+    ) -> Option<crate::executor::stream_hop::HopSender> {
         if self.current_body_node_input_refs.is_some() {
             return None;
         }
@@ -2338,16 +2340,8 @@ impl<'a> ExecutorContext<'a> {
         producer_idx: NodeIndex,
         producer_name: &str,
         reader_name: &str,
-    ) -> Result<
-        (
-            crossbeam_channel::Receiver<crate::executor::stream_event::StreamEvent>,
-            Arc<crate::pipeline::memory::ConsumerHandle>,
-            crate::pipeline::memory::ConsumerId,
-        ),
-        PipelineError,
-    > {
-        let (tx, rx) =
-            crossbeam_channel::bounded::<crate::executor::stream_event::StreamEvent>(256);
+    ) -> Result<crate::executor::stream_hop::StreamingIngestHop, PipelineError> {
+        let (tx, rx) = crossbeam_channel::bounded::<crate::executor::stream_hop::HopMessage>(256);
         let charge_handle = crate::pipeline::memory::ConsumerHandle::new();
         let charge_consumer_id = self.memory_budget.register_node_consumer(
             Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
@@ -2362,10 +2356,16 @@ impl<'a> ExecutorContext<'a> {
                 },
             },
         )?;
+        let end = crate::executor::stream_hop::HopEnd::new(tx.clone());
         self.streaming_output_senders.insert(producer_idx, tx);
         self.streaming_charge_consumers
             .insert(producer_idx, (charge_consumer_id, charge_handle.clone()));
-        Ok((rx, charge_handle, charge_consumer_id))
+        Ok(crate::executor::stream_hop::StreamingIngestHop {
+            rx,
+            end,
+            charge_handle,
+            charge_consumer_id,
+        })
     }
 
     /// Build the [`crate::executor::batch_handoff::StreamingChargeHandle`]
@@ -4087,7 +4087,7 @@ fn admit_node_buffer_inner(
 /// materialized-tail bookkeeping is skipped that a downstream stage
 /// depends on.
 pub(crate) fn stream_linear_producer_emit(
-    sender: &crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>,
+    sender: &crate::executor::stream_hop::HopSender,
     batch_size: usize,
     node_name: &str,
     rows: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
@@ -4100,14 +4100,16 @@ pub(crate) fn stream_linear_producer_emit(
             charge.charge_and_route(
                 batch,
                 |event: crate::executor::stream_event::StreamEvent| {
-                    sender.send(event).map_err(|_| PipelineError::Internal {
-                        op: "executor",
-                        node: node_name.to_string(),
-                        detail: String::from(
-                            "streaming Sink writer task dropped its receiver before \
+                    sender
+                        .send(crate::executor::stream_hop::HopMessage::Event(event))
+                        .map_err(|_| PipelineError::Internal {
+                            op: "executor",
+                            node: node_name.to_string(),
+                            detail: String::from(
+                                "streaming Sink writer task dropped its receiver before \
                              the streaming producer arm finished",
-                        ),
-                    })
+                            ),
+                        })
                 },
             )
         },
@@ -4446,7 +4448,7 @@ pub(crate) fn finalize_node_rooted_windows(
 /// Vec instead). Bundled into one struct so the arm's signature stays
 /// under the argument-count lint.
 pub(crate) struct MergeStreamHandoff<'a> {
-    pub(crate) sender: crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>,
+    pub(crate) sender: crate::executor::stream_hop::HopSender,
     pub(crate) charge: &'a crate::executor::batch_handoff::StreamingChargeHandle,
     pub(crate) batch_size: usize,
 }
@@ -4625,7 +4627,7 @@ pub(crate) fn merge_fused_interleave(
                 |event: crate::executor::stream_event::StreamEvent| {
                     handoff
                         .sender
-                        .send(event)
+                        .send(crate::executor::stream_hop::HopMessage::Event(event))
                         .map_err(|_| PipelineError::Internal {
                             op: "executor",
                             node: merge_name.to_string(),
@@ -5075,14 +5077,15 @@ pub(crate) fn transform_fused_consume(
                 return charge.charge_and_route(
                     batch,
                     |event: crate::executor::stream_event::StreamEvent| {
-                        tx.send(event).map_err(|_| PipelineError::Internal {
-                            op: "executor",
-                            node: String::from("fused-transform-stream"),
-                            detail: String::from(
-                                "streaming Sink writer task dropped its receiver \
+                        tx.send(crate::executor::stream_hop::HopMessage::Event(event))
+                            .map_err(|_| PipelineError::Internal {
+                                op: "executor",
+                                node: String::from("fused-transform-stream"),
+                                detail: String::from(
+                                    "streaming Sink writer task dropped its receiver \
                                  before the fused Transform arm finished",
-                            ),
-                        })
+                                ),
+                            })
                     },
                 );
             }
@@ -5274,13 +5277,27 @@ pub(crate) fn transform_fused_consume(
         }
         Ok(())
     })();
-    // Surface a loop error first (the originating failure), then flush the
-    // trailing partial batch. `finish` consumes the batcher, dropping the
-    // streaming sender (clean-exit disconnect of the writer thread) or
-    // releasing the borrow of `output_records` for the materialized-path
-    // helper calls below; on the loop-error path the batcher drops here
-    // instead, which also drops the sender / releases the borrow.
-    loop_result?;
+    // A producer delivers every row it emitted before it reports its
+    // failure, so the step it streams into meets the rows in data order and
+    // fails on the earliest row it cannot take. On a loop error the pending
+    // batch is flushed first. The loop's error is earlier in data order than
+    // any row that batch carries, so it is the error returned even when the
+    // flush fails too. `finish` consumes the batcher, dropping the streaming
+    // sender or releasing the borrow of `output_records` for the
+    // materialized-path helper calls below. Dropping the sender does not end
+    // the consumer's input: only the hop's End does, sent after this arm
+    // returns `Ok`.
+    if let Err(loop_error) = loop_result {
+        if let Err(flush_error) = event_batcher.finish() {
+            tracing::warn!(
+                node = name,
+                error = %flush_error,
+                "the Transform could not hand the rows it produced before its failure to \
+                 the step it streams into; the run reports the Transform's failure"
+            );
+        }
+        return Err(loop_error);
+    }
     event_batcher.finish()?;
     ctx.finalize_source_count(&source_name_arc, count);
     ctx.release_source_consumer(source_name_owned.as_str());

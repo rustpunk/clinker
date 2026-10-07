@@ -30,7 +30,7 @@ use crate::executor::dispatch::{
     tee_emit_to_region_input_buffers, transform_fused_consume,
 };
 use crate::executor::schema_check::check_input_schema;
-use crate::executor::stream_event::{Punctuation, SourceRowId, StreamEvent};
+use crate::executor::stream_event::{Punctuation, SourceRowId};
 use crate::executor::{
     WindowedEvalCtx, evaluate_single_transform, evaluate_single_transform_windowed,
 };
@@ -73,7 +73,7 @@ impl crate::executor::dispatch::DispatchFaultGuard {
 /// The writer thread of a Sink whose edge from this Transform the compiled
 /// plan certified as streaming, with the charge handle its batches cross.
 struct CertifiedSinkHop {
-    sender: crossbeam_channel::Sender<StreamEvent>,
+    sender: crate::executor::stream_hop::HopSender,
     charge: StreamingChargeHandle,
 }
 

@@ -1471,24 +1471,6 @@ impl StreamingProbeEffects {
     }
 }
 
-/// Read the streaming channel to disconnect, discharging each record's
-/// per-row cost, so the driver producer's `send` can never block on a probe
-/// thread that has stopped consuming. Every early return from the probe loop
-/// drains first.
-fn drain_probe_channel(
-    rx: &crossbeam_channel::Receiver<crate::executor::stream_event::StreamEvent>,
-    charge_handle: &crate::pipeline::memory::ConsumerHandle,
-    resources: &clinker_record::owned_storage::AllocationResources,
-) {
-    while let Ok(event) = rx.recv() {
-        if let crate::executor::stream_event::StreamEvent::Record(record, _) = event {
-            charge_handle.sub_bytes(crate::executor::node_buffer::unaccounted_record_byte_cost(
-                &record, resources,
-            ));
-        }
-    }
-}
-
 /// Drive an inline hash build-probe Combine's probe (driver) side off a
 /// bounded channel the driver producer fills, instead of pre-draining the
 /// driver's whole output from a charged `node_buffers` slot. The build-side
@@ -1545,7 +1527,12 @@ fn run_streaming_combine_probe(
     // producer's index, so its dispatch arm streams into it with no
     // producer-side change. The probe thread's per-record `sub_bytes`
     // discharge nets the producer's per-batch charge to zero.
-    let (rx, charge_handle, charge_consumer_id) = ctx.install_streaming_ingest_channel(
+    let crate::executor::stream_hop::StreamingIngestHop {
+        rx,
+        end: hop_end,
+        charge_handle,
+        charge_consumer_id,
+    } = ctx.install_streaming_ingest_channel(
         producer_idx,
         current_dag.graph[producer_idx].name(),
         name,
@@ -1587,7 +1574,11 @@ fn run_streaming_combine_probe(
                 let mut probe_keys_buf: Vec<Value> =
                     Vec::with_capacity(kernel.probe_extractor.len());
                 let mut budget_cadence: usize = 0;
-                while let Ok(event) = rx.recv() {
+                loop {
+                    let event = match rx.recv() {
+                        Ok(crate::executor::stream_hop::HopMessage::Event(event)) => event,
+                        Ok(crate::executor::stream_hop::HopMessage::End) | Err(_) => break,
+                    };
                     let (record, rn) = match event {
                         StreamEvent::Record(r, rn) => (r, rn),
                         // Punctuations carry zero record charge (no `sub_bytes`
@@ -1626,7 +1617,11 @@ fn run_streaming_combine_probe(
                         // A schema mismatch is a fatal E314 in both paths; drain
                         // to disconnect first so the driver `send` cannot
                         // deadlock, then surface.
-                        drain_probe_channel(&rx, &charge_handle, &allocation_resources);
+                        crate::executor::stream_hop::discard_until_closed(
+                            &rx,
+                            &charge_handle,
+                            &allocation_resources,
+                        );
                         return Err(err);
                     }
 
@@ -1676,7 +1671,11 @@ fn run_streaming_combine_probe(
                             // Fatal (FailFast surfacing, on_miss::error,
                             // planner-invariant) — drain to disconnect, then
                             // surface.
-                            drain_probe_channel(&rx, &charge_handle, &allocation_resources);
+                            crate::executor::stream_hop::discard_until_closed(
+                                &rx,
+                                &charge_handle,
+                                &allocation_resources,
+                            );
                             return Err(e);
                         }
                     };
@@ -1704,7 +1703,11 @@ fn run_streaming_combine_probe(
                             0,
                         )
                     {
-                        drain_probe_channel(&rx, &charge_handle, &allocation_resources);
+                        crate::executor::stream_hop::discard_until_closed(
+                            &rx,
+                            &charge_handle,
+                            &allocation_resources,
+                        );
                         return Err(PipelineError::MemoryBudgetExceeded { report });
                     }
                     if budget_cadence >= 10_000 {
@@ -1735,6 +1738,7 @@ fn run_streaming_combine_probe(
         // producer error left a sender lingering on `ctx`, so the probe
         // thread's `recv` returns `Err` and the join below cannot hang.
         ctx.streaming_output_senders.remove(&producer_idx);
+        drop(hop_end);
 
         let probe = handle.join().map_err(|_| PipelineError::Internal {
             op: "combine",
@@ -2651,7 +2655,7 @@ fn drain_block_band_output(
 /// backing is retained until routing consumes it. The bounded channel paces
 /// the drain, and punctuations follow records as on the buffered path.
 fn stream_block_band_rows(
-    sender: &crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>,
+    sender: &crate::executor::stream_hop::HopSender,
     batch_size: usize,
     node_name: &str,
     rows: OutputDrainRows,
@@ -2673,7 +2677,7 @@ fn stream_block_band_rows(
             container,
         } = owned;
         let result = charge.own_charged_batch(batch, pending).and_then(|batch| charge.route_charged_batch(batch, |event| {
-            sender.send(event).map_err(|_| PipelineError::Internal {
+            sender.send(crate::executor::stream_hop::HopMessage::Event(event)).map_err(|_| PipelineError::Internal {
                 op: "executor", node: node_name.to_string(),
                 detail: "streaming Sink writer task dropped its receiver before the output drain finished".into(),
             })

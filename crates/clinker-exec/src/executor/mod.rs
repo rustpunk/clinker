@@ -39,6 +39,7 @@ pub mod source_stream;
 pub mod spill_purge;
 pub mod storage_validate;
 pub(crate) mod stream_event;
+pub(crate) mod stream_hop;
 mod streaming;
 pub(crate) mod structured_output_guard;
 pub(crate) mod time_window;
@@ -72,7 +73,7 @@ pub use params::{
 #[cfg(any(test, feature = "test-utils"))]
 pub use params::{
     ForcedShortfall, HardLimitReclaim, HardLimitReclaims, IN_PROCESS_BASELINE_BYTES,
-    SourceDrainCharge, SourceDrainCharges,
+    SourceDrainCharge, SourceDrainCharges, StreamingEnd, StreamingEnds, StreamingInputEnd,
 };
 pub use registry::WriterRegistry;
 pub(crate) use registry::build_format_writer;
@@ -1816,7 +1817,7 @@ impl PipelineExecutor {
         let truncation_ledger = truncation_report::TruncationLedger::default();
         let mut streaming_output_senders: HashMap<
             petgraph::graph::NodeIndex,
-            crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>,
+            crate::executor::stream_hop::HopSender,
         > = HashMap::new();
         let mut streaming_sink_nodes: HashSet<petgraph::graph::NodeIndex> = HashSet::new();
         let mut streaming_output_tasks: Vec<std::thread::JoinHandle<StreamingOutputTaskOutput>> =
@@ -1840,7 +1841,7 @@ impl PipelineExecutor {
             // curve. Mirrors the Source ingest channel sizing (issue
             // #67) — the same bound paces both ends of the pipeline.
             let (tx, rx) =
-                crossbeam_channel::bounded::<crate::executor::stream_event::StreamEvent>(256);
+                crossbeam_channel::bounded::<crate::executor::stream_hop::HopMessage>(256);
             let producer_idx = spec.producer_idx;
             let output_idx = spec.output_idx;
             let output_name = spec.output_name.clone();
@@ -2016,6 +2017,7 @@ impl PipelineExecutor {
                 params.telemetry_producer.clone(),
             ),
             streaming_output_senders,
+            hop_ends: stream_hop::HopEndLog::for_run(&params.memory_test),
             streaming_sink_nodes,
             streaming_aggregate_ingest_edges,
             streaming_combine_probe_edges,

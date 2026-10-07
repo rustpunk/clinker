@@ -171,6 +171,8 @@ pub struct MemoryTestOverrides {
     hard_limit_reclaims: Option<HardLimitReclaims>,
     #[cfg(any(test, feature = "test-utils"))]
     source_drain_charges: Option<SourceDrainCharges>,
+    #[cfg(any(test, feature = "test-utils"))]
+    streaming_ends: Option<StreamingEnds>,
 }
 
 impl MemoryTestOverrides {
@@ -188,6 +190,8 @@ impl MemoryTestOverrides {
             hard_limit_reclaims: None,
             #[cfg(any(test, feature = "test-utils"))]
             source_drain_charges: None,
+            #[cfg(any(test, feature = "test-utils"))]
+            streaming_ends: None,
         }
     }
 
@@ -319,6 +323,68 @@ impl MemoryTestOverrides {
     /// The record to keep the run's Source drain charges in, if any.
     pub(crate) fn source_drain_charges(&self) -> Option<&SourceDrainCharges> {
         self.source_drain_charges.as_ref()
+    }
+
+    /// Record in `record` how each streaming consumer of the run (a
+    /// streaming Sink, Aggregate ingest or Combine probe, on its own thread)
+    /// stopped: on its producer's end, on an input that closed without it,
+    /// or on its own failure, and whether it finished its work. For an
+    /// in-process test of a failed or cancelled run, whose published output
+    /// cannot show whether a step finished on the rows it was given.
+    pub fn with_streaming_ends(mut self, record: StreamingEnds) -> Self {
+        self.streaming_ends = Some(record);
+        self
+    }
+
+    /// The record to keep the run's streaming consumer ends in, if any.
+    pub(crate) fn streaming_ends(&self) -> Option<&StreamingEnds> {
+        self.streaming_ends.as_ref()
+    }
+}
+
+/// How each streaming consumer of a run stopped, in the order they stopped.
+/// Every clone shares the one record, so a test keeps a clone before handing
+/// the value to a run through [`MemoryTestOverrides::with_streaming_ends`].
+/// It grows by one entry per streaming consumer and is for in-process tests
+/// only.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone, Debug, Default)]
+pub struct StreamingEnds(std::sync::Arc<std::sync::Mutex<Vec<StreamingEnd>>>);
+
+/// How one streaming consumer stopped.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamingEnd {
+    /// The consumer's node name.
+    pub node: String,
+    /// How its input ended, or that it failed first.
+    pub input: StreamingInputEnd,
+    /// Whether it finished its work: an Aggregate finalized its groups, a
+    /// Combine completed its probe, a Sink closed its output.
+    pub finished: bool,
+}
+
+/// How a streaming consumer's input ended.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamingInputEnd {
+    /// The consumer read its producer's end.
+    Ended,
+    /// The input closed without its producer's end.
+    Incomplete,
+    /// The consumer failed before its input ended.
+    ConsumerFailed,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl StreamingEnds {
+    /// The consumer ends recorded so far, in the order they stopped.
+    pub fn ends(&self) -> Vec<StreamingEnd> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub(crate) fn record(&self, end: StreamingEnd) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).push(end);
     }
 }
 
