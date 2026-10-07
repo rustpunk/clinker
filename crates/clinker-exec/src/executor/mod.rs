@@ -3217,4 +3217,5 @@ nodes:
     mod spill_dir_unavailable_midrun;
     mod stream_hop_end;
     mod transient_node_buffer_reservations;
+    mod walk_failure_order;
 }
