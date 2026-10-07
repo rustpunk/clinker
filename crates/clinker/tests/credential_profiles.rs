@@ -812,6 +812,68 @@ fn bounds_lease_admission_ignores_the_process_memory_reading() {
 }
 
 #[test]
+fn bounds_a_registry_whose_table_does_not_fit_is_refused_with_its_e310() {
+    // The fixed handle table is admitted through the ledger like a lease: on
+    // a ledger too full to hold it the registry is refused with the run's
+    // E310, and the refused table never raises the run's peak past the limit.
+    let provider = overshoot_fixture();
+    let providers: [&dyn CredentialProvider; 1] = [&provider];
+    let profiles = [CredentialProfile::new(
+        CredentialProfileName::parse("release").expect("valid explicit profile"),
+        &providers,
+    )];
+    let catalog = CredentialProfileCatalog::admit(&profiles, profile_limits(1, 1, usize::MAX, 2))
+        .expect("bounded profile catalog");
+    let limit = 64 * 1024 * 1024;
+    let arbitrator = memory_arbitrator(limit);
+    let filler = arbitrator
+        .reserve(
+            limit - 1,
+            clinker_exec::pipeline::memory::ledger::Requester::governed(),
+        )
+        .expect("the filler fits the run budget");
+
+    let error = CredentialHandleRegistry::new(&arbitrator, &catalog)
+        .err()
+        .expect("a table that does not fit beside the run's charge is refused");
+
+    assert_eq!(
+        error.kind(),
+        CredentialRegistryErrorKind::MemoryLimitExceeded
+    );
+    let report = error
+        .memory_report()
+        .expect("a memory refusal carries the run's E310 report");
+    assert_eq!(
+        report.requester,
+        Some(clinker_plan::runtime_error::ConsumerLabel {
+            node: "credentials".to_string(),
+            surface: clinker_plan::runtime_error::MemorySurface::CredentialRegistry,
+        })
+    );
+    assert!(
+        report.requested_bytes > 1,
+        "the refusal names the table's bytes"
+    );
+    assert_eq!(
+        report.charged_bytes,
+        limit - 1,
+        "the refusal reads the run's charged total"
+    );
+    assert!(
+        arbitrator.peak_charged_bytes() <= limit,
+        "the refused table never raises the run's peak past the limit"
+    );
+    assert_eq!(
+        arbitrator.consumer_count(),
+        0,
+        "the refused registry leaves no consumer"
+    );
+    drop(filler);
+    assert_eq!(arbitrator.charged_bytes(), 0);
+}
+
+#[test]
 fn bounds_refused_lease_never_raises_the_run_peak_past_the_limit() {
     // A refused lease charges nothing, so the run's highest charged total
     // never records bytes that were refused and never allocated.
@@ -1414,7 +1476,24 @@ fn lifecycle_registry_preallocation_failure_closes_one_resolve_attempt() {
         .expect("bounded profile catalog");
     let selected = CredentialProfileName::parse("memory-failure").expect("valid explicit profile");
     let requirement = requirement(vec![CredentialCapability::AuthenticateRequest]);
-    let arbitrator = memory_arbitrator(0);
+    // The run's limit is the floor the registry's own table refusal reports,
+    // so the fixed table fits and no lease beside it does. The report's
+    // suggested limit is not used: it rounds up to a whole MiB, which would
+    // admit the lease as well.
+    let probe_arbitrator = memory_arbitrator(1);
+    let table_refusal = CredentialHandleRegistry::new(&probe_arbitrator, &catalog)
+        .err()
+        .expect("a one-byte run cannot hold the registry's fixed table");
+    assert_eq!(
+        table_refusal.kind(),
+        CredentialRegistryErrorKind::MemoryLimitExceeded
+    );
+    assert_eq!(probe_arbitrator.consumer_count(), 0);
+    let table_report = table_refusal
+        .memory_report()
+        .expect("the table refusal carries the run's E310 report");
+    assert!(table_report.requested_bytes > 0);
+    let arbitrator = memory_arbitrator(table_report.charged_bytes + table_report.requested_bytes);
     let (producer, receiver) = telemetry_arena();
     let mut registry =
         CredentialHandleRegistry::new_with_telemetry(&arbitrator, &catalog, producer)
