@@ -2014,17 +2014,15 @@ pub(crate) struct ExecutorContext<'a> {
     /// interrupted execution rather than discarded.
     pub(crate) transform_signal_carry: crate::log_dispatch::ParkedTransformSignals,
 
-    /// Streaming-Output channel senders keyed by the upstream fused
-    /// `Merge` node's `NodeIndex`. Present when the executor entry has
-    /// matched a `Merge.interleave → single Output` chain against
-    /// the streaming eligibility predicate (issue #72) and spawned the
-    /// writer thread. The fused Merge arm checks the map for its index;
-    /// if present, it streams each canonicalized record through the
-    /// bounded crossbeam channel instead of accumulating into a `Vec`,
-    /// and drops its sender at clean exit so the writer thread's `recv`
-    /// returns `Err` (channel disconnected). Empty for pipelines that
-    /// don't match the topology — every other Output stays on the
-    /// buffered path. See
+    /// Streaming-hop senders keyed by the producer's `NodeIndex`: one per
+    /// edge the compiled plan certified as streaming, installed at executor
+    /// entry for a streaming Sink's writer thread, or by a streaming
+    /// Aggregate or Combine arm for its consumer thread. The producer's arm
+    /// takes its sender and streams each event through the bounded channel
+    /// instead of admitting a node buffer. Dropping a sender does not end the
+    /// consumer's input: only the hop's End does, sent by the hop's driver
+    /// once the producer's dispatch returned `Ok`. Empty for pipelines with
+    /// no streaming edge. See
     /// https://github.com/rustpunk/clinker/issues/72.
     pub(crate) streaming_output_senders: HashMap<NodeIndex, crate::executor::stream_hop::HopSender>,
     /// How each streaming consumer stopped, recorded only for an in-process
@@ -4887,11 +4885,10 @@ pub(crate) fn merge_fused_interleave(
     // Reconcile the collected boundaries down to one open + one close per
     // document (the non-fused Merge arm's cross-input fold). In streaming
     // mode emit them through the same bounded channel at the tail and
-    // return an empty result; the sender then drops with this frame,
-    // disconnecting the writer thread's `recv` loop and triggering its
-    // flush. In materialized mode hand the records and the reconciled
-    // boundaries back to the Merge arm, which admits both into the node
-    // buffer.
+    // return an empty result; the consumer finishes on the hop's End, sent
+    // once this arm returns `Ok`. In materialized mode hand the records and
+    // the reconciled boundaries back to the Merge arm, which admits both into
+    // the node buffer.
     let deduped_puncts =
         crate::executor::stream_event::reconcile_document_boundaries(collected_puncts);
     if streaming.is_some() {
@@ -4899,8 +4896,7 @@ pub(crate) fn merge_fused_interleave(
         // chunked at `batch_size` exactly like the record stream above and
         // the non-fused arm's `stream_linear_producer_emit`, so a run
         // spanning very many documents never builds one unbounded tail
-        // batch. The sender then drops with this frame, disconnecting the
-        // writer thread's `recv` loop and triggering its flush.
+        // batch.
         let mut batch = crate::executor::batch_handoff::EventBatch::with_capacity(batch_size);
         for p in deduped_puncts {
             batch.push_punctuation(p);

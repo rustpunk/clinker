@@ -295,7 +295,8 @@ where
     // `branch_buffers` holds exactly the one successor here, and a
     // streaming Route → terminal Output crosses no deferred
     // region, so the cross-region tee below is correctly skipped.
-    // Dropping the sender disconnects the writer's recv.
+    // The writer closes its output only on the hop's End, which the walk
+    // sends once this arm returns `Ok`.
     if let Some((sender, charge)) = ctx.take_streaming_hop(current_dag, node_idx, name)? {
         let batch_size = ctx.batch_size;
         let merged: Vec<(Record, crate::executor::stream_event::SourceRowId)> =

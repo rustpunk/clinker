@@ -508,8 +508,8 @@ fn finalize_aggregate_emit(
         // this streaming handoff; the eligibility predicate
         // certified this aggregate roots no window and is not a
         // deferred-region producer, so the helper calls below are
-        // correctly skipped. Dropping the sender disconnects the
-        // writer's recv loop.
+        // correctly skipped. The writer closes its output only on the
+        // hop's End, which the walk sends once this arm returns `Ok`.
         if let Some((sender, charge)) = ctx.take_streaming_hop(current_dag, node_idx, name)? {
             let batch_size = ctx.batch_size;
             stream_linear_producer_emit(
@@ -1574,10 +1574,13 @@ struct AggregateEmit {
 /// every close after all records, so several buckets populate during the
 /// record run and each close flushes its own — splitting the documents
 /// rather than folding them. The finalize half stays blocking: once the
-/// channel disconnects (every sender dropped at the producer arm's clean
-/// exit), every surviving bucket (the synthetic-doc-id sentinel of a
+/// producer's End arrives (this arm sends it after the producer's dispatch
+/// returned `Ok`), every surviving bucket (the synthetic-doc-id sentinel of a
 /// no-envelope pipeline, plus any document whose close never arrived) flushes
-/// in ascending `DocumentId` order and the finalized rows return.
+/// in ascending `DocumentId` order and the finalized rows return. A channel
+/// that closes without End means the producer failed or was stopped: no
+/// bucket is finalized, and the hop's join reports the first failure in data
+/// order.
 /// Document-boundary punctuations are forwarded at the output tail unchanged.
 ///
 /// Memory: this holds one open table per open-but-not-yet-closed document —
@@ -1625,8 +1628,8 @@ fn run_streaming_aggregate_ingest(
     // table through the factory's captured `Arc<MemoryArbitrator>`. Each
     // table's `AggregateConsumer` contributes its growing group state to
     // `sum_consumer_usage` while live, and is unregistered when that
-    // document flushes (on its `DocumentClose`, or at disconnect for the
-    // document left open).
+    // document flushes (on its `DocumentClose`, or at the producer's End for
+    // the document left open).
     let factory = DocAggregatorFactory::from_ctx(ctx, spec)?;
     let allocation_resources = ctx.allocation_resources.clone();
 

@@ -168,9 +168,9 @@ pub(crate) fn settle_hop(
 }
 
 /// Where a run records how each of its streaming consumers ended. Only an
-/// in-process test, through
-/// [`crate::executor::MemoryTestOverrides::with_streaming_ends`], gives it a
-/// record; otherwise recording does nothing.
+/// in-process test, through `MemoryTestOverrides::with_streaming_ends`
+/// (compiled only for tests), gives it a record; otherwise recording does
+/// nothing.
 #[derive(Clone, Default)]
 pub(crate) struct HopEndLog {
     #[cfg(any(test, feature = "test-utils"))]

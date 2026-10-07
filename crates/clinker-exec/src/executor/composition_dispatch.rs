@@ -581,9 +581,9 @@ fn execute_composition_body(
     ctx.planned_node_buffer_readers = saved_planned_readers;
     // Drop every residual body receiver before joining its finite ingest
     // workers. This unblocks a producer whose downstream body failed before
-    // draining the bounded channel. Source arms that reached EOF already
-    // removed and unregistered their own consumer; the sweep covers only
-    // early-return residue.
+    // draining the bounded channel. Source arms that took their reader's
+    // `Ended` event already removed and unregistered their own consumer;
+    // the sweep covers only early-return residue.
     drop(std::mem::take(&mut ctx.source_records));
     for (_, (id, handle)) in std::mem::take(&mut ctx.source_consumers) {
         handle.resume();

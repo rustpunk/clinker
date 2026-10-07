@@ -396,7 +396,7 @@ pub(super) fn drain_streaming_channel<C: StreamingConsumer>(
 /// The `Output` instantiation of [`StreamingConsumer`]: projects each
 /// record through `project_output_from_record`, lazily constructs the
 /// format writer on the first record, calls `Writer::write_record` per
-/// record, and flushes at channel close. Errors are accumulated into
+/// record, and flushes on the producer's End. Errors are accumulated into
 /// `out` rather than aborting so the dispatcher can surface them alongside
 /// any sibling `output_errors`.
 struct SinkStreamConsumer {

@@ -2099,13 +2099,14 @@ impl PipelineExecutor {
         //
         // Wrapped in an immediately-invoked closure so a `?` error inside
         // doesn't short-circuit past the streaming-output thread join
-        // below — the spawned threads own writers we still need to flush
-        // (or drop) before the function returns, and dropping
-        // `ctx.streaming_output_senders` on the error path is what signals
-        // the threads to disconnect their channel and run their flush. A
-        // tripped shutdown token surfaces as `PipelineError::Interrupted`
-        // from a per-node poll, which lands here too so the same
-        // drain-then-join cleanup runs.
+        // below — the spawned threads own writers we still need to close
+        // or abandon before the function returns. A Sink closes its output
+        // only on its hop's End, which the loop sends after its producer's
+        // turn returns `Ok`; on the error path the held ends and senders are
+        // dropped instead, so each Sink's channel closes without End and the
+        // Sink abandons its output. A tripped shutdown token surfaces as
+        // `PipelineError::Interrupted` from a per-node poll, which lands
+        // here too so the same drain-then-join cleanup runs.
         // Under document dead-lettering every Sink waits for every operator
         // of its pass, so each document's verdict is final before any Sink
         // writes; the plan orders Sinks last on the same predicate.

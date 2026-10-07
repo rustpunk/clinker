@@ -168,9 +168,9 @@ where
     // this Merge passed the eligibility predicate at executor
     // entry, its crossbeam `Sender` was installed under our
     // `node_idx`. Take it here so the Merge arm streams every
-    // record through the channel instead of accumulating, and so
-    // dropping the sender at clean exit disconnects the streaming
-    // thread's `recv` loop. The fused-interleave path streams
+    // record through the channel instead of accumulating. The writer
+    // closes its output only on the hop's End, which the walk sends once
+    // this arm returns `Ok`. The fused-interleave path streams
     // inside `merge_fused_interleave` (the sender moves there);
     // the non-fused path (concat, or interleave with non-Source
     // inputs) accumulates `merged` then streams it through
@@ -426,12 +426,11 @@ where
     // overlap the writer with the next topo node. (The fused
     // Merge.interleave path is the true one-batch streamer; it
     // forwards records off the live Source channels inside
-    // `merge_fused_interleave` and returns an empty `merged`, its
-    // sender already dropped there.) The eligibility predicate
-    // certified this Merge roots no window and tees to no deferred
-    // region, so the helper calls below are correctly skipped.
-    // Dropping `nonfused_sender` at the end of this branch
-    // disconnects the writer thread's `recv` loop.
+    // `merge_fused_interleave` and returns an empty `merged`.) The
+    // eligibility predicate certified this Merge roots no window and
+    // tees to no deferred region, so the helper calls below are
+    // correctly skipped. The writer closes its output only on the hop's
+    // End, which the walk sends once this arm returns `Ok`.
     if let Some((sender, charge)) = nonfused_hop {
         stream_linear_producer_emit(
             &sender,
