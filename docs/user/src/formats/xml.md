@@ -35,8 +35,9 @@ adding an `encoding` option. Names, attributes, text and CDATA are never decoded
 with replacement characters.
 
 Validation applies to bytes the reader consumes. A pre-scan may find a late
-error before any body record is delivered; a streaming body can have already
-delivered earlier records. Each subsequent file establishes its own BOM and
+error before any body record is delivered; an error later in a streaming body
+fails the run the same way, and no step finishes on the records read before it.
+Each subsequent file establishes its own BOM and
 declaration policy. Metadata adjacent to a selected record does not become an
 extra row, and repeated matching containers preserve body order and empty rows.
 
