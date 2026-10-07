@@ -463,6 +463,99 @@ fn a_reader_panic_fails_the_run_naming_the_source() {
     );
 }
 
+/// Rows the dying reader yields before its thread dies.
+const ROWS_BEFORE_THE_THREAD_DIES: usize = 10;
+
+const PAYLOAD_DROP_PANIC: &str = "the caught panic's payload panicked as it was dropped";
+
+/// A panic payload that panics again when it is dropped.
+struct PanicsWhenDropped;
+
+impl Drop for PanicsWhenDropped {
+    fn drop(&mut self) {
+        panic!("{PAYLOAD_DROP_PANIC}");
+    }
+}
+
+/// [`ROWS_BEFORE_THE_THREAD_DIES`] rows, then a panic carrying a
+/// [`PanicsWhenDropped`] payload. The reader thread catches the first panic,
+/// but `catch_unwind` hands the payload back to its caller, and std documents
+/// that dropping it may panic in turn: that second panic starts after the
+/// catch, so the thread dies without sending its stream's terminal event.
+struct DiesOutsideTheCatch {
+    schema: clinker_record::owned_storage::SharedStorage<clinker_record::Schema>,
+    sent: usize,
+}
+
+impl crate::source::RecordSource for DiesOutsideTheCatch {
+    fn schema(
+        &mut self,
+    ) -> Result<
+        clinker_record::owned_storage::SharedStorage<clinker_record::Schema>,
+        clinker_format::FormatError,
+    > {
+        Ok(self.schema.clone())
+    }
+
+    fn next_record(
+        &mut self,
+    ) -> Result<Option<clinker_record::Record>, clinker_format::FormatError> {
+        if self.sent < ROWS_BEFORE_THE_THREAD_DIES {
+            self.sent += 1;
+            return Ok(Some(interrupted_row(&self.schema, self.sent - 1)));
+        }
+        std::panic::panic_any(PanicsWhenDropped)
+    }
+}
+
+/// A reader thread that dies without ending its stream has not reached the
+/// end of its input, though its channel closes just as a finished one does.
+/// The run fails naming the Source, nothing after it finishes on the rows it
+/// sent, and the thread's death is logged on the walk's thread with the
+/// Source's name and the panic's message.
+#[test]
+fn a_reader_that_dies_without_a_terminal_event_fails_the_run_and_finishes_nothing() {
+    let readers: crate::executor::SourceReaders = HashMap::from([(
+        "src".to_string(),
+        crate::source::SourceInput::Records(Box::new(DiesOutsideTheCatch {
+            schema: interrupted_schema(),
+            sent: 0,
+        })),
+    )]);
+    let (run, warnings) = super::capture_warnings(|| {
+        run_readers(&source_aggregate(), readers, &["agg_out"], None, None)
+    });
+    let error = run
+        .result
+        .as_ref()
+        .expect_err("a reader thread that dies fails the run");
+    assert_eq!(
+        run.outputs["agg_out"], "",
+        "no total is finished over the rows sent before the thread died"
+    );
+    assert!(
+        matches!(
+            error,
+            PipelineError::Internal { node, detail, .. }
+                if node == "src" && detail.contains("without reporting why")
+        ),
+        "the failure names the Source whose reader stopped without a terminal event: {error:?}"
+    );
+    let lines: Vec<&String> = warnings
+        .iter()
+        .filter(|line| line.contains(r#"source="src""#))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "one warning names the Source whose reader thread died: {warnings:?}"
+    );
+    assert!(
+        lines[0].contains(PAYLOAD_DROP_PANIC),
+        "the warning carries the panic that killed the thread: {warnings:?}"
+    );
+}
+
 /// A reader that reads its whole input still ends normally on every path,
 /// and its rows reach the Sink unchanged and in order.
 #[test]
