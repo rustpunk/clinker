@@ -1499,9 +1499,18 @@ fn nested_input_rows_enforce_utf8_and_independent_physical_file_policy() {
                     "{id}: failed run must not publish"
                 );
                 let partials = nested_partial_outputs(root.path());
-                // The walk stops at the reader's failure, so the retained
-                // attempt holds none of the rows read before it.
-                let expected: &[u8] = b"";
+                // The walk stops at the reader's failure, so a Sink fed from
+                // the Source's buffered arm writes nothing. Only xml-prescan
+                // streams its rows into the Sink as they are read (Source ->
+                // Transform -> Sink): its retained attempt holds the rows
+                // delivered before the failure, the first file's row when the
+                // second file is the invalid one, unclosed and unpublished.
+                let streams_into_sink = mode == "xml-prescan";
+                let expected: &[u8] = if streams_into_sink && variant == "invalid-second" {
+                    first
+                } else {
+                    b""
+                };
                 assert!(
                     partials.iter().any(|bytes| bytes == expected),
                     "{id}: retained prefix {partials:?}"

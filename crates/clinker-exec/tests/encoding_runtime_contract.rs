@@ -486,7 +486,7 @@ mode = "none"
 }
 
 #[test]
-fn nested_failed_second_file_keeps_source_count_and_writes_no_rows() {
+fn nested_failed_second_file_keeps_source_count_and_publishes_no_rows() {
     use clinker_exec::progress::RunProgress;
     use clinker_exec::telemetry::{MetricKey, TelemetryArena};
     use clinker_plan::config::ClinkerToml;
@@ -577,6 +577,10 @@ nodes:
             "xml-ordinary" => b"<row><id>1</id></row>",
             _ => b"<Root><items><row><id>1</id></row></items><manifest><batch>7</batch></manifest></Root>",
         };
+        // Only this layout streams its rows into the Sink as they are read
+        // (Source -> Transform -> Sink); every other layout's Sink runs only
+        // after a complete read.
+        let streams_into_sink = *mode == "xml-prescan";
         let accepted: &[u8] = if *mode == "xml-prescan" {
             b"{\"id\":1,\"batch\":7}\n"
         } else {
@@ -648,19 +652,46 @@ nodes:
                 "{mode}: {error:?}"
             );
             assert_eq!(progress.sample().records_read, count, "{mode}/{variant}");
-            // The walk stops at the reader's failure, so the Sink writes none
-            // of the rows read before it.
-            assert_eq!(std::fs::read(&path).unwrap(), b"", "{mode}");
+            // The walk stops at the reader's failure, so a Sink fed from the
+            // Source's buffered arm writes nothing, and a streaming Sink holds
+            // the rows delivered to it before the failure, unclosed.
+            let output = std::fs::read(&path).unwrap();
+            let delivered: &[u8] = if streams_into_sink && !late {
+                accepted
+            } else {
+                b""
+            };
+            assert_eq!(output, delivered, "{mode}/{variant}");
             let mut records = 0;
             let mut bytes = 0;
             let mut source_failed = 0;
+            let mut sink_errors = 0;
+            let mut sink_failed = 0;
+            let mut sink_completed = 0;
             while let Some(batch) = receiver.try_recv_batch() {
                 records += batch.metric(MetricKey::SinkRecords);
                 bytes += batch.metric(MetricKey::SinkBytes);
                 source_failed += batch.metric(MetricKey::SourceFailed);
-                assert_eq!(batch.metric(MetricKey::SinkErrors), 0, "{mode}");
+                sink_errors += batch.metric(MetricKey::SinkErrors);
+                sink_failed += batch.metric(MetricKey::SinkFailed);
+                sink_completed += batch.metric(MetricKey::SinkCompleted);
             }
-            assert_eq!((records, bytes, source_failed), (0, 0, 1), "{mode}");
+            let written_rows = output.iter().filter(|byte| **byte == b'\n').count() as u64;
+            assert_eq!(
+                (records, bytes, source_failed),
+                (written_rows, output.len() as u64, 1),
+                "{mode}/{variant}"
+            );
+            // A streaming Sink whose input stopped without its end records a
+            // failure with one error, never a completion.
+            assert_eq!(
+                sink_errors,
+                u64::from(streams_into_sink),
+                "{mode}/{variant}"
+            );
+            if streams_into_sink {
+                assert_eq!((sink_failed, sink_completed), (1, 0), "{mode}/{variant}");
+            }
         }
         assert!(executed.insert(*mode));
     }
