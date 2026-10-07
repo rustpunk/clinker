@@ -832,11 +832,7 @@ pub(crate) fn consume_source_event(
     expected_source: &Arc<str>,
     item: Option<crate::executor::source_stream::SourceStreamEvent>,
 ) -> Result<ConsumedSourceEvent, PipelineError> {
-    // A failure ends the walk before `finalize_source_count` flushes the
-    // staged tail, so each failure arm publishes it first: the observer's
-    // count of rows read includes the rows read before the reader stopped.
     let Some(event) = item else {
-        publish_record_progress(ctx);
         return Err(PipelineError::Internal {
             op: "source-read",
             node: expected_source.to_string(),
@@ -848,7 +844,6 @@ pub(crate) fn consume_source_event(
     match event {
         crate::executor::source_stream::SourceStreamEvent::Ended => Ok(ConsumedSourceEvent::Ended),
         crate::executor::source_stream::SourceStreamEvent::Failed(failure) => {
-            publish_record_progress(ctx);
             Err(failure.take().unwrap_or_else(|| PipelineError::Internal {
                 op: "source-read",
                 node: expected_source.to_string(),
