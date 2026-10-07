@@ -1646,8 +1646,8 @@ fn run_streaming_combine_probe(
                         .push((Arc::clone(&source_name_arc), rn));
 
                     // Mid-stream `$source.count` is `None` (the driver total is
-                    // unknown until its Source's stream ends) — the same
-                    // defer-emit semantic the streaming Aggregate ingest uses.
+                    // unknown until disconnect) — the same defer-emit semantic
+                    // the streaming Aggregate ingest uses.
                     let eval_ctx = EvalContext {
                         stable,
                         source_file: &source_file_arc,

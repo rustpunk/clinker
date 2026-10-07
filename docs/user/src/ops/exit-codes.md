@@ -145,9 +145,8 @@ attempt's final paths are unchanged. These produce it:
   be written. The run refuses to publish an outcome it cannot report, so a
   broken control pipe stops the attempt rather than promoting silently.
 - A bounded `--dry-run -n N` preview cancelled by SIGINT or SIGTERM. Its
-  preview output is incomplete. No step finishes on a source's input that the
-  cancellation cut short, but a step over a source read in full before the
-  signal can still finish and write preview rows.
+  preview output is incomplete. A step can still finish on the records read
+  before the signal and write preview rows.
 
 A **discardable** machine record — a periodic `progress` observation — is not
 in that set. Losing one is reported on stderr as `machine progress channel
