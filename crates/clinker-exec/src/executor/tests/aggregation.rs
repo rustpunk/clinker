@@ -2728,10 +2728,17 @@ mod window_tables_error_exit {
     use crate::executor::{PipelineExecutor, PipelineRunParams, single_file_reader};
     use crate::pipeline::memory::MemoryArbitrator;
 
-    /// A tumbling-window Aggregate over two hourly windows. The earlier
-    /// window's sum overflows at its finalize, so the run fails there while
-    /// the later window's table is still waiting for its own.
-    const YAML: &str = r#"
+    /// Run a grouped time-windowed Aggregate, windowed by `window` and
+    /// emitting `total` as `total_expr`, over `events_csv`, with a fresh
+    /// arbitrator the caller reads afterwards. Each group also collects its
+    /// keys, so every open table holds a charged value heap.
+    fn run_windowed(
+        window: &str,
+        total_expr: &str,
+        events_csv: &str,
+    ) -> (Result<(), PipelineError>, Arc<MemoryArbitrator>) {
+        let yaml = format!(
+            r#"
 pipeline:
   name: window_tables_error_exit
 error_handling:
@@ -2743,56 +2750,43 @@ nodes:
     name: events
     type: csv
     path: events.csv
-    watermark: { column: event_ts }
+    watermark: {{ column: event_ts }}
     schema:
-      - { name: k, type: string }
-      - { name: v, type: int }
-      - { name: event_ts, type: date_time }
+      - {{ name: k, type: string }}
+      - {{ name: v, type: int }}
+      - {{ name: event_ts, type: date_time }}
 - type: aggregate
-  name: hourly
+  name: windowed
   input: events
   config:
     group_by: [k]
     time_window:
-      tumbling: { size: 1h }
+      {window}
     cxl: |
       emit k = k
-      emit total = sum(v)
+      emit total = {total_expr}
+      emit keys = collect(k)
 - type: sink
   name: out
-  input: hourly
+  input: windowed
   config:
     name: out
     type: csv
     path: out.csv
-"#;
-
-    const EVENTS_CSV: &str = "\
-k,v,event_ts
-g,9223372036854775807,2026-05-14T10:00:00
-g,1,2026-05-14T10:30:00
-g,1,2026-05-14T11:00:00
-";
-
-    /// A time-windowed Aggregate that fails with window tables still open
-    /// unregisters each of their consumers on the way out, as the
-    /// per-document arm does: a consumer left registered keeps its charge
-    /// and stays electable by every later reclaim pass, which can no longer
-    /// reach its table.
-    #[test]
-    fn a_failed_windowed_aggregate_unregisters_its_open_window_tables() {
+"#
+        );
         let arbitrator = Arc::new(MemoryArbitrator::with_policy(
             100 * 1024 * 1024 * 1024,
             0.80,
             0.70,
             MemoryArbitrator::default_policy(),
         ));
-        let config = clinker_plan::config::parse_config(YAML).expect("parse pipeline YAML");
+        let config = clinker_plan::config::parse_config(&yaml).expect("parse pipeline YAML");
         let readers = HashMap::from([(
             "events".to_string(),
             single_file_reader(
                 "events.csv",
-                Box::new(std::io::Cursor::new(EVENTS_CSV.as_bytes().to_vec())),
+                Box::new(std::io::Cursor::new(events_csv.as_bytes().to_vec())),
             ),
         )]);
         let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
@@ -2812,7 +2806,59 @@ g,1,2026-05-14T11:00:00
             clinker_plan::config::CompileContext::default(),
             Arc::clone(&arbitrator),
         );
+        (result.map(|_| ()), arbitrator)
+    }
 
+    /// A tumbling, hopping or session Aggregate whose second record fails to
+    /// fold, after the first opened its own table, unregisters every table
+    /// still open on the way out, as the per-document arm does: a consumer
+    /// left registered keeps its charge and stays electable by every later
+    /// reclaim pass, which can no longer reach its table. The second record
+    /// falls in a window or session of its own, so two tables are open when
+    /// the fold fails.
+    #[test]
+    fn a_windowed_aggregate_failing_mid_ingest_unregisters_its_open_tables() {
+        const EVENTS_CSV: &str = "\
+k,v,event_ts
+g,1,2026-05-14T10:00:00
+g,9223372036854775807,2026-05-14T12:00:00
+";
+        let mut left_registered = Vec::new();
+        for window in [
+            "tumbling: { size: 1h }",
+            "hopping: { size: 1h, slide: 30m }",
+            "session: { gap: 30m }",
+        ] {
+            let (result, arbitrator) = run_windowed(window, "sum(v + 1)", EVENTS_CSV);
+            assert!(
+                matches!(result, Err(PipelineError::Eval(_))),
+                "{window}: the second record's overflowing `v + 1` must fail the run as it \
+                 folds, got {result:?}"
+            );
+            let (consumers, charged) =
+                (arbitrator.consumer_count(), arbitrator.sum_consumer_usage());
+            if (consumers, charged) != (0, 0) {
+                left_registered.push((window, consumers, charged));
+            }
+        }
+        assert!(
+            left_registered.is_empty(),
+            "no open table may leave its consumer registered or charged; \
+             (window, consumers, charged bytes) left: {left_registered:?}"
+        );
+    }
+
+    /// A tumbling Aggregate whose earlier window fails at its finalize
+    /// unregisters the later window's table, which never reached its own.
+    #[test]
+    fn a_failed_windowed_aggregate_unregisters_its_open_window_tables() {
+        const EVENTS_CSV: &str = "\
+k,v,event_ts
+g,9223372036854775807,2026-05-14T10:00:00
+g,1,2026-05-14T10:30:00
+g,1,2026-05-14T11:00:00
+";
+        let (result, arbitrator) = run_windowed("tumbling: { size: 1h }", "sum(v)", EVENTS_CSV);
         assert!(
             matches!(result, Err(PipelineError::Accumulator { .. })),
             "the earlier window's overflowing sum must fail the run at its finalize, got {result:?}"
