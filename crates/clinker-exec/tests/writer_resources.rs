@@ -3242,6 +3242,11 @@ fn json_runtime_identity_tracer_factory_writer_and_config_deallocate_before_rele
     let resources = provider.resources();
     let scope = resources.scope().unwrap();
     let observer = arb.writer_resource_observer();
+    // A thread's first governed admission initializes the admission path's
+    // thread-local state, and where std keeps thread-local destructors in a
+    // growable list (macOS, Windows) registering one can allocate. Admit once
+    // before the first capture so each capture sees only the backing it names.
+    drop(scope.reserve(Layout::new::<u64>()).unwrap());
     NATIVE_BACKINGS.with(|watch| {
         watch.set(Some(NativeBackingWatch {
             observer: &observer,
