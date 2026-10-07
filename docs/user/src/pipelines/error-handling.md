@@ -30,8 +30,6 @@ The safest strategy. Any record-level error (type coercion failure, validation e
 
 Some failures abort the run under **either** strategy, because they are not record-scoped: an unwritable output path, a config or CXL compile error, and the DLQ-rate ceiling ([`dlq.max_rate`](#bounding-how-much-can-dead-letter), E315/E316) all end the run regardless of the strategy.
 
-A Source that cannot read its input to the end ends the run with its own error: a read failure part-way through a file, input it cannot parse, or the memory limit refusing the rows it reads (an E310 that names the Source). The rows it read before the failure are not treated as its input. No later step finishes on them, so an Aggregate never reports totals over part of a file, and the run publishes nothing. A Sink that writes rows as they arrive can already have written some of them to its staged file or to a `--dry-run` preview; a staged file is discarded, never published. When a multi-file Source fails on a later file, the run publishes none of the earlier files' rows either: fix or remove the failing file and run again.
-
 CSV, JSON and XML resource failures are also fatal under either strategy. Memory or disk
 admission refusal, allocation failure, descriptor exhaustion and temporary-storage
 failure are not bad-record errors, so `continue` cannot turn them into successful

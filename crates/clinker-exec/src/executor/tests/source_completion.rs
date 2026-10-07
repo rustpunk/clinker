@@ -74,10 +74,7 @@ fn source_completion_observes_worker_teardown_and_late_peak() {
         let mut workers = Vec::new();
         if failed_worker {
             workers.push(std::thread::spawn(|| {
-                Err(crate::executor::source_stream::SourceReadFailure::new(
-                    "failing",
-                    PipelineError::Io(std::io::Error::other("reader failure")),
-                ))
+                Err(PipelineError::Io(std::io::Error::other("reader failure")))
             }));
         }
         workers.push(worker);

@@ -194,8 +194,8 @@ where
     //    the source's plan-time schema, seed `$record.<key>`
     //    defaults, seed `$source.<key>` defaults per
     //    `(source, file_arc)`, advance the per-source running
-    //    counter. On the reader's `Ended`, stamp the finalized
-    //    per-source count and
+    //    counter. On `recv` returning `Err` (channel
+    //    disconnected), stamp the finalized per-source count and
     //    call `finalize_node_rooted_windows` so every spec rooted
     //    at this Source's `NodeIndex` lands its arena.
     //
@@ -352,10 +352,13 @@ where
                 },
                 None => rx.recv().ok(),
             };
-            let consumed =
-                crate::executor::dispatch::consume_source_event(ctx, &source_name_arc, item)?;
+            let consumed = item
+                .map(|event| {
+                    crate::executor::dispatch::consume_source_event(ctx, &source_name_arc, event)
+                })
+                .transpose()?;
             match consumed {
-                crate::executor::dispatch::ConsumedSourceEvent::Record(record, rn) => {
+                Some(crate::executor::dispatch::ConsumedSourceEvent::Record(record, rn)) => {
                     last_file = source_file_arc_of(&record);
                     let mut rec = canonicalize(&record);
                     if has_record_seed {
@@ -370,7 +373,7 @@ where
                     }
                     drained.push((rec, rn));
                 }
-                crate::executor::dispatch::ConsumedSourceEvent::Rejected => {
+                Some(crate::executor::dispatch::ConsumedSourceEvent::Rejected) => {
                     count += 1;
                     records_since_check += 1;
                     if records_since_check >= 1024 {
@@ -378,7 +381,7 @@ where
                         ctx.check_shutdown()?;
                     }
                 }
-                crate::executor::dispatch::ConsumedSourceEvent::Punctuation(p) => {
+                Some(crate::executor::dispatch::ConsumedSourceEvent::Punctuation(p)) => {
                     // Mark a structural-count close failed BEFORE forwarding it,
                     // so the Output arm's per-file buffer rejects the file at
                     // this close rather than flushing it.
@@ -389,8 +392,8 @@ where
                     )?;
                     drained_puncts.push(p);
                 }
-                crate::executor::dispatch::ConsumedSourceEvent::Population => {}
-                crate::executor::dispatch::ConsumedSourceEvent::Ended => break,
+                Some(crate::executor::dispatch::ConsumedSourceEvent::Population) => {}
+                None => break,
             }
         }
         ctx.finalize_source_count(&source_name_arc, count);

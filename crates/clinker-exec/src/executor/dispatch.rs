@@ -703,10 +703,6 @@ pub(crate) enum ConsumedSourceEvent {
     Punctuation(crate::executor::stream_event::Punctuation),
     Rejected,
     Population,
-    /// The Source's reader reached the end of its input: every event before
-    /// this one is the Source's complete output, and the channel carries
-    /// nothing more.
-    Ended,
 }
 
 /// Rows staged before the shared write path publishes them itself.
@@ -817,39 +813,12 @@ pub(crate) fn apply_source_attempt_population(
 /// Consume all source-channel shapes through one accounting seam. Ordered
 /// payloads prove their population was applied; direct unordered attempts are
 /// counted one at a time through the same counters.
-///
-/// `item` is what the receive returned: `None` when the channel disconnected.
-/// Every walk path that reads a Source's channel comes through here, so the
-/// end of a Source's input is established in one place: only the reader's
-/// [`Ended`](crate::executor::source_stream::SourceStreamEvent::Ended) ends
-/// it. A reader's failure becomes the walk's error at the point in the
-/// Source's data where the reader stopped, before any step finishes on the
-/// rows that came before it; a channel that disconnects without either
-/// terminal event means the reader stopped without reporting (a panic), and
-/// is a failure too.
 pub(crate) fn consume_source_event(
     ctx: &mut ExecutorContext<'_>,
     expected_source: &Arc<str>,
-    item: Option<crate::executor::source_stream::SourceStreamEvent>,
+    event: crate::executor::source_stream::SourceStreamEvent,
 ) -> Result<ConsumedSourceEvent, PipelineError> {
-    let Some(event) = item else {
-        return Err(PipelineError::Internal {
-            op: "source-read",
-            node: expected_source.to_string(),
-            detail: "the Source's reader stopped before it reached the end of its input \
-                     without reporting why"
-                .to_string(),
-        });
-    };
     match event {
-        crate::executor::source_stream::SourceStreamEvent::Ended => Ok(ConsumedSourceEvent::Ended),
-        crate::executor::source_stream::SourceStreamEvent::Failed(failure) => {
-            Err(failure.take().unwrap_or_else(|| PipelineError::Internal {
-                op: "source-read",
-                node: expected_source.to_string(),
-                detail: "the Source's reader failure was already reported".to_string(),
-            }))
-        }
         crate::executor::source_stream::SourceStreamEvent::Population(delta) => {
             apply_source_attempt_population(ctx, expected_source, delta)?;
             Ok(ConsumedSourceEvent::Population)
@@ -1560,9 +1529,9 @@ pub(crate) struct ExecutorContext<'a> {
     /// `pipeline.batch_id`.
     pub(crate) source_batch_arc: &'a Arc<str>,
     /// Per-source finalized record count, keyed by Source node name.
-    /// `Some(n)` once the Source's reader has ended its stream — i.e. it
-    /// read its whole input and we know the total. `None` while the source
-    /// is still streaming.
+    /// `Some(n)` once the Source's crossbeam `Receiver` has disconnected
+    /// — i.e. the upstream ingest thread closed its sender and we know
+    /// the total. `None` while the source is still streaming.
     ///
     /// The `$source.count` evaluator reads this through
     /// [`Self::source_count_for`], which resolves the right per-source
@@ -1637,7 +1606,7 @@ pub(crate) struct ExecutorContext<'a> {
     /// [`Self::source_records`]. Ownership follows the receiver: the arm
     /// that removes a source's receiver (the Source arm, a fused
     /// `Merge.interleave`, or a fused Transform) also releases this entry
-    /// via [`Self::release_source_consumer`] when the stream ends,
+    /// via [`Self::release_source_consumer`] at receiver disconnect,
     /// zeroing the mirrored queue charge and unregistering the wrapper so
     /// the drained channel stops counting toward `sum_consumer_usage`.
     /// Body-scope walks save/restore this map with `source_records`, install
@@ -2129,7 +2098,7 @@ pub(crate) struct ExecutorContext<'a> {
     /// catalog). Operators fold finalized sketch results in at drain — the
     /// grace-hash join routes its merged per-partition distinct-count
     /// estimate here at completion, and a Source records its exact row
-    /// count when its stream ends. Seeded from the plan-time
+    /// count when its stream disconnects. Seeded from the plan-time
     /// catalog's Plane A row counts at executor entry so a downstream node
     /// reading this map sees both the metadata-derived estimates and any
     /// exec-measured figures that have superseded them. Behind a `Mutex`
@@ -2414,7 +2383,7 @@ impl<'a> ExecutorContext<'a> {
     /// every per-source slot is now populated, derive and stamp the
     /// pipeline-wide total under [`MERGED_SOURCE_NAME`]. Called by the
     /// Source dispatch arm (and the Merge.interleave fusion arm) when
-    /// a source's reader ends its stream.
+    /// a source's crossbeam `Receiver` disconnects.
     pub(crate) fn finalize_source_count(&mut self, source_name: &Arc<str>, count: u64) {
         // Flush the drain's last partial chunk. Without this the tail of every
         // source — up to 1023 rows — would reach the observer only if some
@@ -2455,15 +2424,15 @@ impl<'a> ExecutorContext<'a> {
     }
 
     /// Release the arbitrator registration for `source_name`'s ingest
-    /// channel once its reader has ended its stream. Every queued attempt
+    /// channel once its receiver has disconnected. Every queued attempt
     /// released its own charge when it left the channel, but an ordered
     /// Source's barrier never zeroes the figure it last charged to the shared
     /// handle, so without this release that figure stays in the run's
     /// charged total — memory that has already moved downstream keeps
     /// influencing spill victim selection and abort checks. Call only after
-    /// the walk took the stream's `Ended`: the reader sends it after it has
-    /// dropped its channel and released everything else it held in the
-    /// Source's name, so zeroing cannot race a concurrent charge. The `remove`
+    /// `recv` reports disconnect: the producer has dropped its sender by
+    /// then, and released everything else it held in the Source's name
+    /// before it, so zeroing cannot race a concurrent charge. The `remove`
     /// makes the release single-shot; a repeat call for the same source is a
     /// no-op.
     pub(crate) fn release_source_consumer(&mut self, source_name: &str) {
@@ -4598,9 +4567,9 @@ pub(crate) fn merge_fused_interleave(
     // stays round-robin-fair across iterations), block on `select()`
     // (parks the thread — no busy spin — until some receiver has a
     // message or is disconnected), then map the chosen operation back
-    // to its predecessor index. A source's `Ended` closes its slot inside
-    // the same select loop; a disconnected channel surfaces as a ready op
-    // whose `recv` returns `Err`, which fails the run.
+    // to its predecessor index. A disconnected channel surfaces as a
+    // ready op whose `recv` returns `Err`, so closed-source detection
+    // happens inside the same select loop.
     //
     // Flush one accumulated streaming batch through the slot's charge
     // handle: `add_bytes` its footprint, optionally one-batch spill on a
@@ -4680,9 +4649,10 @@ pub(crate) fn merge_fused_interleave(
         };
         let op_index = oper.index();
         let i = op_to_pred[op_index];
-        // Complete the chosen operation on its receiver. `Err(RecvError)`
-        // means that source's channel disconnected (all senders dropped);
-        // `ok()` hands it to `consume_source_event` as `None`, a failure.
+        // Complete the chosen operation on its receiver. `Ok` is a
+        // record/punctuation; `Err(RecvError)` means that source's
+        // channel disconnected (all senders dropped) — `ok()` maps it to
+        // the `None` close arm below.
         let item: Option<crate::executor::source_stream::SourceStreamEvent> = oper
             .recv(
                 receivers[i]
@@ -4693,14 +4663,16 @@ pub(crate) fn merge_fused_interleave(
         // A document-boundary punctuation off a Source channel is collected
         // for the close-time reconcile rather than forwarded inline; only
         // records flow into the per-record pipeline below.
-        let consumed = consume_source_event(ctx, &states[i].source_name_arc, item)?;
+        let consumed = item
+            .map(|event| consume_source_event(ctx, &states[i].source_name_arc, event))
+            .transpose()?;
         let item: Option<(Record, crate::executor::stream_event::SourceRowId)> = match consumed {
-            ConsumedSourceEvent::Record(record, row_id) => Some((record, row_id)),
-            ConsumedSourceEvent::Rejected => {
+            Some(ConsumedSourceEvent::Record(record, row_id)) => Some((record, row_id)),
+            Some(ConsumedSourceEvent::Rejected) => {
                 per_source_counts[i] += 1;
                 continue;
             }
-            ConsumedSourceEvent::Punctuation(p) => {
+            Some(ConsumedSourceEvent::Punctuation(p)) => {
                 // A structural-count close condemns its whole file; mark it
                 // failed before the reconcile so the Output arm's per-file
                 // buffer rejects every already-streamed record of the file.
@@ -4712,8 +4684,8 @@ pub(crate) fn merge_fused_interleave(
                 collected_puncts.push(p);
                 continue;
             }
-            ConsumedSourceEvent::Population => continue,
-            ConsumedSourceEvent::Ended => None,
+            Some(ConsumedSourceEvent::Population) => continue,
+            None => None,
         };
         match item {
             Some((record, rn)) => {
@@ -4773,7 +4745,7 @@ pub(crate) fn merge_fused_interleave(
                 }
             }
             None => {
-                // Source ended. Stamp finalized per-source count, drop
+                // Source closed. Stamp finalized per-source count, drop
                 // the receiver slot so subsequent iterations skip it, and
                 // release the source's arbitrator registration — its
                 // channel is drained, so the Source's per-attempt queued
@@ -5114,9 +5086,12 @@ pub(crate) fn transform_fused_consume(
             // appended in arrival order, a `DocumentClose` stays after the
             // last record of its own document even when a multi-file Source
             // interleaves several documents through this one fused Transform.
-            let (record, rn) = match consume_source_event(ctx, &source_name_arc, item)? {
-                ConsumedSourceEvent::Record(record, row_id) => (record, row_id),
-                ConsumedSourceEvent::Rejected => {
+            let consumed = item
+                .map(|event| consume_source_event(ctx, &source_name_arc, event))
+                .transpose()?;
+            let (record, rn) = match consumed {
+                Some(ConsumedSourceEvent::Record(record, row_id)) => (record, row_id),
+                Some(ConsumedSourceEvent::Rejected) => {
                     count += 1;
                     records_since_check += 1;
                     if records_since_check >= 1024 {
@@ -5125,7 +5100,7 @@ pub(crate) fn transform_fused_consume(
                     }
                     continue;
                 }
-                ConsumedSourceEvent::Punctuation(p) => {
+                Some(ConsumedSourceEvent::Punctuation(p)) => {
                     // A structural-count close condemns its whole file; mark
                     // it failed before forwarding so the Output arm's
                     // per-file buffer rejects every already-streamed record
@@ -5138,8 +5113,8 @@ pub(crate) fn transform_fused_consume(
                     event_batcher.push_punctuation(p)?;
                     continue;
                 }
-                ConsumedSourceEvent::Population => continue,
-                ConsumedSourceEvent::Ended => break,
+                Some(ConsumedSourceEvent::Population) => continue,
+                None => break,
             };
             last_file = source_file_arc_of(&record);
             let mut rec = canonicalize(&record);
