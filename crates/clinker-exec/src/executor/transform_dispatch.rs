@@ -3,8 +3,17 @@
 //! Holds the record-level CXL projection / filter / lookup body lifted out
 //! of [`crate::executor::dispatch::dispatch_plan_node`], including the
 //! streaming-fused fast path that drives per-record evaluation directly off
-//! a Source receiver and the buffered `node_buffers` path. The dispatcher's
-//! `Transform` arm is a single delegating call into [`dispatch_transform`].
+//! a Source receiver and the materialized path that reads a `node_buffers`
+//! slot. The dispatcher's `Transform` arm is a single delegating call into
+//! [`dispatch_transform`].
+//!
+//! A Transform whose edge to its Sink the compiled plan certified as
+//! streaming hands its rows to that Sink's writer thread in whichever arm
+//! runs. The fused arm streams batches straight off its Source's channel.
+//! The materialized arm sends its materialized rows through the same sender
+//! and admits no node buffer; it is reached for such a Transform only in a
+//! bounded preview, which runs the Transform apart from its Source so the
+//! Sources drain in a fixed order.
 
 use std::sync::Arc;
 
@@ -13,13 +22,15 @@ use cxl::eval::{ProgramEvaluator, SkipReason};
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
+use crate::executor::batch_handoff::StreamingChargeHandle;
 use crate::executor::dispatch::{
     ExecutorContext, NodeBufferKey, admit_node_buffer, advance_cursor,
     dispatch_transform_eval_error, finalize_node_rooted_windows, node_buffer_spill_allowed,
-    require_node_buffer_input, source_file_arc_of, source_name_arc_of,
+    require_node_buffer_input, source_file_arc_of, source_name_arc_of, stream_linear_producer_emit,
     tee_emit_to_region_input_buffers, transform_fused_consume,
 };
 use crate::executor::schema_check::check_input_schema;
+use crate::executor::stream_event::{Punctuation, SourceRowId, StreamEvent};
 use crate::executor::{
     WindowedEvalCtx, evaluate_single_transform, evaluate_single_transform_windowed,
 };
@@ -59,11 +70,78 @@ impl crate::executor::dispatch::DispatchFaultGuard {
     }
 }
 
+/// The writer thread of a Sink whose edge from this Transform the compiled
+/// plan certified as streaming, with the charge handle its batches cross.
+struct CertifiedSinkHop {
+    sender: crossbeam_channel::Sender<StreamEvent>,
+    charge: StreamingChargeHandle,
+}
+
+impl CertifiedSinkHop {
+    /// Send `rows`, then `puncts`, to the Sink's writer thread in batches of
+    /// the Transform's batch size. Blocks on the writer's bounded channel;
+    /// each batch is charged to the streaming slot until the writer drains
+    /// it.
+    fn send(
+        &self,
+        ctx: &ExecutorContext<'_>,
+        name: &str,
+        rows: Vec<(Record, SourceRowId)>,
+        puncts: Vec<Punctuation>,
+    ) -> Result<(), PipelineError> {
+        stream_linear_producer_emit(
+            &self.sender,
+            ctx.batch_size_for(name),
+            name,
+            rows,
+            puncts,
+            &self.charge,
+        )
+    }
+}
+
+/// Take the streaming Sink hop installed for this Transform, if the compiled
+/// plan certified one. Outside a bounded preview a certified Transform always
+/// runs fused and takes its sender there, so the materialized arm finds one
+/// only in a preview, and never inside a composition body.
+///
+/// A sender with no streaming charge consumer registered for it is an
+/// executor invariant violation: both are installed together at executor
+/// entry.
+fn take_certified_sink_hop(
+    ctx: &mut ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
+    node_idx: NodeIndex,
+    name: &str,
+) -> Result<Option<CertifiedSinkHop>, PipelineError> {
+    let Some(sender) = ctx.take_streaming_sender(node_idx) else {
+        return Ok(None);
+    };
+    let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
+    let charge = ctx
+        .streaming_charge_handle(node_idx, name, spill_allowed)
+        .ok_or_else(|| PipelineError::Internal {
+            op: "executor",
+            node: name.to_string(),
+            detail: format!(
+                "transform {name:?} holds its Sink's streaming sender but no streaming \
+                 charge consumer is registered for it"
+            ),
+        })?;
+    Ok(Some(CertifiedSinkHop { sender, charge }))
+}
+
 /// Execute the `Transform` arm for `node_idx`: drive per-record CXL
 /// evaluation (filter, projection, distinct, emit_each fan-out) over the
 /// predecessor's records, taking the streaming-fused path off a Source
 /// receiver when the pre-pass flagged this Transform eligible and the
-/// buffered `node_buffers` path otherwise. Stateless and streaming.
+/// materialized path otherwise. Stateless.
+///
+/// When the compiled plan certified the Transform's edge to its Sink as
+/// streaming, either arm hands its rows to the Sink's writer thread: the
+/// fused arm batch by batch off the Source's channel, the materialized arm
+/// (reached for such a Transform only in a bounded preview) by sending its
+/// materialized rows, admitting no node buffer.
 pub(crate) fn dispatch_transform<'borrow, 'plan>(
     ctx: impl Into<TransformDispatchContext<'borrow, 'plan>>,
     current_dag: &ExecutionPlanDag,
@@ -171,6 +249,12 @@ where
     let payload = match resolved {
         Some(p) => p,
         None => {
+            // As in the fused arm's tail, a certified Transform tees to no
+            // deferred region, so its streamed rows skip the tee.
+            if let Some(hop) = take_certified_sink_hop(ctx, current_dag, node_idx, name)? {
+                hop.send(ctx, name, input_records, input_puncts)?;
+                return Ok(());
+            }
             tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &input_records)?;
             admit_node_buffer(
                 ctx,
@@ -418,6 +502,19 @@ where
                 dispatch_transform_eval_error(ctx, record, rn, transform_name, eval_err)?;
             }
         }
+    }
+
+    // As in the fused arm's tail, a certified Transform roots no
+    // node-anchored window and tees to no deferred region, so its rows go to
+    // the Sink's writer thread in the order this loop produced them and skip
+    // the window, tee and node-buffer steps below.
+    if let Some(hop) = take_certified_sink_hop(ctx, current_dag, node_idx, name)? {
+        hop.send(ctx, name, output_records, input_puncts)?;
+        signals.finish();
+        if let Some(carry) = signals.into_carry() {
+            ctx.transform_signal_carry.park(logical_node, carry);
+        }
+        return Ok(());
     }
 
     // Materialize node-rooted window runtimes for any IndexSpec
