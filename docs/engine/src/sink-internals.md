@@ -272,8 +272,10 @@ describes spill and cleanup debt.
 
 Memory, disk, allocation, descriptor and temporary-storage errors remain typed
 resource failures and are fatal even under `strategy: continue`. Cancellation
-is interrupted work, not a Sink error; a real failure retains its classification
-when shutdown also occurs. The CSV cell encoder preserves its original failure
+is interrupted work, not a Sink error. A real failure the walk reached retains
+its classification when shutdown also occurs; a reader failure the walk never
+reached because the cancellation stopped it first is logged and the run stays
+cancelled. The CSV cell encoder preserves its original failure
 across the library writer's drop-time flush. Malformed UTF-8 in source headers
 and body cells is an input-data failure, including schema discovery; unsupported
 authored encodings fail configuration admission instead.

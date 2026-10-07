@@ -48,9 +48,19 @@ envelope pre-scan may discover it before any body records. Failed runs do not
 publish their staged normal output files.
 
 Explicit cancellation ends an interrupted run with exit `130`; it does not add a
-Sink error. If a real I/O or resource failure occurs alongside a shutdown request,
-the real failure retains its classification. Record and byte counters describe
-established progress, not rows merely attempted or prepared.
+Sink error. Clinker reads each source's input in order, and the first thing it
+meets decides the outcome:
+
+- A real I/O, data or resource failure that Clinker reached before it stopped
+  fails the run with its own classification, even if a shutdown was also
+  requested.
+- A failure in input Clinker had not reached when the cancellation stopped it
+  does not change the outcome. The run still exits `130` as cancelled, and the
+  failure is logged as a warning that names the source. A rerun that reaches
+  that input reports the failure.
+
+Record and byte counters describe established progress, not rows merely
+attempted or prepared.
 
 An executor invariant failure also aborts under either strategy with exit code
 `1`. In particular, if a planned materialized input is unavailable when its
