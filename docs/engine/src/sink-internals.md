@@ -326,10 +326,8 @@ not invent data-column influence edges.
 Fault tests in `writer_preparation` and `writer_resources` cover all native
 operation boundaries, storage failures, exact destination prefixes, cancellation,
 cache rollback and telemetry admission loss. `encoding_cli` and
-`encoding_runtime_contract` cover literal files, publication, exit codes,
-Source read counts, and that a later file's failure leaves the Sink with no
-rows written. See
-[native ownership](memory-arbitration.md#native-jsonxml-configuration-and-schema-caches)
+`encoding_runtime_contract` cover literal files, publication, exit codes and
+source/sink count prefixes. See [native ownership](memory-arbitration.md#native-jsonxml-configuration-and-schema-caches)
 for configuration, schema lifetime and the remaining reader allowance.
 
 ## Streaming vs. buffered

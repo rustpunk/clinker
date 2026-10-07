@@ -295,10 +295,10 @@ struct DagExecResources {
     /// Arbitrator registration for each declared Source's ingest-channel
     /// consumer, keyed by Source node name in lockstep with
     /// `source_records`. The dispatch arm that takes a source's receiver
-    /// out of `source_records` also owns this entry and releases it once it
-    /// has taken the Source's `Ended`, so a drained source's per-attempt
-    /// queued charge leaves the ledger total `sum_consumer_usage` reads
-    /// instead of freezing until arbitrator drop.
+    /// out of `source_records` also owns this entry and releases it at
+    /// receiver disconnect, so a drained source's per-attempt queued charge
+    /// leaves the ledger total `sum_consumer_usage` reads instead of
+    /// freezing until arbitrator drop.
     source_consumers: HashMap<
         String,
         (
@@ -1109,9 +1109,8 @@ impl PipelineExecutor {
                 // carry their unadmitted heap as a charge on it until they
                 // leave the channel. The registration travels with the
                 // receiver: whichever dispatch arm drains this source's
-                // channel releases the wrapper once it takes the stream's
-                // `Ended`, so a drained source leaves the registry the
-                // policies poll.
+                // channel releases the wrapper at receiver disconnect, so a
+                // drained source leaves the registry the policies poll.
                 let source_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
                 let source_body = validated_plan
                     .config()
@@ -1486,7 +1485,7 @@ impl PipelineExecutor {
         // - seed `$record.<key>` defaults per record,
         // - seed `$source.<key>` defaults per `(source, file)` Arc on
         //   first observation,
-        // - on the reader's `Ended` (the whole input was read), stamp the
+        // - on `recv` returning `Err` (channel disconnected), stamp the
         //   finalized per-source count and call
         //   `finalize_node_rooted_windows` to populate every spec rooted
         //   at this source's NodeIndex.
@@ -2172,8 +2171,8 @@ impl PipelineExecutor {
         // before their dispatch turn — still hold their ingest-channel
         // registration. Release them here so the registry does not outlive
         // the walk with a frozen queued charge on the ledger. On a completed
-        // walk this map is empty: each drain arm released its entry when it
-        // took the Source's `Ended`. `resume` before unregister is load-bearing:
+        // walk this map is empty: each drain arm released its entry at
+        // receiver disconnect. `resume` before unregister is load-bearing:
         // an arbitration round may have paused an undrained source's ingest
         // thread, and once the wrapper leaves the registry nothing else can
         // unpark it — the thread would sit parked forever and the caller's

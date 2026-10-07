@@ -1508,9 +1508,8 @@ fn drain_probe_channel(
 /// [`StreamingProbeEffects`], replayed on the dispatch thread after the
 /// scope joins so rollback cursors, the per-fold rewind snapshot, and DLQ
 /// sequencing match the drain-to-`Vec` path exactly. Mid-stream
-/// `$source.count` is `None` (the driver's total is unknown until its
-/// Source's stream ends), the same defer-emit semantic the streaming
-/// Aggregate ingest uses.
+/// `$source.count` is `None` (the driver total is unknown until disconnect),
+/// the same defer-emit semantic the streaming Aggregate ingest uses.
 ///
 /// The failures the thread holds until the join are charged to `held`, the
 /// combine's own consumer, as each is appended, and discharged as the replay
