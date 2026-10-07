@@ -464,6 +464,13 @@ nodes:
     }
 
     fn fixture() -> (tempfile::TempDir, clinker_plan::plan::CompiledPlan) {
+        fixture_with(BODY, PIPELINE)
+    }
+
+    fn fixture_with(
+        body: &str,
+        pipeline: &str,
+    ) -> (tempfile::TempDir, clinker_plan::plan::CompiledPlan) {
         let workspace = tempfile::tempdir().expect("workspace");
         std::fs::create_dir_all(workspace.path().join("compositions"))
             .expect("composition directory");
@@ -475,7 +482,7 @@ nodes:
             workspace
                 .path()
                 .join("compositions/memory_reader.comp.yaml"),
-            BODY,
+            body,
         )
         .expect("composition body");
         std::fs::write(
@@ -487,7 +494,7 @@ access = "read"
 "#,
         )
         .expect("catalog");
-        let config = parse_config(PIPELINE).expect("pipeline parses");
+        let config = parse_config(pipeline).expect("pipeline parses");
         let plan = config
             .compile(&CompileContext::with_pipeline_dir(
                 workspace.path(),
@@ -714,6 +721,161 @@ access = "read"
             assert_eq!(memory.consumer_count(), 0);
             assert_eq!(memory.sum_consumer_usage(), 0);
         }
+    }
+
+    /// A body Source whose reader is cancelled after one row feeds a body
+    /// Aggregate. The body walk stops at the Source: its count is never
+    /// finalized and the Aggregate never finishes on the cut-off row.
+    #[test]
+    fn an_interrupted_body_read_stops_the_body_walk_before_a_step_finishes() {
+        const AGGREGATE_BODY: &str = r#"_compose:
+  name: memory_reader
+  inputs: {}
+  outputs: { out: totals }
+  config_schema: {}
+  resources_schema:
+    input: { kind: file, required: true }
+nodes:
+  - type: source
+    name: read
+    config:
+      name: read
+      type: csv
+      resource: input
+      on_unmapped: { mode: drop }
+      schema: [{ name: id, type: int }]
+  - type: aggregate
+    name: totals
+    input: read
+    config:
+      group_by: []
+      cxl: |
+        emit n = count(*)
+"#;
+        const AGGREGATE_PIPELINE: &str = r#"pipeline: { name: body_source_interrupted }
+nodes:
+  - type: source
+    name: driver
+    config:
+      name: driver
+      type: csv
+      path: driver.csv
+      schema: [{ name: seed, type: string }]
+  - type: composition
+    name: call
+    input: driver
+    use: ../compositions/memory_reader.comp.yaml
+    inputs: {}
+    resources: { input: shared_input }
+  - type: sink
+    name: out
+    input: call
+    config: { name: out, type: csv, path: out.csv }
+"#;
+        struct Reader {
+            schema: clinker_record::owned_storage::SharedStorage<clinker_record::Schema>,
+            row: bool,
+        }
+        impl crate::source::RecordSource for Reader {
+            fn schema(
+                &mut self,
+            ) -> Result<
+                clinker_record::owned_storage::SharedStorage<clinker_record::Schema>,
+                clinker_format::FormatError,
+            > {
+                Ok(self.schema.clone())
+            }
+            fn next_record(
+                &mut self,
+            ) -> Result<Option<clinker_record::Record>, clinker_format::FormatError> {
+                if !std::mem::replace(&mut self.row, true) {
+                    return Ok(Some(clinker_record::Record::new(
+                        self.schema.clone(),
+                        vec![clinker_record::Value::Integer(1)],
+                    )));
+                }
+                Err(clinker_format::FormatError::Resource(
+                    clinker_record::owned_storage::ResourceError::new(
+                        clinker_record::owned_storage::ResourceErrorKind::Cancelled,
+                        0,
+                        0,
+                    ),
+                ))
+            }
+        }
+        struct Opener(Option<SourceInput>);
+        impl CapabilityOpener for Opener {
+            fn open(
+                mut self: Box<Self>,
+            ) -> Result<Box<dyn CapabilitySession>, CapabilityOpenError> {
+                Ok(Box::new(InputSession {
+                    input: self.0.take(),
+                }))
+            }
+        }
+        let (workspace, plan) = fixture_with(AGGREGATE_BODY, AGGREGATE_PIPELINE);
+        let mut input = Some(SourceInput::Records(Box::new(Reader {
+            schema: clinker_record::SchemaBuilder::new()
+                .with_field("id")
+                .build(),
+            row: false,
+        })));
+        let activation = plan.dag().source_activation();
+        let groups = activation
+            .groups()
+            .iter()
+            .map(|group| {
+                let members = group
+                    .members()
+                    .iter()
+                    .copied()
+                    .map(|member| {
+                        if matches!(
+                            member.scope,
+                            clinker_plan::plan::execution::CompiledSourceScope::TopLevel
+                        ) {
+                            AdmittedSourceOpener::caller_supplied(member)
+                        } else {
+                            AdmittedSourceOpener::new(member, Box::new(Opener(input.take())))
+                        }
+                    })
+                    .collect();
+                AdmittedActivationGroup::uncredentialed(group.id(), group.capacity(), members)
+            })
+            .collect();
+        let resources = AdmittedRunCapabilities::admit(activation, groups).unwrap();
+        let memory = memory();
+        let result = run(
+            workspace.path(),
+            &plan,
+            resources,
+            &PipelineRunParams {
+                shutdown_token: Some(ShutdownToken::detached()),
+                ..Default::default()
+            },
+            memory.clone(),
+        );
+        let report = result.expect("an interrupted body read ends the run as an interruption");
+        assert!(report.interrupted);
+        assert_eq!(
+            report.per_source_record_counts.get("call.read"),
+            None,
+            "an interrupted read never finalizes the body Source's count"
+        );
+        assert!(
+            report
+                .stages
+                .iter()
+                .all(|stage| stage.name != crate::executor::stage_metrics::StageName::Sort),
+            "the body Aggregate never finishes on the cut-off row: {:?}",
+            report.stages
+        );
+        assert_eq!(
+            report.counters.ok_count, 0,
+            "nothing read before the interruption reaches the parent Sink"
+        );
+        assert_eq!(memory.consumer_count(), 0);
+        assert_eq!(memory.sum_consumer_usage(), 0);
     }
 
     #[test]

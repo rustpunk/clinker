@@ -123,6 +123,78 @@ nodes:
     assert!(!dir.path().join("configured.csv").exists());
 }
 
+/// A preview's read limit is the end of the input it asked for, not a
+/// cancellation: the Aggregate finishes on the rows the limit admitted and the
+/// preview succeeds.
+#[test]
+fn a_preview_read_limit_ends_the_input_and_the_aggregate_finishes_on_it() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    fs::write(
+        dir.path().join("orders.csv"),
+        "grp,amount\na,1\na,2\nb,3\na,4\nc,6\nb,5\n",
+    )
+    .expect("write source");
+    fs::write(
+        dir.path().join("pipeline.yaml"),
+        r#"pipeline:
+  name: run_flag_contract_preview_aggregate
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: grp, type: string }
+        - { name: amount, type: int }
+  - type: aggregate
+    name: totals
+    input: orders
+    config:
+      group_by: [grp]
+      cxl: |
+        emit grp = grp
+        emit n = count(*)
+        emit total = sum(amount)
+  - type: sink
+    name: final
+    input: totals
+    config:
+      name: final
+      type: csv
+      path: configured.csv
+"#,
+    )
+    .expect("write pipeline");
+
+    let output = run_in(
+        dir.path(),
+        &[
+            "run",
+            "pipeline.yaml",
+            "--dry-run",
+            "-n",
+            "2",
+            "--dry-run-output",
+            "preview.csv",
+        ],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "bounded preview failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("preview.csv")).expect("preview bytes"),
+        "grp,n,total\na,2,3\n"
+    );
+    assert!(!dir.path().join("configured.csv").exists());
+}
+
 #[test]
 fn tracer_invalid_policy_values_and_adjacency_fail_before_config_access() {
     for args in [

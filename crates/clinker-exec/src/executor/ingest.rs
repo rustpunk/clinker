@@ -3455,6 +3455,7 @@ nodes:
                     panic!("unexpected ordered population in envelope fixture: {population:?}")
                 }
                 crate::executor::source_stream::SourceStreamEvent::Ended
+                | crate::executor::source_stream::SourceStreamEvent::Interrupted
                 | crate::executor::source_stream::SourceStreamEvent::Failed(_) => {
                     panic!("the driver sends no terminal event; its caller ends the stream")
                 }
