@@ -137,23 +137,17 @@ debt before retrying or executing another bounded purge.
 ### Exit code 130: Cancelled
 
 Exit 130 means the attempt stopped before publication and the current
-attempt's final paths are unchanged. Two things produce it:
+attempt's final paths are unchanged. These produce it:
 
 - A SIGINT or SIGTERM that won the cancellation gate before the first final
   rename.
 - Under `--machine ndjson-v1`, a **required** lifecycle record that could not
   be written. The run refuses to publish an outcome it cannot report, so a
   broken control pipe stops the attempt rather than promoting silently.
-
-A bounded `--dry-run -n N` preview cancelled by SIGINT or SIGTERM also exits
-130. Its preview output is incomplete, and no step finished on the records
-read before the cancellation.
-
-A source whose input fails after the cancellation has stopped the run, on
-input Clinker had not reached yet, does not change this: the run still exits
-130, and the failure is logged as a warning naming the source. A failure
-Clinker had already reached when it stopped fails the run with that failure's
-own exit code instead.
+- A bounded `--dry-run -n N` preview cancelled by SIGINT or SIGTERM. Its
+  preview output is incomplete. No step finishes on a source's input that the
+  cancellation cut short, but a step over a source read in full before the
+  signal can still finish and write preview rows.
 
 A **discardable** machine record — a periodic `progress` observation — is not
 in that set. Losing one is reported on stderr as `machine progress channel
@@ -161,6 +155,12 @@ failed` and the run continues to its real outcome; it never converts a
 completed run into a cancellation or discards computed output. A supervisor
 should therefore read 130 as "nothing was published", never as "an advisory
 record went missing".
+
+A source whose input fails after the cancellation has stopped the run, on
+input Clinker had not reached yet, does not change the outcome either: the run
+still exits 130, and the failure is logged as a warning naming the source. A
+failure Clinker had already reached when it stopped fails the run with that
+failure's own exit code instead.
 
 Cancellation is also recorded as a cancellation everywhere else it is
 reported: the OpenLineage terminal is `ABORT` and the `--machine` terminal is
