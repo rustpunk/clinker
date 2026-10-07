@@ -500,7 +500,7 @@ fn real_run_logs_per_stage_actual_spill() {
     // Aggregate so the Aggregate streaming-ingests its input per record. Without
     // it a direct Source→Aggregate materializes its whole (spilled-under-budget)
     // input into one Vec, which the #674 re-materialized-drain gate aborts (E310,
-    // BudgetCategory::NodeBuffer) before the Aggregate ever reaches its own
+    // rows collected for a full scan) before the Aggregate ever reaches its own
     // group-table spill. Streaming the input keeps the working set to one batch,
     // so the only spill is the group-table spill this test targets.
     let yaml = AGG_PIPELINE_YAML

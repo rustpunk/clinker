@@ -178,7 +178,7 @@ where
         .or_insert(0);
     // Three input paths feed a Source's emit:
     //
-    // 1. Records already seeded into `ctx.node_buffers[node_idx]`
+    // 1. Records already seeded into the walk reclaim set's `node_idx` slot
     //    by the body executor at composition entry —
     //    composition input ports surface as synthetic Source
     //    nodes owning the records the parent scope harvested.
@@ -194,8 +194,8 @@ where
     //    the source's plan-time schema, seed `$record.<key>`
     //    defaults, seed `$source.<key>` defaults per
     //    `(source, file_arc)`, advance the per-source running
-    //    counter. On `recv` returning `Err` (channel
-    //    disconnected), stamp the finalized per-source count and
+    //    counter. On the reader's `Ended`, stamp the finalized
+    //    per-source count and
     //    call `finalize_node_rooted_windows` so every spec rooted
     //    at this Source's `NodeIndex` lands its arena.
     //
@@ -204,7 +204,11 @@ where
     // `Arc::ptr_eq` fast path on the first record. Structural
     // equality holds by construction.
     let source_slot_key = NodeBufferKey::from(node_idx);
-    let has_seeded_own_slot = ctx.node_buffers.contains_key(&source_slot_key);
+    let has_seeded_own_slot = ctx
+        .walk_reclaim
+        .borrow()
+        .slots()
+        .contains_buffer(&source_slot_key);
     if !has_seeded_own_slot && ctx.fused_sources.contains(name.as_str()) {
         return Ok(());
     }
@@ -232,7 +236,7 @@ where
             "composition input",
             None,
         )?;
-        let (seeded, reservation) = seeded.into_parts();
+        let (seeded, reservation) = seeded.into_parts()?;
         // Body-context port source — records were seeded by
         // `execute_composition_body` from parent-scope
         // output. The seeded records still carry the parent
@@ -265,7 +269,11 @@ where
             .as_ref()
             .map(|schema| seeded.estimated_materialized_bytes_for_columns(schema.column_count()))
             .unwrap_or_else(|| seeded.estimated_materialized_bytes());
-        reservation.reserve_additional(prospective_bytes, name)?;
+        reservation.reserve_additional(
+            prospective_bytes,
+            name,
+            clinker_plan::runtime_error::MemorySurface::ScanMaterialization,
+        )?;
         let mut out_records: Vec<(Record, crate::executor::stream_event::SourceRowId)> =
             Vec::with_capacity(seeded.len_hint());
         let mut out_puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
@@ -285,10 +293,11 @@ where
                 }
             }
         }
-        reservation.set_bytes(estimate_node_buffer_unaccounted_bytes(
-            &out_records,
-            &ctx.allocation_resources,
-        ));
+        reservation.resize(
+            estimate_node_buffer_unaccounted_bytes(&out_records, &ctx.allocation_resources),
+            name.as_str(),
+            clinker_plan::runtime_error::MemorySurface::ScanMaterialization,
+        )?;
         (out_records, out_puncts, Some(reservation))
     } else if let Some(rx) = ctx.source_records.remove(name.as_str()) {
         // Live channel: consume per record so back-pressure
@@ -343,13 +352,10 @@ where
                 },
                 None => rx.recv().ok(),
             };
-            let consumed = item
-                .map(|event| {
-                    crate::executor::dispatch::consume_source_event(ctx, &source_name_arc, event)
-                })
-                .transpose()?;
+            let consumed =
+                crate::executor::dispatch::consume_source_event(ctx, &source_name_arc, item)?;
             match consumed {
-                Some(crate::executor::dispatch::ConsumedSourceEvent::Record(record, rn)) => {
+                crate::executor::dispatch::ConsumedSourceEvent::Record(record, rn) => {
                     last_file = source_file_arc_of(&record);
                     let mut rec = canonicalize(&record);
                     if has_record_seed {
@@ -364,7 +370,7 @@ where
                     }
                     drained.push((rec, rn));
                 }
-                Some(crate::executor::dispatch::ConsumedSourceEvent::Rejected) => {
+                crate::executor::dispatch::ConsumedSourceEvent::Rejected => {
                     count += 1;
                     records_since_check += 1;
                     if records_since_check >= 1024 {
@@ -372,7 +378,7 @@ where
                         ctx.check_shutdown()?;
                     }
                 }
-                Some(crate::executor::dispatch::ConsumedSourceEvent::Punctuation(p)) => {
+                crate::executor::dispatch::ConsumedSourceEvent::Punctuation(p) => {
                     // Mark a structural-count close failed BEFORE forwarding it,
                     // so the Output arm's per-file buffer rejects the file at
                     // this close rather than flushing it.
@@ -383,8 +389,8 @@ where
                     )?;
                     drained_puncts.push(p);
                 }
-                Some(crate::executor::dispatch::ConsumedSourceEvent::Population) => {}
-                None => break,
+                crate::executor::dispatch::ConsumedSourceEvent::Population => {}
+                crate::executor::dispatch::ConsumedSourceEvent::Ended => break,
             }
         }
         ctx.finalize_source_count(&source_name_arc, count);

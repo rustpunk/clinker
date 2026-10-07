@@ -31,8 +31,8 @@ nodes, and leaves at a Sink:
 Stateless nodes (Transform, Route, Merge, the Combine probe side, Sink)
 evaluate records one at a time without accumulating per-record state.
 Blocking nodes (Aggregate, sort, the grace-hash Combine build side)
-accumulate state inside the RSS budget and spill to disk rather than OOM
-the process. The [Streaming vs. Blocking Stages](../ops/streaming-vs-blocking.md)
+count the state they hold against `memory.limit` and spill to disk rather
+than OOM the process. The [Streaming vs. Blocking Stages](../ops/streaming-vs-blocking.md)
 page in the Operations Guide is the full memory model.
 
 ## Wiring and naming

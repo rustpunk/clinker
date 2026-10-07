@@ -654,6 +654,10 @@ correlation-deferred writers all use the same counter names and one closed
 `clinker.sink` span. A failed flush can therefore report bytes accepted before
 the destination rejected the flush; the failed terminal counter remains the
 authoritative outcome.
+A Sink that writes rows as they arrive and is stopped by a failure upstream
+reports `clinker.sink.failed` with at least one error, and counts the records
+and bytes it had written before the run stopped; stopped by a cancellation, it
+reports `clinker.sink.interrupted`.
 
 Each dead-letter (DLQ) file a run writes is a work unit of its own. It emits
 one `clinker.dead_letter.started` when the file receives its first row, and

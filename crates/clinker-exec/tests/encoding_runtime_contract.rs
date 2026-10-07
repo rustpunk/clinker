@@ -486,7 +486,7 @@ mode = "none"
 }
 
 #[test]
-fn nested_failed_second_file_preserves_source_and_sink_count_prefixes() {
+fn nested_failed_second_file_keeps_source_count_and_publishes_no_rows() {
     use clinker_exec::progress::RunProgress;
     use clinker_exec::telemetry::{MetricKey, TelemetryArena};
     use clinker_plan::config::ClinkerToml;
@@ -577,7 +577,11 @@ nodes:
             "xml-ordinary" => b"<row><id>1</id></row>",
             _ => b"<Root><items><row><id>1</id></row></items><manifest><batch>7</batch></manifest></Root>",
         };
-        let expected: &[u8] = if *mode == "xml-prescan" {
+        // Only this layout streams its rows into the Sink as they are read
+        // (Source -> Transform -> Sink); every other layout's Sink runs only
+        // after a complete read.
+        let streams_into_sink = *mode == "xml-prescan";
+        let accepted: &[u8] = if *mode == "xml-prescan" {
             b"{\"id\":1,\"batch\":7}\n"
         } else {
             b"{\"id\":1}\n"
@@ -604,12 +608,12 @@ nodes:
             } else {
                 vec![valid, invalid]
             };
-            let expected = if late && matches!(*mode, "xml-ordinary" | "xml-prescan") {
+            let accepted = if late && matches!(*mode, "xml-ordinary" | "xml-prescan") {
                 b"".as_slice()
             } else {
-                expected
+                accepted
             };
-            let count = u64::from(!expected.is_empty());
+            let count = u64::from(!accepted.is_empty());
             let root = tempfile::tempdir().unwrap();
             let mut files = Vec::new();
             for (index, bytes) in inputs.iter().enumerate() {
@@ -648,21 +652,46 @@ nodes:
                 "{mode}: {error:?}"
             );
             assert_eq!(progress.sample().records_read, count, "{mode}/{variant}");
-            assert_eq!(std::fs::read(&path).unwrap(), expected, "{mode}");
+            // The walk stops at the reader's failure, so a Sink fed from the
+            // Source's buffered arm writes nothing, and a streaming Sink holds
+            // the rows delivered to it before the failure, unclosed.
+            let output = std::fs::read(&path).unwrap();
+            let delivered: &[u8] = if streams_into_sink && !late {
+                accepted
+            } else {
+                b""
+            };
+            assert_eq!(output, delivered, "{mode}/{variant}");
             let mut records = 0;
             let mut bytes = 0;
             let mut source_failed = 0;
+            let mut sink_errors = 0;
+            let mut sink_failed = 0;
+            let mut sink_completed = 0;
             while let Some(batch) = receiver.try_recv_batch() {
                 records += batch.metric(MetricKey::SinkRecords);
                 bytes += batch.metric(MetricKey::SinkBytes);
                 source_failed += batch.metric(MetricKey::SourceFailed);
-                assert_eq!(batch.metric(MetricKey::SinkErrors), 0, "{mode}");
+                sink_errors += batch.metric(MetricKey::SinkErrors);
+                sink_failed += batch.metric(MetricKey::SinkFailed);
+                sink_completed += batch.metric(MetricKey::SinkCompleted);
             }
+            let written_rows = output.iter().filter(|byte| **byte == b'\n').count() as u64;
             assert_eq!(
                 (records, bytes, source_failed),
-                (count, expected.len() as u64, 1),
-                "{mode}"
+                (written_rows, output.len() as u64, 1),
+                "{mode}/{variant}"
             );
+            // A streaming Sink whose input stopped without its end records a
+            // failure with one error, never a completion.
+            assert_eq!(
+                sink_errors,
+                u64::from(streams_into_sink),
+                "{mode}/{variant}"
+            );
+            if streams_into_sink {
+                assert_eq!((sink_failed, sink_completed), (1, 0), "{mode}/{variant}");
+            }
         }
         assert!(executed.insert(*mode));
     }
@@ -670,7 +699,7 @@ nodes:
 }
 
 #[test]
-fn physical_failed_files_preserve_source_population_sink_bytes_and_lifecycle() {
+fn physical_failed_files_keep_source_population_and_lifecycle_and_write_no_rows() {
     use clinker_exec::progress::RunProgress;
     use clinker_exec::telemetry::{MetricKey, TelemetryArena};
     use clinker_plan::config::ClinkerToml;
@@ -770,7 +799,7 @@ nodes:
                 ],
                 _ => vec![invalid.to_vec()],
             };
-            let expected = if variant.ends_with("second")
+            let accepted = if variant.ends_with("second")
                 || variant == "numeric-continue"
                 || (variant == "late" && format == "fixed_width")
             {
@@ -778,7 +807,7 @@ nodes:
             } else {
                 b""
             };
-            let count = u64::from(!expected.is_empty());
+            let count = u64::from(!accepted.is_empty());
             let root = tempfile::tempdir().unwrap();
             let mut files = Vec::new();
             for (index, bytes) in inputs.iter().enumerate() {
@@ -821,11 +850,9 @@ nodes:
                 "{format}/{variant}: {error:?}"
             );
             assert_eq!(progress.sample().records_read, count, "{format}/{variant}");
-            assert_eq!(
-                std::fs::read(&output).unwrap(),
-                expected,
-                "{format}/{variant}"
-            );
+            // The walk stops at the reader's failure, so the Sink writes none
+            // of the rows read before it.
+            assert_eq!(std::fs::read(&output).unwrap(), b"", "{format}/{variant}");
             let (mut records, mut bytes, mut started, mut failed, mut completed) = (0, 0, 0, 0, 0);
             while let Some(batch) = receiver.try_recv_batch() {
                 records += batch.metric(MetricKey::SinkRecords);
@@ -838,7 +865,7 @@ nodes:
             }
             assert_eq!(
                 (records, bytes, started, failed, completed),
-                (count, expected.len() as u64, 1, 1, 0),
+                (0, 0, 1, 1, 0),
                 "{format}/{variant}"
             );
         }

@@ -25,6 +25,7 @@ pub(crate) mod merge_dispatch;
 pub mod node_buffer;
 pub(crate) mod node_buffer_spill;
 mod params;
+pub(crate) mod parked_generations;
 mod registry;
 pub(crate) mod reshape_dispatch;
 mod route;
@@ -38,6 +39,7 @@ pub mod source_stream;
 pub mod spill_purge;
 pub mod storage_validate;
 pub(crate) mod stream_event;
+pub(crate) mod stream_hop;
 mod streaming;
 pub(crate) mod structured_output_guard;
 pub(crate) mod time_window;
@@ -63,13 +65,16 @@ pub use document_dlq::take_document_dlq_peak_charged_bytes_for_testing;
 #[doc(hidden)]
 pub use document_dlq::{DocumentDlqTeardown, take_document_dlq_teardown_for_testing};
 pub use ingest::build_source_format_reader;
-use ingest::{IngestTaskOutcome, ingest_source};
+use ingest::ingest_source;
 use params::sum_cpu_io_totals;
 pub use params::{
     ExecutionReport, MemoryTestOverrides, PipelineRunParams, PreviewPolicy, RunPolicy,
 };
 #[cfg(any(test, feature = "test-utils"))]
-pub use params::{ForcedShortfall, IN_PROCESS_BASELINE_BYTES};
+pub use params::{
+    ForcedShortfall, HardLimitReclaim, HardLimitReclaims, IN_PROCESS_BASELINE_BYTES,
+    SourceDrainCharge, SourceDrainCharges, StreamingEnd, StreamingEnds, StreamingInputEnd,
+};
 pub use registry::WriterRegistry;
 pub(crate) use registry::build_format_writer;
 pub(crate) use route::CompiledRoute;
@@ -78,15 +83,15 @@ pub use storage_validate::{
     validate_storage_config,
 };
 pub use stream_event::{OutputDeliveryId, SourceRowId};
-pub(crate) use streaming::StreamingOutputTaskOutput;
+pub(crate) use streaming::StreamingSinkThread;
 use streaming::{compute_streaming_sink_specs, streaming_sink};
 pub(crate) use transform::{
     WindowedEvalCtx, evaluate_single_transform, evaluate_single_transform_windowed,
 };
 use util::scheduled_pass_order;
 pub(crate) use util::{
-    GroupedNodeKind, build_arbitrator_from_config, copy_build_ck_columns, format_group_key,
-    giant_group_error, operator_memory_limit, record_with_emitted_fields, widen_record_to_schema,
+    build_arbitrator_from_config, copy_build_ck_columns, format_group_key, giant_group_error,
+    operator_memory_limit, record_with_emitted_fields, widen_record_to_schema,
 };
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -291,10 +296,10 @@ struct DagExecResources {
     /// Arbitrator registration for each declared Source's ingest-channel
     /// consumer, keyed by Source node name in lockstep with
     /// `source_records`. The dispatch arm that takes a source's receiver
-    /// out of `source_records` also owns this entry and releases it at
-    /// receiver disconnect, so a drained source's per-attempt queued charge
-    /// leaves the ledger total `sum_consumer_usage` reads instead of
-    /// freezing until arbitrator drop.
+    /// out of `source_records` also owns this entry and releases it once it
+    /// has taken the Source's `Ended`, so a drained source's per-attempt
+    /// queued charge leaves the ledger total `sum_consumer_usage` reads
+    /// instead of freezing until arbitrator drop.
     source_consumers: HashMap<
         String,
         (
@@ -319,6 +324,9 @@ struct DagExecResources {
     /// Pipeline-scoped memory arbitrator that envelopes every spill /
     /// back-pressure decision across the run.
     memory_budget: std::sync::Arc<crate::pipeline::memory::MemoryArbitrator>,
+    /// The run's kernel pool, built before the Source threads so an order
+    /// barrier and the walk's kernels share one worker set.
+    kernel_pool: std::sync::Arc<rayon::ThreadPool>,
 }
 
 /// Helper for callers (mostly tests and benchmarks) that have a single
@@ -412,8 +420,9 @@ impl PipelineExecutor {
     /// ```
     ///
     /// The executor is fully synchronous: it drives source ingest on
-    /// `std::thread` workers, runs CPU-bound operator kernels (sort,
-    /// grace-hash, IEJoin, sort-merge) on a shared Rayon pool, and
+    /// `std::thread` workers, runs the parallel sections of CPU-bound
+    /// operator kernels (sort, grace-hash, IEJoin, sort-merge) on a
+    /// run-scoped Rayon pool, and
     /// blocks the calling thread on bounded crossbeam channels for
     /// back-pressure. No async runtime is required.
     pub fn run_plan_with_readers_writers<W: Into<WriterRegistry>>(
@@ -966,6 +975,14 @@ impl PipelineExecutor {
             }
         })?);
 
+        // Shared Rayon pool for the parallel sections of the CPU-bound kernels
+        // (the comparator sort of every sort buffer, grace-hash partition key
+        // extraction, IEJoin and sort-merge key evaluation). Sized off the
+        // run's resolved nonzero thread capacity. Built once per run, before
+        // the Source threads, because an order barrier sorts on it from the
+        // first staged row; the walk shares the same `Arc`.
+        let kernel_pool = build_kernel_pool(run_policy)?;
+
         // Pipeline-scoped MemoryArbitrator. One declared `memory.limit`
         // envelopes every node-rooted arena finalize — including the
         // arenas built at Source dispatch-arm exits. Arrives as a
@@ -993,9 +1010,8 @@ impl PipelineExecutor {
             crossbeam_channel::Receiver<crate::executor::source_stream::SourceStreamEvent>,
         > = HashMap::new();
         let mut watermarks = crate::executor::watermark::PerSourceWatermarks::new();
-        let mut ingest_handles: Vec<
-            std::thread::JoinHandle<Result<IngestTaskOutcome, PipelineError>>,
-        > = Vec::with_capacity(source_configs.len());
+        let mut ingest_handles: Vec<ingest::SourceWorker> =
+            Vec::with_capacity(source_configs.len());
         let mut source_consumers: HashMap<
             String,
             (
@@ -1094,8 +1110,9 @@ impl PipelineExecutor {
                 // carry their unadmitted heap as a charge on it until they
                 // leave the channel. The registration travels with the
                 // receiver: whichever dispatch arm drains this source's
-                // channel releases the wrapper at receiver disconnect, so a
-                // drained source leaves the registry the policies poll.
+                // channel releases the wrapper once it takes the stream's
+                // `Ended`, so a drained source leaves the registry the
+                // policies poll.
                 let source_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
                 let source_body = validated_plan
                     .config()
@@ -1144,24 +1161,28 @@ impl PipelineExecutor {
                         node: src_cfg.name.clone(),
                         surface: clinker_plan::runtime_error::MemorySurface::RowsRead,
                     },
-                );
+                )?;
                 let source_allocation = writer_provider.attributed_allocation(
                     crate::pipeline::memory::ledger::Requester::for_consumer(source_consumer_id),
                 );
                 let (stream, rx) = match order_config {
                     Some(order_config) => {
-                        crate::executor::source_stream::SourceIngestChannel::new_ordered(
-                            crate::executor::source_stream::SourceIngestChannel::DEFAULT_CAPACITY,
-                            source_consumer_handle.clone(),
-                            source_id,
-                            order_config,
-                            Arc::clone(&memory_budget),
-                            spill_root.path().to_path_buf(),
-                            params
-                                .spill_compress
-                                .resolve_for_schema(source_column_count, source_batch_size as u64),
-                            source_allocation,
-                        )
+                        let (mut stream, rx) =
+                            crate::executor::source_stream::SourceIngestChannel::new_ordered(
+                                crate::executor::source_stream::SourceIngestChannel::DEFAULT_CAPACITY,
+                                source_consumer_handle.clone(),
+                                source_id,
+                                order_config,
+                                Arc::clone(&memory_budget),
+                                spill_root.path().to_path_buf(),
+                                params.spill_compress.resolve_for_schema(
+                                    source_column_count,
+                                    source_batch_size as u64,
+                                ),
+                                source_allocation,
+                            );
+                        stream.set_kernel_pool(Arc::clone(&kernel_pool));
+                        (stream, rx)
                     }
                     None => crate::executor::source_stream::SourceIngestChannel::new(
                         crate::executor::source_stream::SourceIngestChannel::DEFAULT_CAPACITY,
@@ -1187,6 +1208,8 @@ impl PipelineExecutor {
                 let lifecycle_telemetry = params.telemetry_producer.clone();
                 let ingest_progress = params.progress.clone();
                 let ingest_source_runtime = source_runtime.clone();
+                let ingest_node = src_cfg.name.clone();
+                let stream_end = stream.end(&src_cfg.name);
                 // One OS thread per Source. Spawned before the DAG dispatch
                 // drains so the producers fill the bounded channels while the
                 // consumer dispatch loop runs concurrently. Joined after
@@ -1194,24 +1217,36 @@ impl PipelineExecutor {
                 let handle = std::thread::Builder::new()
                     .name(format!("clinker-ingest-{}", src_cfg.name))
                     .spawn(move || {
-                        source_activation::observe_source(lifecycle_telemetry.as_ref(), || {
-                            ingest_source(
-                                src_cfg_owned,
-                                source_input,
-                                config_clone,
-                                stream,
-                                ingest_shutdown,
-                                ingest_progress,
-                                ingest_source_runtime,
-                            )
-                        })
+                        source_activation::run_source_reader(
+                            &ingest_node,
+                            lifecycle_telemetry.as_ref(),
+                            stream_end,
+                            || {
+                                // A governed allocation this Source was
+                                // refused ends its ingest here, on the thread
+                                // that recorded the refusal's report.
+                                crate::pipeline::memory::ledger::convert_governed_refusal(
+                                    ingest_source(
+                                        src_cfg_owned,
+                                        source_input,
+                                        config_clone,
+                                        stream,
+                                        ingest_shutdown,
+                                        ingest_progress,
+                                        ingest_source_runtime,
+                                    ),
+                                    &ingest_node,
+                                    clinker_plan::runtime_error::MemorySurface::RowsRead,
+                                )
+                            },
+                        )
                     })
                     .map_err(|e| PipelineError::Internal {
                         op: "source-ingest-spawn",
                         node: src_cfg.name.clone(),
                         detail: format!("failed to spawn source ingest thread: {e}"),
                     })?;
-                ingest_handles.push(handle);
+                ingest_handles.push(ingest::SourceWorker::new(&src_cfg.name, handle));
             }
             Ok(())
         })();
@@ -1222,7 +1257,7 @@ impl PipelineExecutor {
                 handle.set_bytes(0);
                 memory_budget.unregister_consumer(id);
             }
-            let _ = ingest::join_source_workers(ingest_handles, "source-ingest-thread");
+            ingest::join_source_workers_after_failure(ingest_handles);
             return Err(error);
         }
 
@@ -1248,20 +1283,27 @@ impl PipelineExecutor {
                 spill_root,
                 watermarks,
                 memory_budget: memory_budget.clone(),
+                kernel_pool,
             },
             &mut collector,
             counters,
         ) {
             Ok(outcome) => outcome,
             Err(dispatch_error) => {
+                // A governed allocation the walk itself was refused names its
+                // requester through the walk's own attribution, so nothing is
+                // stamped here.
+                let dispatch_error =
+                    crate::pipeline::memory::ledger::governed_refusal_error(dispatch_error, None);
                 // `execute_dag` has already dropped or drained every receiver,
                 // so each finite source worker can now finish. Join all of
                 // them before returning the original dispatcher failure: a
                 // detached ingest thread would keep reader and spill handles
-                // alive beyond the failed run's lifecycle boundary.
-                for handle in ingest_handles {
-                    let _ = handle.join();
-                }
+                // alive beyond the failed run's lifecycle boundary. The
+                // walk's error is the first failure in data order, a
+                // reader's it reached included; a reader failure it never
+                // reached is logged, not dropped.
+                ingest::join_source_workers_after_failure(ingest_handles);
                 return Err(dispatch_error);
             }
         };
@@ -1280,17 +1322,24 @@ impl PipelineExecutor {
 
         // Collect ingest-task outcomes: per-source row counts and the
         // per-(source, file) watermark observations each task captured
-        // locally. The dispatch path consumed each task's receiver
-        // already, so a clean ingest task's join is the synchronization
-        // point that confirms readers + spill writers closed without
-        // error. A task error here (reader I/O, spill writer failure,
-        // closed-receiver — which can only fire if dispatch aborted
-        // before draining, in which case the dispatch error fires
-        // first) propagates after dispatch's own result.
+        // locally. A clean join confirms the reader and its spill writers
+        // closed without error. A reader failure the walk reached already
+        // failed dispatch above, so a failure here is one the walk never
+        // reached. After a completed walk it is the run's error, and so is
+        // a read whose receiver the walk dropped before the reader's end:
+        // a completed walk reads every Source to its end.
         let mut total_ingested: u64 = 0;
         let mut counters = counters;
         // Join every worker before selecting the terminal result. An earlier
         // failure must never detach later workers holding readers or grants.
+        // A walk the run's cancellation stopped keeps the cancellation as the
+        // run's outcome: a reader failure it never reached is logged, while
+        // one it reached already failed the walk above.
+        let walk_end = if interrupted {
+            ingest::WalkEnd::Interrupted
+        } else {
+            ingest::WalkEnd::Completed
+        };
         let SourceCompletion {
             outcomes,
             cumulative_spill_bytes,
@@ -1300,7 +1349,7 @@ impl PipelineExecutor {
             per_node_peak_charged_bytes,
             memory_limit_bytes,
         } = SourceCompletion::join(&memory_budget, || {
-            ingest::join_source_workers(ingest_handles, "source-ingest-thread")
+            walk_end.join_source_workers(ingest_handles, "source-ingest-thread")
         })?;
         for outcome in outcomes {
             interrupted |= outcome.interrupted;
@@ -1445,7 +1494,7 @@ impl PipelineExecutor {
         // - seed `$record.<key>` defaults per record,
         // - seed `$source.<key>` defaults per `(source, file)` Arc on
         //   first observation,
-        // - on `recv` returning `Err` (channel disconnected), stamp the
+        // - on the reader's `Ended` (the whole input was read), stamp the
         //   finalized per-source count and call
         //   `finalize_node_rooted_windows` to populate every spec rooted
         //   at this source's NodeIndex.
@@ -1502,6 +1551,7 @@ impl PipelineExecutor {
             spill_root,
             watermarks,
             memory_budget,
+            kernel_pool,
         } = resources;
 
         // Cache the spill-dir path as an `Arc<Path>` derived from the guard, so
@@ -1606,18 +1656,20 @@ impl PipelineExecutor {
                 .filter(|s| s.dlq_granularity == clinker_plan::config::DlqGranularity::Document)
                 .map(|s| Arc::from(s.name.as_str()))
                 .collect();
-            Some(crate::executor::document_dlq::DocumentDlqState::new(
-                doc_sources,
-                Arc::clone(&memory_budget),
-                crate::executor::document_dlq::HeldLogConfig {
-                    spill_root: Arc::clone(&spill_root_path),
-                    compress: params.spill_compress,
-                    batch_size: config
-                        .pipeline
-                        .batch_size
-                        .unwrap_or(crate::executor::batch_handoff::DEFAULT_BATCH_SIZE),
-                },
-            ))
+            Some(std::rc::Rc::new(std::cell::RefCell::new(
+                crate::executor::document_dlq::DocumentDlqState::new(
+                    doc_sources,
+                    Arc::clone(&memory_budget),
+                    crate::executor::document_dlq::HeldLogConfig {
+                        spill_root: Arc::clone(&spill_root_path),
+                        compress: params.spill_compress,
+                        batch_size: config
+                            .pipeline
+                            .batch_size
+                            .unwrap_or(crate::executor::batch_handoff::DEFAULT_BATCH_SIZE),
+                    },
+                )?,
+            )))
         } else {
             None
         };
@@ -1728,13 +1780,6 @@ impl PipelineExecutor {
             )
         };
 
-        // Shared Rayon pool for the CPU-bound owned-input kernels (sort,
-        // grace-hash partition build, IEJoin, sort-merge). Sized off the
-        // run's resolved nonzero thread capacity. Built once per
-        // run and shared via `Arc` so every kernel `install` reuses the
-        // same worker set rather than spinning up a pool per operator.
-        let kernel_pool = build_kernel_pool(run_policy)?;
-
         // The walk's dead-letter writer, opened before any thread is spawned
         // so a refusal leaves nothing to join. Rows stream through it from the
         // first dead letter; it is closed once the walk's last dead letter is
@@ -1772,11 +1817,17 @@ impl PipelineExecutor {
         let truncation_ledger = truncation_report::TruncationLedger::default();
         let mut streaming_output_senders: HashMap<
             petgraph::graph::NodeIndex,
-            crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>,
+            crate::executor::stream_hop::HopSender,
         > = HashMap::new();
+        // The walk ends each streaming Sink's hop once its producer's
+        // top-level turn returns `Ok`; until then it holds the hop's end.
+        let mut streaming_sink_ends: HashMap<
+            petgraph::graph::NodeIndex,
+            crate::executor::stream_hop::SinkHopEnd,
+        > = HashMap::new();
+        let hop_ends = stream_hop::HopEndLog::for_run(&params.memory_test);
         let mut streaming_sink_nodes: HashSet<petgraph::graph::NodeIndex> = HashSet::new();
-        let mut streaming_output_tasks: Vec<std::thread::JoinHandle<StreamingOutputTaskOutput>> =
-            Vec::new();
+        let mut streaming_output_tasks: Vec<StreamingSinkThread> = Vec::new();
         let mut streaming_charge_consumers: HashMap<
             petgraph::graph::NodeIndex,
             (
@@ -1796,7 +1847,7 @@ impl PipelineExecutor {
             // curve. Mirrors the Source ingest channel sizing (issue
             // #67) — the same bound paces both ends of the pipeline.
             let (tx, rx) =
-                crossbeam_channel::bounded::<crate::executor::stream_event::StreamEvent>(256);
+                crossbeam_channel::bounded::<crate::executor::stream_hop::HopMessage>(256);
             let producer_idx = spec.producer_idx;
             let output_idx = spec.output_idx;
             let output_name = spec.output_name.clone();
@@ -1821,10 +1872,12 @@ impl PipelineExecutor {
                     node: spec.producer_name.clone(),
                     surface: clinker_plan::runtime_error::MemorySurface::BufferedRows {
                         from: spec.producer_name.clone(),
-                        to: spec.output_name.clone(),
+                        to: clinker_plan::runtime_error::NonEmptyReaders::one(
+                            spec.output_name.clone(),
+                        ),
                     },
                 },
-            );
+            )?;
             let writer_charge_handle = charge_handle.clone();
             let telemetry_producer = params.telemetry_producer.clone();
             let sink_shutdown_token = params.shutdown_token.clone();
@@ -1833,10 +1886,12 @@ impl PipelineExecutor {
                 allocation_resources: allocation_resources.clone(),
                 truncation_ledger: truncation_ledger.clone(),
             };
+            let writer_node = output_name.clone();
+            let writer_end_name = output_name.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("clinker-output-{output_name}"))
                 .spawn(move || {
-                    streaming_sink(
+                    let mut output = streaming_sink(
                         rx,
                         raw_writer,
                         spec,
@@ -1844,19 +1899,59 @@ impl PipelineExecutor {
                         telemetry_producer,
                         sink_shutdown_token,
                         sink_resources,
-                    )
+                    );
+                    // A governed allocation this writer was refused ends its
+                    // work here, on the thread that recorded the refusal's
+                    // report.
+                    output.errors = std::mem::take(&mut output.errors)
+                        .into_iter()
+                        .map(|error| {
+                            crate::pipeline::memory::ledger::governed_refusal_error(
+                                error,
+                                Some((
+                                    &writer_node,
+                                    clinker_plan::runtime_error::MemorySurface::OutputStaging,
+                                )),
+                            )
+                        })
+                        .collect();
+                    output
                 })
                 .map_err(|e| PipelineError::Internal {
                     op: "streaming-output-spawn",
                     node: output_name,
                     detail: format!("failed to spawn streaming output thread: {e}"),
                 })?;
+            streaming_sink_ends.insert(
+                producer_idx,
+                crate::executor::stream_hop::SinkHopEnd {
+                    sink: writer_end_name.clone(),
+                    end: crate::executor::stream_hop::HopEnd::new(tx.clone()),
+                },
+            );
             streaming_output_senders.insert(producer_idx, tx);
             streaming_sink_nodes.insert(output_idx);
-            streaming_output_tasks.push(handle);
+            streaming_output_tasks.push(StreamingSinkThread {
+                producer: producer_idx,
+                sink: writer_end_name,
+                handle,
+            });
             streaming_charge_consumers.insert(producer_idx, (charge_consumer_id, charge_handle));
         }
 
+        let batch_size = config
+            .pipeline
+            .batch_size
+            .unwrap_or(crate::executor::batch_handoff::DEFAULT_BATCH_SIZE);
+        let parked_generations = std::rc::Rc::new(std::cell::RefCell::new(
+            parked_generations::ParkedGenerations::new(
+                Arc::clone(&memory_budget),
+                allocation_resources.clone(),
+                Arc::clone(&spill_root_path),
+                params.spill_compress,
+                batch_size,
+            ),
+        ));
         let mut ctx = dispatch::ExecutorContext {
             writer_resources,
             allocation_resources,
@@ -1874,9 +1969,15 @@ impl PipelineExecutor {
             strategy,
             run_policy,
 
-            node_buffers: HashMap::new(),
-            node_buffer_consumer_ids: HashMap::new(),
-            node_buffer_readers: dispatch::NodeBufferReaderLedger::default(),
+            walk_reclaim: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::pipeline::memory::walk::WalkReclaimSet::new(
+                    crate::pipeline::memory::walk::WalkSpillSettings {
+                        spill_root: Arc::clone(&spill_root_path),
+                        spill_compress: params.spill_compress,
+                        batch_size,
+                    },
+                ),
+            )),
             planned_node_buffer_readers: dispatch::planned_materialized_reader_counts(plan),
             window_arena_consumer_ids: HashMap::new(),
             source_records,
@@ -1928,12 +2029,14 @@ impl PipelineExecutor {
             relaxed_aggregator_states: HashMap::new(),
             relaxed_aggregator_degrade: Vec::new(),
             commit_step_path: dispatch::CommitStepPath::NotSelected,
-            region_input_buffers: HashMap::new(),
+            parked_generations,
             in_deferred_dispatch: false,
             transform_signal_carry: crate::log_dispatch::ParkedTransformSignals::new(
                 params.telemetry_producer.clone(),
             ),
             streaming_output_senders,
+            hop_ends,
+            streaming_sink_ends,
             streaming_sink_nodes,
             streaming_aggregate_ingest_edges,
             streaming_combine_probe_edges,
@@ -1942,10 +2045,7 @@ impl PipelineExecutor {
             kernel_pool,
             shutdown_token: params.shutdown_token.clone(),
             interrupted: false,
-            batch_size: config
-                .pipeline
-                .batch_size
-                .unwrap_or(crate::executor::batch_handoff::DEFAULT_BATCH_SIZE),
+            batch_size,
             spill_compress: params.spill_compress,
             // Seed the exec-time accumulator with the plan-time catalog's
             // Plane A row counts so a downstream node reading it sees the
@@ -1953,6 +2053,22 @@ impl PipelineExecutor {
             // supersedes one with an exec-measured figure.
             runtime_statistics: Arc::new(std::sync::Mutex::new(statistics.clone())),
         };
+        // This thread is the run's walk from here until the function returns,
+        // by any path; the guard drops before `ctx`.
+        let _walk_frame = crate::pipeline::memory::walk::WalkContextGuard::install(
+            &ctx.memory_budget,
+            std::rc::Rc::clone(&ctx.walk_reclaim),
+        );
+        // The document dead-letter state's held rows are a victim any
+        // reclaim pass on the walk can flush. Registered once the walk frame
+        // is installed, and declared after the guard so the registration
+        // drops first. Rows parked for a deferred consumer register edge by
+        // edge, at each edge's first park.
+        let _document_dlq_reclaim = ctx
+            .document_dlq
+            .as_ref()
+            .map(crate::executor::document_dlq::DocumentDlqState::register_for_reclaim)
+            .transpose()?;
 
         // Resolve dispatch order through the memory arbitrator rather
         // than walking `topo_order` blindly. `scheduled_pass_order` runs
@@ -1984,15 +2100,15 @@ impl PipelineExecutor {
         // dispatcher call, so the resolved `Vec<NodeIndex>` is what the
         // loop iterates instead of re-borrowing `plan` per step.
         //
-        // Wrapped in an immediately-invoked closure so a `?` error inside
-        // doesn't short-circuit past the streaming-output thread join
-        // below — the spawned threads own writers we still need to flush
-        // (or drop) before the function returns, and dropping
-        // `ctx.streaming_output_senders` on the error path is what signals
-        // the threads to disconnect their channel and run their flush. A
-        // tripped shutdown token surfaces as `PipelineError::Interrupted`
-        // from a per-node poll, which lands here too so the same
-        // drain-then-join cleanup runs.
+        // A turn's failure stops the loop without returning, so the teardown
+        // below still joins every streaming Sink thread: those threads own
+        // writers that must be closed or abandoned before the function
+        // returns. A Sink closes its output only on its hop's End, which a
+        // turn sends once its producer returned `Ok`; a failed turn drops the
+        // end instead, so the Sink's channel closes without End and the Sink
+        // abandons its output. A tripped shutdown token surfaces as
+        // `PipelineError::Interrupted` from a per-node poll, which stops the
+        // loop the same way.
         // Under document dead-lettering every Sink waits for every operator
         // of its pass, so each document's verdict is final before any Sink
         // writes; the plan orders Sinks last on the same predicate.
@@ -2031,35 +2147,59 @@ impl PipelineExecutor {
             )
         };
 
-        let mut walk_result: Result<(), PipelineError> = (|| {
-            for node_idx in dispatch_sequence {
-                ctx.check_shutdown()?;
-                dispatch::dispatch_plan_node(&mut ctx, plan, node_idx)?;
+        let pipeline_name = ctx.config.pipeline.name.clone();
+        let mut failures = WalkFailures::default();
+        let mut walk_end = WalkEnd::Completed;
+        let mut turns = 0;
+        for (turn, node_idx) in dispatch_sequence.into_iter().enumerate() {
+            turns = turn + 1;
+            let node = plan.graph[node_idx].name().to_string();
+            let result = ctx
+                .check_shutdown()
+                .and_then(|()| dispatch::dispatch_plan_node(&mut ctx, plan, node_idx));
+            // The output errors this turn collected (so sibling Sinks still
+            // ran) belong to this turn, ahead of how the turn itself ended.
+            failures.extend(turn, &node, std::mem::take(&mut ctx.output_errors));
+            if let Some(end) = settle_turn(&mut ctx, &mut failures, turn, node_idx, &node, result) {
+                walk_end = end;
+                break;
             }
-            Ok(())
-        })();
+        }
+        // The walk has stopped, however it stopped: publish the rows it read
+        // and has not yet published. This is the one place that establishes
+        // the observer's final count, so a walk that failed or was cancelled
+        // between publishing boundaries still reports every row it took.
+        dispatch::publish_record_progress(&mut ctx);
+        // A spill a reclaim pass met between dispatches (none is expected:
+        // every allocation of the walk runs inside a dispatch) still fails
+        // the run rather than being lost.
+        if walk_end == WalkEnd::Completed
+            && let Some(failure) = ctx.memory_budget.take_reclaim_failure()
+        {
+            failures.push(turns, &pipeline_name, failure);
+            walk_end = WalkEnd::Failed;
+        }
 
-        // Streaming-output drain. Drop every remaining sender BEFORE
-        // joining so the writer threads' `rx.recv` returns `Err`
-        // (channel disconnected) and they fall through to their flush
-        // path — joining before dropping would deadlock, the thread
-        // blocked on a `recv` that never disconnects. The fused Merge arm
-        // normally removes its sender at clean exit; remaining entries
-        // here are the error-/interrupt-path leftovers (Merge arm never
-        // ran) or pipelines where no streaming chain was eligible (the
-        // map is empty).
+        // Streaming-output drain for the Sinks the walk did not settle: their
+        // producers never finished a turn. Let go of every Sink hop end the
+        // walk still holds, then of every remaining sender, BEFORE joining: a
+        // writer thread waits on its channel until End or until the channel
+        // closes, so joining first would deadlock. An end still held after a
+        // completed walk names a Sink no producer turn finished, an engine
+        // defect; after a failed or interrupted walk the held ends are the
+        // Sinks whose producers never ran, which close nothing. What those
+        // Sinks report enters the record after the walk's own failure.
+        if let Err(error) = stream_hop::release_sink_hop_ends(
+            std::mem::take(&mut ctx.streaming_sink_ends),
+            walk_end == WalkEnd::Completed,
+        ) {
+            failures.push(turns, &pipeline_name, error);
+            walk_end = WalkEnd::Failed;
+        }
         ctx.streaming_output_senders.clear();
-        for handle in std::mem::take(&mut ctx.streaming_output_tasks) {
-            match handle.join() {
-                Ok(out) => out.fold_into(&mut ctx),
-                Err(_panic) => {
-                    ctx.output_errors.push(PipelineError::Internal {
-                        op: "streaming_sink",
-                        node: String::from("<unknown>"),
-                        detail: String::from("streaming output thread panicked"),
-                    });
-                }
-            }
+        for sink in std::mem::take(&mut ctx.streaming_output_tasks) {
+            let outcome = sink.join_into(&mut ctx);
+            failures.extend(turns, &outcome.sink, outcome.errors);
         }
 
         // Every streaming writer has joined, so its discharge is
@@ -2076,8 +2216,8 @@ impl PipelineExecutor {
         // before their dispatch turn — still hold their ingest-channel
         // registration. Release them here so the registry does not outlive
         // the walk with a frozen queued charge on the ledger. On a completed
-        // walk this map is empty: each drain arm released its entry at
-        // receiver disconnect. `resume` before unregister is load-bearing:
+        // walk this map is empty: each drain arm released its entry when it
+        // took the Source's `Ended`. `resume` before unregister is load-bearing:
         // an arbitration round may have paused an undrained source's ingest
         // thread, and once the wrapper leaves the registry nothing else can
         // unpark it — the thread would sit parked forever and the caller's
@@ -2090,49 +2230,39 @@ impl PipelineExecutor {
             ctx.memory_budget.unregister_consumer(id);
         }
 
-        if walk_result.is_ok()
+        if walk_end == WalkEnd::Completed
             && let Err(error) =
                 dispatch::validate_completed_node_buffer_scope(&ctx, &ctx.config.pipeline.name)
         {
-            walk_result = Err(error);
+            failures.push(turns, &pipeline_name, error);
+            walk_end = WalkEnd::Failed;
         }
 
         // The walk is finished (success, interruption, or error), so no
         // top-scope node buffer can be consumed again. Drop every residual
         // allocation while its pull-mode wrapper is still registered, then
-        // unregister the matching ids before propagating `walk_result`.
+        // unregister the matching ids before the run's error is decided.
         // Successful reads consume every declared reader and leave no slot;
         // this sweep is the early-error/interruption backstop for partially
         // consumed fan-out and composition inputs.
-        drop(std::mem::take(&mut ctx.node_buffers));
-        ctx.node_buffer_readers = dispatch::NodeBufferReaderLedger::default();
-        for (_, (id, handle)) in std::mem::take(&mut ctx.node_buffer_consumer_ids) {
-            handle.set_bytes(0);
-            ctx.memory_budget.unregister_consumer(id);
-        }
+        let residue = ctx.walk_reclaim.borrow_mut().take_slots();
+        residue.release_residue(&ctx.memory_budget);
+        // Rows parked for a deferred consumer are released when the commit
+        // returns; a walk that never reached the commit releases them here.
+        ctx.parked_generations.borrow_mut().release_all();
 
-        // A tripped shutdown token unwinds the walk via
-        // `PipelineError::Interrupted`; that is a graceful early stop, not
-        // a failure, so swallow it here (the interruption is recorded in
-        // `ctx.interrupted` and surfaced through the report) and let the
-        // run finish draining. Every other walk error still propagates.
-        let cancelled_output = ctx
-            .output_errors
-            .iter()
-            .any(preparation::is_explicit_cancellation);
-        if cancelled_output {
-            ctx.interrupted = true;
-            ctx.output_errors
-                .retain(|error| !preparation::is_explicit_cancellation(error));
-        }
-        let walk_completed = match walk_result {
-            Ok(()) => !cancelled_output,
-            Err(error) if preparation::is_explicit_cancellation(&error) => {
-                ctx.interrupted = true;
-                false
-            }
-            Err(other) => return Err(other),
-        };
+        // Output errors collected outside every turn (the teardown above).
+        failures.extend(
+            turns,
+            &pipeline_name,
+            std::mem::take(&mut ctx.output_errors),
+        );
+        // A tripped shutdown token stops the walk with
+        // `PipelineError::Interrupted`; that is a graceful early stop, not a
+        // failure, so the run finishes draining and reports the interruption
+        // (unless a step failed first, which the record decides below). A
+        // Sink stopped by the cancellation is the same stop.
+        let walk_completed = walk_end == WalkEnd::Completed && !failures.any_cancellation();
 
         // Document-level DLQ terminal sweep. The walk's Output arms already
         // flushed-or-rejected every document whose close arrived or whose
@@ -2141,8 +2271,19 @@ impl PipelineExecutor {
         // all suppressed before any Output — emitting their trigger entry
         // once each. Skipped on an interrupted run, which is a graceful stop
         // rather than a completed drain.
+        // What the sweep collects and any failure it returns come after the
+        // last turn.
         if walk_completed {
-            crate::executor::document_dlq::reject_unclosed_failed_documents(&mut ctx)?;
+            let swept = crate::executor::document_dlq::reject_unclosed_failed_documents(&mut ctx);
+            failures.extend(
+                turns,
+                &pipeline_name,
+                std::mem::take(&mut ctx.output_errors),
+            );
+            if let Err(error) = swept {
+                failures.push(turns, &pipeline_name, error);
+                walk_end = WalkEnd::Failed;
+            }
         }
 
         // Top-scope teardown: the run has drained, so unregister every
@@ -2187,7 +2328,6 @@ impl PipelineExecutor {
         let projection_timer = ctx.projection_timer;
         let write_timer = ctx.write_timer;
         let records_emitted = ctx.records_emitted;
-        let output_errors = ctx.output_errors;
         let collector = ctx.collector;
         let total_records: u64 = ctx.total_per_source.values().sum();
         *counters = ctx.counters;
@@ -2213,25 +2353,25 @@ impl PipelineExecutor {
             records_emitted,
         ));
 
-        // Aggregate Output errors collected during the topo walk.
-        // Single error → bare error; ≥2 errors →
-        // `PipelineError::Multiple` (the DataFusion collection-pattern
-        // shape). Zero errors → fall through to Ok. An early return here drops
-        // `ctx` (and with it the sole `SpillDir` guard), whose `Drop` releases
-        // the lock before removing the directory — the error path is cleaned up
-        // identically to the clean path.
-        match output_errors.len() {
-            0 => {}
-            1 => return Err(output_errors.into_iter().next().unwrap()),
-            _ => return Err(PipelineError::Multiple(output_errors)),
-        }
-
         // Every dead letter of the walk has been pushed: the streaming Sink
         // threads were joined and folded above, and the document terminal
         // sweep has run. Close the walk's writer so its rows are flushed into
-        // the staged files before the caller can publish them. A flush error
-        // fails the run.
-        ctx.dlq.close(counters.dlq_count)?;
+        // the staged files before the caller can publish them; a run that
+        // already failed publishes nothing, so its writer is left unflushed.
+        // A failed close is the run's failure, after the last turn.
+        if !failures.has_failure(walk_end)
+            && let Err(error) = ctx.dlq.close(counters.dlq_count)
+        {
+            failures.push(turns, &pipeline_name, error);
+            walk_end = WalkEnd::Failed;
+        }
+
+        // The one place the run's error is decided, from every failure the
+        // walk met in the order it met them. An early return here drops
+        // `ctx` (and with it the sole `SpillDir` guard), whose `Drop` releases
+        // the lock before removing the directory — the error path is cleaned
+        // up identically to the clean path.
+        failures.resolve(walk_end, &mut ctx.interrupted)?;
 
         // Clean-exit teardown of the spill directory. Dropping the guard here —
         // after every operator-side spill path has been drained and the metrics
@@ -2307,6 +2447,247 @@ impl PipelineExecutor {
     }
 }
 
+/// How the walk stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WalkEnd {
+    /// Every turn ran and every post-walk check passed.
+    Completed,
+    /// The run's cancellation stopped a turn.
+    Cancelled,
+    /// A failure stopped the walk; the record holds it.
+    Failed,
+}
+
+/// One failure the walk met: the turn it belongs to, the step it names, and
+/// the error. Failures met after the last turn carry the turn count.
+struct WalkFailure {
+    turn: usize,
+    node: String,
+    error: PipelineError,
+}
+
+/// Every failure a run's walk met, in the order the walk met them: turn by
+/// turn, and within a turn in the order the turn settled them.
+///
+/// Kept on the walk's thread only: each verdict, a streaming Sink's
+/// included, is settled on the walk before it is recorded, so the order is
+/// the walk's own and needs no synchronization. It holds the errors the run
+/// already collected for its report, plus at most one walk failure and the
+/// post-walk checks, so it is bounded by the plan, not by the input.
+#[derive(Default)]
+struct WalkFailures {
+    entries: Vec<WalkFailure>,
+}
+
+impl WalkFailures {
+    fn push(&mut self, turn: usize, node: &str, error: PipelineError) {
+        self.entries.push(WalkFailure {
+            turn,
+            node: node.to_string(),
+            error,
+        });
+    }
+
+    fn extend(&mut self, turn: usize, node: &str, errors: impl IntoIterator<Item = PipelineError>) {
+        for error in errors {
+            self.push(turn, node, error);
+        }
+    }
+
+    /// Record how turn `turn` of `node` ended: `None` to go on to the next
+    /// turn, or how the walk stopped.
+    fn stop(
+        &mut self,
+        turn: usize,
+        node: &str,
+        result: Result<(), PipelineError>,
+    ) -> Option<WalkEnd> {
+        match result {
+            Ok(()) => None,
+            Err(error) if preparation::is_explicit_cancellation(&error) => Some(WalkEnd::Cancelled),
+            Err(error) => {
+                self.push(turn, node, error);
+                Some(WalkEnd::Failed)
+            }
+        }
+    }
+
+    /// Whether the run fails: the walk failed, or the record holds a
+    /// failure that is not the run's cancellation.
+    fn has_failure(&self, end: WalkEnd) -> bool {
+        end == WalkEnd::Failed
+            || self
+                .entries
+                .iter()
+                .any(|entry| !preparation::is_explicit_cancellation(&entry.error))
+    }
+
+    /// Whether any recorded failure is the run's cancellation.
+    fn any_cancellation(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| preparation::is_explicit_cancellation(&entry.error))
+    }
+
+    /// Decide the run's error from the walk's end and every failure it met.
+    ///
+    /// - A failed walk reports the first failure in the record, and every
+    ///   later one is logged on the walk's thread with the step it names.
+    /// - A cancelled walk, or a Sink stopped by the cancellation, marks the
+    ///   run interrupted; any other failure the walk collected is still the
+    ///   run's error.
+    /// - Otherwise the Sinks' failures are the run's error: one as itself,
+    ///   several as [`PipelineError::Multiple`] in the order they were met.
+    ///
+    /// A cancellation in the record is never a failure to report or log.
+    fn resolve(self, end: WalkEnd, interrupted: &mut bool) -> Result<(), PipelineError> {
+        let mut cancelled = end == WalkEnd::Cancelled;
+        let mut failed = Vec::with_capacity(self.entries.len());
+        for entry in self.entries {
+            if preparation::is_explicit_cancellation(&entry.error) {
+                cancelled = true;
+            } else {
+                failed.push(entry);
+            }
+        }
+        if end == WalkEnd::Failed {
+            let mut failed = failed.into_iter();
+            let Some(first) = failed.next() else {
+                return Err(PipelineError::Internal {
+                    op: "executor",
+                    node: String::new(),
+                    detail: "the walk failed without recording its failure".to_string(),
+                });
+            };
+            for later in failed {
+                tracing::warn!(
+                    node = later.node.as_str(),
+                    turn = later.turn,
+                    error = %later.error,
+                    "this step also failed, after the run's first failure; the run reports \
+                     its first failure"
+                );
+            }
+            return Err(first.error);
+        }
+        if cancelled {
+            *interrupted = true;
+        }
+        let mut errors: Vec<PipelineError> = failed.into_iter().map(|entry| entry.error).collect();
+        match errors.len() {
+            0 => Ok(()),
+            1 => Err(errors.remove(0)),
+            _ => Err(PipelineError::Multiple(errors)),
+        }
+    }
+}
+
+/// Settle turn `turn` of `node` on the walk's thread: end or release its
+/// streaming Sink's hop, settle that Sink in this turn, and record how the
+/// turn ended. `None` lets the walk go on to its next turn.
+fn settle_turn(
+    ctx: &mut dispatch::ExecutorContext<'_>,
+    failures: &mut WalkFailures,
+    turn: usize,
+    node_idx: petgraph::graph::NodeIndex,
+    node: &str,
+    result: Result<(), PipelineError>,
+) -> Option<WalkEnd> {
+    // The producer's turn returned `Ok`, so its whole output is on its
+    // streaming Sink's channel: end the Sink's input. A failed or interrupted
+    // turn drops the end unsent, and the Sink finishes nothing.
+    if let Some(held) = ctx.streaming_sink_ends.remove(&node_idx) {
+        if result.is_ok() {
+            held.end.end();
+        } else {
+            drop(held);
+        }
+    }
+    let sink = ctx
+        .streaming_output_tasks
+        .iter()
+        .position(|sink| sink.producer == node_idx)
+        .map(|at| ctx.streaming_output_tasks.remove(at));
+    match sink {
+        Some(sink) => settle_streaming_sink(ctx, failures, turn, node, sink, result),
+        None => failures.stop(turn, node, result),
+    }
+}
+
+/// Join the streaming Sink `node` feeds at the end of `node`'s turn and
+/// settle the turn with [`stream_hop::settle_hop`] over the Sink's verdict
+/// and the producer's `result`.
+///
+/// The Sink's own failure was met on a row `node` emitted before any failure
+/// `node` reports, so it enters the record first and `settle_hop` logs the
+/// producer's later failure. A Sink failure stops the walk only when its
+/// producer's turn stopped it too: a Sink that failed beside a producer that
+/// finished leaves the walk running, as a Sink's failure always has, so the
+/// other Sinks still report theirs. A Sink stopped only by the cancellation
+/// takes its producer's result, and a Sink whose input closed without End
+/// beside a producer that finished is an engine defect.
+fn settle_streaming_sink(
+    ctx: &mut dispatch::ExecutorContext<'_>,
+    failures: &mut WalkFailures,
+    turn: usize,
+    node: &str,
+    sink: StreamingSinkThread,
+    result: Result<(), PipelineError>,
+) -> Option<WalkEnd> {
+    // A producer that failed before it took its sender would otherwise keep
+    // the Sink's channel open, and the join below would never return.
+    ctx.streaming_output_senders.remove(&sink.producer);
+    let streaming::StreamingSinkOutcome {
+        sink,
+        mut errors,
+        input_end,
+    } = sink.join_into(ctx);
+    if errors.is_empty() && input_end.is_none() {
+        errors.push(PipelineError::Internal {
+            op: "streaming_sink",
+            node: sink.clone(),
+            detail: "the Sink stopped before the end of its input without reporting why"
+                .to_string(),
+        });
+    }
+    let own_failure = errors
+        .iter()
+        .position(|error| !preparation::is_explicit_cancellation(error));
+    match (own_failure, input_end) {
+        (Some(at), _) => {
+            let stops_walk = match &result {
+                Ok(()) => None,
+                Err(error) if preparation::is_explicit_cancellation(error) => {
+                    Some(WalkEnd::Cancelled)
+                }
+                Err(_) => Some(WalkEnd::Failed),
+            };
+            let own = errors.remove(at);
+            let own = match stream_hop::settle_hop(&sink, node, Err(own), result) {
+                Err(own) => own,
+                Ok(()) => PipelineError::Internal {
+                    op: "streaming-hop",
+                    node: sink.clone(),
+                    detail: "the hop settled as finished over the Sink's own failure".to_string(),
+                },
+            };
+            errors.insert(at, own);
+            failures.extend(turn, &sink, errors);
+            stops_walk
+        }
+        // Stopped only by the cancellation: the producer's result stands.
+        (None, _) if !errors.is_empty() => {
+            failures.extend(turn, &sink, errors);
+            failures.stop(turn, node, result)
+        }
+        (None, Some(verdict)) => {
+            let settled = stream_hop::settle_hop(&sink, node, Ok(verdict), result);
+            failures.stop(turn, node, settled)
+        }
+        (None, None) => failures.stop(turn, node, result),
+    }
+}
+
 /// Render mapping findings in the same order the Outputs appear in the
 /// pipeline. The probe registry is keyed for lookup, not presentation; walking
 /// it directly would sort advisories by output name.
@@ -2378,6 +2759,52 @@ mod tests {
     //! in-crate symbols.
 
     use super::*;
+
+    /// Runs `run` with a subscriber on this thread that keeps every warning
+    /// and error logged, each as its message followed by its fields, and
+    /// returns them with `run`'s result.
+    ///
+    /// Only the calling thread is seen. An error the engine logs instead of
+    /// returning must therefore be logged on the walk thread, the thread a
+    /// run's caller is on, for a test to observe it; one logged on a reader
+    /// or writer thread is invisible here.
+    pub(super) fn capture_warnings<T>(run: impl FnOnce() -> T) -> (T, Vec<String>) {
+        struct Capture(Arc<std::sync::Mutex<Vec<String>>>);
+        struct Line(String);
+        impl tracing::field::Visit for Line {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if !self.0.is_empty() {
+                    self.0.push(' ');
+                }
+                if field.name() == "message" {
+                    self.0.push_str(&format!("{value:?}"));
+                } else {
+                    self.0.push_str(&format!("{}={value:?}", field.name()));
+                }
+            }
+        }
+        impl tracing::Subscriber for Capture {
+            fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+                *metadata.level() <= tracing::Level::WARN
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut line = Line(String::new());
+                event.record(&mut line);
+                self.0.lock().expect("capture lock").push(line.0);
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let result = tracing::subscriber::with_default(Capture(Arc::clone(&lines)), run);
+        let lines = std::mem::take(&mut *lines.lock().expect("capture lock"));
+        (result, lines)
+    }
 
     #[test]
     fn run_policy_capacity_sizes_the_kernel_pool() {
@@ -3025,10 +3452,14 @@ nodes:
     mod per_source_projection;
     mod resident_node_buffer_spill;
     mod scheduling;
+    mod shared_slot_read_reservation;
     mod source_completion;
     mod source_consumer_release;
+    mod source_end_of_input;
     mod source_pause_liveness;
     mod spill_backed_drain_overshoot;
     mod spill_dir_unavailable_midrun;
+    mod stream_hop_end;
     mod transient_node_buffer_reservations;
+    mod walk_failure_order;
 }

@@ -524,6 +524,10 @@ pub(super) struct IngestTaskOutcome {
     pub(super) total_count: u64,
     /// The source observed cancellation; progress remains valid on this exit.
     pub(super) interrupted: bool,
+    /// The walk stopped listening before the reader reached the end of its
+    /// input, with no cancellation requested: the read stopped short and is
+    /// not complete. Reported like an interrupted read, never as complete.
+    pub(super) abandoned: bool,
     pub(super) watermark_observations: Vec<(Arc<str>, i64)>,
 }
 
@@ -533,27 +537,164 @@ impl IngestTaskOutcome {
             source_name,
             total_count: 0,
             interrupted: false,
+            abandoned: false,
             watermark_observations: Vec::new(),
+        }
+    }
+
+    /// The reader stopped before the end of its input: the run was
+    /// cancelled, or the walk stopped listening.
+    pub(super) fn stopped_short(&self) -> bool {
+        self.interrupted || self.abandoned
+    }
+}
+
+/// Record that the walk dropped this Source's receiver before the reader
+/// reached the end of its input.
+///
+/// Every push the reader makes, a record's, a rejection's or a document
+/// boundary's, can meet the closed channel; each is reported here. Under a
+/// requested cancellation the closed channel is the cancellation's teardown,
+/// so the read is interrupted. Otherwise the walk stopped reading this
+/// Source (it failed elsewhere), so the read is abandoned. Either way the
+/// read is not complete.
+fn stop_on_closed_channel(
+    outcome: &mut IngestTaskOutcome,
+    shutdown: Option<&crate::pipeline::shutdown::ShutdownToken>,
+) {
+    if shutdown.is_some_and(crate::pipeline::shutdown::ShutdownToken::is_requested) {
+        outcome.interrupted = true;
+    } else {
+        outcome.abandoned = true;
+    }
+}
+
+/// A Source reader's thread, named for its Source.
+///
+/// The thread's result is its outcome, or the failure it also sent as its
+/// stream's last event. The name travels beside the handle so a join can say
+/// which Source a failure belongs to even when the thread died without a
+/// result.
+pub(super) struct SourceWorker {
+    source: Arc<str>,
+    handle: std::thread::JoinHandle<
+        Result<IngestTaskOutcome, crate::executor::source_stream::SourceReadFailure>,
+    >,
+}
+
+impl SourceWorker {
+    /// The reader thread `handle`, reading `source`.
+    pub(super) fn new(
+        source: &str,
+        handle: std::thread::JoinHandle<
+            Result<IngestTaskOutcome, crate::executor::source_stream::SourceReadFailure>,
+        >,
+    ) -> Self {
+        Self {
+            source: Arc::from(source),
+            handle,
+        }
+    }
+
+    /// Wait for the thread. A thread that died without a result yields the
+    /// message it panicked with.
+    fn join(
+        self,
+    ) -> (
+        Arc<str>,
+        Result<
+            Result<IngestTaskOutcome, crate::executor::source_stream::SourceReadFailure>,
+            String,
+        >,
+    ) {
+        let result = self
+            .handle
+            .join()
+            .map_err(|payload| panic_message(payload.as_ref()).to_string());
+        (self.source, result)
+    }
+}
+
+/// The message a panic carried, when it was text.
+pub(super) fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("a non-text panic payload")
+}
+
+/// How a walk over a scope's Sources ended. It decides what a reader failure
+/// the walk never reached becomes once the scope's workers are joined.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WalkEnd {
+    /// The walk ran to its end: an unreached reader failure is the run's
+    /// error ([`join_source_workers`]).
+    Completed,
+    /// The walk stopped on the run's cancellation: the run is cancelled, and
+    /// an unreached reader failure is logged
+    /// ([`join_source_workers_after_interrupt`]).
+    Interrupted,
+    /// The walk failed: its error is the run's, and an unreached reader
+    /// failure is logged ([`join_source_workers_after_failure`]).
+    Failed,
+}
+
+impl WalkEnd {
+    /// Join every finite worker as this walk end requires, returning the
+    /// outcomes a completed or interrupted walk keeps. After a failed walk
+    /// the outcomes are empty: the walk's error is the run's.
+    pub(super) fn join_source_workers(
+        self,
+        workers: impl IntoIterator<Item = SourceWorker>,
+        op: &'static str,
+    ) -> Result<Vec<IngestTaskOutcome>, PipelineError> {
+        match self {
+            Self::Completed => join_source_workers(workers, op),
+            Self::Interrupted => join_source_workers_after_interrupt(workers, op),
+            Self::Failed => {
+                join_source_workers_after_failure(workers);
+                Ok(Vec::new())
+            }
         }
     }
 }
 
-/// Join every finite worker before returning a genuine failure or all progress.
-/// The caller must drop receivers and release paused consumers before entry.
+/// Join every finite worker after a walk that ran to its end, before
+/// returning a genuine failure or all progress. The caller must drop
+/// receivers and release paused consumers before entry.
+///
+/// A reader failure here is one the walk never reached: a Source the walk
+/// stopped reading early. It is the run's error. A failure the walk did take,
+/// yet ran to its end anyway, and a reader the walk stopped listening to
+/// before its input ended, are invariant violations: a completed walk reads
+/// every Source to its end.
 pub(super) fn join_source_workers(
-    workers: impl IntoIterator<Item = std::thread::JoinHandle<Result<IngestTaskOutcome, PipelineError>>>,
+    workers: impl IntoIterator<Item = SourceWorker>,
     op: &'static str,
 ) -> Result<Vec<IngestTaskOutcome>, PipelineError> {
     let mut outcomes = Vec::new();
     let mut first_error = None;
     for worker in workers {
-        let result = worker.join().unwrap_or_else(|_| {
-            Err(PipelineError::Internal {
+        let (source, joined) = worker.join();
+        let result = match joined {
+            Ok(Ok(outcome)) if outcome.abandoned => Err(PipelineError::Internal {
                 op,
-                node: String::new(),
-                detail: "source ingest thread panicked".to_string(),
-            })
-        });
+                node: source.to_string(),
+                detail: "the walk completed without reading the Source to its end".to_string(),
+            }),
+            Ok(Ok(outcome)) => Ok(outcome),
+            Ok(Err(failure)) => Err(failure.take().unwrap_or_else(|| PipelineError::Internal {
+                op,
+                node: source.to_string(),
+                detail: "the walk completed after it took the Source's reader failure".to_string(),
+            })),
+            Err(message) => Err(PipelineError::Internal {
+                op,
+                node: source.to_string(),
+                detail: format!("the Source's reader panicked: {message}"),
+            }),
+        };
         match result {
             Ok(outcome) => outcomes.push(outcome),
             Err(error) if first_error.is_none() => first_error = Some(error),
@@ -563,6 +704,96 @@ pub(super) fn join_source_workers(
     match first_error {
         Some(error) => Err(error),
         None => Ok(outcomes),
+    }
+}
+
+/// Join every finite worker after the walk stopped on the run's
+/// cancellation, keeping the cancellation as the run's outcome and the
+/// progress of every reader that did not fail. The caller must drop
+/// receivers and release paused consumers before entry.
+///
+/// A reader failure the walk had reached would have failed the walk instead,
+/// so a failure here is one the walk never reached: later in its Source's
+/// data, or on a Source the walk had not read. It is logged on the walk's
+/// thread, naming the Source, and never reported in place of the
+/// cancellation. The log does not claim the failure is unrelated to the
+/// cancellation: a reader can fail on the teardown the cancellation itself
+/// caused. A failure the walk did take, yet stopped as cancelled anyway, is
+/// an invariant violation.
+pub(super) fn join_source_workers_after_interrupt(
+    workers: impl IntoIterator<Item = SourceWorker>,
+    op: &'static str,
+) -> Result<Vec<IngestTaskOutcome>, PipelineError> {
+    let mut outcomes = Vec::new();
+    let mut first_error = None;
+    for worker in workers {
+        let (source, joined) = worker.join();
+        match joined {
+            Ok(Ok(outcome)) => outcomes.push(outcome),
+            Ok(Err(failure)) => match failure.take() {
+                Some(error) => tracing::warn!(
+                    source = &*source,
+                    error = %error,
+                    "the Source's reader stopped with an error after the run was cancelled; \
+                     the run reports the cancellation"
+                ),
+                None if first_error.is_none() => {
+                    first_error = Some(PipelineError::Internal {
+                        op,
+                        node: source.to_string(),
+                        detail: "the walk stopped as cancelled after it took the Source's \
+                                 reader failure"
+                            .to_string(),
+                    });
+                }
+                None => {}
+            },
+            Err(message) => tracing::warn!(
+                source = &*source,
+                error = %message,
+                "the Source's reader panicked after the run was cancelled; \
+                 the run reports the cancellation"
+            ),
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(outcomes),
+    }
+}
+
+/// Join every finite worker after the walk failed, keeping the walk's error
+/// as the run's. The caller must drop receivers and release paused consumers
+/// before entry.
+///
+/// The walk reads each Source's events in order and fails at the first
+/// failure it meets, a reader's included, so its error is the first cause in
+/// data order. A reader failure the walk never reached came later in its
+/// Source's data, or on a Source the walk had not reached: it is logged on
+/// the walk's thread, naming the Source, never dropped silently, and never
+/// reported in place of the walk's. A failure the walk took is already its
+/// error and is not logged again.
+pub(super) fn join_source_workers_after_failure(workers: impl IntoIterator<Item = SourceWorker>) {
+    for worker in workers {
+        let (source, joined) = worker.join();
+        match joined {
+            Ok(Ok(_)) => {}
+            Ok(Err(failure)) => {
+                if let Some(error) = failure.take() {
+                    tracing::warn!(
+                        source = &*source,
+                        error = %error,
+                        "the Source's reader also failed after the run had already failed; \
+                         the run reports its first failure"
+                    );
+                }
+            }
+            Err(message) => tracing::warn!(
+                source = &*source,
+                error = %message,
+                "the Source's reader thread panicked; the run reports its first failure"
+            ),
+        }
     }
 }
 
@@ -748,11 +979,18 @@ fn ingest_source_body_inner(
 /// tail columns, emitting document-boundary punctuation, observing
 /// event-time watermarks, and pushing into `stream`. Shared by both the
 /// file and non-file ingest arms — see [`ingest_source`].
+///
+/// `stream` is dropped last, on every return: the reader and everything else
+/// this body holds in the Source's name are released before its sender. The
+/// stream's terminal event is sent through its
+/// [`SourceStreamEnd`](crate::executor::source_stream::SourceStreamEnd) only
+/// after this returns, so a walk that takes it sees the Source's charge
+/// settled.
 fn drive_record_source(
     src_cfg: clinker_plan::config::SourceConfig,
     physical_columns: &[Column],
     src_reader: Box<dyn crate::source::RecordSource>,
-    stream: crate::executor::source_stream::SourceIngestChannel,
+    mut stream: crate::executor::source_stream::SourceIngestChannel,
     shutdown_token: Option<crate::pipeline::shutdown::ShutdownToken>,
     source_runtime: SourceRuntimePolicy,
     outcome: &mut IngestTaskOutcome,
@@ -863,7 +1101,6 @@ fn drive_record_source(
         };
 
         let preserve_empty_physical_files = stream.has_order_barrier();
-        let mut stream = stream;
         let mut read_attempts: u64 = 0;
         // First successfully decoded body record for the current physical
         // file, kept together with the exact identity minted for it. A
@@ -995,12 +1232,12 @@ fn drive_record_source(
                         })
                         .is_none()
                         .then(|| widened_record.clone());
-                    // A closed channel means the consumer stopped pulling —
-                    // a shutdown-token unwind dropped the receiver, or the
-                    // downstream finished early. That is a graceful stop, not
-                    // a failure: stop producing and return the records pushed
-                    // so far. The dispatch side surfaces the interruption (if
-                    // any) through `report.interrupted`.
+                    // A closed channel means the walk dropped this Source's
+                    // receiver before the reader reached the end of its
+                    // input: the run's cancellation tore the walk down, or
+                    // the walk failed elsewhere and stopped listening. Either
+                    // way the read is not complete: stop producing and record
+                    // it as interrupted or abandoned.
                     match stream.push(widened_record) {
                         Ok(row_id) => {
                             if let Some(record) = representative_record {
@@ -1008,9 +1245,7 @@ fn drive_record_source(
                             }
                         }
                         Err(crate::executor::source_stream::SourceStreamError::Closed) => {
-                            outcome.interrupted = shutdown_for_poll.as_ref().is_some_and(
-                                crate::pipeline::shutdown::ShutdownToken::is_requested,
-                            );
+                            stop_on_closed_channel(outcome, shutdown_for_poll.as_ref());
                             break;
                         }
                         Err(
@@ -1170,9 +1405,7 @@ fn drive_record_source(
                     match stream.push_rejection(event) {
                         Ok(()) => {}
                         Err(crate::executor::source_stream::SourceStreamError::Closed) => {
-                            outcome.interrupted = shutdown_for_poll.as_ref().is_some_and(
-                                crate::pipeline::shutdown::ShutdownToken::is_requested,
-                            );
+                            stop_on_closed_channel(outcome, shutdown_for_poll.as_ref());
                             break;
                         }
                         Err(
@@ -1264,9 +1497,7 @@ fn drive_record_source(
                     match stream.push_rejection(event) {
                         Ok(()) => {}
                         Err(crate::executor::source_stream::SourceStreamError::Closed) => {
-                            outcome.interrupted = shutdown_for_poll.as_ref().is_some_and(
-                                crate::pipeline::shutdown::ShutdownToken::is_requested,
-                            );
+                            stop_on_closed_channel(outcome, shutdown_for_poll.as_ref());
                             break;
                         }
                         Err(
@@ -1373,9 +1604,7 @@ fn drive_record_source(
                     match stream.push_rejection(event) {
                         Ok(()) => {}
                         Err(crate::executor::source_stream::SourceStreamError::Closed) => {
-                            outcome.interrupted = shutdown_for_poll.as_ref().is_some_and(
-                                crate::pipeline::shutdown::ShutdownToken::is_requested,
-                            );
+                            stop_on_closed_channel(outcome, shutdown_for_poll.as_ref());
                             break;
                         }
                         Err(
@@ -1526,19 +1755,29 @@ fn drive_record_source(
                 }
             }
         }
-        if !outcome.interrupted {
+        // A document boundary's push carries no outcome, so the channel keeps
+        // the closure it met; a read whose last pushes were boundaries is
+        // reported short here, before anything more is pushed into a channel
+        // no one reads.
+        if stream.receiver_dropped() {
+            stop_on_closed_channel(outcome, shutdown_for_poll.as_ref());
+        }
+        if !outcome.stopped_short() {
             // Close every level still open at end-of-input, innermost first.
             // This balances both the file-level document and any nested level
             // a reader left open (a truncated `--dry-run -n` read, or a reader
             // that opens a level it never explicitly closes).
             close_open_levels(&mut stream, &mut doc_stack)?;
+            // A close can be the push that meets the closed channel.
+            if stream.receiver_dropped() {
+                stop_on_closed_channel(outcome, shutdown_for_poll.as_ref());
+            }
         }
-        // On interruption the still-open ordered barrier is deliberately not
+        // On a short read the still-open ordered barrier is deliberately not
         // closed: dropping `stream` aborts it, removes partial spill files,
         // and balances its arbitrator charges without releasing partial data.
-        // Drop the sender so the dispatch-side `recv` returns `Err`
-        // (channel disconnected) once the channel drains.
-        drop(stream);
+        // `stream` drops on return, after this block's locals; the caller
+        // then ends the stream through its `SourceStreamEnd`.
         Ok(())
     }
 }
@@ -1562,14 +1801,14 @@ fn stack_belongs_to_other_file(
     }
 }
 
-/// Push a document-boundary punctuation, treating a closed channel as a
-/// benign stop.
+/// Push a document-boundary punctuation.
 ///
-/// A closed channel during punctuation delivery carries the same meaning
-/// as during record delivery — the consumer dropped the receiver (a
-/// shutdown unwind or an early-completing downstream). No further
-/// punctuation matters once the receiver is gone, so the close is a no-op;
-/// the driver's record push breaks on the same signal.
+/// A closed channel during punctuation delivery carries the same meaning as
+/// during record delivery: the walk dropped the receiver before the reader
+/// reached the end of its input. It is not an error, so it does not fail the
+/// read here; the channel keeps the closure, the driver's next record push
+/// meets it too, and the driver reports the read as stopped short through
+/// [`stop_on_closed_channel`] before it returns.
 fn push_doc_punctuation(
     stream: &mut crate::executor::source_stream::SourceIngestChannel,
     punct: crate::executor::stream_event::Punctuation,
@@ -3155,6 +3394,296 @@ nodes:
         assert_eq!(resource_memory.writer_resource_usage().memory, 0);
     }
 
+    /// An ordered read whose channel the walk closed is short even when only
+    /// a document boundary met the closure: the file still staged at end of
+    /// input is dropped with the stream, never sorted and released into a
+    /// channel no one reads.
+    ///
+    /// The walk has stopped listening before the read starts. The first
+    /// file's release, at the boundary into the second, meets the closed
+    /// channel; the second file is out of order, so releasing it would repair
+    /// it and warn.
+    #[test]
+    fn an_ordered_read_abandoned_at_a_file_boundary_releases_no_later_file() {
+        use crate::pipeline::memory::{ConsumerHandle, MemoryArbitrator, NoOpPolicy};
+        struct TwoFiles {
+            schema: SharedStorage<Schema>,
+            files: [Arc<str>; 2],
+            rows: std::collections::VecDeque<(usize, i64)>,
+            current: usize,
+        }
+        impl crate::source::RecordSource for TwoFiles {
+            fn schema(&mut self) -> Result<SharedStorage<Schema>, clinker_format::FormatError> {
+                Ok(self.schema.clone())
+            }
+            fn next_record(
+                &mut self,
+            ) -> Result<Option<clinker_record::Record>, clinker_format::FormatError> {
+                let Some((file, id)) = self.rows.pop_front() else {
+                    return Ok(None);
+                };
+                self.current = file;
+                Ok(Some(clinker_record::Record::new(
+                    self.schema.clone(),
+                    vec![Value::Integer(id)],
+                )))
+            }
+            fn current_source_file(&self) -> Option<&Arc<str>> {
+                Some(&self.files[self.current])
+            }
+        }
+        let plan = clinker_plan::config::parse_config(
+            r#"
+pipeline: { name: abandoned_ordered_read }
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: csv
+      path: input.csv
+      schema: [{ name: id, type: int }]
+      sort_order: [id]
+      on_unsorted: warn
+  - type: sink
+    name: out
+    input: rows
+    config: { name: out, type: csv, path: out.csv }
+"#,
+        )
+        .unwrap()
+        .compile(&clinker_plan::config::CompileContext::default())
+        .unwrap();
+        let body = plan.config().source_bodies().next().unwrap().clone();
+        let order = &plan.dag().order_contract().source_orders[0];
+        let config = crate::source::order_barrier::SourceOrderConfig::from_compiled(
+            order,
+            order.source_id,
+            "rows",
+            &body.schema,
+        )
+        .unwrap();
+        let memory = Arc::new(MemoryArbitrator::with_policy(
+            16 * 1024 * 1024,
+            0.8,
+            0.7,
+            Box::new(NoOpPolicy),
+        ));
+        let resources = crate::executor::preparation::ExecutorResources::new(
+            memory.clone(),
+            crate::pipeline::shutdown::ShutdownToken::detached(),
+            None,
+            std::num::NonZeroUsize::new(8).unwrap(),
+            None,
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let (stream, receiver) = crate::executor::source_stream::SourceIngestChannel::new_ordered(
+            32,
+            ConsumerHandle::new(),
+            order.source_id,
+            config,
+            memory.clone(),
+            directory.path().to_path_buf(),
+            false,
+            resources.allocation(),
+        );
+        drop(receiver);
+        let reader = TwoFiles {
+            schema: clinker_record::SchemaBuilder::new()
+                .with_field("id")
+                .build(),
+            files: [Arc::from("first.csv"), Arc::from("second.csv")],
+            rows: [(0, 1), (1, 5), (1, 3)].into_iter().collect(),
+            current: 0,
+        };
+        let (result, warnings) = crate::executor::tests::capture_warnings(|| {
+            ingest_source_body(
+                body,
+                crate::source::SourceInput::Records(Box::new(reader)),
+                stream,
+                None,
+                None,
+                SourceRuntimePolicy::new(crate::executor::RunPolicy::new(
+                    std::num::NonZeroUsize::MIN,
+                    crate::executor::PreviewPolicy::Disabled,
+                )),
+            )
+        });
+        let outcome = result.expect("an abandoned read keeps its progress");
+        assert!(outcome.abandoned, "the read stopped short: {outcome:?}");
+        assert!(!outcome.interrupted);
+        assert_eq!(outcome.total_count, 3);
+        let repairs: Vec<&String> = warnings
+            .iter()
+            .filter(|line| line.contains("W307"))
+            .collect();
+        assert!(
+            repairs.is_empty(),
+            "the staged second file must not be sorted and released after the walk stopped \
+             listening, but it was repaired: {repairs:?}"
+        );
+        assert_eq!(memory.cumulative_spill_bytes(), 0);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    /// What a reader's `Drop` saw on its Source's channel.
+    #[derive(Debug, PartialEq, Eq)]
+    enum ChannelAtReaderDrop {
+        /// Still open, with no terminal event: the walk cannot yet take the
+        /// Source as finished.
+        Open,
+        /// Its senders were gone.
+        Closed,
+        /// The terminal event had already been sent.
+        Ended,
+    }
+
+    /// A reader that reads one row, then ends or fails, and records on drop
+    /// what its channel showed.
+    struct DropObservingReader {
+        schema: SharedStorage<Schema>,
+        read: bool,
+        fail: bool,
+        receiver: crossbeam_channel::Receiver<crate::executor::source_stream::SourceStreamEvent>,
+        seen: Arc<std::sync::Mutex<Option<ChannelAtReaderDrop>>>,
+    }
+
+    impl crate::source::RecordSource for DropObservingReader {
+        fn schema(&mut self) -> Result<SharedStorage<Schema>, clinker_format::FormatError> {
+            Ok(self.schema.clone())
+        }
+
+        fn next_record(
+            &mut self,
+        ) -> Result<Option<clinker_record::Record>, clinker_format::FormatError> {
+            if !std::mem::replace(&mut self.read, true) {
+                return Ok(Some(clinker_record::Record::new(
+                    self.schema.clone(),
+                    vec![Value::Integer(1)],
+                )));
+            }
+            if self.fail {
+                return Err(clinker_format::FormatError::Io(std::io::Error::other(
+                    "reader failure",
+                )));
+            }
+            Ok(None)
+        }
+    }
+
+    impl Drop for DropObservingReader {
+        fn drop(&mut self) {
+            let seen = loop {
+                match self.receiver.try_recv() {
+                    Ok(
+                        crate::executor::source_stream::SourceStreamEvent::Ended
+                        | crate::executor::source_stream::SourceStreamEvent::Failed(_),
+                    ) => break ChannelAtReaderDrop::Ended,
+                    Ok(_) => {}
+                    Err(crossbeam_channel::TryRecvError::Empty) => break ChannelAtReaderDrop::Open,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        break ChannelAtReaderDrop::Closed;
+                    }
+                }
+            };
+            *self.seen.lock().unwrap() = Some(seen);
+        }
+    }
+
+    /// The reader, and everything else the ingest body holds in the Source's
+    /// name, is released before the body lets go of the Source's channel, on
+    /// a successful read and on a failed one; and the stream's terminal
+    /// event, the walk's signal that the Source has finished, is sent only
+    /// after that, as the channel's last event.
+    #[test]
+    fn a_reader_is_released_before_its_channel_closes_and_before_its_stream_ends() {
+        for fail in [false, true] {
+            for with_end in [false, true] {
+                let (stream, receiver) = crate::executor::source_stream::SourceIngestChannel::new(
+                    8,
+                    crate::pipeline::memory::ConsumerHandle::new(),
+                    <clinker_plan::plan::PlanNodeId as clinker_plan::plan::EntityRef>::new(0),
+                    clinker_format::preparation::MemoryOnlyResources::new(
+                        std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+                    )
+                    .resources()
+                    .allocation()
+                    .clone(),
+                );
+                // Taken before the read, as production takes it before the
+                // reader's thread starts: an extra sender, so the channel
+                // closes only once the terminal event has been sent.
+                let end = with_end.then(|| stream.end("edi"));
+                let seen = Arc::new(std::sync::Mutex::new(None));
+                let reader = DropObservingReader {
+                    schema: SchemaBuilder::with_capacity(1).with_field("id").build(),
+                    read: false,
+                    fail,
+                    receiver: receiver.clone(),
+                    seen: seen.clone(),
+                };
+                let runtime = SourceRuntimePolicy::new(crate::executor::RunPolicy::new(
+                    std::num::NonZeroUsize::MIN,
+                    crate::executor::PreviewPolicy::Disabled,
+                ));
+                let read = move || {
+                    ingest_source_body(
+                        pathless_source_body(),
+                        crate::source::SourceInput::Records(Box::new(reader)),
+                        stream,
+                        None,
+                        None,
+                        runtime,
+                    )
+                };
+                let Some(end) = end else {
+                    assert_eq!(read().is_err(), fail);
+                    assert_eq!(
+                        seen.lock().unwrap().take(),
+                        Some(ChannelAtReaderDrop::Open),
+                        "fail={fail}: the reader was dropped after its channel closed"
+                    );
+                    continue;
+                };
+                // The thread body production runs: the read, then the
+                // stream's terminal event.
+                let finished =
+                    super::super::source_activation::run_source_reader("edi", None, end, read);
+                assert_eq!(finished.is_err(), fail);
+                assert_eq!(
+                    seen.lock().unwrap().take(),
+                    Some(ChannelAtReaderDrop::Open),
+                    "fail={fail}: the reader was dropped after its channel closed or its \
+                     stream ended"
+                );
+                let terminal = receiver
+                    .try_recv()
+                    .expect("the stream's terminal event follows the reader's release");
+                assert!(
+                    matches!(
+                        (&terminal, fail),
+                        (
+                            crate::executor::source_stream::SourceStreamEvent::Ended,
+                            false
+                        ) | (
+                            crate::executor::source_stream::SourceStreamEvent::Failed(_),
+                            true
+                        )
+                    ),
+                    "fail={fail}: {terminal:?}"
+                );
+                assert!(
+                    matches!(
+                        receiver.try_recv(),
+                        Err(crossbeam_channel::TryRecvError::Disconnected)
+                    ),
+                    "the terminal event is the channel's last"
+                );
+            }
+        }
+    }
+
     #[test]
     fn worker_failure_waits_for_every_reader_before_returning() {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
@@ -3163,9 +3692,10 @@ nodes:
         let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_dropped = dropped.clone();
         let failure = std::thread::spawn(|| {
-            Err(PipelineError::Io(std::io::Error::other(
-                "original reader failure",
-            )))
+            Err(crate::executor::source_stream::SourceReadFailure::new(
+                "failing",
+                PipelineError::Io(std::io::Error::other("original reader failure")),
+            ))
         });
         let remaining = std::thread::spawn(move || {
             entered_tx.send(()).unwrap();
@@ -3178,7 +3708,10 @@ nodes:
         let joiner = std::thread::spawn(move || {
             result_tx
                 .send(join_source_workers(
-                    [failure, remaining],
+                    [
+                        SourceWorker::new("failing", failure),
+                        SourceWorker::new("remaining", remaining),
+                    ],
                     "test-source-join",
                 ))
                 .unwrap();
@@ -3252,6 +3785,11 @@ nodes:
                 }
                 crate::executor::source_stream::SourceStreamEvent::Population(population) => {
                     panic!("unexpected ordered population in envelope fixture: {population:?}")
+                }
+                crate::executor::source_stream::SourceStreamEvent::Ended
+                | crate::executor::source_stream::SourceStreamEvent::Interrupted
+                | crate::executor::source_stream::SourceStreamEvent::Failed(_) => {
+                    panic!("the driver sends no terminal event; its caller ends the stream")
                 }
             })
             .collect()

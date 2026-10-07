@@ -1499,10 +1499,14 @@ fn nested_input_rows_enforce_utf8_and_independent_physical_file_policy() {
                     "{id}: failed run must not publish"
                 );
                 let partials = nested_partial_outputs(root.path());
-                let expected = if variant == "invalid-second"
-                    || (variant == "malformed-late"
-                        && !matches!(mode, "xml-ordinary" | "xml-prescan"))
-                {
+                // The walk stops at the reader's failure, so a Sink fed from
+                // the Source's buffered arm writes nothing. Only xml-prescan
+                // streams its rows into the Sink as they are read (Source ->
+                // Transform -> Sink): its retained attempt holds the rows
+                // delivered before the failure, the first file's row when the
+                // second file is the invalid one, unclosed and unpublished.
+                let streams_into_sink = mode == "xml-prescan";
+                let expected: &[u8] = if streams_into_sink && variant == "invalid-second" {
                     first
                 } else {
                     b""
@@ -1915,12 +1919,16 @@ nodes:
         "source.data.invalid"
     );
     assert!(!root.path().join("output.json").exists());
+    // The walk stops at the reader's failure, so the retained attempt holds
+    // none of the rows read before it.
     let partials = nested_partial_outputs(root.path());
-    assert!(partials.iter().any(|bytes| bytes == b"{\"number\":1}\n"));
     assert!(
-        partials
-            .iter()
-            .all(|bytes| bytes == b"{\"number\":1}\n" || bytes.is_empty())
+        partials.iter().any(|bytes| bytes.is_empty()),
+        "{partials:?}"
+    );
+    assert!(
+        partials.iter().all(|bytes| bytes.is_empty()),
+        "{partials:?}"
     );
     let diagnostic = String::from_utf8_lossy(&result.stderr);
     assert!(
@@ -1930,7 +1938,7 @@ nodes:
 }
 
 #[test]
-fn physical_cli_malformed_files_preserve_exact_successful_prefixes() {
+fn physical_cli_malformed_files_fail_with_an_empty_retained_attempt() {
     for format in ["fixed_width", "swift"] {
         for variant in [
             "utf8",
@@ -2021,12 +2029,9 @@ nodes:
                     "{format}/{variant}: {outcome}"
                 );
                 assert!(!root.path().join("output.json").exists());
-                let expected =
-                    if variant == "second" || (variant == "late" && format == "fixed_width") {
-                        first
-                    } else {
-                        b""
-                    };
+                // The walk stops at the reader's failure, so the retained
+                // attempt holds none of the rows read before it.
+                let expected: &[u8] = b"";
                 let partials = nested_partial_outputs(root.path());
                 assert!(
                     partials.iter().any(|bytes| bytes == expected),

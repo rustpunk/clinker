@@ -4,13 +4,14 @@
 //! reload, and the BNL fallback — so match-mode and on-miss semantics
 //! stay identical across spill boundaries.
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use clinker_record::owned_storage::{OwnedKey, OwnedMap, OwnedValues, SharedStorage};
 use clinker_record::{Record, Schema, Value};
 use cxl::eval::{EvalContext, EvalResult, ProgramEvaluator, SkipReason};
 
-use super::RecordOrder;
+use super::{ReadyPartition, RecordOrder};
 use crate::executor::combine::{CombineResolver, CombineResolverMapping};
 use crate::executor::widen_record_to_schema;
 use crate::pipeline::combine::BuildSeq;
@@ -28,11 +29,27 @@ use clinker_plan::plan::combine::DecomposedPredicate;
 const COLLECT_PER_GROUP_CAP: usize = 10_000;
 
 /// Outcome of [`super::GraceHashExecutor::probe_record`]. Either the
-/// in-memory matches (caller walks them inline) or a marker that the
-/// record was written to a probe-side spill file.
-pub(crate) enum ProbeOutcome<'a> {
-    InMemory(ProbeMatches<'a>),
+/// partition built in memory that the record probes (caller walks its
+/// matches inline) or a marker that the record was written to a probe-side
+/// spill file.
+pub(crate) enum ProbeOutcome<'k> {
+    InMemory(InMemoryProbe<'k>),
     Spilled,
+}
+
+/// One probe routed to a partition built in memory: the partition, held by
+/// its own `Rc` so walking the matches needs no borrow of the executor, and
+/// the probe's key values.
+pub(crate) struct InMemoryProbe<'k> {
+    pub(super) partition: Rc<ReadyPartition>,
+    pub(super) probe_keys: &'k [Value],
+}
+
+impl InMemoryProbe<'_> {
+    /// The probe's candidates in the partition, in build arrival order.
+    pub(crate) fn matches(&self) -> ProbeMatches<'_> {
+        self.partition.matches(self.probe_keys)
+    }
 }
 
 /// One probe's candidates against a built hash table, with the row id and

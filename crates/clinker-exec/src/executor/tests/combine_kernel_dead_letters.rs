@@ -39,7 +39,8 @@ const GENERATED_COLUMNS: [&str; 3] = ["_cxl_dlq_id", PAIRING_COLUMN, "_cxl_dlq_t
 
 /// A 10 GiB hard limit with a soft limit near 10 KiB and `NoOpPolicy`:
 /// `should_spill()` holds for the whole run, so every kernel that consults it
-/// spills its build side, while `should_abort()` never fires.
+/// spills its build side, while the hard-limit check
+/// (`MemoryArbitrator::check_hard_limit`) never refuses.
 ///
 /// The grace-hash and sort-merge cases still use it. Grace-hash growth reads
 /// process memory rather than the ledger, so a ledger capacity small enough to

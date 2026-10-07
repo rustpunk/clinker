@@ -1410,7 +1410,7 @@ nodes:
 
 #[cfg(feature = "test-utils")]
 #[test]
-fn decode_second_file_header_refusal_remains_resource_error() {
+fn decode_second_file_header_refusal_is_the_sources_e310() {
     let root = tempfile::tempdir().unwrap();
     let header = format!("{}\n", "x".repeat(2 * 1024 * 1024));
     let error = decode_file_run_at_capacity(
@@ -1422,8 +1422,9 @@ fn decode_second_file_header_refusal_remains_resource_error() {
     )
     .unwrap_err();
     assert!(
-        matches!(error, clinker_plan::error::PipelineError::Format(
-        clinker_format::FormatError::Resource(ref error)) if error.kind == ResourceErrorKind::Budget),
+        matches!(&error, clinker_plan::error::PipelineError::MemoryBudgetExceeded { report }
+            if report.requester.as_ref().map(|label| &label.surface)
+                == Some(&clinker_plan::runtime_error::MemorySurface::RowsRead)),
         "{error:?}"
     );
 }
@@ -2271,16 +2272,17 @@ fn decode_header_and_body_refusal_remain_typed() {
             1024 * 1024,
         )
         .unwrap_err();
-        let clinker_plan::error::PipelineError::Format(clinker_format::FormatError::Resource(
-            resource,
-        )) = error
-        else {
+        let clinker_plan::error::PipelineError::MemoryBudgetExceeded { report } = error else {
             panic!("decoder allocation must fail with typed budget evidence: {error:?}");
         };
-        assert_eq!(resource.kind, ResourceErrorKind::Budget);
-        assert!(resource.requested >= oversized.len());
-        assert!(resource.available <= 1024 * 1024);
-        assert!(resource.requested > resource.available);
+        let available = report.limit.bytes().saturating_sub(report.charged_bytes);
+        assert_eq!(
+            report.requester.as_ref().map(|label| &label.surface),
+            Some(&clinker_plan::runtime_error::MemorySurface::RowsRead)
+        );
+        assert!(report.requested_bytes >= oversized.len() as u64);
+        assert!(available <= 1024 * 1024);
+        assert!(report.requested_bytes > available);
         assert!(
             std::fs::read(root.path().join("output.csv"))
                 .unwrap()
@@ -2489,7 +2491,7 @@ nodes:
 }
 
 #[test]
-fn multiple_source_failures_beat_cancellation_in_either_join_order() {
+fn reached_source_failures_beat_cancellation_but_unreached_ones_do_not() {
     use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, WriterRegistry};
     use clinker_exec::source::{RecordSource, SourceInput};
     use clinker_format::FormatError;
@@ -2535,9 +2537,19 @@ nodes:
     .unwrap()
     .compile(&clinker_plan::config::CompileContext::default())
     .unwrap();
-    for kinds in [
-        [ResourceErrorKind::Cancelled, ResourceErrorKind::Budget],
-        [ResourceErrorKind::Budget, ResourceErrorKind::Cancelled],
+    // The walk reads `second` before `first` and stops at the first end it
+    // meets. A failure it reaches fails the run; a cancellation it reaches
+    // stops the run as cancelled, and the other Source's failure, which the
+    // walk never reached, is logged.
+    for (kinds, walk_reaches_failure) in [
+        (
+            [ResourceErrorKind::Cancelled, ResourceErrorKind::Budget],
+            true,
+        ),
+        (
+            [ResourceErrorKind::Budget, ResourceErrorKind::Cancelled],
+            false,
+        ),
     ] {
         let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let readers = ["first", "second"]
@@ -2553,7 +2565,7 @@ nodes:
                 )
             })
             .collect();
-        let error = PipelineExecutor::run_plan_with_readers_writers(
+        let result = PipelineExecutor::run_plan_with_readers_writers(
             &plan,
             readers,
             WriterRegistry {
@@ -2566,12 +2578,17 @@ nodes:
                 ..Default::default()
             },
             &PipelineRunParams::default(),
-        )
-        .unwrap_err();
-        assert!(
-            matches!(error, clinker_plan::error::PipelineError::Format(FormatError::Resource(resource))
-            if resource.kind == ResourceErrorKind::Budget && resource.requested == 42 && resource.available == 7)
         );
+        if walk_reaches_failure {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, clinker_plan::error::PipelineError::Format(FormatError::Resource(resource))
+                if resource.kind == ResourceErrorKind::Budget && resource.requested == 42 && resource.available == 7)
+            );
+        } else {
+            let report = result.expect("a cancellation the walk reached first stands");
+            assert!(report.interrupted);
+        }
         assert_eq!(
             dropped.load(std::sync::atomic::Ordering::SeqCst),
             2,
@@ -2677,7 +2694,7 @@ fn decode_cancelled_source_lifecycle_is_independent_of_telemetry_admission() {
 }
 
 #[test]
-fn decode_source_failure_stays_failed_when_shutdown_is_requested() {
+fn decode_source_failure_unreached_by_a_cancelled_run_stays_cancelled() {
     use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, WriterRegistry};
     use clinker_exec::source::{RecordSource, SourceInput};
     use clinker_exec::telemetry::{MetricKey, SpanName, SpanStatus};
@@ -2722,11 +2739,11 @@ nodes:
             FormatError::Resource(ResourceError::new(ResourceErrorKind::Budget, 42, 7)),
             FormatError::Charset("invalid byte".into()),
         ] {
-            let expected = failure.to_string();
             let (producer, receiver) = telemetry();
             let shutdown = ShutdownToken::detached();
+            shutdown.request();
             let output = clinker_bench_support::io::SharedBuffer::new();
-            let error = PipelineExecutor::run_plan_with_readers_writers(
+            let report = PipelineExecutor::run_plan_with_readers_writers(
                 &plan,
                 [(
                     "rows".into(),
@@ -2750,12 +2767,12 @@ nodes:
                     ..Default::default()
                 },
             )
-            .unwrap_err();
+            // Shutdown is requested before the run, so the walk stops before
+            // it reads the Source and never reaches the reader's failure: the
+            // run stays cancelled, and that failure is logged.
+            .expect("the walk stopped on the shutdown before it reached the failure");
             assert!(shutdown.is_requested());
-            let clinker_plan::error::PipelineError::Format(actual) = error else {
-                panic!("shutdown must not mask a source failure: {error:?}");
-            };
-            assert_eq!(actual.to_string(), expected);
+            assert!(report.interrupted);
             assert!(output.contents().is_empty());
             if telemetry_enabled {
                 let batch = receiver.try_recv_batch().unwrap();
@@ -3240,6 +3257,11 @@ fn json_runtime_identity_tracer_factory_writer_and_config_deallocate_before_rele
     let resources = provider.resources();
     let scope = resources.scope().unwrap();
     let observer = arb.writer_resource_observer();
+    // A thread's first governed admission initializes the admission path's
+    // thread-local state, and where std keeps thread-local destructors in a
+    // growable list (macOS, Windows) registering one can allocate. Admit once
+    // before the first capture so each capture sees only the backing it names.
+    drop(scope.reserve(Layout::new::<u64>()).unwrap());
     NATIVE_BACKINGS.with(|watch| {
         watch.set(Some(NativeBackingWatch {
             observer: &observer,
@@ -4874,7 +4896,10 @@ fn decode_multi_record_resource_refusal_aborts_despite_continue() {
         )
         .unwrap_err();
         assert!(
-            matches!(error, clinker_plan::error::PipelineError::Format(clinker_format::FormatError::Resource(error)) if error.kind == ResourceErrorKind::Budget)
+            matches!(&error, clinker_plan::error::PipelineError::MemoryBudgetExceeded { report }
+                if report.requester.as_ref().map(|label| &label.surface)
+                    == Some(&clinker_plan::runtime_error::MemorySurface::RowsRead)),
+            "{error:?}"
         );
         assert!(
             std::fs::read(root.path().join("output.csv"))

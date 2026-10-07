@@ -342,9 +342,11 @@ pub fn classify_stream_nodes(
 ///
 /// This is the [`certify_streaming_edge`] predicate applied with each
 /// `Aggregation` node as the consumer; the producer-kind half of the
-/// predicate (fused `Source → Transform`, non-fused `Merge`, single-branch
-/// `Route`, streaming-strategy `Aggregate`) is shared with the `Output`
-/// consumer, so the same fusion analysis decides both. The runtime
+/// predicate (a `Source → Transform` the plan fuses, non-fused `Merge`,
+/// single-branch `Route`, streaming-strategy `Aggregate`) is shared with the
+/// `Output` consumer, so the same fusion analysis decides both. A certified
+/// Transform's arm streams through the certified edge whether it runs fused
+/// or materialized. The runtime
 /// installs one bounded channel per returned edge: the producer arm
 /// streams into it during its own dispatch turn, and the Aggregate arm
 /// drains it via a back-pressured recv loop — so a slow producer paces
@@ -471,8 +473,10 @@ pub fn compute_streaming_combine_probe_edges(
 /// - non-fused `Merge` (concat, or interleave with non-Source inputs):
 ///   the arm drains its predecessors' `node_buffers` slots and forwards
 ///   each record to the consumer rather than admitting its own slot.
-/// - fused `Source → Transform`: a `PlanNode::Transform` that
-///   `compute_transform_fused_sources` classified as fused.
+/// - `Source → Transform`: a `PlanNode::Transform` that
+///   `compute_transform_fused_sources` classified as fused with its Source.
+///   At run time its arm streams through the certified edge whether it runs
+///   fused or materialized; a bounded preview runs it materialized.
 /// - single-branch `Route`: exactly one outgoing edge into this consumer.
 /// - streaming-strategy `Aggregate`
 ///   ([`crate::plan::types::AggregateStrategy::Streaming`]): emits one
@@ -619,11 +623,16 @@ fn single_incoming_producer(
 
 /// Certify the producer-kind half of a streaming edge: given the resolved
 /// producer index, return `Some(producer_idx)` when the producer is a
-/// linear streaming source (fused `Merge.interleave`, non-fused `Merge`,
-/// fused `Source → Transform`, single-branch `Route`, streaming-strategy
-/// `Aggregate`, hash build-probe `Combine`, or pure-range block-band
-/// `Combine`) feeding only the consumer and rooting no node-anchored window
-/// arena, or `None` otherwise.
+/// linear streaming source (fused `Merge.interleave`, non-fused `Merge`, a
+/// `Source → Transform` the plan fuses, single-branch `Route`,
+/// streaming-strategy `Aggregate`, hash build-probe `Combine`, or pure-range
+/// block-band `Combine`) feeding only the consumer and rooting no
+/// node-anchored window arena, or `None` otherwise.
+///
+/// A certified producer takes the consumer's sender in whichever arm runs.
+/// For the Transform that is the fused arm in a full run and the
+/// materialized arm in a bounded preview, which runs every Transform apart
+/// from its Source so the Sources drain in a fixed order.
 ///
 /// Shared by every consumer arm of [`certify_streaming_edge`] so the
 /// producer eligibility rules are derived once. A window rooted at the
@@ -675,8 +684,10 @@ fn certify_linear_producer(
             Some(producer_idx)
         }
         PlanNode::Transform { .. } => {
-            // The Transform must be a fused Source→Transform that feeds
-            // only this consumer and roots no node-anchored window arena.
+            // The Transform must be one the plan fuses with its Source, feed
+            // only this consumer and root no node-anchored window arena. At
+            // run time its arm streams through this edge whether it runs
+            // fused or materialized (a bounded preview runs it materialized).
             if !fused_transforms.contains(&producer_idx)
                 || !has_single_outgoing(plan, producer_idx)
                 || roots_window(producer_idx)

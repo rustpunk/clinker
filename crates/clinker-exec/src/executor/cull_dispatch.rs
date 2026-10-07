@@ -39,7 +39,10 @@
 //! each record's admission sequence) so the ingest-time resident peak stays
 //! bounded under skew. The consumer registers at priority `15` (between
 //! grace-hash and external sort) and cannot back-pressure: there is no
-//! upstream channel to gate once the predecessor has drained.
+//! upstream channel to gate once the predecessor has drained. The buffer
+//! itself is walk-owned state registered in the walk reclaim set, so a
+//! reclaim pass that another node's request starts spills its resident
+//! groups as well.
 //!
 //! The drop decision per group is computed by folding the same records
 //! through an in-memory aggregate over the predicate (group-by =
@@ -54,11 +57,13 @@
 //!
 //! A single correlation group whose reloaded footprint exceeds the finalize
 //! budget fails loud with the same [`PipelineError::MemoryBudgetExceeded`]
-//! diagnostic, naming the offending `partition_by` group, rather than risking
-//! an out-of-memory crash on reload.
+//! diagnostic, naming the offending group by the Source and row number of its
+//! first row, rather than risking an out-of-memory crash on reload.
 
 use clinker_record::owned_storage::SharedStorage;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use clinker_record::{GroupByKey, Record, Schema, SchemaBuilder, Value};
@@ -69,22 +74,27 @@ use petgraph::visit::EdgeRef;
 
 use crate::executor::dispatch::{
     ExecutorContext, NodeBufferKey, admit_node_buffer, admit_node_buffer_with_readers,
-    crosses_into_deferred_consumer, node_buffer_spill_allowed,
+    crosses_into_deferred_consumer, node_buffer_spill_allowed, park_cross_region,
     require_single_input_node_buffer_slot, source_file_arc_of, source_name_arc_of,
 };
-use crate::executor::node_buffer::unaccounted_record_byte_cost;
-use crate::executor::{GroupedNodeKind, giant_group_error};
+use crate::executor::giant_group_error;
+use crate::executor::node_buffer::{
+    resident_record_reclaimable_bytes, unaccounted_record_byte_cost,
+};
+use crate::executor::stream_event::SourceRowId;
+use crate::pipeline::memory::walk::{
+    OwnedSpillResult, WalkOwnedRegistration, WalkOwnedSpill, register_walk_owned,
+};
 use crate::pipeline::memory::{
-    ConsumerHandle, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
+    ConsumerHandle, ConsumerId, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
 };
 use crate::pipeline::sort_key::compare_authored_keys;
 use crate::pipeline::spill::{SpillFile, SpillWriter};
-use clinker_plan::BudgetCategory;
 use clinker_plan::config::SortField;
 use clinker_plan::config::pipeline_node::CullBody;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode, single_predecessor};
-use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface};
+use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface, RowPosition};
 
 /// Spill priority for the Cull group buffer: between grace-hash (`10`) and
 /// external sort (`20`), matching Reshape. A grouped record buffer is
@@ -111,6 +121,12 @@ use clinker_plan::config::pipeline_node::CULL_DROP_DECISION_COLUMN as DROP_DECIS
 /// remains once the predecessor has drained). On `try_spill` it flips the
 /// handle's spill-request flag; the dispatch loop reads it at the next
 /// grouping boundary and evicts resident groups to disk in-thread.
+///
+/// The buffer is also walk-owned state registered under this consumer
+/// ([`CullGroups`]), so a reclaim pass that elects it spills the resident
+/// groups at once. It ranks by the figure the buffer records on the handle:
+/// what that spill frees now. Rows already on disk count 0, and so do rows
+/// taken out of the buffer for routing, which no spill can reach.
 struct CullConsumer {
     handle: Arc<ConsumerHandle>,
 }
@@ -124,6 +140,12 @@ impl CullConsumer {
 impl MemoryConsumer for CullConsumer {
     fn current_usage(&self) -> u64 {
         self.handle.bytes()
+    }
+
+    /// What a spill of the resident groups frees now, as the buffer last
+    /// recorded it after a push, spill or take.
+    fn reclaimable_bytes(&self) -> u64 {
+        self.handle.reclaimable()
     }
 
     fn peak_charged_bytes(&self) -> Option<u64> {
@@ -264,15 +286,7 @@ where
 
     // Register the group buffer with the arbitrator only after the
     // empty-input guard, so the no-work path never leaks a consumer.
-    let handle = ConsumerHandle::new();
-    let consumer_id = ctx.memory_budget.register_node_consumer(
-        Arc::new(CullConsumer::new(handle.clone())),
-        handle.clone(),
-        ConsumerLabel {
-            node: name.to_string(),
-            surface: MemorySurface::DecisionState,
-        },
-    );
+    let (consumer_id, handle) = register_cull_consumer(&ctx.memory_budget, name)?;
 
     // Every exit path past this point must deregister `consumer_id`, so the
     // grouping/finalize work runs inside a helper whose result is matched
@@ -292,11 +306,30 @@ where
         typed,
         input,
         input_puncts,
+        consumer_id,
         &handle,
         &order_fields,
     );
     ctx.memory_budget.unregister_consumer(consumer_id);
     result
+}
+
+/// Register the consumer that charges node `name`'s group buffer, as a
+/// Cull's held group rows.
+fn register_cull_consumer(
+    budget: &MemoryArbitrator,
+    name: &str,
+) -> Result<(ConsumerId, Arc<ConsumerHandle>), PipelineError> {
+    let handle = ConsumerHandle::new();
+    let consumer_id = budget.register_node_consumer(
+        Arc::new(CullConsumer::new(handle.clone())),
+        handle.clone(),
+        ConsumerLabel {
+            node: name.to_string(),
+            surface: MemorySurface::CullGroups,
+        },
+    )?;
+    Ok((consumer_id, handle))
 }
 
 /// Group the drained input, spilling resident groups to disk under memory
@@ -319,6 +352,7 @@ fn run_cull_grouped(
     typed: &Arc<cxl::typecheck::TypedProgram>,
     input: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
     input_puncts: Vec<crate::executor::stream_event::Punctuation>,
+    consumer_id: ConsumerId,
     handle: &Arc<ConsumerHandle>,
     order_fields: &[SortField],
 ) -> Result<(), PipelineError> {
@@ -343,15 +377,24 @@ fn run_cull_grouped(
     let budget = Arc::clone(&ctx.memory_budget);
     let spill_root = Arc::clone(&ctx.spill_root_path);
 
-    let mut buffer = CullGroupBuffer::new(
-        input_schema.clone(),
-        spill_compress,
-        ctx.allocation_resources.clone(),
-    );
+    // The buffer lives in a walk-owned cell, borrowed only inside one push,
+    // one spill or one take of a group; every other step below runs with it
+    // free.
+    let groups = CullGroups::register(
+        &budget,
+        consumer_id,
+        handle,
+        name,
+        &spill_root,
+        CullGroupBuffer::new(
+            input_schema.clone(),
+            spill_compress,
+            ctx.allocation_resources.clone(),
+        ),
+    )?;
     for (record, row_num) in input {
         let key = partition_key(name, &record, &config.partition_by)?;
-        buffer.push(key, record, row_num);
-        handle.set_bytes(buffer.unaccounted_resident_bytes() as u64);
+        groups.push(key, record, row_num);
         // Poll for self-spill pressure at every admission. `should_spill_self`
         // updates the peak and reports the soft-threshold crossing WITHOUT
         // running the pausing arbitration round: Cull relieves pressure by
@@ -361,8 +404,7 @@ fn run_cull_grouped(
         // same way. `take_spill_request` still honors a spill nudge another
         // stage's arbitration round set on this consumer.
         if budget.should_spill_self() || handle.take_spill_request() {
-            buffer.spill_until_under_budget(name, &budget, &spill_root, handle)?;
-            handle.set_bytes(buffer.unaccounted_resident_bytes() as u64);
+            groups.spill_until_under_budget(&budget)?;
         }
     }
 
@@ -374,10 +416,9 @@ fn run_cull_grouped(
     let hard_limit = budget.hard_limit();
     let mut kept: Vec<(Record, crate::executor::stream_event::SourceRowId)> = Vec::new();
     let mut removed: Vec<(Record, crate::executor::stream_event::SourceRowId)> = Vec::new();
-    let group_order = buffer.take_group_order();
+    let group_order = groups.take_group_order();
     for key in group_order {
-        let mut group = buffer.take_group(name, &config.partition_by, &key, hard_limit)?;
-        handle.set_bytes(buffer.unaccounted_resident_bytes() as u64);
+        let mut group = groups.take_group(&key, hard_limit, &budget)?;
         if !order_fields.is_empty() {
             // The Sort node's order, so a group's rows arrive in the same
             // order a Sink `sort_order` would write them, with the authored
@@ -404,6 +445,9 @@ fn run_cull_grouped(
             kept.append(&mut group);
         }
     }
+    // Every group is taken: the buffer and its registration leave before
+    // the rows are routed.
+    drop(groups);
 
     emit_ports(
         ctx,
@@ -514,7 +558,7 @@ fn compute_drop_decisions(
         let live = stream.estimated_memory_bytes();
         let projected = ctx.memory_budget.sum_consumer_usage().saturating_add(live);
         if hard_limit > 0 && projected > hard_limit {
-            return Err(cull_decision_budget_error(name, projected, hard_limit));
+            return Err(cull_decision_budget_error(&ctx.memory_budget, name, live));
         }
     }
     let finalize_ctx = ctx.merged_eval_ctx();
@@ -550,7 +594,11 @@ fn compute_drop_decisions(
         .saturating_add(emitted_bytes)
         .saturating_add(decisions_bytes);
     if hard_limit > 0 && projected > hard_limit {
-        return Err(cull_decision_budget_error(name, projected, hard_limit));
+        return Err(cull_decision_budget_error(
+            &ctx.memory_budget,
+            name,
+            emitted_bytes.saturating_add(decisions_bytes),
+        ));
     }
     let mut decisions: HashMap<Vec<GroupByKey>, bool> = HashMap::with_capacity(emitted.len());
     for (record, _) in emitted {
@@ -593,8 +641,6 @@ fn emit_ports(
     let removed_port = config.removed_to.as_str();
     let is_removed_port = |port: Option<&str>| matches!(port, Some(p) if p == removed_port);
 
-    let active_body = ctx.window_runtime.active_stack.last().copied();
-
     // Predecessor-slot readers (Merge / Combine) drain by incoming edge, so one
     // slot per distinct producer output port lands in this Cull's own slot
     // keyed `(node_idx, Some(port))`. Materialize each port's set once (multiple
@@ -628,32 +674,7 @@ fn emit_ports(
         // In-region and non-deferred edges skip the tee; their `node_buffers`
         // slot already covers them.
         if crosses_into_deferred_consumer(current_dag, node_idx, succ) {
-            let row_bytes_each: u64 = records
-                .first()
-                .map(|(rec, _)| {
-                    (std::mem::size_of::<Value>() * rec.schema().column_count()
-                        + std::mem::size_of::<(Record, crate::executor::stream_event::SourceRowId)>(
-                        )) as u64
-                })
-                .unwrap_or(0);
-            for (record, rn) in records {
-                // Fail loud if an oversized cross-region tee would blow the
-                // budget, mirroring the Route tee — parking unbounded records
-                // into `region_input_buffers` must not silently overshoot.
-                if row_bytes_each > 0 && ctx.memory_budget.should_abort() {
-                    return Err(PipelineError::MemoryBudgetExceeded {
-                        node: name.to_string(),
-                        used: ctx.memory_budget.peak_rss().unwrap_or(0),
-                        limit: ctx.memory_budget.hard_limit(),
-                        source: BudgetCategory::Arena,
-                        detail: Some("Cull cross-region tee admission".to_string()),
-                    });
-                }
-                ctx.region_input_buffers
-                    .entry((active_body, edge_id))
-                    .or_default()
-                    .push((record.clone(), *rn));
-            }
+            park_cross_region(ctx, current_dag, node_idx, edge_id, records)?;
             continue;
         }
         if reads_predecessor_slot(&current_dag.graph[succ]) {
@@ -740,16 +761,24 @@ struct CullGroupState {
     resident: Vec<BufferedRecord>,
     resident_bytes: usize,
     unaccounted_resident_bytes: usize,
+    /// What spilling `resident` frees now, each row counted as a slot
+    /// counts it ([`resident_record_reclaimable_bytes`]).
+    reclaimable_bytes: u64,
     spilled_bytes: usize,
     spilled: Vec<SpillFile<CullSpillPayload>>,
+    /// The source-row identity of the group's first record, which names the
+    /// group in a diagnostic without printing its key.
+    first_row: SourceRowId,
 }
 
 impl CullGroupState {
-    fn new() -> Self {
+    fn new(first_row: SourceRowId) -> Self {
         Self {
+            first_row,
             resident: Vec::new(),
             resident_bytes: 0,
             unaccounted_resident_bytes: 0,
+            reclaimable_bytes: 0,
             spilled_bytes: 0,
             spilled: Vec::new(),
         }
@@ -773,7 +802,14 @@ struct CullGroupBuffer {
     groups: HashMap<Vec<GroupByKey>, CullGroupState>,
     resident_bytes: usize,
     unaccounted_resident_bytes: usize,
+    /// Sum of every group's `reclaimable_bytes`: what spilling every
+    /// resident group frees now. Rows on disk or taken out count 0.
+    reclaimable_bytes: u64,
     next_seq: u64,
+    /// The Source name behind each Source identity a group's first record
+    /// carried, read from that record's `$source.name` stamp, or `None` when
+    /// that record carried no stamp; one entry per Source identity seen.
+    source_names: Vec<(clinker_plan::plan::PlanNodeId, Option<Arc<str>>)>,
 }
 
 impl CullGroupBuffer {
@@ -790,8 +826,26 @@ impl CullGroupBuffer {
             groups: HashMap::new(),
             resident_bytes: 0,
             unaccounted_resident_bytes: 0,
+            reclaimable_bytes: 0,
             next_seq: 0,
+            source_names: Vec::new(),
         }
+    }
+
+    /// Where `row` came from, as the dead-letter output names a row: its
+    /// Source's name and its number among that Source's rows. `None` when no
+    /// Source name is known for it (the group's first row carried no
+    /// `$source.name` stamp): the report then names no group rather than an
+    /// engine placeholder in the Source's place.
+    fn row_position(&self, row: SourceRowId) -> Option<RowPosition> {
+        let (_, name) = self
+            .source_names
+            .iter()
+            .find(|(source, _)| *source == row.source())?;
+        Some(RowPosition {
+            source: name.as_deref()?.to_string(),
+            row: row.ordinal(),
+        })
     }
 
     #[cfg(test)]
@@ -801,6 +855,12 @@ impl CullGroupBuffer {
 
     fn unaccounted_resident_bytes(&self) -> usize {
         self.unaccounted_resident_bytes
+    }
+
+    /// What spilling every resident group frees now; 0 once nothing is
+    /// resident.
+    fn reclaimable_bytes(&self) -> u64 {
+        self.reclaimable_bytes
     }
 
     /// Admit one record into its group, stamping a Cull-local admission
@@ -813,12 +873,20 @@ impl CullGroupBuffer {
     ) {
         let bytes = estimated_input_bytes(&record);
         let unaccounted = unaccounted_input_bytes(&record, &self.allocation_resources);
+        let reclaimable = resident_record_reclaimable_bytes(&record);
         let seq = self.next_seq;
         self.next_seq += 1;
         let order = &mut self.group_order;
+        let names = &mut self.source_names;
         let state = self.groups.entry(key.clone()).or_insert_with(|| {
             order.push(key);
-            CullGroupState::new()
+            if !names.iter().any(|(source, _)| *source == row_num.source()) {
+                names.push((
+                    row_num.source(),
+                    crate::executor::dispatch::source_name_of(&record).map(Arc::from),
+                ));
+            }
+            CullGroupState::new(row_num)
         });
         state.resident.push(BufferedRecord {
             record,
@@ -829,6 +897,8 @@ impl CullGroupBuffer {
         self.resident_bytes += bytes;
         state.unaccounted_resident_bytes += unaccounted;
         self.unaccounted_resident_bytes += unaccounted;
+        state.reclaimable_bytes += reclaimable;
+        self.reclaimable_bytes += reclaimable;
     }
 
     /// Take the first-seen group order, consuming it for the finalize drain.
@@ -849,7 +919,30 @@ impl CullGroupBuffer {
         handle: &Arc<ConsumerHandle>,
     ) -> Result<(), PipelineError> {
         let soft = budget.spill_threshold_bytes() as usize;
-        while self.resident_bytes > soft {
+        self.spill_resident_above(node_name, budget, spill_root, soft, |buffer| {
+            handle.set_bytes(buffer.unaccounted_resident_bytes as u64);
+            handle.set_reclaimable(buffer.reclaimable_bytes);
+        })
+        .map(|_| ())
+    }
+
+    /// Evict resident groups, largest first, until at most `keep` bytes stay
+    /// resident, calling `evicted` after each eviction. A group larger than
+    /// the soft threshold is sliced ([`Self::spill_group_partitioned`]),
+    /// any other is spilled whole: the one per-group choice the Cull's own
+    /// spill and a reclaim pass both make. Returns whether any group was
+    /// written.
+    fn spill_resident_above(
+        &mut self,
+        node_name: &str,
+        budget: &MemoryArbitrator,
+        spill_root: &std::path::Path,
+        keep: usize,
+        mut evicted: impl FnMut(&Self),
+    ) -> Result<bool, PipelineError> {
+        let soft = budget.spill_threshold_bytes() as usize;
+        let mut wrote = false;
+        while self.resident_bytes > keep {
             let Some(key) = self.largest_resident_group() else {
                 break;
             };
@@ -859,9 +952,10 @@ impl CullGroupBuffer {
             } else {
                 self.spill_group_whole(node_name, budget, spill_root, &key)?;
             }
-            handle.set_bytes(self.unaccounted_resident_bytes as u64);
+            wrote = true;
+            evicted(self);
         }
-        Ok(())
+        Ok(wrote)
     }
 
     /// Key of the resident group holding the most in-memory bytes, or `None`
@@ -890,6 +984,7 @@ impl CullGroupBuffer {
         let freed = std::mem::take(&mut state.resident_bytes);
         self.resident_bytes -= freed;
         self.unaccounted_resident_bytes -= std::mem::take(&mut state.unaccounted_resident_bytes);
+        self.reclaimable_bytes -= std::mem::take(&mut state.reclaimable_bytes);
         let file = write_spill_slice(
             node_name,
             budget,
@@ -929,6 +1024,7 @@ impl CullGroupBuffer {
         let total_bytes = std::mem::take(&mut state.resident_bytes);
         self.resident_bytes -= total_bytes;
         self.unaccounted_resident_bytes -= std::mem::take(&mut state.unaccounted_resident_bytes);
+        self.reclaimable_bytes -= std::mem::take(&mut state.reclaimable_bytes);
 
         let parts_wanted = total_bytes.div_ceil(soft.max(1)).max(2);
         let bits =
@@ -979,9 +1075,15 @@ impl CullGroupBuffer {
             .iter()
             .map(|row| unaccounted_input_bytes(&row.record, &self.allocation_resources))
             .sum::<usize>();
+        let retained_reclaimable = tail
+            .iter()
+            .map(|row| resident_record_reclaimable_bytes(&row.record))
+            .sum::<u64>();
         state.resident = tail;
         state.unaccounted_resident_bytes = retained_unaccounted;
         self.unaccounted_resident_bytes += retained_unaccounted;
+        state.reclaimable_bytes = retained_reclaimable;
+        self.reclaimable_bytes += retained_reclaimable;
         state.resident_bytes = remaining;
         state.spilled_bytes += spilled_now;
         state.spilled.extend(spilled_files);
@@ -1011,23 +1113,23 @@ impl CullGroupBuffer {
     fn take_group(
         &mut self,
         node_name: &str,
-        partition_by: &[String],
         key: &[GroupByKey],
         hard_limit: u64,
+        arbitrator: &MemoryArbitrator,
     ) -> Result<Vec<(Record, crate::executor::stream_event::SourceRowId)>, PipelineError> {
         let state = self.groups.remove(key).expect("group key present in order");
         self.resident_bytes -= state.resident_bytes;
         self.unaccounted_resident_bytes -= state.unaccounted_resident_bytes;
+        self.reclaimable_bytes -= state.reclaimable_bytes;
 
         let group_bytes = (state.resident_bytes + state.spilled_bytes) as u64;
         if hard_limit > 0 && group_bytes > hard_limit {
             return Err(giant_group_error(
-                GroupedNodeKind::Cull,
+                arbitrator,
                 node_name,
-                partition_by,
-                key,
+                MemorySurface::CullGroups,
                 group_bytes,
-                hard_limit,
+                self.row_position(state.first_row),
             ));
         }
 
@@ -1054,6 +1156,163 @@ impl CullGroupBuffer {
         group.extend(state.resident);
         group.sort_by_key(|b| b.seq);
         Ok(group.into_iter().map(|b| (b.record, b.row_num)).collect())
+    }
+}
+
+/// A Cull's group buffer as walk-owned state: the buffer, and what spilling
+/// it needs (the Cull's node name, the run's spill root and the handle of
+/// the consumer that charges it).
+///
+/// A reclaim pass that another consumer's request starts spills it
+/// ([`WalkOwnedSpill`]) whenever the Cull is between two of its own
+/// operations on it, which is all the time but one push, one spill or one
+/// take of a group.
+struct CullGroupCell {
+    buffer: CullGroupBuffer,
+    node_name: String,
+    spill_root: Arc<std::path::Path>,
+    consumer: ConsumerId,
+    handle: Arc<ConsumerHandle>,
+}
+
+impl CullGroupCell {
+    /// Mirror the buffer's resident charge onto the consumer's handle, and
+    /// record there what spilling its resident groups frees now: the
+    /// figure the consumer ranks by as a reclaim victim.
+    fn publish(&self) {
+        self.handle
+            .set_bytes(self.buffer.unaccounted_resident_bytes() as u64);
+        self.handle.set_reclaimable(self.buffer.reclaimable_bytes());
+    }
+}
+
+impl WalkOwnedSpill for CullGroupCell {
+    /// A pass that elects the Cull's consumer spills every resident group,
+    /// each with the choice the Cull's own spill makes, and records the
+    /// files under the Cull's node. It wrote when any group had rows
+    /// resident. A buffer whose groups are all on disk or taken wrote
+    /// nothing; one that holds no group holds no state. Never reserves.
+    fn spill_owned(
+        &mut self,
+        id: ConsumerId,
+        arbitrator: &MemoryArbitrator,
+    ) -> Result<OwnedSpillResult, PipelineError> {
+        if id != self.consumer || self.buffer.groups.is_empty() {
+            return Ok(OwnedSpillResult::NotHeld);
+        }
+        let spilled = self.buffer.spill_resident_above(
+            &self.node_name,
+            arbitrator,
+            &self.spill_root,
+            0,
+            |_| {},
+        );
+        self.publish();
+        Ok(if spilled? {
+            OwnedSpillResult::Wrote
+        } else {
+            OwnedSpillResult::NothingToWrite
+        })
+    }
+}
+
+/// A Cull's group buffer in its walk-owned cell, registered in the walk
+/// reclaim set under the Cull's consumer for as long as this lives.
+///
+/// The cell is borrowed only inside one of the methods here (one push, one
+/// spill, one take of a group), never across `partition_key`, the decision
+/// aggregate, a group's sort or the routing of its rows, so a pass another
+/// request starts can always spill the groups still resident.
+struct CullGroups {
+    cell: Rc<RefCell<CullGroupCell>>,
+    /// Dropped with the cell, on every exit.
+    _registration: WalkOwnedRegistration,
+}
+
+impl CullGroups {
+    /// Put `buffer` in a walk-owned cell for node `node_name`, whose consumer
+    /// `consumer` charges it through `handle`, and register the cell on
+    /// `budget`'s walk.
+    ///
+    /// # Errors
+    ///
+    /// As [`register_walk_owned`].
+    fn register(
+        budget: &MemoryArbitrator,
+        consumer: ConsumerId,
+        handle: &Arc<ConsumerHandle>,
+        node_name: &str,
+        spill_root: &Arc<std::path::Path>,
+        buffer: CullGroupBuffer,
+    ) -> Result<Self, PipelineError> {
+        let cell = Rc::new(RefCell::new(CullGroupCell {
+            buffer,
+            node_name: node_name.to_string(),
+            spill_root: Arc::clone(spill_root),
+            consumer,
+            handle: Arc::clone(handle),
+        }));
+        let registration = register_walk_owned(budget, consumer, handle, &cell)?;
+        Ok(Self {
+            cell,
+            _registration: registration,
+        })
+    }
+
+    /// Admit one record into its group.
+    fn push(
+        &self,
+        key: Vec<GroupByKey>,
+        record: Record,
+        row_num: crate::executor::stream_event::SourceRowId,
+    ) {
+        let mut cell = self.cell.borrow_mut();
+        cell.buffer.push(key, record, row_num);
+        cell.publish();
+    }
+
+    /// The Cull's own spill: evict resident groups until the buffer is back
+    /// under the soft threshold.
+    ///
+    /// # Errors
+    ///
+    /// A failed spill, including E320 past the spill cap.
+    fn spill_until_under_budget(&self, budget: &MemoryArbitrator) -> Result<(), PipelineError> {
+        let mut cell = self.cell.borrow_mut();
+        let cell = &mut *cell;
+        let spilled = cell.buffer.spill_until_under_budget(
+            &cell.node_name,
+            budget,
+            &cell.spill_root,
+            &cell.handle,
+        );
+        cell.publish();
+        spilled
+    }
+
+    /// Take the first-seen group order for the routing drain.
+    fn take_group_order(&self) -> Vec<Vec<GroupByKey>> {
+        self.cell.borrow_mut().buffer.take_group_order()
+    }
+
+    /// Take group `key` out of the buffer, reloaded whole in arrival order.
+    ///
+    /// # Errors
+    ///
+    /// As [`CullGroupBuffer::take_group`].
+    fn take_group(
+        &self,
+        key: &[GroupByKey],
+        hard_limit: u64,
+        budget: &MemoryArbitrator,
+    ) -> Result<Vec<(Record, crate::executor::stream_event::SourceRowId)>, PipelineError> {
+        let mut cell = self.cell.borrow_mut();
+        let cell = &mut *cell;
+        let group = cell
+            .buffer
+            .take_group(&cell.node_name, key, hard_limit, budget);
+        cell.publish();
+        group
     }
 }
 
@@ -1209,16 +1468,14 @@ fn cull_predicate_error(node_name: &str, e: crate::aggregation::HashAggError) ->
 /// back-pressure. So a group cardinality whose decision state plus the other
 /// live charged memory exceeds the budget has no in-budget representation —
 /// fail loud rather than grow it uncounted toward an out-of-memory crash.
-/// `used` is the offending live or estimated footprint; `hard_limit` is the
-/// configured ceiling.
-fn cull_decision_budget_error(node_name: &str, used: u64, hard_limit: u64) -> PipelineError {
-    PipelineError::MemoryBudgetExceeded {
-        node: node_name.to_string(),
-        used,
-        limit: hard_limit,
-        source: BudgetCategory::Arena,
-        detail: Some("Cull drop-decision aggregate state".to_string()),
-    }
+/// `requested` is the decision state's live or estimated footprint, the bytes
+/// it would hold beside what is already charged.
+fn cull_decision_budget_error(
+    budget: &crate::pipeline::memory::MemoryArbitrator,
+    node_name: &str,
+    requested: u64,
+) -> PipelineError {
+    budget.refusal(node_name, MemorySurface::DecisionState, requested)
 }
 
 #[cfg(test)]
@@ -1302,7 +1559,7 @@ mod tests {
         }
         assert!(physical > relative);
         let rows = buffer
-            .take_group("mixed", &["v".into()], &key, u64::MAX)
+            .take_group("mixed", &key, u64::MAX, &arbitrator(512))
             .unwrap();
         assert_eq!(buffer.resident_bytes(), 0);
         assert_eq!(buffer.unaccounted_resident_bytes(), 0);
@@ -1378,7 +1635,7 @@ mod tests {
                 "failed write leaves a conservative published value until dispatch cleanup"
             );
             let rows = buffer
-                .take_group("failure", &["v".into()], &sibling, u64::MAX)
+                .take_group("failure", &sibling, u64::MAX, &arbitrator(512))
                 .unwrap();
             assert_eq!(rows[0].1.ordinal(), 99);
             drop(rows);
@@ -1440,7 +1697,12 @@ mod tests {
                 buffer.groups[&key].resident_bytes + buffer.groups[&key].spilled_bytes;
             assert!(physical_group >= physical);
             let rows = buffer
-                .take_group("groups", &["v".into()], &key, physical_group as u64)
+                .take_group(
+                    "groups",
+                    &key,
+                    physical_group as u64,
+                    &arbitrator(physical_group as u64),
+                )
                 .unwrap();
             assert_eq!(buffer.unaccounted_resident_bytes(), 0);
             assert_eq!(rows.len(), if partitioned { 32 } else { 33 });
@@ -1501,17 +1763,135 @@ mod tests {
     // "internal error" that implies a broken engine.
     #[test]
     fn take_group_rejects_a_group_larger_than_the_hard_limit_with_e310() {
-        let schema: SharedStorage<Schema> =
-            SharedStorage::from_arc(Arc::new(Schema::new(vec!["account".into()])));
+        // Rows as Source ingest delivers them: stamped with the Source that
+        // read them and numbered from that Source's first row.
+        let schema = clinker_record::SchemaBuilder::with_capacity(2)
+            .with_field("account")
+            .with_field_meta("$source.name", clinker_record::FieldMetadata::SourceName)
+            .build();
+        // One group, ~5 KiB across 64 records against a 512 B soft limit, so
+        // part of it partition-spills — exercising the reload path the hard
+        // limit gates rather than a purely resident group.
+        let (mut buffer, key, _spill_root) = oversized_group(&schema, |payload| {
+            Record::new(
+                schema.clone(),
+                vec![Value::String(payload.into()), Value::from("orders")],
+            )
+        });
+
+        // The finalize gate and the report read the same limit in production
+        // (`budget.hard_limit()` of the run's arbitrator); here the report
+        // comes from an arbitrator held to the 256-byte limit the gate uses.
+        let limit_in_force = MemoryArbitrator::with_policy(256, 0.80, 0.70, Box::new(NoOpPolicy));
+        let err = buffer
+            .take_group("cl", &key, 256, &limit_in_force)
+            .expect_err("a group exceeding the hard limit must be rejected at finalize");
+
+        let PipelineError::MemoryBudgetExceeded { report } = &err else {
+            panic!("a giant correlation group must surface E310; got {err:?}");
+        };
+        assert_eq!(
+            report.requester,
+            Some(ConsumerLabel {
+                node: "cl".to_string(),
+                surface: MemorySurface::CullGroups,
+            }),
+            "the diagnostic must name the Cull node and its held group rows"
+        );
+        assert_eq!(
+            report.limit.bytes(),
+            256,
+            "the limit must be the hard budget in force"
+        );
+        assert!(
+            report.oversized && report.requested_bytes > report.limit.bytes(),
+            "the reported request ({}) must be the group's footprint, above the limit ({})",
+            report.requested_bytes,
+            report.limit.bytes()
+        );
+        // The group is named by where its first row came from, never by its
+        // key (a record value): the Source that read it and its row number,
+        // counted from 1 as the dead-letter output counts it.
+        assert_eq!(
+            report.group_first_row,
+            Some(RowPosition {
+                source: "orders".to_string(),
+                row: 1,
+            }),
+            "the diagnostic must identify the offending group"
+        );
+
+        let rendered = err.to_string();
+        assert!(
+            rendered.starts_with("E310 \"cl\":"),
+            "the rendered diagnostic must lead with the E310 code and the node: {rendered}"
+        );
+        assert!(
+            rendered.contains("\n  group: the one whose first row is row 1 of source \"orders\""),
+            "the rendered diagnostic must name the group: {rendered}"
+        );
+        assert!(
+            !rendered.contains("\"g\""),
+            "the group's key is a record value and must not be printed: {rendered}"
+        );
+        assert!(
+            rendered.contains("see \"Rows held for Cull groups\" in clinker explain --code E310"),
+            "the diagnostic must route to the remedy for a Cull group: {rendered}"
+        );
+        assert!(
+            !rendered.contains("finer `partition_by`"),
+            "the remediation must not recommend narrowing partition_by: {rendered}"
+        );
+
+        // The remedy the report routes to explains why one group must fit and
+        // offers only fixes whose consequence it states.
+        let remedy = crate::executor::util::e310_section("Rows held for Cull groups");
+        assert!(
+            remedy.contains("drop_group_when"),
+            "the remedy must explain why one group must fit the budget: {remedy}"
+        );
+        assert!(
+            remedy.contains("memory.limit")
+                && remedy.contains("only fix that leaves your output unchanged"),
+            "the remedy must name raising the budget as the one output-preserving fix: {remedy}"
+        );
+        // The column-dropping remedy must be offered AND must carry its
+        // consequence: this node writes every input column through, so
+        // dropped columns leave the written output as well.
+        assert!(
+            remedy.contains("upstream Transform") && remedy.contains("leave the output too"),
+            "offering the column-drop remedy requires disclosing that it changes which columns \
+             are written: {remedy}"
+        );
+        // Narrowing `partition_by` splits the group, so a `count(*) > 100`
+        // rule can stop firing and rows that should have routed to
+        // `removed_to` land on the main port instead. The engine must warn
+        // about that, never suggest it.
+        assert!(
+            !remedy.contains("add a finer `partition_by`"),
+            "the remediation must not recommend narrowing partition_by: {remedy}"
+        );
+        assert!(
+            remedy.contains("Narrowing `partition_by`")
+                && remedy.contains("changes which rows are removed"),
+            "the remedy must warn that narrowing partition_by changes the result set: {remedy}"
+        );
+    }
+
+    /// One group of 64 rows, ~5 KiB, numbered from the first ordinal a
+    /// Source mints, admitted against a 512 B soft limit so part of it
+    /// partition-spills: the reload path the finalize's hard limit gates.
+    /// `row` builds each row from its payload. The spill directory is
+    /// returned so it outlives the buffer's spill files.
+    fn oversized_group(
+        schema: &SharedStorage<Schema>,
+        row: impl Fn(String) -> Record,
+    ) -> (CullGroupBuffer, Vec<GroupByKey>, tempfile::TempDir) {
+        use crate::executor::stream_event::SourceRowId;
         let spill_root = tempfile::tempdir().unwrap();
         let arb = arbitrator(512);
         let handle = ConsumerHandle::new();
         let key = vec![GroupByKey::Str("g".into())];
-        let partition_by = vec!["account".to_string()];
-
-        // One group, ~5 KiB across 64 records against a 512 B soft limit, so
-        // part of it partition-spills — exercising the reload path the hard
-        // limit gates rather than a purely resident group.
         let mut buffer = CullGroupBuffer::new(
             schema.clone(),
             true,
@@ -1522,12 +1902,12 @@ mod tests {
             .allocation()
             .clone(),
         );
-        for row_num in 0..64u64 {
-            let payload = format!("{row_num:063}");
+        for index in 0..64u64 {
+            let payload = format!("{index:063}");
             buffer.push(
                 key.clone(),
-                record(&schema, Value::String(payload.into())),
-                crate::executor::stream_event::SourceRowId::new(PlanNodeId::new(0), row_num),
+                row(payload),
+                SourceRowId::new(PlanNodeId::new(0), SourceRowId::FIRST_ORDINAL + index),
             );
             handle.set_bytes(buffer.unaccounted_resident_bytes() as u64);
             if arb.spill_threshold_bytes() < buffer.resident_bytes() as u64 {
@@ -1540,80 +1920,301 @@ mod tests {
             !buffer.groups[&key].spilled.is_empty(),
             "the oversized group must have partition-spilled for this to test the reload gate"
         );
+        (buffer, key, spill_root)
+    }
 
+    /// A group whose first row carries no Source stamp (a row the engine
+    /// made rather than read) has no Source to be named by, so its E310
+    /// prints no `group:` line rather than an engine placeholder where the
+    /// Source's name belongs.
+    #[test]
+    fn a_group_with_no_known_source_prints_no_group_line() {
+        let schema: SharedStorage<Schema> =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["account".into()])));
+        let (mut buffer, key, _spill_root) = oversized_group(&schema, |payload| {
+            record(&schema, Value::String(payload.into()))
+        });
+        let limit_in_force = MemoryArbitrator::with_policy(256, 0.80, 0.70, Box::new(NoOpPolicy));
         let err = buffer
-            .take_group("cl", &partition_by, &key, 256)
+            .take_group("cl", &key, 256, &limit_in_force)
             .expect_err("a group exceeding the hard limit must be rejected at finalize");
 
-        match &err {
-            PipelineError::MemoryBudgetExceeded {
-                node,
-                used,
-                limit,
-                source,
-                detail,
-            } => {
-                assert_eq!(node, "cl", "the diagnostic must name the Cull node");
-                assert_eq!(*limit, 256, "the limit must be the hard budget in force");
-                assert!(
-                    *used > *limit,
-                    "the reported footprint ({used}) must be the overrun, above the limit ({limit})"
-                );
-                assert_eq!(*source, BudgetCategory::Arena);
-                let detail = detail.as_deref().expect("the overrun must carry detail");
-                assert!(
-                    detail.contains("Cull correlation group [account=\"g\"]"),
-                    "the detail must name the offending partition_by group: {detail}"
-                );
-                assert!(
-                    detail.contains("drop_group_when"),
-                    "the detail must explain why one group must fit the budget: {detail}"
-                );
-                assert!(
-                    detail.contains("memory.limit")
-                        && detail.contains("only fix that leaves your output unchanged"),
-                    "the detail must name raising the budget as the one output-preserving fix: \
-                     {detail}"
-                );
-                // The column-dropping remedy must be offered AND must carry its
-                // consequence: this node writes every input column through, so
-                // dropped columns leave the written output as well. Asserting
-                // the pair rather than "consequence-if-offered" keeps the check
-                // live — the implication form passes vacuously the moment the
-                // remedy is reworded, which is how the two node messages drifted
-                // apart before.
-                assert!(
-                    detail.contains("upstream Transform"),
-                    "the detail must offer the column-drop remedy: {detail}"
-                );
-                assert!(
-                    detail.contains("leave the output too"),
-                    "offering the column-drop remedy requires disclosing that it changes which \
-                     columns are written: {detail}"
-                );
-                // Narrowing `partition_by` splits the group, so a
-                // `count(*) > 100` rule can stop firing and rows that should
-                // have routed to `removed_to` land on the main port instead.
-                // The engine must warn about that, never suggest it.
-                assert!(
-                    !detail.contains("add a finer `partition_by`"),
-                    "the remediation must not recommend narrowing partition_by: {detail}"
-                );
-                assert!(
-                    detail.contains("Narrowing `partition_by`")
-                        && detail.contains("changes which rows are removed"),
-                    "the detail must warn that narrowing partition_by changes the result set: \
-                     {detail}"
-                );
-            }
-            other => panic!("a giant correlation group must surface E310; got {other:?}"),
-        }
-
+        let PipelineError::MemoryBudgetExceeded { report } = &err else {
+            panic!("a giant correlation group must surface E310; got {err:?}");
+        };
+        assert_eq!(
+            report.group_first_row, None,
+            "no Source is known for the group's first row, so none is named"
+        );
         let rendered = err.to_string();
         assert!(
-            rendered.starts_with("E310 cl:"),
-            "the rendered diagnostic must lead with the E310 code and the node: {rendered}"
+            rendered.starts_with("E310 \"cl\":"),
+            "the refusal still leads with the E310 code and the node: {rendered}"
         );
+        assert!(
+            !rendered.contains("group:"),
+            "with no Source to name, the report has no group line: {rendered}"
+        );
+        assert!(
+            !rendered.contains(crate::executor::dispatch::MERGED_SOURCE_NAME.as_ref()),
+            "the engine's placeholder is never printed as a Source: {rendered}"
+        );
+    }
+
+    /// Text bytes of each row's note.
+    const NOTE_BYTES: usize = 1024;
+    /// Rows a reclaim test buffers, across [`GROUPS`] groups.
+    const ROWS: u64 = 48;
+    const GROUPS: u64 = 4;
+    /// What is free beside the buffered rows when the foreign request is
+    /// made.
+    const FREE: u64 = 4 * 1024;
+
+    /// A run's allocation provider over `arbitrator`, so text admitted
+    /// through it is charged to the run's ledger as a Source's text is.
+    fn run_provider(
+        arbitrator: &Arc<MemoryArbitrator>,
+    ) -> crate::executor::preparation::ExecutorResources {
+        crate::executor::preparation::ExecutorResources::new(
+            Arc::clone(arbitrator),
+            crate::pipeline::shutdown::ShutdownToken::detached(),
+            None,
+            std::num::NonZeroUsize::MIN,
+            None,
+        )
+        .expect("a run provider")
+    }
+
+    fn account_schema() -> SharedStorage<Schema> {
+        SharedStorage::from_arc(Arc::new(Schema::new(vec!["account".into(), "note".into()])))
+    }
+
+    /// [`ROWS`] rows, each with its group key: row `i` belongs to account
+    /// `3i mod GROUPS`, so the groups are first seen out of key order, and
+    /// carries a [`NOTE_BYTES`] note admitted under `resources`, so the run
+    /// holds the note charged until the row's last copy drops.
+    fn admitted_rows(
+        schema: &SharedStorage<Schema>,
+        resources: &clinker_record::owned_storage::AllocationResources,
+    ) -> Vec<(Vec<GroupByKey>, Record, SourceRowId)> {
+        let scope = resources.scope().expect("an allocation scope");
+        (0..ROWS)
+            .map(|i| {
+                let mut values =
+                    clinker_record::owned_storage::OwnedValues::try_with_capacity(2, &scope)
+                        .expect("values admitted");
+                values
+                    .try_push(Value::Integer(((3 * i) % GROUPS) as i64), &scope)
+                    .expect("account admitted");
+                let note = clinker_record::FieldStr::try_new(&format!("{i:0>NOTE_BYTES$}"), &scope)
+                    .expect("note admitted");
+                values
+                    .try_push(Value::String(note), &scope)
+                    .expect("note admitted");
+                let record =
+                    Record::from_owned_values(schema.clone(), values).expect("record built");
+                let key = partition_key("culled", &record, &["account".to_string()])
+                    .expect("a group key");
+                (key, record, SourceRowId::new(PlanNodeId::new(0), i))
+            })
+            .collect()
+    }
+
+    /// Node `culled`'s consumer and its group buffer, registered as
+    /// [`dispatch_cull`] and [`run_cull_grouped`] register them.
+    fn registered_groups(
+        arbitrator: &Arc<MemoryArbitrator>,
+        root: &std::path::Path,
+        schema: &SharedStorage<Schema>,
+        resources: &clinker_record::owned_storage::AllocationResources,
+    ) -> (ConsumerId, Arc<ConsumerHandle>, CullGroups) {
+        let (id, handle) =
+            register_cull_consumer(arbitrator, "culled").expect("a fresh handle registers");
+        let groups = CullGroups::register(
+            arbitrator,
+            id,
+            &handle,
+            "culled",
+            &Arc::from(root),
+            CullGroupBuffer::new(schema.clone(), false, resources.clone()),
+        )
+        .expect("registered");
+        (id, handle, groups)
+    }
+
+    /// Every group, taken in first-seen order, as row ordinals and values.
+    fn take_every_group(
+        take_order: Vec<Vec<GroupByKey>>,
+        mut take: impl FnMut(&[GroupByKey]) -> Vec<(Record, SourceRowId)>,
+    ) -> Vec<(u64, Vec<Value>)> {
+        take_order
+            .iter()
+            .flat_map(|key| take(key))
+            .map(|(record, row)| (row.ordinal(), record.values().to_vec()))
+            .collect()
+    }
+
+    /// A walk request another consumer makes for more than is free, while a
+    /// Cull holds its groups resident, is granted by spilling those groups:
+    /// the Cull's figure falls to 0, every group is on disk, the spill is
+    /// recorded under the Cull's node, and taking every group yields the
+    /// rows an unspilled buffer of the same input yields, in the same order.
+    #[test]
+    fn cull_groups_spill_when_another_walk_request_falls_short() {
+        use crate::pipeline::memory::walk::walk_test_support::{
+            foreign_walk_request, with_test_walk_frame,
+        };
+        let root = tempfile::tempdir().expect("spill root");
+        let arbitrator = Arc::new(MemoryArbitrator::with_policy(
+            64 * 1024 * 1024,
+            0.80,
+            0.70,
+            Box::new(crate::pipeline::memory::Priority),
+        ));
+        with_test_walk_frame(&arbitrator, || {
+            let provider = run_provider(&arbitrator);
+            let resources = provider.allocation();
+            let schema = account_schema();
+            let (id, handle, groups) =
+                registered_groups(&arbitrator, root.path(), &schema, &resources);
+            for (key, record, row) in admitted_rows(&schema, &resources) {
+                groups.push(key, record, row);
+            }
+            let notes = ROWS * NOTE_BYTES as u64;
+            arbitrator
+                .set_limit(arbitrator.charged_bytes() + FREE)
+                .expect("limit");
+            let spilled_before = arbitrator
+                .per_stage_spill_bytes()
+                .get("culled")
+                .copied()
+                .unwrap_or(0);
+
+            let grant = foreign_walk_request(&arbitrator, FREE + notes / 2)
+                .expect("the pass spills the Cull's groups and the request fits");
+            assert_eq!(
+                handle.reclaimable(),
+                0,
+                "nothing the Cull holds is resident"
+            );
+            assert!(
+                groups
+                    .cell
+                    .borrow()
+                    .buffer
+                    .groups
+                    .values()
+                    .all(|group| group.resident.is_empty() && !group.spilled.is_empty()),
+                "every group is on disk"
+            );
+            assert!(
+                arbitrator
+                    .per_stage_spill_bytes()
+                    .get("culled")
+                    .copied()
+                    .unwrap_or(0)
+                    > spilled_before,
+                "the spill is recorded under the Cull's node"
+            );
+            drop(grant);
+
+            let spilled = take_every_group(groups.take_group_order(), |key| {
+                groups
+                    .take_group(key, u64::MAX, &arbitrator)
+                    .expect("group reloads")
+            });
+            let mut unspilled = CullGroupBuffer::new(schema.clone(), false, resources.clone());
+            for (key, record, row) in admitted_rows(&schema, &resources) {
+                unspilled.push(key, record, row);
+            }
+            let expected = take_every_group(unspilled.take_group_order(), |key| {
+                unspilled
+                    .take_group("culled", key, u64::MAX, &arbitrator)
+                    .expect("group taken")
+            });
+            assert_eq!(spilled.len(), ROWS as usize);
+            assert_eq!(
+                spilled, expected,
+                "spilled groups come back as an unspilled buffer gives them"
+            );
+            drop(groups);
+            arbitrator.unregister_consumer(id);
+        });
+    }
+
+    /// The Cull's figure is what spilling its resident groups frees now,
+    /// counted per row as a slot counts it, and a group taken out for
+    /// routing leaves it; once every group is taken the Cull is never asked
+    /// by a pass another request starts.
+    #[test]
+    fn cull_groups_taken_for_routing_are_not_reclaimable() {
+        use crate::executor::node_buffer::resident_record_reclaimable_bytes;
+        use crate::pipeline::memory::walk::walk_test_support::{
+            TestWalkOwned, foreign_walk_request, with_test_walk_frame,
+        };
+        let root = tempfile::tempdir().expect("spill root");
+        let arbitrator = Arc::new(MemoryArbitrator::with_policy(
+            64 * 1024 * 1024,
+            0.80,
+            0.70,
+            Box::new(crate::pipeline::memory::Priority),
+        ));
+        with_test_walk_frame(&arbitrator, || {
+            let provider = run_provider(&arbitrator);
+            let resources = provider.allocation();
+            let schema = account_schema();
+            let (id, handle, groups) =
+                registered_groups(&arbitrator, root.path(), &schema, &resources);
+            let consumer = CullConsumer::new(Arc::clone(&handle));
+            let mut per_group: HashMap<Vec<GroupByKey>, u64> = HashMap::new();
+            for (key, record, row) in admitted_rows(&schema, &resources) {
+                *per_group.entry(key.clone()).or_default() +=
+                    resident_record_reclaimable_bytes(&record);
+                groups.push(key, record, row);
+            }
+            let mut resident: u64 = per_group.values().sum();
+            assert!(resident > 0);
+            assert_eq!(
+                consumer.reclaimable_bytes(),
+                resident,
+                "the figure counts every resident row as a slot counts it"
+            );
+
+            let mut taken = Vec::new();
+            for key in groups.take_group_order() {
+                taken.extend(
+                    groups
+                        .take_group(&key, u64::MAX, &arbitrator)
+                        .expect("group taken"),
+                );
+                resident -= per_group[&key];
+                assert_eq!(
+                    consumer.reclaimable_bytes(),
+                    resident,
+                    "a group taken for routing leaves the figure"
+                );
+            }
+            assert_eq!(consumer.reclaimable_bytes(), 0);
+
+            let other = TestWalkOwned::register(&arbitrator, "other", (0..64).collect(), FREE);
+            arbitrator
+                .set_limit(arbitrator.charged_bytes() + FREE)
+                .expect("limit");
+            let shortfall = foreign_walk_request(&arbitrator, 3 * FREE)
+                .expect_err("spilling the other owner leaves too little room");
+            let report = shortfall.into_report(&arbitrator);
+            let round = report.reclaim.as_ref().expect("the walk ran a round");
+            assert_eq!(
+                round.holders_asked,
+                vec!["other".to_string()],
+                "the round asks the other owner and never the Cull"
+            );
+            assert_eq!(taken.len(), ROWS as usize, "the routed rows stay held");
+            drop(taken);
+            drop(groups);
+            arbitrator.unregister_consumer(other.id);
+            arbitrator.unregister_consumer(id);
+        });
     }
 
     // The disk-spill cap must abort the spill instead of writing past

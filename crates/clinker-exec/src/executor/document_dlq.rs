@@ -75,6 +75,9 @@ use crate::executor::sink_dispatch::OrderedWriterBoundary;
 use crate::executor::stream_event::{SourceRowId, StreamEvent};
 use crate::executor::structured_output_guard::StructuredOutputDocumentGuard;
 use crate::executor::{DlqEntry, DlqFailureStamp, build_format_writer};
+use crate::pipeline::memory::walk::{
+    OwnedSpillResult, WalkOwnedRegistration, WalkOwnedSpill, register_walk_owned,
+};
 use crate::pipeline::memory::{
     ConsumerHandle, ConsumerId, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
 };
@@ -165,8 +168,8 @@ const MERGED_INTERVAL_BYTES: u64 = 8;
 const SOURCE_ENTRY_BYTES: u64 = std::mem::size_of::<(PlanNodeId, SourceEmittedRows)>() as u64;
 
 /// The most one admission can add to the ledger's charge: a merging row that
-/// opens a new Source entry, bitmap and container. Every admission
-/// preflights its own growth, which never exceeds this.
+/// opens a new Source entry, bitmap and container. Every admission is
+/// charged its own growth, which never exceeds this.
 const MAX_ADMISSION_BYTES: u64 = ROW_ADMISSION_BYTES
     + MERGED_INTERVAL_BYTES
     + NEW_CONTAINER_BYTES
@@ -204,9 +207,10 @@ const FAILED_DOCUMENT_BYTES: u64 = 3 * (std::mem::size_of::<(DocKey, FailedDocum
 ///
 /// The ledger is exact dedup state and does not spill. Its charge is an upper
 /// bound on its heap: each admission is charged its worst-case growth (at
-/// most [`MAX_ADMISSION_BYTES`]) and preflighted against the hard limit, and
-/// [`EmittedRows::settle`] replaces the accumulated admissions with the
-/// compressed structure's bound. Growth past the hard limit fails the run
+/// most [`MAX_ADMISSION_BYTES`]) through the ledger before the row is
+/// recorded, and [`EmittedRows::settle`] replaces the accumulated admissions
+/// with the compressed structure's bound. Growth that does not fit once the
+/// walk's reclaim and the state's own held-row flush have run fails the run
 /// with E310 rather than spilling.
 ///
 /// There is more than one entry only when two Sources read the same file
@@ -317,8 +321,8 @@ impl EmittedRows {
     /// compressed heap. Returns the new charge. Optimizing converts a
     /// container to runs only when that is smaller, but the new run vector
     /// may keep doubling slack, so the new charge can exceed the old one by
-    /// that slack; it is reported, and the next admission's preflight sees
-    /// it.
+    /// that slack; it is reported, and the next admission's checked charge
+    /// counts it.
     ///
     /// Merge slack larger than the treemap's own bound is shed by rebuilding
     /// the treemap as a clone, whose vectors hold exactly their length. The
@@ -417,13 +421,19 @@ pub(crate) struct HeldLogConfig {
 ///
 /// The held log's resident frames and index, the failed-document slots and
 /// the ledgers are charged to the run's arbitrator through one consumer the
-/// state registers at construction and unregisters on drop. Held frames
+/// state registers at construction and unregisters on drop. The run keeps
+/// the state in a cell of its own that the walk reclaim set also holds, so a
+/// reclaim pass any other request on the walk starts can flush the held
+/// frames at once when it elects the state's consumer. Otherwise held frames
 /// leave memory only on the arbitrator's signals (see
-/// [`crate::executor::extent_log`]): the consumer's election, answered on
-/// every append, at every decision and at every ledger admission; the soft
-/// threshold, polled every `batch_size` appends and at every decision; and
-/// the hard-limit preflight on every append and every ledger admission,
-/// which flushes every held tail before it refuses with E310.
+/// [`crate::executor::extent_log`]): the consumer's election by a pass that
+/// found the state busy or by a round without the walk, polled on every
+/// append and at every decision (a ledger admission leaves it pending);
+/// the soft threshold, polled every `batch_size` appends and at every
+/// decision; and
+/// the state's own growth (a held row, a ledger admission) when the walk's
+/// reclaim leaves it short, which flushes the tails and retries once before
+/// it refuses with E310. Each growth is charged once, when it is admitted.
 pub(crate) struct DocumentDlqState {
     /// Source-node names declaring `dlq_granularity: document`. A record is
     /// governed by the policy only when its originating source is in this
@@ -447,6 +457,10 @@ pub(crate) struct DocumentDlqState {
     /// Frames held so far, for the soft-threshold poll cadence.
     appends: u64,
     batch_size: u64,
+    /// The node whose failure was held last: a flush a reclaim pass asks
+    /// for has no node of its own, so it records its extents under the
+    /// node whose rows it moves.
+    last_failing_node: String,
     arbitrator: Arc<MemoryArbitrator>,
     consumer_id: ConsumerId,
     /// The bytes charged for the held log, the failed-document slots and
@@ -459,11 +473,15 @@ impl DocumentDlqState {
     /// source names, registering the one consumer it is charged through with
     /// `arbitrator`. Empty: the first marked failure populates it. The held
     /// log creates no file until the arbitrator first asks it to spill.
+    ///
+    /// # Errors
+    ///
+    /// [`PipelineError::Internal`] when the consumer cannot be registered.
     pub(crate) fn new(
         doc_sources: HashSet<Arc<str>>,
         arbitrator: Arc<MemoryArbitrator>,
         held: HeldLogConfig,
-    ) -> Self {
+    ) -> Result<Self, PipelineError> {
         let handle = ConsumerHandle::new();
         let log = ExtentLog::new(held.spill_root, held.compress, Arc::clone(&handle));
         let consumer_id = arbitrator.register_consumer(
@@ -476,8 +494,8 @@ impl DocumentDlqState {
                 node: "dead letters".to_string(),
                 surface: MemorySurface::HeldFailingRows,
             },
-        );
-        Self {
+        )?;
+        Ok(Self {
             doc_sources,
             failed: HashMap::new(),
             held: log,
@@ -485,10 +503,51 @@ impl DocumentDlqState {
             frame: Vec::new(),
             appends: 0,
             batch_size: held.batch_size.max(1) as u64,
+            last_failing_node: String::new(),
             arbitrator,
             consumer_id,
             handle,
-        }
+        })
+    }
+
+    /// Make the state in `state` a victim every reclaim pass on its
+    /// arbitrator's walk can flush, until the returned registration drops.
+    /// Borrows the state's cell once, to read its consumer and handle. Call
+    /// it on the walk after the walk frame is installed; with no walk frame
+    /// it registers nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`register_walk_owned`]: [`PipelineError::Internal`] when the walk
+    /// reclaim set is borrowed.
+    pub(crate) fn register_for_reclaim(
+        state: &std::rc::Rc<std::cell::RefCell<Self>>,
+    ) -> Result<WalkOwnedRegistration, PipelineError> {
+        let (arbitrator, consumer, handle) = {
+            let borrowed = state.borrow();
+            (
+                Arc::clone(&borrowed.arbitrator),
+                borrowed.consumer_id,
+                Arc::clone(&borrowed.handle),
+            )
+        };
+        register_walk_owned(&arbitrator, consumer, &handle, state)
+    }
+
+    /// Flush every resident held tail to the held log's file because a
+    /// reclaim pass elected the state: the same extents, chaining and spill
+    /// quota as a flush the state asks for itself, with the bytes written
+    /// recorded under the node whose failure was held last. Returns the
+    /// resident bytes freed.
+    ///
+    /// # Errors
+    ///
+    /// A flush's spill errors, including E320.
+    pub(crate) fn spill_held_rows(
+        &mut self,
+        arbitrator: &MemoryArbitrator,
+    ) -> Result<u64, PipelineError> {
+        self.held.flush_all(arbitrator, &self.last_failing_node)
     }
 
     /// The document key (source file) `record` is governed by under the
@@ -516,24 +575,18 @@ impl DocumentDlqState {
     /// already wrote it, so the caller writes nothing; `Ok(true)` when the
     /// caller must write it now.
     ///
-    /// Every admission first answers a spill request pending on the state's
-    /// handle by flushing every held tail, so a request the arbitrator raised
-    /// on a poll that holds no row, as the late-record path's is, is answered
-    /// here. The ledger's growth is then preflighted against the arbitrator's
-    /// hard limit before the row is recorded, as a node-buffer reservation's
-    /// is. When it does not fit, every held tail is flushed first, as a hold
-    /// does, and the growth checked again: the ledger itself cannot spill (it
-    /// is exact dedup state), so growth that still does not fit with every
-    /// held row on disk fails the run with E310, naming `node`. Any flush is
-    /// credited to `node`.
+    /// The ledger's growth is charged before the row is recorded, and that
+    /// is its only charge: on the walk the growth first reclaims from every
+    /// other walk victim, then, only if that falls short, the state flushes
+    /// its own held rows and retries once. The ledger itself cannot spill (it
+    /// is exact dedup state), so growth that still does not fit fails the
+    /// run with E310 naming `node`. Any flush is credited to `node`.
     ///
     /// # Errors
     ///
-    /// [`PipelineError::MemoryBudgetExceeded`] with
-    /// [`clinker_plan::BudgetCategory::Arena`] when the growth would pass
-    /// the hard limit with every held row on disk; a flush's spill errors,
-    /// including E320; [`PipelineError::Internal`] when `key` is not a
-    /// failed document.
+    /// [`PipelineError::MemoryBudgetExceeded`] when the growth does not fit
+    /// with every held row on disk; a flush's spill errors, including E320;
+    /// [`PipelineError::Internal`] when `key` is not a failed document.
     fn admit_emitted(
         &mut self,
         key: &DocKey,
@@ -548,40 +601,18 @@ impl DocumentDlqState {
                 node: node.to_string(),
                 detail: format!("document {key:?} is rejected but was never marked failed"),
             })?;
-        if self.handle.take_spill_request() {
-            self.held.flush_all(&self.arbitrator, node)?;
-        }
         let Some(admission) = failed.emitted.admission(row) else {
             return Ok(false);
         };
         let growth = admission.growth;
         debug_assert!(growth <= MAX_ADMISSION_BYTES);
-        let hard_limit = self.arbitrator.hard_limit();
-        let fits = |arbitrator: &MemoryArbitrator| {
-            hard_limit == 0 || arbitrator.sum_consumer_usage().saturating_add(growth) <= hard_limit
-        };
-        if !fits(&self.arbitrator) {
-            self.held.flush_all(&self.arbitrator, node)?;
-        }
-        if !fits(&self.arbitrator) {
-            use clinker_core_types::QuoteName;
-            let charged_pressure = self.arbitrator.sum_consumer_usage();
-            let projected_pressure = charged_pressure.saturating_add(growth);
-            // The document is named as every diagnostic names one. The byte
-            // figures stay raw counts, as the other E310 details write them.
-            return Err(PipelineError::MemoryBudgetExceeded {
-                node: node.to_string(),
-                used: projected_pressure,
-                limit: hard_limit,
-                source: clinker_plan::BudgetCategory::Arena,
-                detail: Some(format!(
-                    "the document dead-letter ledger of {quoted} projected {projected_pressure} bytes from charged pressure {charged_pressure} plus {growth} bytes for one more row, with every held row already on disk",
-                    quoted = key.quoted_name(),
-                )),
-            });
-        }
+        self.held.admit_owner_charge(
+            &self.arbitrator,
+            growth,
+            node,
+            MemorySurface::DeadLetteredRowSet,
+        )?;
         failed.emitted.record(row, &admission);
-        self.handle.add_bytes(growth);
         if failed.emitted.unsettled >= SETTLE_EVERY_ADMISSIONS {
             settle_ledger(&self.handle, &mut failed.emitted);
         }
@@ -622,9 +653,9 @@ impl DocumentDlqState {
     }
 
     /// Mark document `key` failed at `node` with its first failure's stamp
-    /// `cause`, charging the document's fixed map slot.
+    /// `cause`. The document's fixed map slot, [`FAILED_DOCUMENT_BYTES`], is
+    /// charged by the admission of the held frame that marks it.
     fn insert_failed(&mut self, key: DocKey, cause: DlqFailureStamp, node: &str) {
-        self.handle.add_bytes(FAILED_DOCUMENT_BYTES);
         let failing_node = self.names.failing_node(node);
         self.failed.insert(
             key,
@@ -643,16 +674,16 @@ impl DocumentDlqState {
     /// Before the row is held the arbitrator's signals are polled: the
     /// consumer's election every time, the soft threshold every `batch_size`
     /// holds; either flushes every held tail. Then the frame, and on a first
-    /// failure the document's slot and index entry, are preflighted against
-    /// the hard limit, flushing every held tail first if they do not fit.
-    /// Between two polls the resident tails grow by at most one batch of
-    /// holds past the soft threshold; the hard limit is checked on every
-    /// hold. `node` is the failing node, for E310 and for the spill
-    /// attribution of any flush.
+    /// failure the document's slot and index entry, are admitted in one
+    /// growth of the state's charge, which is their only charge: on the walk
+    /// it first reclaims from every other walk victim, the state (the
+    /// requester) last, and only if that falls short does the state flush
+    /// its own held tails and retry once. `node` is the failing node, for
+    /// E310 and for the spill attribution of any flush.
     ///
     /// # Errors
     ///
-    /// [`PipelineError::MemoryBudgetExceeded`] (E310, `Arena`) when the frame
+    /// [`PipelineError::MemoryBudgetExceeded`] (E310) when the frame
     /// does not fit even with every held row on disk; nothing is held and the
     /// document is not marked. A flush's spill errors, including E320.
     fn hold(
@@ -690,12 +721,15 @@ impl DocumentDlqState {
             frame.len(),
             extra,
             node,
-            "the held dead-letter rows of the failed documents",
+            clinker_plan::runtime_error::MemorySurface::HeldFailingRows,
         )?;
         if first {
             self.insert_failed(Arc::clone(&key), row.failed_at, node);
         }
         self.held.append(&key, frame)?;
+        if self.last_failing_node != node {
+            node.clone_into(&mut self.last_failing_node);
+        }
         debug_assert!(
             self.handle.bytes() >= self.held.resident_bytes() + self.held.index_bytes(),
             "the state's charge covers its held rows"
@@ -737,6 +771,33 @@ fn settle_ledger(handle: &ConsumerHandle, emitted: &mut EmittedRows) {
         handle.add_bytes(after - before);
     } else {
         handle.sub_bytes(before - after);
+    }
+}
+
+impl WalkOwnedSpill for DocumentDlqState {
+    /// A pass that elects the state's consumer flushes every resident held
+    /// tail ([`DocumentDlqState::spill_held_rows`]). The state's cell is
+    /// borrowed on the walk only for one of its own steps, which is when the
+    /// state is itself the requester admitting a row; a pass then finds it
+    /// busy, and the requester flushes its own tails if its request falls
+    /// short.
+    ///
+    /// It wrote when the flush released resident bytes. With no held tail
+    /// resident it wrote nothing, though it still holds the state's exact
+    /// index and ledgers for the consumer.
+    fn spill_owned(
+        &mut self,
+        id: ConsumerId,
+        arbitrator: &MemoryArbitrator,
+    ) -> Result<OwnedSpillResult, PipelineError> {
+        if id != self.consumer_id {
+            return Ok(OwnedSpillResult::NotHeld);
+        }
+        Ok(if self.spill_held_rows(arbitrator)? > 0 {
+            OwnedSpillResult::Wrote
+        } else {
+            OwnedSpillResult::NothingToWrite
+        })
     }
 }
 
@@ -1009,7 +1070,8 @@ fn held_frame_error(detail: &str) -> PipelineError {
 /// `Priority` policy elects the lowest priority first, so a state holding
 /// only ledgers is elected only when every registered consumer is equally
 /// non-reclaimable, and never shadows a node buffer that could spill. Growth
-/// that cannot be relieved is refused at the hard limit with E310.
+/// that neither the walk's reclaim nor the state's own flush makes room for
+/// is refused with E310.
 ///
 /// No producer feeds the state that the arbitrator could pause, so
 /// `can_back_pressure` is false and the consumer is never paused: there is
@@ -1029,6 +1091,12 @@ impl DocumentDlqConsumer {
 impl MemoryConsumer for DocumentDlqConsumer {
     fn current_usage(&self) -> u64 {
         self.handle.bytes()
+    }
+
+    /// Only the held log's resident frames leave memory on a spill; the
+    /// index, failed-document slots and ledgers are exact state that stays.
+    fn reclaimable_bytes(&self) -> u64 {
+        self.resident.load(Ordering::Relaxed)
     }
 
     fn peak_charged_bytes(&self) -> Option<u64> {
@@ -1113,7 +1181,7 @@ pub(crate) fn record_error_to_document_buffer_if_doc_dlq(
     let Some(state) = ctx.document_dlq.as_ref() else {
         return Ok(false);
     };
-    let Some(key) = state.governing_key(record) else {
+    let Some(key) = state.borrow().governing_key(record) else {
         return Ok(false);
     };
     let source_name = source_name_arc_of(record);
@@ -1156,7 +1224,7 @@ pub(crate) fn record_source_rejection_to_document_buffer_if_doc_dlq(
         return Ok(false);
     };
     if event.original_record.doc_ctx().id() == DocumentId::SYNTHETIC
-        || !state.doc_sources.contains(&event.source_name)
+        || !state.borrow().doc_sources.contains(&event.source_name)
         || !is_concrete_file(&event.source_file)
     {
         return Ok(false);
@@ -1236,21 +1304,22 @@ pub(crate) fn mark_structural_reject_if_present(
 /// # Errors
 ///
 /// [`PipelineError::Internal`] when the row cannot be encoded;
-/// [`PipelineError::MemoryBudgetExceeded`] (E310, `Arena`) naming `node`
-/// when the held row does not fit under the hard limit even with every held
-/// row on disk; a spill error, including E320, from a flush.
+/// [`PipelineError::MemoryBudgetExceeded`] (E310) naming `node`
+/// when the held row does not fit even with every other walk victim spilled
+/// and every held row on disk; a spill error, including E320, from a flush.
 fn mark_document_failed(
     ctx: &mut ExecutorContext<'_>,
     key: DocKey,
     entry: DlqEntry,
     node: &str,
 ) -> Result<(), PipelineError> {
-    let Some(state) = ctx.document_dlq.as_mut() else {
+    let Some(state) = ctx.document_dlq.as_ref().map(std::rc::Rc::clone) else {
         return Ok(());
     };
-    let entry = match state.failed.get(&key) {
+    let cause = state.borrow().failed.get(&key).map(|failed| failed.cause);
+    let entry = match cause {
         None => entry,
-        Some(failed) => DlqEntry {
+        Some(cause) => DlqEntry {
             source_row: entry.source_row,
             category: clinker_core_types::dlq::DlqErrorCategory::DocumentRejected,
             error_message: format!("document {key:?} rejected: a sibling record failed"),
@@ -1261,11 +1330,13 @@ fn mark_document_failed(
             source_name: entry.source_name,
             triggering_field: None,
             triggering_value: None,
-            failed_at: DlqFailureStamp::condemned_by(&failed.cause),
+            failed_at: DlqFailureStamp::condemned_by(&cause),
         },
     };
     let bytes = ctx.dlq.encode_row(&entry)?;
-    state.hold(
+    // The state is the requester while it holds the row: the borrow spans
+    // only its own admission, flush and append.
+    state.borrow_mut().hold(
         key,
         &HeldRow {
             source_row: entry.source_row,
@@ -1292,6 +1363,10 @@ struct DocBucket {
     /// `DocumentClose`. The file's outermost close is the one that returns
     /// this to zero; a nested-level close leaves it positive.
     depth: i64,
+    /// The bucket's entry in the walk reclaim set, under its consumer and
+    /// against the Output's cell of buckets; it leaves the set when the
+    /// bucket drops, on every path that takes a bucket out.
+    _reclaim: WalkOwnedRegistration,
 }
 
 /// Claim the one decision slot for `key` in this Output invocation.
@@ -1322,6 +1397,270 @@ fn remaining_document_keys(buckets: &HashMap<DocKey, DocBucket>) -> Vec<DocKey> 
     remaining
 }
 
+/// One Output invocation's per-document buckets, in a cell of their own that
+/// the walk reclaim set reaches by each bucket's consumer id, with what a
+/// bucket's spill needs.
+///
+/// Walk-owned (`!Send`, reached through an `Rc<RefCell<_>>`). The driver
+/// borrows the cell only for one step of its own: building or finding a
+/// bucket, pushing a record, spilling a bucket, taking a bucket out at its
+/// decision. It never holds the borrow across a checked growth, a writer
+/// call or a call into the executor context, so a reclaim pass can spill a
+/// bucket whenever the driver is not in the middle of such a step; a pass
+/// that finds the cell borrowed raises the bucket's spill request, which the
+/// bucket's next push answers.
+pub(crate) struct DocumentBuckets {
+    /// Per-file spillable buckets, dropped at each file's outermost close.
+    buckets: HashMap<DocKey, DocBucket>,
+    /// This cell, which each bucket built here is entered under in the walk
+    /// reclaim set.
+    this: std::rc::Weak<std::cell::RefCell<DocumentBuckets>>,
+    /// The Output's name: each bucket's consumer is registered under it and
+    /// its spills are recorded under it.
+    output_name: String,
+    spill_root: Arc<Path>,
+    spill_compress: CompressMode,
+    batch_size: usize,
+}
+
+impl DocumentBuckets {
+    /// An empty cell of buckets for the Output `output_name`, spilling into
+    /// `spill_root`.
+    pub(crate) fn new_cell(
+        output_name: &str,
+        spill_root: Arc<Path>,
+        spill_compress: CompressMode,
+        batch_size: usize,
+    ) -> std::rc::Rc<std::cell::RefCell<Self>> {
+        std::rc::Rc::new_cyclic(|this| {
+            std::cell::RefCell::new(Self {
+                buckets: HashMap::new(),
+                this: this.clone(),
+                output_name: output_name.to_string(),
+                spill_root,
+                spill_compress,
+                batch_size,
+            })
+        })
+    }
+
+    /// Borrow (building on first sight) the bucket for file `key`. A new
+    /// bucket's consumer is registered under the Output's name as rows held
+    /// until their document is decided, and this cell is registered under that consumer in the walk reclaim set of
+    /// `arbitrator`'s walk ([`register_walk_owned`]), when the calling
+    /// thread is that walk, so any reclaim pass there can spill the bucket.
+    /// The registration is kept in the bucket and drops with it. A thread
+    /// with no walk frame (a unit test building buckets without a run)
+    /// registers nothing there.
+    ///
+    /// # Errors
+    ///
+    /// [`PipelineError::Internal`] when the walk reclaim set is borrowed
+    /// while the bucket is built; the bucket's consumer is unregistered
+    /// again and no bucket is built.
+    fn bucket_for(
+        &mut self,
+        arbitrator: &MemoryArbitrator,
+        key: &DocKey,
+    ) -> Result<&mut DocBucket, PipelineError> {
+        let bucket = match self.buckets.entry(Arc::clone(key)) {
+            std::collections::hash_map::Entry::Occupied(occupied) => occupied.into_mut(),
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                // `self` is borrowed out of this cell, so the cell is alive.
+                let cell = self.this.upgrade().ok_or_else(|| PipelineError::Internal {
+                    op: "document dead-letter",
+                    node: self.output_name.clone(),
+                    detail: "a document's bucket was built outside its Output's cell".to_string(),
+                })?;
+                let handle = ConsumerHandle::new();
+                let consumer_id = arbitrator.register_node_consumer(
+                    Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                        Arc::clone(&handle),
+                    )),
+                    Arc::clone(&handle),
+                    // Every row of a document no verdict has reached, not
+                    // only failing ones: a clean document waits here too.
+                    ConsumerLabel {
+                        node: self.output_name.clone(),
+                        surface: MemorySurface::OpenDocumentRows,
+                    },
+                )?;
+                let reclaim = match register_walk_owned(arbitrator, consumer_id, &handle, &cell) {
+                    Ok(reclaim) => reclaim,
+                    Err(error) => {
+                        arbitrator.unregister_consumer(consumer_id);
+                        return Err(error);
+                    }
+                };
+                vacant.insert(DocBucket {
+                    buffer: NodeBuffer::Memory(Vec::new()),
+                    consumer_id,
+                    handle,
+                    depth: 0,
+                    _reclaim: reclaim,
+                })
+            }
+        };
+        Ok(bucket)
+    }
+
+    /// The live bucket for file `key`.
+    fn bucket_mut(&mut self, key: &DocKey) -> Result<&mut DocBucket, PipelineError> {
+        let output_name = &self.output_name;
+        self.buckets
+            .get_mut(key)
+            .ok_or_else(|| PipelineError::Internal {
+                op: "document dead-letter",
+                node: output_name.clone(),
+                detail: format!("document {key:?} has no live bucket"),
+            })
+    }
+
+    /// Spill bucket `key`'s resident records to a new chunk after any it
+    /// already has, recording the file under the Output's name. A bucket
+    /// with nothing resident, or no bucket, spills nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`spill_bucket_in_place`], including E320 past the spill cap.
+    fn spill(&mut self, arbitrator: &MemoryArbitrator, key: &DocKey) -> Result<(), PipelineError> {
+        let Some(bucket) = self.buckets.get_mut(key) else {
+            return Ok(());
+        };
+        spill_resident_bucket(
+            bucket,
+            arbitrator,
+            &self.output_name,
+            &self.spill_root,
+            self.spill_compress,
+            self.batch_size,
+        )
+    }
+
+    /// Answer bucket `key`'s spill request, raised by a reclaim pass that
+    /// found this cell borrowed, by spilling the bucket now. Returns whether
+    /// a request was raised.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::spill`].
+    fn answer_spill_request(
+        &mut self,
+        arbitrator: &MemoryArbitrator,
+        key: &DocKey,
+    ) -> Result<bool, PipelineError> {
+        let requested = self
+            .buckets
+            .get(key)
+            .is_some_and(|bucket| bucket.handle.take_spill_request());
+        if requested {
+            self.spill(arbitrator, key)?;
+        }
+        Ok(requested)
+    }
+
+    /// Spill the bucket whose consumer is `id`, because a reclaim pass
+    /// elected it. Returns the bytes its charge fell by, or `None` when no
+    /// bucket here has that consumer.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::spill`].
+    pub(crate) fn spill_consumer(
+        &mut self,
+        id: ConsumerId,
+        arbitrator: &MemoryArbitrator,
+    ) -> Result<Option<u64>, PipelineError> {
+        let Some(bucket) = self
+            .buckets
+            .values_mut()
+            .find(|bucket| bucket.consumer_id == id)
+        else {
+            return Ok(None);
+        };
+        let before = bucket.handle.bytes();
+        spill_resident_bucket(
+            bucket,
+            arbitrator,
+            &self.output_name,
+            &self.spill_root,
+            self.spill_compress,
+            self.batch_size,
+        )?;
+        Ok(Some(before.saturating_sub(bucket.handle.bytes())))
+    }
+
+    /// Take bucket `key` out for its decision. Its entry in the walk reclaim
+    /// set leaves with the bucket's registration when the bucket drops;
+    /// until then a pass that reaches it finds no bucket here for its
+    /// consumer. The caller releases the consumer.
+    fn take(&mut self, key: &DocKey) -> Option<DocBucket> {
+        self.buckets.remove(key)
+    }
+}
+
+impl WalkOwnedSpill for DocumentBuckets {
+    /// A pass that elects a bucket's consumer spills that bucket
+    /// ([`DocumentBuckets::spill_consumer`]); an id whose bucket has left
+    /// this cell is not held here. It wrote when the bucket's charge fell; a
+    /// bucket with nothing resident wrote nothing.
+    fn spill_owned(
+        &mut self,
+        id: ConsumerId,
+        arbitrator: &MemoryArbitrator,
+    ) -> Result<OwnedSpillResult, PipelineError> {
+        Ok(match self.spill_consumer(id, arbitrator)? {
+            None => OwnedSpillResult::NotHeld,
+            Some(0) => OwnedSpillResult::NothingToWrite,
+            Some(_) => OwnedSpillResult::Wrote,
+        })
+    }
+}
+
+/// Spill `bucket`'s resident records as [`spill_bucket_in_place`] does,
+/// resolving compression for the column count of the last record resident,
+/// which is the record the bucket's latest push added. Nothing resident
+/// spills nothing.
+fn spill_resident_bucket(
+    bucket: &mut DocBucket,
+    arbitrator: &MemoryArbitrator,
+    output_name: &str,
+    spill_root: &Path,
+    spill_compress: CompressMode,
+    batch_size: usize,
+) -> Result<(), PipelineError> {
+    let Some(column_count) = last_resident_column_count(&bucket.buffer) else {
+        return Ok(());
+    };
+    spill_bucket_in_place(
+        bucket,
+        arbitrator,
+        output_name,
+        spill_root,
+        spill_compress,
+        batch_size,
+        column_count,
+    )
+}
+
+/// The column count of the last record resident in `buffer`, `None` when no
+/// record is resident.
+fn last_resident_column_count(buffer: &NodeBuffer) -> Option<usize> {
+    let events = match buffer {
+        NodeBuffer::Memory(events) => events,
+        NodeBuffer::Mixed { mem, .. } => mem,
+        NodeBuffer::Spilled { .. }
+        | NodeBuffer::MergeSpilled { .. }
+        | NodeBuffer::ReReadable(_) => {
+            return None;
+        }
+    };
+    events.iter().rev().find_map(|event| match event {
+        StreamEvent::Record(record, _) => Some(record.schema().column_count()),
+        StreamEvent::Punctuation(_) => None,
+    })
+}
+
 /// Per-Output-invocation driver for the `document` granularity: buffers
 /// each record into its file's spillable bucket and, when the file's
 /// outermost close arrives (envelope depth back to zero) or at end-of-input,
@@ -1338,8 +1677,9 @@ pub(crate) struct DocumentDlqDriver<'cfg> {
     output_name: String,
     out_cfg: &'cfg SinkConfig,
     cxl_emit_names: Option<Vec<String>>,
-    /// Per-file spillable buckets, dropped at each file's outermost close.
-    buckets: HashMap<DocKey, DocBucket>,
+    /// Per-file spillable buckets, dropped at each file's outermost close,
+    /// in the cell a reclaim pass reaches them through.
+    buckets: std::rc::Rc<std::cell::RefCell<DocumentBuckets>>,
     /// Files already flushed clean / rejected this invocation, so a record
     /// or close arriving after a file is decided does not silently vanish:
     /// a late record for a decided-clean file writes through (it would have
@@ -1350,9 +1690,6 @@ pub(crate) struct DocumentDlqDriver<'cfg> {
     /// across this arm's document decisions. `None` until then.
     writer: Option<clinker_format::FormatWriterHandle>,
     arbitrator: Arc<crate::pipeline::memory::MemoryArbitrator>,
-    spill_root: Arc<std::path::Path>,
-    spill_compress: clinker_plan::config::CompressMode,
-    batch_size: usize,
     ok_count: u64,
     records_written: u64,
     structured_guard: StructuredOutputDocumentGuard,
@@ -1380,13 +1717,15 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
             output_name: output_name.to_string(),
             out_cfg,
             cxl_emit_names,
-            buckets: HashMap::new(),
+            buckets: DocumentBuckets::new_cell(
+                output_name,
+                Arc::clone(&ctx.spill_root_path),
+                ctx.spill_compress,
+                ctx.batch_size,
+            ),
             decided: HashSet::new(),
             writer: None,
             arbitrator: Arc::clone(&ctx.memory_budget),
-            spill_root: Arc::clone(&ctx.spill_root_path),
-            spill_compress: ctx.spill_compress,
-            batch_size: ctx.batch_size,
             ok_count: 0,
             records_written: 0,
             structured_guard: StructuredOutputDocumentGuard::new(&out_cfg.format),
@@ -1394,69 +1733,59 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
         }
     }
 
-    /// Borrow (building on first sight) the bucket for file `key`. The
-    /// arbitrator is passed in so the caller's other `&self` fields stay
-    /// free of the `&mut self.buckets` borrow this returns. A new bucket's
-    /// consumer is registered under `output_name`, the name its spill is
-    /// recorded under.
-    fn bucket_for<'a>(
-        buckets: &'a mut HashMap<DocKey, DocBucket>,
-        arbitrator: &crate::pipeline::memory::MemoryArbitrator,
-        output_name: &str,
-        key: &DocKey,
-    ) -> &'a mut DocBucket {
-        buckets.entry(Arc::clone(key)).or_insert_with(|| {
-            let handle = crate::pipeline::memory::ConsumerHandle::new();
-            let consumer_id = arbitrator.register_node_consumer(
-                Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
-                    handle.clone(),
-                )),
-                handle.clone(),
-                ConsumerLabel {
-                    node: output_name.to_string(),
-                    surface: MemorySurface::HeldFailingRows,
-                },
-            );
-            DocBucket {
-                buffer: NodeBuffer::Memory(Vec::new()),
-                consumer_id,
-                handle,
-                depth: 0,
-            }
-        })
-    }
-
-    /// Buffer one record into its file's bucket, charging and spilling the
-    /// bucket under budget pressure.
+    /// Buffer one record into its file's bucket, charging its bytes first.
+    ///
+    /// The bucket answers a spill request a reclaim pass raised while its
+    /// cell was busy before anything else. The record's own bytes (what its
+    /// run did not already charge) are then grown through the bucket's
+    /// handle with no borrow of the cell held, so on the walk the pass this
+    /// growth starts can spill sibling buckets and every other walk victim,
+    /// this bucket (the requester) last. Only if that falls short does the
+    /// bucket spill itself and retry once. Until the soft-threshold poll is
+    /// retired, a push while the threshold is tripped also spills the
+    /// bucket, as before.
     ///
     /// # Errors
     ///
-    /// Surfaces a spill-cap-exceeded [`PipelineError`] when admitting the
-    /// bucket would push cumulative spill past the configured ceiling.
+    /// E310 when the record's bytes do not fit even with this bucket on
+    /// disk; a spill-cap-exceeded [`PipelineError`] (E320) when a spill of
+    /// the bucket passes the configured ceiling.
     fn buffer_record(
         &mut self,
         key: &DocKey,
         record: Record,
         source_row: SourceRowId,
     ) -> Result<(), PipelineError> {
-        let column_count = record.schema().column_count();
-        let bucket = Self::bucket_for(&mut self.buckets, &self.arbitrator, &self.output_name, key);
-        bucket.buffer.push(record, source_row);
-        bucket.handle.set_bytes(
-            bucket
-                .buffer
-                .unaccounted_memory_bytes(&self.allocation_resources),
+        let reclaimable = crate::executor::node_buffer::resident_record_reclaimable_bytes(&record);
+        let residue = crate::executor::node_buffer::unaccounted_record_byte_cost(
+            &record,
+            &self.allocation_resources,
         );
+        let handle = {
+            let mut buckets = self.buckets.borrow_mut();
+            let handle = Arc::clone(&buckets.bucket_for(&self.arbitrator, key)?.handle);
+            buckets.answer_spill_request(&self.arbitrator, key)?;
+            handle
+        };
+        if handle.try_grow(residue).is_err() {
+            self.buckets.borrow_mut().spill(&self.arbitrator, key)?;
+            handle
+                .try_grow(residue)
+                .map_err(|shortfall| PipelineError::MemoryBudgetExceeded {
+                    report: shortfall.into_report(&self.arbitrator),
+                })?;
+        }
+        {
+            let mut buckets = self.buckets.borrow_mut();
+            let bucket = buckets.bucket_mut(key)?;
+            bucket.buffer.push(record, source_row);
+            // The bucket's resident tail is what its in-place spill frees.
+            bucket
+                .handle
+                .set_reclaimable(bucket.handle.reclaimable().saturating_add(reclaimable));
+        }
         if self.arbitrator.should_spill() {
-            spill_bucket_in_place(
-                bucket,
-                &self.arbitrator,
-                &self.output_name,
-                self.spill_root.as_ref(),
-                self.spill_compress,
-                self.batch_size,
-                column_count,
-            )?;
+            self.buckets.borrow_mut().spill(&self.arbitrator, key)?;
         }
         Ok(())
     }
@@ -1477,11 +1806,11 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
         if !claim_document_decision(&mut self.decided, key) {
             return Ok(());
         }
-        let bucket = self.buckets.remove(key);
+        let bucket = self.buckets.borrow_mut().take(key);
         let is_failed = ctx
             .document_dlq
             .as_ref()
-            .is_some_and(|s| s.failed.contains_key(key));
+            .is_some_and(|s| s.borrow().failed.contains_key(key));
         if is_failed {
             reject_document_now(ctx, key, bucket, &self.output_name)
         } else {
@@ -1507,6 +1836,7 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
             ..
         } = bucket;
         handle.set_bytes(0);
+        handle.set_reclaimable(0);
         let result = (|| {
             // Drain in ARRIVAL order. The success sink is order-sensitive, and
             // a bucket that spilled and then kept a resident mem tail has its
@@ -1679,15 +2009,13 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
             let cause = ctx
                 .document_dlq
                 .as_ref()
-                .and_then(|s| s.failed.get(&key))
-                .map(|failed| failed.cause);
+                .and_then(|s| s.borrow().failed.get(&key).map(|failed| failed.cause));
             match cause {
                 Some(cause) => {
-                    if document_state(ctx, &self.output_name)?.admit_emitted(
-                        &key,
-                        source_row,
-                        &self.output_name,
-                    )? {
+                    let admitted = document_state(ctx, &self.output_name)?
+                        .borrow_mut()
+                        .admit_emitted(&key, source_row, &self.output_name)?;
+                    if admitted {
                         push_document_collateral(ctx, &key, record, source_row, &cause)?;
                     }
                 }
@@ -1724,7 +2052,7 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
                     let key = ctx
                         .document_dlq
                         .as_ref()
-                        .and_then(|s| s.governing_key(&record));
+                        .and_then(|s| s.borrow().governing_key(&record));
                     match key {
                         Some(key) => self.admit_governed(ctx, key, record, source_row)?,
                         None => self.write_through(ctx, record, source_row)?,
@@ -1742,16 +2070,15 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
                             // the file. A bucket may not exist yet for a
                             // header-only file that has emitted no record;
                             // create it so the open/close balance is counted.
-                            Self::bucket_for(
-                                &mut self.buckets,
-                                &self.arbitrator,
-                                &self.output_name,
-                                &file,
-                            )
-                            .depth += 1;
+                            self.buckets
+                                .borrow_mut()
+                                .bucket_for(&self.arbitrator, &file)?
+                                .depth += 1;
                         }
                         PunctuationKind::DocumentClose => {
-                            if let Some(key) = closing_document_key(&mut self.buckets, &file) {
+                            let closing =
+                                closing_document_key(&mut self.buckets.borrow_mut().buckets, &file);
+                            if let Some(key) = closing {
                                 self.decide_document(ctx, &key)?;
                             }
                         }
@@ -1764,14 +2091,15 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
         // clean-vs-failed axis as one closed in stream — a failed one
         // rejects with its collaterals, a clean one flushes. Deterministic
         // order keeps emit / write ordering stable across runs.
-        for key in remaining_document_keys(&self.buckets) {
+        let remaining = remaining_document_keys(&self.buckets.borrow().buckets);
+        for key in remaining {
             self.decide_document(ctx, &key)?;
         }
         // Late records of failed documents are admitted to their ledgers
         // outside any rejection pass, so this Sink's pass settles those
         // ledgers before it ends.
-        if let Some(state) = ctx.document_dlq.as_mut() {
-            state.settle_unsettled_ledgers();
+        if let Some(state) = ctx.document_dlq.as_ref() {
+            state.borrow_mut().settle_unsettled_ledgers();
         }
 
         if let Some(mut writer) = self.writer.take() {
@@ -1794,8 +2122,16 @@ impl Drop for DocumentDlqDriver<'_> {
     fn drop(&mut self) {
         // A `?`-early-return out of `run` leaves buckets live; unregister
         // every surviving consumer so an error exit cannot strand a charge
-        // in the arbitrator's registry. Mirrors `RegisteredTables`' guard.
-        for (_, bucket) in self.buckets.drain() {
+        // in the arbitrator's registry, and each bucket's registration drops
+        // with it, taking its walk reclaim entry. Mirrors `RegisteredTables`'
+        // guard.
+        // Every borrow of the cell is a single step that ends before any
+        // return or unwind reaches here; were one still held, borrowing
+        // again inside an unwind would abort, so the buckets are left.
+        let Ok(mut buckets) = self.buckets.try_borrow_mut() else {
+            return;
+        };
+        for (_, bucket) in buckets.buckets.drain() {
             self.arbitrator.unregister_consumer(bucket.consumer_id);
         }
     }
@@ -1822,7 +2158,8 @@ pub(crate) fn reject_unclosed_failed_documents(
     let Some(state) = ctx.document_dlq.as_ref() else {
         return Ok(());
     };
-    for (key, node) in state.unclosed_failed_documents() {
+    let pending = state.borrow().unclosed_failed_documents();
+    for (key, node) in pending {
         reject_document_now(ctx, &key, None, &node)?;
     }
     Ok(())
@@ -1965,6 +2302,7 @@ fn spill_bucket_in_place(
     // The mem tail is now on disk; the bucket's live in-memory bytes are
     // zero (only spill chunks remain).
     bucket.handle.set_bytes(0);
+    bucket.handle.set_reclaimable(0);
     bucket.buffer = NodeBuffer::Spilled {
         chunks,
         pending_puncts: puncts,
@@ -2003,13 +2341,15 @@ fn push_document_collateral(
 }
 
 /// The run's document-DLQ state, which every caller here has already
-/// established is active.
-fn document_state<'a>(
-    ctx: &'a mut ExecutorContext<'_>,
+/// established is active. The caller borrows it for one step of the state's
+/// own work at a time.
+fn document_state(
+    ctx: &ExecutorContext<'_>,
     node: &str,
-) -> Result<&'a mut DocumentDlqState, PipelineError> {
+) -> Result<std::rc::Rc<std::cell::RefCell<DocumentDlqState>>, PipelineError> {
     ctx.document_dlq
-        .as_mut()
+        .as_ref()
+        .map(std::rc::Rc::clone)
         .ok_or_else(|| PipelineError::Internal {
             op: "document dead-letter",
             node: node.to_string(),
@@ -2040,6 +2380,7 @@ fn reject_document_now(
             ..
         }) => {
             handle.set_bytes(0);
+            handle.set_reclaimable(0);
             (Some(buffer), Some(consumer_id))
         }
         None => (None, None),
@@ -2067,7 +2408,9 @@ fn stream_document_rejection(
     buffer: Option<NodeBuffer>,
     node: &str,
 ) -> Result<(), PipelineError> {
-    let cause = document_state(ctx, node)?
+    let state = document_state(ctx, node)?;
+    let cause = state
+        .borrow()
         .failed
         .get(key)
         .map(|failed| failed.cause)
@@ -2082,7 +2425,8 @@ fn stream_document_rejection(
             for event in buffer.drain() {
                 match event? {
                     StreamEvent::Record(record, source_row) => {
-                        if document_state(ctx, node)?.admit_emitted(key, source_row, node)? {
+                        let admitted = state.borrow_mut().admit_emitted(key, source_row, node)?;
+                        if admitted {
                             push_document_collateral(ctx, key, record, source_row, &cause)?;
                         }
                     }
@@ -2092,9 +2436,7 @@ fn stream_document_rejection(
         }
         Ok(())
     })();
-    if let Some(state) = ctx.document_dlq.as_mut() {
-        state.settle_emitted(key);
-    }
+    state.borrow_mut().settle_emitted(key);
     result
 }
 
@@ -2114,12 +2456,16 @@ fn replay_held(
     key: &DocKey,
     node: &str,
 ) -> Result<(), PipelineError> {
-    let Some(mut reader) = document_state(ctx, node)?.take_held(key, node)? else {
+    let state = document_state(ctx, node)?;
+    let Some(mut reader) = state.borrow_mut().take_held(key, node)? else {
         return Ok(());
     };
     while let Some(frame) = reader.next_frame()? {
-        let held = document_state(ctx, node)?.names.decode(frame)?;
-        if document_state(ctx, node)?.admit_emitted(key, held.source_row, node)? {
+        let held = state.borrow().names.decode(frame)?;
+        let admitted = state
+            .borrow_mut()
+            .admit_emitted(key, held.source_row, node)?;
+        if admitted {
             ctx.dlq_funnel().account_row(AccountedRow {
                 source_row: held.source_row,
                 source_name: &held.source_name,
@@ -2135,6 +2481,7 @@ fn replay_held(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::memory::walk::{WalkContextGuard, WalkReclaimSet, WalkSpillSettings};
 
     fn test_label(node: &str) -> clinker_plan::runtime_error::ConsumerLabel {
         clinker_plan::runtime_error::ConsumerLabel {
@@ -2147,13 +2494,15 @@ mod tests {
     /// victim-selection snapshot can name.
     fn register_fresh(arbitrator: &MemoryArbitrator) -> ConsumerId {
         let handle = ConsumerHandle::new();
-        arbitrator.register_consumer(
-            Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
-                handle.clone(),
-            )),
-            handle,
-            test_label("out"),
-        )
+        arbitrator
+            .register_consumer(
+                Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                    handle.clone(),
+                )),
+                handle,
+                test_label("out"),
+            )
+            .expect("a fresh handle registers")
     }
     use clinker_record::owned_storage::SharedStorage;
     use clinker_record::{
@@ -2215,7 +2564,8 @@ mod tests {
             HashSet::from([Arc::clone(&source_name)]),
             Arc::clone(&arbitrator),
             held_config(&std::env::temp_dir()),
-        );
+        )
+        .expect("a fresh handle registers");
         let trigger = HeldRow {
             source_row: trigger_row,
             source_name: &source_name,
@@ -2238,13 +2588,15 @@ mod tests {
         );
 
         let handle = ConsumerHandle::new();
-        let consumer_id = arbitrator.register_consumer(
-            Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+        let consumer_id = arbitrator
+            .register_consumer(
+                Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                    handle.clone(),
+                )),
                 handle.clone(),
-            )),
-            handle.clone(),
-            test_label("out"),
-        );
+                test_label("out"),
+            )
+            .expect("a fresh handle registers");
         let mut buffer = NodeBuffer::Memory(Vec::new());
         buffer.push(trigger_record, trigger_row);
         buffer.push(collateral_record, collateral_row);
@@ -2253,6 +2605,7 @@ mod tests {
             consumer_id,
             handle,
             depth: 1,
+            _reclaim: WalkOwnedRegistration::inert(),
         };
         (arbitrator, state, HashMap::from([(key, bucket)]), doc)
     }
@@ -2414,6 +2767,18 @@ mod tests {
         ))
     }
 
+    /// A run whose policy elects spill victims, as a production run's does,
+    /// for the tests that ask the arbitrator to shed state: a reclaim round
+    /// follows the run's policy, and `ledger_arbitrator`'s elects no one.
+    fn electing_arbitrator(limit: u64) -> Arc<MemoryArbitrator> {
+        Arc::new(MemoryArbitrator::with_policy(
+            limit,
+            0.8,
+            0.6,
+            MemoryArbitrator::default_policy(),
+        ))
+    }
+
     /// A document state charged to `arbitrator` holding one failed document.
     fn ledger_state(arbitrator: &Arc<MemoryArbitrator>) -> (DocumentDlqState, DocKey) {
         let key: DocKey = Arc::from("orders.csv");
@@ -2421,7 +2786,8 @@ mod tests {
             HashSet::from([Arc::from("orders")]),
             Arc::clone(arbitrator),
             held_config(&std::env::temp_dir()),
-        );
+        )
+        .expect("a fresh handle registers");
         state.failed.insert(
             Arc::clone(&key),
             FailedDocument {
@@ -2598,20 +2964,16 @@ mod tests {
             }
         }
         match refused.expect("scattered rows reach the 1 KiB hard limit") {
-            PipelineError::MemoryBudgetExceeded {
-                node,
-                limit,
-                source,
-                detail,
-                ..
-            } => {
-                assert_eq!(node, "orders_out");
-                assert_eq!(limit, 1024);
-                assert_eq!(source, clinker_plan::BudgetCategory::Arena);
-                assert!(
-                    detail.is_some_and(|d| d.contains("dead-letter ledger")),
-                    "the detail names the ledger"
+            PipelineError::MemoryBudgetExceeded { report } => {
+                assert_eq!(
+                    report.requester,
+                    Some(clinker_plan::runtime_error::ConsumerLabel {
+                        node: "orders_out".to_string(),
+                        surface: clinker_plan::runtime_error::MemorySurface::DeadLetteredRowSet,
+                    }),
+                    "the report names the node and the ledger"
                 );
+                assert_eq!(report.limit.bytes(), 1024);
             }
             other => panic!("expected E310, got {other:?}"),
         }
@@ -2698,18 +3060,21 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
 
         let handle = crate::pipeline::memory::ConsumerHandle::new();
-        let consumer_id = arbitrator.register_consumer(
-            Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+        let consumer_id = arbitrator
+            .register_consumer(
+                Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                    handle.clone(),
+                )),
                 handle.clone(),
-            )),
-            handle.clone(),
-            test_label("out"),
-        );
+                test_label("out"),
+            )
+            .expect("a fresh handle registers");
         let mut bucket = DocBucket {
             buffer: NodeBuffer::Memory(Vec::new()),
             consumer_id,
             handle,
             depth: 1,
+            _reclaim: WalkOwnedRegistration::inert(),
         };
 
         let n: u64 = 64;
@@ -2786,18 +3151,21 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
 
         let handle = crate::pipeline::memory::ConsumerHandle::new();
-        let consumer_id = arbitrator.register_consumer(
-            Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+        let consumer_id = arbitrator
+            .register_consumer(
+                Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                    handle.clone(),
+                )),
                 handle.clone(),
-            )),
-            handle.clone(),
-            test_label("out"),
-        );
+                test_label("out"),
+            )
+            .expect("a fresh handle registers");
         let mut bucket = DocBucket {
             buffer: NodeBuffer::Memory(Vec::new()),
             consumer_id,
             handle,
             depth: 1,
+            _reclaim: WalkOwnedRegistration::inert(),
         };
 
         for i in 0..64u64 {
@@ -2838,18 +3206,21 @@ mod tests {
         ));
         let tmp = tempfile::tempdir().expect("tempdir");
         let handle = crate::pipeline::memory::ConsumerHandle::new();
-        let consumer_id = arbitrator.register_consumer(
-            Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+        let consumer_id = arbitrator
+            .register_consumer(
+                Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                    handle.clone(),
+                )),
                 handle.clone(),
-            )),
-            handle.clone(),
-            test_label("out"),
-        );
+                test_label("out"),
+            )
+            .expect("a fresh handle registers");
         let mut bucket = DocBucket {
             buffer: NodeBuffer::Memory(Vec::new()),
             consumer_id,
             handle,
             depth: 1,
+            _reclaim: WalkOwnedRegistration::inert(),
         };
 
         // Arrival order: rows 0..32 (the head) then rows 32..40 (the tail).
@@ -2916,6 +3287,7 @@ mod tests {
                 batch_size,
             },
         )
+        .expect("a fresh handle registers")
     }
 
     /// Hold row `ordinal` of document `doc` as a failure at `validate`.
@@ -2951,7 +3323,7 @@ mod tests {
     #[test]
     fn held_rows_flush_on_a_spill_request() {
         let root = tempfile::tempdir().expect("spill root");
-        let arbitrator = ledger_arbitrator(1 << 30);
+        let arbitrator = electing_arbitrator(1 << 30);
         let mut state = held_state(&arbitrator, root.path(), 1 << 20);
         let docs: Vec<DocKey> = (0..3).map(doc_key).collect();
         let mut ordinal = 0;
@@ -3046,17 +3418,14 @@ mod tests {
             .set_limit(charged + FAILED_DOCUMENT_BYTES / 2)
             .expect("limit");
         match hold_row(&mut state, &second, 2) {
-            Err(PipelineError::MemoryBudgetExceeded {
-                node,
-                source,
-                detail,
-                ..
-            }) => {
-                assert_eq!(node, "validate");
-                assert_eq!(source, clinker_plan::BudgetCategory::Arena);
-                assert!(
-                    detail.is_some_and(|d| d.contains("held dead-letter rows")),
-                    "the detail names the held rows"
+            Err(PipelineError::MemoryBudgetExceeded { report }) => {
+                assert_eq!(
+                    report.requester,
+                    Some(clinker_plan::runtime_error::ConsumerLabel {
+                        node: "validate".to_string(),
+                        surface: clinker_plan::runtime_error::MemorySurface::HeldFailingRows,
+                    }),
+                    "the report names the node and the held rows"
                 );
             }
             other => panic!("expected E310, got {other:?}"),
@@ -3076,7 +3445,7 @@ mod tests {
     #[test]
     fn held_log_past_the_disk_cap_is_e320() {
         let root = tempfile::tempdir().expect("spill root");
-        let arbitrator = ledger_arbitrator(1 << 30);
+        let arbitrator = electing_arbitrator(1 << 30);
         arbitrator.set_max_spill_bytes(16).expect("cap");
         let mut state = held_state(&arbitrator, root.path(), usize::MAX);
         let doc = doc_key(0);
@@ -3100,7 +3469,7 @@ mod tests {
     #[test]
     fn dropping_the_state_removes_the_held_file_and_consumer() {
         let root = tempfile::tempdir().expect("spill root");
-        let arbitrator = ledger_arbitrator(1 << 30);
+        let arbitrator = electing_arbitrator(1 << 30);
         let consumers_before = arbitrator.consumer_count();
         let usage_before = arbitrator.sum_consumer_usage();
         let mut state = held_state(&arbitrator, root.path(), usize::MAX);
@@ -3239,16 +3608,21 @@ mod tests {
         assert_eq!(take_held_rows(&mut state, &holding), rows_of(1..=8));
     }
 
-    /// A spill request the arbitrator raised on a poll that holds no row,
-    /// as the late-record path's is, is answered by the next ledger
-    /// admission.
+    /// A spill request raised on the state's handle while it held no row is
+    /// answered by the next held row, once. A ledger admission that fits
+    /// spills nothing: a growth flushes the tails only when it falls short,
+    /// so no row leaves memory while there is room for it.
     #[test]
-    fn a_ledger_admission_answers_a_pending_spill_request() {
+    fn a_pending_spill_request_is_answered_by_the_next_held_row() {
         let root = tempfile::tempdir().expect("spill root");
-        let arbitrator = ledger_arbitrator(1 << 30);
+        let arbitrator = electing_arbitrator(1 << 30);
         let mut state = held_state(&arbitrator, root.path(), usize::MAX);
         let (rejected, holding) = (doc_key(0), doc_key(1));
-        for ordinal in 1..=8 {
+        hold_row(&mut state, &holding, 1).expect("hold");
+        // What one row charges when held into an empty tail. Rows 1 and 9
+        // encode to frames of one length.
+        let lone_row = state.held.resident_bytes();
+        for ordinal in 2..=8 {
             hold_row(&mut state, &holding, ordinal).expect("hold");
         }
         state.insert_failed(Arc::clone(&rejected), DlqFailureStamp::now(), "validate");
@@ -3261,13 +3635,37 @@ mod tests {
                 .expect("admission"),
             "the row is new"
         );
+        assert_eq!(
+            files_in(root.path()),
+            0,
+            "an admission that fits leaves every held row resident"
+        );
+        let resident_before = state.held.resident_bytes();
+        assert!(resident_before > 0);
+        let charged_before = state.charged_bytes();
+
+        // The hold answers the request before it appends, so the eight rows
+        // already held move to disk and only the new row stays resident.
+        hold_row(&mut state, &holding, 9).expect("hold");
         assert_eq!(files_in(root.path()), 1, "the held rows moved to one file");
-        assert_eq!(state.held.resident_bytes(), 0);
+        // The elected spill writes out every tail resident before the hold;
+        // the new row is then admitted into an empty tail, as row 1 was.
+        let spilled = resident_before;
+        assert_eq!(
+            state.held.resident_bytes(),
+            resident_before - spilled + lone_row,
+            "only the row held after the spill stays resident"
+        );
+        assert_eq!(
+            state.charged_bytes(),
+            charged_before - spilled + lone_row,
+            "the charge fell by the spill and rose by the row admitted"
+        );
         assert!(
             !state.handle.take_spill_request(),
-            "the admission consumed the request"
+            "the held row consumed the request"
         );
-        assert_eq!(take_held_rows(&mut state, &holding), rows_of(1..=8));
+        assert_eq!(take_held_rows(&mut state, &holding), rows_of(1..=9));
     }
 
     /// A flush during a rejection's replay appends another document's tail
@@ -3307,7 +3705,12 @@ mod tests {
             .decode(reader.next_frame().expect("frame").expect("a first frame"))
             .expect("decode")
             .source_row;
-        arbitrator.spill_reclaimable(1);
+        // A reclaim pass that elects the state while the replay is in flight
+        // flushes every resident tail, the other document's included.
+        state
+            .held
+            .flush_all(&arbitrator, "validate")
+            .expect("flush");
         assert!(
             state
                 .admit_emitted(&replayed, first, "out")
@@ -3392,8 +3795,11 @@ mod tests {
         );
 
         hold_row_at(&mut state, &other, 4, "validate").expect("hold");
-        arbitrator.spill_reclaimable(1);
         let (key, node) = &swept[0];
+        // A flush while the sweep runs — a pass that elects the state, or the
+        // sweep's own growth falling short — is credited to the node the
+        // sweep rejects the document under.
+        state.held.flush_all(&arbitrator, node).expect("flush");
         let mut reader = state
             .take_held(key, node)
             .expect("take")
@@ -3431,11 +3837,14 @@ mod tests {
             .set_limit(arbitrator.charged_bytes())
             .expect("limit");
         match state.admit_emitted(key, row(1, 99), node) {
-            Err(PipelineError::MemoryBudgetExceeded { node, detail, .. }) => {
-                assert_eq!(node, "route_x");
-                assert!(
-                    detail.is_some_and(|d| d.contains("dead-letter ledger")),
-                    "the detail names the ledger"
+            Err(PipelineError::MemoryBudgetExceeded { report }) => {
+                assert_eq!(
+                    report.requester,
+                    Some(clinker_plan::runtime_error::ConsumerLabel {
+                        node: "route_x".to_string(),
+                        surface: clinker_plan::runtime_error::MemorySurface::DeadLetteredRowSet,
+                    }),
+                    "the report names the node that failed the document and its row set"
                 );
             }
             other => panic!("expected E310, got {other:?}"),
@@ -3642,7 +4051,8 @@ mod tests {
             HashSet::from([Arc::from("orders")]),
             Arc::clone(arbitrator),
             held_config(&std::env::temp_dir()),
-        );
+        )
+        .expect("a fresh handle registers");
         state.failed.insert(
             Arc::clone(&key),
             FailedDocument {
@@ -3879,10 +4289,11 @@ mod tests {
         );
     }
 
+    /// A refused ledger admission names the node that asked and what the
+    /// memory was for, and never the document the rows belong to: the report
+    /// carries nodes, surfaces and byte counts only.
     #[test]
-    fn the_ledger_refusal_names_the_document_as_diagnostics_quote_names() {
-        use clinker_core_types::QuoteName;
-        // A decomposed accent that does not open the name prints as written.
+    fn the_ledger_refusal_names_the_node_and_never_the_document() {
         let arbitrator = ledger_arbitrator(1024);
         let (mut state, key) = ledger_state_for(&arbitrator, "cafe\u{301}.csv");
         let refused = (0..64_u64)
@@ -3892,22 +4303,22 @@ mod tests {
                     .err()
             })
             .expect("scattered rows reach the 1 KiB hard limit");
-        let detail = match refused {
-            PipelineError::MemoryBudgetExceeded {
-                detail: Some(detail),
-                ..
-            } => detail,
-            other => panic!("expected E310 with a detail, got {other:?}"),
+        let report = match refused {
+            PipelineError::MemoryBudgetExceeded { report } => report,
+            other => panic!("expected E310, got {other:?}"),
         };
-        let quoted = key.quoted_name().to_string();
-        assert_eq!(quoted, "\"cafe\u{301}.csv\"");
-        assert!(
-            detail.contains(&quoted),
-            "the detail names the document as {quoted}: {detail}"
+        assert_eq!(
+            report.requester,
+            Some(clinker_plan::runtime_error::ConsumerLabel {
+                node: "orders_out".to_string(),
+                surface: clinker_plan::runtime_error::MemorySurface::DeadLetteredRowSet,
+            }),
+            "the report names the node that asked and its row set"
         );
+        let rendered = report.to_string();
         assert!(
-            !detail.contains("\\u{301}"),
-            "the detail does not escape the accent: {detail}"
+            !rendered.contains("cafe"),
+            "the report never names the document: {rendered}"
         );
     }
 
@@ -3959,5 +4370,496 @@ mod tests {
             "the peak stays at its high-water mark"
         );
         assert_eq!(files_in(root.path()), 0);
+    }
+
+    /// A walk with its reclaim set, spilling node-buffer slots into `root`.
+    fn walk_set(root: &std::path::Path) -> std::rc::Rc<std::cell::RefCell<WalkReclaimSet>> {
+        std::rc::Rc::new(std::cell::RefCell::new(WalkReclaimSet::new(
+            WalkSpillSettings {
+                spill_root: Arc::from(root),
+                spill_compress: CompressMode::Auto,
+                batch_size: 1024,
+            },
+        )))
+    }
+
+    /// A consumer holding nothing that asks for memory on the walk: its
+    /// request is not the document state's, and it has nothing a pass could
+    /// spill.
+    fn probe(arbitrator: &MemoryArbitrator) -> Arc<ConsumerHandle> {
+        let handle = ConsumerHandle::new();
+        arbitrator
+            .register_consumer(
+                Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                    Arc::clone(&handle),
+                )),
+                Arc::clone(&handle),
+                test_label("probe"),
+            )
+            .expect("a fresh handle registers");
+        handle
+    }
+
+    /// A request another consumer makes on the walk spills the held failing
+    /// rows of failed documents when it does not fit beside them, and they
+    /// replay afterwards in the order they were held.
+    ///
+    /// Capacity: the 24 held rows leave `R` bytes of resident tails and
+    /// `F` bytes of index entries and failed-document slots charged, and the
+    /// capacity is set to `R + F + FREE`. The probe asks for `FREE + R / 2`:
+    /// more than is free, less than is free once the tails are on disk. The
+    /// tails are the only state any pass could spill.
+    ///
+    /// While the document state's cell is borrowed (as it is while the state
+    /// admits a row of its own) the same pass frees nothing from it: the
+    /// state is busy, and its spill request is raised instead. No boundary
+    /// relief runs between the holds and the requests, so the extent log's
+    /// own soft-threshold poll cannot flush the tails for the pass.
+    #[test]
+    fn held_rows_are_spilled_by_a_pass_another_walk_request_starts() {
+        const FREE: u64 = 1024;
+        let root = tempfile::tempdir().expect("held-log root");
+        let walk_root = tempfile::tempdir().expect("walk spill root");
+        let arbitrator = electing_arbitrator(1 << 30);
+        let set = walk_set(walk_root.path());
+        let _walk = WalkContextGuard::install(&arbitrator, std::rc::Rc::clone(&set));
+        let cell = std::rc::Rc::new(std::cell::RefCell::new(held_state(
+            &arbitrator,
+            root.path(),
+            usize::MAX,
+        )));
+        let _reclaim = DocumentDlqState::register_for_reclaim(&cell).expect("registered");
+
+        let docs: Vec<DocKey> = (0..3).map(doc_key).collect();
+        let mut expected: HashMap<DocKey, Vec<SourceRowId>> = HashMap::new();
+        for ordinal in 1..=24u64 {
+            let doc = &docs[(ordinal % 3) as usize];
+            hold_row(&mut cell.borrow_mut(), doc, ordinal).expect("hold");
+            expected
+                .entry(Arc::clone(doc))
+                .or_default()
+                .push(row(1, ordinal));
+        }
+        let (resident, charged) = {
+            let state = cell.borrow();
+            (state.held.resident_bytes(), state.charged_bytes())
+        };
+        assert!(resident > 2 * FREE, "the tails hold more than is free");
+        arbitrator.set_test_capacity(arbitrator.charged_bytes() + FREE);
+        let probe = probe(&arbitrator);
+        let request = FREE + resident / 2;
+
+        let busy = cell.borrow_mut();
+        assert!(
+            probe.try_grow(request).is_err(),
+            "with the document state busy the pass frees nothing from it"
+        );
+        drop(busy);
+        assert_eq!(cell.borrow().held.resident_bytes(), resident);
+        assert_eq!(files_in(root.path()), 0, "nothing was flushed");
+        assert!(
+            cell.borrow().handle.take_spill_request(),
+            "the busy state's spill request is raised, for its next boundary"
+        );
+
+        probe
+            .try_grow(request)
+            .expect("the pass flushes the held rows and the request fits");
+        {
+            let state = cell.borrow();
+            assert_eq!(state.held.resident_bytes(), 0, "every tail is on disk");
+            assert_eq!(
+                state.charged_bytes(),
+                charged - resident,
+                "the state's charge fell by what its tails held"
+            );
+        }
+        assert_eq!(files_in(root.path()), 1, "the held rows moved to one file");
+        assert_eq!(
+            arbitrator.per_stage_spill_bytes().get("validate").copied(),
+            Some(arbitrator.cumulative_spill_bytes()),
+            "the flush is attributed to the failing node"
+        );
+        assert!(arbitrator.cumulative_spill_bytes() > 0);
+        probe.shrink(probe.bytes());
+        for doc in &docs {
+            assert_eq!(
+                take_held_rows(&mut cell.borrow_mut(), doc),
+                expected[doc],
+                "a rejection replays the held rows from disk in order, the trigger first"
+            );
+        }
+    }
+
+    /// Publish a resident node-buffer slot of `rows` records in `set`'s
+    /// running scope, its consumer registered under `node` and charged
+    /// `charge` bytes.
+    fn publish_resident_slot(
+        arbitrator: &MemoryArbitrator,
+        set: &std::rc::Rc<std::cell::RefCell<WalkReclaimSet>>,
+        node: &str,
+        rows: u64,
+        charge: u64,
+    ) -> (
+        crate::executor::dispatch::NodeBufferKey,
+        Arc<ConsumerHandle>,
+    ) {
+        let handle = ConsumerHandle::new();
+        let id = arbitrator
+            .register_node_consumer(
+                Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                    Arc::clone(&handle),
+                )),
+                Arc::clone(&handle),
+                clinker_plan::runtime_error::ConsumerLabel {
+                    node: node.to_string(),
+                    surface: clinker_plan::runtime_error::MemorySurface::BufferedRows {
+                        from: node.to_string(),
+                        to: clinker_plan::runtime_error::NonEmptyReaders::one("out".to_string()),
+                    },
+                },
+            )
+            .expect("a fresh handle registers");
+        handle.try_grow(charge).expect("the slot's charge fits");
+        let s = schema();
+        let records: Vec<(Record, SourceRowId)> = (0..rows)
+            .map(|n| (rec(&s, n as i64, 0), row(2, n)))
+            .collect();
+        let key =
+            crate::executor::dispatch::NodeBufferKey::from(petgraph::graph::NodeIndex::new(0));
+        let mut set = set.borrow_mut();
+        set.slots_mut().register(
+            key.clone(),
+            (id, Arc::clone(&handle)),
+            crate::pipeline::memory::walk::SlotSpill {
+                spill_allowed: true,
+                node_name: Box::from(node),
+            },
+        );
+        set.slots_mut()
+            .insert_buffer(key.clone(), NodeBuffer::memory_from_records(records));
+        (key, handle)
+    }
+
+    /// A held-row admission that does not fit spills another walk victim
+    /// before the document state's own tails: the state is the requester,
+    /// elected last, and a resident node-buffer slot frees enough.
+    ///
+    /// Capacity: the slot charges `S` = 64 KiB and the twelve held rows `R`
+    /// bytes of tails plus their index and slots `F`; the capacity is
+    /// `S + R + F + 64`, so a new document's admission (its index entry, a
+    /// 200-byte frame and its failed-document slot) does not fit. The pass
+    /// aims at the resume watermark (60% of the capacity), which the slot's
+    /// 64 KiB covers alone, so it never reaches the requester. The test calls
+    /// the admission directly, holding the state's cell as a hold does, and
+    /// runs no boundary relief, so neither soft poll is reached.
+    #[test]
+    fn held_row_admission_spills_a_resident_slot_before_its_own_tails() {
+        const SLOT: u64 = 64 * 1024;
+        let root = tempfile::tempdir().expect("held-log root");
+        let walk_root = tempfile::tempdir().expect("walk spill root");
+        let arbitrator = electing_arbitrator(1 << 30);
+        let set = walk_set(walk_root.path());
+        let _walk = WalkContextGuard::install(&arbitrator, std::rc::Rc::clone(&set));
+        let cell = std::rc::Rc::new(std::cell::RefCell::new(held_state(
+            &arbitrator,
+            root.path(),
+            usize::MAX,
+        )));
+        let _reclaim = DocumentDlqState::register_for_reclaim(&cell).expect("registered");
+        let (slot_key, slot_handle) =
+            publish_resident_slot(&arbitrator, &set, "upstream", 256, SLOT);
+        for ordinal in 1..=12u64 {
+            hold_row(
+                &mut cell.borrow_mut(),
+                &doc_key((ordinal % 3) as usize),
+                ordinal,
+            )
+            .expect("hold");
+        }
+        let resident = cell.borrow().held.resident_bytes();
+        assert!(resident > 0);
+        arbitrator.set_test_capacity(arbitrator.charged_bytes() + 64);
+
+        let admitted = {
+            let mut state = cell.borrow_mut();
+            state.held.admit_charge(
+                &arbitrator,
+                &doc_key(9),
+                200,
+                FAILED_DOCUMENT_BYTES,
+                "validate",
+                clinker_plan::runtime_error::MemorySurface::HeldFailingRows,
+            )
+        };
+        let admitted = admitted.expect("the pass spills the slot and the admission fits");
+        assert!(admitted > FAILED_DOCUMENT_BYTES + 200);
+        assert!(
+            matches!(
+                set.borrow().slots().buffer(&slot_key),
+                Some(NodeBuffer::Spilled { .. })
+            ),
+            "the resident slot went to disk"
+        );
+        assert_eq!(
+            slot_handle.bytes(),
+            0,
+            "the slot's charge left with its rows"
+        );
+        assert!(
+            arbitrator
+                .per_stage_spill_bytes_written()
+                .get("upstream")
+                .is_some_and(|bytes| *bytes > 0),
+            "the slot's spill is recorded under its node"
+        );
+        assert_eq!(
+            cell.borrow().held.resident_bytes(),
+            resident,
+            "the requester's own tails stay resident"
+        );
+        assert_eq!(files_in(root.path()), 0, "no held row was flushed");
+        assert!(
+            !cell.borrow().handle.take_spill_request(),
+            "the pass never reached the requester"
+        );
+    }
+
+    /// The admission's charge is the only charge a held row makes: marking
+    /// its document failed and appending its frame charge nothing again, and
+    /// the admission is exactly the append's growth plus the document's slot
+    /// on its first failure.
+    #[test]
+    fn held_row_admission_charges_each_byte_once() {
+        let root = tempfile::tempdir().expect("held-log root");
+        let arbitrator = ledger_arbitrator(1 << 30);
+        let mut state = held_state(&arbitrator, root.path(), usize::MAX);
+        let grown =
+            |state: &DocumentDlqState| state.held.resident_bytes() + state.held.index_bytes();
+
+        let key = doc_key(0);
+        let frame = vec![7u8; 190];
+        let before = state.charged_bytes();
+        let held_before = grown(&state);
+        let admitted = state
+            .held
+            .admit_charge(
+                &arbitrator,
+                &key,
+                frame.len(),
+                FAILED_DOCUMENT_BYTES,
+                "validate",
+                clinker_plan::runtime_error::MemorySurface::HeldFailingRows,
+            )
+            .expect("admitted");
+        assert_eq!(
+            state.charged_bytes() - before,
+            admitted,
+            "the admission is the charge"
+        );
+        state.insert_failed(Arc::clone(&key), DlqFailureStamp::now(), "validate");
+        assert_eq!(
+            state.charged_bytes() - before,
+            admitted,
+            "marking the document failed charges nothing again"
+        );
+        state.held.append(&key, &frame).expect("append");
+        assert_eq!(
+            state.charged_bytes() - before,
+            admitted,
+            "appending the frame charges nothing again"
+        );
+        assert_eq!(
+            admitted,
+            grown(&state) - held_before + FAILED_DOCUMENT_BYTES,
+            "the admission is the append's growth and the document's slot"
+        );
+
+        for (doc, ordinal, slot) in [(doc_key(0), 2, 0), (doc_key(1), 3, FAILED_DOCUMENT_BYTES)] {
+            let before = state.charged_bytes();
+            let held_before = grown(&state);
+            hold_row(&mut state, &doc, ordinal).expect("hold");
+            assert_eq!(
+                state.charged_bytes() - before,
+                grown(&state) - held_before + slot,
+                "a hold charges its growth, and a first failure its slot, once"
+            );
+        }
+    }
+
+    /// Push the records `ids` into `key`'s bucket in `cell`, building it on
+    /// first sight, and charge their bytes through the bucket's handle as a
+    /// push does. Returns the bytes charged.
+    fn fill_bucket(
+        cell: &std::rc::Rc<std::cell::RefCell<DocumentBuckets>>,
+        arbitrator: &MemoryArbitrator,
+        key: &DocKey,
+        ids: std::ops::Range<u64>,
+    ) -> u64 {
+        let s = schema();
+        let mut buckets = cell.borrow_mut();
+        let bucket = buckets.bucket_for(arbitrator, key).expect("bucket");
+        let mut charge = 0;
+        for id in ids {
+            charge += crate::executor::node_buffer::record_byte_cost(s.column_count());
+            bucket
+                .buffer
+                .push(rec(&s, id as i64, (id * 10) as i64), 1000 + id);
+        }
+        bucket
+            .handle
+            .set_reclaimable(bucket.buffer.reclaimable_bytes());
+        let handle = Arc::clone(&bucket.handle);
+        drop(buckets);
+        handle.try_grow(charge).expect("the bucket's records fit");
+        charge
+    }
+
+    /// The handle of `key`'s bucket in `cell`.
+    fn bucket_handle(
+        cell: &std::rc::Rc<std::cell::RefCell<DocumentBuckets>>,
+        key: &DocKey,
+    ) -> Arc<ConsumerHandle> {
+        Arc::clone(&cell.borrow().buckets[key].handle)
+    }
+
+    /// A record of a document no verdict has reached yet builds that
+    /// document's bucket, and the bucket is registered as the Output's rows
+    /// held until their document is decided, not as a failed document's
+    /// held rows: an E310 that lists it must name what it holds and point
+    /// at that state's remedy.
+    #[test]
+    fn an_open_documents_rows_are_named_as_held_until_it_is_decided() {
+        let root = tempfile::tempdir().expect("bucket spill root");
+        let arbitrator = ledger_arbitrator(1 << 30);
+        let cell = DocumentBuckets::new_cell("out", Arc::from(root.path()), CompressMode::Auto, 8);
+        let key: DocKey = Arc::from("orders.csv");
+
+        fill_bucket(&cell, &arbitrator, &key, 0..1);
+        let consumer_id = cell.borrow().buckets[&key].consumer_id;
+        let registered = arbitrator
+            .ledger_snapshot(
+                0,
+                crate::pipeline::memory::ledger::Requester::for_consumer(consumer_id),
+            )
+            .requester_label
+            .map(|label| *label);
+        assert_eq!(
+            registered,
+            Some(clinker_plan::runtime_error::ConsumerLabel {
+                node: "out".to_string(),
+                surface: clinker_plan::runtime_error::MemorySurface::OpenDocumentRows,
+            }),
+            "the open document's bucket is named by its Output and its own state"
+        );
+
+        let bucket = cell
+            .borrow_mut()
+            .take(&key)
+            .expect("the bucket leaves its cell");
+        arbitrator.unregister_consumer(bucket.consumer_id);
+    }
+
+    /// A request another consumer makes on the walk spills an Output's
+    /// per-document bucket when it does not fit beside it, and the bucket
+    /// drains afterwards in arrival order.
+    ///
+    /// Capacity: the bucket's 64 resident records charge `R`, the only bytes
+    /// charged, and the capacity is set to `R + FREE`. The probe asks for
+    /// `FREE + R / 2`: more than is free, less than is free once the bucket
+    /// is on disk. The bucket is the only state any pass could spill.
+    ///
+    /// While the Output's cell of buckets is borrowed the pass frees nothing
+    /// from it: the bucket is busy and its spill request is raised, which
+    /// the bucket's next push answers first. The test builds the cell
+    /// directly and never pushes through the driver, so the soft-threshold
+    /// poll after a push cannot spill the bucket for the pass.
+    #[test]
+    fn document_bucket_is_spilled_by_a_pass_another_walk_request_starts() {
+        const FREE: u64 = 1024;
+        let root = tempfile::tempdir().expect("bucket spill root");
+        let walk_root = tempfile::tempdir().expect("walk spill root");
+        let arbitrator = electing_arbitrator(1 << 30);
+        let set = walk_set(walk_root.path());
+        let _walk = WalkContextGuard::install(&arbitrator, std::rc::Rc::clone(&set));
+        let cell = DocumentBuckets::new_cell("out", Arc::from(root.path()), CompressMode::Auto, 8);
+        let key: DocKey = Arc::from("orders.csv");
+        let probe = probe(&arbitrator);
+
+        let first = fill_bucket(&cell, &arbitrator, &key, 0..64);
+        let handle = bucket_handle(&cell, &key);
+        arbitrator.set_test_capacity(arbitrator.charged_bytes() + FREE);
+        let busy = cell.borrow_mut();
+        assert!(
+            probe.try_grow(FREE + first / 2).is_err(),
+            "with the Output's buckets busy the pass frees nothing from them"
+        );
+        drop(busy);
+        assert_eq!(handle.bytes(), first, "the bucket is still charged");
+        assert!(matches!(
+            cell.borrow().buckets[&key].buffer,
+            NodeBuffer::Memory(_)
+        ));
+        assert!(
+            cell.borrow_mut()
+                .answer_spill_request(&arbitrator, &key)
+                .expect("spill"),
+            "the busy bucket's spill request is raised, and its next push answers it first"
+        );
+        assert!(matches!(
+            cell.borrow().buckets[&key].buffer,
+            NodeBuffer::Spilled { .. }
+        ));
+        assert_eq!(handle.bytes(), 0);
+
+        let second = fill_bucket(&cell, &arbitrator, &key, 64..128);
+        arbitrator.set_test_capacity(arbitrator.charged_bytes() + FREE);
+        let spilled_before = arbitrator
+            .per_stage_spill_bytes_written()
+            .get("out")
+            .copied()
+            .unwrap_or(0);
+        probe
+            .try_grow(FREE + second / 2)
+            .expect("the pass spills the bucket and the request fits");
+        assert!(
+            matches!(
+                cell.borrow().buckets[&key].buffer,
+                NodeBuffer::Spilled { .. }
+            ),
+            "every record of the bucket is on disk"
+        );
+        assert_eq!(handle.bytes(), 0, "the bucket's charge left with its rows");
+        assert!(
+            arbitrator
+                .per_stage_spill_bytes_written()
+                .get("out")
+                .is_some_and(|bytes| *bytes > spilled_before),
+            "the spill is recorded under the Output's name"
+        );
+        probe.shrink(probe.bytes());
+
+        let bucket = cell
+            .borrow_mut()
+            .take(&key)
+            .expect("the bucket leaves its cell");
+        let drained: Vec<(i64, i64, u64)> = drain_records_in_arrival_order(bucket.buffer)
+            .map(|item| {
+                let (record, row) = item.expect("drain");
+                let value = |i: usize| match &record.values()[i] {
+                    Value::Integer(v) => *v,
+                    other => panic!("unexpected value: {other:?}"),
+                };
+                (value(0), value(1), row.ordinal())
+            })
+            .collect();
+        let expected: Vec<(i64, i64, u64)> = (0..128)
+            .map(|id| (id as i64, (id * 10) as i64, 1000 + id))
+            .collect();
+        assert_eq!(
+            drained, expected,
+            "the bucket drains every record and row number in arrival order"
+        );
+        arbitrator.unregister_consumer(bucket.consumer_id);
     }
 }

@@ -1387,9 +1387,10 @@ nodes:
         true,
         MemoryTestOverrides::default().with_ledger_capacity(1024),
     ) {
-        Err(PipelineError::MemoryBudgetExceeded { node, .. }) => {
+        Err(PipelineError::MemoryBudgetExceeded { report }) => {
             assert_eq!(
-                node, "dept_stats",
+                report.requester.as_ref().map(|label| label.node.as_str()),
+                Some("dept_stats"),
                 "the E310 oversized-row abort must name the aggregate stage",
             );
         }

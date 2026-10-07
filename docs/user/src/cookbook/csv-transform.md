@@ -80,10 +80,6 @@ mkdir -p output
 clinker run salary_tiers.yaml
 ```
 
-At revision `3b343a4e`, bounded preview of this example can fail with an internal
-node-buffer cleanup error; the ordinary run produces the output below. See
-[the preview limitation](../ops/validation.md#bounded-execution-preview).
-
 ## Expected output
 
 `output/salary_report.csv`:

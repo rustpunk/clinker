@@ -41,10 +41,12 @@ use std::sync::Arc;
 use crate::pipeline::memory::MemoryArbitrator;
 #[cfg(test)]
 use crate::pipeline::memory::NoOpPolicy;
+use crate::pipeline::memory::ledger::Requester;
+use clinker_plan::runtime_error::{MemoryShortfallReport, MemorySurface};
 
 /// Period (measured in records processed) between
-/// [`crate::pipeline::memory::MemoryArbitrator::should_abort`] checks during
-/// `CombineHashTable::build` AND during probe-side fan-out emission.
+/// `MemoryArbitrator::check_hard_limit` checks
+/// during `CombineHashTable::build` AND during probe-side fan-out emission.
 ///
 /// Matches ClickHouse per-block cadence and is the same order of
 /// magnitude as DataFusion's default 8192-row RecordBatch. Per-row RSS
@@ -403,12 +405,12 @@ pub enum CombineError {
     /// back-pressure shutdown).
     ProbeAborted { reason: String },
 
-    /// Memory budget was exhausted while building or probing. `used` is
-    /// the hash table's self-reported footprint at the moment of the
-    /// check; `limit` is the configured budget. Emitted after
-    /// `MemoryArbitrator::should_abort` returns true (checked every
-    /// [`MEMORY_CHECK_INTERVAL`] records to amortize the cost).
-    MemoryLimitExceeded { used: u64, limit: u64 },
+    /// The run's hard-limit backstop refused the build: the table's bytes
+    /// did not fit beside the run's charges after the reclaim round the
+    /// walk ran, or the process's memory was over the limit. The E310
+    /// report is the one the arbitrator's backstop check built (checked
+    /// every [`MEMORY_CHECK_INTERVAL`] records and once more at the end).
+    MemoryRefused(Box<MemoryShortfallReport>),
 
     /// Key-expression evaluation failed. `side` is `"driving"` or
     /// `"build"` so the executor can produce an accurate diagnostic.
@@ -431,9 +433,11 @@ impl std::fmt::Display for CombineError {
             CombineError::ProbeAborted { reason } => {
                 write!(f, "combine probe aborted: {reason}")
             }
-            CombineError::MemoryLimitExceeded { used, limit } => write!(
+            CombineError::MemoryRefused(report) => write!(
                 f,
-                "combine memory limit exceeded: used {used} bytes, limit {limit} bytes"
+                "combine memory refused: requested {} bytes, limit {} bytes",
+                report.requested_bytes,
+                report.limit.bytes()
             ),
             CombineError::KeyEvalFailed { source, side } => {
                 write!(f, "combine {side}-side key evaluation failed: {source}")
@@ -441,6 +445,30 @@ impl std::fmt::Display for CombineError {
             CombineError::SpillFailed { reason } => {
                 write!(f, "combine spill failed: {reason}")
             }
+        }
+    }
+}
+
+impl CombineError {
+    /// This failure of `node`'s hash build as the run's error.
+    ///
+    /// A memory refusal is the E310 the backstop check built, passed
+    /// through unchanged. A build key that failed to evaluate is the same
+    /// error the probe side's key failure is; any other build failure is an
+    /// internal error naming `node`.
+    pub(crate) fn into_build_error(self, node: &str) -> clinker_plan::error::PipelineError {
+        use clinker_plan::error::PipelineError;
+        match self {
+            CombineError::MemoryRefused(report) => PipelineError::MemoryBudgetExceeded { report },
+            CombineError::KeyEvalFailed { source, .. } => PipelineError::Compilation {
+                transform_name: node.to_string(),
+                messages: vec![format!("combine build key eval error: {source}")],
+            },
+            other => PipelineError::Internal {
+                op: "combine",
+                node: node.to_string(),
+                detail: other.to_string(),
+            },
         }
     }
 }
@@ -460,8 +488,8 @@ impl std::error::Error for CombineError {
 
 /// One recoverable output-stage eval failure surfaced by a combine kernel.
 ///
-/// Kernels run inside the Rayon pool with only a `&MemoryArbitrator` and a
-/// local `EvalContext` — they hold no `&mut ExecutorContext`, so they cannot
+/// Kernels run with only a `&MemoryArbitrator` and a local `EvalContext` —
+/// they hold no `&mut ExecutorContext`, so they cannot
 /// route a failing row to the dead-letter queue or rewind a source's
 /// rollback cursor themselves. Instead a recoverable failure is captured
 /// here and handed back to the dispatcher, which drains it through the same
@@ -733,9 +761,24 @@ impl CombineHashTable {
     ///   conjunct, aligned to the build side's expressions.
     /// * `ctx` — CXL evaluation context, carries the Clock and stable
     ///   context shared across the build walk.
-    /// * `budget` — polled every [`MEMORY_CHECK_INTERVAL`] inserts AND at
-    ///   the end of build. Returns [`CombineError::MemoryLimitExceeded`] if
-    ///   the process RSS exceeds the budget's hard limit.
+    /// * `budget`, `node`, `requester` — the run's hard-limit backstop
+    ///   (`MemoryArbitrator::check_hard_limit`) is checked every
+    ///   [`MEMORY_CHECK_INTERVAL`] inserts and at the end of build, for
+    ///   `node`'s join build side and in `requester`'s name, with the
+    ///   table's bytes so far, its records included, as the bytes not yet
+    ///   charged. That is exact for `records` charged to no consumer while
+    ///   the table takes them (rows reloaded from a spill file). Charging
+    ///   the finished table is the caller's, and its two callers do not:
+    ///   the grace reload of a spilled partition and the grace chunked
+    ///   fallback both probe against a table no consumer charges, so the run's
+    ///   charged total leaves it out while they probe (#1394). On the walk
+    ///   the check runs a reclaim round before it refuses; a refusal is
+    ///   [`CombineError::MemoryRefused`] carrying the check's E310. A caller
+    ///   whose records stay charged while they are indexed, and that does
+    ///   not charge them a second time, builds through
+    ///   [`Self::build_from_charged`]; a caller whose build input a
+    ///   reservation charges, handed to the finished table, builds through
+    ///   [`Self::build_from_reserved`].
     /// * `estimated_rows` — optional capacity hint. When `Some`, the
     ///   underlying [`HashTable`] is pre-sized via `with_capacity` to avoid
     ///   the resize spike, which can reach 2.25× peak footprint during
@@ -758,6 +801,106 @@ impl CombineHashTable {
         extractor: &KeyExtractor,
         ctx: &EvalContext<'_>,
         budget: &MemoryArbitrator,
+        node: &str,
+        requester: Requester,
+        estimated_rows: Option<usize>,
+    ) -> Result<Self, CombineError>
+    where
+        I: IntoIterator<Item = Record>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        Self::build_charging(
+            records,
+            extractor,
+            ctx,
+            BuildBackstop {
+                budget,
+                node,
+                requester,
+                charged: BuildCharge::Input(0),
+            },
+            estimated_rows,
+        )
+    }
+
+    /// [`Self::build`] over `records` that stay charged to a consumer while
+    /// the table takes them (a grace partition's rows, charged to the grace
+    /// consumer for as long as the partition is in memory). The hard-limit
+    /// check then counts only what the build adds on top of them, the hash
+    /// index, the chains and the key cache, so the records are never counted
+    /// twice.
+    pub fn build_from_charged<I>(
+        records: I,
+        extractor: &KeyExtractor,
+        ctx: &EvalContext<'_>,
+        budget: &MemoryArbitrator,
+        node: &str,
+        requester: Requester,
+        estimated_rows: Option<usize>,
+    ) -> Result<Self, CombineError>
+    where
+        I: IntoIterator<Item = Record>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        Self::build_charging(
+            records,
+            extractor,
+            ctx,
+            BuildBackstop {
+                budget,
+                node,
+                requester,
+                charged: BuildCharge::Records,
+            },
+            estimated_rows,
+        )
+    }
+
+    /// [`Self::build`] over `records` whose build input a reservation
+    /// charges at `input_charge` bytes until the caller hands that charge to
+    /// the finished table's consumer (the inline hash join's build rows,
+    /// charged under the build input's reservation). The periodic checks
+    /// count the whole partial table, because the input vector and the table
+    /// coexist until the build has consumed the last record. The final check
+    /// counts the finished table less `input_charge`, because the input is
+    /// gone by then and its charge moves to the table; the ledger after the
+    /// hand-over then holds what the check found fits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_from_reserved<I>(
+        records: I,
+        extractor: &KeyExtractor,
+        ctx: &EvalContext<'_>,
+        budget: &MemoryArbitrator,
+        node: &str,
+        requester: Requester,
+        estimated_rows: Option<usize>,
+        input_charge: u64,
+    ) -> Result<Self, CombineError>
+    where
+        I: IntoIterator<Item = Record>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        Self::build_charging(
+            records,
+            extractor,
+            ctx,
+            BuildBackstop {
+                budget,
+                node,
+                requester,
+                charged: BuildCharge::Input(input_charge),
+            },
+            estimated_rows,
+        )
+    }
+
+    /// The one build every entry point runs; `backstop` says what the
+    /// hard-limit check counts as not yet charged.
+    fn build_charging<I>(
+        records: I,
+        extractor: &KeyExtractor,
+        ctx: &EvalContext<'_>,
+        backstop: BuildBackstop<'_>,
         estimated_rows: Option<usize>,
     ) -> Result<Self, CombineError>
     where
@@ -818,26 +961,18 @@ impl CombineHashTable {
             arena.push(rec);
 
             // Periodic budget poll. The build-side table's bytes are not
-            // yet mirrored into the registered consumer handle (the
-            // executor seeds it only after build completes), so RSS is the
-            // only whole-process signal — and RSS is unavailable on
-            // unsupported targets and the wasm build, where an RSS-only
-            // gate never fires and the build grows until the OS OOMs.
-            // `should_abort_local` adds the partial table footprint as an
-            // RSS-independent gate: the build aborts when the in-memory
-            // table alone exceeds the budget regardless of RSS
-            // availability. Partial footprint (arena + chain + keys_cache +
+            // yet charged to any consumer (the executor charges the table
+            // only after the build completes), so the check takes the
+            // partial footprint as the bytes not yet charged: the run must
+            // fit its limit with them, whether or not the process's memory
+            // can be read. Partial footprint (arena + chain + keys_cache +
             // index-so-far) under-reports the finalized table slightly once
             // the HashTable rehashes, which is the honest figure to gate
             // and report mid-build.
             if (i + 1).is_multiple_of(MEMORY_CHECK_INTERVAL) {
-                let used = partial_memory_bytes(&index, &chain, &arena, &keys_cache);
-                if budget.should_abort_local(used as u64) {
-                    return Err(CombineError::MemoryLimitExceeded {
-                        used: used as u64,
-                        limit: budget.limit(),
-                    });
-                }
+                let index_bytes = index_memory_bytes(&index, &chain, &keys_cache);
+                let records_bytes = records_memory_bytes(std::mem::size_of_val(&arena[..]), &arena);
+                backstop.check(index_bytes, records_bytes, false)?;
             }
         }
 
@@ -850,15 +985,12 @@ impl CombineHashTable {
         };
 
         // Safety-net final check — catches builds shorter than
-        // MEMORY_CHECK_INTERVAL that slipped past the periodic poll. Gates
-        // on the finalized table's own bytes too, so a sub-interval build
-        // over a tiny budget aborts even when RSS cannot be measured.
-        if budget.should_abort_local(table.memory_bytes() as u64) {
-            return Err(CombineError::MemoryLimitExceeded {
-                used: table.memory_bytes() as u64,
-                limit: budget.limit(),
-            });
-        }
+        // MEMORY_CHECK_INTERVAL that slipped past the periodic poll, with the
+        // finished table's bytes no consumer charges as the bytes not yet
+        // charged, so a sub-interval build over a tiny budget stops even when
+        // RSS cannot be measured. The input is gone by now, so its charge
+        // counts as the table's.
+        backstop.check(table.index_bytes(), table.records_bytes(), true)?;
 
         Ok(table)
     }
@@ -908,23 +1040,24 @@ impl CombineHashTable {
     /// Stable pub API: the executor uses this both for the periodic
     /// `MemoryArbitrator` check and for the `--explain` RSS reporting.
     pub fn memory_bytes(&self) -> usize {
+        self.index_bytes() + self.records_bytes()
+    }
+
+    /// What the table adds on top of its records: the hash index, the
+    /// chains and the key cache.
+    fn index_bytes(&self) -> usize {
         self.index.allocation_size()
             + self.chain.capacity() * std::mem::size_of::<u32>()
-            + self.records.capacity() * std::mem::size_of::<Record>()
-            + self
-                .records
-                .iter()
-                .map(Record::estimated_heap_size)
-                .sum::<usize>()
             + self.keys_cache.capacity() * std::mem::size_of::<Vec<Value>>()
-            + self
-                .keys_cache
-                .iter()
-                .map(|k| {
-                    k.capacity() * std::mem::size_of::<Value>()
-                        + k.iter().map(Value::heap_size).sum::<usize>()
-                })
-                .sum::<usize>()
+            + keys_heap_bytes(&self.keys_cache)
+    }
+
+    /// The table's records: their slots and their heap.
+    fn records_bytes(&self) -> usize {
+        records_memory_bytes(
+            self.records.capacity() * std::mem::size_of::<Record>(),
+            &self.records,
+        )
     }
 
     /// Number of build-side records in the table.
@@ -979,24 +1112,88 @@ impl<'a> Iterator for ProbeIter<'a> {
 /// Identical formula to [`CombineHashTable::memory_bytes`], broken out so
 /// the error path can report accurate `used` without constructing a
 /// fully-assembled `CombineHashTable`.
-fn partial_memory_bytes(
+fn index_memory_bytes(
     index: &HashTable<(u64, u32, u32)>,
     chain: &[u32],
-    arena: &[Record],
     keys_cache: &[Vec<Value>],
 ) -> usize {
     index.allocation_size()
         + std::mem::size_of_val(chain)
-        + std::mem::size_of_val(arena)
-        + arena.iter().map(Record::estimated_heap_size).sum::<usize>()
         + std::mem::size_of_val(keys_cache)
-        + keys_cache
+        + keys_heap_bytes(keys_cache)
+}
+
+/// Records held in `slot_bytes` of slots, plus their heap.
+fn records_memory_bytes(slot_bytes: usize, records: &[Record]) -> usize {
+    slot_bytes
+        + records
             .iter()
-            .map(|k| {
-                k.capacity() * std::mem::size_of::<Value>()
-                    + k.iter().map(Value::heap_size).sum::<usize>()
-            })
+            .map(Record::estimated_heap_size)
             .sum::<usize>()
+}
+
+/// The key cache's per-key vectors and their values' heap.
+fn keys_heap_bytes(keys_cache: &[Vec<Value>]) -> usize {
+    keys_cache
+        .iter()
+        .map(|k| {
+            k.capacity() * std::mem::size_of::<Value>()
+                + k.iter().map(Value::heap_size).sum::<usize>()
+        })
+        .sum::<usize>()
+}
+
+/// What a consumer already charges of the table a build makes.
+#[derive(Clone, Copy)]
+enum BuildCharge {
+    /// Every record, for as long as the table holds it.
+    Records,
+    /// This many bytes of the build input, which coexists with the table
+    /// until the build has consumed it and whose charge then moves to the
+    /// finished table; 0 for records charged to no one.
+    Input(u64),
+}
+
+/// A build's hard-limit check: the node and requester it names, and what of
+/// the table a consumer already charges.
+struct BuildBackstop<'a> {
+    budget: &'a MemoryArbitrator,
+    node: &'a str,
+    requester: Requester,
+    charged: BuildCharge,
+}
+
+impl BuildBackstop<'_> {
+    /// Check the hard limit with the table's bytes not yet charged: its
+    /// index bytes, plus its records' bytes unless a consumer charges every
+    /// record. The input's charge counts as the table's only once the table
+    /// is `finished`; before that the input and the partial table coexist.
+    fn check(
+        &self,
+        index_bytes: usize,
+        records_bytes: usize,
+        finished: bool,
+    ) -> Result<(), CombineError> {
+        let uncharged = match self.charged {
+            BuildCharge::Records => index_bytes as u64,
+            BuildCharge::Input(input) => {
+                let table = (index_bytes + records_bytes) as u64;
+                if finished {
+                    table.saturating_sub(input)
+                } else {
+                    table
+                }
+            }
+        };
+        self.budget
+            .check_hard_limit(
+                self.node,
+                MemorySurface::JoinBuildSide,
+                self.requester,
+                uncharged,
+            )
+            .map_err(CombineError::MemoryRefused)
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -1014,6 +1211,11 @@ fn partial_memory_bytes(
 /// resort victim alongside hash-aggregation. `can_back_pressure = false`:
 /// an in-flight combine has no upstream channel to gate; pausing the
 /// probe loop would stall the join without releasing memory.
+///
+/// The build side is approved charged-only: the inline strategy has no
+/// spill path (grace-hash is the spillable one), so `reclaimable_bytes` is
+/// 0 and no reclaim pass or victim policy elects it, while its whole charge
+/// still counts toward the run's ledger.
 pub struct CombineHashConsumer {
     handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
 }
@@ -1027,6 +1229,10 @@ impl CombineHashConsumer {
 impl crate::pipeline::memory::MemoryConsumer for CombineHashConsumer {
     fn current_usage(&self) -> u64 {
         self.handle.bytes()
+    }
+
+    fn reclaimable_bytes(&self) -> u64 {
+        0
     }
 
     fn peak_charged_bytes(&self) -> Option<u64> {
@@ -1682,10 +1888,16 @@ mod tests {
         // Anchors the Display format and the fact that source() chains
         // for KeyEvalFailed. The executor depends on both (for diagnostic
         // messages and for error-chain walking).
-        let e = CombineError::MemoryLimitExceeded {
-            used: 1024,
-            limit: 512,
-        };
+        let e = CombineError::MemoryRefused(
+            test_budget(512)
+                .check_hard_limit(
+                    "enrich",
+                    clinker_plan::runtime_error::MemorySurface::JoinBuildSide,
+                    Requester::governed(),
+                    1024,
+                )
+                .expect_err("1024 bytes do not fit a 512-byte limit"),
+        );
         let msg = format!("{e}");
         assert!(msg.contains("1024"));
         assert!(msg.contains("512"));
@@ -1695,6 +1907,76 @@ mod tests {
         };
         assert!(format!("{spill}").contains("disk full"));
         assert!(std::error::Error::source(&spill).is_none());
+    }
+
+    #[test]
+    fn a_build_failure_is_a_memory_refusal_only_when_memory_ran_out() {
+        use clinker_plan::error::PipelineError;
+        use clinker_plan::runtime_error::MemorySurface;
+        let budget = test_budget(512);
+
+        // The table alone outgrew the limit: the refusal of its bytes.
+        let alone = CombineError::MemoryRefused(
+            budget
+                .check_hard_limit(
+                    "enrich",
+                    MemorySurface::JoinBuildSide,
+                    Requester::governed(),
+                    1024,
+                )
+                .expect_err("1024 bytes do not fit a 512-byte limit"),
+        )
+        .into_build_error("enrich");
+        let PipelineError::MemoryBudgetExceeded { report } = alone else {
+            panic!("a table larger than the limit is E310; got {alone:?}");
+        };
+        assert_eq!(
+            report
+                .requester
+                .as_ref()
+                .map(|label| (label.node.as_str(), &label.surface)),
+            Some(("enrich", &MemorySurface::JoinBuildSide))
+        );
+        assert_eq!(report.requested_bytes, 1024);
+        assert!(report.oversized);
+
+        // The run was past its limit while the table still fit: the backstop.
+        // The check samples the process's own memory, so this half runs under
+        // a limit far above what the test process holds, with the process's
+        // reading 300 bytes over it.
+        let roomy_limit = 64 * 1024 * 1024 * 1024;
+        let roomy = test_budget(roomy_limit);
+        roomy.set_peak_rss_for_test(roomy_limit + 300);
+        let backstop = CombineError::MemoryRefused(
+            roomy
+                .check_hard_limit(
+                    "enrich",
+                    MemorySurface::JoinBuildSide,
+                    Requester::governed(),
+                    100,
+                )
+                .expect_err("the process's memory is over the limit"),
+        )
+        .into_build_error("enrich");
+        let PipelineError::MemoryBudgetExceeded { report } = backstop else {
+            panic!("a run past its limit is E310; got {backstop:?}");
+        };
+        assert_eq!(report.requested_bytes, 300);
+
+        // A build key that fails to evaluate is the probe side's key error,
+        // never a memory refusal.
+        let key = CombineError::KeyEvalFailed {
+            source: Box::new(EvalError::new(
+                cxl::eval::EvalErrorKind::DivisionByZero,
+                cxl::lexer::Span::new(0, 0),
+            )),
+            side: "build",
+        }
+        .into_build_error("enrich");
+        assert!(
+            matches!(&key, PipelineError::Compilation { transform_name, .. } if transform_name == "enrich"),
+            "{key:?}"
+        );
     }
 
     // ──────────────────────────────────────────────────────────────────
@@ -1768,8 +2050,16 @@ mod tests {
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
         let budget = test_budget(256 * 1024 * 1024);
 
-        let table =
-            CombineHashTable::build(records, &extractor, &ctx, &budget, Some(1000)).unwrap();
+        let table = CombineHashTable::build(
+            records,
+            &extractor,
+            &ctx,
+            &budget,
+            "enrich",
+            Requester::governed(),
+            Some(1000),
+        )
+        .unwrap();
         assert_eq!(table.len(), 1000);
         assert!(!table.is_empty());
 
@@ -1802,7 +2092,16 @@ mod tests {
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
         let budget = test_budget(256 * 1024 * 1024);
 
-        let table = CombineHashTable::build(records, &extractor, &ctx, &budget, None).unwrap();
+        let table = CombineHashTable::build(
+            records,
+            &extractor,
+            &ctx,
+            &budget,
+            "enrich",
+            Requester::governed(),
+            None,
+        )
+        .unwrap();
 
         let probe = mk_record(&schema, vec![Value::Integer(5), Value::Null]);
         let probe_keys = probe_keys_for(&extractor, &ctx, &probe);
@@ -1832,7 +2131,16 @@ mod tests {
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
         let budget = test_budget(256 * 1024 * 1024);
-        let table = CombineHashTable::build(records, &extractor, &ctx, &budget, None).unwrap();
+        let table = CombineHashTable::build(
+            records,
+            &extractor,
+            &ctx,
+            &budget,
+            "enrich",
+            Requester::governed(),
+            None,
+        )
+        .unwrap();
 
         let probe = mk_record(&schema, vec![Value::Integer(9999)]);
         let probe_keys = probe_keys_for(&extractor, &ctx, &probe);
@@ -1863,7 +2171,16 @@ mod tests {
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
         let budget = test_budget(256 * 1024 * 1024);
-        let table = CombineHashTable::build(records, &extractor, &ctx, &budget, None).unwrap();
+        let table = CombineHashTable::build(
+            records,
+            &extractor,
+            &ctx,
+            &budget,
+            "enrich",
+            Requester::governed(),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             table.len(),
             2,
@@ -1920,7 +2237,16 @@ mod tests {
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
         let budget = test_budget(256 * 1024 * 1024);
-        let table = CombineHashTable::build(records, &extractor, &ctx, &budget, None).unwrap();
+        let table = CombineHashTable::build(
+            records,
+            &extractor,
+            &ctx,
+            &budget,
+            "enrich",
+            Requester::governed(),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             table.len(),
             3,
@@ -1995,8 +2321,16 @@ mod tests {
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
         let budget = test_budget(256 * 1024 * 1024);
-        let table =
-            CombineHashTable::build(records, &extractor, &ctx, &budget, Some(1000)).unwrap();
+        let table = CombineHashTable::build(
+            records,
+            &extractor,
+            &ctx,
+            &budget,
+            "enrich",
+            Requester::governed(),
+            Some(1000),
+        )
+        .unwrap();
 
         // These keys are NOT in the build set.
         for missing_key in [1000i64, 10_000, -1, -999] {
@@ -2044,7 +2378,16 @@ mod tests {
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
         let budget = test_budget(256 * 1024 * 1024);
-        let table = CombineHashTable::build(records, &extractor, &ctx, &budget, Some(100)).unwrap();
+        let table = CombineHashTable::build(
+            records,
+            &extractor,
+            &ctx,
+            &budget,
+            "enrich",
+            Requester::governed(),
+            Some(100),
+        )
+        .unwrap();
 
         let total = table.memory_bytes();
 
@@ -2132,8 +2475,16 @@ mod tests {
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
         let budget = test_budget(256 * 1024 * 1024);
-        let table =
-            CombineHashTable::build(records, &extractor, &ctx, &budget, Some(1000)).unwrap();
+        let table = CombineHashTable::build(
+            records,
+            &extractor,
+            &ctx,
+            &budget,
+            "enrich",
+            Requester::governed(),
+            Some(1000),
+        )
+        .unwrap();
 
         let total = table.memory_bytes();
         let ratio = total as f64 / raw_baseline as f64;
@@ -2201,8 +2552,16 @@ mod tests {
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
         let budget = test_budget(1024 * 1024 * 1024);
-        let table =
-            CombineHashTable::build(records, &extractor, &ctx, &budget, Some(N_RECORDS)).unwrap();
+        let table = CombineHashTable::build(
+            records,
+            &extractor,
+            &ctx,
+            &budget,
+            "enrich",
+            Requester::governed(),
+            Some(N_RECORDS),
+        )
+        .unwrap();
 
         let total = table.memory_bytes();
         let ratio = total as f64 / raw_baseline as f64;
@@ -2226,9 +2585,10 @@ mod tests {
     fn test_combine_hash_table_oom_aborts_during_build_probe() {
         // With a 1-byte budget the 10-record table's own footprint trivially
         // exceeds the hard limit, so the final-check safety net's
-        // `should_abort_local(table.memory_bytes())` fires regardless of
-        // whether RSS is measurable — the build-side cap is no longer an
-        // RSS-only gate that goes silent when `rss_bytes()` returns `None`.
+        // `check_hard_limit`, given the table's bytes as not yet charged,
+        // refuses regardless of whether RSS is measurable — the build-side
+        // cap is no longer an RSS-only gate that goes silent when
+        // `rss_bytes()` returns `None`.
         let schema = test_schema(&["k"]);
         let records: Vec<Record> = (0..10)
             .map(|i| mk_record(&schema, vec![Value::Integer(i)]))
@@ -2239,8 +2599,17 @@ mod tests {
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
         let budget = test_budget(1); // 1 byte — impossibly tight.
 
-        match CombineHashTable::build(records, &extractor, &ctx, &budget, None) {
-            Err(CombineError::MemoryLimitExceeded { used, limit }) => {
+        match CombineHashTable::build(
+            records,
+            &extractor,
+            &ctx,
+            &budget,
+            "enrich",
+            Requester::governed(),
+            None,
+        ) {
+            Err(CombineError::MemoryRefused(report)) => {
+                let (used, limit) = (report.requested_bytes, report.limit.bytes());
                 assert_eq!(limit, 1);
                 // The 10-record table holds far more than 1 byte, so the
                 // local-bytes gate reports a non-zero footprint.
@@ -2249,7 +2618,7 @@ mod tests {
                     "expected a non-trivial table footprint, got {used}"
                 );
             }
-            Err(other) => panic!("expected MemoryLimitExceeded, got {other}"),
+            Err(other) => panic!("expected MemoryRefused, got {other}"),
             Ok(_) => panic!(
                 "build() succeeded under a 1-byte budget — the byte-counted \
                  build-side cap regressed; it must abort even when RSS is \
@@ -2272,7 +2641,7 @@ mod tests {
         // never seeds `peak_rss`, so on a target where `rss_bytes()`
         // returns `None` the only signal is the byte-counted local-bytes
         // gate. A 64-byte budget cannot hold a 5000-record integer-key
-        // table, so the build must fail with MemoryLimitExceeded rather
+        // table, so the build must fail with MemoryRefused rather
         // than succeed and risk an OOM.
         let schema = test_schema(&["k"]);
         let records: Vec<Record> = (0..5000)
@@ -2283,9 +2652,17 @@ mod tests {
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
         let budget = test_budget(64);
 
-        match CombineHashTable::build(records, &extractor, &ctx, &budget, Some(5000)) {
-            Err(CombineError::MemoryLimitExceeded { limit, .. }) => assert_eq!(limit, 64),
-            Err(other) => panic!("expected MemoryLimitExceeded, got {other}"),
+        match CombineHashTable::build(
+            records,
+            &extractor,
+            &ctx,
+            &budget,
+            "enrich",
+            Requester::governed(),
+            Some(5000),
+        ) {
+            Err(CombineError::MemoryRefused(report)) => assert_eq!(report.limit.bytes(), 64),
+            Err(other) => panic!("expected MemoryRefused, got {other}"),
             Ok(_) => panic!(
                 "build() succeeded under a 64-byte budget without a seeded RSS — \
                  the byte-counted backstop did not fire, so the budget is a no-op \
@@ -2310,7 +2687,16 @@ mod tests {
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
         let budget = test_budget(256 * 1024 * 1024);
-        let table = CombineHashTable::build(vec![], &extractor, &ctx, &budget, None).unwrap();
+        let table = CombineHashTable::build(
+            vec![],
+            &extractor,
+            &ctx,
+            &budget,
+            "enrich",
+            Requester::governed(),
+            None,
+        )
+        .unwrap();
         assert!(table.is_empty());
         assert_eq!(table.len(), 0);
 
@@ -2344,8 +2730,16 @@ mod tests {
         let stable = test_ctx();
         let ctx = cxl::eval::EvalContext::test_default_borrowed(&stable);
         let budget = test_budget(256 * 1024 * 1024);
-        let table =
-            CombineHashTable::build(records, &extractor, &ctx, &budget, Some(10_000)).unwrap();
+        let table = CombineHashTable::build(
+            records,
+            &extractor,
+            &ctx,
+            &budget,
+            "enrich",
+            Requester::governed(),
+            Some(10_000),
+        )
+        .unwrap();
 
         for key in [0i64, 500, 9999] {
             let probe = mk_record(&schema, vec![Value::Integer(key)]);
@@ -2413,8 +2807,16 @@ mod tests {
                 })
                 .collect();
             let budget = test_budget(256 * 1024 * 1024);
-            let table =
-                CombineHashTable::build(records, &extractor, &ctx, &budget, None).expect("build");
+            let table = CombineHashTable::build(
+                records,
+                &extractor,
+                &ctx,
+                &budget,
+                "enrich",
+                Requester::governed(),
+                None,
+            )
+            .expect("build");
             assert_eq!(table.len(), n);
 
             // For every key in the universe PLUS a few definitely-missing

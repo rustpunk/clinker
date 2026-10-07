@@ -3892,20 +3892,18 @@ nodes:
         .expect_err("1-byte mem_limit under spill must abort fast on the first admission");
         match &err {
             CombineFixtureError::Run(
-                clinker_plan::error::PipelineError::MemoryBudgetExceeded { node, source, .. },
+                clinker_plan::error::PipelineError::MemoryBudgetExceeded { report },
             ) => {
-                use clinker_plan::BudgetCategory;
-                // Either the per-row Arena charge inside the Combine
-                // build/probe path or the per-Vec NodeBuffer admission
-                // charge at any upstream insert can be the first surface
-                // to trip the 1-byte ceiling. Both report the producing
-                // operator's name and the BudgetCategory tag.
+                // Any charge inside the Combine build/probe path, or any
+                // buffer admission at an upstream insert, can be the first
+                // to trip the 1-byte ceiling. Each reports the node that
+                // asked and what the memory was for.
+                let requester = report
+                    .requester
+                    .as_ref()
+                    .expect("memory abort must name the node that asked and its surface");
                 assert!(
-                    matches!(*source, BudgetCategory::Arena | BudgetCategory::NodeBuffer),
-                    "memory abort must carry a BudgetCategory; got {source:?}"
-                );
-                assert!(
-                    !node.is_empty(),
+                    !requester.node.is_empty(),
                     "memory abort must name the producing operator; got empty string"
                 );
             }

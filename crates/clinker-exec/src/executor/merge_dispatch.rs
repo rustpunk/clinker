@@ -115,7 +115,8 @@ where
     //
     // 2. **Non-fused** — concat mode, a mix of Source and non-Source
     //    predecessors, or any shared Source. Predecessor arms have
-    //    already populated `ctx.node_buffers`; this arm
+    //    already populated their node-buffer slots in the walk
+    //    reclaim set; this arm
     //    consumes those buffers in declaration order (Concat)
     //    or round-robins across them (Interleave).
     //
@@ -167,29 +168,26 @@ where
     // this Merge passed the eligibility predicate at executor
     // entry, its crossbeam `Sender` was installed under our
     // `node_idx`. Take it here so the Merge arm streams every
-    // record through the channel instead of accumulating, and so
-    // dropping the sender at clean exit disconnects the streaming
-    // thread's `recv` loop. The fused-interleave path streams
+    // record through the channel instead of accumulating. The writer
+    // closes its output only on the hop's End, which the walk sends once
+    // this arm returns `Ok`. The fused-interleave path streams
     // inside `merge_fused_interleave` (the sender moves there);
     // the non-fused path (concat, or interleave with non-Source
     // inputs) accumulates `merged` then streams it through
     // `stream_linear_producer_emit` below, skipping the
     // materialized `admit_node_buffer` slot.
-    let streaming_sender = ctx.take_streaming_sender(node_idx);
-    let fused_streaming_handoff = fused_mode && streaming_sender.is_some();
-    // The per-batch charge handle for the streaming slot, shared by
-    // both fused and non-fused streaming paths. `None` when this
-    // Merge is materialized (no streaming sender installed).
-    let merge_charge = streaming_sender.as_ref().and_then(|_| {
-        let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
-        ctx.streaming_charge_handle(node_idx, name, spill_allowed)
-    });
+    // The sender comes with the per-batch charge handle for the streaming
+    // slot, shared by both fused and non-fused streaming paths; `None` when
+    // this Merge is materialized (no streaming sender installed).
+    let streaming_hop = ctx.take_streaming_hop(current_dag, node_idx, name)?;
+    let fused_streaming_handoff = fused_mode && streaming_hop.is_some();
     let merge_batch_size = ctx.batch_size;
     // Held only on the non-fused streaming path; the fused path
     // consumes its sender inside `merge_fused_interleave`.
-    let mut nonfused_sender: Option<
-        crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>,
-    > = None;
+    let mut nonfused_hop: Option<(
+        crate::executor::stream_hop::HopSender,
+        crate::executor::batch_handoff::StreamingChargeHandle,
+    )> = None;
     // Shared-input materialization reservations belong to the complete Merge
     // arm, not only the input-conversion block: collected records remain live through
     // boundary reconciliation, window finalization, and output admission.
@@ -198,24 +196,27 @@ where
         records: merged,
         puncts: fused_deduped_puncts,
     } = if fused_mode {
-        let handoff = match (streaming_sender, merge_charge.as_ref()) {
-            (Some(sender), Some(charge)) => Some(MergeStreamHandoff {
-                sender,
+        let handoff = streaming_hop
+            .as_ref()
+            .map(|(sender, charge)| MergeStreamHandoff {
+                sender: sender.clone(),
                 charge,
                 batch_size: merge_batch_size,
-            }),
-            _ => None,
-        };
-        merge_fused_interleave(
+            });
+        let merged = merge_fused_interleave(
             ctx,
             current_dag,
             name,
             &sorted_preds,
             merge_output_schema.as_ref(),
             handoff,
-        )?
+        );
+        // The interleave's handoff held a clone of the sender; release the
+        // arm's own so only the hop's end still holds the channel.
+        drop(streaming_hop);
+        merged?
     } else {
-        nonfused_sender = streaming_sender;
+        nonfused_hop = streaming_hop;
         // Ordered incoming inputs as `(source, producer_port)` — one per incoming
         // edge, keyed by the producer output port the edge draws. A Merge that
         // draws several ports of one producer (Route branches, or a Cull's `main`
@@ -249,14 +250,17 @@ where
                 })
                 .unwrap_or(usize::MAX)
         });
-        let total: usize = ordered_inputs
-            .iter()
-            .map(|(src, port)| {
-                ctx.node_buffers
-                    .get(&NodeBufferKey::with_port(*src, port.as_deref()))
-                    .map_or(0, |b| b.len_hint())
-            })
-            .sum();
+        let total: usize = {
+            let set = ctx.walk_reclaim.borrow();
+            ordered_inputs
+                .iter()
+                .map(|(src, port)| {
+                    set.slots()
+                        .buffer(&NodeBufferKey::with_port(*src, port.as_deref()))
+                        .map_or(0, |b| b.len_hint())
+                })
+                .sum()
+        };
         let mut merged = Vec::with_capacity(total);
         let emit = |merged: &mut Vec<(Record, crate::executor::stream_event::SourceRowId)>,
                     upstream_name: &str,
@@ -422,23 +426,19 @@ where
     // overlap the writer with the next topo node. (The fused
     // Merge.interleave path is the true one-batch streamer; it
     // forwards records off the live Source channels inside
-    // `merge_fused_interleave` and returns an empty `merged`, its
-    // sender already dropped there.) The eligibility predicate
-    // certified this Merge roots no window and tees to no deferred
-    // region, so the helper calls below are correctly skipped.
-    // Dropping `nonfused_sender` at the end of this branch
-    // disconnects the writer thread's `recv` loop.
-    if let Some(sender) = nonfused_sender {
-        let charge = merge_charge
-            .as_ref()
-            .expect("streaming sender implies a registered charge handle");
+    // `merge_fused_interleave` and returns an empty `merged`.) The
+    // eligibility predicate certified this Merge roots no window and
+    // tees to no deferred region, so the helper calls below are
+    // correctly skipped. The writer closes its output only on the hop's
+    // End, which the walk sends once this arm returns `Ok`.
+    if let Some((sender, charge)) = nonfused_hop {
         stream_linear_producer_emit(
             &sender,
             merge_batch_size,
             name,
             merged,
             deduped_puncts,
-            charge,
+            &charge,
         )?;
         return Ok(());
     }

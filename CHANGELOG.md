@@ -4,6 +4,53 @@ All notable changes to Clinker are tracked here.
 
 ## Unreleased
 
+### Fixed — a bounded preview of a Transform that reads one Source and feeds one Sink prints its rows
+
+`clinker run pipeline.yaml --dry-run -n N` failed with an internal error
+(exit 1, `completed node-buffer scope retained ...`) when a Transform read one
+Source and fed one Sink, the shape of the getting-started walkthrough and the
+CSV-to-CSV recipe, and wrote nothing. It now prints the first `N` transformed
+rows, the same rows a full run writes first for that input. The preview exits
+0, or 2 when it dead-letters a row, and still writes no dead-letter file or
+configured output. A preview whose Transform fails part way reports the same
+error as a full run. Full runs are unchanged.
+
+Closes [#1220](https://github.com/rustpunk/clinker/issues/1220).
+
+### Fixed — a failed or interrupted read never lets a later step finish on part of its input, and the run reports the first failure
+
+This is a breaking change in which error a failed run reports and in what it
+leaves behind.
+
+A Source that failed or was cancelled part-way through its input used to end
+that input as if it were complete, so a later step could finish on the rows
+read so far, an Aggregate writing totals over part of a file, before the run
+failed. Every step's input now ends only when the step feeding it says it has
+ended: a Source's when its reader has read all of it (or reached the
+`--dry-run -n` limit), and a streaming step's when the step feeding it
+finished. A read failure or a cancellation ends the input as incomplete, and
+nothing finishes on it.
+
+- **Which error you see.** When several steps or Sources fail, the run reports
+  the first failure in the order Clinker runs its steps and logs each later
+  one as a warning naming its step or Source. A Sink that fails on a row now
+  wins over a later failure of the step that sent it that row; before, the
+  later failure could be reported instead and the Sink's dropped.
+- **A failing later file leaves nothing finished.** When a Source fails on a
+  later file, no step finishes on the earlier files' rows, and nothing is
+  published. An output that was being written as rows arrived keeps the rows
+  it had written, without its closing syntax, in the failed run's retained
+  attempt; nothing reaches a configured output path.
+- **Cancellation.** A cancelled run stays cancelled (exit 130) when another
+  Source fails on input the run never reached; that failure is logged. A
+  failure the run had already reached still wins over a cancellation, except a
+  Source read the cancellation itself cut off before the server answered,
+  which is reported as cancelled. A `--dry-run -n` preview follows the same
+  rules as a full run.
+- **Logged warnings.** The later failures are logged at `warn` level, on
+  standard output or, when standard output carries data, standard error. The
+  [CLI reference](docs/user/src/ops/cli-reference.md) lists their forms.
+
 ### Changed — aggregates follow one numeric rule: exact decimal totals, a typed error for every failure, and no decimal–float mixing
 
 This is a breaking change. A numeric aggregate now gives the exact value of its
@@ -126,6 +173,26 @@ and applies the `null_order` written there, `last` by default for `asc` and
   take their place in the value order.
 
 Closes [#1281](https://github.com/rustpunk/clinker/issues/1281).
+
+### Fixed — a relaxed-key commit that recomputes reads its held inputs on every recompute
+
+When an aggregate's `group_by` omits a correlation-key field, the steps below
+it run at the commit and run again for every recompute a failure triggers.
+Rows they read from elsewhere in the pipeline — the other input of a
+Combine fed by a Source, a Route branch, a Cull port or a composition body's
+input — were lost after the first pass, so a pipeline that needed a second
+recompute stopped with an internal error ("planned input … was
+unavailable"). Every recompute now reads those rows again, unchanged and in
+arrival order. The same pipelines also stopped with an internal error when
+two such aggregates fed one step, or when the held input came from inside a
+composition body; both now run.
+
+The held rows now count against `memory.limit` and may spill to disk under
+memory pressure, instead of being checked only against the process's
+resident memory. A Route or Cull that feeds a deferred step no longer stops
+the run with an E310 naming its process memory.
+
+Closes [#1263](https://github.com/rustpunk/clinker/issues/1263).
 
 ### Changed — null_order: drop is accepted only on a Sink sort_order
 
@@ -341,6 +408,98 @@ run wrote.
 - Under a key, `dlq_count`, `records_dlq` and the `dlq.max_rate` numerators
   therefore rise to the counts the same failures give without a key, plus
   the rows the failing groups condemn.
+### Changed — memory-limit failures (E310) name what holds memory and a limit that works
+
+**Breaking diagnostic and Rust API change.** An E310 now reports the request
+the engine refused, read from one account of the run's charged memory at the
+refusal:
+
+```
+E310 "totals": needed 2.0 MiB more for group state, but only 704.0 KiB of memory.limit 8.0 MiB was left
+  charged 7.3 MiB of 8.0 MiB (91%) · private memory 200.0 MiB
+  largest holders:
+    "enrich"  join build side  3.5 MiB  cannot spill
+    "totals"  group state  1.0 MiB  requester
+    "sorted"  rows buffered between "orders" and "sorted"  1.0 MiB  in use
+    "orders"  rows read from the source  768.0 KiB  paused source
+    "dedupe"  decision state  256.0 KiB  cannot spill
+    +2 more holders  192.0 KiB
+    not held by any one node  640.0 KiB
+  reclaim: none attempted
+  fix: raise the limit to at least 10M — the smallest limit with room for this request and what the run already holds; later stages may need more
+    pipeline:
+      memory: { limit: "10M" }
+    or: --memory-limit 10M
+  remedy: "enrich"'s join build side holds 3.5 MiB and could not be spilled; see "Join build side" in clinker explain --code E310
+  See: clinker explain --code E310
+```
+
+- The headline keeps the greppable `E310 "<node>":` prefix, the node's name
+  now in double quotes as every node name in the report is, and names what
+  the memory was for in pipeline terms and how much of the limit was left. It
+  adds `and nothing more could be spilled` only after the engine tried to
+  spill; a report whose reclaim line says `none attempted` does not claim
+  it. A request larger than the limit on its
+  own, or than the limit leaves beside state that cannot spill, says
+  `one request ... needs N, more than memory.limit L can hold — spilling
+  cannot help`.
+- A step that stops because the process's own memory passed the limit,
+  rather than the charged total, says so: `E310 "<node>": process memory
+  peaked at P resident, over memory.limit L, while "<node>" held <what>; the
+  run had charged C`, and its suggested limit is that reading rounded up.
+  It never claims the limit is fully held.
+- A join, sort-merge or grace fallback that finds the run already over the
+  limit while it works now spills other steps' state first and stops only
+  when that cannot make room. Its report states what the run held instead
+  of a request: `E310 "<node>": the run held H, over memory.limit L, while
+  "<node>" held <what>`, adding `and nothing more could be spilled` only
+  after a round, and its suggested limit is what the run held,
+  rounded up: `fix: raise the limit to at least N — the smallest limit with
+  room for what the run already holds; "<node>" and later stages may need
+  more`. If the round makes room but the process's own memory is still over
+  the limit, the report takes the process-memory form above.
+- An in-memory hash join no longer counts its build rows twice near the
+  limit once its table holds them. The text inside those rows can still be
+  counted twice ([#1394](https://github.com/rustpunk/clinker/issues/1394)).
+- Below it: the charged total against the limit, the five largest holders
+  and why each still held its memory, what the reclaim round asked and
+  freed, the smallest limit that would have granted the request in YAML
+  and `--memory-limit` form, and a remedy keyed to the largest holder that
+  cannot spill. A Source still reading is listed as `active source`; a
+  Source's rows, paused, active or after it has finished reading, never count
+  as state that cannot spill, and a Source is never the remedy. Rows read by
+  several nodes name each of them: `rows buffered between "split" and "a",
+  "b"`. An Aggregate whose `group_by` leaves out a correlation-key field keeps
+  its groups in memory for the whole run, and its group state is listed as
+  `cannot spill`.
+- A Reshape or Cull group too large to hold whole is identified by where its
+  first row came from (`group: the one whose first row is row 4812 of source
+  "orders"`, the row number the dead-letter output writes in
+  `_cxl_dlq_source_row`); a group whose first row was not read from a Source
+  gets no `group:` line. The report no longer prints the group's key: it
+  names nodes, surfaces and byte counts only, never a record value.
+- A join that stops while matching a part of its build side it could not
+  split further says about how many distinct join keys that part held
+  (`join partition: about N distinct keys`), and, when it is one, that one
+  key's rows cannot be split across partitions. The count is an estimate;
+  no key is printed.
+- A Source, writer or worker whose own allocation the memory limit refuses
+  now fails the run with this E310, naming that node, instead of an
+  I/O-shaped budget error, including inside a composition body (the message
+  is prefixed with the composition's name) and when it is reported together
+  with other errors.
+- A Combine build key that fails to evaluate now fails with the same error a
+  probe key does, not E310.
+
+`clinker explain --code E310` describes each part and has a section per kind
+of state; Cull's held group rows (`rows held for Cull groups`) now have their
+own section, apart from its per-group decisions (`decision state`).
+
+For Rust callers, `PipelineError::MemoryBudgetExceeded` now carries one
+`report: Box<MemoryShortfallReport>` in place of `node`, `used`, `limit`,
+`source` and `detail`. `clinker_plan::runtime_error::BudgetCategory` and its
+`clinker_plan::BudgetCategory` re-export are removed: match on
+`report.requester` (the node and its `MemorySurface`) instead.
 
 ### Changed — records group by exact numeric value, and NaN is one group
 

@@ -201,23 +201,27 @@ The on-disk spill volume Cull produces is surfaced per stage in `clinker run --e
 
 ### Limit: a single group must fit the finalize budget
 
-Cull evaluates its group-level predicate against the *whole* group at once, so even though cross-group and ingest-time peaks spill to disk, the finalize reload of one group needs that group to fit the memory budget. Skew slicing bounds the ingest peak, but a single correlation group larger than `memory.limit` has no in-budget representation. Rather than risk an out-of-memory crash, the run **fails loud** with `E310 MemoryBudgetExceeded`, naming the Cull node, the offending `partition_by` group, and its footprint against the budget:
+Cull evaluates its group-level predicate against the *whole* group at once, so even though cross-group and ingest-time peaks spill to disk, the finalize reload of one group needs that group to fit the memory budget. Skew slicing bounds the ingest peak, but a single correlation group larger than `memory.limit` has no in-budget representation. Rather than risk an out-of-memory crash, the run **fails loud** with `E310`. The report names the Cull node and says that one request for the rows it holds for its groups needs more than `memory.limit` can hold, so spilling cannot help. It names the group by the Source and row number of its first row — the row number the dead-letter output writes in `_cxl_dlq_source_row` — and prints byte counts and node names only, never the group's key value (a group whose first row was not read from a Source gets no `group:` line):
 
 ```
-E310 drop_big: arena exceeded budget (512000/8192) [one Cull correlation
-group [account="BIG"] does not fit; the reported use is that group's reload
-footprint alone. ...]
+E310 "drop_big": one request for rows held for Cull groups needs 500.0 KiB, more than memory.limit 8.0 KiB can hold — spilling cannot help
+  group: the one whose first row is row 1 of source "events"
+  ...
+  fix: raise the limit to at least 1M — the smallest limit with room for this request and what the run already holds; later stages may need more
+    pipeline:
+      memory: { limit: "1M" }
+    or: --memory-limit 1M
 ```
 
-**Raising `memory.limit` is the only fix that leaves your output unchanged.** Raise it clear of the reported figure — finalize also holds the run's remaining groups and the per-group decision map, so that figure is a floor, not a target.
+**Raising `memory.limit` is the only fix that leaves your output unchanged.** Raise it to at least the limit on the report's `fix:` line — finalize also holds the run's remaining groups and the per-group decision map, so that figure is a floor, not a target.
 
 The other two levers both change what you get, and are worth knowing only so you can weigh them deliberately:
 
 - *Dropping columns this node does not read*, in an upstream Transform, shrinks each buffered record. But Cull filters rows, never columns — both its ports carry the unchanged upstream schema — so anything you strip upstream is also missing from the main and `removed_to` outputs.
 - *Narrowing `partition_by`* shrinks the group too, but that key **defines** the group `drop_group_when` evaluates over. With a rule like `count(*) > 100`, splitting one account across a finer key drops each resulting group below the threshold, so an account that should have been removed is emitted on the main port instead — the run "works" and quietly returns a different result set. Treat the grouping key as a modelling decision, never as a memory knob.
 
-Run `clinker explain --code E310` for remediation keyed to whichever memory surface overran, or see the [memory guide](../ops/memory.md#behavior-under-memory-pressure).
+Run `clinker explain --code E310` for remediation keyed to the state that fills the limit, or see the [memory guide](../ops/memory.md#behavior-under-memory-pressure).
 
-There is a second, symmetric bound on the **number** of groups. The per-group removal decision is held in an in-memory aggregate that is `O(distinct groups)` and — unlike the raw records — cannot spill. If a partition key is so high-cardinality that the decision state plus the run's other live charged memory would exceed `memory.limit` (many small groups rather than one giant group), the run likewise **fails loud** with `E310`, rather than growing that state unbounded. Here, coarsening `partition_by` is a legitimate fix only if the coarser key is the grouping you actually meant — the same caveat as above applies. Otherwise, raise `memory.limit`.
+There is a second, symmetric bound on the **number** of groups. The per-group removal decision is held in an in-memory aggregate that is `O(distinct groups)` and — unlike the raw records — cannot spill. If a partition key is so high-cardinality that the decision state plus the run's other live charged memory would exceed `memory.limit` (many small groups rather than one giant group), the run likewise **fails loud** with `E310` naming the Cull node's `decision state`, rather than growing that state unbounded. Here, coarsening `partition_by` is a legitimate fix only if the coarser key is the grouping you actually meant — the same caveat as above applies. Otherwise, raise `memory.limit`.
 
-Several distinct memory surfaces can raise `E310` against a Cull node, so read the `[...]` detail to see which one overran. The ones documented here are `Cull correlation group [...]` (the giant-group case above), `Cull drop-decision aggregate state` (the group-count bound), `Cull cross-region tee admission` (a downstream stage in a different deferred region forces this node's output to be parked in memory), and `node-buffer materialization overlap` (a consumer must collect one of Cull's sequential port scans into a resident vector). Cull's main and `removed_to` handoff buffers themselves are spill-eligible, including when a port fans out. Other surfaces the shared runtime charges may name this node too — the detail string is the authority, not this list.
+Several kinds of state held for a Cull node can fill the limit, and the E310 report lists the largest holders by node and what they hold, so read it to see which one it was. The ones documented here are the Cull node's `rows held for Cull groups` (its buffered groups: the giant-group case above), `decision state` (its per-group drop decisions: the group-count bound above), `rows held between "drop_big" and "<next node>" for commit` (a downstream stage in a different deferred region forces this node's output to be parked in memory), and `rows collected for a full scan` (a downstream node must collect one of Cull's sequential port scans into memory at once). Cull's main and `removed_to` handoff buffers (`rows buffered between "drop_big" and "<next node>"`, or `rows buffered between "drop_big" and "kept", "review"` when a port feeds several nodes, each named) are spill-eligible, including when a port fans out. Other state the run charges may be listed under this node too — the report's holder list is the authority, not this list.

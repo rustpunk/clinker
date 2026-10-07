@@ -1,7 +1,9 @@
 //! Inline punctuation events on the executor's record stream.
 //!
-//! Every channel and buffer between executor stages carries
-//! [`StreamEvent`], a two-variant enum:
+//! Every buffer between executor stages, and every streaming channel
+//! between threads (wrapped in
+//! [`HopMessage::Event`](crate::executor::stream_hop::HopMessage::Event),
+//! beside the producer's end), carries [`StreamEvent`], a two-variant enum:
 //!
 //! - [`StreamEvent::Record`] — a record paired with its exact
 //!   [`SourceRowId`] for the current execution attempt.

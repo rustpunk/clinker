@@ -17,16 +17,20 @@ lightweight, and easy to reason about.
 long-running stream processor.** A pipeline run is a job: Sources read until
 EOF, the DAG drains, the process exits. Within a run, stateless operators
 (Transform, Route, most Combine probe-side work, Sink) evaluate records one
-at a time without accumulating per-record state. Every stage is charged
-against the configured RSS budget. Fused Source → Transform → Sink paths
-run streaming with no per-stage materialization; non-fused boundaries
-(Route fan-out, Merge fan-in, Composition bodies, diamond DAGs) materialize
-records into per-stage buffers that charge against the same envelope. The
-engine spills buffers to disk at 80% of the limit and fails fast with
-`E310 MemoryBudgetExceeded` at the hard limit, naming the offending
-producer. Blocking operators (Aggregate, sort, grace-hash Combine)
-accumulate state inside that same budget and **spill to disk** when soft
-and hard memory thresholds trip, rather than OOM-killing the process.
+at a time without accumulating per-record state. Every stage counts the
+memory it holds against the configured `memory.limit`. Fused Source →
+Transform → Sink paths run streaming with no per-stage materialization;
+non-fused boundaries (Route fan-out, Merge fan-in, Composition bodies,
+diamond DAGs) materialize records into per-stage buffers that count against
+the same limit. The engine starts spilling buffers to disk at 80% of the
+limit. When a request would pass the limit, the engine first spills to disk
+what can be written there, and fails with `E310` only when that frees
+nothing, naming the node that needed the memory. Pausing a Source is
+separate: under the default `backpressure: pause`, a Source is paused when
+the run's memory passes 80% of the limit and resumes once it falls back, and
+a pause frees nothing the run already holds. Blocking operators (Aggregate, sort, grace-hash Combine)
+accumulate state inside that same budget and **spill to disk** under memory
+pressure, rather than OOM-killing the process.
 
 If you have used Flink, Kafka Streams, or Beam in unbounded mode: Clinker is
 not that. There are no watermarks against wall-clock time, no infinite-source

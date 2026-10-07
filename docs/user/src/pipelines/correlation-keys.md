@@ -141,6 +141,14 @@ When an aggregate's `group_by` **omits** a correlation-key field, the engine aut
       emit total = sum(amount)
 ```
 
+The steps downstream of such an aggregate run once the run's rows have all
+been read, and again for every recompute a failure triggers. Rows those steps
+read from elsewhere in the pipeline — the other input of a
+Combine fed by a Source, a Route branch or a Cull port — are held until then. They
+count against `memory.limit` like any other buffered rows and may spill to
+disk under memory pressure; every recompute reads them back unchanged and in
+the order they arrived.
+
 ### Combine interaction
 
 Every combine declares `propagate_ck:` to select which correlation-key fields its output rows carry:

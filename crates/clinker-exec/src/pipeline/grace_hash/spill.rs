@@ -22,11 +22,10 @@ use crate::pipeline::grace_spill::{
 };
 use crate::pipeline::memory::MemoryArbitrator;
 use crate::pipeline::spill::{SpillFile, SpillWriter};
-use clinker_plan::BudgetCategory;
 use clinker_plan::error::PipelineError;
 
 /// Number of result records the BNL fallback emits per output batch
-/// before polling [`MemoryArbitrator::should_abort`]. Output amplification
+/// before checking the run's hard limit. Output amplification
 /// from a hot key joining against many probe-side records can produce
 /// `M * N` rows for a single equivalence class; periodic polling at the
 /// 10 K boundary keeps the abort signal responsive without paying an
@@ -50,9 +49,9 @@ pub(crate) const PROBE_BUFFER_RESERVATION: usize = 4 * 1024 * 1024;
 pub(crate) const SKEW_REDUCTION_THRESHOLD: f64 = 0.20;
 
 /// One spilled partition's reload payload, drained from the executor
-/// after the probe phase. The HLL sketch travels alongside so the
-/// BNL fallback path can fold a cardinality estimate into the E310
-/// diagnostic without re-walking the spill files.
+/// after the probe phase. The HLL sketch travels alongside so the BNL
+/// fallback path can put a cardinality estimate on the E310 report
+/// without re-walking the spill files.
 pub(crate) struct SpilledPartition {
     pub partition_id: u16,
     pub build_files: Vec<SpillFilePath>,
@@ -344,15 +343,11 @@ pub(super) fn process_spilled_partition(
         build_extractor,
         ctx,
         budget,
+        name,
+        reload_requester(),
         Some(sp.build_count as usize),
     )
-    .map_err(|e| PipelineError::MemoryBudgetExceeded {
-        node: name.to_string(),
-        used: budget.peak_rss().unwrap_or(0),
-        limit: budget.hard_limit(),
-        source: BudgetCategory::Arena,
-        detail: Some(format!("grace hash reload build: {e}")),
-    })?;
+    .map_err(|e| e.into_build_error(name))?;
 
     // Walk every probe-side spill file and emit matches.
     let mut probe_keys_buf: Vec<Value> = Vec::with_capacity(driver_extractor.len());
@@ -404,7 +399,7 @@ pub(crate) struct BnlStats {
     /// [`CombineHashTable::memory_bytes`].
     pub peak_chunk_table_bytes: usize,
     /// Number of times the fallback hit a 10 K-record output batch
-    /// boundary and polled [`MemoryArbitrator::should_abort`].
+    /// boundary and checked the run's hard limit.
     pub batches_emitted: usize,
     /// Largest single-chunk record count.
     pub peak_chunk_records: usize,
@@ -432,10 +427,10 @@ pub(crate) struct BnlStats {
 ///     chunk it's `M * chunk_keys`, so the result-batch poll happens
 ///     between every 10 K matches.
 ///
-/// On [`MemoryArbitrator::should_abort`] returning true at any tier
+/// When the run's hard-limit check refuses at any tier
 /// (chunk-table construction, between batches), the function returns
-/// an E310 [`PipelineError::Compilation`] carrying the partition_id
-/// and the HLL-derived approximate distinct-key count.
+/// the E310 for the combine's join build side, carrying the partition's
+/// approximate distinct-key count.
 pub(super) fn bnl_fallback(
     rc: &ReloadContext<'_>,
     sp: &SpilledPartition,
@@ -460,15 +455,9 @@ pub(super) fn bnl_fallback(
         .max(1);
     stats.chunk_byte_budget = chunk_budget;
 
-    // If hard limit is already breached before any work, fail fast.
-    if budget.should_abort() {
-        return Err(combine_e310_partition_aborted(
-            name,
-            sp.partition_id,
-            approx_distinct,
-            budget,
-        ));
-    }
+    // If the run is already past its hard limit before any work, the
+    // backstop reclaims on the walk before it stops the partition.
+    hard_limit_check(name, approx_distinct, budget)?;
 
     let chunks = BuildChunkIter::new(build_records, chunk_budget);
     let mut probe_keys_buf: Vec<Value> = Vec::with_capacity(rc.driver_extractor.len());
@@ -482,22 +471,20 @@ pub(super) fn bnl_fallback(
         let chunk_ids: Vec<(RecordOrder, BuildSeq)> =
             chunk.iter().map(|(_, row, seq)| (*row, *seq)).collect();
         let chunk = chunk.into_iter().map(|(record, _, _)| record);
-        let table =
-            CombineHashTable::build(chunk, rc.build_extractor, rc.ctx, budget, Some(chunk_len))
-                .map_err(|e| PipelineError::MemoryBudgetExceeded {
-                    node: name.to_string(),
-                    used: budget.peak_rss().unwrap_or(0),
-                    limit: budget.hard_limit(),
-                    source: BudgetCategory::Arena,
-                    detail: Some(format!(
-                        "grace hash bnl chunk build (partition {}, ~{} distinct): {e}",
-                        sp.partition_id, approx_distinct
-                    )),
-                })?;
+        let table = CombineHashTable::build(
+            chunk,
+            rc.build_extractor,
+            rc.ctx,
+            budget,
+            name,
+            reload_requester(),
+            Some(chunk_len),
+        )
+        .map_err(|e| with_partition_distinct_keys(e.into_build_error(name), approx_distinct))?;
         stats.peak_chunk_table_bytes = stats.peak_chunk_table_bytes.max(table.memory_bytes());
 
         // Emit matches in 10 K-record batches against this chunk's
-        // table. After every batch boundary, poll should_abort so a
+        // table. After every batch boundary, check the hard limit so a
         // runaway output amplification (one hot key joined against M
         // probe records → M outputs per probe) gets caught.
         let mut emitted_in_batch = 0usize;
@@ -535,14 +522,7 @@ pub(super) fn bnl_fallback(
                 while emitted_in_batch >= RESULT_BATCH_SIZE {
                     stats.batches_emitted += 1;
                     emitted_in_batch -= RESULT_BATCH_SIZE;
-                    if budget.should_abort() {
-                        return Err(combine_e310_partition_aborted(
-                            name,
-                            sp.partition_id,
-                            approx_distinct,
-                            budget,
-                        ));
-                    }
+                    hard_limit_check(name, approx_distinct, budget)?;
                 }
             }
         }
@@ -550,40 +530,52 @@ pub(super) fn bnl_fallback(
         // bounded-memory invariant relies on this happening eagerly.
         drop(table);
 
-        // Final between-chunk abort check. The chunked build alone
-        // cannot exceed the budget by construction (chunk_budget is
-        // sized for it), but cumulative `output` growth could.
-        if budget.should_abort() {
-            return Err(combine_e310_partition_aborted(
-                name,
-                sp.partition_id,
-                approx_distinct,
-                budget,
-            ));
-        }
+        // Final between-chunk check. The chunked build alone cannot
+        // exceed the budget by construction (chunk_budget is sized for it),
+        // but cumulative `output` growth could.
+        hard_limit_check(name, approx_distinct, budget)?;
     }
     Ok(())
 }
 
-/// E310 — runtime partition aborted because the chunked BNL fallback
-/// could not bring memory under the hard limit. Carries the partition
-/// index and an HLL-approximated distinct-key count in `detail` so the
-/// operator can size `partition_bits` upstream or reroute the dominant
-/// key before retrying.
-fn combine_e310_partition_aborted(
+/// The run's hard-limit backstop for the chunked fallback of one partition,
+/// checked after the fact: on the walk it reclaims before it refuses. A
+/// refusal is the E310 for `transform`'s join build side, carrying the
+/// partition's approximate distinct-key count, so the author can tell one
+/// hot key no repartitioning can split from a partition that holds many
+/// keys.
+fn hard_limit_check(
     transform: &str,
-    partition_id: u16,
     approx_distinct: u64,
     budget: &MemoryArbitrator,
-) -> PipelineError {
-    PipelineError::MemoryBudgetExceeded {
-        node: transform.to_string(),
-        used: budget.peak_rss().unwrap_or(0),
-        limit: budget.hard_limit(),
-        source: BudgetCategory::Arena,
-        detail: Some(format!(
-            "combine grace hash exceeded memory limit on partition {partition_id}; \
-             approximate distinct key count {approx_distinct}"
-        )),
+) -> Result<(), PipelineError> {
+    budget
+        .check_hard_limit(
+            transform,
+            clinker_plan::runtime_error::MemorySurface::JoinBuildSide,
+            reload_requester(),
+            0,
+        )
+        .map_err(|mut report| {
+            report.join_partition_distinct_keys = Some(approx_distinct);
+            PipelineError::MemoryBudgetExceeded { report }
+        })
+}
+
+/// The requester the reload phase's hard-limit checks name: the run as a
+/// whole. From the end of the build the grace consumer reports nothing
+/// reclaimable, so a pass never elects it either way, and its holder still
+/// reads as the requester because its label is the node's join build side,
+/// the surface these checks name.
+fn reload_requester() -> crate::pipeline::memory::ledger::Requester {
+    crate::pipeline::memory::ledger::Requester::governed()
+}
+
+/// `error` with the stopped partition's approximate distinct-key count on
+/// its report, when it is an E310; any other error unchanged.
+fn with_partition_distinct_keys(mut error: PipelineError, approx_distinct: u64) -> PipelineError {
+    if let PipelineError::MemoryBudgetExceeded { report } = &mut error {
+        report.join_partition_distinct_keys = Some(approx_distinct);
     }
+    error
 }

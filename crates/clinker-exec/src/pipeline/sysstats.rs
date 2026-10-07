@@ -42,6 +42,59 @@ pub fn io_counters() -> Option<IoCounters> {
     io_counters_impl()
 }
 
+/// The current process's private memory in bytes: memory it alone holds,
+/// resident or swapped out, and no other process shares. `None` on
+/// unsupported platforms or when the platform reading fails.
+///
+/// - Linux: `RssAnon + VmSwap` from `/proc/self/status` (anonymous resident
+///   pages plus what was swapped out; not `VmRSS`, which counts shared file
+///   pages, and not the cgroup's `memory.current`). Both fields are required.
+/// - macOS: `phys_footprint`, the figure the memory budget's RSS reader uses.
+/// - Windows: `PrivateUsage` (commit charge), the figure the memory budget's
+///   RSS reader uses.
+///
+/// **Unit invariant — every arm returns BYTES.** Linux `RssAnon` and `VmSwap`
+/// are reported in **kB**, so their sum is multiplied by 1024; macOS
+/// `phys_footprint` and Windows `PrivateUsage` are already in bytes and pass
+/// through unconverted. A future editor must not "normalize" the Linux ×1024
+/// away — the kB→bytes conversion is the one place the arms differ.
+pub fn private_memory_bytes() -> Option<u64> {
+    private_memory_bytes_impl()
+}
+
+#[cfg(target_os = "linux")]
+fn private_memory_bytes_impl() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    rss_anon_plus_swap_bytes(&status)
+}
+
+#[cfg(target_os = "macos")]
+fn private_memory_bytes_impl() -> Option<u64> {
+    phys_footprint_bytes()
+}
+
+#[cfg(target_os = "windows")]
+fn private_memory_bytes_impl() -> Option<u64> {
+    super::memory::rss_bytes()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn private_memory_bytes_impl() -> Option<u64> {
+    None
+}
+
+/// `RssAnon + VmSwap` from the text of `/proc/self/status`, in BYTES (both
+/// fields are in kB). `None` unless both fields are present and parse.
+#[cfg(any(target_os = "linux", test))]
+fn rss_anon_plus_swap_bytes(status: &str) -> Option<u64> {
+    let field = |name: &str| -> Option<u64> {
+        let rest = status.lines().find_map(|line| line.strip_prefix(name))?;
+        rest.split_whitespace().next()?.parse().ok()
+    };
+    let kb = field("RssAnon:")?.checked_add(field("VmSwap:")?)?;
+    kb.checked_mul(1024)
+}
+
 // ---------- CPU times ----------
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -267,6 +320,32 @@ fn io_counters_impl() -> Option<IoCounters> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn private_memory_is_anonymous_resident_plus_swap_in_bytes() {
+        let status = "Name:\tclinker\nVmRSS:\t   90000 kB\nRssAnon:\t   40000 kB\n\
+                      RssFile:\t   50000 kB\nVmSwap:\t     512 kB\n";
+        assert_eq!(
+            rss_anon_plus_swap_bytes(status),
+            Some((40_000 + 512) * 1024)
+        );
+        assert_eq!(
+            rss_anon_plus_swap_bytes("RssAnon:\t40000 kB\n"),
+            None,
+            "both fields are required"
+        );
+        assert_eq!(
+            rss_anon_plus_swap_bytes("RssAnon:\tlots kB\nVmSwap:\t0 kB\n"),
+            None
+        );
+        if cfg!(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows"
+        )) {
+            assert!(private_memory_bytes().is_some_and(|bytes| bytes > 0));
+        }
+    }
 
     #[test]
     fn cpu_times_returns_some_on_supported_platforms() {

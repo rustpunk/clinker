@@ -33,7 +33,6 @@ use crate::pipeline::combine_verdict::{
     Admit, DriverScan, DriverVerdict, MissToken, PredicateOutcome, eval_predicate,
 };
 use crate::pipeline::iejoin::RecordOrder;
-use clinker_plan::BudgetCategory;
 use clinker_plan::config::ErrorStrategy;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{
@@ -46,62 +45,76 @@ use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface};
 /// and aligns with DataFusion's collect-list bound.
 const COLLECT_PER_GROUP_CAP: usize = 10_000;
 
-/// Keep source materialization charged through a kernel that consumes its
-/// owned inputs. Its returned output has a separate drain owner; freed input
-/// vectors must not remain reported throughout that later drain.
-fn consume_materialized_inputs<T>(
-    reservations: [Option<crate::executor::node_buffer::TransientNodeBufferReservation>; 2],
-    kernel: impl FnOnce() -> Result<T, PipelineError>,
-) -> Result<T, PipelineError> {
-    let result = kernel();
-    drop(reservations);
-    result
-}
-
 #[cfg(test)]
 mod output_ownership_tests {
     use clinker_record::owned_storage::SharedStorage;
+
+    /// An output drain that fails reading a later row first hands the step
+    /// it streams into every row it produced before the failure, then
+    /// reports the failure; the rows still in its pending batch are not
+    /// dropped.
     #[test]
-    fn input_materialization_charge_ends_after_consuming_kernel() {
-        use crate::executor::node_buffer::reserve_node_buffer_materialization;
-        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
-        let budget = std::sync::Arc::new(MemoryArbitrator::with_policy(
-            4096,
-            0.8,
-            0.7,
-            Box::new(NoOpPolicy),
-        ));
-        let first = reserve_node_buffer_materialization(100, &budget, "join").unwrap();
-        let second = reserve_node_buffer_materialization(200, &budget, "join").unwrap();
-        let result = super::consume_materialized_inputs([Some(first), Some(second)], || {
-            assert_eq!(
-                budget.sum_consumer_usage(),
-                300,
-                "inputs remain charged throughout kernel execution"
-            );
-            Ok(17)
-        })
-        .unwrap();
-        assert_eq!(result, 17);
-        assert_eq!(
-            budget.sum_consumer_usage(),
-            0,
-            "input storage is gone before output drain"
+    fn an_output_drain_delivers_its_pending_rows_before_a_read_failure() {
+        use crate::executor::stream_event::StreamEvent;
+        use crate::executor::stream_hop::HopMessage;
+        use clinker_plan::error::PipelineError;
+        use clinker_record::{Record, Schema, Value};
+        let schema = SharedStorage::from_arc(std::sync::Arc::new(Schema::new(vec!["v".into()])));
+        let row = |v: i64| Record::new(schema.clone(), vec![Value::Integer(v)]);
+        let resources = clinker_format::preparation::MemoryOnlyResources::new(
+            std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
         );
-        assert_eq!(budget.consumer_count(), 0);
-        let input = reserve_node_buffer_materialization(100, &budget, "join").unwrap();
-        let failed: Result<(), _> = super::consume_materialized_inputs([Some(input), None], || {
-            assert_eq!(budget.sum_consumer_usage(), 100);
-            Err(clinker_plan::error::PipelineError::Interrupted)
-        });
-        assert!(failed.is_err());
+        let charge = crate::executor::batch_handoff::StreamingChargeHandle::new(
+            crate::pipeline::memory::ConsumerHandle::new(),
+            std::sync::Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
+                1024 * 1024,
+                0.8,
+                0.7,
+                Box::new(crate::pipeline::memory::NoOpPolicy),
+            )),
+            std::sync::Arc::from(std::path::Path::new(".")),
+            "joined".into(),
+            false,
+            clinker_plan::config::CompressMode::Off,
+            8,
+            resources.resources().allocation().clone(),
+        );
+        let (tx, rx) = crossbeam_channel::unbounded::<HopMessage>();
+        let rows = super::OutputDrainRows::Scripted(
+            vec![
+                Ok((row(1), 1u64.into())),
+                Ok((row(2), 2u64.into())),
+                Err(PipelineError::Internal {
+                    op: "test",
+                    node: "joined".into(),
+                    detail: "spill run read failed".into(),
+                }),
+            ]
+            .into_iter(),
+        );
+        let result =
+            super::stream_block_band_rows(&tx, 8, "joined", rows, Vec::new(), &charge, None);
+        drop(tx);
+        assert!(
+            matches!(&result, Err(PipelineError::Internal { detail, .. }) if detail == "spill run read failed"),
+            "the drain reports its read failure: {result:?}"
+        );
+        let delivered: Vec<i64> = rx
+            .iter()
+            .map(|message| match message {
+                HopMessage::Event(StreamEvent::Record(record, _)) => match record.values()[0] {
+                    Value::Integer(v) => v,
+                    ref other => panic!("unexpected value {other:?}"),
+                },
+                other => panic!("unexpected message {other:?}"),
+            })
+            .collect();
         assert_eq!(
-            budget.consumer_count(),
-            0,
-            "kernel errors release input guards too"
+            delivered,
+            vec![1, 2],
+            "the rows before the failure are delivered in order"
         );
     }
-
     #[test]
     fn output_drain_excludes_only_local_grants_and_retains_vector_capacity() {
         use clinker_format::preparation::MemoryOnlyResources;
@@ -492,7 +505,7 @@ where
     // below), so this drains nothing and the driver records (and their
     // punctuations) arrive on the channel instead, to be reconciled with the
     // retained `build_puncts` after the probe joins.
-    let (driver_buf, driver_puncts, _driver_clone_reservation): (
+    let (driver_buf, driver_puncts, driver_clone_reservation): (
         Vec<(Record, crate::executor::stream_event::SourceRowId)>,
         Vec<crate::executor::stream_event::Punctuation>,
         Option<crate::executor::node_buffer::TransientNodeBufferReservation>,
@@ -517,7 +530,7 @@ where
         build_upstream,
         build_port.as_deref(),
     )?;
-    let (build_input, _build_clone_reservation) =
+    let (build_input, build_clone_reservation) =
         build_input.into_materialized_parts(&ctx.memory_budget, name)?;
     let (build_buf, build_puncts): (
         Vec<(Record, crate::executor::stream_event::SourceRowId)>,
@@ -668,9 +681,9 @@ where
             // equi+range combines, which now share the one path. The
             // path is threshold-driven: it spills its sorted runs,
             // min/max-tagged blocks, and output sort when a buffer
-            // exceeds its own threshold, so the handle's
-            // `should_abort_local` gate is a genuine last resort for a
-            // single block-pair plus kernel aux that still cannot fit.
+            // exceeds its own threshold, so its pre-output check is a
+            // genuine last resort for a single block-pair plus kernel aux
+            // that still cannot fit the whole limit.
             let ie_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
             let ie_consumer_id = ctx.memory_budget.register_node_consumer(
                 Arc::new(crate::pipeline::sort_buffer::SortConsumer::new(
@@ -681,7 +694,7 @@ where
                     node: name.to_string(),
                     surface: MemorySurface::JoinState,
                 },
-            );
+            )?;
             // Every exit past this registration must unregister the
             // consumer, so the kernel-install-through-admit body runs
             // inside a closure whose Result is captured: the clean return
@@ -733,46 +746,47 @@ where
                     .resolve_for_schema(ie_column_count, ctx.batch_size as u64);
                 let iejoin_ctx = ctx.merged_eval_ctx();
                 // CPU-bound block-band IEJoin kernel — external-sort +
-                // block-band range walk over a bounded working set. The
-                // kernel owns its inputs (`driver_buf`, `build_buf`)
-                // and borrows only `&ctx.memory_budget` + the local
-                // `iejoin_ctx`, so it runs on the shared Rayon pool. Row
-                // order is the deterministic `(driver order, driver_idx,
-                // build_idx)` the output sort returns, not pool scheduling.
-                let kernel = consume_materialized_inputs(
-                    [_driver_clone_reservation, _build_clone_reservation],
-                    || {
-                        let kernel = ctx.kernel_pool.install(|| {
-                            execute_combine_iejoin(IEJoinExec {
-                                allocation_resources: &ctx.allocation_resources,
-                                name,
-                                build_qualifier: &build_qualifier,
-                                driver_records: driver_buf,
-                                build_records: build_buf,
-                                decomposed,
-                                body_program: body_typed,
-                                resolver_mapping: &resolver_mapping,
-                                output_schema: combine_output_schema_arc.as_ref(),
-                                match_mode: *match_mode,
-                                on_miss: *on_miss,
-                                max_output_rows,
-                                propagate_ck,
-                                ctx: &iejoin_ctx,
-                                budget: &ctx.memory_budget,
-                                consumer: &ie_consumer_handle,
-                                spill_dir: ctx.spill_root_path.as_ref(),
-                                spill_compress: ie_spill_compress,
-                                strategy: ctx.strategy,
-                            })
-                        })?;
-                        let prior = crate::executor::batch_handoff::StreamingReservation::retain(
-                            ie_consumer_handle.clone(),
-                            sorted_output_retained_bytes(&kernel.sorted, &ctx.allocation_resources)
-                                as u64,
-                        );
-                        Ok(OwnedKernelOutput { kernel, prior })
-                    },
-                )?;
+                // block-band range walk over a bounded working set. It runs
+                // on the walk, so its budget checks and spills run here; only
+                // its key scan and comparator sorts go to the run's kernel
+                // pool. Row order is the deterministic `(driver order,
+                // driver_idx, build_idx)` the output sort returns, not pool
+                // scheduling. The kernel owns both inputs' charges and ends
+                // each once its drain has consumed the side.
+                let kernel = {
+                    let kernel = execute_combine_iejoin(
+                        IEJoinExec {
+                            allocation_resources: &ctx.allocation_resources,
+                            name,
+                            build_qualifier: &build_qualifier,
+                            driver_records: driver_buf,
+                            build_records: build_buf,
+                            decomposed,
+                            body_program: body_typed,
+                            resolver_mapping: &resolver_mapping,
+                            output_schema: combine_output_schema_arc.as_ref(),
+                            match_mode: *match_mode,
+                            on_miss: *on_miss,
+                            max_output_rows,
+                            propagate_ck,
+                            ctx: &iejoin_ctx,
+                            budget: &ctx.memory_budget,
+                            consumer: &ie_consumer_handle,
+                            spill_dir: ctx.spill_root_path.as_ref(),
+                            spill_compress: ie_spill_compress,
+                            strategy: ctx.strategy,
+                            driver_input_charge: driver_clone_reservation,
+                            build_input_charge: build_clone_reservation,
+                        },
+                        &ctx.kernel_pool,
+                    )?;
+                    let prior = crate::executor::batch_handoff::StreamingReservation::retain(
+                        ie_consumer_handle.clone(),
+                        sorted_output_retained_bytes(&kernel.sorted, &ctx.allocation_resources)
+                            as u64,
+                    );
+                    OwnedKernelOutput { kernel, prior }
+                };
                 // Route each deferred output-stage eval failure through the same
                 // `combine_output_row` path the inline arm uses. This MUST run
                 // before the snapshot is dropped below —
@@ -842,18 +856,10 @@ where
             // priority 10) and the GraceHashExecutor that
             // mirrors its in-memory partition `bytes_estimated`
             // sum into the handle's counter on every admit /
-            // spill_partition transition.
-            let grace_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
-            let grace_consumer_id = ctx.memory_budget.register_node_consumer(
-                Arc::new(crate::pipeline::grace_hash::GraceHashConsumer::new(
-                    grace_consumer_handle.clone(),
-                )),
-                grace_consumer_handle.clone(),
-                ConsumerLabel {
-                    node: name.to_string(),
-                    surface: MemorySurface::JoinBuildSide,
-                },
-            );
+            // spill_partition transition. The kernel registers its
+            // partition table as walk-owned state under the same id.
+            let (grace_consumer_id, grace_consumer_handle) =
+                crate::pipeline::grace_hash::register_grace_consumer(&ctx.memory_budget, name)?;
             // Every exit past this registration must unregister the
             // consumer, so the kernel-install-through-admit body runs
             // inside a closure whose Result is captured: the clean return
@@ -901,13 +907,12 @@ where
                     .resolve_for_schema(grace_column_count, ctx.batch_size as u64);
                 let grace_ctx = ctx.merged_eval_ctx();
                 // CPU-bound grace-hash join kernel: partition build +
-                // probe + spill I/O. The kernel owns its inputs and
-                // borrows only `&ctx.memory_budget`, the local
-                // `grace_ctx`, and the spill dir, so it runs on the
-                // shared Rayon pool. Emitted-row order is fixed by the
-                // kernel's deterministic partition-then-probe walk.
-                let kernel_out = ctx.kernel_pool.install(|| {
-                    execute_combine_grace_hash(GraceHashExec {
+                // probe + spill I/O. It runs on the walk, so its budget
+                // checks and spills run here; only its build-key extraction
+                // goes to the run's kernel pool. Emitted-row order is fixed
+                // by the kernel's deterministic partition-then-probe walk.
+                let kernel_out = execute_combine_grace_hash(
+                    GraceHashExec {
                         name,
                         build_qualifier: &build_qualifier,
                         driver_records: driver_buf,
@@ -926,14 +931,18 @@ where
                         spill_dir: ctx.spill_root_path.as_ref(),
                         spill_compress: grace_spill_compress,
                         consumer_handle: grace_consumer_handle,
+                        consumer_id: grace_consumer_id,
                         strategy: ctx.strategy,
                         stats_sink: crate::pipeline::grace_hash::GraceStatsSink {
                             catalog: std::sync::Arc::clone(&ctx.runtime_statistics),
                             node: build_upstream,
                             column: &build_qualifier,
                         },
-                    })
-                })?;
+                        build_input_charge: build_clone_reservation,
+                        driver_input_charge: driver_clone_reservation,
+                    },
+                    &ctx.kernel_pool,
+                )?;
                 let crate::pipeline::combine::CombineKernelOutput {
                     records: output_records,
                     output_eval_failures,
@@ -994,7 +1003,7 @@ where
                     node: name.to_string(),
                     surface: MemorySurface::JoinState,
                 },
-            );
+            )?;
             // Every exit past this registration must unregister the
             // consumer, so the kernel-install-through-admit body runs
             // inside a closure whose Result is captured: the clean return
@@ -1049,13 +1058,12 @@ where
                     .resolve_for_schema(sm_column_count, ctx.batch_size as u64);
                 let sm_ctx = ctx.merged_eval_ctx();
                 // CPU-bound sort-merge join kernel: two-cursor merge
-                // over pre-sorted inputs. The kernel owns its inputs
-                // and borrows only `&ctx.memory_budget`, the local
-                // `sm_ctx`, and the spill dir, so it runs on the
-                // shared Rayon pool. The two-cursor merge emits in a
-                // deterministic order independent of pool scheduling.
-                let kernel_out = ctx.kernel_pool.install(|| {
-                    execute_combine_sort_merge(SortMergeExec {
+                // over pre-sorted inputs. It runs on the walk, so its budget
+                // checks and spills run here; only its range-key extraction
+                // and comparator sorts go to the run's kernel pool. The
+                // two-cursor merge emits in a deterministic order.
+                let kernel_out = execute_combine_sort_merge(
+                    SortMergeExec {
                         allocation_resources: &ctx.allocation_resources,
                         name,
                         build_qualifier: &build_qualifier,
@@ -1076,8 +1084,11 @@ where
                         spill_compress: sm_spill_compress,
                         consumer_handle: sm_consumer_handle,
                         strategy: ctx.strategy,
-                    })
-                })?;
+                        driver_input_charge: driver_clone_reservation,
+                        build_input_charge: build_clone_reservation,
+                    },
+                    &ctx.kernel_pool,
+                )?;
                 let crate::pipeline::sort_merge_join::SortMergeOutput {
                     sorted,
                     row_count,
@@ -1144,7 +1155,7 @@ where
             node: name.to_string(),
             surface: MemorySurface::JoinBuildSide,
         },
-    );
+    )?;
     // Every exit past this registration must unregister the
     // consumer, so the hash-build-through-admit body runs inside a
     // closure whose Result is captured: the clean return, the
@@ -1190,43 +1201,56 @@ where
         let build_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::CombineBuild {
             name: name.clone(),
         });
-        let hash_table = CombineHashTable::build(
+        let inline_requester =
+            crate::pipeline::memory::ledger::Requester::for_consumer(inline_consumer_id);
+        // The build rows stay charged under the build input's reservation
+        // until the finished table takes them over below, so that charge is
+        // what the table's checks count as already charged.
+        let build_input_charge = build_clone_reservation.as_ref().map_or(
+            0,
+            crate::executor::node_buffer::TransientNodeBufferReservation::bytes,
+        );
+        let hash_table = CombineHashTable::build_from_reserved(
             build_records,
             &build_extractor,
             &hash_table_ctx,
             &budget,
+            name,
+            inline_requester,
             estimated_rows,
+            build_input_charge,
         )
-        .map_err(|e| PipelineError::MemoryBudgetExceeded {
-            node: name.clone(),
-            used: budget.peak_rss().unwrap_or(0),
-            limit: budget.hard_limit(),
-            source: BudgetCategory::Arena,
-            detail: Some(format!("combine build: {e}")),
-        })?;
+        .map_err(|e| e.into_build_error(name))?;
         let build_identity_bytes = build_row_ids.capacity().saturating_mul(std::mem::size_of::<
             crate::executor::stream_event::SourceRowId,
         >());
         let inline_bytes = hash_table
             .memory_bytes()
-            .saturating_add(build_identity_bytes);
-        if budget.should_abort_local(inline_bytes as u64) {
-            return Err(PipelineError::MemoryBudgetExceeded {
-                node: name.clone(),
-                used: inline_bytes as u64,
-                limit: budget.limit(),
-                source: BudgetCategory::Arena,
-                detail: Some("combine build identities exceed memory budget".to_string()),
-            });
-        }
+            .saturating_add(build_identity_bytes) as u64;
+        // The finished table is not charged yet: the backstop makes room for
+        // what it adds beyond the build input's charge (spilling other state
+        // on the walk), or refuses naming the reading that tripped. The
+        // hand-over below then moves the input's charge to the table in one
+        // ledger step, so the ledger holds what this check found fits and
+        // each build row's slot is charged once. A row's text its Source
+        // read stays charged under the Source as well as in the table's
+        // figure (#1394).
+        budget
+            .check_hard_limit(
+                name,
+                clinker_plan::runtime_error::MemorySurface::JoinBuildSide,
+                inline_requester,
+                inline_bytes.saturating_sub(build_input_charge),
+            )
+            .map_err(|report| PipelineError::MemoryBudgetExceeded { report })?;
         let build_records_out = hash_table.len() as u64;
-        // Mirror the freshly-built table's footprint into the
-        // consumer handle so the arbitrator's pull-mode
-        // `current_usage` reads the inline-combine's in-memory
-        // bytes for the duration of the probe loop. The probe
-        // loop is read-only on the table so no further updates
-        // are needed; arm exit below unregisters the consumer.
-        inline_consumer_handle.set_bytes(inline_bytes as u64);
+        // The table's footprint is charged to the inline consumer for the
+        // probe loop, which only reads the table; arm exit below
+        // unregisters the consumer.
+        match build_clone_reservation {
+            Some(reservation) => reservation.hand_over_to(&inline_consumer_handle, inline_bytes),
+            None => inline_consumer_handle.set_bytes(inline_bytes),
+        }
         ctx.collector
             .record(build_timer.finish(build_records_in, build_records_out));
 
@@ -1352,23 +1376,30 @@ where
                     // check here — this loop only bounds memory.
 
                     // Budget check every 10K emitted records to bound memory under
-                    // fan-out. The build phase polls `should_abort` every 10K
-                    // inserts inside `CombineHashTable::build`; this covers the
-                    // symmetric probe-side risk where a small build × large driver
-                    // fan-out can blow RSS even though the table itself is bounded.
-                    if emitted_since_check >= 10_000 && budget.should_abort() {
-                        return Err(PipelineError::MemoryBudgetExceeded {
-                            node: name.clone(),
-                            used: budget.peak_rss().unwrap_or(0),
-                            limit: budget.hard_limit(),
-                            source: BudgetCategory::Arena,
-                            detail: Some("combine probe RSS abort".to_string()),
-                        });
+                    // fan-out. The build phase checks every 10K inserts inside
+                    // `CombineHashTable::build`; this covers the symmetric
+                    // probe-side risk where a small build × large driver fan-out
+                    // can blow the limit even though the table itself is bounded.
+                    // Checked after the fact: the walk reclaims other state
+                    // before it refuses.
+                    if emitted_since_check >= 10_000 {
+                        budget
+                            .check_hard_limit(
+                                name,
+                                clinker_plan::runtime_error::MemorySurface::JoinState,
+                                inline_requester,
+                                0,
+                            )
+                            .map_err(|report| PipelineError::MemoryBudgetExceeded { report })?;
                     }
                     if emitted_since_check >= 10_000 {
                         emitted_since_check = 0;
                     }
                 }
+                // Every driver row was probed and dropped, and the input
+                // vector is freed: the input's charge stands for nothing from
+                // here, through the output's hand-off or admission.
+                drop(driver_clone_reservation);
 
                 // Fold the probe kernel's `distinct` / `filtered` skip counts into
                 // the run counters — applied after the loop, the same place the
@@ -1401,12 +1432,8 @@ where
         // harmlessly. The per-fold snapshot is dropped here; the
         // hash-table consumer is released by the shared unregister
         // funnel every exit from this arm passes through.
-        if let Some(sender) = ctx.take_streaming_sender(node_idx) {
+        if let Some((sender, charge)) = ctx.take_streaming_hop(current_dag, node_idx, name)? {
             let batch_size = ctx.batch_size;
-            let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
-            let charge = ctx
-                .streaming_charge_handle(node_idx, name, spill_allowed)
-                .expect("streaming sender implies a registered charge consumer");
             stream_linear_producer_emit(
                 &sender,
                 batch_size,
@@ -1507,24 +1534,6 @@ impl StreamingProbeEffects {
     }
 }
 
-/// Read the streaming channel to disconnect, discharging each record's
-/// per-row cost, so the driver producer's `send` can never block on a probe
-/// thread that has stopped consuming. Every early return from the probe loop
-/// drains first.
-fn drain_probe_channel(
-    rx: &crossbeam_channel::Receiver<crate::executor::stream_event::StreamEvent>,
-    charge_handle: &crate::pipeline::memory::ConsumerHandle,
-    resources: &clinker_record::owned_storage::AllocationResources,
-) {
-    while let Ok(event) = rx.recv() {
-        if let crate::executor::stream_event::StreamEvent::Record(record, _) = event {
-            charge_handle.sub_bytes(crate::executor::node_buffer::unaccounted_record_byte_cost(
-                &record, resources,
-            ));
-        }
-    }
-}
-
 /// Drive an inline hash build-probe Combine's probe (driver) side off a
 /// bounded channel the driver producer fills, instead of pre-draining the
 /// driver's whole output from a charged `node_buffers` slot. The build-side
@@ -1544,8 +1553,9 @@ fn drain_probe_channel(
 /// [`StreamingProbeEffects`], replayed on the dispatch thread after the
 /// scope joins so rollback cursors, the per-fold rewind snapshot, and DLQ
 /// sequencing match the drain-to-`Vec` path exactly. Mid-stream
-/// `$source.count` is `None` (the driver total is unknown until disconnect),
-/// the same defer-emit semantic the streaming Aggregate ingest uses.
+/// `$source.count` is `None` (the driver's total is unknown until its
+/// Source's stream ends), the same defer-emit semantic the streaming
+/// Aggregate ingest uses.
 ///
 /// The failures the thread holds until the join are charged to `held`, the
 /// combine's own consumer, as each is appended, and discharged as the replay
@@ -1581,11 +1591,16 @@ fn run_streaming_combine_probe(
     // producer's index, so its dispatch arm streams into it with no
     // producer-side change. The probe thread's per-record `sub_bytes`
     // discharge nets the producer's per-batch charge to zero.
-    let (rx, charge_handle, charge_consumer_id) = ctx.install_streaming_ingest_channel(
+    let crate::executor::stream_hop::StreamingIngestHop {
+        rx,
+        end: hop_end,
+        charge_handle,
+        charge_consumer_id,
+    } = ctx.install_streaming_ingest_channel(
         producer_idx,
         current_dag.graph[producer_idx].name(),
         name,
-    );
+    )?;
 
     // Copy the stable-context references out of `ctx` before the scope so
     // the probe thread borrows `&'a StableEvalContext` directly (shared,
@@ -1595,6 +1610,9 @@ fn run_streaming_combine_probe(
     let source_batch_arc = ctx.source_batch_arc;
     let ingestion_timestamp = ctx.source_ingestion_timestamp;
     let allocation_resources = ctx.allocation_resources.clone();
+    // The hard-limit check names the combine's own consumer, as the
+    // materialized loop's does.
+    let inline_requester = held.requester();
 
     let mut effects = StreamingProbeEffects {
         cursor_advances: Vec::new(),
@@ -1609,137 +1627,178 @@ fn run_streaming_combine_probe(
 
     // Run the probe recv loop and the driver producer concurrently. The
     // scoped thread owns the channel drain + probe; the main thread
-    // redispatches the driver (which streams into the channel and drops its
-    // sender at clean exit, disconnecting the channel). Both the driver's
-    // `?` error and the probe thread's error surface; the probe thread
-    // always drains to disconnect first so a driver `send` can never
-    // deadlock on a dead consumer.
+    // redispatches the driver, which streams into the channel, and then
+    // ends the hop if the driver returned `Ok`. The probe completes only on
+    // that End: a channel that closes without it means the driver failed or
+    // was stopped, and the probe completes nothing. Both results are
+    // settled together by `settle_hop`; the probe thread drains to
+    // disconnect on every error exit so neither a driver `send` nor the End
+    // can block on a dead consumer.
+    let hop_ends = ctx.hop_ends.clone();
     let probe_result: Result<(), PipelineError> = std::thread::scope(|scope| {
-        let handle = scope.spawn(|| -> Result<(), PipelineError> {
-            let mut probe_keys_buf: Vec<Value> = Vec::with_capacity(kernel.probe_extractor.len());
-            let mut budget_cadence: usize = 0;
-            while let Ok(event) = rx.recv() {
-                let (record, rn) = match event {
-                    StreamEvent::Record(r, rn) => (r, rn),
-                    // Punctuations carry zero record charge (no `sub_bytes`
-                    // discharge, no `input_count` increment), so collect them
-                    // for post-join reconciliation with the build side rather
-                    // than dropping them. The driver's document boundaries
-                    // must reach a downstream per-document consumer.
-                    StreamEvent::Punctuation(p) => {
-                        driver_puncts.push(p);
-                        continue;
+        let handle = scope.spawn(|| {
+            // The thread owns the receiver, so a panic on it drops the
+            // receiver and a driver's next `send` fails instead of blocking.
+            let rx = rx;
+            let mut completed = false;
+            let mut probe = || -> Result<crate::executor::stream_hop::HopVerdict, PipelineError> {
+                let mut probe_keys_buf: Vec<Value> =
+                    Vec::with_capacity(kernel.probe_extractor.len());
+                let mut budget_cadence: usize = 0;
+                let verdict = loop {
+                    let event = match crate::executor::stream_hop::next_event(&rx) {
+                        std::ops::ControlFlow::Continue(event) => event,
+                        std::ops::ControlFlow::Break(verdict) => break verdict,
+                    };
+                    let (record, rn) = match event {
+                        StreamEvent::Record(r, rn) => (r, rn),
+                        // Punctuations carry zero record charge (no `sub_bytes`
+                        // discharge, no `input_count` increment), so collect them
+                        // for post-join reconciliation with the build side rather
+                        // than dropping them. The driver's document boundaries
+                        // must reach a downstream per-document consumer.
+                        StreamEvent::Punctuation(p) => {
+                            driver_puncts.push(p);
+                            continue;
+                        }
+                    };
+                    // Discharge this record's per-row cost — the consume half of
+                    // the driver's per-batch admit. The formula matches the
+                    // charge so a fully-drained stream nets to zero.
+                    charge_handle.sub_bytes(
+                        crate::executor::node_buffer::unaccounted_record_byte_cost(
+                            &record,
+                            &allocation_resources,
+                        ),
+                    );
+                    input_count += 1;
+
+                    let source_file_arc = source_file_arc_of(&record);
+                    let source_name_arc = source_name_arc_of(&record);
+
+                    // Operator-entry schema check, mirroring the materialized
+                    // driver-side `check_input_schema` loop.
+                    if let Err(err) = check_input_schema(
+                        &expected_input,
+                        record.schema(),
+                        name,
+                        "combine",
+                        &upstream_name,
+                    ) {
+                        // A schema mismatch is a fatal E314 in both paths; drain
+                        // to disconnect first so the driver `send` cannot
+                        // deadlock, then surface.
+                        crate::executor::stream_hop::discard_until_closed(
+                            &rx,
+                            &charge_handle,
+                            &allocation_resources,
+                        );
+                        return Err(err);
                     }
-                };
-                // Discharge this record's per-row cost — the consume half of
-                // the driver's per-batch admit. The formula matches the
-                // charge so a fully-drained stream nets to zero.
-                charge_handle.sub_bytes(
-                    crate::executor::node_buffer::unaccounted_record_byte_cost(
+
+                    // Track the driver source on first sight (for the post-join
+                    // pre-fold floor capture) and record the cursor advance for
+                    // replay.
+                    if !effects
+                        .driver_sources
+                        .iter()
+                        .any(|s| Arc::ptr_eq(s, &source_name_arc))
+                    {
+                        effects.driver_sources.push(Arc::clone(&source_name_arc));
+                    }
+                    effects
+                        .cursor_advances
+                        .push((Arc::clone(&source_name_arc), rn));
+
+                    // Mid-stream `$source.count` is `None` (the driver's total
+                    // is unknown until its Source's stream ends) — the same
+                    // defer-emit semantic the streaming Aggregate ingest uses.
+                    let eval_ctx = EvalContext {
+                        stable,
+                        source_file: &source_file_arc,
+                        source_row: rn.ordinal(),
+                        source_path: &source_file_arc,
+                        source_count: None,
+                        source_batch: source_batch_arc,
+                        ingestion_timestamp,
+                        source_name: &source_name_arc,
+                        doc_ctx: record.doc_ctx(),
+                    };
+
+                    let before = output_records.len();
+                    match kernel.probe_row(
+                        &eval_ctx,
                         &record,
-                        &allocation_resources,
-                    ),
-                );
-                input_count += 1;
+                        rn,
+                        &mut probe_keys_buf,
+                        ProbeSink {
+                            rows: &mut output_records,
+                            failures: &mut effects.failures,
+                            counters: &mut counters,
+                        },
+                    ) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            // Fatal (FailFast surfacing, on_miss::error,
+                            // planner-invariant) — drain to disconnect, then
+                            // surface.
+                            crate::executor::stream_hop::discard_until_closed(
+                                &rx,
+                                &charge_handle,
+                                &allocation_resources,
+                            );
+                            return Err(e);
+                        }
+                    };
 
-                let source_file_arc = source_file_arc_of(&record);
-                let source_name_arc = source_name_arc_of(&record);
+                    // The opt-in `max_output_rows` cap (E325) is enforced per-row inside
+                    // `kernel.probe_row`; when it trips, `probe_row` returns `Err`, which
+                    // the match above already surfaces after draining the channel — so
+                    // the streaming path is covered without a separate check here.
 
-                // Operator-entry schema check, mirroring the materialized
-                // driver-side `check_input_schema` loop.
-                if let Err(err) = check_input_schema(
-                    &expected_input,
-                    record.schema(),
-                    name,
-                    "combine",
-                    &upstream_name,
-                ) {
-                    // A schema mismatch is a fatal E314 in both paths; drain
-                    // to disconnect first so the driver `send` cannot
-                    // deadlock, then surface.
-                    drain_probe_channel(&rx, &charge_handle, &allocation_resources);
-                    return Err(err);
-                }
+                    // Charge the failures this driver added before the budget
+                    // check, so the check sees them. They are held until the
+                    // join, not written as the materialized loop writes its own.
+                    let new_failures = effects.charge_new_failures(held, &allocation_resources);
 
-                // Track the driver source on first sight (for the post-join
-                // pre-fold floor capture) and record the cursor advance for
-                // replay.
-                if !effects
-                    .driver_sources
-                    .iter()
-                    .any(|s| Arc::ptr_eq(s, &source_name_arc))
-                {
-                    effects.driver_sources.push(Arc::clone(&source_name_arc));
-                }
-                effects
-                    .cursor_advances
-                    .push((Arc::clone(&source_name_arc), rn));
-
-                // Mid-stream `$source.count` is `None` (the driver total is
-                // unknown until disconnect) — the same defer-emit semantic
-                // the streaming Aggregate ingest uses.
-                let eval_ctx = EvalContext {
-                    stable,
-                    source_file: &source_file_arc,
-                    source_row: rn.ordinal(),
-                    source_path: &source_file_arc,
-                    source_count: None,
-                    source_batch: source_batch_arc,
-                    ingestion_timestamp,
-                    source_name: &source_name_arc,
-                    doc_ctx: record.doc_ctx(),
-                };
-
-                let before = output_records.len();
-                match kernel.probe_row(
-                    &eval_ctx,
-                    &record,
-                    rn,
-                    &mut probe_keys_buf,
-                    ProbeSink {
-                        rows: &mut output_records,
-                        failures: &mut effects.failures,
-                        counters: &mut counters,
-                    },
-                ) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        // Fatal (FailFast surfacing, on_miss::error,
-                        // planner-invariant) — drain to disconnect, then
-                        // surface.
-                        drain_probe_channel(&rx, &charge_handle, &allocation_resources);
-                        return Err(e);
+                    // Budget check every 10K emitted or failed records, the same
+                    // cadence and abort the materialized loop uses.
+                    budget_cadence += output_records.len() - before + new_failures;
+                    // The probe thread is off the walk, so the check refuses at
+                    // once, with no reclaim round, when the run is past its limit.
+                    if budget_cadence >= 10_000
+                        && let Err(report) = budget.check_hard_limit(
+                            name,
+                            clinker_plan::runtime_error::MemorySurface::JoinState,
+                            inline_requester,
+                            0,
+                        )
+                    {
+                        crate::executor::stream_hop::discard_until_closed(
+                            &rx,
+                            &charge_handle,
+                            &allocation_resources,
+                        );
+                        return Err(PipelineError::MemoryBudgetExceeded { report });
+                    }
+                    if budget_cadence >= 10_000 {
+                        budget_cadence = 0;
                     }
                 };
-
-                // The opt-in `max_output_rows` cap (E325) is enforced per-row inside
-                // `kernel.probe_row`; when it trips, `probe_row` returns `Err`, which
-                // the match above already surfaces after draining the channel — so
-                // the streaming path is covered without a separate check here.
-
-                // Charge the failures this driver added before the budget
-                // check, so the check sees them. They are held until the
-                // join, not written as the materialized loop writes its own.
-                let new_failures = effects.charge_new_failures(held, &allocation_resources);
-
-                // Budget check every 10K emitted or failed records, the same
-                // cadence and abort the materialized loop uses.
-                budget_cadence += output_records.len() - before + new_failures;
-                if budget_cadence >= 10_000 && budget.should_abort() {
-                    drain_probe_channel(&rx, &charge_handle, &allocation_resources);
-                    return Err(PipelineError::MemoryBudgetExceeded {
-                        node: name.to_string(),
-                        used: budget.peak_rss().unwrap_or(0),
-                        limit: budget.hard_limit(),
-                        source: BudgetCategory::Arena,
-                        detail: Some("combine probe RSS abort".to_string()),
-                    });
-                }
-                if budget_cadence >= 10_000 {
-                    budget_cadence = 0;
-                }
-            }
-            Ok(())
+                // Only the driver's End completes the probe: a closed channel
+                // is a prefix of the driver's output, which joins nothing.
+                completed = verdict == crate::executor::stream_hop::HopVerdict::Ended;
+                Ok(verdict)
+            };
+            // A governed allocation this worker was refused ends the probe
+            // here, on the thread that recorded the refusal's report.
+            let result = crate::pipeline::memory::ledger::convert_governed_refusal(
+                probe(),
+                name,
+                clinker_plan::runtime_error::MemorySurface::JoinState,
+            );
+            hop_ends.record(name, result.as_ref().ok().copied(), completed);
+            result
         });
 
         // Redispatch the driver producer on the main thread. Clear its
@@ -1747,21 +1806,31 @@ fn run_streaming_combine_probe(
         // short-circuit (which made the producer's own topo turn a no-op)
         // does not fire again here — this is the one turn the producer must
         // actually run. It takes the sender we installed and streams into
-        // the channel, dropping it at clean exit.
+        // the channel.
         ctx.streaming_combine_probe_edges.remove(&producer_idx);
         let producer_result =
             crate::executor::dispatch::dispatch_plan_node(ctx, current_dag, producer_idx);
-        // Belt-and-suspenders: ensure the channel disconnects even if a
-        // producer error left a sender lingering on `ctx`, so the probe
-        // thread's `recv` returns `Err` and the join below cannot hang.
+        // Belt-and-suspenders: a producer error may leave its sender on
+        // `ctx`; remove it so only the hop's end still holds the channel.
         ctx.streaming_output_senders.remove(&producer_idx);
+        // The driver's whole output is on the channel only when it returned
+        // `Ok`. Otherwise the end is dropped unsent, and the channel closes
+        // without End once the last sender is gone, so the join below cannot
+        // wait on a channel that stays open.
+        if producer_result.is_ok() {
+            hop_end.end();
+        } else {
+            drop(hop_end);
+        }
 
-        let probe = handle.join().map_err(|_| PipelineError::Internal {
-            op: "combine",
-            node: name.to_string(),
-            detail: "streaming combine probe thread panicked".to_string(),
-        })?;
-        producer_result.and(probe)
+        let probe = handle.join().unwrap_or_else(|_| {
+            Err(PipelineError::Internal {
+                op: "combine",
+                node: name.to_string(),
+                detail: "streaming combine probe thread panicked".to_string(),
+            })
+        });
+        crate::executor::stream_hop::settle_hop(name, &upstream_name, probe, producer_result)
     });
 
     // Charge bookkeeping is complete: the driver charged each batch and the
@@ -2512,11 +2581,11 @@ fn drain_block_band_output(
     // cross-region tee — those consume the whole slice) AND a sender is
     // present: taking it without draining would strand the writer thread on
     // records that never arrive.
-    if !needs_materialization && let Some(sender) = ctx.take_streaming_sender(node_idx) {
+    if !needs_materialization
+        && let Some((sender, charge)) =
+            ctx.take_streaming_hop(current_dag, node_idx, combine_name)?
+    {
         let batch_size = ctx.batch_size;
-        let charge = ctx
-            .streaming_charge_handle(node_idx, combine_name, spill_allowed)
-            .expect("streaming sender implies a registered charge consumer");
         // Both output shapes drain the identical `(order, driver_idx,
         // build_idx)` sort, so the streamed rows arrive in the same order the
         // buffered path admits — the determinism the cross-limit tests pin
@@ -2671,7 +2740,7 @@ fn drain_block_band_output(
 /// backing is retained until routing consumes it. The bounded channel paces
 /// the drain, and punctuations follow records as on the buffered path.
 fn stream_block_band_rows(
-    sender: &crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>,
+    sender: &crate::executor::stream_hop::HopSender,
     batch_size: usize,
     node_name: &str,
     rows: OutputDrainRows,
@@ -2693,7 +2762,7 @@ fn stream_block_band_rows(
             container,
         } = owned;
         let result = charge.own_charged_batch(batch, pending).and_then(|batch| charge.route_charged_batch(batch, |event| {
-            sender.send(event).map_err(|_| PipelineError::Internal {
+            sender.send(crate::executor::stream_hop::HopMessage::Event(event)).map_err(|_| PipelineError::Internal {
                 op: "executor", node: node_name.to_string(),
                 detail: "streaming Sink writer task dropped its receiver before the output drain finished".into(),
             })
@@ -2703,7 +2772,25 @@ fn stream_block_band_rows(
     };
     let mut count: u64 = 0;
     while let Some(item) = rows.rows.next() {
-        let (record, rn) = item?;
+        let (record, rn) = match item {
+            Ok(row) => row,
+            Err(read_error) => {
+                // A producer delivers every row it emitted before it reports
+                // its failure, so the step it streams into meets the rows in
+                // order and fails on the earliest one it cannot take. The
+                // read failure is later in the output than any pending row,
+                // so it is the error returned even when the delivery fails.
+                if let Err(delivery_error) = route(batch) {
+                    tracing::warn!(
+                        node = node_name,
+                        error = %delivery_error,
+                        "the Combine could not hand the rows it produced before its failure \
+                         to the step it streams into; the run reports the Combine's failure"
+                    );
+                }
+                return Err(read_error);
+            }
+        };
         rows.retained.transfer_row(
             &mut batch.pending,
             rows.rows.retained_heap_bytes(charge.allocation_resources()) as u64,
@@ -2807,6 +2894,10 @@ enum OutputDrainRows {
         allocation_resources: clinker_record::owned_storage::AllocationResources,
     },
     Spilled(crate::pipeline::spill_merge::SortedRunMerger<(RecordOrder, u64, u64)>),
+    /// Rows and failures in a fixed order, for a test of the drain's failure
+    /// path; it holds no charged storage.
+    #[cfg(test)]
+    Scripted(std::vec::IntoIter<Result<(Record, RecordOrder), PipelineError>>),
 }
 impl OutputDrainRows {
     fn memory(
@@ -2836,6 +2927,8 @@ impl OutputDrainRows {
                 ..
             } => *backing_bytes + *record_heap_bytes,
             Self::Spilled(merger) => merger.retained_unaccounted_heap_bytes(resources),
+            #[cfg(test)]
+            Self::Scripted(_) => 0,
         }
     }
 }
@@ -2853,6 +2946,8 @@ impl Iterator for OutputDrainRows {
                 Ok(pair)
             }),
             Self::Spilled(merger) => merger.next(),
+            #[cfg(test)]
+            Self::Scripted(rows) => return rows.next(),
         }
         .map(|item| item.map(|(record, (order, _, _))| (record, order)))
     }
@@ -2925,9 +3020,12 @@ fn adopt_spilled_runs_into_node_buffer(
     puncts: Vec<crate::executor::stream_event::Punctuation>,
 ) -> Result<(), PipelineError> {
     use crate::executor::node_buffer::{NodeBuffer, NodeBufferConsumer};
-    if ctx.node_buffers.contains_key(&node_idx.into())
-        || ctx.node_buffer_consumer_ids.contains_key(&node_idx.into())
-    {
+    let slot_key = crate::executor::dispatch::NodeBufferKey::from(node_idx);
+    let occupied = {
+        let set = ctx.walk_reclaim.borrow();
+        set.slots().contains_buffer(&slot_key) || set.slots().is_registered(&slot_key)
+    };
+    if occupied {
         return Err(PipelineError::Internal {
             op: "executor",
             node: combine_name.to_string(),
@@ -2938,7 +3036,6 @@ fn adopt_spilled_runs_into_node_buffer(
     // Register the slot's node-buffer consumer at zero resident bytes so its
     // later drain unregisters through the same path `admit_node_buffer` sets up.
     let handle = crate::pipeline::memory::ConsumerHandle::new();
-    handle.set_bytes(0);
     let label = ctx.planned_node_buffer_readers.slot_label(
         combine_name,
         &node_idx.into(),
@@ -2948,12 +3045,26 @@ fn adopt_spilled_runs_into_node_buffer(
         Arc::new(NodeBufferConsumer::new(handle.clone())),
         handle.clone(),
         label,
+    )?;
+    ctx.walk_reclaim.borrow_mut().slots_mut().register(
+        slot_key.clone(),
+        (consumer_id, handle),
+        crate::pipeline::memory::walk::SlotSpill {
+            spill_allowed: crate::executor::dispatch::node_buffer_spill_allowed(
+                current_dag,
+                node_idx,
+            ),
+            node_name: Box::from(current_dag.graph[node_idx].name()),
+        },
     );
-    ctx.node_buffer_consumer_ids
-        .insert(node_idx.into(), (consumer_id, handle));
     if let Err(error) = declare_node_buffer_readers(ctx, current_dag, combine_name, node_idx) {
-        if let Some((id, handle)) = ctx.node_buffer_consumer_ids.remove(&node_idx.into()) {
-            handle.set_bytes(0);
+        let registration = ctx
+            .walk_reclaim
+            .borrow_mut()
+            .slots_mut()
+            .remove_registration(&slot_key);
+        if let Some((id, handle)) = registration {
+            handle.shrink(handle.bytes());
             ctx.memory_budget.unregister_consumer(id);
         }
         return Err(error);
@@ -2969,7 +3080,13 @@ fn adopt_spilled_runs_into_node_buffer(
         merge_compress,
     );
     let buffer = NodeBuffer::merge_spilled(files, row_count, puncts, merge_budget);
-    if ctx.node_buffers.insert(node_idx.into(), buffer).is_some() {
+    let replaced = ctx
+        .walk_reclaim
+        .borrow_mut()
+        .slots_mut()
+        .insert_buffer(slot_key, buffer)
+        .is_some();
+    if replaced {
         drain_node_buffer_slot(ctx, node_idx);
         return Err(PipelineError::Internal {
             op: "executor",

@@ -219,8 +219,9 @@ nodes:
 /// batch; under the layout-sized budget the test process's own RSS crosses the
 /// 80 % soft floor, so each batch's records round-trip through a
 /// `SpillFile<u64>` (re-read and forwarded to the writer). The run
-/// completes — the streaming path never polls the hard-limit
-/// `should_abort`, so a tiny test budget spills rather than aborts, the
+/// completes — the streaming path never runs the hard-limit check
+/// (`MemoryArbitrator::check_hard_limit`), so a tiny test budget spills
+/// rather than aborts, the
 /// same posture the materialized `route_fanout_soft_spill` test relies on.
 ///
 /// `backpressure: spill` is required because the budget is below the

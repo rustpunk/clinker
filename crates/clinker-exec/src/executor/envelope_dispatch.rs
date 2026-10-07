@@ -185,7 +185,12 @@ where
         .edges_connecting(body_pred, node_idx)
         .next()
         .and_then(|edge| edge.weight().producer_port.as_deref());
-    let body_key = single_input_node_buffer_key(&ctx.node_buffers, node_idx, body_pred, body_port);
+    let body_key = single_input_node_buffer_key(
+        ctx.walk_reclaim.borrow().slots().buffers(),
+        node_idx,
+        body_pred,
+        body_port,
+    );
     let body_input = require_node_buffer_input(
         ctx,
         body_key,

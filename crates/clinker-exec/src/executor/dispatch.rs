@@ -229,7 +229,7 @@ pub(crate) fn source_file_arc_of(record: &Record) -> Arc<str> {
 /// Read the per-record Source-node name from the record's
 /// [`FieldMetadata::SourceName`] engine-stamped column. Returns `None`
 /// when the column is absent (synthetic emits) or non-String.
-fn source_name_of(record: &Record) -> Option<&str> {
+pub(crate) fn source_name_of(record: &Record) -> Option<&str> {
     let schema = record.schema();
     for idx in 0..schema.column_count() {
         if matches!(schema.field_metadata(idx), Some(FieldMetadata::SourceName))
@@ -703,6 +703,11 @@ pub(crate) enum ConsumedSourceEvent {
     Punctuation(crate::executor::stream_event::Punctuation),
     Rejected,
     Population,
+    /// The Source's reader reached the end of its input: every event before
+    /// this one is the Source's complete output, and the channel carries
+    /// nothing more. Only a complete read ends this way; an interrupted or
+    /// failed read is the walk's error instead.
+    Ended,
 }
 
 /// Rows staged before the shared write path publishes them itself.
@@ -813,12 +818,45 @@ pub(crate) fn apply_source_attempt_population(
 /// Consume all source-channel shapes through one accounting seam. Ordered
 /// payloads prove their population was applied; direct unordered attempts are
 /// counted one at a time through the same counters.
+///
+/// `item` is what the receive returned: `None` when the channel disconnected.
+/// Every walk path that reads a Source's channel comes through here, so the
+/// end of a Source's input is established in one place: only the reader's
+/// [`Ended`](crate::executor::source_stream::SourceStreamEvent::Ended) ends
+/// it. A reader's failure becomes the walk's error at the point in the
+/// Source's data where the reader stopped, before any step finishes on the
+/// rows that came before it. A read the run's cancellation cut off becomes
+/// the walk's graceful interruption at that same point, so no step finishes
+/// on its rows either. A channel that disconnects without a terminal event
+/// means the reader's thread stopped without reporting how its read ended,
+/// and is a failure too.
 pub(crate) fn consume_source_event(
     ctx: &mut ExecutorContext<'_>,
     expected_source: &Arc<str>,
-    event: crate::executor::source_stream::SourceStreamEvent,
+    item: Option<crate::executor::source_stream::SourceStreamEvent>,
 ) -> Result<ConsumedSourceEvent, PipelineError> {
+    let Some(event) = item else {
+        return Err(PipelineError::Internal {
+            op: "source-read",
+            node: expected_source.to_string(),
+            detail: "the Source's reader stopped before it reached the end of its input \
+                     without reporting why"
+                .to_string(),
+        });
+    };
     match event {
+        crate::executor::source_stream::SourceStreamEvent::Ended => Ok(ConsumedSourceEvent::Ended),
+        crate::executor::source_stream::SourceStreamEvent::Interrupted => {
+            ctx.interrupted = true;
+            Err(PipelineError::Interrupted)
+        }
+        crate::executor::source_stream::SourceStreamEvent::Failed(failure) => {
+            Err(failure.take().unwrap_or_else(|| PipelineError::Internal {
+                op: "source-read",
+                node: expected_source.to_string(),
+                detail: "the Source's reader failure was already reported".to_string(),
+            }))
+        }
         crate::executor::source_stream::SourceStreamEvent::Population(delta) => {
             apply_source_attempt_population(ctx, expected_source, delta)?;
             Ok(ConsumedSourceEvent::Population)
@@ -1285,7 +1323,6 @@ pub(crate) fn sink_collision_dlq_entry(
 use crate::executor::node_buffer::{NodeBuffer, TransientNodeBufferReservation};
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{DlqEntry, DlqFailureStamp, evaluate_single_transform, stage_metrics};
-use clinker_plan::BudgetCategory;
 use clinker_plan::plan::composition_body::CompositionBodies;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 use clinker_record::Schema;
@@ -1300,7 +1337,7 @@ use clinker_record::Schema;
 /// `(node, Some(port))` slot, and a predecessor-slot consumer (Merge / Combine)
 /// drains the slot named by its incoming edge's
 /// [`producer_port`](clinker_plan::plan::execution::PlanEdge::producer_port).
-/// Keeping `node_buffers` and `node_buffer_consumer_ids` keyed by the same type
+/// Keying a scope's buffers and their consumer registrations by the same type
 /// keeps the arbitrator's consumer registry aligned with the live slot map.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct NodeBufferKey {
@@ -1368,6 +1405,12 @@ impl NodeBufferReaderLedger {
             }
         }
         Ok(())
+    }
+
+    /// How many readers the slot at `key` still expects.
+    #[cfg(test)]
+    pub(crate) fn remaining(&self, key: &NodeBufferKey) -> Option<usize> {
+        self.remaining.get(key).copied()
     }
 
     fn remaining_for_slot(
@@ -1475,7 +1518,8 @@ impl NodeBufferReaderLedger {
 ///   reused at every per-record dispatch site.
 ///
 /// Owned (mutated across the walk):
-/// * `node_buffers` — `(Record, row_num)` queues threaded between arms.
+/// * `walk_reclaim` — the walk reclaim set, owning the node-buffer slots:
+///   `(Record, row_num)` queues threaded between arms.
 /// * `source_records` — per-source live crossbeam `Receiver`s keyed by
 ///   Source node name. The Source dispatch arm drains its receiver
 ///   via `recv`; the paired sender lives on a `std::thread` ingest
@@ -1523,9 +1567,9 @@ pub(crate) struct ExecutorContext<'a> {
     /// `pipeline.batch_id`.
     pub(crate) source_batch_arc: &'a Arc<str>,
     /// Per-source finalized record count, keyed by Source node name.
-    /// `Some(n)` once the Source's crossbeam `Receiver` has disconnected
-    /// — i.e. the upstream ingest thread closed its sender and we know
-    /// the total. `None` while the source is still streaming.
+    /// `Some(n)` once the Source's reader has ended its stream — i.e. it
+    /// read its whole input and we know the total. `None` while the source
+    /// is still streaming.
     ///
     /// The `$source.count` evaluator reads this through
     /// [`Self::source_count_for`], which resolves the right per-source
@@ -1543,25 +1587,21 @@ pub(crate) struct ExecutorContext<'a> {
     pub(crate) run_policy: crate::executor::RunPolicy,
 
     // Owned mutable per-walk state.
-    pub(crate) node_buffers: HashMap<NodeBufferKey, NodeBuffer>,
-    /// Per-slot consumer registration for `node_buffers`. `admit_node_buffer`
-    /// registers a `NodeBufferConsumer` with the pipeline-scoped arbitrator
-    /// and stores both the returned `ConsumerId` (used to `unregister_consumer`
-    /// after the slot's final reader) and a clone of the `Arc<ConsumerHandle>`
-    /// (used by partial-discharge sites to drive `handle.sub_bytes`). Keyed
-    /// by exact `NodeBufferKey`; body-scope swaps replace this map alongside
-    /// `node_buffers` so a body walk does not pollute the parent scope's registry.
-    pub(crate) node_buffer_consumer_ids: HashMap<
-        NodeBufferKey,
-        (
-            crate::pipeline::memory::ConsumerId,
-            std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
-        ),
-    >,
-    /// Producer-declared remaining readers for every materialized slot. Body
-    /// scopes swap this ledger alongside `node_buffers` so equal local
-    /// `NodeIndex` values cannot collide across scopes.
-    pub(crate) node_buffer_readers: NodeBufferReaderLedger,
+    /// The walk's reclaimable state, shared with the walk frame the run
+    /// installs on this thread, so a reclaim started from any governed
+    /// allocation on the walk reaches it without `&mut` access to this
+    /// context. It owns each open scope's node-buffer slots: the
+    /// `(Record, row_num)` queues threaded between arms, each slot's
+    /// `NodeBufferConsumer` registration (the id unregistered after the
+    /// slot's final reader, and the handle partial discharges drive), and the
+    /// producer-declared remaining readers. A composition body pushes its
+    /// own slots as a frame above its caller's so equal local `NodeIndex`
+    /// values never collide across scopes; arms see only the top frame.
+    /// Borrowed in short scopes only, never across a governed
+    /// allocation, a `reserve`, a channel wait or a call into another
+    /// dispatch arm.
+    pub(crate) walk_reclaim:
+        std::rc::Rc<std::cell::RefCell<crate::pipeline::memory::walk::WalkReclaimSet>>,
     /// Immutable reader cardinality for each producer-owned slot in the
     /// current DAG scope. Built once in one edge pass, then consulted in O(1)
     /// at publication so wide multi-port fan-out does not rescan the graph per
@@ -1604,7 +1644,7 @@ pub(crate) struct ExecutorContext<'a> {
     /// [`Self::source_records`]. Ownership follows the receiver: the arm
     /// that removes a source's receiver (the Source arm, a fused
     /// `Merge.interleave`, or a fused Transform) also releases this entry
-    /// via [`Self::release_source_consumer`] at receiver disconnect,
+    /// via [`Self::release_source_consumer`] when the stream ends,
     /// zeroing the mirrored queue charge and unregistering the wrapper so
     /// the drained channel stops counting toward `sum_consumer_usage`.
     /// Body-scope walks save/restore this map with `source_records`, install
@@ -1806,10 +1846,16 @@ pub(crate) struct ExecutorContext<'a> {
     /// `None` otherwise; every record streams through per-record DLQ
     /// semantics with zero overhead.
     ///
+    /// The state lives in a cell of its own that the walk reclaim set also
+    /// holds, so a reclaim pass can flush its held rows. Every borrow of it
+    /// is one step of the state's own work, never held across a call into
+    /// another dispatch arm or the dead-letter writer.
+    ///
     /// Declared before [`Self::spill_root`]: its held log keeps a file open
     /// inside the spill directory, which must close before the directory is
     /// removed.
-    pub(crate) document_dlq: Option<crate::executor::document_dlq::DocumentDlqState>,
+    pub(crate) document_dlq:
+        Option<std::rc::Rc<std::cell::RefCell<crate::executor::document_dlq::DocumentDlqState>>>,
 
     /// Pipeline-scoped spill directory bundled with the OS advisory lock held on
     /// its `.lock` file. Allocated once at `execute_dag_branching` start; every
@@ -1925,19 +1971,20 @@ pub(crate) struct ExecutorContext<'a> {
     /// proves the short-circuit is taken on every strict workload.
     pub(crate) commit_step_path: CommitStepPath,
 
-    /// Per-edge buffer parking records that cross from a non-deferred
-    /// upstream into a deferred-region member (typically Combine's
-    /// build-side input). Populated by the upstream operator's arm at
-    /// emit time; drained by the commit-time deferred dispatcher in a
-    /// later phase. Keyed by `(active body, EdgeIndex)` because
-    /// top-level and body graphs maintain disjoint EdgeIndex namespaces
-    /// — the body id disambiguates collisions.
+    /// Rows parked on every edge that crosses into a deferred-region member
+    /// (typically a Combine's build-side input), from the producer's emit
+    /// until the commit, keyed by `(active body, EdgeIndex)` because
+    /// top-level and body graphs keep disjoint EdgeIndex namespaces.
     ///
-    /// Per-pipeline footprint flows through pull-mode attribution: the
-    /// arbitrator's `should_abort` poll at downstream batch boundaries
-    /// guards the hard limit on the cumulative cross-region buffer
-    /// payload, same envelope every other operator uses.
-    pub(crate) region_input_buffers: RegionInputBuffers,
+    /// Bounded by its charge: each edge's resident rows are charged to the
+    /// run's ledger through a consumer registered under the producer, and
+    /// spill when a reclaim elects the edge or its own park falls short.
+    /// Every retraction iteration of the commit reads them again; they are
+    /// released when the commit returns, or at the end of a walk that never
+    /// reached it. In its own cell, so a park growing its charge can let a
+    /// reclaim spill the store's other edges.
+    pub(crate) parked_generations:
+        std::rc::Rc<std::cell::RefCell<crate::executor::parked_generations::ParkedGenerations>>,
 
     /// Inverts the meaning of the per-operator deferred-region guard at
     /// the top of `dispatch_plan_node`. `false` (forward pass) makes
@@ -1967,20 +2014,25 @@ pub(crate) struct ExecutorContext<'a> {
     /// interrupted execution rather than discarded.
     pub(crate) transform_signal_carry: crate::log_dispatch::ParkedTransformSignals,
 
-    /// Streaming-Output channel senders keyed by the upstream fused
-    /// `Merge` node's `NodeIndex`. Present when the executor entry has
-    /// matched a `Merge.interleave → single Output` chain against
-    /// the streaming eligibility predicate (issue #72) and spawned the
-    /// writer thread. The fused Merge arm checks the map for its index;
-    /// if present, it streams each canonicalized record through the
-    /// bounded crossbeam channel instead of accumulating into a `Vec`,
-    /// and drops its sender at clean exit so the writer thread's `recv`
-    /// returns `Err` (channel disconnected). Empty for pipelines that
-    /// don't match the topology — every other Output stays on the
-    /// buffered path. See
+    /// Streaming-hop senders keyed by the producer's `NodeIndex`: one per
+    /// edge the compiled plan certified as streaming, installed at executor
+    /// entry for a streaming Sink's writer thread, or by a streaming
+    /// Aggregate or Combine arm for its consumer thread. The producer's arm
+    /// takes its sender and streams each event through the bounded channel
+    /// instead of admitting a node buffer. Dropping a sender does not end the
+    /// consumer's input: only the hop's End does, sent by the hop's driver
+    /// once the producer's dispatch returned `Ok`. Empty for pipelines with
+    /// no streaming edge. See
     /// https://github.com/rustpunk/clinker/issues/72.
-    pub(crate) streaming_output_senders:
-        HashMap<NodeIndex, crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>>,
+    pub(crate) streaming_output_senders: HashMap<NodeIndex, crate::executor::stream_hop::HopSender>,
+    /// How each streaming consumer stopped, recorded only for an in-process
+    /// test that asks for it; production records nothing.
+    pub(crate) hop_ends: crate::executor::stream_hop::HopEndLog,
+    /// The end of each streaming Sink's hop, keyed by the Sink's producer,
+    /// held until that producer's top-level turn returns `Ok`; the walk loop
+    /// then sends End. Ends left here when the walk stops are released before
+    /// the writer threads are joined.
+    pub(crate) streaming_sink_ends: HashMap<NodeIndex, crate::executor::stream_hop::SinkHopEnd>,
     /// Per-streaming-producer-slot arbitrator registration. One
     /// `NodeBufferConsumer` is registered per logical streaming slot at
     /// executor entry (keyed by the producer's `NodeIndex`); its shared
@@ -2042,23 +2094,19 @@ pub(crate) struct ExecutorContext<'a> {
     /// driver → Source. Empty for pipelines with no streaming-probe
     /// Combine.
     pub(crate) streaming_combine_probe_edges: HashMap<NodeIndex, NodeIndex>,
-    /// `JoinHandle`s for spawned streaming-output writer threads. Owned
-    /// by the dispatcher so the end-of-DAG join surface (in
-    /// `execute_dag_branching`) folds per-thread counter / timer /
-    /// error accounting back into the dispatcher's
-    /// `counters` / `records_emitted` / `write_timer` /
-    /// `projection_timer` / `ok_source_rows` / `output_errors`.
-    /// Drained via `std::mem::take` at the join surface.
-    pub(crate) streaming_output_tasks:
-        Vec<std::thread::JoinHandle<crate::executor::StreamingOutputTaskOutput>>,
+    /// The streaming Sinks' writer threads not yet joined, in the order
+    /// their specs were built. The walk joins a Sink's thread at the end of
+    /// its producer's top-level turn and folds its counters, timers and
+    /// errors back into this context; a Sink whose producer never had that
+    /// turn (the walk failed or was cancelled first) is joined at teardown.
+    pub(crate) streaming_output_tasks: Vec<crate::executor::StreamingSinkThread>,
 
-    /// Shared Rayon pool for CPU-bound owned-input kernels (sort,
-    /// grace-hash partition build, IEJoin range-walk, sort-merge). Sized
-    /// off the run's thread budget; each kernel extracts its owned input
-    /// out of `ctx` and runs under `pool.install(...)`, so the closures
-    /// capture only owned data plus `&memory_budget` and stay order-
-    /// preserving (the kernels emit in a deterministic order independent
-    /// of pool scheduling).
+    /// The run's Rayon pool for the parallel sections of the CPU-bound
+    /// kernels (sort, grace-hash, IEJoin, sort-merge). Sized off the run's
+    /// thread budget. A kernel runs on the walk and wraps only its pure
+    /// parallel blocks (per-record key extraction, the comparator sort) in
+    /// `pool.install(...)`, so its budget checks and spills never run on a
+    /// pool worker; its output order does not depend on pool scheduling.
     pub(crate) kernel_pool: Arc<rayon::ThreadPool>,
 
     /// Per-run shutdown handle, cloned from `PipelineRunParams`. The
@@ -2090,7 +2138,7 @@ pub(crate) struct ExecutorContext<'a> {
     /// catalog). Operators fold finalized sketch results in at drain — the
     /// grace-hash join routes its merged per-partition distinct-count
     /// estimate here at completion, and a Source records its exact row
-    /// count when its stream disconnects. Seeded from the plan-time
+    /// count when its stream ends. Seeded from the plan-time
     /// catalog's Plane A row counts at executor entry so a downstream node
     /// reading this map sees both the metadata-derived estimates and any
     /// exec-measured figures that have superseded them. Behind a `Mutex`
@@ -2098,18 +2146,6 @@ pub(crate) struct ExecutorContext<'a> {
     pub(crate) runtime_statistics:
         Arc<std::sync::Mutex<clinker_plan::plan::statistics::StatisticsCatalog>>,
 }
-
-/// Map keying (active composition body, outgoing edge id) to the rows
-/// that crossed from a non-deferred upstream into a deferred-region
-/// consumer along that edge. The body id is `None` for top-level edges;
-/// each composition body has its own EdgeIndex namespace.
-type RegionInputBuffers = HashMap<
-    (
-        Option<clinker_plan::plan::CompositionBodyId>,
-        petgraph::graph::EdgeIndex,
-    ),
-    Vec<(Record, crate::executor::stream_event::SourceRowId)>,
->;
 
 /// Which commit-step body the orchestrator selected for the current
 /// pipeline. `FastPath` short-circuits to the strict body and is the
@@ -2137,6 +2173,13 @@ pub(crate) enum CommitStepPath {
 /// orchestrator's recompute-aggregates phase can call `retract_row` +
 /// `finalize_in_place`. Populated only on relaxed-CK aggregates;
 /// strict pipelines never instantiate this struct.
+///
+/// The aggregator was built kept for retraction
+/// ([`crate::aggregation::HashAggregator::keep_for_retraction`]): it ranks by
+/// 0 and is not in the walk reclaim set, so no reclaim pass or
+/// soft-threshold poll spills it while it is held here. A spilled table
+/// would fail the next `retract_row` and send the Aggregate to the degrade
+/// path, which loses its groups (#1288).
 pub(crate) struct RetainedAggregatorState {
     pub(crate) aggregator: Box<crate::aggregation::HashAggregator>,
     /// Arbitrator registration for this aggregator's memory consumer.
@@ -2269,7 +2312,7 @@ impl<'a> ExecutorContext<'a> {
     pub(crate) fn take_streaming_sender(
         &mut self,
         node_idx: NodeIndex,
-    ) -> Option<crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>> {
+    ) -> Option<crate::executor::stream_hop::HopSender> {
         if self.current_body_node_input_refs.is_some() {
             return None;
         }
@@ -2281,7 +2324,8 @@ impl<'a> ExecutorContext<'a> {
     /// consumer, key the sender by the producer index so its dispatch arm
     /// streams into the channel via the shared `take_streaming_sender`
     /// path, and return the receiver, the charge handle, and the charge
-    /// consumer's id for later unregistration.
+    /// consumer's id for later unregistration. A charge consumer that cannot
+    /// be registered is an internal error and installs nothing.
     ///
     /// Shared by the streaming-ingest consumers (Aggregate ingest, Combine
     /// probe): both move a producer's emit onto a back-pressured channel a
@@ -2296,13 +2340,8 @@ impl<'a> ExecutorContext<'a> {
         producer_idx: NodeIndex,
         producer_name: &str,
         reader_name: &str,
-    ) -> (
-        crossbeam_channel::Receiver<crate::executor::stream_event::StreamEvent>,
-        Arc<crate::pipeline::memory::ConsumerHandle>,
-        crate::pipeline::memory::ConsumerId,
-    ) {
-        let (tx, rx) =
-            crossbeam_channel::bounded::<crate::executor::stream_event::StreamEvent>(256);
+    ) -> Result<crate::executor::stream_hop::StreamingIngestHop, PipelineError> {
+        let (tx, rx) = crossbeam_channel::bounded::<crate::executor::stream_hop::HopMessage>(256);
         let charge_handle = crate::pipeline::memory::ConsumerHandle::new();
         let charge_consumer_id = self.memory_budget.register_node_consumer(
             Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
@@ -2313,14 +2352,20 @@ impl<'a> ExecutorContext<'a> {
                 node: producer_name.to_string(),
                 surface: clinker_plan::runtime_error::MemorySurface::BufferedRows {
                     from: producer_name.to_string(),
-                    to: reader_name.to_string(),
+                    to: clinker_plan::runtime_error::NonEmptyReaders::one(reader_name.to_string()),
                 },
             },
-        );
+        )?;
+        let end = crate::executor::stream_hop::HopEnd::new(tx.clone());
         self.streaming_output_senders.insert(producer_idx, tx);
         self.streaming_charge_consumers
             .insert(producer_idx, (charge_consumer_id, charge_handle.clone()));
-        (rx, charge_handle, charge_consumer_id)
+        Ok(crate::executor::stream_hop::StreamingIngestHop {
+            rx,
+            end,
+            charge_handle,
+            charge_consumer_id,
+        })
     }
 
     /// Build the [`crate::executor::batch_handoff::StreamingChargeHandle`]
@@ -2352,6 +2397,34 @@ impl<'a> ExecutorContext<'a> {
         ))
     }
 
+    /// Take the streaming hop installed for the producer at `node_idx`, with
+    /// the charge handle its batches cross, if the compiled plan certified
+    /// one and the producer runs at the top level. Its spill classification
+    /// is the slot's [`node_buffer_spill_allowed`].
+    ///
+    /// A sender with no streaming charge consumer registered for it is
+    /// [`PipelineError::Internal`] naming `node_name`: both are installed
+    /// together, so the pair cannot be split outside an engine defect.
+    pub(crate) fn take_streaming_hop(
+        &mut self,
+        current_dag: &ExecutionPlanDag,
+        node_idx: NodeIndex,
+        node_name: &str,
+    ) -> Result<
+        Option<(
+            crate::executor::stream_hop::HopSender,
+            crate::executor::batch_handoff::StreamingChargeHandle,
+        )>,
+        PipelineError,
+    > {
+        let sender = self.take_streaming_sender(node_idx);
+        let charge = sender.as_ref().and_then(|_| {
+            let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
+            self.streaming_charge_handle(node_idx, node_name, spill_allowed)
+        });
+        pair_streaming_hop(sender, charge, node_name)
+    }
+
     /// Resolve the streaming-handoff batch size for the Transform named
     /// `transform_name`: its per-Transform `batch_size` override when
     /// present, otherwise the pipeline-resolved [`Self::batch_size`].
@@ -2376,7 +2449,7 @@ impl<'a> ExecutorContext<'a> {
     /// every per-source slot is now populated, derive and stamp the
     /// pipeline-wide total under [`MERGED_SOURCE_NAME`]. Called by the
     /// Source dispatch arm (and the Merge.interleave fusion arm) when
-    /// a source's crossbeam `Receiver` disconnects.
+    /// a source's reader ends its stream.
     pub(crate) fn finalize_source_count(&mut self, source_name: &Arc<str>, count: u64) {
         // Flush the drain's last partial chunk. Without this the tail of every
         // source — up to 1023 rows — would reach the observer only if some
@@ -2417,18 +2490,21 @@ impl<'a> ExecutorContext<'a> {
     }
 
     /// Release the arbitrator registration for `source_name`'s ingest
-    /// channel once its receiver has disconnected. Every queued attempt
+    /// channel once its reader has ended its stream. Every queued attempt
     /// released its own charge when it left the channel, but an ordered
     /// Source's barrier never zeroes the figure it last charged to the shared
     /// handle, so without this release that figure stays in the run's
     /// charged total — memory that has already moved downstream keeps
     /// influencing spill victim selection and abort checks. Call only after
-    /// `recv` reports disconnect: the producer has dropped its sender by
-    /// then, so zeroing cannot race a concurrent charge. The `remove` makes
-    /// the release single-shot; a repeat call for the same source is a
+    /// the walk took the stream's `Ended`: the reader sends it after it has
+    /// dropped its channel and released everything else it held in the
+    /// Source's name, so zeroing cannot race a concurrent charge. The `remove`
+    /// makes the release single-shot; a repeat call for the same source is a
     /// no-op.
     pub(crate) fn release_source_consumer(&mut self, source_name: &str) {
         if let Some((id, handle)) = self.source_consumers.remove(source_name) {
+            #[cfg(any(test, feature = "test-utils"))]
+            self.memory_budget.note_source_drain(source_name, id);
             // Resume before unregister: a prior arbitration round may have
             // paused this source's ingest thread, and once the wrapper leaves
             // the registry nothing else can unpark it — the thread would sit
@@ -2453,12 +2529,16 @@ impl<'a> ExecutorContext<'a> {
     /// registered handle (already released, or a body-port seed source).
     pub(crate) fn activate_source_for_drain(&self, source_name: &str) {
         if let Some((_, handle)) = self.source_consumers.get(source_name) {
-            // Layer 3 spill-nudge: if a prior round paused this source under
-            // genuine pressure, shed reclaimable downstream state (Priority
-            // order) before resuming it, so the resumed producer does not
-            // immediately re-trip the soft limit. Overshoot reduction only —
-            // liveness does not depend on it, so an over-target of 0 (no
-            // current pressure) is a no-op.
+            // If a prior round paused this source under genuine pressure,
+            // shed reclaimable downstream state before resuming it, so the
+            // resumed producer does not immediately re-trip the soft limit.
+            // The shedding is one reclaim round (the walk spills its own
+            // state, ranked by what each spill frees), aimed at how far the
+            // larger of process memory and the charged total sits above the
+            // soft limit: until a Source can wait for memory, this eager
+            // spill is what leaves it room to resume into. Overshoot
+            // reduction only — liveness does not depend on it, so an
+            // over-target of 0 (no current pressure) is a no-op.
             if handle.is_paused() {
                 let over = self
                     .memory_budget
@@ -2580,18 +2660,14 @@ pub(crate) fn project_rows_to_buffer_schema(
         .collect()
 }
 
-/// Tee `emit_rows` into `region_input_buffers` for every outgoing edge
-/// from `producer_idx` whose target is a deferred-region member or
-/// output AND whose source (`producer_idx`) is NOT in the same region.
-/// Internal-region edges are skipped — they live in `node_buffers`
-/// already. Edges leaving the region's producer toward a member are
-/// also skipped because the producer's own `node_buffers[producer_idx]`
-/// is the canonical entry point the commit-time deferred dispatcher
+/// Park `emit_rows` for every outgoing edge from `producer_idx` whose target
+/// is a deferred-region member or output AND whose source (`producer_idx`)
+/// is NOT in the same region ([`park_cross_region`]). Internal-region edges
+/// are skipped — they live in node-buffer slots already. Edges leaving the
+/// region's producer toward a member are also skipped because the
+/// producer's own slot (in the walk reclaim set's slots for the running
+/// scope) is the canonical entry point the commit-time deferred dispatcher
 /// reads from.
-///
-/// In-flight bytes flow through pull-mode attribution; the
-/// arbitrator's `should_abort` poll at downstream batch boundaries
-/// guards the pipeline-wide hard limit.
 pub(crate) fn tee_emit_to_region_input_buffers(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
@@ -2599,7 +2675,6 @@ pub(crate) fn tee_emit_to_region_input_buffers(
     emit_rows: &[(Record, crate::executor::stream_event::SourceRowId)],
 ) -> Result<(), PipelineError> {
     use petgraph::visit::EdgeRef;
-    let active_body = ctx.window_runtime.active_stack.last().copied();
     let mut crossing_edges: Vec<petgraph::graph::EdgeIndex> = Vec::new();
     for edge_ref in current_dag
         .graph
@@ -2610,17 +2685,108 @@ pub(crate) fn tee_emit_to_region_input_buffers(
             crossing_edges.push(edge_ref.id());
         }
     }
-    if crossing_edges.is_empty() {
-        return Ok(());
-    }
     for edge_id in crossing_edges {
-        for (record, rn) in emit_rows {
-            ctx.region_input_buffers
-                .entry((active_body, edge_id))
-                .or_default()
-                .push((record.clone(), *rn));
-        }
+        park_cross_region(ctx, current_dag, producer_idx, edge_id, emit_rows)?;
     }
+    Ok(())
+}
+
+/// Park a copy of `rows` on the crossing edge `edge_id` out of
+/// `producer_idx`, in the active composition body's edge namespace, until
+/// the commit reads them ([`ParkedGenerations::park`]).
+///
+/// The rows' resident size is charged before they are kept: on the walk
+/// that growth reclaims other state first, and rows that still do not fit
+/// spill. Never refused for memory; past the spill cap it fails with E320.
+///
+/// [`ParkedGenerations::park`]: crate::executor::parked_generations::ParkedGenerations::park
+pub(crate) fn park_cross_region(
+    ctx: &mut ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
+    producer_idx: NodeIndex,
+    edge_id: petgraph::graph::EdgeIndex,
+    rows: &[(Record, crate::executor::stream_event::SourceRowId)],
+) -> Result<(), PipelineError> {
+    let active_body = ctx.window_runtime.active_stack.last().copied();
+    let Some((_, target)) = current_dag.graph.edge_endpoints(edge_id) else {
+        return Err(PipelineError::Internal {
+            op: "executor",
+            node: current_dag.graph[producer_idx].name().to_string(),
+            detail: format!(
+                "crossing edge {} is not in the current DAG",
+                edge_id.index()
+            ),
+        });
+    };
+    // Rows a region member parks during the commit pass belong to that
+    // iteration; the forward pass's are read by every iteration.
+    let generation = if ctx.in_deferred_dispatch {
+        crate::executor::parked_generations::Generation::CommitPass
+    } else {
+        crate::executor::parked_generations::Generation::Forward
+    };
+    crate::executor::parked_generations::ParkedGenerations::park(
+        &ctx.parked_generations,
+        generation,
+        (active_body, edge_id),
+        rows,
+        current_dag.graph[producer_idx].name(),
+        current_dag.graph[target].name(),
+    )
+}
+
+/// Publish `view`, a cursor over rows another owner holds and charges, as
+/// the slot at `key` for `readers` readers.
+///
+/// The slot is registered like any other, under `reader`, with nothing
+/// charged: a materializing reader charges its own copy to it, as it would
+/// to a slot it took over. A spill of the slot frees nothing while the view
+/// shares its owner's backing, so it ranks with no reclaimable bytes.
+pub(crate) fn publish_node_buffer_view(
+    ctx: &mut ExecutorContext<'_>,
+    producer: &str,
+    reader: &str,
+    key: NodeBufferKey,
+    view: NodeBuffer,
+    readers: usize,
+) -> Result<(), PipelineError> {
+    let occupied = {
+        let set = ctx.walk_reclaim.borrow();
+        set.slots().contains_buffer(&key) || set.slots().is_registered(&key)
+    };
+    if occupied {
+        return Err(PipelineError::Internal {
+            op: "executor",
+            node: producer.to_string(),
+            detail: format!(
+                "node-buffer slot {key:?} was republished without first discarding the previous slot"
+            ),
+        });
+    }
+    let slot_spill = ctx
+        .planned_node_buffer_readers
+        .slot_spill(&key, true, producer)?;
+    ctx.walk_reclaim
+        .borrow_mut()
+        .slots_mut()
+        .readers_mut()
+        .publish(key.clone(), readers, producer)?;
+    let handle = crate::pipeline::memory::ConsumerHandle::new();
+    let consumer = ctx.memory_budget.register_node_consumer(
+        Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+            Arc::clone(&handle),
+        )),
+        Arc::clone(&handle),
+        clinker_plan::runtime_error::ConsumerLabel {
+            node: reader.to_string(),
+            surface: clinker_plan::runtime_error::MemorySurface::ScanMaterialization,
+        },
+    )?;
+    let mut set = ctx.walk_reclaim.borrow_mut();
+    let slots = set.slots_mut();
+    slots.register(key.clone(), (consumer, Arc::clone(&handle)), slot_spill);
+    slots.insert_buffer(key, view);
+    handle.set_reclaimable(0);
     Ok(())
 }
 
@@ -2674,13 +2840,34 @@ pub(crate) fn estimate_node_buffer_unaccounted_bytes(
     })
 }
 
-/// Predicate: does this materialized slot permit a soft-threshold spill at
-/// admission time?
+/// Predicate: may this materialized slot spill, at its admission or when a
+/// reclaim pass elects it?
 ///
 /// Every materialized slot is eligible. Fan-out readers use sequential
 /// re-readable cursors over immutable memory/spill backing, and producer-port
 /// identity remains part of [`NodeBufferKey`], so neither multiple outgoing
 /// edges nor port-scoped edges require a memory-only clone.
+/// Pair a producer's streaming sender with its slot's charge handle. No
+/// sender is no hop; a sender without a charge is an invariant violation
+/// naming `node_name`, reported rather than unwrapped.
+pub(crate) fn pair_streaming_hop<C>(
+    sender: Option<crate::executor::stream_hop::HopSender>,
+    charge: Option<C>,
+    node_name: &str,
+) -> Result<Option<(crate::executor::stream_hop::HopSender, C)>, PipelineError> {
+    match (sender, charge) {
+        (None, _) => Ok(None),
+        (Some(sender), Some(charge)) => Ok(Some((sender, charge))),
+        (Some(_), None) => Err(PipelineError::Internal {
+            op: "executor",
+            node: node_name.to_string(),
+            detail: "the step holds its streaming hop's sender but no streaming charge \
+                     consumer is registered for it"
+                .to_string(),
+        }),
+    }
+}
+
 pub(crate) fn node_buffer_spill_allowed(
     _current_dag: &ExecutionPlanDag,
     _slot_key: NodeIndex,
@@ -2688,26 +2875,6 @@ pub(crate) fn node_buffer_spill_allowed(
     true
 }
 
-/// Admit `rows` into a `ctx.node_buffers` slot, choosing between the
-/// in-memory and on-disk variants based on the live RSS reading.
-///
-/// 1. Empty input returns `NodeBuffer::Memory(Vec::new())`.
-/// 2. The slot's byte estimate seeds a fresh `NodeBufferConsumer`
-///    handle and the arbitrator registers the wrapper. Pull-mode
-///    attribution flows through the handle; the arbitrator's
-///    `should_abort` poll guards the pipeline-wide hard limit.
-/// 3. When `spill_allowed` is `true` and `MemoryArbitrator::should_spill()`
-///    reports the RSS soft threshold tripped, the rows flush to a
-///    `SpillFile<crate::executor::stream_event::SourceRowId>` via [`node_buffer_spill::spill_node_buffer`].
-///    The in-memory charge is discharged immediately and the file size
-///    is added to `cumulative_spill_bytes`; an over-quota disk total
-///    surfaces `PipelineError::SpillCapExceeded` (E320) — a disk-cap
-///    surface deliberately distinct from the memory-budget E310 so a
-///    spilled-out volume never reads as an out-of-memory failure.
-/// 4. Otherwise rows stay in memory as `NodeBuffer::Memory(rows)`.
-///
-/// `spill_allowed` should be computed via [`node_buffer_spill_allowed`]
-/// for the slot's `NodeIndex`; all materialized slots currently qualify.
 /// Discard a `node_buffers` slot and all paired accounting state.
 ///
 /// This is a cleanup/replacement primitive, not a logical read: semantic
@@ -2720,13 +2887,16 @@ pub(crate) fn drain_node_buffer_slot(
     key: impl Into<NodeBufferKey>,
 ) -> Option<NodeBuffer> {
     let key = key.into();
-    ctx.node_buffer_readers.discard(&key);
-    if let Some((id, _)) = ctx.node_buffer_consumer_ids.remove(&key) {
+    let (registration, buffer) = {
+        let mut set = ctx.walk_reclaim.borrow_mut();
+        let slots = set.slots_mut();
+        slots.readers_mut().discard(&key);
+        (slots.remove_registration(&key), slots.remove_buffer(&key))
+    };
+    if let Some((id, _)) = registration {
         ctx.memory_budget.unregister_consumer(id);
     }
-    ctx.node_buffers
-        .remove(&key)
-        .map(NodeBuffer::into_authoritative)
+    buffer.map(NodeBuffer::into_authoritative)
 }
 
 /// Build the cold-path invariant error for a required materialized input that
@@ -2752,45 +2922,182 @@ pub(crate) fn missing_node_buffer_input_error(
 /// One materialized slot read plus the optional reservation for its resident
 /// scan materialization. The guard must remain live through the consumer's
 /// complete synchronous operation.
+///
+/// A read of a slot that later readers still need is pending until the
+/// consumer says how it reads: until then it has no cursor on the slot and is
+/// not counted as a read.
 #[must_use = "a materialized input must retain its scan reservation"]
 pub(crate) struct NodeBufferInput {
-    allocation_resources: clinker_record::owned_storage::AllocationResources,
-    buffer: NodeBuffer,
-    reservation: Option<TransientNodeBufferReservation>,
+    read: NodeBufferRead,
+}
+
+enum NodeBufferRead {
+    /// The slot's last read: the slot itself, and its registration as a
+    /// reservation when it had one.
+    Last {
+        allocation_resources: clinker_record::owned_storage::AllocationResources,
+        buffer: NodeBuffer,
+        reservation: Option<TransientNodeBufferReservation>,
+    },
+    /// A read of a slot later readers still need.
+    Shared(PendingSharedRead),
 }
 
 impl NodeBufferInput {
-    /// Split the input from its optional materialization/transfer lifetime guard.
-    pub(crate) fn into_parts(self) -> (NodeBuffer, Option<TransientNodeBufferReservation>) {
-        (self.buffer, self.reservation)
+    /// Split the input from its optional materialization/transfer lifetime
+    /// guard, for a consumer that streams the input rather than collecting
+    /// it. A read of a shared slot takes its cursor here and is counted.
+    pub(crate) fn into_parts(
+        self,
+    ) -> Result<(NodeBuffer, Option<TransientNodeBufferReservation>), PipelineError> {
+        match self.read {
+            NodeBufferRead::Last {
+                buffer,
+                reservation,
+                ..
+            } => Ok((buffer, reservation)),
+            NodeBufferRead::Shared(pending) => Ok((pending.take_cursor()?, None)),
+        }
     }
 
     /// Prepare a consumer that will collect the sequential scan into a full
     /// resident vector. A standalone reservation covers the materialized
     /// footprint when ownership was not transferred; a transferred
     /// registration charges only the representation overlap.
+    ///
+    /// A read of a shared slot reserves its copy first, while the slot is
+    /// still in the walk reclaim set with no cursor on it, so the reclaim
+    /// pass that reservation may start can spill the shared slot like any
+    /// other. It takes its cursor (from disk, if the slot spilled) and is
+    /// counted as a read only once the reservation is granted; a refused
+    /// reservation leaves the slot and its reader count as they were.
     pub(crate) fn into_materialized_parts(
         self,
         budget: &Arc<crate::pipeline::memory::MemoryArbitrator>,
         node: &str,
     ) -> Result<(NodeBuffer, Option<TransientNodeBufferReservation>), PipelineError> {
-        let materialized_bytes = self
-            .buffer
-            .materialization_bytes_without_transfer(&self.allocation_resources);
-        let overlap_bytes = self.buffer.transferred_materialization_overlap_bytes();
-        let reservation = match self.reservation {
-            Some(reservation) => {
-                reservation.reserve_additional(overlap_bytes, node)?;
-                reservation
+        match self.read {
+            NodeBufferRead::Last {
+                allocation_resources,
+                buffer,
+                reservation,
+            } => {
+                let reservation = match reservation {
+                    Some(reservation) => {
+                        reservation.reserve_additional(
+                            buffer.transferred_materialization_overlap_bytes(),
+                            node,
+                            clinker_plan::runtime_error::MemorySurface::ScanMaterialization,
+                        )?;
+                        reservation
+                    }
+                    None => crate::executor::node_buffer::reserve_node_buffer_materialization(
+                        buffer.materialization_bytes_without_transfer(&allocation_resources),
+                        budget,
+                        node,
+                    )?,
+                };
+                Ok((buffer, Some(reservation)))
             }
-            None => crate::executor::node_buffer::reserve_node_buffer_materialization(
-                materialized_bytes,
-                budget,
-                node,
-            )?,
-        };
-        Ok((self.buffer, Some(reservation)))
+            NodeBufferRead::Shared(pending) => {
+                let reservation =
+                    crate::executor::node_buffer::reserve_node_buffer_materialization(
+                        pending.copy_bytes()?,
+                        budget,
+                        node,
+                    )?;
+                Ok((pending.take_cursor()?, Some(reservation)))
+            }
+        }
     }
+}
+
+/// A read of a slot that later readers still need, not yet taken: the slot
+/// stays in the walk reclaim set, uncounted and with no cursor on it, so a
+/// reclaim pass may still spill it.
+///
+/// Holds the walk's reclaim set handle, so it is walk-only (`!Send`), like
+/// the set. It borrows the set only briefly and never across a reservation.
+struct PendingSharedRead {
+    reclaim: std::rc::Rc<std::cell::RefCell<crate::pipeline::memory::walk::WalkReclaimSet>>,
+    key: NodeBufferKey,
+    reader: Box<str>,
+}
+
+impl PendingSharedRead {
+    /// The bytes this reader's collected copy of the slot will hold. The
+    /// estimate counts every row at its decoded size, so it is the same
+    /// whether the slot is resident or on disk, and so whether or not a pass
+    /// spills the slot before the copy is made.
+    fn copy_bytes(&self) -> Result<u64, PipelineError> {
+        let set = self.reclaim.borrow();
+        let buffer = set
+            .slots()
+            .buffer(&self.key)
+            .ok_or_else(|| self.slot_missing())?;
+        Ok(buffer.estimated_materialized_bytes())
+    }
+
+    /// Take this reader's cursor on the slot, which stays published for the
+    /// readers after it, and count the read.
+    fn take_cursor(self) -> Result<NodeBuffer, PipelineError> {
+        // Making a slot re-readable can fold spilled runs, which allocates
+        // under the run's budget, so the slot leaves the walk reclaim set for
+        // the conversion and goes back whatever its outcome.
+        let taken = self
+            .reclaim
+            .borrow_mut()
+            .slots_mut()
+            .remove_buffer(&self.key);
+        let mut shared = taken.ok_or_else(|| self.slot_missing())?;
+        let cursor = shared.reread();
+        self.reclaim
+            .borrow_mut()
+            .slots_mut()
+            .insert_buffer(self.key.clone(), shared);
+        let cursor = cursor?;
+        self.reclaim
+            .borrow_mut()
+            .slots_mut()
+            .readers_mut()
+            .complete_clone(&self.key, &self.reader)?;
+        Ok(cursor)
+    }
+
+    #[cold]
+    fn slot_missing(&self) -> PipelineError {
+        node_buffer_reader_mismatch_error(
+            &self.reader,
+            &self.key,
+            "slot disappeared after reader-ledger validation",
+        )
+    }
+}
+
+/// Open a read of the slot at `key` of the walk reclaim set `reclaim` for
+/// `reader`, when more readers than this one still need it.
+///
+/// The read stays pending: the slot is neither re-read nor counted until the
+/// consumer resolves the input through [`NodeBufferInput::into_parts`] or
+/// [`NodeBufferInput::into_materialized_parts`]. Fails when the slot is not
+/// published in `reclaim`.
+pub(crate) fn shared_node_buffer_read(
+    reclaim: &std::rc::Rc<std::cell::RefCell<crate::pipeline::memory::walk::WalkReclaimSet>>,
+    key: NodeBufferKey,
+    reader: &str,
+) -> Result<NodeBufferInput, PipelineError> {
+    let published = reclaim.borrow().slots().contains_buffer(&key);
+    let pending = PendingSharedRead {
+        reclaim: std::rc::Rc::clone(reclaim),
+        key,
+        reader: reader.into(),
+    };
+    if !published {
+        return Err(pending.slot_missing());
+    }
+    Ok(NodeBufferInput {
+        read: NodeBufferRead::Shared(pending),
+    })
 }
 
 #[cold]
@@ -2814,9 +3121,9 @@ pub(crate) fn validate_completed_node_buffer_scope(
     ctx: &ExecutorContext<'_>,
     scope_name: &str,
 ) -> Result<(), PipelineError> {
-    if ctx.node_buffers.is_empty()
-        && ctx.node_buffer_readers.is_empty()
-        && ctx.node_buffer_consumer_ids.is_empty()
+    let set = ctx.walk_reclaim.borrow();
+    let slots = set.slots();
+    if slots.buffers().is_empty() && slots.readers().is_empty() && slots.registrations().is_empty()
     {
         return Ok(());
     }
@@ -2826,9 +3133,9 @@ pub(crate) fn validate_completed_node_buffer_scope(
         node: scope_name.to_string(),
         detail: format!(
             "completed node-buffer scope retained {} slot(s), {} reader-count entry/entries, and {} memory registration(s)",
-            ctx.node_buffers.len(),
-            ctx.node_buffer_readers.remaining.len(),
-            ctx.node_buffer_consumer_ids.len(),
+            slots.buffers().len(),
+            slots.readers().remaining.len(),
+            slots.registrations().len(),
         ),
     })
 }
@@ -2836,8 +3143,10 @@ pub(crate) fn validate_completed_node_buffer_scope(
 /// Read one published materialized slot according to its producer-declared
 /// remaining-reader count.
 ///
-/// Earlier readers receive a sequential scan and decrement only after that
-/// scan is acquired. The last reader removes the authoritative slot and
+/// Earlier readers receive a pending read ([`shared_node_buffer_read`]) that
+/// takes its sequential scan, and decrements the count, only when the
+/// consumer resolves it; a materializing consumer reserves its copy first.
+/// The last reader removes the authoritative slot and
 /// transfers its ordinary node-buffer registration. A present empty buffer is a
 /// valid zero-row input; missing, zero, or inconsistent ledger state fails as
 /// an internal executor invariant instead of becoming an empty stream.
@@ -2887,13 +3196,17 @@ fn require_node_buffer_input_inner(
     producer_port: Option<&str>,
     _transfer_last_registration: bool,
 ) -> Result<NodeBufferInput, PipelineError> {
-    let Some(remaining) = ctx.node_buffer_readers.remaining_for_slot(
-        &key,
-        ctx.node_buffers.contains_key(&key),
-        ctx.node_buffer_consumer_ids.contains_key(&key),
-        consumer_name,
-    )?
-    else {
+    let remaining = {
+        let set = ctx.walk_reclaim.borrow();
+        let slots = set.slots();
+        slots.readers().remaining_for_slot(
+            &key,
+            slots.contains_buffer(&key),
+            slots.is_registered(&key),
+            consumer_name,
+        )?
+    };
+    let Some(remaining) = remaining else {
         return Err(missing_node_buffer_input_error(
             consumer_name,
             producer_name,
@@ -2901,29 +3214,24 @@ fn require_node_buffer_input_inner(
         ));
     };
     if remaining > 1 {
-        let buffer = ctx.node_buffers.get_mut(&key).ok_or_else(|| {
-            node_buffer_reader_mismatch_error(
-                consumer_name,
-                &key,
-                "slot disappeared after reader-ledger validation",
-            )
-        })?;
-        let buffer = buffer.reread()?;
-        ctx.node_buffer_readers
-            .complete_clone(&key, consumer_name)?;
-        return Ok(NodeBufferInput {
-            allocation_resources: ctx.allocation_resources.clone(),
-            buffer,
-            reservation: None,
-        });
+        return shared_node_buffer_read(&ctx.walk_reclaim, key, consumer_name);
     }
 
-    ctx.node_buffer_readers.complete_last(&key, consumer_name)?;
+    ctx.walk_reclaim
+        .borrow_mut()
+        .slots_mut()
+        .readers_mut()
+        .complete_last(&key, consumer_name)?;
     // The authoritative last reader takes the slot's existing registration as
     // a RAII guard for the complete synchronous read. This preserves the
     // original resident charge while a consuming drain moves memory out, and
     // gives spill-backed materialization a handle to charge its overlap.
-    let buffer = ctx.node_buffers.remove(&key).ok_or_else(|| {
+    let taken = ctx
+        .walk_reclaim
+        .borrow_mut()
+        .slots_mut()
+        .remove_buffer(&key);
+    let buffer = taken.ok_or_else(|| {
         node_buffer_reader_mismatch_error(
             consumer_name,
             &key,
@@ -2931,20 +3239,24 @@ fn require_node_buffer_input_inner(
         )
     })?;
     let buffer = buffer.into_authoritative();
-    let reservation = ctx
-        .node_buffer_consumer_ids
-        .remove(&key)
-        .map(|(id, handle)| {
-            TransientNodeBufferReservation::from_registration(
-                Arc::clone(&ctx.memory_budget),
-                id,
-                handle,
-            )
-        });
+    let registration = ctx
+        .walk_reclaim
+        .borrow_mut()
+        .slots_mut()
+        .remove_registration(&key);
+    let reservation = registration.map(|(id, handle)| {
+        TransientNodeBufferReservation::from_registration(
+            Arc::clone(&ctx.memory_budget),
+            id,
+            handle,
+        )
+    });
     Ok(NodeBufferInput {
-        allocation_resources: ctx.allocation_resources.clone(),
-        buffer,
-        reservation,
+        read: NodeBufferRead::Last {
+            allocation_resources: ctx.allocation_resources.clone(),
+            buffer,
+            reservation,
+        },
     })
 }
 
@@ -2964,8 +3276,12 @@ pub(crate) fn require_single_input_node_buffer_slot(
     producer_name: &str,
     producer_port: Option<&str>,
 ) -> Result<NodeBufferInput, PipelineError> {
-    let key =
-        single_input_node_buffer_key(&ctx.node_buffers, consumer_idx, producer_idx, producer_port);
+    let key = single_input_node_buffer_key(
+        ctx.walk_reclaim.borrow().slots().buffers(),
+        consumer_idx,
+        producer_idx,
+        producer_port,
+    );
     require_node_buffer_input(ctx, key, consumer_name, producer_name, producer_port)
 }
 
@@ -2988,9 +3304,51 @@ pub(crate) fn single_input_node_buffer_key(
 
 #[cfg(test)]
 mod required_node_buffer_tests {
-    use super::{NodeBufferKey, NodeBufferReaderLedger, missing_node_buffer_input_error};
+    use super::{
+        NodeBufferKey, NodeBufferReaderLedger, PlannedNodeBufferReaders,
+        missing_node_buffer_input_error,
+    };
     use clinker_plan::error::PipelineError;
+    use clinker_plan::runtime_error::MemorySurface;
     use petgraph::graph::NodeIndex;
+
+    /// A slot several nodes read is reported with every reader named on its
+    /// own, once each, in the order the plan reads the slot: joined into one
+    /// name, two readers would print like a single node whose name contains a
+    /// comma.
+    #[test]
+    fn slot_label_lists_every_reader_of_a_shared_slot() {
+        let split = NodeIndex::new(0);
+        let key = NodeBufferKey::from(split);
+        let mut planned = PlannedNodeBufferReaders::default();
+        planned.node_names.insert(split, Box::from("split"));
+        // One entry per reading edge: "b" reads the slot over two edges.
+        planned.readers.insert(
+            key.clone(),
+            vec![Box::from("b"), Box::from("a"), Box::from("b")],
+        );
+
+        let label = planned.slot_label("split", &key, &[]);
+
+        assert_eq!(label.node, "split");
+        assert_eq!(
+            label.surface,
+            MemorySurface::BufferedRows {
+                from: "split".to_string(),
+                to: clinker_plan::runtime_error::NonEmptyReaders::from_vec(vec![
+                    "b".to_string(),
+                    "a".to_string()
+                ])
+                .expect("at least one reader"),
+            },
+            "every distinct reader, in planned order"
+        );
+        assert_eq!(
+            label.surface.to_string(),
+            "rows buffered between \"split\" and \"b\", \"a\"",
+            "each reader is quoted on its own"
+        );
+    }
 
     fn internal_detail(error: PipelineError) -> String {
         let PipelineError::Internal { op, detail, .. } = error else {
@@ -3130,13 +3488,7 @@ pub(crate) fn admit_node_buffer(
     spill_allowed: bool,
 ) -> Result<(), PipelineError> {
     let slot_key = key.into();
-    let mut readers = planned_materialized_reader_count(ctx, current_dag, &slot_key)?;
-    // A composition body's terminal output is harvested by the scope driver,
-    // not represented by an outgoing graph edge. Count that synthetic reader
-    // at publication so body slots still obey the same strict ledger contract.
-    if readers == 0 && ctx.current_body_node_input_refs.is_some() {
-        readers = 1;
-    }
+    let readers = published_reader_count(ctx, current_dag, &slot_key)?;
     admit_node_buffer_with_readers(
         ctx,
         node_name,
@@ -3158,7 +3510,11 @@ pub(crate) fn declare_node_buffer_readers(
 ) -> Result<(), PipelineError> {
     let key = key.into();
     let readers = planned_materialized_reader_count(ctx, current_dag, &key)?;
-    ctx.node_buffer_readers.publish(key, readers, node_name)
+    ctx.walk_reclaim
+        .borrow_mut()
+        .slots_mut()
+        .readers_mut()
+        .publish(key, readers, node_name)
 }
 
 /// Admit a slot whose reader set is established by a scope-local publication
@@ -3210,11 +3566,17 @@ impl NodeBufferAdmission {
         drop(self.prior.take());
     }
     /// Charge `bytes` to `handle`, the slot that now owns these rows, taking
-    /// them over from the prior owner in one step when there is one.
-    fn charge_to(&mut self, handle: &crate::pipeline::memory::ConsumerHandle, bytes: u64) {
+    /// them over from the prior owner in one step when there is one. Rows
+    /// with no prior owner are new resident bytes: their charge grows the
+    /// handle through the ledger, which on the walk reclaims first, and
+    /// `false` means it still did not fit and nothing was charged.
+    fn charge_to(&mut self, handle: &crate::pipeline::memory::ConsumerHandle, bytes: u64) -> bool {
         match self.prior.take() {
-            Some(prior) => prior.hand_over(handle, bytes),
-            None => handle.add_bytes(bytes),
+            Some(prior) => {
+                prior.hand_over(handle, bytes);
+                true
+            }
+            None => handle.try_grow(bytes).is_ok(),
         }
     }
 }
@@ -3228,10 +3590,7 @@ pub(crate) fn admit_node_buffer_with_prior_owner(
     spill_allowed: bool,
 ) -> Result<(), PipelineError> {
     let key = key.into();
-    let mut readers = planned_materialized_reader_count(ctx, current_dag, &key)?;
-    if readers == 0 && ctx.current_body_node_input_refs.is_some() {
-        readers = 1;
-    }
+    let readers = published_reader_count(ctx, current_dag, &key)?;
     admit_owned_node_buffer_with_readers(ctx, node_name, key, owned, spill_allowed, readers)
 }
 
@@ -3247,9 +3606,11 @@ fn admit_owned_node_buffer_with_readers(
     if readers == 0 {
         return Ok(());
     }
-    if ctx.node_buffers.contains_key(&slot_key)
-        || ctx.node_buffer_consumer_ids.contains_key(&slot_key)
-    {
+    let occupied = {
+        let set = ctx.walk_reclaim.borrow();
+        set.slots().contains_buffer(&slot_key) || set.slots().is_registered(&slot_key)
+    };
+    if occupied {
         return Err(PipelineError::Internal {
             op: "executor",
             node: node_name.to_string(),
@@ -3258,12 +3619,25 @@ fn admit_owned_node_buffer_with_readers(
             ),
         });
     }
-    ctx.node_buffer_readers
+    ctx.walk_reclaim
+        .borrow_mut()
+        .slots_mut()
+        .readers_mut()
         .publish(slot_key.clone(), readers, node_name)?;
     match admit_node_buffer_inner(ctx, node_name, slot_key.clone(), owned, spill_allowed, None) {
         Ok(buffer) => {
-            if ctx.node_buffers.insert(slot_key.clone(), buffer).is_some() {
-                ctx.node_buffer_readers.discard(&slot_key);
+            let replaced = ctx
+                .walk_reclaim
+                .borrow_mut()
+                .slots_mut()
+                .insert_buffer(slot_key.clone(), buffer)
+                .is_some();
+            if replaced {
+                ctx.walk_reclaim
+                    .borrow_mut()
+                    .slots_mut()
+                    .readers_mut()
+                    .discard(&slot_key);
                 return Err(PipelineError::Internal {
                     op: "executor",
                     node: node_name.to_string(),
@@ -3275,9 +3649,14 @@ fn admit_owned_node_buffer_with_readers(
             Ok(())
         }
         Err(error) => {
-            ctx.node_buffer_readers.discard(&slot_key);
-            if let Some((id, handle)) = ctx.node_buffer_consumer_ids.remove(&slot_key) {
-                handle.set_bytes(0);
+            let registration = {
+                let mut set = ctx.walk_reclaim.borrow_mut();
+                let slots = set.slots_mut();
+                slots.readers_mut().discard(&slot_key);
+                slots.remove_registration(&slot_key)
+            };
+            if let Some((id, handle)) = registration {
+                handle.shrink(handle.bytes());
                 ctx.memory_budget.unregister_consumer(id);
             }
             Err(error)
@@ -3303,16 +3682,15 @@ pub(crate) fn admit_node_buffer_transferred(
 ) -> Result<(), PipelineError> {
     let slot_key = key.into();
     let spill_allowed = node_buffer_spill_allowed(current_dag, slot_key.node);
-    let mut readers = planned_materialized_reader_count(ctx, current_dag, &slot_key)?;
-    if readers == 0 && ctx.current_body_node_input_refs.is_some() {
-        readers = 1;
-    }
+    let readers = published_reader_count(ctx, current_dag, &slot_key)?;
     if readers == 0 {
         return Ok(());
     }
-    if ctx.node_buffers.contains_key(&slot_key)
-        || ctx.node_buffer_consumer_ids.contains_key(&slot_key)
-    {
+    let occupied = {
+        let set = ctx.walk_reclaim.borrow();
+        set.slots().contains_buffer(&slot_key) || set.slots().is_registered(&slot_key)
+    };
+    if occupied {
         return Err(PipelineError::Internal {
             op: "executor",
             node: node_name.to_string(),
@@ -3321,7 +3699,10 @@ pub(crate) fn admit_node_buffer_transferred(
             ),
         });
     }
-    ctx.node_buffer_readers
+    ctx.walk_reclaim
+        .borrow_mut()
+        .slots_mut()
+        .readers_mut()
         .publish(slot_key.clone(), readers, node_name)?;
     match admit_node_buffer_inner(
         ctx,
@@ -3336,8 +3717,18 @@ pub(crate) fn admit_node_buffer_transferred(
         Some(reservation),
     ) {
         Ok(buffer) => {
-            if ctx.node_buffers.insert(slot_key.clone(), buffer).is_some() {
-                ctx.node_buffer_readers.discard(&slot_key);
+            let replaced = ctx
+                .walk_reclaim
+                .borrow_mut()
+                .slots_mut()
+                .insert_buffer(slot_key.clone(), buffer)
+                .is_some();
+            if replaced {
+                ctx.walk_reclaim
+                    .borrow_mut()
+                    .slots_mut()
+                    .readers_mut()
+                    .discard(&slot_key);
                 return Err(PipelineError::Internal {
                     op: "executor",
                     node: node_name.to_string(),
@@ -3349,9 +3740,14 @@ pub(crate) fn admit_node_buffer_transferred(
             Ok(())
         }
         Err(error) => {
-            ctx.node_buffer_readers.discard(&slot_key);
-            if let Some((id, handle)) = ctx.node_buffer_consumer_ids.remove(&slot_key) {
-                handle.set_bytes(0);
+            let registration = {
+                let mut set = ctx.walk_reclaim.borrow_mut();
+                let slots = set.slots_mut();
+                slots.readers_mut().discard(&slot_key);
+                slots.remove_registration(&slot_key)
+            };
+            if let Some((id, handle)) = registration {
+                handle.shrink(handle.bytes());
                 ctx.memory_budget.unregister_consumer(id);
             }
             Err(error)
@@ -3373,8 +3769,35 @@ impl PlannedNodeBufferReaders {
         self.readers.get(key).map_or(0, Vec::len)
     }
 
+    /// What a spill of `key`'s slot needs from this scope's DAG: whether it
+    /// may spill, and the keyed node's name its file bytes are reported
+    /// under. `producer` names the node for the error when `key` is not in
+    /// this scope.
+    pub(crate) fn slot_spill(
+        &self,
+        key: &NodeBufferKey,
+        spill_allowed: bool,
+        producer: &str,
+    ) -> Result<crate::pipeline::memory::walk::SlotSpill, PipelineError> {
+        let node_name = self
+            .node_names
+            .get(&key.node)
+            .ok_or_else(|| PipelineError::Internal {
+                op: "executor",
+                node: producer.to_string(),
+                detail: format!(
+                    "node-buffer slot {key:?} does not belong to the current DAG scope"
+                ),
+            })?;
+        Ok(crate::pipeline::memory::walk::SlotSpill {
+            spill_allowed,
+            node_name: node_name.clone(),
+        })
+    }
+
     /// The label a slot's charge is reported under: the rows `producer`
-    /// buffered for the nodes that read the slot. A successor-local slot is
+    /// buffered for the nodes that read the slot, every distinct planned
+    /// reader named on its own in planned order. A successor-local slot is
     /// read by the node it is keyed on; a slot with no planned reader (a
     /// composition body's terminal output) is read by the composition.
     pub(crate) fn slot_label(
@@ -3383,23 +3806,27 @@ impl PlannedNodeBufferReaders {
         key: &NodeBufferKey,
         composition_call_sites: &[String],
     ) -> clinker_plan::runtime_error::ConsumerLabel {
-        let mut readers: Vec<&str> = Vec::new();
+        // One entry per reading edge, so a node reading the slot over two
+        // edges appears twice; the report names it once.
+        let mut readers: Vec<String> = Vec::new();
         for name in self.readers.get(key).into_iter().flatten() {
-            if !readers.contains(&&**name) {
-                readers.push(name);
+            if !readers.iter().any(|reader| reader.as_str() == &**name) {
+                readers.push(name.to_string());
             }
         }
-        let to = if !readers.is_empty() {
-            readers.join(", ")
-        } else if let Some(keyed) = self.node_names.get(&key.node)
-            && &**keyed != producer
-        {
-            keyed.to_string()
-        } else if let Some(call_site) = composition_call_sites.last() {
-            call_site.clone()
-        } else {
-            producer.to_string()
-        };
+        let to =
+            clinker_plan::runtime_error::NonEmptyReaders::from_vec(readers).unwrap_or_else(|| {
+                let reader = if let Some(keyed) = self.node_names.get(&key.node)
+                    && &**keyed != producer
+                {
+                    keyed.to_string()
+                } else if let Some(call_site) = composition_call_sites.last() {
+                    call_site.clone()
+                } else {
+                    producer.to_string()
+                };
+                clinker_plan::runtime_error::NonEmptyReaders::one(reader)
+            });
         clinker_plan::runtime_error::ConsumerLabel {
             node: producer.to_string(),
             surface: clinker_plan::runtime_error::MemorySurface::BufferedRows {
@@ -3455,6 +3882,36 @@ pub(crate) fn planned_materialized_reader_counts(
     planned
 }
 
+/// How many reads a slot at `key` published in `current_dag` gets: its
+/// planned readers, and for an output node of the running composition body
+/// with none, the one harvest read of the scope driver, which no graph edge
+/// represents. A body node whose every edge crosses into a deferred region
+/// has no planned reader and is no output: its rows are parked for the
+/// commit, and a slot published for it would never be read.
+fn published_reader_count(
+    ctx: &ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
+    key: &NodeBufferKey,
+) -> Result<usize, PipelineError> {
+    let readers = planned_materialized_reader_count(ctx, current_dag, key)?;
+    let harvested = ctx.current_body_node_input_refs.is_some()
+        && ctx
+            .window_runtime
+            .active_stack
+            .last()
+            .and_then(|body| ctx.composition_bodies.get(body))
+            .is_some_and(|body| {
+                body.output_port_to_node_idx
+                    .values()
+                    .any(|output| *output == key.node)
+            });
+    Ok(if readers == 0 && harvested {
+        1
+    } else {
+        readers
+    })
+}
+
 /// Read the precomputed publication cardinality in O(1), while failing loudly
 /// if a slot key belongs to a different DAG scope.
 fn planned_materialized_reader_count(
@@ -3472,6 +3929,26 @@ fn planned_materialized_reader_count(
     Ok(ctx.planned_node_buffer_readers.count(key))
 }
 
+/// Admit `rows` into a node-buffer slot of the walk reclaim set: in memory
+/// when its charge fits and the arbitrator's soft threshold is not crossed,
+/// on disk otherwise.
+///
+/// A fresh `NodeBufferConsumer` registers for the slot (or a composition
+/// port's transferred reservation becomes one) and the slot's charge (the
+/// rows' residue; their values are charged where they were allocated) is
+/// grown through its handle. On the walk that growth first runs a reclaim
+/// pass, which may spill other resident slots; the admitted slot is the
+/// requester, so it is elected last and holds nothing yet.
+///
+/// The rows are spilled here, at their admission, when even then the charge
+/// does not fit, or while the soft threshold is crossed
+/// (`MemoryArbitrator::should_spill`, whose tripped branch also pauses and
+/// resumes Sources on the charged total). They go to one `SpillFile`
+/// through [`node_buffer_spill::spill_node_buffer`], releasing the values
+/// they hold, and the file is charged to the disk quota; an over-quota total
+/// surfaces `PipelineError::SpillCapExceeded` (E320), a disk-cap error kept
+/// distinct from the memory E310. A slot is never refused for memory: every
+/// published slot may spill.
 fn admit_node_buffer_inner(
     ctx: &mut ExecutorContext<'_>,
     node_name: &str,
@@ -3480,6 +3957,9 @@ fn admit_node_buffer_inner(
     spill_allowed: bool,
     transferred_reservation: Option<TransientNodeBufferReservation>,
 ) -> Result<NodeBuffer, PipelineError> {
+    let slot_spill =
+        ctx.planned_node_buffer_readers
+            .slot_spill(&slot_key, spill_allowed, node_name)?;
     let bytes = transferred_reservation
         .as_ref()
         .map(TransientNodeBufferReservation::bytes)
@@ -3504,7 +3984,7 @@ fn admit_node_buffer_inner(
     // discharge — e.g. the post-recompute aggregate emit path)
     // unregisters first so the arbitrator's registry holds exactly
     // one wrapper per live slot.
-    let (consumer_id, handle) = if let Some(reservation) = transferred_reservation {
+    let (consumer_id, handle, admitted) = if let Some(reservation) = transferred_reservation {
         let (consumer_id, handle) = reservation.into_registration();
         let replacement = Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
             handle.clone(),
@@ -3518,7 +3998,7 @@ fn admit_node_buffer_inner(
             // the id on this invariant failure. `unregister_consumer` is safe
             // even when the missing-id result reflects a concurrently removed
             // final snapshot.
-            handle.set_bytes(0);
+            handle.shrink(handle.bytes());
             ctx.memory_budget.unregister_consumer(consumer_id);
             return Err(PipelineError::Internal {
                 op: "executor",
@@ -3527,9 +4007,15 @@ fn admit_node_buffer_inner(
                     .to_string(),
             });
         }
-        (consumer_id, handle)
+        // The reservation already holds the slot's bytes charged.
+        (consumer_id, handle, true)
     } else {
-        if let Some((prev_id, _)) = ctx.node_buffer_consumer_ids.remove(&slot_key) {
+        let previous = ctx
+            .walk_reclaim
+            .borrow_mut()
+            .slots_mut()
+            .remove_registration(&slot_key);
+        if let Some((prev_id, _)) = previous {
             ctx.memory_budget.unregister_consumer(prev_id);
         }
         // Registered empty: the slot's bytes are charged below, taken over
@@ -3546,21 +4032,27 @@ fn admit_node_buffer_inner(
             )),
             handle.clone(),
             label,
-        );
-        owned.charge_to(&handle, bytes);
-        (consumer_id, handle)
+        )?;
+        let admitted = owned.charge_to(&handle, bytes);
+        (consumer_id, handle, admitted)
     };
-    ctx.node_buffer_consumer_ids
-        .insert(slot_key, (consumer_id, handle.clone()));
+    ctx.walk_reclaim.borrow_mut().slots_mut().register(
+        slot_key,
+        (consumer_id, handle.clone()),
+        slot_spill,
+    );
     // Establish the NodeBuffer owner first, then release any prior producer
-    // portion still held before any local pressure poll.
+    // portion still held before the pressure poll.
     owned.release_prior();
     let NodeBufferAdmission { rows, puncts, .. } = owned;
     debug_assert!(
         spill_allowed,
         "every published materialized node-buffer slot must be spill-eligible"
     );
-    if !ctx.memory_budget.should_spill() {
+    // Polled whether or not the charge fit: its tripped branch is also where
+    // Sources pause and resume on the charged total.
+    let soft_threshold_crossed = ctx.memory_budget.should_spill();
+    if admitted && !soft_threshold_crossed {
         return Ok(NodeBuffer::memory_from_records_and_puncts(rows, puncts));
     }
     // Resolve the spill compression mode against this slot's schema width and
@@ -3584,7 +4076,7 @@ fn admit_node_buffer_inner(
             // is zero. The handle reflects the operator's live state
             // for the arbitrator's pull-mode `current_usage` —
             // Velox's "reclaimable ≠ held" point.
-            handle.set_bytes(0);
+            handle.shrink(handle.bytes());
             let file_bytes = std::fs::metadata(file.path()).map(|m| m.len()).unwrap_or(0);
             if ctx.memory_budget.record_spill_bytes(node_name, file_bytes) {
                 return Err(PipelineError::spill_cap_exceeded(
@@ -3644,7 +4136,7 @@ fn admit_node_buffer_inner(
 /// materialized-tail bookkeeping is skipped that a downstream stage
 /// depends on.
 pub(crate) fn stream_linear_producer_emit(
-    sender: &crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>,
+    sender: &crate::executor::stream_hop::HopSender,
     batch_size: usize,
     node_name: &str,
     rows: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
@@ -3657,14 +4149,16 @@ pub(crate) fn stream_linear_producer_emit(
             charge.charge_and_route(
                 batch,
                 |event: crate::executor::stream_event::StreamEvent| {
-                    sender.send(event).map_err(|_| PipelineError::Internal {
-                        op: "executor",
-                        node: node_name.to_string(),
-                        detail: String::from(
-                            "streaming Sink writer task dropped its receiver before \
+                    sender
+                        .send(crate::executor::stream_hop::HopMessage::Event(event))
+                        .map_err(|_| PipelineError::Internal {
+                            op: "executor",
+                            node: node_name.to_string(),
+                            detail: String::from(
+                                "streaming Sink writer task dropped its receiver before \
                              the streaming producer arm finished",
-                        ),
-                    })
+                            ),
+                        })
                 },
             )
         },
@@ -3878,12 +4372,11 @@ pub(crate) fn finalize_node_rooted_windows(
         let arena_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::ArenaBuild);
         let arena =
             Arena::from_records(rows, &spec.arena_fields, anchor_schema, &ctx.memory_budget)
-                .map_err(|e| PipelineError::MemoryBudgetExceeded {
-                    node: current_dag.graph[upstream_idx].name().to_string(),
-                    used: ctx.memory_budget.peak_rss().unwrap_or(0),
-                    limit: ctx.memory_budget.hard_limit(),
-                    source: BudgetCategory::Arena,
-                    detail: Some(format!("node-rooted arena build: {e}")),
+                .map_err(|e| {
+                    e.into_pipeline_error(
+                        current_dag.graph[upstream_idx].name(),
+                        &ctx.memory_budget,
+                    )
                 })?;
         let arena_len = arena.record_count();
         ctx.collector
@@ -3912,7 +4405,7 @@ pub(crate) fn finalize_node_rooted_windows(
                 node: current_dag.graph[upstream_idx].name().to_string(),
                 surface: clinker_plan::runtime_error::MemorySurface::WindowIndex,
             },
-        );
+        )?;
         ctx.window_arena_consumer_ids
             .insert(idx, (arena_consumer_id, arena_handle));
 
@@ -4004,7 +4497,7 @@ pub(crate) fn finalize_node_rooted_windows(
 /// Vec instead). Bundled into one struct so the arm's signature stays
 /// under the argument-count lint.
 pub(crate) struct MergeStreamHandoff<'a> {
-    pub(crate) sender: crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>,
+    pub(crate) sender: crate::executor::stream_hop::HopSender,
     pub(crate) charge: &'a crate::executor::batch_handoff::StreamingChargeHandle,
     pub(crate) batch_size: usize,
 }
@@ -4164,9 +4657,9 @@ pub(crate) fn merge_fused_interleave(
     // stays round-robin-fair across iterations), block on `select()`
     // (parks the thread — no busy spin — until some receiver has a
     // message or is disconnected), then map the chosen operation back
-    // to its predecessor index. A disconnected channel surfaces as a
-    // ready op whose `recv` returns `Err`, so closed-source detection
-    // happens inside the same select loop.
+    // to its predecessor index. A source's `Ended` closes its slot inside
+    // the same select loop; a disconnected channel surfaces as a ready op
+    // whose `recv` returns `Err`, which fails the run.
     //
     // Flush one accumulated streaming batch through the slot's charge
     // handle: `add_bytes` its footprint, optionally one-batch spill on a
@@ -4183,7 +4676,7 @@ pub(crate) fn merge_fused_interleave(
                 |event: crate::executor::stream_event::StreamEvent| {
                     handoff
                         .sender
-                        .send(event)
+                        .send(crate::executor::stream_hop::HopMessage::Event(event))
                         .map_err(|_| PipelineError::Internal {
                             op: "executor",
                             node: merge_name.to_string(),
@@ -4205,156 +4698,177 @@ pub(crate) fn merge_fused_interleave(
         ctx.activate_source_for_drain(&state.source_name_string);
     }
     let n = receivers.len();
-    loop {
-        // Honor cooperative shutdown at the chunk boundary before blocking on
-        // the next `select()`. Without this poll a long fused
-        // Merge.interleave -> streaming-Output stream ignores a tripped token
-        // and runs to natural EOF, blowing the shutdown-latency bound that the
-        // non-fused operator loops already respect.
-        ctx.check_shutdown()?;
-        let start = {
-            let s = if n == 0 { 0 } else { cursor % n };
-            cursor = cursor.wrapping_add(1);
-            s
-        };
-        let mut sel = crossbeam_channel::Select::new();
-        // Map each registered select operation index back to its
-        // predecessor index.
-        let mut op_to_pred: Vec<usize> = Vec::with_capacity(n);
-        for offset in 0..n {
-            let i = (start + offset) % n;
-            if let Some(rx) = receivers[i].as_ref() {
-                sel.recv(rx);
-                op_to_pred.push(i);
-            }
-        }
-        if op_to_pred.is_empty() {
-            // Every source closed.
-            break;
-        }
-        // Publish the staged tail before blocking. This loop has no
-        // record-count boundary of its own, so without this a fused
-        // interleave over several sources would report a frozen count for
-        // its whole run and jump only as each source closed — the stalled
-        // reading this counter exists to rule out.
-        let oper = match sel.try_select() {
-            Ok(ready) => ready,
-            Err(_) => {
-                publish_record_progress(ctx);
-                sel.select()
-            }
-        };
-        let op_index = oper.index();
-        let i = op_to_pred[op_index];
-        // Complete the chosen operation on its receiver. `Ok` is a
-        // record/punctuation; `Err(RecvError)` means that source's
-        // channel disconnected (all senders dropped) — `ok()` maps it to
-        // the `None` close arm below.
-        let item: Option<crate::executor::source_stream::SourceStreamEvent> = oper
-            .recv(
-                receivers[i]
-                    .as_ref()
-                    .expect("select op_index maps to an active receiver"),
-            )
-            .ok();
-        // A document-boundary punctuation off a Source channel is collected
-        // for the close-time reconcile rather than forwarded inline; only
-        // records flow into the per-record pipeline below.
-        let consumed = item
-            .map(|event| consume_source_event(ctx, &states[i].source_name_arc, event))
-            .transpose()?;
-        let item: Option<(Record, crate::executor::stream_event::SourceRowId)> = match consumed {
-            Some(ConsumedSourceEvent::Record(record, row_id)) => Some((record, row_id)),
-            Some(ConsumedSourceEvent::Rejected) => {
-                per_source_counts[i] += 1;
-                continue;
-            }
-            Some(ConsumedSourceEvent::Punctuation(p)) => {
-                // A structural-count close condemns its whole file; mark it
-                // failed before the reconcile so the Output arm's per-file
-                // buffer rejects every already-streamed record of the file.
-                crate::executor::document_dlq::mark_structural_reject_if_present(
-                    ctx,
-                    &p,
-                    &states[i].source_name_arc,
-                )?;
-                collected_puncts.push(p);
-                continue;
-            }
-            Some(ConsumedSourceEvent::Population) => continue,
-            None => None,
-        };
-        match item {
-            Some((record, rn)) => {
-                let state = &states[i];
-                let mut rec = match state.source_schema.as_ref() {
-                    Some(target) => {
-                        canonicalize_to_source_schema(&record, target, &state.engine_stamped)
-                    }
-                    None => record,
-                };
-                if has_record_seed {
-                    rec.seed_record_vars(ctx.record_var_seed);
+    let loop_result: Result<(), PipelineError> = (|| {
+        loop {
+            // Honor cooperative shutdown at the chunk boundary before blocking on
+            // the next `select()`. Without this poll a long fused
+            // Merge.interleave -> streaming-Output stream ignores a tripped token
+            // and runs to natural EOF, blowing the shutdown-latency bound that the
+            // non-fused operator loops already respect.
+            ctx.check_shutdown()?;
+            let start = {
+                let s = if n == 0 { 0 } else { cursor % n };
+                cursor = cursor.wrapping_add(1);
+                s
+            };
+            let mut sel = crossbeam_channel::Select::new();
+            // Map each registered select operation index back to its
+            // predecessor index.
+            let mut op_to_pred: Vec<usize> = Vec::with_capacity(n);
+            for offset in 0..n {
+                let i = (start + offset) % n;
+                if let Some(rx) = receivers[i].as_ref() {
+                    sel.recv(rx);
+                    op_to_pred.push(i);
                 }
-                seed_source_vars_for_record(ctx, &state.source_name_string, &rec)?;
-                per_source_counts[i] += 1;
-                // Re-canonicalize onto the Merge's output schema so
-                // downstream operators hit `Arc::ptr_eq` regardless of which
-                // Source produced the record. The rebuild carries the
-                // record's document context across, so a downstream
-                // per-document operator still buckets each row by the
-                // document its Source opened — otherwise the rebuilt row
-                // would carry the synthetic sentinel id and every document's
-                // `DocumentClose` would flush an empty bucket.
-                if let Some(merge_schema) = merge_schema_arc.as_ref() {
-                    check_input_schema(
-                        merge_schema,
-                        rec.schema(),
-                        merge_name,
-                        "merge",
-                        &state.source_name_string,
+            }
+            if op_to_pred.is_empty() {
+                // Every source closed.
+                break;
+            }
+            // Publish the staged tail before blocking. This loop has no
+            // record-count boundary of its own, so without this a fused
+            // interleave over several sources would report a frozen count for
+            // its whole run and jump only as each source closed — the stalled
+            // reading this counter exists to rule out.
+            let oper = match sel.try_select() {
+                Ok(ready) => ready,
+                Err(_) => {
+                    publish_record_progress(ctx);
+                    sel.select()
+                }
+            };
+            let op_index = oper.index();
+            let i = op_to_pred[op_index];
+            // Complete the chosen operation on its receiver. `Err(RecvError)`
+            // means that source's channel disconnected (all senders dropped);
+            // `ok()` hands it to `consume_source_event` as `None`, a failure.
+            let item: Option<crate::executor::source_stream::SourceStreamEvent> = oper
+                .recv(
+                    receivers[i]
+                        .as_ref()
+                        .expect("select op_index maps to an active receiver"),
+                )
+                .ok();
+            // A document-boundary punctuation off a Source channel is collected
+            // for the close-time reconcile rather than forwarded inline; only
+            // records flow into the per-record pipeline below.
+            let consumed = consume_source_event(ctx, &states[i].source_name_arc, item)?;
+            let item: Option<(Record, crate::executor::stream_event::SourceRowId)> = match consumed
+            {
+                ConsumedSourceEvent::Record(record, row_id) => Some((record, row_id)),
+                ConsumedSourceEvent::Rejected => {
+                    per_source_counts[i] += 1;
+                    continue;
+                }
+                ConsumedSourceEvent::Punctuation(p) => {
+                    // A structural-count close condemns its whole file; mark it
+                    // failed before the reconcile so the Output arm's per-file
+                    // buffer rejects every already-streamed record of the file.
+                    crate::executor::document_dlq::mark_structural_reject_if_present(
+                        ctx,
+                        &p,
+                        &states[i].source_name_arc,
                     )?;
-                    let doc_ctx = rec.doc_ctx().clone();
-                    let values = rec.values().to_vec();
-                    rec = Record::new(merge_schema.clone(), values);
-                    rec.set_doc_ctx(doc_ctx);
+                    collected_puncts.push(p);
+                    continue;
                 }
-                match stream_batch.as_mut() {
-                    // Streaming: accumulate into the current batch and flush
-                    // it through the charge handle once it fills. The
-                    // charge handle's bounded `send` is the back-pressure
-                    // pivot — a slow writer stalls the Merge thread here,
-                    // stopping its `select()` calls and letting the Source
-                    // channels fill.
-                    Some(batch) => {
-                        batch.push_record(rec, rn);
-                        if batch.len() >= batch_size {
-                            let full = std::mem::replace(
-                                batch,
-                                crate::executor::batch_handoff::EventBatch::with_capacity(
-                                    batch_size,
-                                ),
-                            );
-                            flush_stream_batch(full)?;
+                ConsumedSourceEvent::Population => continue,
+                ConsumedSourceEvent::Ended => None,
+            };
+            match item {
+                Some((record, rn)) => {
+                    let state = &states[i];
+                    let mut rec = match state.source_schema.as_ref() {
+                        Some(target) => {
+                            canonicalize_to_source_schema(&record, target, &state.engine_stamped)
                         }
+                        None => record,
+                    };
+                    if has_record_seed {
+                        rec.seed_record_vars(ctx.record_var_seed);
                     }
-                    None => merged.push((rec, rn)),
+                    seed_source_vars_for_record(ctx, &state.source_name_string, &rec)?;
+                    per_source_counts[i] += 1;
+                    // Re-canonicalize onto the Merge's output schema so
+                    // downstream operators hit `Arc::ptr_eq` regardless of which
+                    // Source produced the record. The rebuild carries the
+                    // record's document context across, so a downstream
+                    // per-document operator still buckets each row by the
+                    // document its Source opened — otherwise the rebuilt row
+                    // would carry the synthetic sentinel id and every document's
+                    // `DocumentClose` would flush an empty bucket.
+                    if let Some(merge_schema) = merge_schema_arc.as_ref() {
+                        check_input_schema(
+                            merge_schema,
+                            rec.schema(),
+                            merge_name,
+                            "merge",
+                            &state.source_name_string,
+                        )?;
+                        let doc_ctx = rec.doc_ctx().clone();
+                        let values = rec.values().to_vec();
+                        rec = Record::new(merge_schema.clone(), values);
+                        rec.set_doc_ctx(doc_ctx);
+                    }
+                    match stream_batch.as_mut() {
+                        // Streaming: accumulate into the current batch and flush
+                        // it through the charge handle once it fills. The
+                        // charge handle's bounded `send` is the back-pressure
+                        // pivot — a slow writer stalls the Merge thread here,
+                        // stopping its `select()` calls and letting the Source
+                        // channels fill.
+                        Some(batch) => {
+                            batch.push_record(rec, rn);
+                            if batch.len() >= batch_size {
+                                let full = std::mem::replace(
+                                    batch,
+                                    crate::executor::batch_handoff::EventBatch::with_capacity(
+                                        batch_size,
+                                    ),
+                                );
+                                flush_stream_batch(full)?;
+                            }
+                        }
+                        None => merged.push((rec, rn)),
+                    }
                 }
-            }
-            None => {
-                // Source closed. Stamp finalized per-source count, drop
-                // the receiver slot so subsequent iterations skip it, and
-                // release the source's arbitrator registration — its
-                // channel is drained, so the Source's per-attempt queued
-                // charge must leave the ledger total `sum_consumer_usage`
-                // reads.
-                let count = per_source_counts[i];
-                let name_arc = Arc::clone(&states[i].source_name_arc);
-                receivers[i] = None;
-                ctx.finalize_source_count(&name_arc, count);
-                ctx.release_source_consumer(&states[i].source_name_string);
+                None => {
+                    // Source ended. Stamp finalized per-source count, drop
+                    // the receiver slot so subsequent iterations skip it, and
+                    // release the source's arbitrator registration — its
+                    // channel is drained, so the Source's per-attempt queued
+                    // charge must leave the ledger total `sum_consumer_usage`
+                    // reads.
+                    let count = per_source_counts[i];
+                    let name_arc = Arc::clone(&states[i].source_name_arc);
+                    receivers[i] = None;
+                    ctx.finalize_source_count(&name_arc, count);
+                    ctx.release_source_consumer(&states[i].source_name_string);
+                }
             }
         }
+        Ok(())
+    })();
+    // A producer delivers every row it took before it reports its failure,
+    // so the step it streams into meets the rows in data order and fails on
+    // the earliest row it cannot take. On a loop error the pending batch is
+    // flushed first. The loop's error is earlier in data order than any row
+    // that batch carries, so it is the error returned even when the flush
+    // fails too.
+    if let Err(loop_error) = loop_result {
+        if let Some(batch) = stream_batch.take()
+            && !batch.is_empty()
+            && let Err(flush_error) = flush_stream_batch(batch)
+        {
+            tracing::warn!(
+                node = merge_name,
+                error = %flush_error,
+                "the Merge could not hand the rows it took before its failure to the step \
+                 it streams into; the run reports the Merge's failure"
+            );
+        }
+        return Err(loop_error);
     }
 
     // Flush the trailing partial record batch (streaming mode only) before
@@ -4368,11 +4882,10 @@ pub(crate) fn merge_fused_interleave(
     // Reconcile the collected boundaries down to one open + one close per
     // document (the non-fused Merge arm's cross-input fold). In streaming
     // mode emit them through the same bounded channel at the tail and
-    // return an empty result; the sender then drops with this frame,
-    // disconnecting the writer thread's `recv` loop and triggering its
-    // flush. In materialized mode hand the records and the reconciled
-    // boundaries back to the Merge arm, which admits both into the node
-    // buffer.
+    // return an empty result; the consumer finishes on the hop's End, sent
+    // once this arm returns `Ok`. In materialized mode hand the records and
+    // the reconciled boundaries back to the Merge arm, which admits both into
+    // the node buffer.
     let deduped_puncts =
         crate::executor::stream_event::reconcile_document_boundaries(collected_puncts);
     if streaming.is_some() {
@@ -4380,8 +4893,7 @@ pub(crate) fn merge_fused_interleave(
         // chunked at `batch_size` exactly like the record stream above and
         // the non-fused arm's `stream_linear_producer_emit`, so a run
         // spanning very many documents never builds one unbounded tail
-        // batch. The sender then drops with this frame, disconnecting the
-        // writer thread's `recv` loop and triggering its flush.
+        // batch.
         let mut batch = crate::executor::batch_handoff::EventBatch::with_capacity(batch_size);
         for p in deduped_puncts {
             batch.push_punctuation(p);
@@ -4417,8 +4929,9 @@ pub(crate) fn merge_fused_interleave(
 /// Source's plan-time schema, seed `$record.<key>` defaults, seed
 /// `$source.<key>` defaults per `(source, file)`, advance the per-
 /// source running counter), runs the Transform's `evaluate_single_transform`
-/// per record, and emits records into `ctx.node_buffers[transform_idx]`
-/// at the close. See https://github.com/rustpunk/clinker/issues/74.
+/// per record, and emits records into the walk reclaim set's
+/// `transform_idx` slot at the close.
+/// See https://github.com/rustpunk/clinker/issues/74.
 ///
 /// Eligibility (windowed Transforms, multi-input Transforms, body-
 /// context Transforms, init-phase Transforms, fanned-out Sources) is
@@ -4521,16 +5034,12 @@ pub(crate) fn transform_fused_consume(
     // a blocking operator), each batch drains into the stage's full output
     // accumulator and `admit_node_buffer` charges it as one slot, the
     // existing materialized path.
-    let streaming_sender = ctx.streaming_output_senders.remove(&node_idx);
-    let streaming = streaming_sender.is_some();
-    // The per-batch charge handle for the streaming slot. Built before the
-    // batcher closure that moves it; `None` in materialized mode where the
-    // batch drains into the stage accumulator and `admit_node_buffer`
-    // charges the full slot instead.
-    let charge = streaming_sender.as_ref().and_then(|_| {
-        let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
-        ctx.streaming_charge_handle(node_idx, name, spill_allowed)
-    });
+    // The sender comes with the per-batch charge handle for the streaming
+    // slot; `None` in materialized mode, where the batch drains into the
+    // stage accumulator and `admit_node_buffer` charges the full slot
+    // instead.
+    let streaming_hop = ctx.take_streaming_hop(current_dag, node_idx, name)?;
+    let streaming = streaming_hop.is_some();
 
     let (mut evaluator_opt, directives, log_conditions): FusedTransformParts<'_> =
         match transform_payload {
@@ -4612,14 +5121,13 @@ pub(crate) fn transform_fused_consume(
     // batch) or, in materialized mode, splits the batch into the
     // records-only accumulator (the input to the window/region helpers)
     // and the punctuation list. A send error or accumulation error
-    // bubbles out through `loop_result`. The closure owns
-    // `streaming_sender` by value so the bounded channel's sender drops
-    // when the batcher drops — clean exit then disconnects the writer
-    // thread's `recv` loop and triggers its flush.
+    // bubbles out through `loop_result`. The consumer finishes only on the
+    // hop's End, which the hop's driver sends once this arm returns `Ok`;
+    // when the sender drops does not matter to it.
     let mut event_batcher = crate::executor::batch_handoff::EventBatcher::new(
         batch_size,
         |batch: crate::executor::batch_handoff::EventBatch| -> Result<(), PipelineError> {
-            if let Some(tx) = streaming_sender.as_ref() {
+            if let Some((tx, charge)) = streaming_hop.as_ref() {
                 // Route the flushed batch through the slot's charge handle:
                 // it `add_bytes` the batch footprint to the arbitrator
                 // wrapper, optionally spills the batch on a soft-threshold
@@ -4629,20 +5137,18 @@ pub(crate) fn transform_fused_consume(
                 // channel fill. A send error means the writer dropped its
                 // receiver, so the streaming chain is broken; surface it
                 // rather than silently dropping the record.
-                let charge = charge
-                    .as_ref()
-                    .expect("streaming sender implies a registered charge handle");
                 return charge.charge_and_route(
                     batch,
                     |event: crate::executor::stream_event::StreamEvent| {
-                        tx.send(event).map_err(|_| PipelineError::Internal {
-                            op: "executor",
-                            node: String::from("fused-transform-stream"),
-                            detail: String::from(
-                                "streaming Sink writer task dropped its receiver \
+                        tx.send(crate::executor::stream_hop::HopMessage::Event(event))
+                            .map_err(|_| PipelineError::Internal {
+                                op: "executor",
+                                node: String::from("fused-transform-stream"),
+                                detail: String::from(
+                                    "streaming Sink writer task dropped its receiver \
                                  before the fused Transform arm finished",
-                            ),
-                        })
+                                ),
+                            })
                     },
                 );
             }
@@ -4682,12 +5188,9 @@ pub(crate) fn transform_fused_consume(
             // appended in arrival order, a `DocumentClose` stays after the
             // last record of its own document even when a multi-file Source
             // interleaves several documents through this one fused Transform.
-            let consumed = item
-                .map(|event| consume_source_event(ctx, &source_name_arc, event))
-                .transpose()?;
-            let (record, rn) = match consumed {
-                Some(ConsumedSourceEvent::Record(record, row_id)) => (record, row_id),
-                Some(ConsumedSourceEvent::Rejected) => {
+            let (record, rn) = match consume_source_event(ctx, &source_name_arc, item)? {
+                ConsumedSourceEvent::Record(record, row_id) => (record, row_id),
+                ConsumedSourceEvent::Rejected => {
                     count += 1;
                     records_since_check += 1;
                     if records_since_check >= 1024 {
@@ -4696,7 +5199,7 @@ pub(crate) fn transform_fused_consume(
                     }
                     continue;
                 }
-                Some(ConsumedSourceEvent::Punctuation(p)) => {
+                ConsumedSourceEvent::Punctuation(p) => {
                     // A structural-count close condemns its whole file; mark
                     // it failed before forwarding so the Output arm's
                     // per-file buffer rejects every already-streamed record
@@ -4709,8 +5212,8 @@ pub(crate) fn transform_fused_consume(
                     event_batcher.push_punctuation(p)?;
                     continue;
                 }
-                Some(ConsumedSourceEvent::Population) => continue,
-                None => break,
+                ConsumedSourceEvent::Population => continue,
+                ConsumedSourceEvent::Ended => break,
             };
             last_file = source_file_arc_of(&record);
             let mut rec = canonicalize(&record);
@@ -4837,13 +5340,27 @@ pub(crate) fn transform_fused_consume(
         }
         Ok(())
     })();
-    // Surface a loop error first (the originating failure), then flush the
-    // trailing partial batch. `finish` consumes the batcher, dropping the
-    // streaming sender (clean-exit disconnect of the writer thread) or
-    // releasing the borrow of `output_records` for the materialized-path
-    // helper calls below; on the loop-error path the batcher drops here
-    // instead, which also drops the sender / releases the borrow.
-    loop_result?;
+    // A producer delivers every row it emitted before it reports its
+    // failure, so the step it streams into meets the rows in data order and
+    // fails on the earliest row it cannot take. On a loop error the pending
+    // batch is flushed first. The loop's error is earlier in data order than
+    // any row that batch carries, so it is the error returned even when the
+    // flush fails too. `finish` consumes the batcher, dropping the streaming
+    // sender or releasing the borrow of `output_records` for the
+    // materialized-path helper calls below. Dropping the sender does not end
+    // the consumer's input: only the hop's End does, sent after this arm
+    // returns `Ok`.
+    if let Err(loop_error) = loop_result {
+        if let Err(flush_error) = event_batcher.finish() {
+            tracing::warn!(
+                node = name,
+                error = %flush_error,
+                "the Transform could not hand the rows it produced before its failure to \
+                 the step it streams into; the run reports the Transform's failure"
+            );
+        }
+        return Err(loop_error);
+    }
     event_batcher.finish()?;
     ctx.finalize_source_count(&source_name_arc, count);
     ctx.release_source_consumer(source_name_owned.as_str());
@@ -4885,10 +5402,12 @@ pub(crate) fn transform_fused_consume(
 /// Service any pending node-buffer spill requests before dispatching the
 /// next node.
 ///
-/// When [`MemoryArbitrator::should_spill`] trips at an admission boundary it
-/// elects a victim and, for a non-back-pressureable consumer, calls
-/// `try_spill`, which only flips the slot's [`ConsumerHandle`] spill-request
-/// flag — it performs no I/O. This sweep is the missing servicing half: it
+/// A spill request reaches a slot when an operator's `should_spill` poll
+/// elects it (`try_spill`), or when a reclaim pass (a request's, or the
+/// round `spill_reclaimable` runs before a paused Source resumes) finds the
+/// slot held by the running arm; each only flips the slot's
+/// [`ConsumerHandle`] spill-request flag and performs no I/O. This sweep is
+/// the servicing half: it
 /// reads each live slot's flag via `take_spill_request` and, for a resident
 /// resident `NodeBuffer::Memory` slot whose compiled classification permits
 /// spilling ([`node_buffer_spill_allowed`]), flushes it to
@@ -4899,22 +5418,40 @@ pub(crate) fn transform_fused_consume(
 ///
 /// Thin `ExecutorContext` adapter over [`service_pending_node_buffer_spills`],
 /// which holds the testable core (the full context is impractical to build
-/// for a unit test, and the RSS-vs-charged interplay makes the false→true
-/// `should_spill` transition non-deterministic through a live run).
+/// for a unit test, and whether a live run raises a request between two
+/// admissions depends on the other operators' polls).
 fn service_node_buffer_spill_requests(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
 ) -> Result<(), PipelineError> {
     let is_spill_allowed = |idx: NodeIndex| node_buffer_spill_allowed(current_dag, idx);
     let node_name = |idx: NodeIndex| current_dag.graph[idx].name().to_string();
+    // The sweep only writes spill files and charges the disk quota; it makes
+    // no governed allocation, so it holds the set for its whole pass.
+    let mut set = ctx.walk_reclaim.borrow_mut();
+    // What each slot captured at registration is what this DAG answers, so a
+    // reclaim that has no DAG decides every slot the same way.
+    debug_assert!(
+        set.slots().registrations().keys().all(|key| {
+            set.slots().slot_spill(key).is_some_and(|captured| {
+                captured.spill_allowed == is_spill_allowed(key.node)
+                    && current_dag
+                        .graph
+                        .node_weight(key.node)
+                        .is_some_and(|node| *captured.node_name == *node.name())
+            })
+        }),
+        "a node-buffer slot's captured spill facts disagree with its DAG"
+    );
+    let (node_buffers, consumer_ids, settings) = set.spill_sweep_parts();
     service_pending_node_buffer_spills(
-        &mut ctx.node_buffers,
+        node_buffers,
         &NodeBufferSpillSweep {
-            consumer_ids: &ctx.node_buffer_consumer_ids,
+            consumer_ids,
             arbitrator: &ctx.memory_budget,
-            spill_root: ctx.spill_root_path.as_ref(),
-            spill_compress: ctx.spill_compress,
-            batch_size: ctx.batch_size,
+            spill_root: settings.spill_root.as_ref(),
+            spill_compress: settings.spill_compress,
+            batch_size: settings.batch_size,
             is_spill_allowed: &is_spill_allowed,
             node_name: &node_name,
         },
@@ -4952,13 +5489,18 @@ pub(crate) struct NodeBufferSpillSweep<'a> {
 /// consumer registry, the arbitrator, the run's spill settings, and the
 /// `is_spill_allowed` / `node_name` resolvers the caller derives from the live
 /// DAG. Splitting it out lets a white-box test drive the resident-slot spill
-/// path deterministically — a live pipeline run cannot, because the RSS-vs-
-/// charged arms of `should_spill` cannot be made to transition false→true
-/// between two admissions with real record footprints.
+/// path deterministically, raising the request itself rather than depending
+/// on another operator's poll to raise it between two admissions.
 pub(crate) fn service_pending_node_buffer_spills(
     node_buffers: &mut HashMap<NodeBufferKey, NodeBuffer>,
     sweep: &NodeBufferSpillSweep<'_>,
 ) -> Result<(), PipelineError> {
+    let spill = ResidentSlotSpill {
+        arbitrator: sweep.arbitrator,
+        spill_root: sweep.spill_root,
+        spill_compress: sweep.spill_compress,
+        batch_size: sweep.batch_size,
+    };
     // Phase 1: collect the slots whose consumer flagged a spill request and
     // that are eligible to spill (resident `Memory` or re-readable resident
     // memory). `take_spill_request` read-and-clears every observed flag.
@@ -4984,51 +5526,179 @@ pub(crate) fn service_pending_node_buffer_spills(
         else {
             continue;
         };
-        let Some(buffer) = node_buffers.remove(&key) else {
-            continue;
-        };
         let name = (sweep.node_name)(key.node);
+        spill.spill_slot(node_buffers, &key, &handle, &name)?;
+    }
+    Ok(())
+}
+
+/// What spilling one resident node-buffer slot needs besides the slot: the
+/// arbitrator its file bytes are charged to and the run's spill settings.
+pub(crate) struct ResidentSlotSpill<'a> {
+    pub(crate) arbitrator: &'a crate::pipeline::memory::MemoryArbitrator,
+    pub(crate) spill_root: &'a std::path::Path,
+    pub(crate) spill_compress: clinker_plan::config::CompressMode,
+    pub(crate) batch_size: usize,
+}
+
+/// What spilling one node-buffer slot did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SlotSpillResult {
+    /// The slot's rows went to one spill file of this many bytes.
+    Written(u64),
+    /// Nothing was written and the slot's rows stay in memory: a live
+    /// cursor or view shares their backing, so they stay where its reader
+    /// holds them and a spill could free none of them.
+    StillShared,
+    /// Nothing was written because the slot holds no rows in memory: it is
+    /// absent, already on disk, or holds only document boundaries.
+    NothingResident,
+}
+
+impl ResidentSlotSpill<'_> {
+    /// Spill the slot at `key` to one file now, if it is resident, and
+    /// release its in-memory charge: the slot's residue through `handle`,
+    /// and its records' own allocations as they drop once written. Charges
+    /// the file to `node_name` against the disk quota, failing with the
+    /// spill-cap error (E320) past it. A slot that is not resident, or is
+    /// absent, is left as it is.
+    ///
+    /// Reports what it did. A slot whose rows a live cursor or view still
+    /// shares writes nothing and keeps them; its handle's reclaimable figure
+    /// and its charge are left exactly as they were, so a view published
+    /// with nothing reclaimable still reports nothing reclaimable after a
+    /// sweep. Otherwise the figure is re-set to what the slot still holds in
+    /// memory.
+    ///
+    /// Blocks on the file write. Never reserves memory, so a reclaim may call
+    /// it while it holds the reclaim set.
+    pub(crate) fn spill_slot(
+        &self,
+        node_buffers: &mut HashMap<NodeBufferKey, NodeBuffer>,
+        key: &NodeBufferKey,
+        handle: &crate::pipeline::memory::ConsumerHandle,
+        node_name: &str,
+    ) -> Result<SlotSpillResult, PipelineError> {
+        let Some(buffer) = node_buffers.remove(key) else {
+            return Ok(SlotSpillResult::NothingResident);
+        };
         // Resolve the compression mode against this slot's schema width and
         // the run's batch size, matching the admission path so the on-disk
         // format agrees with what `--explain` projects.
         let column_count = buffer.first_record_column_count();
-        let compress = sweep
+        let compress = self
             .spill_compress
-            .resolve_for_schema(column_count, sweep.batch_size as u64);
+            .resolve_for_schema(column_count, self.batch_size as u64);
         let (spilled, file_bytes) =
-            buffer.spill_resident_memory(Some(sweep.spill_root), compress)?;
-        node_buffers.insert(key, spilled);
-        if file_bytes > 0 {
-            // Rows are on disk now; the slot's in-memory charge is zero.
-            handle.set_bytes(0);
-            if sweep.arbitrator.record_spill_bytes(&name, file_bytes) {
-                return Err(PipelineError::spill_cap_exceeded(
-                    name,
-                    sweep.arbitrator.max_spill_bytes(),
-                    file_bytes,
-                    sweep.arbitrator.cumulative_spill_bytes(),
-                ));
-            }
+            buffer.spill_resident_memory(Some(self.spill_root), compress)?;
+        let still_resident = spilled.reclaimable_bytes();
+        if file_bytes == 0 && still_resident > 0 {
+            node_buffers.insert(key.clone(), spilled);
+            return Ok(SlotSpillResult::StillShared);
         }
+        handle.set_reclaimable(still_resident);
+        node_buffers.insert(key.clone(), spilled);
+        if file_bytes == 0 {
+            return Ok(SlotSpillResult::NothingResident);
+        }
+        // Rows are on disk now; the slot's in-memory charge is zero.
+        handle.shrink(handle.bytes());
+        if self.arbitrator.record_spill_bytes(node_name, file_bytes) {
+            return Err(PipelineError::spill_cap_exceeded(
+                node_name,
+                self.arbitrator.max_spill_bytes(),
+                file_bytes,
+                self.arbitrator.cumulative_spill_bytes(),
+            ));
+        }
+        Ok(SlotSpillResult::Written(file_bytes))
     }
-    Ok(())
 }
 
 /// Execute one DAG node by routing it to its arm.
 ///
 /// Reads the node by `node_idx` from `current_dag.graph` and dispatches on
-/// `PlanNode` variant. Each arm reads from and writes to `ctx.node_buffers`
-/// and updates the cumulative counters / timers. Errors short-circuit only for
-/// invariant violations and `ErrorStrategy::FailFast` runtime failures;
+/// `PlanNode` variant. Each arm reads from and writes to the node-buffer
+/// slots in the walk reclaim set and updates the cumulative counters /
+/// timers. Errors short-circuit only for invariant violations and
+/// `ErrorStrategy::FailFast` runtime failures;
 /// per-record DLQ-able errors go through [`push_dlq`] under `Continue`.
 /// Output sink errors are collected into `ctx.output_errors` instead of
 /// short-circuiting so sibling outputs still get their chance to fail (and be
 /// reported) — the caller aggregates after the walk.
+///
+/// While the arm runs, governed allocations on the walk are charged to the
+/// node's own first registered consumer when it has one, so a reclaim they
+/// start elects that node's state last; the previous walk requester is
+/// restored afterwards, unless it unregistered while the arm ran. A spill a
+/// reclaim pass could not complete during the arm fails the node with that
+/// spill's error, ahead of whatever the arm returned (see
+/// [`settle_reclaim_slot`]).
 pub(crate) fn dispatch_plan_node(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
 ) -> Result<(), PipelineError> {
+    let node = current_dag.graph.node_weight(node_idx);
+    let node_consumer = node.and_then(|node| ctx.memory_budget.first_node_consumer(node.name()));
+    let previous = ctx.memory_budget.set_walk_requester(node_consumer);
+    let result = dispatch_plan_node_arm(ctx, current_dag, node_idx);
+    ctx.memory_budget.set_walk_requester(previous);
+    settle_reclaim_slot(
+        &ctx.memory_budget,
+        node.map_or("", |node| node.name()),
+        result,
+    )
+}
+
+/// The result of `node`'s dispatch turn, given the reclaim slot. Runs on the
+/// walk's thread, once the turn's arm has returned.
+///
+/// A spill a reclaim pass could not complete while the turn ran fails the
+/// node with that spill's error, ahead of whatever the arm returned: it is
+/// earlier in data order, since the request that met it saw only a
+/// shortfall and the arm went on from there. An error of the arm's own that
+/// it replaces is logged with the node's name, unless it is the run's
+/// cancellation, which is not a failure; it is never dropped silently.
+pub(crate) fn settle_reclaim_slot(
+    arbitrator: &crate::pipeline::memory::MemoryArbitrator,
+    node: &str,
+    result: Result<(), PipelineError>,
+) -> Result<(), PipelineError> {
+    match (arbitrator.take_reclaim_failure(), result) {
+        (Some(failure), Err(arm)) => {
+            if !super::preparation::is_explicit_cancellation(&arm) {
+                tracing::warn!(
+                    node,
+                    error = %arm,
+                    "this step also failed, after a spill a reclaim pass started for it had \
+                     failed; the run reports the spill's failure"
+                );
+            }
+            Err(failure)
+        }
+        (Some(failure), Ok(())) => Err(failure),
+        (None, result) => result,
+    }
+}
+
+fn dispatch_plan_node_arm(
+    ctx: &mut ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
+    node_idx: NodeIndex,
+) -> Result<(), PipelineError> {
+    // Every node runs on the walk that owns this context's reclaim set; a
+    // reclaim started from a governed allocation in any arm relies on it.
+    debug_assert_eq!(
+        crate::pipeline::memory::walk::thread_role(&ctx.memory_budget),
+        crate::pipeline::memory::walk::ThreadRole::Walk,
+        "a plan node was dispatched off the run's walk"
+    );
+    debug_assert!(
+        crate::pipeline::memory::walk::walk_reclaim_set(&ctx.memory_budget)
+            .is_some_and(|installed| std::rc::Rc::ptr_eq(&installed, &ctx.walk_reclaim)),
+        "the walk frame installed for this run does not own this context's reclaim set"
+    );
     // Service any spill requests the arbitrator flagged on resident slots at
     // a prior admission boundary before doing this node's work, so an
     // elected victim actually frees its memory instead of only carrying a
@@ -5484,13 +6154,15 @@ mod output_admission_ownership_tests {
                 Box::new(NoOpPolicy),
             ));
             let prior_handle = ConsumerHandle::new();
-            let prior_id = budget.register_consumer(
-                Arc::new(crate::pipeline::sort_buffer::SortConsumer::new(
+            let prior_id = budget
+                .register_consumer(
+                    Arc::new(crate::pipeline::sort_buffer::SortConsumer::new(
+                        prior_handle.clone(),
+                    )),
                     prior_handle.clone(),
-                )),
-                prior_handle.clone(),
-                test_label("sorted"),
-            );
+                    test_label("sorted"),
+                )
+                .expect("a fresh handle registers");
             // This unrelated portion must survive release of the output token.
             prior_handle.add_bytes(7);
             let schema = SharedStorage::from_arc(Arc::new(clinker_record::Schema::new(vec![
@@ -5510,13 +6182,15 @@ mod output_admission_ownership_tests {
                 drop(owned);
             } else {
                 let next = ConsumerHandle::new();
-                let next_id = budget.register_consumer(
-                    Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                let next_id = budget
+                    .register_consumer(
+                        Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                            next.clone(),
+                        )),
                         next.clone(),
-                    )),
-                    next.clone(),
-                    test_label("output"),
-                );
+                        test_label("output"),
+                    )
+                    .expect("a fresh handle registers");
                 owned.charge_to(&next, bytes);
                 owned.release_prior();
                 assert_eq!(next.bytes(), bytes);

@@ -277,8 +277,9 @@ nodes:
     // `backpressure: spill` the budget does not reject at admission; it forces
     // operators to spill, and the failure surfaces at whichever operator hits a
     // wall spilling cannot clear:
-    //   - the deferred-buffer arena projection raises MemoryBudgetExceeded
-    //     (BudgetCategory::Arena) directly, or
+    //   - the deferred-buffer projection raises MemoryBudgetExceeded naming
+    //     the node that asked and its operator state (not a buffered-rows
+    //     surface) directly, or
     //   - the relaxed-CK (correlation-key) aggregate spills its group table and
     //     then reaches its unsupported spilled-finalize path — retract-mode
     //     finalize runs only on in-memory state — surfacing a typed
@@ -287,17 +288,21 @@ nodes:
     // now k-way merges its multi-run spill rather than rejecting it, so a
     // spilling sort passes through cleanly and the pressure lands downstream.
     match &err {
-        clinker_plan::error::PipelineError::MemoryBudgetExceeded {
-            source: clinker_plan::BudgetCategory::Arena,
-            ..
-        } => {}
+        clinker_plan::error::PipelineError::MemoryBudgetExceeded { report }
+            if report.requester.as_ref().is_some_and(|label| {
+                !matches!(
+                    label.surface,
+                    clinker_plan::runtime_error::MemorySurface::ScanMaterialization
+                        | clinker_plan::runtime_error::MemorySurface::BufferedRows { .. }
+                )
+            }) => {}
         clinker_plan::error::PipelineError::Internal { op, detail, .. }
             if *op == "aggregation"
                 && detail
                     .contains("finalize_in_place called on aggregator with spilled groups") => {}
         other => panic!(
             "memory-overflow surface must carry MemoryBudgetExceeded \
-             (BudgetCategory::Arena) or the relaxed-CK aggregate spilled-finalize \
+             for operator state or the relaxed-CK aggregate spilled-finalize \
              limitation; got: {other:?}"
         ),
     }

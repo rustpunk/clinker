@@ -176,6 +176,31 @@ impl Record {
             })
     }
 
+    /// Heap bytes a clone of this record allocates, or keeps alive with no
+    /// charge in the run whose `resources` are given once the original is
+    /// gone: the value slots, counted once, each value by
+    /// [`Value::clone_allocation_bytes`], and the record variables' map with
+    /// its keys and values by the same rule. Only governed shared text that
+    /// run admitted is left out; text another authority admitted counts its
+    /// admitted size, since that admission is no charge in this run.
+    ///
+    /// The shared schema and document context are left out: a clone only
+    /// bumps their reference counts and their owners report them. The record
+    /// value itself is left out too; whoever holds the copy counts the place
+    /// it sits in. Computed from a borrow, so a holder can be charged before
+    /// it makes the copy.
+    pub fn clone_allocation_bytes(&self, resources: &AllocationResources) -> usize {
+        self.values.clone_allocation_bytes(resources)
+            + self.record_vars.as_ref().map_or(0, |map| {
+                std::mem::size_of::<IndexMap<Box<str>, Value>>()
+                    + crate::value::indexmap_backing_size::<Box<str>>(map.capacity())
+                    + map
+                        .iter()
+                        .map(|(key, value)| key.len() + value.clone_allocation_bytes(resources))
+                        .sum::<usize>()
+            })
+    }
+
     pub fn new(schema: SharedStorage<Schema>, mut values: Vec<Value>) -> Self {
         debug_assert_eq!(
             schema.column_count(),
@@ -739,5 +764,130 @@ mod tests {
         let expected_backing = 2 * std::mem::size_of::<Value>();
         // The heap-backed string charges its byte length on top of the Vec backing.
         assert_eq!(size, expected_backing + long.len());
+    }
+
+    /// Admits every reservation: what a clone allocates does not depend on
+    /// a limit.
+    struct OpenAuthority;
+
+    impl crate::owned_storage::AllocationAuthority for OpenAuthority {
+        fn try_reserve(
+            self: Arc<Self>,
+            owner: crate::owned_storage::OwnerId,
+            layout: std::alloc::Layout,
+        ) -> Result<crate::owned_storage::AllocationLease, crate::owned_storage::ResourceError>
+        {
+            crate::owned_storage::AllocationLease::admitted(self, owner, layout.size())
+        }
+
+        fn release(&self, _: crate::owned_storage::OwnerId, _: usize) {}
+
+        fn check_cancelled(&self) -> Result<(), crate::owned_storage::ResourceError> {
+            Ok(())
+        }
+    }
+
+    /// A record holding every long-text arm, a list and a map: its clone
+    /// figure counts the value slots once and every payload the copy copies
+    /// or alone may keep alive, and leaves out only inline text and governed
+    /// shared text, whose admission covers every alias.
+    #[test]
+    fn a_clone_counts_what_it_copies_or_alone_may_keep_alive() {
+        use crate::field_str::FieldStr;
+        use crate::owned_storage::OwnedKey;
+
+        let run = AllocationResources::new(Arc::new(OpenAuthority));
+        let scope = run.scope().expect("an open scope");
+        let text = |byte: char, len: usize| byte.to_string().repeat(len);
+        let (shared, unique, governed_shared, governed_unique) = (101, 203, 307, 409);
+        let (element, region, note, tag) = (53, 71, 89, 37);
+
+        let list = Value::Array(crate::owned_storage::OwnedValues::from_vec(vec![
+            Value::String(text('e', element).into()),
+            Value::String(text('f', element).into()),
+            Value::String(text('g', element).into()),
+        ]));
+        let map = Value::map([
+            ("region", Value::String(text('r', region).into())),
+            (
+                "note",
+                Value::String(FieldStr::try_new(&text('n', note), &scope).expect("admitted")),
+            ),
+        ]);
+        let schema = crate::SchemaBuilder::new()
+            .with_field("inline")
+            .with_field("governed_shared")
+            .with_field("shared")
+            .with_field("unique")
+            .with_field("governed_unique")
+            .with_field("list")
+            .with_field("map")
+            .build();
+        let mut record = Record::new(
+            schema,
+            vec![
+                Value::String("short".into()),
+                Value::String(
+                    FieldStr::try_new(&text('a', governed_shared), &scope).expect("admitted"),
+                ),
+                Value::String(text('b', shared).into()),
+                Value::string_unique(&text('c', unique)),
+                Value::String(
+                    FieldStr::try_new_unique(&text('d', governed_unique), &scope)
+                        .expect("admitted"),
+                ),
+                list.clone(),
+                map.clone(),
+            ],
+        );
+        record
+            .set_record_var("tag", Value::String(text('t', tag).into()))
+            .expect("one record variable");
+
+        let value = std::mem::size_of::<Value>();
+        let Value::Array(list_copy) = list.clone() else {
+            panic!("a list")
+        };
+        let list_bytes = list_copy.capacity() * value + 3 * element;
+        let map_copy = map.clone();
+        let map_bytes = std::mem::size_of::<IndexMap<OwnedKey, Value>>()
+            + crate::value::indexmap_backing_size::<OwnedKey>(
+                map_copy.as_map().expect("a map").capacity(),
+            )
+            + "region".len()
+            + region
+            + "note".len();
+        let vars_copy = record.clone().record_vars.expect("one record variable");
+        let vars_bytes = std::mem::size_of::<IndexMap<Box<str>, Value>>()
+            + crate::value::indexmap_backing_size::<Box<str>>(vars_copy.capacity())
+            + "tag".len()
+            + tag;
+        let expected =
+            7 * value + shared + unique + governed_unique + list_bytes + map_bytes + vars_bytes;
+
+        assert_eq!(
+            record.clone_allocation_bytes(&run),
+            expected,
+            "the value slots once, the ungoverned shared, ungoverned unique and governed \
+             unique text, the list and the map with their contents, and the record \
+             variables; no inline and no governed shared text the run admitted"
+        );
+
+        // Seen from a run whose ledger did not admit them, the governed
+        // shared strings are kept alive by the clone with no charge there,
+        // so they count at their admitted size.
+        let other_run = AllocationResources::new(Arc::new(OpenAuthority));
+        let admitted = |value: &Value| match value {
+            Value::String(text) => text.heap_size(),
+            _ => panic!("text"),
+        };
+        let governed_shared_admitted = admitted(&record.values()[1]);
+        let note_admitted = admitted(map.as_map().expect("a map").get("note").expect("note"));
+        assert!(governed_shared_admitted > governed_shared && note_admitted > note);
+        assert_eq!(
+            record.clone_allocation_bytes(&other_run),
+            expected + governed_shared_admitted + note_admitted,
+            "governed shared text another authority admitted is counted at its admitted size"
+        );
     }
 }

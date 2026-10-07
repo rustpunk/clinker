@@ -10,7 +10,9 @@
 //! [`dispatch_aggregation`].
 
 use clinker_record::owned_storage::{OwnedKey, SharedStorage};
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use clinker_record::{DocumentId, GroupByKey, Record, Schema, SchemaBuilder, Value};
@@ -25,6 +27,9 @@ use crate::executor::dispatch::{
 };
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{DlqEntry, DlqFailureStamp, operator_memory_limit, stage_metrics};
+use crate::pipeline::memory::walk::{
+    OwnedSpillResult, WalkOwnedRegistration, WalkOwnedSpill, register_walk_owned,
+};
 use clinker_plan::config::ErrorStrategy;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
@@ -57,13 +62,13 @@ fn aggregate_spill_schema(compiled: &cxl::plan::CompiledAggregate) -> SharedStor
 /// factory ([`DocAggregatorFactory::from_ctx`]) and the streaming-ingest
 /// helper ([`run_streaming_aggregate_ingest`]) instead of re-passing the same
 /// list to each.
-struct AggregateSpec<'a> {
-    name: &'a str,
-    typed: &'a Arc<cxl::typecheck::TypedProgram>,
-    compiled: &'a Arc<cxl::plan::CompiledAggregate>,
-    output_schema: &'a SharedStorage<Schema>,
-    strategy: AggregateStrategy,
-    has_distinct: bool,
+pub(crate) struct AggregateSpec<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) typed: &'a Arc<cxl::typecheck::TypedProgram>,
+    pub(crate) compiled: &'a Arc<cxl::plan::CompiledAggregate>,
+    pub(crate) output_schema: &'a SharedStorage<Schema>,
+    pub(crate) strategy: AggregateStrategy,
+    pub(crate) has_distinct: bool,
 }
 
 /// Context carrier kept lazy until the node-kind guard has succeeded. Normal
@@ -286,60 +291,25 @@ where
         // per-document flush does not apply here — a document-aware
         // relaxed-CK aggregate keeps its single cross-document table.
         //
-        // The single `ConsumerHandle` is shared with the
-        // `AggregateConsumer` the arbitrator holds; its `ConsumerId` is
-        // captured so the wrapper is unregistered the moment the
-        // aggregator's state stops being live. Parking transfers
-        // ownership of the unregister to `RetainedAggregatorState`,
-        // which fires it when the aggregator drops.
+        // No reclaim pass or soft-threshold poll may spill that table, while
+        // it ingests or while the commit keeps it: the in-place finalize and
+        // the commit's retract read only resident groups, so its spill would
+        // end the run or lose its groups rather than free memory (#1288). It
+        // is built kept for retraction, which makes it rank by 0, and it is
+        // not registered in the walk reclaim set.
         //
-        // Build the single retained-stream artifacts here, on the branch
-        // that consumes them — the strict path below re-derives its own per
-        // document, so nothing is built-then-dropped on the dominant arm.
-        let evaluator = ProgramEvaluator::with_max_expansion(
-            Arc::clone(typed),
-            has_distinct,
-            cxl::eval::DEFAULT_MAX_EXPANSION,
-        );
-        let spill_schema = aggregate_spill_schema(compiled);
-        let mem_limit = operator_memory_limit(&ctx.memory_budget);
-        // Resolve the spill compression mode against this aggregate's
-        // output-schema width and the run's batch size, so spilled group
-        // state matches what `--explain` projects for the operator: the
-        // explain line resolves the same way against
-        // `stored_output_schema().column_count()`, keeping the reported mode
-        // and the on-disk format in lockstep. `auto` skips LZ4 on
-        // narrow/short aggregates where the per-frame fixed cost outweighs
-        // the savings.
-        let spill_compress = ctx
-            .spill_compress
-            .resolve_for_schema(output_schema.column_count(), ctx.batch_size as u64);
-        let agg_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
-        let agg_consumer_id = ctx.memory_budget.register_node_consumer(
-            Arc::new(crate::aggregation::AggregateConsumer::new(
-                agg_consumer_handle.clone(),
-            )),
-            agg_consumer_handle.clone(),
-            ConsumerLabel {
-                node: name.to_string(),
-                surface: MemorySurface::GroupState,
-            },
-        );
-        let mut stream = crate::aggregation::AggregateStream::for_node(
-            agg_strategy,
-            crate::aggregation::AggregatorConfig {
-                compiled: Arc::clone(compiled),
-                evaluator,
-                output_schema: output_schema.clone(),
-                spill_schema,
-                memory_budget: mem_limit,
-                spill_dir: Some(ctx.spill_root_path.to_path_buf()),
-                spill_compress,
-                transform_name: name.clone(),
-                consumer_handle: agg_consumer_handle,
-                arbitrator: Arc::clone(&ctx.memory_budget),
-            },
-        )?;
+        // The table is built and its `AggregateConsumer` registered through
+        // the per-document factory the untimed arms use: the same evaluator,
+        // spill schema, memory limit, spill directory and compression mode,
+        // with the consumer registered only once the table exists. (The
+        // time-windowed arm still builds its tables inline and registers
+        // each consumer before its table exists; see #1403.) Its
+        // `ConsumerId` is captured so the wrapper is unregistered the moment
+        // the aggregator's state stops being live. Parking transfers
+        // ownership of the unregister to `RetainedAggregatorState`, which
+        // fires it when the aggregator drops.
+        let factory = DocAggregatorFactory::from_ctx(ctx, &spec)?;
+        let (mut stream, agg_consumer_id) = factory.make_for_retraction()?;
 
         // Per-record accumulator updates + spill I/O. The loop
         // threads `&mut ctx` (cursor advance, DLQ routing) per
@@ -538,14 +508,10 @@ fn finalize_aggregate_emit(
         // this streaming handoff; the eligibility predicate
         // certified this aggregate roots no window and is not a
         // deferred-region producer, so the helper calls below are
-        // correctly skipped. Dropping the sender disconnects the
-        // writer's recv loop.
-        if let Some(sender) = ctx.take_streaming_sender(node_idx) {
+        // correctly skipped. The writer closes its output only on the
+        // hop's End, which the walk sends once this arm returns `Ok`.
+        if let Some((sender, charge)) = ctx.take_streaming_hop(current_dag, node_idx, name)? {
             let batch_size = ctx.batch_size;
-            let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
-            let charge = ctx
-                .streaming_charge_handle(node_idx, name, spill_allowed)
-                .expect("streaming sender implies a registered charge consumer");
             stream_linear_producer_emit(
                 &sender,
                 batch_size,
@@ -597,7 +563,13 @@ fn finalize_aggregate_emit(
 /// shared arbitrator, so the open document's group bytes count toward the
 /// run's RSS accounting and the existing per-aggregator spill triggers
 /// fire normally.
-struct DocAggregatorFactory {
+///
+/// The relaxed-key arm builds its one cross-document table through the
+/// same factory ([`Self::make_for_retraction`]), so the untimed arms build
+/// and register their hash tables one way. The time-windowed arm does not
+/// yet: `WindowedAggContext::make_stream` builds its table inline and
+/// registers the consumer before the table exists (#1403).
+pub(crate) struct DocAggregatorFactory {
     strategy: AggregateStrategy,
     compiled: Arc<cxl::plan::CompiledAggregate>,
     typed: Arc<cxl::typecheck::TypedProgram>,
@@ -631,31 +603,48 @@ impl DocAggregatorFactory {
         // The compression mode resolves against the output-schema width and
         // batch size so a spilled table's on-disk format matches what
         // `--explain` reports.
-        let spill_schema = aggregate_spill_schema(spec.compiled);
         let spill_compress = ctx
             .spill_compress
             .resolve_for_schema(spec.output_schema.column_count(), ctx.batch_size as u64);
-        Ok(Self {
+        Ok(Self::new(
+            spec,
+            Arc::clone(&ctx.memory_budget),
+            ctx.spill_root_path.to_path_buf(),
+            spill_compress,
+        ))
+    }
+
+    /// Snapshot the build inputs for an aggregate node whose tables are
+    /// charged to `arbitrator`'s run, spill under `spill_dir` and compress
+    /// their spill files as `spill_compress` resolved. Each table's memory
+    /// limit is the run's limit now.
+    pub(crate) fn new(
+        spec: &AggregateSpec<'_>,
+        arbitrator: Arc<crate::pipeline::memory::MemoryArbitrator>,
+        spill_dir: std::path::PathBuf,
+        spill_compress: bool,
+    ) -> Self {
+        Self {
             strategy: spec.strategy,
             compiled: Arc::clone(spec.compiled),
             typed: Arc::clone(spec.typed),
             has_distinct: spec.has_distinct,
             max_expansion: cxl::eval::DEFAULT_MAX_EXPANSION,
             output_schema: spec.output_schema.clone(),
-            spill_schema,
-            mem_limit: operator_memory_limit(&ctx.memory_budget),
-            spill_dir: ctx.spill_root_path.to_path_buf(),
+            spill_schema: aggregate_spill_schema(spec.compiled),
+            mem_limit: operator_memory_limit(&arbitrator),
+            spill_dir,
             spill_compress,
             transform_name: spec.name.to_string(),
-            arbitrator: Arc::clone(&ctx.memory_budget),
+            arbitrator,
             is_global_fold: spec.compiled.group_by_fields.is_empty(),
-        })
+        }
     }
 
     /// Build a fresh stream + register its arbitrator consumer. Building a
     /// new `ProgramEvaluator` per document is cheap: the heavy CXL
     /// pipeline lives behind `Arc<TypedProgram>`.
-    fn make(
+    pub(crate) fn make(
         &self,
     ) -> Result<
         (
@@ -707,7 +696,32 @@ impl DocAggregatorFactory {
                 node: self.transform_name.clone(),
                 surface: MemorySurface::GroupState,
             },
-        );
+        )?;
+        Ok((stream, consumer_id))
+    }
+
+    /// Build the relaxed-key arm's one table, which spans every document
+    /// and which the correlation commit keeps to retract rows from and
+    /// finalize again in place, and register its arbitrator consumer as
+    /// [`Self::make`] does.
+    ///
+    /// The table is marked kept for retraction from its first record on, so
+    /// it ranks by 0 and no reclaim pass or soft-threshold poll elects it: a
+    /// spill of it cannot be finalized in place or retracted from, so it
+    /// would end the run or lose the Aggregate's groups at the commit
+    /// rather than free memory (#1288). It is not registered in the walk
+    /// reclaim set. Its own spill triggers still fire.
+    pub(crate) fn make_for_retraction(
+        &self,
+    ) -> Result<
+        (
+            crate::aggregation::AggregateStream,
+            crate::pipeline::memory::ConsumerId,
+        ),
+        PipelineError,
+    > {
+        let (mut stream, consumer_id) = self.make()?;
+        stream.keep_for_retraction();
         Ok((stream, consumer_id))
     }
 }
@@ -734,7 +748,13 @@ impl DocAggregatorFactory {
 /// The `flushed` dedup set lives here rather than in either arm so neither
 /// re-implements it: a duplicate `DocumentClose` for an id that already
 /// flushed must not synthesize a second global-fold row.
-struct RegisteredTables {
+///
+/// The materialized arm keeps its tables in a walk-owned cell
+/// ([`WalkGroupTables`]), so a reclaim pass on the walk can spill them. The
+/// streaming-ingest worker owns its tables by value on its own thread
+/// (they must stay `Send`): no pass can reach them until they are lent to
+/// the walk, so a pass that elects one skips it.
+pub(crate) struct RegisteredTables {
     tables: HashMap<
         DocumentId,
         (
@@ -796,18 +816,33 @@ impl RegisteredTables {
         out: &mut Vec<crate::aggregation::SortRow>,
         route: impl FnOnce(Result<(), crate::aggregation::HashAggError>) -> Result<(), PipelineError>,
     ) -> Result<(), PipelineError> {
-        if !self.flushed.insert(doc_id) {
-            return Ok(());
-        }
-        let bucket = match self.tables.remove(&doc_id) {
-            Some(bucket) => Some(bucket),
-            None if factory.is_global_fold => Some(factory.make()?),
-            None => None,
-        };
-        match bucket {
+        match self.take_closing_document(doc_id, factory)? {
             Some(bucket) => route(finalize_bucket(bucket, finalize_ctx, &self.arbitrator, out)),
             None => Ok(()),
         }
+    }
+
+    /// Remove the bucket a closing document `doc_id` flushes, for the caller
+    /// to finalize: its own table, or for a global fold with no table yet a
+    /// fresh one, which owes the fold's defaulted row. `None` for a
+    /// duplicate close or a grouped fold's empty document.
+    ///
+    /// # Errors
+    ///
+    /// A failed build of the fresh global-fold table.
+    fn take_closing_document(
+        &mut self,
+        doc_id: DocumentId,
+        factory: &DocAggregatorFactory,
+    ) -> Result<Option<GroupTable>, PipelineError> {
+        if !self.flushed.insert(doc_id) {
+            return Ok(None);
+        }
+        Ok(match self.tables.remove(&doc_id) {
+            Some(bucket) => Some(bucket),
+            None if factory.is_global_fold => Some(factory.make()?),
+            None => None,
+        })
     }
 
     /// Force a fresh global-fold sentinel bucket open so an otherwise-empty
@@ -835,13 +870,36 @@ impl RegisteredTables {
         out: &mut Vec<crate::aggregation::SortRow>,
         mut route: impl FnMut(Result<(), crate::aggregation::HashAggError>) -> Result<(), PipelineError>,
     ) -> Result<(), PipelineError> {
+        for key in self.remaining_keys() {
+            let bucket = self.tables.remove(&key).expect("key from this map");
+            route(finalize_bucket(bucket, finalize_ctx, &self.arbitrator, out))?;
+        }
+        Ok(())
+    }
+
+    /// The keys of every surviving bucket in ascending [`DocumentId`] order,
+    /// the order they flush in at end of input.
+    fn remaining_keys(&self) -> Vec<DocumentId> {
         let mut keys: Vec<DocumentId> = self.tables.keys().copied().collect();
         if keys.len() > 1 {
             keys.sort_unstable();
         }
-        for key in keys {
-            let bucket = self.tables.remove(&key).expect("key from this map");
-            route(finalize_bucket(bucket, finalize_ctx, &self.arbitrator, out))?;
+        keys
+    }
+
+    /// Open the sentinel bucket a global fold over an `empty_input` run that
+    /// flushed no document still owes its defaulted row to.
+    ///
+    /// # Errors
+    ///
+    /// A failed build of the sentinel.
+    fn open_owed_sentinel(
+        &mut self,
+        empty_input: bool,
+        factory: &DocAggregatorFactory,
+    ) -> Result<(), PipelineError> {
+        if empty_input && self.flushed_is_empty() && factory.is_global_fold {
+            self.force_open_global_fold_sentinel(factory)?;
         }
         Ok(())
     }
@@ -862,9 +920,7 @@ impl RegisteredTables {
         out: &mut Vec<crate::aggregation::SortRow>,
         route: impl FnMut(Result<(), crate::aggregation::HashAggError>) -> Result<(), PipelineError>,
     ) -> Result<(), PipelineError> {
-        if empty_input && self.flushed_is_empty() && factory.is_global_fold {
-            self.force_open_global_fold_sentinel(factory)?;
-        }
+        self.open_owed_sentinel(empty_input, factory)?;
         self.drain_remaining(finalize_ctx, out, route)
     }
 }
@@ -874,6 +930,368 @@ impl Drop for RegisteredTables {
         for (_, (_, consumer_id)) in self.tables.drain() {
             self.arbitrator.unregister_consumer(consumer_id);
         }
+    }
+}
+
+/// One group table of an Aggregate arm: the table and the consumer it is
+/// charged to.
+pub(crate) type GroupTable = (
+    crate::aggregation::AggregateStream,
+    crate::pipeline::memory::ConsumerId,
+);
+
+/// What a walk arm's table built by an add hands its registration: the
+/// table's consumer and the handle that charges it, `None` for a table that
+/// holds no group table (a streaming-strategy one).
+type BuiltTable = (
+    crate::pipeline::memory::ConsumerId,
+    Option<Arc<crate::pipeline::memory::ConsumerHandle>>,
+);
+
+/// Group tables keyed by what they aggregate over: a document, a window or
+/// a group's session.
+pub(crate) trait KeyedGroupTables {
+    /// The key one table answers to.
+    type Key: Eq + std::hash::Hash + Clone;
+
+    /// The tables, by key.
+    fn tables(&self) -> &HashMap<Self::Key, GroupTable>;
+
+    /// The tables, by key, to add to or take from.
+    fn tables_mut(&mut self) -> &mut HashMap<Self::Key, GroupTable>;
+}
+
+/// Spill the table among `tables` that consumer `id` charges, for the pass
+/// that elected `id`: wrote when it had groups resident, nothing to write
+/// when it holds them all on disk, not held when no table here is `id`'s.
+/// The table records the run under its node; never reserves.
+fn spill_elected_table<K>(
+    tables: &mut HashMap<K, GroupTable>,
+    id: crate::pipeline::memory::ConsumerId,
+) -> Result<OwnedSpillResult, PipelineError> {
+    let Some((stream, _)) = tables.values_mut().find(|(_, consumer)| *consumer == id) else {
+        return Ok(OwnedSpillResult::NotHeld);
+    };
+    Ok(if stream.spill_resident()? {
+        OwnedSpillResult::Wrote
+    } else {
+        OwnedSpillResult::NothingToWrite
+    })
+}
+
+impl WalkOwnedSpill for RegisteredTables {
+    /// A pass that elects one of these tables' consumers spills that
+    /// table's resident groups, the way the table's own triggers do.
+    fn spill_owned(
+        &mut self,
+        id: crate::pipeline::memory::ConsumerId,
+        _arbitrator: &crate::pipeline::memory::MemoryArbitrator,
+    ) -> Result<OwnedSpillResult, PipelineError> {
+        spill_elected_table(&mut self.tables, id)
+    }
+}
+
+impl KeyedGroupTables for RegisteredTables {
+    type Key = DocumentId;
+
+    fn tables(&self) -> &HashMap<DocumentId, GroupTable> {
+        &self.tables
+    }
+
+    fn tables_mut(&mut self) -> &mut HashMap<DocumentId, GroupTable> {
+        &mut self.tables
+    }
+}
+
+/// A time-windowed Aggregate's tables: one per window (tumbling, hopping) or
+/// per group's session, keyed by `K`. Every table finalizes at end of input.
+///
+/// Like [`RegisteredTables`], it is the arm's guard: a table still here when
+/// it drops (an error exit before the finalize took it) has its consumer
+/// unregistered, so an error cannot strand a charged consumer in the
+/// arbitrator's registry that every later pass would elect and find out of
+/// the walk's reach.
+pub(crate) struct WindowTables<K> {
+    tables: HashMap<K, GroupTable>,
+    arbitrator: Arc<crate::pipeline::memory::MemoryArbitrator>,
+}
+
+impl<K> Drop for WindowTables<K> {
+    fn drop(&mut self) {
+        for (_, (_, consumer_id)) in self.tables.drain() {
+            self.arbitrator.unregister_consumer(consumer_id);
+        }
+    }
+}
+
+impl<K: 'static> WalkOwnedSpill for WindowTables<K> {
+    /// A pass that elects one window's or session's consumer spills that
+    /// table's resident groups, the way the table's own triggers do.
+    fn spill_owned(
+        &mut self,
+        id: crate::pipeline::memory::ConsumerId,
+        _arbitrator: &crate::pipeline::memory::MemoryArbitrator,
+    ) -> Result<OwnedSpillResult, PipelineError> {
+        spill_elected_table(&mut self.tables, id)
+    }
+}
+
+impl<K: Eq + std::hash::Hash + Clone> KeyedGroupTables for WindowTables<K> {
+    type Key = K;
+
+    fn tables(&self) -> &HashMap<K, GroupTable> {
+        &self.tables
+    }
+
+    fn tables_mut(&mut self) -> &mut HashMap<K, GroupTable> {
+        &mut self.tables
+    }
+}
+
+/// A walk arm's group tables in one walk-owned cell, each table that holds
+/// a hash table registered in the walk reclaim set under its own consumer.
+///
+/// A reclaim pass that another consumer's request starts spills an elected
+/// table whenever the arm is between two of its own operations on the cell,
+/// which is all the time but one build-and-add of a record and one take of a
+/// table. The build-and-add evaluates the record and folds it into its group
+/// with the cell borrowed. Nothing in that evaluation or fold makes a
+/// checked charge, so no pass can start while the cell is borrowed; a change
+/// that moves group growth onto a checked charge must first split the
+/// record's evaluation from its fold, so the cell is not borrowed across
+/// the charge. The cell is never borrowed across a cursor advance,
+/// dead-letter routing, a table's finalize or the routing of its result, so
+/// none of those can find it busy. A table taken out of
+/// the cell for its finalize leaves the walk reclaim set with it.
+///
+/// Holds an `Rc`, so it is `!Send`: it lives on the walk. Its registrations
+/// drop with it on every exit, `?` and unwind included, and the tables still
+/// in the cell drop as the arm's tables would on that exit.
+pub(crate) struct WalkGroupTables<T> {
+    /// One registration per table in the cell that holds a hash table, under
+    /// that table's consumer.
+    registrations: HashMap<crate::pipeline::memory::ConsumerId, WalkOwnedRegistration>,
+    cell: Rc<RefCell<T>>,
+    arbitrator: Arc<crate::pipeline::memory::MemoryArbitrator>,
+}
+
+impl<T: KeyedGroupTables> WalkGroupTables<T> {
+    fn new(arbitrator: &Arc<crate::pipeline::memory::MemoryArbitrator>, tables: T) -> Self {
+        Self {
+            registrations: HashMap::new(),
+            cell: Rc::new(RefCell::new(tables)),
+            arbitrator: Arc::clone(arbitrator),
+        }
+    }
+
+    /// Add `record` to the table under `key`, building that table through
+    /// `make` first when there is none, under one borrow of the cell. Returns
+    /// the add's own result and, for a table built now, what its
+    /// registration needs.
+    ///
+    /// Blocks only on a spill the table's own triggers start inside the add.
+    /// Neither `make` (it registers the table's consumer) nor the add starts
+    /// a reclaim pass.
+    ///
+    /// # Errors
+    ///
+    /// `make`'s error, with nothing built.
+    fn add_with(
+        &self,
+        key: T::Key,
+        make: impl FnOnce() -> Result<GroupTable, PipelineError>,
+        record: &Record,
+        row_num: crate::executor::stream_event::SourceRowId,
+        eval_ctx: &EvalContext,
+        out: &mut Vec<crate::aggregation::SortRow>,
+    ) -> Result<
+        (
+            Result<(), crate::aggregation::HashAggError>,
+            Option<BuiltTable>,
+        ),
+        PipelineError,
+    > {
+        let mut cell = self.cell.borrow_mut();
+        let mut built = None;
+        let (stream, _) = match cell.tables_mut().entry(key) {
+            std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                let table = make()?;
+                built = Some((table.1, table.0.consumer_handle().cloned()));
+                v.insert(table)
+            }
+        };
+        let result = stream.add_record(record, row_num, eval_ctx, out);
+        Ok((result, built))
+    }
+
+    /// Take the table under `key` out of the cell for its finalize, under
+    /// one short borrow; `None` when there is none.
+    pub(crate) fn take(&mut self, key: &T::Key) -> Option<GroupTable> {
+        let table = self.cell.borrow_mut().tables_mut().remove(key)?;
+        Some(self.withdraw(table))
+    }
+
+    /// The keys of the tables in the cell, in no particular order.
+    pub(crate) fn keys(&self) -> Vec<T::Key> {
+        self.cell.borrow().tables().keys().cloned().collect()
+    }
+
+    /// A table leaving the cell leaves the walk reclaim set with it, and
+    /// ranks by 0 from here on: it is being finalized, and no pass can reach
+    /// it.
+    fn withdraw(&mut self, mut table: GroupTable) -> GroupTable {
+        self.registrations.remove(&table.1);
+        table.0.begin_finalize();
+        table
+    }
+
+    /// Read the table under `key` in place.
+    #[cfg(test)]
+    pub(crate) fn inspect<R>(
+        &self,
+        key: &T::Key,
+        read: impl FnOnce(&crate::aggregation::AggregateStream) -> R,
+    ) -> Option<R> {
+        self.cell
+            .borrow()
+            .tables()
+            .get(key)
+            .map(|(stream, _)| read(stream))
+    }
+}
+
+impl<T: KeyedGroupTables + WalkOwnedSpill + 'static> WalkGroupTables<T> {
+    /// Make the table just built reachable by every reclaim pass on the walk,
+    /// under its consumer, until it leaves the cell. A table with no handle
+    /// holds no group table and is not registered.
+    ///
+    /// # Errors
+    ///
+    /// As [`register_walk_owned`].
+    fn enroll(&mut self, built: BuiltTable) -> Result<(), PipelineError> {
+        let (id, Some(handle)) = built else {
+            return Ok(());
+        };
+        let registration = register_walk_owned(&self.arbitrator, id, &handle, &self.cell)?;
+        self.registrations.insert(id, registration);
+        Ok(())
+    }
+}
+
+impl WalkGroupTables<RegisteredTables> {
+    /// The strict per-document arm's tables, empty, for the run whose
+    /// arbitrator is `arbitrator`.
+    pub(crate) fn for_documents(
+        arbitrator: &Arc<crate::pipeline::memory::MemoryArbitrator>,
+    ) -> Self {
+        Self::new(arbitrator, RegisteredTables::new(Arc::clone(arbitrator)))
+    }
+
+    /// Add `record` to the table of flush key `key`, building and
+    /// registering that table through `factory` when it is the key's first
+    /// record. Returns the add's own result for the caller to route.
+    ///
+    /// # Errors
+    ///
+    /// A failed build or registration.
+    pub(crate) fn add_document_record(
+        &mut self,
+        key: DocumentId,
+        factory: &DocAggregatorFactory,
+        record: &Record,
+        row_num: crate::executor::stream_event::SourceRowId,
+        eval_ctx: &EvalContext,
+        out: &mut Vec<crate::aggregation::SortRow>,
+    ) -> Result<Result<(), crate::aggregation::HashAggError>, PipelineError> {
+        let (result, built) =
+            self.add_with(key, || factory.make(), record, row_num, eval_ctx, out)?;
+        if let Some(built) = built {
+            self.enroll(built)?;
+        }
+        Ok(result)
+    }
+
+    /// Take the table a closing document `doc_id` flushes out of the cell,
+    /// as [`RegisteredTables::take_closing_document`] chooses it.
+    ///
+    /// # Errors
+    ///
+    /// As [`RegisteredTables::take_closing_document`].
+    pub(crate) fn take_closing_document(
+        &mut self,
+        doc_id: DocumentId,
+        factory: &DocAggregatorFactory,
+    ) -> Result<Option<GroupTable>, PipelineError> {
+        let table = self
+            .cell
+            .borrow_mut()
+            .take_closing_document(doc_id, factory)?;
+        Ok(table.map(|table| self.withdraw(table)))
+    }
+
+    /// The keys of every table left at the end of input, in the order they
+    /// flush, after opening the sentinel a global fold over empty input
+    /// owes.
+    ///
+    /// # Errors
+    ///
+    /// A failed build of that sentinel.
+    pub(crate) fn remaining_keys(
+        &mut self,
+        empty_input: bool,
+        factory: &DocAggregatorFactory,
+    ) -> Result<Vec<DocumentId>, PipelineError> {
+        let mut tables = self.cell.borrow_mut();
+        tables.open_owed_sentinel(empty_input, factory)?;
+        Ok(tables.remaining_keys())
+    }
+}
+
+impl<K: Eq + std::hash::Hash + Clone + 'static> WalkGroupTables<WindowTables<K>> {
+    /// A time-windowed arm's tables, empty, for the run whose arbitrator is
+    /// `arbitrator`.
+    pub(crate) fn for_windows(arbitrator: &Arc<crate::pipeline::memory::MemoryArbitrator>) -> Self {
+        Self::new(
+            arbitrator,
+            WindowTables {
+                tables: HashMap::new(),
+                arbitrator: Arc::clone(arbitrator),
+            },
+        )
+    }
+
+    /// Add `record` to the table of window or session `key`, building and
+    /// registering that table through `make` when it is the key's first
+    /// record. Returns the add's own result for the caller to route.
+    ///
+    /// # Errors
+    ///
+    /// A failed build or registration.
+    pub(crate) fn add_window_record(
+        &mut self,
+        key: K,
+        make: impl FnOnce() -> Result<GroupTable, PipelineError>,
+        record: &Record,
+        row_num: crate::executor::stream_event::SourceRowId,
+        eval_ctx: &EvalContext,
+        out: &mut Vec<crate::aggregation::SortRow>,
+    ) -> Result<Result<(), crate::aggregation::HashAggError>, PipelineError> {
+        let (result, built) = self.add_with(key, make, record, row_num, eval_ctx, out)?;
+        if let Some(built) = built {
+            self.enroll(built)?;
+        }
+        Ok(result)
+    }
+}
+
+/// The error for a table listed for its finalize that is no longer in its
+/// arm's cell: the arm took it twice.
+fn missing_group_table(name: &str) -> PipelineError {
+    PipelineError::Internal {
+        op: "aggregation",
+        node: name.to_string(),
+        detail: "a group table listed for its finalize left before it".to_string(),
     }
 }
 
@@ -936,8 +1354,12 @@ fn run_strict_aggregate_per_document(
     // `Accumulator` finalize error, or a `factory.make()` failure exits via
     // `?` with tables still live; without the guard each would strand its
     // arbitrator consumer in `sum_consumer_usage`. Normal completion removes
-    // every key as it flushes, so the guard drops empty.
-    let mut tables = RegisteredTables::new(Arc::clone(&factory.arbitrator));
+    // every key as it flushes, so the guard drops empty. The guard lives in a
+    // walk-owned cell borrowed only for one build-and-add or one take, so a
+    // reclaim pass another request starts can spill any table still in it;
+    // the evaluation context, the cursor advance, dead-letter routing, each
+    // finalize and the routing of its result all run with the cell free.
+    let mut tables = WalkGroupTables::for_documents(&factory.arbitrator);
     let mut out_rows: Vec<crate::aggregation::SortRow> = Vec::with_capacity(64);
 
     for (record, row_num) in input {
@@ -950,8 +1372,14 @@ fn run_strict_aggregate_per_document(
             *row_num,
             record.doc_ctx(),
         );
-        let stream = tables.entry_or_make(key, &factory)?;
-        let add_result = stream.add_record(record, *row_num, &eval_ctx, &mut out_rows);
+        let add_result = tables.add_document_record(
+            key,
+            &factory,
+            record,
+            *row_num,
+            &eval_ctx,
+            &mut out_rows,
+        )?;
         if add_result.is_ok() {
             advance_cursor(ctx, &source_name_arc, *row_num);
         }
@@ -989,16 +1417,11 @@ fn run_strict_aggregate_per_document(
             "a real closing document's id must never equal the sentinel id, \
              or its groups would fold into the unreconciled-remainder table"
         );
-        tables.flush_closing_document(
-            doc_id,
-            &factory,
-            &finalize_ctx,
-            &mut out_rows,
-            |result| {
-                let attribution = document_attribution_record(input, doc_id);
-                route_document_flush_result(ctx, name, attribution, output_schema, result)
-            },
-        )?;
+        if let Some(bucket) = tables.take_closing_document(doc_id, &factory)? {
+            let result = finalize_bucket(bucket, &finalize_ctx, &factory.arbitrator, &mut out_rows);
+            let attribution = document_attribution_record(input, doc_id);
+            route_document_flush_result(ctx, name, attribution, output_schema, result)?;
+        }
     }
 
     // Flush whatever is left in `DocumentId` order for deterministic emit
@@ -1006,15 +1429,13 @@ fn run_strict_aggregate_per_document(
     // closing document whose close never arrived. A wholly-empty input that
     // flushed no closing document still owes its single defaulted row under a
     // global fold, so the sentinel is force-opened first inside
-    // `drain_with_empty_sentinel`. This leftover fold spans no single
-    // document, so its DLQ attribution keeps the batch-first-record behavior.
-    tables.drain_with_empty_sentinel(
-        input.is_empty(),
-        &factory,
-        &finalize_ctx,
-        &mut out_rows,
-        |result| route_document_flush_result(ctx, name, input, output_schema, result),
-    )?;
+    // `remaining_keys`. This leftover fold spans no single document, so its
+    // DLQ attribution keeps the batch-first-record behavior.
+    for key in tables.remaining_keys(input.is_empty(), &factory)? {
+        let bucket = tables.take(&key).ok_or_else(|| missing_group_table(name))?;
+        let result = finalize_bucket(bucket, &finalize_ctx, &factory.arbitrator, &mut out_rows);
+        route_document_flush_result(ctx, name, input, output_schema, result)?;
+    }
 
     Ok(out_rows)
 }
@@ -1169,10 +1590,13 @@ struct AggregateEmit {
 /// every close after all records, so several buckets populate during the
 /// record run and each close flushes its own — splitting the documents
 /// rather than folding them. The finalize half stays blocking: once the
-/// channel disconnects (every sender dropped at the producer arm's clean
-/// exit), every surviving bucket (the synthetic-doc-id sentinel of a
+/// producer's End arrives (this arm sends it after the producer's dispatch
+/// returned `Ok`), every surviving bucket (the synthetic-doc-id sentinel of a
 /// no-envelope pipeline, plus any document whose close never arrived) flushes
-/// in ascending `DocumentId` order and the finalized rows return.
+/// in ascending `DocumentId` order and the finalized rows return. A channel
+/// that closes without End means the producer failed or was stopped: no
+/// bucket is finalized, and the hop's join reports the first failure in data
+/// order.
 /// Document-boundary punctuations are forwarded at the output tail unchanged.
 ///
 /// Memory: this holds one open table per open-but-not-yet-closed document —
@@ -1183,7 +1607,11 @@ struct AggregateEmit {
 /// spills independently under RSS pressure; flushing a table unregisters its
 /// consumer, so the arbitrator's live-usage reflects exactly the open
 /// documents. This is a deliberate, bounded change from the prior
-/// single-table model — the correct per-document memory shape.
+/// single-table model — the correct per-document memory shape. The worker
+/// owns its [`RegisteredTables`] by value on its own thread, so no reclaim
+/// pass on the walk can reach them until they are lent to the walk: a pass
+/// that elects one of their consumers skips it, and only the table's own
+/// triggers spill it.
 ///
 /// The scoped thread holds no `&mut ExecutorContext`; it accumulates cursor
 /// advances and `add_record` DLQ errors into [`StreamingIngestEffects`],
@@ -1216,17 +1644,24 @@ fn run_streaming_aggregate_ingest(
     // table through the factory's captured `Arc<MemoryArbitrator>`. Each
     // table's `AggregateConsumer` contributes its growing group state to
     // `sum_consumer_usage` while live, and is unregistered when that
-    // document flushes (on its `DocumentClose`, or at disconnect for the
-    // document left open).
+    // document flushes (on its `DocumentClose`, or at the producer's End for
+    // the document left open).
     let factory = DocAggregatorFactory::from_ctx(ctx, spec)?;
     let allocation_resources = ctx.allocation_resources.clone();
 
     // Install the bounded streaming-ingest channel keyed by the producer's
     // index, so its dispatch arm streams into it with no producer-side
     // change. The scoped thread's per-record `sub_bytes` discharge below
-    // nets the producer's per-batch charge to zero.
-    let (rx, charge_handle, charge_consumer_id) =
-        ctx.install_streaming_ingest_channel(producer_idx, &upstream_name, name);
+    // nets the producer's per-batch charge to zero. This arm is the hop's
+    // driver: it holds the hop's end and sends End only once the producer's
+    // redispatch below returned `Ok`.
+    let crate::executor::stream_hop::StreamingIngestHop {
+        rx,
+        end: hop_end,
+        charge_handle,
+        charge_consumer_id,
+    } = ctx.install_streaming_ingest_channel(producer_idx, &upstream_name, name)?;
+    let hop_ends = ctx.hop_ends.clone();
 
     // Copy the stable-context reference out of `ctx` *before* the scope so
     // the scoped thread borrows `&'a StableEvalContext` directly (shared,
@@ -1254,24 +1689,30 @@ fn run_streaming_aggregate_ingest(
 
     // Run the ingest recv loop and the producer concurrently. The scoped
     // thread owns the document-flush aggregator and drains the channel; the
-    // main thread redispatches the producer (which streams into the channel
-    // and drops its sender at clean exit, disconnecting the channel). The
-    // producer's `?` error and the ingest thread's error both surface; the
-    // ingest thread always drains to disconnect first so a producer `send`
-    // can never deadlock on a dead consumer.
+    // main thread redispatches the producer, which streams into the channel,
+    // and then ends the hop if the producer returned `Ok`. The ingest
+    // thread finalizes only on that End: a channel that closes without it
+    // means the producer failed or was stopped, and the Aggregate finalizes
+    // nothing. Both results are settled together by `settle_hop`; the ingest
+    // thread drains to disconnect on every error exit so neither a producer
+    // `send` nor the End can block on a dead consumer.
     let finalize_ctx = ctx.merged_eval_ctx();
     let ingest_result: Result<(), PipelineError> = std::thread::scope(|scope| {
-        let handle = scope.spawn(|| -> Result<(), PipelineError> {
+        let handle = scope.spawn(|| {
+            // The thread owns the receiver, so a panic on it drops the
+            // receiver and a producer's next `send` fails instead of blocking.
+            let rx = rx;
+            let mut finalized = false;
             // The recv body is a single fallible closure so EVERY error exit
-            // funnels through the one drain-then-return site below. `rx` lives
-            // in the outer function frame, not in this closure, so an early
-            // `?` return would NOT disconnect the channel — a producer blocked
-            // on the bounded `send` would then deadlock and the join would
-            // hang forever. Draining `rx` to disconnect before propagating any
-            // error closes that gap structurally: no `?` site inside the
-            // closure can reintroduce the non-draining asymmetry.
-            let mut drive = || -> Result<(), PipelineError> {
-                while let Ok(event) = rx.recv() {
+            // funnels through the one drain-then-return site below: an early
+            // `?` inside it would otherwise leave the channel undrained, and a
+            // producer blocked on the bounded `send` would deadlock the join.
+            let mut drive = || -> Result<crate::executor::stream_hop::HopVerdict, PipelineError> {
+                let verdict = loop {
+                    let event = match crate::executor::stream_hop::next_event(&rx) {
+                        std::ops::ControlFlow::Continue(event) => event,
+                        std::ops::ControlFlow::Break(verdict) => break verdict,
+                    };
                     let (record, rn) = match event {
                         StreamEvent::Record(r, rn) => (r, rn),
                         StreamEvent::Punctuation(p) => {
@@ -1326,8 +1767,8 @@ fn run_streaming_aggregate_ingest(
                     let source_file_arc = source_file_arc_of(&record);
                     let source_name_arc = source_name_arc_of(&record);
                     // Mid-stream `$source.count` is `None` (defer-emit) — the
-                    // total is unknown until the source disconnects, exactly as
-                    // the per-record eval sites resolve it.
+                    // total is unknown until the Source's stream ends, exactly
+                    // as the per-record eval sites resolve it.
                     let eval_ctx = EvalContext {
                         stable,
                         source_file: &source_file_arc,
@@ -1361,10 +1802,11 @@ fn run_streaming_aggregate_ingest(
                             return Err(e.into());
                         }
                         Err(e) => match strategy {
-                            // Stamp the aggregate node name so an `OversizedRow`
-                            // → E310 abort names the stage that overran, matching
-                            // the materialized arm's attribution.
-                            ErrorStrategy::FailFast => return Err(agg_hash_error_into(name, e)),
+                            // An `OversizedRow` becomes the E310 naming this
+                            // Aggregate, as in the materialized arm.
+                            ErrorStrategy::FailFast => {
+                                return Err(e.into_pipeline_error(name, &factory.arbitrator));
+                            }
                             ErrorStrategy::Continue => {
                                 effects.add_errors.push((
                                     record,
@@ -1375,17 +1817,23 @@ fn run_streaming_aggregate_ingest(
                             }
                         },
                     }
+                };
+                if verdict == crate::executor::stream_hop::HopVerdict::UpstreamIncomplete {
+                    // The producer failed or was stopped: these rows are a
+                    // prefix of its output, so no group is finalized over them.
+                    return Ok(verdict);
                 }
-                // Channel disconnected — every sender dropped at the producer
-                // arm's clean exit. A completely empty stream (no records, no
-                // forwarded close) opened no bucket; a global fold still owes
-                // one defaulted row, so `drain_with_empty_sentinel` forces the
-                // sentinel bucket open before draining every surviving bucket
-                // in ascending `DocumentId` order (SYNTHETIC id 0 sorts first):
+                // The producer's End: its whole output has arrived. A
+                // completely empty stream (no records, no forwarded close)
+                // opened no bucket; a global fold still owes one defaulted
+                // row, so `drain_with_empty_sentinel` forces the sentinel
+                // bucket open before draining every surviving bucket in
+                // ascending `DocumentId` order (SYNTHETIC id 0 sorts first):
                 // the sentinel for no-document / unreconciled records, plus any
                 // document whose close never arrived. A finalize error
                 // propagates as a hard error through the drain-then-return site
                 // below.
+                finalized = true;
                 tables.drain_with_empty_sentinel(
                     input_count == 0,
                     &factory,
@@ -1393,26 +1841,29 @@ fn run_streaming_aggregate_ingest(
                     &mut out_rows,
                     |result| result.map_err(Into::into),
                 )?;
-                Ok(())
+                Ok(verdict)
             };
-            let result = drive();
+            // A governed allocation this worker was refused ends the ingest
+            // here, on the thread that recorded the refusal's report.
+            let result = crate::pipeline::memory::ledger::convert_governed_refusal(
+                drive(),
+                name,
+                clinker_plan::runtime_error::MemorySurface::GroupState,
+            );
             if result.is_err() {
-                // Drain to disconnect before surfacing the error so a producer
-                // blocked on the bounded `send` cannot deadlock the join. The
-                // streaming-ingest arm aborts on any ingest error (schema
-                // mismatch, FailFast `add_record`, finalize failure) with no
-                // DLQ fallback, matching the prior single-stream behavior.
-                while let Ok(event) = rx.recv() {
-                    if let StreamEvent::Record(record, _) = event {
-                        charge_handle.sub_bytes(
-                            crate::executor::node_buffer::unaccounted_record_byte_cost(
-                                &record,
-                                &allocation_resources,
-                            ),
-                        );
-                    }
-                }
+                // Drain to disconnect before surfacing the error so neither a
+                // producer blocked on the bounded `send` nor the End can
+                // deadlock the join. The streaming-ingest arm aborts on any
+                // ingest error (schema mismatch, FailFast `add_record`,
+                // finalize failure) with no DLQ fallback, matching the prior
+                // single-stream behavior.
+                crate::executor::stream_hop::discard_until_closed(
+                    &rx,
+                    &charge_handle,
+                    &allocation_resources,
+                );
             }
+            hop_ends.record(name, result.as_ref().ok().copied(), finalized);
             result
         });
 
@@ -1420,22 +1871,31 @@ fn run_streaming_aggregate_ingest(
         // entry first so the dispatcher's streaming-ingest short-circuit
         // (which made the producer's own topo turn a no-op) does not fire
         // again here — this is the one turn the producer must actually run.
-        // It takes the sender we installed and streams into the channel,
-        // dropping it at clean exit.
+        // It takes the sender we installed and streams into the channel.
         ctx.streaming_aggregate_ingest_edges.remove(&producer_idx);
         let producer_result =
             crate::executor::dispatch::dispatch_plan_node(ctx, current_dag, producer_idx);
-        // Belt-and-suspenders: ensure the channel disconnects even if a
-        // producer error left a sender lingering on `ctx`, so the ingest
-        // thread's `recv` returns `Err` and the join below cannot hang.
+        // Belt-and-suspenders: a producer error may leave its sender on
+        // `ctx`; remove it so only the hop's end still holds the channel.
         ctx.streaming_output_senders.remove(&producer_idx);
+        // The producer's whole output is on the channel only when it returned
+        // `Ok`. Otherwise the end is dropped unsent, and the channel closes
+        // without End once the last sender is gone, so the join below cannot
+        // wait on a channel that stays open.
+        if producer_result.is_ok() {
+            hop_end.end();
+        } else {
+            drop(hop_end);
+        }
 
-        let ingest = handle.join().map_err(|_| PipelineError::Internal {
-            op: "aggregation",
-            node: name.to_string(),
-            detail: "streaming aggregate ingest thread panicked".to_string(),
-        })?;
-        producer_result.and(ingest)
+        let ingest = handle.join().unwrap_or_else(|_| {
+            Err(PipelineError::Internal {
+                op: "aggregation",
+                node: name.to_string(),
+                detail: "streaming aggregate ingest thread panicked".to_string(),
+            })
+        });
+        crate::executor::stream_hop::settle_hop(name, &upstream_name, ingest, producer_result)
     });
 
     // Charge bookkeeping is complete: the producer charged each batch and
@@ -1538,7 +1998,7 @@ impl WindowedAggContext<'_> {
                 node: self.name.to_string(),
                 surface: MemorySurface::GroupState,
             },
-        );
+        )?;
         // Resolve the spill compression mode against this aggregate's
         // output-schema width and the run's batch size, matching the
         // `--explain` projection for the Aggregation node so each window's
@@ -1593,7 +2053,7 @@ fn run_time_windowed_aggregate(
     let name = win_ctx.name;
     let compiled = win_ctx.compiled;
     let output_schema = win_ctx.output_schema.clone();
-    use crate::aggregation::{AggregateStream, HashAggError, SortRow as AggSortRow};
+    use crate::aggregation::{HashAggError, SortRow as AggSortRow};
     use crate::executor::time_window::{
         WindowBounds, duration_to_nanos, hopping_windows, partition_into_sessions,
         record_event_time_nanos, session_is_closed, tumbling_window, upstream_source_names,
@@ -1674,10 +2134,7 @@ fn run_time_windowed_aggregate(
                     detail: "tumbling window size must be > 0".to_string(),
                 });
             }
-            let mut per_window: HashMap<
-                i64,
-                (AggregateStream, crate::pipeline::memory::ConsumerId),
-            > = HashMap::new();
+            let mut per_window = WalkGroupTables::for_windows(&ctx.memory_budget);
             (|| -> Result<(), PipelineError> {
                 for (record, row_num) in input {
                     let Some(t) = record_event_time_nanos(record) else {
@@ -1731,10 +2188,7 @@ fn run_time_windowed_aggregate(
                     detail: "hopping window size and slide must both be > 0".to_string(),
                 });
             }
-            let mut per_window: HashMap<
-                i64,
-                (AggregateStream, crate::pipeline::memory::ConsumerId),
-            > = HashMap::new();
+            let mut per_window = WalkGroupTables::for_windows(&ctx.memory_budget);
             (|| -> Result<(), PipelineError> {
                 for (record, row_num) in input {
                     let Some(t) = record_event_time_nanos(record) else {
@@ -1847,10 +2301,8 @@ fn run_time_windowed_aggregate(
             // (group_key, session_idx) separates session emits
             // without changing the underlying HashAggregator's
             // group-by contract.
-            let mut session_streams: HashMap<
-                SessionStreamKey,
-                (AggregateStream, crate::pipeline::memory::ConsumerId),
-            > = HashMap::new();
+            let mut session_streams: WalkGroupTables<WindowTables<SessionStreamKey>> =
+                WalkGroupTables::for_windows(&ctx.memory_budget);
             (|| -> Result<(), PipelineError> {
                 for (i, (rec, rn)) in input.iter().enumerate() {
                     let Some(info) = record_session_info[i].clone() else {
@@ -1883,23 +2335,23 @@ fn run_time_windowed_aggregate(
                             .or_insert(t);
                     }
                     let stream_key = (info.key, info.session_idx);
-                    let entry = session_streams.entry(stream_key);
-                    let (stream, _consumer_id) = match entry {
-                        std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
-                        std::collections::hash_map::Entry::Vacant(v) => {
-                            let fresh = win_ctx.make_stream(ctx)?;
-                            v.insert(fresh)
-                        }
-                    };
                     let source_file_arc = source_file_arc_of(rec);
                     let source_name_arc = source_name_arc_of(rec);
-                    let eval_ctx = ctx.eval_ctx_for_record(
+                    let walk_ctx: &ExecutorContext<'_> = ctx;
+                    let eval_ctx = walk_ctx.eval_ctx_for_record(
                         &source_file_arc,
                         &source_name_arc,
                         *rn,
                         rec.doc_ctx(),
                     );
-                    let add_result = stream.add_record(rec, *rn, &eval_ctx, &mut out_rows);
+                    let add_result = session_streams.add_window_record(
+                        stream_key,
+                        || win_ctx.make_stream(walk_ctx),
+                        rec,
+                        *rn,
+                        &eval_ctx,
+                        &mut out_rows,
+                    )?;
                     if add_result.is_ok() {
                         advance_cursor(ctx, &source_name_arc, *rn);
                     }
@@ -1911,22 +2363,23 @@ fn run_time_windowed_aggregate(
             })()?;
             // Finalize every (group, session) stream. Walk in
             // deterministic order (sorted by (group_key, session_idx))
-            // so emit order is stable across runs.
-            let mut entries: Vec<(
-                SessionStreamKey,
-                (AggregateStream, crate::pipeline::memory::ConsumerId),
-            )> = session_streams.into_iter().collect();
+            // so emit order is stable across runs. Each stream leaves the
+            // walk-owned cell just before its finalize.
+            let mut keys: Vec<SessionStreamKey> = session_streams.keys();
             // `GroupByKey` does not implement `Ord`; fall back to a
             // Debug-formatted key for deterministic finalize order
             // across runs. The session_idx breaks ties for the same
             // group key.
-            entries.sort_by(|a, b| {
-                let ka: Vec<String> = a.0.0.iter().map(|k| format!("{k:?}")).collect();
-                let kb: Vec<String> = b.0.0.iter().map(|k| format!("{k:?}")).collect();
-                ka.cmp(&kb).then(a.0.1.cmp(&b.0.1))
+            keys.sort_by(|a, b| {
+                let ka: Vec<String> = a.0.iter().map(|k| format!("{k:?}")).collect();
+                let kb: Vec<String> = b.0.iter().map(|k| format!("{k:?}")).collect();
+                ka.cmp(&kb).then(a.1.cmp(&b.1))
             });
             let finalize_ctx = ctx.merged_eval_ctx();
-            for (_, (stream, consumer_id)) in entries {
+            for key in keys {
+                let (stream, consumer_id) = session_streams
+                    .take(&key)
+                    .ok_or_else(|| missing_group_table(name))?;
                 // Finalize consumes this session's stream; unregister
                 // its wrapper unconditionally afterward so the session's
                 // bytes leave `sum_consumer_usage` whether finalize
@@ -1977,57 +2430,33 @@ fn add_to_window(
     record: &Record,
     row_num: crate::executor::stream_event::SourceRowId,
     window_start: i64,
-    per_window: &mut std::collections::HashMap<
-        i64,
-        (
-            crate::aggregation::AggregateStream,
-            crate::pipeline::memory::ConsumerId,
-        ),
-    >,
+    per_window: &mut WalkGroupTables<WindowTables<i64>>,
     out_rows: &mut Vec<crate::aggregation::SortRow>,
 ) -> Result<(), PipelineError> {
     let source_file_arc = source_file_arc_of(record);
     let source_name_arc = source_name_arc_of(record);
-    let eval_ctx = ctx.eval_ctx_for_record(
+    let walk_ctx: &ExecutorContext<'_> = ctx;
+    let eval_ctx = walk_ctx.eval_ctx_for_record(
         &source_file_arc,
         &source_name_arc,
         row_num,
         record.doc_ctx(),
     );
-    let (stream, _consumer_id) = match per_window.entry(window_start) {
-        std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
-        std::collections::hash_map::Entry::Vacant(v) => {
-            let fresh = win_ctx.make_stream(ctx)?;
-            v.insert(fresh)
+    let add_result = per_window.add_window_record(
+        window_start,
+        || win_ctx.make_stream(walk_ctx),
+        record,
+        row_num,
+        &eval_ctx,
+        out_rows,
+    )?;
+    match add_result {
+        Ok(()) => {
+            advance_cursor(ctx, &source_name_arc, row_num);
+            Ok(())
         }
-    };
-    let add_result = stream.add_record(record, row_num, &eval_ctx, out_rows);
-    if add_result.is_ok() {
-        advance_cursor(ctx, &source_name_arc, row_num);
-        return Ok(());
+        Err(e) => handle_aggregate_add_error(ctx, win_ctx.name, record, row_num, e),
     }
-    let e = add_result.err().unwrap();
-    handle_aggregate_add_error(ctx, win_ctx.name, record, row_num, e)
-}
-
-/// Convert a `HashAggError` to `PipelineError`, stamping the aggregate node
-/// name into a `MemoryBudgetExceeded` whose `node` the error taxonomy left
-/// empty.
-///
-/// The `OversizedRow → E310` mapping in `aggregation/error.rs` deliberately
-/// leaves `node` empty for the dispatch arm to fill — matching the sibling
-/// budget-error sites — so an aborting oversized-row error renders as
-/// `E310 <aggregate>: ...`, naming the stage that overran exactly as the
-/// memory docs promise. Every other `PipelineError` shape passes through
-/// unchanged (they already carry their own attribution or none is owed).
-fn agg_hash_error_into(name: &str, e: crate::aggregation::HashAggError) -> PipelineError {
-    let mut err: PipelineError = e.into();
-    if let PipelineError::MemoryBudgetExceeded { node, .. } = &mut err
-        && node.is_empty()
-    {
-        *node = name.to_string();
-    }
-    err
 }
 
 /// Shared per-record `add_record` error handler for every materialized
@@ -2049,9 +2478,8 @@ fn handle_aggregate_add_error(
         return Err(e.into());
     }
     match ctx.config.error_handling.strategy {
-        // Stamp the aggregate node name so an `OversizedRow` → E310 abort
-        // names the stage that overran.
-        ErrorStrategy::FailFast => Err(agg_hash_error_into(name, e)),
+        // An `OversizedRow` becomes the E310 naming this Aggregate.
+        ErrorStrategy::FailFast => Err(e.into_pipeline_error(name, &ctx.memory_budget)),
         ErrorStrategy::Continue => {
             let failure = crate::executor::held_failure::HeldFailure::new(
                 row_num,
@@ -2081,28 +2509,21 @@ fn handle_aggregate_add_error(
 fn finalize_windows(
     ctx: &mut ExecutorContext<'_>,
     name: &str,
-    per_window: std::collections::HashMap<
-        i64,
-        (
-            crate::aggregation::AggregateStream,
-            crate::pipeline::memory::ConsumerId,
-        ),
-    >,
+    mut per_window: WalkGroupTables<WindowTables<i64>>,
     out_rows: &mut Vec<crate::aggregation::SortRow>,
     output_schema: &SharedStorage<Schema>,
     input: &[(Record, crate::executor::stream_event::SourceRowId)],
 ) -> Result<(), PipelineError> {
     use crate::aggregation::HashAggError;
-    let mut entries: Vec<(
-        i64,
-        (
-            crate::aggregation::AggregateStream,
-            crate::pipeline::memory::ConsumerId,
-        ),
-    )> = per_window.into_iter().collect();
-    entries.sort_by_key(|(start, _)| *start);
+    let mut starts = per_window.keys();
+    starts.sort_unstable();
     let finalize_ctx = ctx.merged_eval_ctx();
-    for (_, (stream, consumer_id)) in entries {
+    for start in starts {
+        // The window's table leaves the walk-owned cell just before its
+        // finalize, so no pass can reach a table being finalized.
+        let (stream, consumer_id) = per_window
+            .take(&start)
+            .ok_or_else(|| missing_group_table(name))?;
         // Finalize consumes this window's stream; unregister its
         // wrapper unconditionally afterward so the window's bytes leave
         // `sum_consumer_usage` whether finalize emitted rows or routed a

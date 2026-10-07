@@ -1,14 +1,14 @@
 //! Hard-limit overshoot coverage for reserving a spilled node-buffer scan's
-//! resident materialization, surfacing the reserved
-//! `BudgetCategory::NodeBuffer` (E310) tag.
+//! resident materialization, surfacing an E310 for the consuming node's rows
+//! collected for a full scan.
 //!
 //! A blocking consumer that drains a *spilled* predecessor slot streams the
 //! records back off disk into a fresh `Vec`. Before allocating that vector,
 //! `NodeBufferInput::into_materialized_parts` reserves its full estimated
 //! footprint alongside the immutable spill backing. A slot that spilled
 //! precisely because it outgrew the budget therefore cannot re-inflate past
-//! the hard limit uncharged; the reservation fails with typed
-//! `MemoryBudgetExceeded { source: NodeBuffer }`.
+//! the hard limit uncharged; the reservation fails with a typed
+//! `MemoryBudgetExceeded` whose report names that scan.
 //!
 //! The hard limit is a small 64 KiB budget: the ~1,500-record re-materialized
 //! input alone exceeds it, so the abort fires on the re-materialized
@@ -178,35 +178,43 @@ fn run(yaml: &str, csv: String) -> PipelineError {
 #[test]
 fn spilled_transform_input_metered_drain_aborts_as_node_buffer() {
     match run(TRANSFORM_CHAIN_YAML, transform_csv()) {
-        PipelineError::MemoryBudgetExceeded { node, source, .. } => {
+        PipelineError::MemoryBudgetExceeded { report } => {
+            let requester = report
+                .requester
+                .as_ref()
+                .expect("the refusal names its node");
             assert_eq!(
-                node, "stage_two",
+                requester.node, "stage_two",
                 "the consumer draining the spilled predecessor is the aborting stage",
             );
             assert_eq!(
-                source,
-                clinker_plan::BudgetCategory::NodeBuffer,
-                "a re-materialized node-buffer drain is tagged NodeBuffer, not Arena",
+                requester.surface,
+                clinker_plan::runtime_error::MemorySurface::ScanMaterialization,
+                "a re-materialized node-buffer drain is reported as rows collected for a scan",
             );
         }
-        other => panic!("expected MemoryBudgetExceeded {{ NodeBuffer }}; got: {other:?}"),
+        other => panic!("expected MemoryBudgetExceeded for a scan; got: {other:?}"),
     }
 }
 
 #[test]
 fn spilled_aggregate_input_metered_drain_aborts_as_node_buffer() {
     match run(AGGREGATE_CHAIN_YAML, aggregate_csv()) {
-        PipelineError::MemoryBudgetExceeded { node, source, .. } => {
+        PipelineError::MemoryBudgetExceeded { report } => {
+            let requester = report
+                .requester
+                .as_ref()
+                .expect("the refusal names its node");
             assert_eq!(
-                node, "__correlation_sort_events",
+                requester.node, "__correlation_sort_events",
                 "the correlation sort is the first stage materializing the spilled predecessor",
             );
             assert_eq!(
-                source,
-                clinker_plan::BudgetCategory::NodeBuffer,
-                "a re-materialized node-buffer drain is tagged NodeBuffer, not Arena",
+                requester.surface,
+                clinker_plan::runtime_error::MemorySurface::ScanMaterialization,
+                "a re-materialized node-buffer drain is reported as rows collected for a scan",
             );
         }
-        other => panic!("expected MemoryBudgetExceeded {{ NodeBuffer }}; got: {other:?}"),
+        other => panic!("expected MemoryBudgetExceeded for a scan; got: {other:?}"),
     }
 }

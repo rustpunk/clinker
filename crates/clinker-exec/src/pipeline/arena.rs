@@ -46,10 +46,10 @@ impl Arena {
     ///
     /// `fields`: field names to project into the Arena (from `IndexSpec.arena_fields`).
     /// `mem_limit`: hard byte limit threaded through this call only — the
-    /// caller's per-arena cap, distinct from the pipeline-wide budget
-    /// the arbitrator's `should_abort()` poll guards. Each admitted record
-    /// also polls the arbitrator at the per-row boundary so a runaway
-    /// arena trips the pipeline-wide ceiling alongside the per-call cap.
+    /// caller's per-arena cap, distinct from the run's limit
+    /// ([`MemoryArbitrator::hard_limit`]). Each admitted record's projected
+    /// footprint is also compared with that run-wide limit, so a runaway
+    /// arena trips it alongside the per-call cap.
     /// Returns `ArenaError::MemoryBudgetExceeded` when either gate fires.
     pub fn build(
         reader: &mut dyn FormatReader,
@@ -122,11 +122,11 @@ impl Arena {
             }
             // Single-arena overflow against the pipeline-wide ceiling.
             // The arena's own projected footprint is the right gate
-            // here — whole-process RSS (the arbitrator's `should_abort`)
-            // includes the criterion harness, input buffers, and
-            // allocator slack, which would false-trip a benchmark whose
-            // arena fits but whose process footprint does not. Cross-
-            // arena attribution comes from registered consumers.
+            // here — whole-process RSS (the reading the hard-limit check's
+            // process-memory arm refuses on) includes the criterion harness,
+            // input buffers, and allocator slack, which would false-trip a
+            // benchmark whose arena fits but whose process footprint does
+            // not. Cross-arena attribution comes from registered consumers.
             let hard_limit = budget.hard_limit() as usize;
             if hard_limit > 0 && local_bytes_used > hard_limit {
                 return Err(ArenaError::MemoryBudgetExceeded {
@@ -216,7 +216,8 @@ impl Arena {
 /// `i32::MAX - 1` — ranked just ahead of Sources (which at least pause)
 /// and behind every spillable consumer, so a policy elects an arena
 /// only when nothing else can act. The wrapper exists for attribution,
-/// not for victim selection.
+/// not for victim selection: `reclaimable_bytes` is 0, so no reclaim pass
+/// or victim policy elects it.
 pub(crate) struct ArenaConsumer {
     handle: Arc<ConsumerHandle>,
 }
@@ -232,6 +233,10 @@ impl ArenaConsumer {
 impl MemoryConsumer for ArenaConsumer {
     fn current_usage(&self) -> u64 {
         self.handle.bytes()
+    }
+
+    fn reclaimable_bytes(&self) -> u64 {
+        0
     }
 
     fn peak_charged_bytes(&self) -> Option<u64> {
@@ -308,10 +313,11 @@ where
         let minimal = MinimalRecord::new(projected);
         local_bytes_used += estimated_size(&minimal);
         // Gate on this arena's own projected footprint against the
-        // pipeline ceiling. Whole-process RSS (`should_abort`) is the
-        // wrong signal here — it folds in unrelated resident memory and
-        // would false-trip a node-rooted arena that fits. Cross-arena
-        // attribution comes from registered consumers.
+        // pipeline ceiling. Whole-process RSS (the reading the hard-limit
+        // check's process-memory arm refuses on) is the wrong signal here —
+        // it folds in unrelated resident memory and would false-trip a
+        // node-rooted arena that fits. Cross-arena attribution comes from
+        // registered consumers.
         if hard_limit > 0 && local_bytes_used > hard_limit {
             return Err(ArenaError::MemoryBudgetExceeded {
                 used: local_bytes_used,
@@ -387,6 +393,32 @@ pub enum ArenaError {
         expected: SharedStorage<Schema>,
         actual: SharedStorage<Schema>,
     },
+}
+
+impl ArenaError {
+    /// This failure to build the window index rooted at `node` as the run's
+    /// error. An index that outgrew the limit is the E310 refusal of the
+    /// `used` bytes it needed, reported from `budget`'s ledger; any other
+    /// failure (which building from already-read records cannot produce) is
+    /// an internal error naming `node`.
+    pub(crate) fn into_pipeline_error(
+        self,
+        node: &str,
+        budget: &MemoryArbitrator,
+    ) -> clinker_plan::error::PipelineError {
+        match self {
+            ArenaError::MemoryBudgetExceeded { used, .. } => budget.refusal(
+                node,
+                clinker_plan::runtime_error::MemorySurface::WindowIndex,
+                used as u64,
+            ),
+            other => clinker_plan::error::PipelineError::Internal {
+                op: "window index",
+                node: node.to_string(),
+                detail: other.to_string(),
+            },
+        }
+    }
 }
 
 impl std::fmt::Display for ArenaError {

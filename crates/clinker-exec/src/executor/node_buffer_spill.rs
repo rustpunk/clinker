@@ -1,9 +1,10 @@
-//! Producer-side spill helper for `ctx.node_buffers`.
+//! Producer-side spill helper for node-buffer slots in the walk reclaim set.
 //!
-//! When `MemoryArbitrator::should_spill()` trips at admission time, the
-//! producer flushes the in-memory `Vec<(Record, SourceRowId)>` to disk through
-//! `SpillWriter<SourceRowId>` and stores the resulting `(SpillFile<SourceRowId>, u64)`
-//! pair inside `NodeBuffer::Spilled`. Consumer-side streaming is
+//! When a slot's charge does not fit at its admission, even after a reclaim
+//! pass, or when the arbitrator's soft threshold is crossed at that
+//! admission, the producer flushes the in-memory `Vec<(Record, SourceRowId)>`
+//! to disk through `SpillWriter<SourceRowId>` and stores the resulting
+//! `(SpillFile<SourceRowId>, u64)` pair inside `NodeBuffer::Spilled`. Consumer-side streaming is
 //! already covered by [`NodeBuffer::drain`] (memory rows first, then
 //! per-spill rows via `SpillReader<SourceRowId>`), so this module exposes only
 //! the producer-side packaging.
@@ -53,13 +54,28 @@ pub(crate) fn spill_node_buffer<R>(
 where
     R: Copy + Into<SourceRowId>,
 {
+    spill_borrowed_rows(&rows, spill_dir, compress)
+}
+
+/// Write borrowed rows to one spill file without copying them, in the same
+/// format and with the same result as [`spill_node_buffer`]. The caller keeps
+/// its rows; nothing resident is built, so a holder refused memory for a
+/// copy can still put the rows on disk.
+pub(crate) fn spill_borrowed_rows<R>(
+    rows: &[(Record, R)],
+    spill_dir: Option<&Path>,
+    compress: bool,
+) -> Result<Option<(SpillFile<SourceRowId>, u64)>, PipelineError>
+where
+    R: Copy + Into<SourceRowId>,
+{
     let Some((first, _)) = rows.first() else {
         return Ok(None);
     };
     let schema = first.schema().clone();
     let mut writer: SpillWriter<SourceRowId> = SpillWriter::new(schema, spill_dir, compress)?;
     let count = rows.len() as u64;
-    for (record, rn) in &rows {
+    for (record, rn) in rows {
         writer.write_pair(record, &(*rn).into())?;
     }
     let file = writer.finish()?;

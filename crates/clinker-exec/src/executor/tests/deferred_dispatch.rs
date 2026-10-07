@@ -183,18 +183,18 @@ fn relaxed_aggregate_seeds_a_deferred_region_with_downstream_members() {
 }
 
 /// Whole-process RSS over the hard limit aborts a Combine that lives in
-/// a deferred region with the `BudgetCategory::Arena` admission-failure
-/// shape.
+/// a deferred region with the E310 its join build backstop reports.
 ///
 /// Sibling to [`memory_budget_overflow_on_deferred_buffer_raises_e310`],
 /// which drives the per-arena logical charge with a tight byte budget.
-/// This one drives the RSS-based `should_abort` gate instead: it seeds
-/// the pipeline-scoped arbitrator's `peak_rss` above the hard limit and
-/// runs the combine-in-deferred-region topology through the executor's
-/// arbitrator-injection seam. The Combine's build phase polls
-/// `should_abort` and surfaces `MemoryBudgetExceeded { source: Arena }`
-/// naming the Combine, where `used` is the observed peak RSS and `limit`
-/// is the hard limit.
+/// This one drives the process-memory arm of the hard-limit check
+/// (`MemoryArbitrator::check_hard_limit`) instead: it seeds the
+/// pipeline-scoped arbitrator's `peak_rss` above the hard limit and runs
+/// the combine-in-deferred-region topology through the executor's
+/// arbitrator-injection seam. The Combine's build phase runs that check
+/// and surfaces an E310 for the Combine's join build side,
+/// whose request is how far the observed peak RSS stands past the hard
+/// limit.
 ///
 /// Seeding `peak_rss` rather than setting a tight YAML budget is the
 /// only deterministic lever under pull-mode: at `cargo test` time the
@@ -326,8 +326,8 @@ nodes:
     };
 
     // 100 GiB hard limit so the seeded peak RSS stays dominant; seed
-    // just above the hard limit so `should_abort` trips on the first
-    // poll inside the Combine build.
+    // just above the hard limit so the hard-limit check's process-memory
+    // arm refuses at its first run inside the Combine build.
     const HARD_LIMIT: u64 = 100 * 1024 * 1024 * 1024;
     let arbitrator = std::sync::Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
         HARD_LIMIT,
@@ -348,20 +348,22 @@ nodes:
     .expect_err("peak RSS above the hard limit must abort the deferred-region Combine");
 
     match err {
-        clinker_plan::error::PipelineError::MemoryBudgetExceeded {
-            source: clinker_plan::BudgetCategory::Arena,
-            used,
-            limit,
-            ..
-        } => {
+        clinker_plan::error::PipelineError::MemoryBudgetExceeded { report } => {
+            assert_eq!(
+                report.requester.as_ref().map(|label| &label.surface),
+                Some(&clinker_plan::runtime_error::MemorySurface::JoinBuildSide),
+                "the Combine's build backstop reports its join build side"
+            );
             assert!(
-                used > limit,
-                "reported used ({used}) must exceed the hard limit ({limit}) at abort",
+                report.requested_bytes > 0,
+                "the reported overshoot ({}) must put the run past the hard limit ({}) at abort",
+                report.requested_bytes,
+                report.limit.bytes(),
             );
         }
         other => panic!(
             "RSS overshoot in a deferred-region Combine must carry \
-             MemoryBudgetExceeded (BudgetCategory::Arena); got: {other:?}"
+             MemoryBudgetExceeded for its join state; got: {other:?}"
         ),
     }
 }
@@ -1090,4 +1092,292 @@ o6,ENG,300
         !rows.iter().any(|r| r.contains("HR")),
         "HR was DLQ'd by the inner body Transform's /0 — it must NOT appear in the writer output; got rows {rows:?}"
     );
+}
+
+/// A relaxed-key commit whose deferred Combine reads a Source parked across
+/// the regions: the commit fails when `strategy` is `fail_fast` (`ratio`
+/// divides by zero on HR) and converges when it is `continue`.
+fn parked_commit_pipeline(strategy: &str) -> String {
+    format!(
+        r#"
+pipeline:
+  name: parked_commit
+error_handling:
+  strategy: {strategy}
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    path: orders.csv
+    correlation_key: order_id
+    type: csv
+    schema:
+      - {{ name: order_id, type: string }}
+      - {{ name: department, type: string }}
+      - {{ name: amount, type: int }}
+- type: aggregate
+  name: dept_totals
+  input: orders
+  config:
+    group_by: [department]
+    cxl: |
+      emit department = department
+      emit total = sum(amount)
+- type: source
+  name: dept_lookup
+  config:
+    name: dept_lookup
+    path: dept_lookup.csv
+    type: csv
+    schema:
+      - {{ name: department, type: string }}
+      - {{ name: budget, type: int }}
+- type: combine
+  name: enriched
+  input:
+    p: dept_totals
+    b: dept_lookup
+  config:
+    where: 'p.department == b.department'
+    match: first
+    on_miss: skip
+    cxl: |
+      emit department = p.department
+      emit total = p.total
+      emit budget = b.budget
+    propagate_ck: driver
+- type: transform
+  name: ratio
+  input: enriched
+  config:
+    cxl: |
+      emit department = department
+      emit total = total
+      emit ratio = 1 / (total - 60)
+- type: sink
+  name: out
+  input: ratio
+  config:
+    name: out
+    path: out.csv
+    type: csv
+    include_unmapped: true
+"#
+    )
+}
+
+/// Run [`parked_commit_pipeline`] under `strategy` and return the run's
+/// outcome with what the commit left behind as it returned.
+fn run_parked_commit(
+    strategy: &str,
+) -> (
+    Result<ExecutionReport, PipelineError>,
+    crate::executor::commit::CommitObservation,
+) {
+    let config =
+        clinker_plan::config::parse_config(&parked_commit_pipeline(strategy)).expect("parse");
+    let orders_csv = "order_id,department,amount\n\
+                      o1,HR,10\no2,HR,20\no3,HR,30\no4,ENG,100\no5,ENG,200\n";
+    let lookup_csv = "department,budget\nHR,100\nENG,500\n";
+    let readers: crate::executor::SourceReaders = HashMap::from([
+        (
+            "orders".to_string(),
+            crate::executor::single_file_reader(
+                "orders.csv",
+                Box::new(std::io::Cursor::new(orders_csv.as_bytes().to_vec())),
+            ),
+        ),
+        (
+            "dept_lookup".to_string(),
+            crate::executor::single_file_reader(
+                "dept_lookup.csv",
+                Box::new(std::io::Cursor::new(lookup_csv.as_bytes().to_vec())),
+            ),
+        ),
+    ]);
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(SharedBuffer::new()) as Box<dyn std::io::Write + Send>,
+    )]);
+    let params = PipelineRunParams {
+        execution_id: "parked-commit".to_string(),
+        batch_id: "batch-0".to_string(),
+        ..Default::default()
+    };
+    let arbitrator = std::sync::Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
+        1024 * 1024 * 1024,
+        0.80,
+        0.70,
+        Box::new(crate::pipeline::memory::Priority),
+    ));
+    let _ = crate::executor::commit::take_commit_observation();
+    let result = PipelineExecutor::run_with_readers_writers_with_arbitrator(
+        &config,
+        readers,
+        writers.into(),
+        &params,
+        clinker_plan::config::CompileContext::default(),
+        arbitrator,
+    );
+    let observed = crate::executor::commit::take_commit_observation()
+        .expect("the relaxed-key commit ran on this thread and recorded how it returned");
+    (result, observed)
+}
+
+/// A commit that fails mid-iteration still releases every parked edge
+/// before it returns: no parked consumer stays registered and no parked row
+/// or spill file stays in the store, before the run's own teardown.
+#[test]
+fn failed_commit_leaves_no_parked_state() {
+    let (result, observed) = run_parked_commit("fail_fast");
+    assert!(
+        result.is_err(),
+        "`ratio` fails the commit under fail_fast: {result:?}"
+    );
+    assert!(
+        observed.parked_edges_before >= 1,
+        "the build side was parked for the commit: {observed:?}"
+    );
+    assert_eq!(observed.parked_edges_after, 0, "{observed:?}");
+    assert_eq!(
+        observed.parked_consumers_still_registered, 0,
+        "every parked edge's consumer is unregistered when the commit returns: {observed:?}"
+    );
+}
+
+/// The same holds when the commit succeeds.
+#[test]
+fn converged_commit_leaves_no_parked_state() {
+    let (result, observed) = run_parked_commit("continue");
+    let report = result.expect("the commit converges under continue");
+    assert!(report.counters.retraction.iterations >= 2);
+    assert!(observed.parked_edges_before >= 1, "{observed:?}");
+    assert_eq!(observed.parked_edges_after, 0, "{observed:?}");
+    assert_eq!(
+        observed.parked_consumers_still_registered, 0,
+        "{observed:?}"
+    );
+}
+
+/// Two relaxed aggregates whose regions share their downstream nodes: the
+/// node where the regions meet belongs to one of them, and the rows the
+/// other region's member hands it are parked during the commit pass. The
+/// commit must walk the region that parks them before the region that reads
+/// them, whichever aggregate the pipeline declares first.
+#[test]
+fn deferred_regions_are_walked_after_the_regions_they_read_from() {
+    use petgraph::visit::EdgeRef;
+
+    let aggregates = [
+        r#"- type: aggregate
+  name: dept_totals
+  input: orders
+  config:
+    group_by: [department]
+    cxl: |
+      emit department = department
+      emit total = sum(amount)
+"#,
+        r#"- type: aggregate
+  name: dept_peaks
+  input: orders
+  config:
+    group_by: [department]
+    cxl: |
+      emit department = department
+      emit peak = max(amount)
+"#,
+    ];
+    for declared in [[0, 1], [1, 0]] {
+        let yaml = format!(
+            r#"
+pipeline:
+  name: region_order
+error_handling:
+  strategy: continue
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    path: orders.csv
+    correlation_key: order_id
+    type: csv
+    schema:
+      - {{ name: order_id, type: string }}
+      - {{ name: department, type: string }}
+      - {{ name: amount, type: int }}
+{}{}- type: transform
+  name: totals_x
+  input: dept_totals
+  config:
+    cxl: |
+      emit department = department
+      emit total = total
+- type: transform
+  name: peaks_x
+  input: dept_peaks
+  config:
+    cxl: |
+      emit department = department
+      emit peak = peak
+- type: combine
+  name: joined
+  input:
+    p: peaks_x
+    b: totals_x
+  config:
+    where: 'p.department == b.department'
+    match: all
+    on_miss: skip
+    cxl: |
+      emit department = p.department
+      emit peak = p.peak
+      emit total = b.total
+    propagate_ck: driver
+- type: sink
+  name: out
+  input: joined
+  config:
+    name: out
+    path: out.csv
+    type: csv
+    include_unmapped: true
+"#,
+            aggregates[declared[0]], aggregates[declared[1]]
+        );
+        let config = clinker_plan::config::parse_config(&yaml).expect("parse");
+        let dag = config
+            .compile(&clinker_plan::config::CompileContext::default())
+            .expect("compile")
+            .dag()
+            .clone();
+        let order = crate::executor::commit::dispatch::region_walk_order(&dag);
+        let owner = |node| dag.deferred_region_at(node).map(|region| region.producer);
+        let position = |producer| {
+            order
+                .iter()
+                .position(|walked| *walked == producer)
+                .expect("every region is walked")
+        };
+        let mut crossings = 0;
+        for edge in dag.graph.edge_references() {
+            let (Some(from), Some(to)) = (owner(edge.source()), owner(edge.target())) else {
+                continue;
+            };
+            if from != to {
+                crossings += 1;
+                assert!(
+                    position(from) < position(to),
+                    "declared {declared:?}: the region owning {} is walked after the region \
+                     owning {}, which reads what it parks",
+                    dag.graph[edge.source()].name(),
+                    dag.graph[edge.target()].name()
+                );
+            }
+        }
+        assert!(crossings >= 1, "declared {declared:?}: the regions meet");
+        assert_eq!(order.len(), 2, "each region is walked once");
+    }
 }

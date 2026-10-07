@@ -2,9 +2,10 @@
 //!
 //! When peak RSS exceeds the arbitrator's hard limit, `should_abort()`
 //! must return true regardless of how many consumers are registered
-//! or what policy is installed. Operator hot loops poll this in their
-//! 10K-record cadence and surface `PipelineError::MemoryBudgetExceeded`
-//! when the abort gate trips.
+//! or what policy is installed. Operator hot loops do not poll it: their
+//! 10K-record backstop is `MemoryArbitrator::check_hard_limit`, whose
+//! process-memory arm reads the same peak and surfaces
+//! `PipelineError::MemoryBudgetExceeded`.
 //!
 //! Pairs with the existing per-category abort tests in
 //! `pipeline/memory.rs` — this one focuses on the multi-consumer
@@ -63,13 +64,15 @@ fn should_abort_trips_when_rss_exceeds_hard_limit() {
 
     let handle = ConsumerHandle::new();
     handle.set_bytes(64 * 1024);
-    arbitrator.register_consumer(
-        Arc::new(StuckAggregate {
-            handle: handle.clone(),
-        }),
-        handle.clone(),
-        label("stuck_totals"),
-    );
+    arbitrator
+        .register_consumer(
+            Arc::new(StuckAggregate {
+                handle: handle.clone(),
+            }),
+            handle.clone(),
+            label("stuck_totals"),
+        )
+        .expect("a fresh handle registers");
 
     // Push peak RSS just over the hard limit.
     arbitrator.set_peak_rss_for_test(HARD_LIMIT + 1024);
@@ -88,13 +91,15 @@ fn soft_limit_arbitration_runs_before_hard_limit_aborts() {
 
     let handle = ConsumerHandle::new();
     handle.set_bytes(64 * 1024);
-    arbitrator.register_consumer(
-        Arc::new(StuckAggregate {
-            handle: handle.clone(),
-        }),
-        handle.clone(),
-        label("stuck_totals"),
-    );
+    arbitrator
+        .register_consumer(
+            Arc::new(StuckAggregate {
+                handle: handle.clone(),
+            }),
+            handle.clone(),
+            label("stuck_totals"),
+        )
+        .expect("a fresh handle registers");
 
     // Peak RSS above soft limit (50 GiB) but below hard limit (100 GiB).
     arbitrator.set_peak_rss_for_test(75 * 1024 * 1024 * 1024);

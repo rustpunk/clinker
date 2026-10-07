@@ -311,6 +311,17 @@ pub(crate) struct OrderRepairOutcome {
     pub(crate) spilled: bool,
 }
 
+/// Attach the barrier's kernel pool, if it has one, to a buffer it built.
+fn pooled<P>(pool: Option<&Arc<rayon::ThreadPool>>, buffer: SortBuffer<P>) -> SortBuffer<P>
+where
+    P: serde::Serialize + serde::de::DeserializeOwned + Send + Ord + HeapBytes,
+{
+    match pool {
+        Some(pool) => buffer.with_kernel_pool(Arc::clone(pool)),
+        None => buffer,
+    }
+}
+
 /// Run-scoped per-source barrier; at most one physical file is open for a
 /// synchronous `RecordSource`, while different sources own independent state.
 pub(crate) struct SourceFileOrderBarrier {
@@ -339,6 +350,9 @@ pub(crate) struct SourceFileOrderBarrier {
     /// charges, so the barrier moves it only by the change in its own figure
     /// and never restates the handle's whole charge.
     charged_bytes: std::cell::Cell<u64>,
+    /// The run's kernel pool the staged rows' comparator sorts run on. `None`
+    /// sorts sequentially on the Source thread.
+    kernel_pool: Option<Arc<rayon::ThreadPool>>,
     #[cfg(test)]
     emitted_warnings: u64,
 }
@@ -375,9 +389,17 @@ impl SourceFileOrderBarrier {
             releasing_memory_bytes: 0,
             fixed_memory_bytes: 0,
             charged_bytes: std::cell::Cell::new(0),
+            kernel_pool: None,
             #[cfg(test)]
             emitted_warnings: 0,
         }
+    }
+
+    /// Sort every buffer this barrier builds from now on on `pool`, the run's
+    /// kernel pool, instead of sequentially on the Source thread. Output is
+    /// identical either way.
+    pub(crate) fn set_kernel_pool(&mut self, pool: Arc<rayon::ThreadPool>) {
+        self.kernel_pool = Some(pool);
     }
 
     /// Begin one physical file at its unchanged outer `DocumentOpen`.
@@ -480,13 +502,16 @@ impl SourceFileOrderBarrier {
             let threshold = usize::try_from(self.memory.spill_threshold_bytes())
                 .unwrap_or(usize::MAX)
                 .max(1);
-            state.records = Some(SortBuffer::new(
-                self.config.sort_fields.clone(),
-                threshold,
-                Some(self.spill_dir.clone()),
-                self.spill_compress,
-                record.schema().clone(),
-                self.allocation_resources.clone(),
+            state.records = Some(pooled(
+                self.kernel_pool.as_ref(),
+                SortBuffer::new(
+                    self.config.sort_fields.clone(),
+                    threshold,
+                    Some(self.spill_dir.clone()),
+                    self.spill_compress,
+                    record.schema().clone(),
+                    self.allocation_resources.clone(),
+                ),
             ));
         }
         state.previous = Some(record.clone());
@@ -561,12 +586,15 @@ impl SourceFileOrderBarrier {
             let threshold = usize::try_from(self.memory.spill_threshold_bytes())
                 .unwrap_or(usize::MAX)
                 .max(1);
-            state.errors = Some(SortBuffer::new_payload_ordered(
-                threshold,
-                Some(self.spill_dir.clone()),
-                self.spill_compress,
-                record.schema().clone(),
-                self.allocation_resources.clone(),
+            state.errors = Some(pooled(
+                self.kernel_pool.as_ref(),
+                SortBuffer::new_payload_ordered(
+                    threshold,
+                    Some(self.spill_dir.clone()),
+                    self.spill_compress,
+                    record.schema().clone(),
+                    self.allocation_resources.clone(),
+                ),
             ));
         }
         state.attempted_count = state.attempted_count.saturating_add(1);
@@ -1723,6 +1751,11 @@ mod tests {
                     SourceStreamEvent::Population(p) => {
                         assert_eq!((p.attempted, p.rejected), (12, 3));
                         result.push(format!("population:{}:{}", p.attempted, p.rejected));
+                    }
+                    SourceStreamEvent::Ended
+                    | SourceStreamEvent::Interrupted
+                    | SourceStreamEvent::Failed(_) => {
+                        panic!("the barrier sends no terminal event")
                     }
                 }
             }

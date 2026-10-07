@@ -153,7 +153,7 @@ pub enum PipelineError {
     },
     /// Wraps an error that surfaced inside a composition body's
     /// recursive walk so the rendered diagnostic carries the
-    /// composition's name. Lets users see "in composition '<name>'"
+    /// composition's name. Lets users see `in composition "<name>"`
     /// in failure messages instead of an opaque inner error.
     ///
     /// # Two-path model for composition-involved errors
@@ -174,6 +174,12 @@ pub enum PipelineError {
     /// duplicate the same identifier in two places. Consumers that
     /// want to catch every composition-involved failure must match
     /// both this variant and the bare inner-variant form.
+    ///
+    /// `inner` can itself be a [`PipelineError::Multiple`] or another
+    /// `CompositionBodyError` (a composition used inside a body), so code
+    /// looking for one kind of failure, such as an E310
+    /// [`PipelineError::MemoryBudgetExceeded`], walks `inner` recursively
+    /// and through `Multiple` rather than matching one level.
     ///
     /// The wrapper is purely diagnostic attribution, not a separate
     /// enforcement path: body operators share the same `MemoryArbitrator`
@@ -197,35 +203,42 @@ pub enum PipelineError {
         max_group_buffer: u64,
         held_entries: u64,
     },
-    /// E310 — a memory-budget surface (arena state, `node_buffers`,
-    /// or accumulated disk-spill bytes) exceeded the configured RSS
-    /// hard limit. `node` names the producing operator; `source`
-    /// distinguishes which surface tripped. `detail` carries any
-    /// site-specific context the rendered message previously inlined
-    /// (e.g. partition id, distinct-count estimate, disk-spill quota
-    /// figures). Always aborts the run.
+    /// E310 — a request for memory did not fit `memory.limit` after the
+    /// engine tried to make room. `report` is everything the diagnostic
+    /// says, built from one reading of the run's memory account at the
+    /// refusal: the node that asked and what for (when known), the bytes it
+    /// asked for, the charged total against the limit, the largest holders
+    /// and their state, what the reclaim round tried, and the smallest limit
+    /// that would have granted the request. It names nodes, surfaces and byte
+    /// counts only, never a record value; a group too large to hold whole is
+    /// identified by the Source and row number of its first row. Always
+    /// aborts the run.
     ///
     /// # Composition involvement
     ///
     /// When a composition is in play, this variant can reach the
     /// user in two shapes — see [`CompositionBodyError`] for the
-    /// full two-path model. In summary: budget exceedances at a
-    /// composition boundary (records flowing into a body input port
-    /// or back out of the body) surface as a **bare**
-    /// `MemoryBudgetExceeded` with `node` set to the call-site
-    /// composition name; exceedances inside the body surface
-    /// **wrapped** in `CompositionBodyError`, with `node` then
-    /// pointing at a body-internal operator. The budget itself is
-    /// shared across the whole run — body operators charge the same
-    /// `MemoryArbitrator` instance the parent pipeline uses.
+    /// full two-path model. In summary: a refusal at a composition
+    /// boundary (records flowing into a body input port or back out of the
+    /// body) surfaces as a **bare** `MemoryBudgetExceeded` whose requester is
+    /// the call-site composition name; a refusal inside the body surfaces
+    /// **wrapped** in `CompositionBodyError`, its requester then a
+    /// body-internal node. The limit itself is shared across the whole run —
+    /// body operators charge the same memory account the parent pipeline
+    /// uses.
+    ///
+    /// Code that matches only this variant catches the boundary shape and
+    /// misses the wrapped one; code that matches only
+    /// [`CompositionBodyError`] catches the wrapped shape and misses the
+    /// boundary one. To catch every E310 a run can return, match this variant
+    /// and also look inside [`CompositionBodyError`]'s `inner` and each member
+    /// of [`PipelineError::Multiple`], recursively: a refusal on a Source,
+    /// writer or worker thread converts to this variant inside either wrapper
+    /// and keeps the wrapper.
     ///
     /// [`CompositionBodyError`]: PipelineError::CompositionBodyError
     MemoryBudgetExceeded {
-        node: String,
-        used: u64,
-        limit: u64,
-        source: crate::runtime_error::BudgetCategory,
-        detail: Option<String>,
+        report: Box<crate::runtime_error::MemoryShortfallReport>,
     },
     /// E312 — the configured `memory.limit` is below the process's
     /// baseline resident memory (RSS), measured at startup before any
@@ -638,19 +651,7 @@ impl fmt::Display for PipelineError {
                  dead-lettered; to commit a group this size, set \
                  error_handling.max_group_buffer: {held_entries} or higher"
             ),
-            Self::MemoryBudgetExceeded {
-                node,
-                used,
-                limit,
-                source,
-                detail,
-            } => match detail {
-                Some(d) => write!(
-                    f,
-                    "E310 {node}: {source} exceeded budget ({used}/{limit}) [{d}]"
-                ),
-                None => write!(f, "E310 {node}: {source} exceeded budget ({used}/{limit})"),
-            },
+            Self::MemoryBudgetExceeded { report } => report.fmt(f),
             Self::UnsatisfiableMemoryBudget {
                 limit,
                 baseline_rss,

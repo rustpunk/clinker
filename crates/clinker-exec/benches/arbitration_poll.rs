@@ -59,14 +59,16 @@ fn build_arbitrator(n: usize) -> MemoryArbitrator {
         let priority = (i % 4) as i32 * 10;
         let consumer = Arc::new(FakeConsumer::new(priority));
         let handle = Arc::clone(&consumer.handle);
-        arbitrator.register_consumer(
-            consumer,
-            handle,
-            ConsumerLabel {
-                node: format!("node_{i}"),
-                surface: MemorySurface::GroupState,
-            },
-        );
+        arbitrator
+            .register_consumer(
+                consumer,
+                handle,
+                ConsumerLabel {
+                    node: format!("node_{i}"),
+                    surface: MemorySurface::GroupState,
+                },
+            )
+            .expect("a fresh handle registers");
     }
     arbitrator
 }

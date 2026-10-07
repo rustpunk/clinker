@@ -287,6 +287,9 @@ struct ExecutorAuthority {
 struct AdmissionAuthority {
     arbitrator: AdmissionLink,
     release: Arc<ReleaseAuthority>,
+    /// The release side of the walk requester's grants, kept while the
+    /// requester stays the same so each walk allocation reuses it.
+    walk_release: std::sync::Mutex<Option<Arc<AttributedRelease>>>,
     handle: Arc<ConsumerHandle>,
     shutdown: ShutdownToken,
     telemetry: Option<TelemetryProducer>,
@@ -371,7 +374,15 @@ impl AllocationAuthority for AttributedAdmission {
         layout: Layout,
     ) -> Result<AllocationLease, ResourceError> {
         self.admission
-            .admit(owner, layout, self.requester, self.release.clone())
+            .admit(owner, layout, self.requester, self.release.clone(), false)
+    }
+    fn try_reserve_if_free(
+        self: Arc<Self>,
+        owner: OwnerId,
+        layout: Layout,
+    ) -> Result<AllocationLease, ResourceError> {
+        self.admission
+            .admit(owner, layout, self.requester, self.release.clone(), true)
     }
     fn release(&self, owner: OwnerId, bytes: usize) {
         self.release.release(owner, bytes);
@@ -415,14 +426,30 @@ impl AdmissionLink {
             .upgrade()
             .ok_or_else(|| ResourceError::new(ResourceErrorKind::Authority, 0, 0))
     }
-    fn admit_writer_memory(&self, bytes: usize, requester: Requester) -> Result<(), ResourceError> {
-        self.live()?.admit_writer_memory(bytes, requester)
+    fn admit_writer_memory(
+        &self,
+        bytes: usize,
+        requester: Requester,
+        if_free: bool,
+    ) -> Result<(), ResourceError> {
+        let run = self.live()?;
+        if if_free {
+            run.admit_writer_memory_if_free(bytes, requester)
+        } else {
+            run.admit_writer_memory(bytes, requester)
+        }
     }
     fn admit_writer_disk(&self, bytes: u64) -> Result<(), ResourceError> {
         self.live()?.admit_writer_disk(bytes)
     }
     fn admit_writer_descriptor(&self, limit: usize) -> Result<(), ResourceError> {
         self.live()?.admit_writer_descriptor(limit)
+    }
+    /// The consumer a governed allocation by the calling thread is charged
+    /// to: the run's walk requester on its walk, none elsewhere or once the
+    /// run is gone.
+    fn walk_requester(&self) -> Option<ConsumerId> {
+        self.0.upgrade().and_then(|arb| arb.walk_requester())
     }
 }
 
@@ -437,6 +464,10 @@ impl Drop for ExecutorAuthority {
         self.arbitrator.retry_writer_cleanup();
     }
 }
+/// The run's writer resources: output staging, a fixed tail per writer
+/// that is a working floor, not reclaimable state. No reclaim pass or
+/// victim policy elects it (`reclaimable_bytes` is 0): the walk cannot spill
+/// a writer's staging, and no pass may wait for a writer to act.
 struct WriterResourceConsumer {
     handle: Arc<ConsumerHandle>,
 }
@@ -444,6 +475,10 @@ struct WriterResourceConsumer {
 impl MemoryConsumer for WriterResourceConsumer {
     fn current_usage(&self) -> u64 {
         self.handle.bytes()
+    }
+
+    fn reclaimable_bytes(&self) -> u64 {
+        0
     }
 
     fn peak_charged_bytes(&self) -> Option<u64> {
@@ -460,6 +495,37 @@ impl MemoryConsumer for WriterResourceConsumer {
         false
     }
 }
+/// Register the writer's output staging consumer over `handle`, then make
+/// `handle` the run's writer handle, bound to that consumer. The handle is
+/// attached only once its consumer is registered, and a refused attachment
+/// unregisters the consumer, so a failure at either step leaves neither
+/// behind.
+fn establish_writer_consumer(
+    arbitrator: &MemoryArbitrator,
+    handle: &Arc<ConsumerHandle>,
+) -> Result<ConsumerId, ResourceError> {
+    // A refused registration is a second binding of the writer's handle,
+    // the same authority conflict a second attachment reports.
+    let id = arbitrator
+        .register_consumer(
+            Arc::new(WriterResourceConsumer {
+                handle: handle.clone(),
+            }),
+            handle.clone(),
+            clinker_plan::runtime_error::ConsumerLabel {
+                node: "output".to_string(),
+                surface: clinker_plan::runtime_error::MemorySurface::OutputStaging,
+            },
+        )
+        .map_err(|_| ResourceError::new(ResourceErrorKind::Authority, 1, 0))?;
+    if let Err(error) = arbitrator.attach_writer_handle(handle.clone()) {
+        arbitrator.unregister_consumer(id);
+        return Err(error);
+    }
+    arbitrator.bind_writer_consumer(id)?;
+    Ok(id)
+}
+
 impl ExecutorResources {
     /// Establish one run consumer. The control blocks are fixed run-startup
     /// allowances; storage inventory/path allocations are admitted separately.
@@ -492,18 +558,7 @@ impl ExecutorResources {
         telemetry: Option<TelemetryProducer>,
     ) -> Result<Self, ResourceError> {
         let handle = ConsumerHandle::new();
-        arbitrator.attach_writer_handle(handle.clone())?;
-        let id = arbitrator.register_consumer(
-            Arc::new(WriterResourceConsumer {
-                handle: handle.clone(),
-            }),
-            handle.clone(),
-            clinker_plan::runtime_error::ConsumerLabel {
-                node: "output".to_string(),
-                surface: clinker_plan::runtime_error::MemorySurface::OutputStaging,
-            },
-        );
-        arbitrator.bind_writer_consumer(id)?;
+        let id = establish_writer_consumer(&arbitrator, &handle)?;
         let release = Arc::new(ReleaseAuthority {
             state: arbitrator.writer_reservation_state(),
             arbitrator: Arc::downgrade(&arbitrator),
@@ -512,6 +567,7 @@ impl ExecutorResources {
         let admission = Arc::new(AdmissionAuthority {
             arbitrator: AdmissionLink(Arc::downgrade(&arbitrator)),
             release,
+            walk_release: std::sync::Mutex::new(None),
             handle,
             shutdown,
             telemetry,
@@ -576,36 +632,96 @@ impl ExecutorResources {
 }
 impl AdmissionAuthority {
     /// Admit `layout` for `requester` and issue a lease that releases through
-    /// `release`.
+    /// `release`. With `if_free`, the bytes are admitted only if they fit
+    /// now, with no reclaim.
     fn admit(
         &self,
         owner: OwnerId,
         layout: Layout,
         requester: Requester,
         release: Arc<dyn AllocationAuthority>,
+        if_free: bool,
     ) -> Result<AllocationLease, ResourceError> {
         let mut signal = ResourceSignal::new(self.telemetry.clone(), ResourceWork::Admission);
         let result = self
             .check_cancelled()
             .and_then(|()| {
                 self.arbitrator
-                    .admit_writer_memory(layout.size(), requester)
+                    .admit_writer_memory(layout.size(), requester, if_free)
             })
             .and_then(|()| AllocationLease::admitted(release, owner, layout.size()));
         signal.finish(result.as_ref().map(|_| ()).map_err(|error| *error));
         result
+    }
+
+    /// Admit `layout` in the name this thread's allocations are charged to:
+    /// the walk requester on the run's walk, no consumer elsewhere.
+    fn admit_on_this_thread(
+        &self,
+        owner: OwnerId,
+        layout: Layout,
+        if_free: bool,
+    ) -> Result<AllocationLease, ResourceError> {
+        match self.arbitrator.walk_requester() {
+            Some(consumer) => {
+                let release = self.walk_release(consumer);
+                self.admit(
+                    owner,
+                    layout,
+                    Requester::for_consumer(consumer),
+                    release,
+                    if_free,
+                )
+            }
+            None => self.admit(
+                owner,
+                layout,
+                Requester::governed(),
+                self.release.clone(),
+                if_free,
+            ),
+        }
+    }
+
+    /// The release authority for grants made in `consumer`'s name, reused
+    /// while the walk requester stays `consumer`.
+    fn walk_release(&self, consumer: ConsumerId) -> Arc<AttributedRelease> {
+        let mut cached = self.walk_release.lock().unwrap_or_else(|e| e.into_inner());
+        match cached.as_ref() {
+            Some(release) if release.attribution == Some(consumer) => Arc::clone(release),
+            _ => {
+                let release = Arc::new(AttributedRelease {
+                    state: self.release.state.clone(),
+                    attribution: Some(consumer),
+                });
+                *cached = Some(Arc::clone(&release));
+                release
+            }
+        }
     }
 }
 impl AllocationAuthority for AdmissionAuthority {
     fn identity(&self) -> usize {
         self.release.identity()
     }
+    /// On the run's walk, an allocation made while a walk requester is
+    /// named is a grant in that consumer's name, and its lease releases in
+    /// that name whatever the walk requester is when it drops. Anywhere
+    /// else it is charged to no consumer.
     fn try_reserve(
         self: Arc<Self>,
         owner: OwnerId,
         layout: Layout,
     ) -> Result<AllocationLease, ResourceError> {
-        self.admit(owner, layout, Requester::governed(), self.release.clone())
+        self.admit_on_this_thread(owner, layout, false)
+    }
+    /// Admitted only if it fits now: never a reclaim, on the walk or off it.
+    fn try_reserve_if_free(
+        self: Arc<Self>,
+        owner: OwnerId,
+        layout: Layout,
+    ) -> Result<AllocationLease, ResourceError> {
+        self.admit_on_this_thread(owner, layout, true)
     }
     fn release(&self, _: OwnerId, bytes: usize) {
         self.release.state.release_writer_memory(bytes, None);
@@ -641,6 +757,13 @@ impl AllocationAuthority for ExecutorAuthority {
         layout: Layout,
     ) -> Result<AllocationLease, ResourceError> {
         self.admission.clone().try_reserve(owner, layout)
+    }
+    fn try_reserve_if_free(
+        self: Arc<Self>,
+        owner: OwnerId,
+        layout: Layout,
+    ) -> Result<AllocationLease, ResourceError> {
+        self.admission.clone().try_reserve_if_free(owner, layout)
     }
     fn release(&self, owner: OwnerId, bytes: usize) {
         self.admission.release(owner, bytes);
@@ -1210,6 +1333,54 @@ mod tests {
     use super::*;
     use crate::pipeline::memory::NoOpPolicy;
 
+    /// A writer registration the ledger refuses leaves no writer handle
+    /// attached, so the run can still establish its writer consumer.
+    #[test]
+    fn a_refused_writer_registration_leaves_no_writer_handle_attached() {
+        let arb = Arc::new(MemoryArbitrator::with_policy(
+            1024 * 1024,
+            0.8,
+            0.7,
+            Box::new(NoOpPolicy),
+        ));
+        // A handle already bound to a consumer cannot be registered again.
+        let bound = ConsumerHandle::new();
+        let first = arb
+            .register_consumer(
+                Arc::new(WriterResourceConsumer {
+                    handle: bound.clone(),
+                }),
+                bound.clone(),
+                clinker_plan::runtime_error::ConsumerLabel {
+                    node: "output".to_string(),
+                    surface: clinker_plan::runtime_error::MemorySurface::OutputStaging,
+                },
+            )
+            .expect("a fresh handle registers");
+        let refusal = establish_writer_consumer(&arb, &bound)
+            .expect_err("a second binding of the handle is refused");
+        assert_eq!(
+            refusal.kind,
+            ResourceErrorKind::Authority,
+            "a second binding is the writer handle's authority conflict, not a capacity refusal"
+        );
+        assert_eq!(arb.consumer_count(), 1, "the refusal registered nothing");
+        arb.unregister_consumer(first);
+
+        let provider = ExecutorResources::new(
+            arb.clone(),
+            ShutdownToken::detached(),
+            None,
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        );
+        assert!(
+            provider.is_ok(),
+            "the refused registration left no writer handle attached: {:?}",
+            provider.err()
+        );
+    }
+
     #[test]
     fn allocation_lease_drops_live_control_before_final_release() {
         let arb = Arc::new(MemoryArbitrator::with_policy(
@@ -1498,5 +1669,123 @@ mod tests {
             assert_eq!(arb.writer_resource_usage().memory, baseline);
             assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
         }
+    }
+
+    /// A writer's output staging is a fixed tail no spill frees on demand,
+    /// and no pass may wait for the writer to act: the writer's consumer
+    /// reports nothing reclaimable, and a pass at a full ledger elects the
+    /// spillable slot beside it, never the writer, even when the slot alone
+    /// does not cover what the pass aims to free.
+    #[test]
+    fn writer_staging_is_never_elected() {
+        use crate::pipeline::memory::ledger::{PassKind, Requester};
+        use crate::pipeline::memory::walk::{VictimOutcome, WalkReclaim};
+        use crate::pipeline::memory::{ConsumerId, ConsumerSpillError, Priority};
+        use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface};
+
+        const KIB: u64 = 1024;
+        const MIB: u64 = 1024 * KIB;
+
+        /// A spillable slot whose every charged byte a spill frees.
+        struct Slot(Arc<ConsumerHandle>);
+        impl MemoryConsumer for Slot {
+            fn current_usage(&self) -> u64 {
+                self.0.bytes()
+            }
+            fn spill_priority(&self) -> i32 {
+                0
+            }
+            fn try_spill(&self, _: u64) -> Result<u64, ConsumerSpillError> {
+                Ok(0)
+            }
+            fn can_back_pressure(&self) -> bool {
+                false
+            }
+        }
+
+        /// Records every consumer the pass elects; spills only the slot.
+        struct Recorder {
+            elected: Vec<ConsumerId>,
+            slot: (ConsumerId, Arc<ConsumerHandle>),
+        }
+        impl WalkReclaim for Recorder {
+            fn spill_victim(
+                &mut self,
+                id: ConsumerId,
+                _: &MemoryArbitrator,
+            ) -> Result<VictimOutcome, clinker_plan::error::PipelineError> {
+                self.elected.push(id);
+                if id == self.slot.0 {
+                    self.slot.1.shrink(self.slot.1.bytes());
+                    Ok(VictimOutcome::Spilled)
+                } else {
+                    Ok(VictimOutcome::NotOwned)
+                }
+            }
+        }
+
+        let arbitrator =
+            MemoryArbitrator::with_policy(MIB + 64 * KIB, 0.8, 0.7, Box::new(Priority));
+        let writer_handle = ConsumerHandle::new();
+        let writer = Arc::new(WriterResourceConsumer {
+            handle: writer_handle.clone(),
+        });
+        arbitrator
+            .register_consumer(
+                writer.clone(),
+                writer_handle.clone(),
+                ConsumerLabel {
+                    node: "output".to_string(),
+                    surface: MemorySurface::OutputStaging,
+                },
+            )
+            .expect("a fresh handle registers");
+        writer_handle.set_bytes(64 * KIB);
+        let slot_handle = ConsumerHandle::new();
+        let slot = arbitrator
+            .register_node_consumer(
+                Arc::new(Slot(slot_handle.clone())),
+                slot_handle.clone(),
+                ConsumerLabel {
+                    node: "rows".to_string(),
+                    surface: MemorySurface::BufferedRows {
+                        from: "rows".to_string(),
+                        to: clinker_plan::runtime_error::NonEmptyReaders::one("output".to_string()),
+                    },
+                },
+            )
+            .expect("a fresh handle registers");
+        slot_handle.set_bytes(MIB);
+        assert_eq!(
+            arbitrator.charged_bytes(),
+            MIB + 64 * KIB,
+            "the ledger is full"
+        );
+
+        assert_eq!(writer.reclaimable_bytes(), 0);
+        assert_eq!(writer.current_usage(), 64 * KIB);
+        let mut recorder = Recorder {
+            elected: Vec::new(),
+            slot: (slot, slot_handle.clone()),
+        };
+        let outcome = arbitrator
+            .reclaim_pass(
+                MIB,
+                Requester::governed(),
+                &mut recorder,
+                PassKind::Ordinary,
+            )
+            .expect("the pass runs");
+        assert_eq!(
+            recorder.elected,
+            vec![slot],
+            "only the slot is elected, though the pass aims past its bytes"
+        );
+        assert_eq!(outcome.freed, MIB);
+        assert_eq!(
+            arbitrator.charged_bytes(),
+            64 * KIB,
+            "the staging tail stays charged"
+        );
     }
 }

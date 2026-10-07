@@ -11,17 +11,21 @@
 //!
 //! The resident tails and the index (one entry per key) are charged through
 //! the consumer handle the owner passes in, which the owner shares with its
-//! other charges. They leave memory only on the
+//! other charges. Every append is admitted first ([`ExtentLog::admit_charge`]),
+//! and that admission is its only charge: a checked growth of the handle,
+//! which on the run's walk first runs the walk's reclaim, electing every
+//! other victim before the owner. The tails leave memory only on the
 //! [`crate::pipeline::memory::MemoryArbitrator`]'s signals, never on a size
-//! of the log's own: when the owner's consumer is elected
-//! ([`ExtentLog::relieve`], which reads the handle's spill request), when
+//! of the log's own: when a reclaim pass elects the owner's consumer and the
+//! owner is free, which flushes them at once ([`ExtentLog::flush_all`]);
+//! when it was elected while busy or by a round without the walk
+//! ([`ExtentLog::relieve`], which reads the handle's spill request); when
 //! the soft threshold has tripped at a batch boundary or a decision (also
-//! [`ExtentLog::relieve`]), or when the next append would pass the hard
-//! limit ([`ExtentLog::admit_charge`]). Between the owner's polls the tails
-//! grow by at most the appends of one batch past the soft threshold; the
-//! hard limit is checked on every append. The only fixed size is the file's
-//! write buffer, [`EXTENT_LOG_WRITE_BUFFER_BYTES`], which is I/O buffering,
-//! not a spill decision, and is not charged, like the dead-letter writer's.
+//! [`ExtentLog::relieve`]); or when the owner's own admission still falls
+//! short after the reclaim, which flushes them and retries once
+//! ([`ExtentLog::admit_charge`]). The only fixed size is the file's write
+//! buffer, [`EXTENT_LOG_WRITE_BUFFER_BYTES`], which is I/O buffering, not a
+//! spill decision, and is not charged, like the dead-letter writer's.
 //!
 //! ## Disk
 //!
@@ -113,6 +117,9 @@ pub(crate) struct ExtentLog<K> {
     compress: CompressMode,
     handle: Arc<ConsumerHandle>,
     file: Option<ExtentFile>,
+    /// The append growth the owner's last admission charged, which the
+    /// append it preceded takes instead of charging again.
+    admitted: Option<u64>,
 }
 
 impl<K: Eq + Hash + Clone> ExtentLog<K> {
@@ -136,6 +143,7 @@ impl<K: Eq + Hash + Clone> ExtentLog<K> {
             compress,
             handle,
             file: None,
+            admitted: None,
         }
     }
 
@@ -182,18 +190,20 @@ impl<K: Eq + Hash + Clone> ExtentLog<K> {
         }
     }
 
-    /// Preflight appending a frame of `frame_len` bytes to `key`, plus
-    /// `extra` bytes the owner charges with it, against `budget`'s hard
-    /// limit, as a node-buffer reservation does. When the charge would not
-    /// fit, every tail is flushed first and the charge re-checked. Returns
-    /// the resident bytes a flush freed.
+    /// Admit appending a frame of `frame_len` bytes to `key`, plus `extra`
+    /// bytes the owner charges with it, by growing the handle by both: the
+    /// only charge the append makes. The growth runs the walk's reserve loop
+    /// first when the calling thread is the run's walk, so every other walk
+    /// victim is elected before the owner, the requester. Only when that
+    /// loop falls short are the owner's own tails flushed, and the growth
+    /// (restated for the flushed tail) retried once. Returns the bytes
+    /// charged; the next [`Self::append`] takes its part of them.
     ///
     /// # Errors
     ///
-    /// [`PipelineError::MemoryBudgetExceeded`] with
-    /// [`clinker_plan::BudgetCategory::Arena`], naming `node` and `what`,
-    /// when the charge does not fit even with every tail flushed; nothing is
-    /// appended. A flush's errors, as [`Self::flush_all`].
+    /// [`PipelineError::MemoryBudgetExceeded`] naming `node` and `surface`,
+    /// when the growth does not fit even with every tail flushed; nothing is
+    /// charged or appended. A flush's errors, as [`Self::flush_all`].
     pub(crate) fn admit_charge(
         &mut self,
         budget: &MemoryArbitrator,
@@ -201,65 +211,137 @@ impl<K: Eq + Hash + Clone> ExtentLog<K> {
         frame_len: usize,
         extra: u64,
         node: &str,
-        what: &str,
+        surface: clinker_plan::runtime_error::MemorySurface,
     ) -> Result<u64, PipelineError> {
-        let hard_limit = budget.hard_limit();
-        if hard_limit == 0 {
-            return Ok(0);
+        let mut append = self.append_growth(key, frame_len);
+        if self.handle.try_grow(append.saturating_add(extra)).is_err() {
+            self.flush_own_tails(budget, node)?;
+            append = self.append_growth(key, frame_len);
+            self.handle
+                .try_grow(append.saturating_add(extra))
+                .map_err(|shortfall| owner_refusal(shortfall, budget, node, surface))?;
         }
-        let growth = self.append_growth(key, frame_len).saturating_add(extra);
-        if budget.sum_consumer_usage().saturating_add(growth) <= hard_limit {
-            return Ok(0);
-        }
-        let freed = self.flush_all(budget, node)?;
-        let growth = self.append_growth(key, frame_len).saturating_add(extra);
-        let charged = budget.sum_consumer_usage();
-        let projected = charged.saturating_add(growth);
-        if projected > hard_limit {
-            return Err(PipelineError::MemoryBudgetExceeded {
-                node: node.to_string(),
-                used: projected,
-                limit: hard_limit,
-                source: clinker_plan::BudgetCategory::Arena,
-                detail: Some(format!(
-                    "{what} projected {projected} bytes from charged pressure {charged} plus \
-                     {growth} bytes for one more held row, with every held row already on disk"
-                )),
-            });
-        }
-        Ok(freed)
+        self.admitted = Some(append);
+        Ok(append.saturating_add(extra))
     }
 
-    /// Append `frame` to `key`'s resident tail, creating its chain on its
-    /// first frame, and charge the growth. Returns the bytes charged. Never
-    /// flushes; the owner preflights with [`Self::admit_charge`] and polls
-    /// [`Self::relieve`].
+    /// Grow the handle by `bytes` of the owner's other state, as
+    /// [`Self::admit_charge`] grows it for an append: the walk's reserve
+    /// loop first, then, only if that falls short, every tail flushed and
+    /// one retry.
     ///
     /// # Errors
     ///
-    /// [`PipelineError::Internal`] for a frame longer than `u32::MAX` bytes
-    /// or a tail holding `u32::MAX` frames.
+    /// As [`Self::admit_charge`].
+    pub(crate) fn admit_owner_charge(
+        &mut self,
+        budget: &MemoryArbitrator,
+        bytes: u64,
+        node: &str,
+        surface: clinker_plan::runtime_error::MemorySurface,
+    ) -> Result<(), PipelineError> {
+        if self.handle.try_grow(bytes).is_ok() {
+            return Ok(());
+        }
+        self.flush_own_tails(budget, node)?;
+        self.handle
+            .try_grow(bytes)
+            .map_err(|shortfall| owner_refusal(shortfall, budget, node, surface))
+    }
+
+    /// The requester's last step after the reclaim fell short: flush every
+    /// tail. A pass that met the owner busy raised its spill request; this
+    /// flush answers it, so it is cleared rather than answered again.
+    fn flush_own_tails(
+        &mut self,
+        budget: &MemoryArbitrator,
+        node: &str,
+    ) -> Result<(), PipelineError> {
+        self.flush_all(budget, node)?;
+        self.handle.take_spill_request();
+        Ok(())
+    }
+
+    /// Append `frame` to `key`'s resident tail, creating its chain on its
+    /// first frame. Returns the bytes the log grew by. Never flushes; the
+    /// owner admits with [`Self::admit_charge`] first and polls
+    /// [`Self::relieve`].
+    ///
+    /// The admission is the charge: the append takes the growth it admitted
+    /// and charges nothing again, except the difference should the tail
+    /// have grown otherwise than admitted, which only a debug build catches
+    /// as a bug. An append nothing admitted charges its own growth first.
+    ///
+    /// # Errors
+    ///
+    /// [`PipelineError::Internal`] for a frame longer than `u32::MAX` bytes,
+    /// a tail holding `u32::MAX` frames, or growth that fits neither its
+    /// admission nor the ledger; nothing is appended and the admission is
+    /// released.
     pub(crate) fn append(&mut self, key: &K, frame: &[u8]) -> Result<u64, PipelineError> {
-        let length = u32::try_from(frame.len()).map_err(|_| PipelineError::Internal {
-            op: "extent log",
-            node: String::new(),
-            detail: format!("a held frame of {} bytes exceeds u32::MAX", frame.len()),
-        })?;
-        let mut charged = 0;
+        let pending = self.admitted.take();
+        let Ok(length) = u32::try_from(frame.len()) else {
+            if let Some(admitted) = pending {
+                self.handle.shrink(admitted);
+            }
+            return Err(PipelineError::Internal {
+                op: "extent log",
+                node: String::new(),
+                detail: format!("a held frame of {} bytes exceeds u32::MAX", frame.len()),
+            });
+        };
+        let admitted = match pending {
+            Some(admitted) => admitted,
+            None => {
+                let growth = self.append_growth(key, frame.len());
+                self.handle
+                    .try_grow(growth)
+                    .map_err(|_| unadmitted_growth(growth))?;
+                growth
+            }
+        };
+        let grown = match self.push_frame(key, length, frame) {
+            Ok(grown) => grown,
+            Err(error) => {
+                self.handle.shrink(admitted);
+                return Err(error);
+            }
+        };
+        debug_assert_eq!(
+            grown, admitted,
+            "an append grows the log by exactly what it admitted"
+        );
+        if grown > admitted {
+            self.handle
+                .try_grow(grown - admitted)
+                .map_err(|_| unadmitted_growth(grown - admitted))?;
+        } else {
+            self.handle.shrink(admitted - grown);
+        }
+        Ok(grown)
+    }
+
+    /// Push `frame`, `length` bytes long, onto `key`'s tail, creating its
+    /// chain on its first frame, and return the bytes the log grew by: the
+    /// tail's new capacity and a new index entry. Charges nothing.
+    fn push_frame(&mut self, key: &K, length: u32, frame: &[u8]) -> Result<u64, PipelineError> {
+        let tail_frames = self
+            .chains
+            .get(key)
+            .map_or(0, |chain| chain.tail_frames)
+            .checked_add(1)
+            .ok_or_else(|| PipelineError::Internal {
+                op: "extent log",
+                node: String::new(),
+                detail: "a held tail reached u32::MAX frames".to_string(),
+            })?;
+        let mut grown = 0;
         if !self.chains.contains_key(key) {
             self.chains.insert(key.clone(), ExtentChain::new());
-            charged += Self::CHAIN_ENTRY_BYTES;
+            grown += Self::CHAIN_ENTRY_BYTES;
         }
         let chain = self.chains.get_mut(key).expect("chain inserted above");
-        chain.tail_frames =
-            chain
-                .tail_frames
-                .checked_add(1)
-                .ok_or_else(|| PipelineError::Internal {
-                    op: "extent log",
-                    node: String::new(),
-                    detail: "a held tail reached u32::MAX frames".to_string(),
-                })?;
+        chain.tail_frames = tail_frames;
         let before = chain.tail.capacity();
         let target = next_capacity(
             chain.tail.len(),
@@ -271,12 +353,10 @@ impl<K: Eq + Hash + Clone> ExtentLog<K> {
         }
         chain.tail.extend_from_slice(&length.to_le_bytes());
         chain.tail.extend_from_slice(frame);
-        let grown = (chain.tail.capacity() - before) as u64;
-        self.resident += grown;
+        let tail_grown = (chain.tail.capacity() - before) as u64;
+        self.resident += tail_grown;
         self.resident_gauge.store(self.resident, Ordering::Relaxed);
-        charged += grown;
-        self.handle.add_bytes(charged);
-        Ok(charged)
+        Ok(grown + tail_grown)
     }
 
     /// The flush policy: flush every tail when the arbitrator has elected
@@ -457,7 +537,38 @@ impl<K> Drop for ExtentLog<K> {
         // Release this log's charges from the owner's handle; the file goes
         // with its `TempPath`.
         let index = self.chains.len() as u64 * chain_entry_bytes::<K>();
-        self.handle.sub_bytes(self.resident.saturating_add(index));
+        let admitted = self.admitted.unwrap_or(0);
+        self.handle
+            .sub_bytes(self.resident.saturating_add(index).saturating_add(admitted));
+    }
+}
+
+/// The E310 for an owner's growth that did not fit even with every tail
+/// flushed: the refusal's own report, naming `node` and `surface` as the
+/// requester, whatever label the shared handle's consumer carries.
+fn owner_refusal(
+    shortfall: crate::pipeline::memory::ledger::Shortfall,
+    budget: &MemoryArbitrator,
+    node: &str,
+    surface: clinker_plan::runtime_error::MemorySurface,
+) -> PipelineError {
+    let mut report = shortfall.into_report(budget);
+    report.requester = Some(clinker_plan::runtime_error::ConsumerLabel {
+        node: node.to_string(),
+        surface,
+    });
+    PipelineError::MemoryBudgetExceeded { report }
+}
+
+/// A frame's growth that no admission covered and the ledger refused. Every
+/// owner admits before it appends, so reaching this is a bug in the owner.
+fn unadmitted_growth(bytes: u64) -> PipelineError {
+    PipelineError::Internal {
+        op: "extent log",
+        node: String::new(),
+        detail: format!(
+            "{bytes} bytes of a held frame's growth were never admitted and do not fit"
+        ),
     }
 }
 

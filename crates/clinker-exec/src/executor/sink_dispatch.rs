@@ -489,8 +489,12 @@ fn dispatch_sink_work(
         .ok_or_else(|| missing_sink_input_error(current_dag, node_idx, name))?;
     let producer = edge.source();
     let producer_port = edge.weight().producer_port.as_deref();
-    let input_key =
-        single_input_node_buffer_key(&ctx.node_buffers, node_idx, producer, producer_port);
+    let input_key = single_input_node_buffer_key(
+        ctx.walk_reclaim.borrow().slots().buffers(),
+        node_idx,
+        producer,
+        producer_port,
+    );
     let input = require_node_buffer_input(
         ctx,
         input_key,
@@ -1347,8 +1351,12 @@ fn drain_sink_input_event_iter(
         .ok_or_else(|| missing_sink_input_error(current_dag, node_idx, name))?;
     let producer = edge.source();
     let producer_port = edge.weight().producer_port.as_deref();
-    let input_key =
-        single_input_node_buffer_key(&ctx.node_buffers, node_idx, producer, producer_port);
+    let input_key = single_input_node_buffer_key(
+        ctx.walk_reclaim.borrow().slots().buffers(),
+        node_idx,
+        producer,
+        producer_port,
+    );
     let input = require_node_buffer_input(
         ctx,
         input_key,
@@ -1359,7 +1367,7 @@ fn drain_sink_input_event_iter(
     let (input, reservation) = if materializes {
         input.into_materialized_parts(&ctx.memory_budget, name)?
     } else {
-        input.into_parts()
+        input.into_parts()?
     };
     Ok(SinkInputEventIter {
         events: Box::new(input.drain()),
@@ -1878,27 +1886,31 @@ mod tests {
         ));
         let baseline_handle = crate::pipeline::memory::ConsumerHandle::new();
         baseline_handle.set_bytes(baseline_usage);
-        let baseline_id = budget.register_consumer(
-            Arc::new(FixedUsage(baseline_usage)),
-            baseline_handle,
-            clinker_plan::runtime_error::ConsumerLabel {
-                node: "baseline".to_string(),
-                surface: clinker_plan::runtime_error::MemorySurface::GroupState,
-            },
-        );
+        let baseline_id = budget
+            .register_consumer(
+                Arc::new(FixedUsage(baseline_usage)),
+                baseline_handle,
+                clinker_plan::runtime_error::ConsumerLabel {
+                    node: "baseline".to_string(),
+                    surface: clinker_plan::runtime_error::MemorySurface::GroupState,
+                },
+            )
+            .expect("a fresh handle registers");
 
         match reserve_node_buffer_materialization(clone_bytes, &budget, "ordinary_out") {
-            Err(PipelineError::MemoryBudgetExceeded {
-                node,
-                used,
-                limit,
-                source,
-                ..
-            }) => {
-                assert_eq!(node, "ordinary_out");
-                assert_eq!(used, hard_limit + 1);
-                assert_eq!(limit, hard_limit);
-                assert_eq!(source, clinker_plan::BudgetCategory::NodeBuffer);
+            Err(PipelineError::MemoryBudgetExceeded { report }) => {
+                assert_eq!(
+                    report.requester,
+                    Some(clinker_plan::runtime_error::ConsumerLabel {
+                        node: "ordinary_out".to_string(),
+                        surface: clinker_plan::runtime_error::MemorySurface::ScanMaterialization,
+                    })
+                );
+                assert_eq!(
+                    report.charged_bytes + report.requested_bytes,
+                    hard_limit + 1
+                );
+                assert_eq!(report.limit.bytes(), hard_limit);
             }
             Ok(_) => panic!("Output materialization must be rejected before allocation"),
             Err(other) => panic!("expected Output E310 NodeBuffer; got {other:?}"),

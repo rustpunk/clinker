@@ -123,6 +123,233 @@ nodes:
     assert!(!dir.path().join("configured.csv").exists());
 }
 
+/// Source -> Transform -> Sink, where the Transform is the one a full run
+/// fuses with its Source and streams into its Sink.
+const TRANSFORM_CHAIN: &str = r#"pipeline:
+  name: run_flag_contract_preview_transform
+nodes:
+  - type: source
+    name: input
+    config:
+      name: input
+      type: csv
+      path: input.csv
+      schema:
+        - { name: id, type: int }
+        - { name: amount, type: int }
+  - type: transform
+    name: doubled
+    input: input
+    config:
+      cxl: |
+        emit id = id
+        emit doubled = amount * 2
+  - type: sink
+    name: final
+    input: doubled
+    config:
+      name: final
+      type: csv
+      path: configured.csv
+"#;
+
+/// Write the Transform chain and `input` into a fresh directory.
+fn transform_chain_dir(input: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("temp dir");
+    fs::write(dir.path().join("input.csv"), input).expect("write source");
+    fs::write(dir.path().join("pipeline.yaml"), TRANSFORM_CHAIN).expect("write pipeline");
+    dir
+}
+
+fn describe(output: &Output) -> String {
+    format!(
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// The header and first `rows` data lines of `text`.
+fn leading_lines(text: &str, rows: usize) -> String {
+    text.split_inclusive('\n').take(rows + 1).collect()
+}
+
+/// A bounded preview of a Transform reading one Source and feeding one Sink
+/// writes the Transform's first rows, the same rows a full run writes first,
+/// whether the preview goes to a file or to stdout.
+#[test]
+fn a_preview_of_a_source_transform_sink_pipeline_prints_its_first_rows() {
+    let input = "id,amount\n1,10\n2,20\n3,30\n4,40\n5,50\n";
+    let expected = "id,amount,doubled\n1,10,20\n2,20,40\n3,30,60\n";
+
+    let dir = transform_chain_dir(input);
+    let output = run_in(
+        dir.path(),
+        &[
+            "run",
+            "pipeline.yaml",
+            "--dry-run",
+            "-n",
+            "3",
+            "--dry-run-output",
+            "preview.csv",
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "bounded preview failed:\n{}",
+        describe(&output)
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("preview.csv")).expect("preview bytes"),
+        expected
+    );
+    assert!(!dir.path().join("configured.csv").exists());
+
+    let to_stdout = run_in(
+        dir.path(),
+        &["run", "pipeline.yaml", "--dry-run", "-n", "3"],
+    );
+    assert_eq!(
+        to_stdout.status.code(),
+        Some(0),
+        "bounded preview to stdout failed:\n{}",
+        describe(&to_stdout)
+    );
+    assert_eq!(String::from_utf8_lossy(&to_stdout.stdout), expected);
+    assert!(!dir.path().join("configured.csv").exists());
+
+    let full_dir = transform_chain_dir(input);
+    let full = run_in(full_dir.path(), &["run", "pipeline.yaml"]);
+    assert_eq!(
+        full.status.code(),
+        Some(0),
+        "full run failed:\n{}",
+        describe(&full)
+    );
+    let written = fs::read_to_string(full_dir.path().join("configured.csv")).expect("full output");
+    assert_eq!(leading_lines(&written, 3), expected);
+}
+
+/// A preview long enough to cross several batches and many waits on the
+/// writer's bounded channel writes the same bytes on every run.
+#[test]
+fn a_transform_chain_preview_writes_the_same_bytes_every_run() {
+    const ROWS: usize = 5_000;
+    const LIMIT: usize = 4_000;
+    let mut input = String::from("id,amount\n");
+    for id in 1..=ROWS {
+        input.push_str(&format!("{id},{}\n", id % 97));
+    }
+    let mut expected = String::from("id,amount,doubled\n");
+    for id in 1..=LIMIT {
+        let amount = id % 97;
+        expected.push_str(&format!("{id},{amount},{}\n", amount * 2));
+    }
+
+    let dir = transform_chain_dir(&input);
+    let limit = LIMIT.to_string();
+    for run in 0..20 {
+        let output = run_in(
+            dir.path(),
+            &[
+                "run",
+                "pipeline.yaml",
+                "--dry-run",
+                "-n",
+                &limit,
+                "--dry-run-output",
+                "preview.csv",
+            ],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "preview run {run} failed:\n{}",
+            describe(&output)
+        );
+        let written = fs::read_to_string(dir.path().join("preview.csv")).expect("preview bytes");
+        assert!(
+            written == expected,
+            "preview run {run} wrote different bytes"
+        );
+    }
+    assert!(!dir.path().join("configured.csv").exists());
+}
+
+/// A preview's read limit is the end of the input it asked for, not a
+/// cancellation: the Aggregate finishes on the rows the limit admitted and the
+/// preview succeeds.
+#[test]
+fn a_preview_read_limit_ends_the_input_and_the_aggregate_finishes_on_it() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    fs::write(
+        dir.path().join("orders.csv"),
+        "grp,amount\na,1\na,2\nb,3\na,4\nc,6\nb,5\n",
+    )
+    .expect("write source");
+    fs::write(
+        dir.path().join("pipeline.yaml"),
+        r#"pipeline:
+  name: run_flag_contract_preview_aggregate
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: grp, type: string }
+        - { name: amount, type: int }
+  - type: aggregate
+    name: totals
+    input: orders
+    config:
+      group_by: [grp]
+      cxl: |
+        emit grp = grp
+        emit n = count(*)
+        emit total = sum(amount)
+  - type: sink
+    name: final
+    input: totals
+    config:
+      name: final
+      type: csv
+      path: configured.csv
+"#,
+    )
+    .expect("write pipeline");
+
+    let output = run_in(
+        dir.path(),
+        &[
+            "run",
+            "pipeline.yaml",
+            "--dry-run",
+            "-n",
+            "2",
+            "--dry-run-output",
+            "preview.csv",
+        ],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "bounded preview failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("preview.csv")).expect("preview bytes"),
+        "grp,n,total\na,2,3\n"
+    );
+    assert!(!dir.path().join("configured.csv").exists());
+}
+
 #[test]
 fn tracer_invalid_policy_values_and_adjacency_fail_before_config_access() {
     for args in [

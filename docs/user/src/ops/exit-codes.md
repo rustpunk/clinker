@@ -137,13 +137,17 @@ debt before retrying or executing another bounded purge.
 ### Exit code 130: Cancelled
 
 Exit 130 means the attempt stopped before publication and the current
-attempt's final paths are unchanged. Two things produce it:
+attempt's final paths are unchanged. These produce it:
 
 - A SIGINT or SIGTERM that won the cancellation gate before the first final
   rename.
 - Under `--machine ndjson-v1`, a **required** lifecycle record that could not
   be written. The run refuses to publish an outcome it cannot report, so a
   broken control pipe stops the attempt rather than promoting silently.
+- A bounded `--dry-run -n N` preview cancelled by SIGINT or SIGTERM. Its
+  preview output is incomplete. No step finishes on a source's input that the
+  cancellation cut short, but a step over a source read in full before the
+  signal can still finish and print preview rows.
 
 A **discardable** machine record — a periodic `progress` observation — is not
 in that set. Losing one is reported on stderr as `machine progress channel
@@ -151,6 +155,14 @@ failed` and the run continues to its real outcome; it never converts a
 completed run into a cancellation or discards computed output. A supervisor
 should therefore read 130 as "nothing was published", never as "an advisory
 record went missing".
+
+A failure Clinker had already reached when it stopped fails the run with that
+failure's own exit code, even when a shutdown was also requested, with one
+exception: a source read the cancellation itself cut off before the server
+answered is reported as cancelled, exit 130. A failure in input Clinker had not
+reached when the cancellation stopped the run does not change the outcome
+either: the run still exits 130, and the failure is logged as a warning naming
+the source. See [which failure a run reports](../pipelines/error-handling.md#fail_fast).
 
 Cancellation is also recorded as a cancellation everywhere else it is
 reported: the OpenLineage terminal is `ABORT` and the `--machine` terminal is

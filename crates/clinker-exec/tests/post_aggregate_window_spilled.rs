@@ -19,8 +19,8 @@ use std::collections::HashMap;
 
 /// Pipeline with many distinct group keys to exercise the hash
 /// aggregator's randomized emit order. The configured memory limit
-/// (1 GiB) sits above the test process's RSS so the arbitrator's
-/// `should_abort` gate doesn't fire on the test framework's own
+/// (1 GiB) sits above the test process's RSS so the hard-limit check
+/// (`MemoryArbitrator::check_hard_limit`) doesn't refuse on the test framework's own
 /// footprint; the assertion target is downstream window correctness,
 /// not the spill trigger.
 #[test]

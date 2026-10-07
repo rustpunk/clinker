@@ -610,6 +610,17 @@ impl OwnedValues {
                 .map(crate::Value::legacy_heap_size)
                 .sum::<usize>()
     }
+    /// Heap bytes a clone allocates or alone may keep alive uncharged in the
+    /// run whose `resources` are given: a fresh ungoverned backing of exactly
+    /// the values' length, whatever this backing's capacity or governance,
+    /// plus each value by [`crate::Value::clone_allocation_bytes`].
+    pub fn clone_allocation_bytes(&self, resources: &AllocationResources) -> usize {
+        self.len() * std::mem::size_of::<crate::Value>()
+            + self
+                .iter()
+                .map(|value| value.clone_allocation_bytes(resources))
+                .sum::<usize>()
+    }
 }
 impl Deref for OwnedValues {
     type Target = [crate::Value];
@@ -737,6 +748,11 @@ impl OwnedKey {
             KeyStorage::Legacy(k) => k.len(),
             KeyStorage::Governed(_) => 0,
         }
+    }
+    /// Heap bytes a clone allocates: the key's text, which every clone
+    /// copies into a fresh ungoverned box, governed or not.
+    pub fn clone_allocation_bytes(&self) -> usize {
+        self.as_str().len()
     }
 }
 impl From<Box<str>> for OwnedKey {
@@ -1012,6 +1028,21 @@ impl OwnedMap {
                 .map(|(key, value)| key.legacy_heap_size() + value.legacy_heap_size())
                 .sum::<usize>()
     }
+    /// Heap bytes a clone allocates or alone may keep alive uncharged in the
+    /// run whose `resources` are given: a fresh ungoverned map, which keeps
+    /// this map's table capacity, plus each key and value by their own
+    /// `clone_allocation_bytes`.
+    pub fn clone_allocation_bytes(&self, resources: &AllocationResources) -> usize {
+        let map = self.as_map();
+        std::mem::size_of::<ValueMap>()
+            + crate::value::indexmap_backing_size::<OwnedKey>(map.capacity())
+            + map
+                .iter()
+                .map(|(key, value)| {
+                    key.clone_allocation_bytes() + value.clone_allocation_bytes(resources)
+                })
+                .sum::<usize>()
+    }
 }
 /// Restricted mutation of a known legacy map. The borrowed backing cannot escape.
 pub struct LegacyMapMut<'a> {
@@ -1094,18 +1125,41 @@ const _: () = {
 };
 
 /// Fixed-cardinality resource failure, without record values or copied strings.
+///
+/// Most kinds report that a resource could not be had. [`Self::Cancelled`]
+/// reports aborted work, and [`Self::Finalized`] and [`Self::Authority`]
+/// report a broken internal invariant; none of those three is a capacity
+/// refusal, whatever figures accompany it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResourceErrorKind {
+    /// A memory budget had fewer bytes free than the request asked for.
     Budget,
+    /// The allocator could not supply memory for an admitted layout.
     Allocation,
+    /// The requested size or alignment cannot form an allocation layout, or
+    /// its size overflows.
     Layout,
+    /// The spill-disk quota had fewer bytes left than the request asked for.
     DiskQuota,
+    /// The open-descriptor quota had no descriptor left.
     DescriptorQuota,
+    /// The work was cancelled. Callers recognise this as an aborted run
+    /// before they classify failures; it is never a resource shortage.
     Cancelled,
+    /// Writing to temporary storage failed.
     Storage,
+    /// Reading staged bytes back from temporary storage failed.
     Readback,
+    /// A destination refuses further output because an earlier delivery to
+    /// it failed.
     DeliveryPoisoned,
+    /// The resource was already finalized or closed, so nothing more can be
+    /// done through it: an internal invariant.
     Finalized,
+    /// An ownership or authority contract was broken, such as a lease moved
+    /// to another authority, a split larger than the lease, a merge across
+    /// owners, an exhausted identity counter, or a second binding of a handle
+    /// that admits one: an internal invariant.
     Authority,
 }
 
@@ -1114,7 +1168,16 @@ pub enum ResourceErrorKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResourceError {
     pub kind: ResourceErrorKind,
+    /// What the failing operation asked for, in that operation's unit: bytes
+    /// for memory, allocation, layout, spill-disk, storage and readback
+    /// failures and for a lease's transfer, split or merge; one for a
+    /// descriptor, an attachment, a binding or an identity. 0 when the
+    /// failure carries no figure, as for cancellation, a finalized or
+    /// poisoned resource, or an I/O error that reported none.
     pub requested: usize,
+    /// What the authority had toward the request, in the same unit as
+    /// [`Self::requested`]; 0 when it had nothing or the failure carries no
+    /// figure.
     pub available: usize,
     pub field: Option<usize>,
     pub offset: Option<u64>,
@@ -1166,6 +1229,19 @@ pub trait AllocationAuthority: Send + Sync {
         owner: OwnerId,
         layout: Layout,
     ) -> Result<AllocationLease, ResourceError>;
+    /// Admit `layout` only if it fits now, for an optional over-allocation
+    /// the caller can do without (a growing buffer's spare capacity). A
+    /// provider that would otherwise make room first (spill other state,
+    /// wait for a release) refuses at once instead, leaving no trace of the
+    /// attempt; the caller falls back to the size it needs through
+    /// [`Self::try_reserve`]. Unless overridden, the same as `try_reserve`.
+    fn try_reserve_if_free(
+        self: Arc<Self>,
+        owner: OwnerId,
+        layout: Layout,
+    ) -> Result<AllocationLease, ResourceError> {
+        self.try_reserve(owner, layout)
+    }
     fn release(&self, owner: OwnerId, bytes: usize);
     fn check_cancelled(&self) -> Result<(), ResourceError>;
 }
@@ -1298,6 +1374,15 @@ impl AllocationResources {
     ) -> Result<AllocationLease, ResourceError> {
         self.authority.clone().try_reserve(owner, layout)
     }
+    /// [`Self::reserve`] for an optional over-allocation: admitted only if
+    /// it fits now (see [`AllocationAuthority::try_reserve_if_free`]).
+    pub fn reserve_if_free(
+        &self,
+        owner: OwnerId,
+        layout: Layout,
+    ) -> Result<AllocationLease, ResourceError> {
+        self.authority.clone().try_reserve_if_free(owner, layout)
+    }
     /// Scope is inline, including identity and authority handle, with no heap
     /// allocation per writer. Its containing owner must account retained storage.
     pub fn scope(&self) -> Result<AllocationScope, ResourceError> {
@@ -1323,6 +1408,11 @@ impl AllocationScope {
     }
     pub fn reserve(&self, layout: Layout) -> Result<AllocationLease, ResourceError> {
         self.resources.reserve(self.owner, layout)
+    }
+    /// [`Self::reserve`] for an optional over-allocation the caller can do
+    /// without: admitted only if it fits now.
+    pub fn reserve_if_free(&self, layout: Layout) -> Result<AllocationLease, ResourceError> {
+        self.resources.reserve_if_free(self.owner, layout)
     }
     pub fn check_cancelled(&self) -> Result<(), ResourceError> {
         self.resources.authority.check_cancelled()

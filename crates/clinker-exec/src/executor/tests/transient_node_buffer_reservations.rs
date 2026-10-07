@@ -51,14 +51,16 @@ fn register_pinned(
 ) -> crate::pipeline::memory::ConsumerId {
     let handle = crate::pipeline::memory::ConsumerHandle::new();
     handle.set_bytes(bytes);
-    arbitrator.register_consumer(
-        Arc::new(PinnedUsage(bytes)),
-        handle,
-        clinker_plan::runtime_error::ConsumerLabel {
-            node: "pinned".to_string(),
-            surface: clinker_plan::runtime_error::MemorySurface::GroupState,
-        },
-    )
+    arbitrator
+        .register_consumer(
+            Arc::new(PinnedUsage(bytes)),
+            handle,
+            clinker_plan::runtime_error::ConsumerLabel {
+                node: "pinned".to_string(),
+                surface: clinker_plan::runtime_error::MemorySurface::GroupState,
+            },
+        )
+        .expect("a fresh handle registers")
 }
 
 fn quiet_arbitrator() -> Arc<crate::pipeline::memory::MemoryArbitrator> {
@@ -241,17 +243,19 @@ fn composition_materialization_rejects_before_allocation_and_restores_baseline()
     );
 
     match result.expect_err("the composition input materialization must cross the hard limit") {
-        PipelineError::MemoryBudgetExceeded {
-            node,
-            used,
-            limit,
-            source,
-            ..
-        } => {
-            assert_eq!(node, "passthrough_call");
-            assert_eq!(used, HARD_LIMIT + 1);
-            assert_eq!(limit, HARD_LIMIT);
-            assert_eq!(source, clinker_plan::BudgetCategory::NodeBuffer);
+        PipelineError::MemoryBudgetExceeded { report } => {
+            assert_eq!(
+                report.requester,
+                Some(clinker_plan::runtime_error::ConsumerLabel {
+                    node: "passthrough_call".to_string(),
+                    surface: clinker_plan::runtime_error::MemorySurface::ScanMaterialization,
+                })
+            );
+            assert_eq!(
+                report.charged_bytes + report.requested_bytes,
+                HARD_LIMIT + 1
+            );
+            assert_eq!(report.limit.bytes(), HARD_LIMIT);
         }
         other => panic!("expected bare composition-site E310 NodeBuffer; got {other:?}"),
     }
@@ -318,20 +322,25 @@ fn shared_transform_materialization_rejects_before_allocation_and_restores_basel
 
     match result.expect_err("the first shared Transform materialization must cross the hard limit")
     {
-        PipelineError::MemoryBudgetExceeded {
-            node,
-            used,
-            limit,
-            source,
-            ..
-        } => {
+        PipelineError::MemoryBudgetExceeded { report } => {
+            let requester = report
+                .requester
+                .as_ref()
+                .expect("the refusal names its node");
             assert!(
-                node == "m1" || node == "m2",
-                "unexpected materialization site {node}"
+                requester.node == "m1" || requester.node == "m2",
+                "unexpected materialization site {}",
+                requester.node
             );
-            assert_eq!(used, HARD_LIMIT + 1);
-            assert_eq!(limit, HARD_LIMIT);
-            assert_eq!(source, clinker_plan::BudgetCategory::NodeBuffer);
+            assert_eq!(
+                requester.surface,
+                clinker_plan::runtime_error::MemorySurface::ScanMaterialization
+            );
+            assert_eq!(
+                report.charged_bytes + report.requested_bytes,
+                HARD_LIMIT + 1
+            );
+            assert_eq!(report.limit.bytes(), HARD_LIMIT);
         }
         other => panic!("expected shared-Transform E310 NodeBuffer; got {other:?}"),
     }
@@ -384,20 +393,25 @@ fn shared_output_materialization_rejects_before_allocation_and_restores_baseline
     );
 
     match result.expect_err("the first shared Output materialization must cross the hard limit") {
-        PipelineError::MemoryBudgetExceeded {
-            node,
-            used,
-            limit,
-            source,
-            ..
-        } => {
+        PipelineError::MemoryBudgetExceeded { report } => {
+            let requester = report
+                .requester
+                .as_ref()
+                .expect("the refusal names its node");
             assert!(
-                node == "alpha" || node == "beta",
-                "unexpected materialization site {node}"
+                requester.node == "alpha" || requester.node == "beta",
+                "unexpected materialization site {}",
+                requester.node
             );
-            assert_eq!(used, HARD_LIMIT + 1);
-            assert_eq!(limit, HARD_LIMIT);
-            assert_eq!(source, clinker_plan::BudgetCategory::NodeBuffer);
+            assert_eq!(
+                requester.surface,
+                clinker_plan::runtime_error::MemorySurface::ScanMaterialization
+            );
+            assert_eq!(
+                report.charged_bytes + report.requested_bytes,
+                HARD_LIMIT + 1
+            );
+            assert_eq!(report.limit.bytes(), HARD_LIMIT);
         }
         other => panic!("expected shared-Output E310 NodeBuffer; got {other:?}"),
     }
@@ -641,15 +655,16 @@ fn composition_source_canonicalization_overlap_rejects_and_releases_transfer() {
         } => {
             assert_eq!(composition_name, "doubled_call");
             match *inner {
-                PipelineError::MemoryBudgetExceeded {
-                    used,
-                    limit,
-                    source,
-                    ..
-                } => {
-                    assert_eq!(used, HARD_LIMIT + 1);
-                    assert_eq!(limit, HARD_LIMIT);
-                    assert_eq!(source, clinker_plan::BudgetCategory::NodeBuffer);
+                PipelineError::MemoryBudgetExceeded { report } => {
+                    assert_eq!(
+                        report.charged_bytes + report.requested_bytes,
+                        HARD_LIMIT + 1
+                    );
+                    assert_eq!(report.limit.bytes(), HARD_LIMIT);
+                    assert_eq!(
+                        report.requester.as_ref().map(|label| &label.surface),
+                        Some(&clinker_plan::runtime_error::MemorySurface::ScanMaterialization)
+                    );
                 }
                 other => panic!("expected inner E310 NodeBuffer; got {other:?}"),
             }

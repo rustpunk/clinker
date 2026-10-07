@@ -8,19 +8,18 @@
 
 use std::collections::HashMap;
 
-use clinker_record::{Record, Value};
+use clinker_record::Record;
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
 use crate::executor::cull_dispatch::reads_predecessor_slot;
 use crate::executor::dispatch::{
     ExecutorContext, NodeBufferKey, admit_node_buffer, admit_node_buffer_with_readers,
-    advance_cursor, crosses_into_deferred_consumer, node_buffer_spill_allowed,
+    advance_cursor, crosses_into_deferred_consumer, node_buffer_spill_allowed, park_cross_region,
     require_node_buffer_input, source_file_arc_of, source_name_arc_of, stream_linear_producer_emit,
 };
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{CompiledRoute, DlqEntry, DlqFailureStamp};
-use clinker_plan::BudgetCategory;
 use clinker_plan::config::ErrorStrategy;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
@@ -118,7 +117,7 @@ where
         .map(String::as_str);
     let own_key = NodeBufferKey::from(node_idx);
     let (input_key, producer_name, producer_port): (NodeBufferKey, String, Option<String>) =
-        if ctx.node_buffers.contains_key(&own_key) {
+        if ctx.walk_reclaim.borrow().slots().contains_buffer(&own_key) {
             let (producer, port) = authored_input
                 .and_then(|input| input.split_once('.'))
                 .map_or(
@@ -296,13 +295,10 @@ where
     // `branch_buffers` holds exactly the one successor here, and a
     // streaming Route → terminal Output crosses no deferred
     // region, so the cross-region tee below is correctly skipped.
-    // Dropping the sender disconnects the writer's recv.
-    if let Some(sender) = ctx.take_streaming_sender(node_idx) {
+    // The writer closes its output only on the hop's End, which the walk
+    // sends once this arm returns `Ok`.
+    if let Some((sender, charge)) = ctx.take_streaming_hop(current_dag, node_idx, name)? {
         let batch_size = ctx.batch_size;
-        let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
-        let charge = ctx
-            .streaming_charge_handle(node_idx, name, spill_allowed)
-            .expect("streaming sender implies a registered charge consumer");
         let merged: Vec<(Record, crate::executor::stream_event::SourceRowId)> =
             branch_records.into_values().flatten().collect();
         stream_linear_producer_emit(&sender, batch_size, name, merged, input_puncts, &charge)?;
@@ -324,7 +320,6 @@ where
     // assignment selected. Internal-region edges and edges between two
     // non-deferred operators skip the tee — the `node_buffers` entry already
     // covers them.
-    let active_body = ctx.window_runtime.active_stack.last().copied();
     // Collect outgoing (branch, successor, edge) triples before the mutable
     // admissions below so the immutable graph borrow does not overlap them.
     let outgoing: Vec<(String, NodeIndex, petgraph::graph::EdgeIndex)> = current_dag
@@ -348,29 +343,7 @@ where
         let records: &[(Record, crate::executor::stream_event::SourceRowId)] =
             branch_records.get(&branch).map_or(&[], |v| v.as_slice());
         if crosses_into_deferred_consumer(current_dag, node_idx, succ_idx) {
-            let row_bytes_each: u64 = records
-                .first()
-                .map(|(rec, _)| {
-                    (std::mem::size_of::<Value>() * rec.schema().column_count()
-                        + std::mem::size_of::<(Record, crate::executor::stream_event::SourceRowId)>(
-                        )) as u64
-                })
-                .unwrap_or(0);
-            for (record, rn) in records {
-                if row_bytes_each > 0 && ctx.memory_budget.should_abort() {
-                    return Err(PipelineError::MemoryBudgetExceeded {
-                        node: name.to_string(),
-                        used: ctx.memory_budget.peak_rss().unwrap_or(0),
-                        limit: ctx.memory_budget.hard_limit(),
-                        source: BudgetCategory::Arena,
-                        detail: Some("Route cross-region tee admission".to_string()),
-                    });
-                }
-                ctx.region_input_buffers
-                    .entry((active_body, edge_id))
-                    .or_default()
-                    .push((record.clone(), *rn));
-            }
+            park_cross_region(ctx, current_dag, node_idx, edge_id, records)?;
             continue;
         }
         // Route broadcasts punctuations to every branch — each downstream

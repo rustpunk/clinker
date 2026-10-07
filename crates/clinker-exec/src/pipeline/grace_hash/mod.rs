@@ -50,8 +50,8 @@
 //!
 //! ## Submodules
 //!
-//! - [`build`] — partition assignment, the distinct-key sketch, and the
-//!   byte-bounded build-chunk iterator.
+//! - [`build`] — partition assignment, the distinct-key sketch, the
+//!   build-record byte estimate, and the byte-bounded build-chunk iterator.
 //! - [`probe`] — per-probe match emission shared by every join path.
 //! - [`spill`] — spilled-partition reload, recursive repartition, and
 //!   the block-nested-loop fallback.
@@ -60,7 +60,9 @@ mod build;
 mod probe;
 mod spill;
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use ahash::RandomState;
@@ -72,6 +74,7 @@ use cxl::typecheck::TypedProgram;
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 
 use crate::executor::combine::{CombineResolver, CombineResolverMapping};
+use crate::executor::node_buffer::TransientNodeBufferReservation;
 use crate::pipeline::combine::{
     BuildSeq, CombineHashTable, CombineKernelOutput, CombineOutputEvalFailure, KeyExtractor,
     hash_composite_key,
@@ -79,22 +82,55 @@ use crate::pipeline::combine::{
 use crate::pipeline::grace_spill::{
     GraceSpillError, GraceSpillWriter, SpillFilePath, grace_spill_error,
 };
-use crate::pipeline::memory::MemoryArbitrator;
 #[cfg(test)]
 use crate::pipeline::memory::NoOpPolicy;
+use crate::pipeline::memory::walk::{
+    OwnedSpillResult, WalkOwnedRegistration, WalkOwnedSpill, register_walk_owned,
+};
+use crate::pipeline::memory::{ConsumerHandle, ConsumerId, MemoryArbitrator};
 use crate::pipeline::spill::{SpillFile, SpillWriter};
-use clinker_plan::BudgetCategory;
 use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::combine::DecomposedPredicate;
+use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface};
 
 use build::{GraceHll, PartitionAssigner, estimated_build_entry_bytes};
-use probe::{EmitArgs, GraceEmitSink, ProbeMatches, ProbeOutcome, emit_for_probe};
+use probe::{EmitArgs, GraceEmitSink, InMemoryProbe, ProbeMatches, ProbeOutcome, emit_for_probe};
 use spill::{ReloadContext, SpilledPartition, process_spilled_partition};
 
-/// Period (matches emitted) between [`MemoryArbitrator::should_abort`] polls
+/// Period (matches emitted) between hard-limit checks
 /// during the probe loop. Same cadence as the inline hash probe.
 const MEMORY_CHECK_INTERVAL: usize = 10_000;
+
+/// What a test observes at a grace probe loop's first memory check.
+#[cfg(test)]
+type ProbeCheckObserver = Box<dyn FnOnce(&MemoryArbitrator)>;
+
+#[cfg(test)]
+thread_local! {
+    static PROBE_CHECK_OBSERVER: RefCell<Option<ProbeCheckObserver>> = const { RefCell::new(None) };
+}
+
+/// Run `body` with `observer` called once, with the run's arbitrator, at the
+/// first memory check of a grace probe loop this thread runs, so a test can
+/// see what the ledger holds while the probe runs.
+#[cfg(test)]
+pub(crate) fn with_probe_check_observer<R>(
+    observer: impl FnOnce(&MemoryArbitrator) + 'static,
+    body: impl FnOnce() -> R,
+) -> R {
+    let previous = PROBE_CHECK_OBSERVER.with_borrow_mut(|slot| slot.replace(Box::new(observer)));
+    let result = body();
+    PROBE_CHECK_OBSERVER.with_borrow_mut(|slot| *slot = previous);
+    result
+}
+
+#[cfg(test)]
+fn observe_probe_check(budget: &MemoryArbitrator) {
+    if let Some(observer) = PROBE_CHECK_OBSERVER.with_borrow_mut(Option::take) {
+        observer(budget);
+    }
+}
 
 /// Render a composite join key into a single representative [`Value`] for
 /// heavy-hitter reporting. A single-component key keeps its own value so a
@@ -164,16 +200,32 @@ enum PartitionState {
         hash_bits: u8,
         distinct_sketch: GraceHll,
     },
-    /// In-memory hash table built; ready for probe. `build_ids[i]` is the
-    /// row id and [`BuildSeq`] of the build record the table reports at
-    /// `ProbeCandidate.index == i`: the table keeps insertion order, and
-    /// both are built from the same pairs in the same order.
-    Ready {
-        hash_table: CombineHashTable,
-        build_ids: Vec<(RecordOrder, BuildSeq)>,
-    },
+    /// In-memory hash table built; ready for probe. Held by its own `Rc`,
+    /// so a probe's matches are emitted from it with no borrow of the
+    /// executor live.
+    Ready(Rc<ReadyPartition>),
     /// Fully processed; resources released.
     Done,
+}
+
+/// A partition built in memory. `build_ids[i]` is the row id and
+/// [`BuildSeq`] of the build record the table reports at
+/// `ProbeCandidate.index == i`: the table keeps insertion order, and both
+/// are built from the same pairs in the same order.
+pub(crate) struct ReadyPartition {
+    hash_table: CombineHashTable,
+    build_ids: Vec<(RecordOrder, BuildSeq)>,
+}
+
+impl ReadyPartition {
+    /// The candidates `probe_keys` finds in this partition, with the row id
+    /// and arrival position of every build row the table holds.
+    fn matches<'a>(&'a self, probe_keys: &'a [Value]) -> ProbeMatches<'a> {
+        ProbeMatches {
+            candidates: self.hash_table.probe(probe_keys),
+            build_ids: &self.build_ids,
+        }
+    }
 }
 
 impl PartitionState {
@@ -232,6 +284,10 @@ pub(crate) struct GraceHashExec<'a> {
     /// partition bytes mirror into the arbitrator's pull-mode
     /// `current_usage` surface.
     pub consumer_handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
+    /// The id the `GraceHashConsumer` sharing `consumer_handle` was
+    /// registered under ([`register_grace_consumer`]): the kernel registers
+    /// its partition table as walk-owned state under it.
+    pub consumer_id: ConsumerId,
     /// Error strategy governing output-stage eval failures. Under
     /// `FailFast` a residual / body eval error propagates immediately;
     /// under `Continue` the failing row is deferred to the dispatcher via
@@ -246,6 +302,16 @@ pub(crate) struct GraceHashExec<'a> {
     /// node, or the run's own reporting, sees measured figures that
     /// supersede the plan-time row-count guess.
     pub stats_sink: GraceStatsSink<'a>,
+    /// The charge the build input's rows carried into the join, `None` when
+    /// they arrived uncharged. The kernel owns it: the partitions charge
+    /// each row at its full figure as the build loop moves it in, and the
+    /// charge ends when that loop has freed the input vector.
+    pub build_input_charge: Option<TransientNodeBufferReservation>,
+    /// The charge the driver input's rows carried into the join, `None` when
+    /// they arrived uncharged. The kernel owns it and ends it when the probe
+    /// loop has emitted from, or written to disk, every driver row and freed
+    /// the input vector.
+    pub driver_input_charge: Option<TransientNodeBufferReservation>,
 }
 
 /// Where the grace-hash join records its build-side sketch results: the
@@ -269,6 +335,13 @@ pub(crate) struct GraceStatsSink<'a> {
 /// than each operator). Public surface is constructed and driven by
 /// [`execute_combine_grace_hash`]; the type itself is `pub(crate)` so
 /// unit tests in this module can assert on the transition lifecycle.
+///
+/// The kernel keeps it in a walk-owned cell ([`GracePartitions`]), so a
+/// reclaim pass another request starts on the walk spills its `Building`
+/// partitions between two of the kernel's operations on it. Only those
+/// can be spilled: a partition already on disk has nothing left to write,
+/// and from [`Self::finish_build`] on the probe holds every in-memory
+/// partition, so the consumer's reclaimable figure is 0 from then on.
 pub(crate) struct GraceHashExecutor {
     assigner: PartitionAssigner,
     partitions: Vec<PartitionState>,
@@ -285,6 +358,12 @@ pub(crate) struct GraceHashExecutor {
     /// `bytes_estimated`. On-disk partitions don't count against
     /// `handle.bytes` — Velox's "reclaimable ≠ held" point.
     consumer_handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
+    /// Bytes of the `Building` partitions' rows: what a spill of this table
+    /// frees now. Recorded on `consumer_handle` as the consumer's
+    /// reclaimable figure after every insert and every spill, and 0 from
+    /// [`Self::finish_build`] on, when the probe holds every in-memory
+    /// partition (and a reloaded partition is held by its own probe).
+    building_bytes: u64,
     /// Whether partition spill files are LZ4-compressed. Resolved by the
     /// dispatcher from the workspace `[storage.spill] compress` knob against
     /// this combine's output-schema width and the run's batch size, so the
@@ -346,8 +425,14 @@ impl GraceHashExecutor {
             hash_state: RandomState::new(),
             name: name.to_string(),
             consumer_handle,
+            building_bytes: 0,
             spill_compress,
         }
+    }
+
+    /// Record on the consumer's handle what a spill of this table frees now.
+    fn publish_reclaimable(&self) {
+        self.consumer_handle.set_reclaimable(self.building_bytes);
     }
 
     /// Path of the spill directory hosting per-partition files.
@@ -415,6 +500,8 @@ impl GraceHashExecutor {
                     // handle so the arbitrator's policy sees this
                     // partition's contribution at poll time.
                     self.consumer_handle.add_bytes(bytes as u64);
+                    self.building_bytes = self.building_bytes.saturating_add(bytes as u64);
+                    self.publish_reclaimable();
                 }
             }
             Some(hash_bits) => {
@@ -452,8 +539,8 @@ impl GraceHashExecutor {
     fn spill_largest_building(&mut self, budget: &MemoryArbitrator) -> Result<(), GraceSpillError> {
         // Iterate until RSS drops below soft limit OR no Building
         // partition is left to evict. The soft limit is checked through
-        // `should_spill` rather than `should_abort`: we want to catch
-        // overshoots before they breach the hard limit.
+        // `should_spill`, so the build spills before the hard-limit check
+        // (`MemoryArbitrator::check_hard_limit`) would refuse it.
         loop {
             // Scan once to find the largest Building partition.
             let mut victim: Option<(usize, usize)> = None;
@@ -523,8 +610,42 @@ impl GraceHashExecutor {
         // operator's live state without wrapping if estimate drift
         // ever exceeds the running total.
         self.consumer_handle.sub_bytes(bytes_estimated as u64);
+        self.building_bytes = self.building_bytes.saturating_sub(bytes_estimated as u64);
+        self.publish_reclaimable();
         charge_grace_spill(budget, &self.name, written)?;
         Ok(())
+    }
+
+    /// Spill every `Building` partition that holds rows, each through
+    /// [`Self::spill_partition`]: a reclaim pass's spill of this table.
+    /// Returns whether any wrote, and otherwise whether the table still
+    /// holds state (partitions on disk, built for the probe or empty) or
+    /// none (every partition done).
+    fn spill_every_building(
+        &mut self,
+        budget: &MemoryArbitrator,
+    ) -> Result<OwnedSpillResult, GraceSpillError> {
+        let mut wrote = false;
+        for idx in 0..self.partitions.len() {
+            if matches!(
+                &self.partitions[idx],
+                PartitionState::Building { records, .. } if !records.is_empty()
+            ) {
+                self.spill_partition(idx, budget)?;
+                wrote = true;
+            }
+        }
+        Ok(if wrote {
+            OwnedSpillResult::Wrote
+        } else if self
+            .partitions
+            .iter()
+            .any(|state| !matches!(state, PartitionState::Done))
+        {
+            OwnedSpillResult::NothingToWrite
+        } else {
+            OwnedSpillResult::NotHeld
+        })
     }
 
     /// Transition every Building partition → Ready by constructing
@@ -533,6 +654,10 @@ impl GraceHashExecutor {
     /// at this transition: in-memory partitions complete probing
     /// against the live `CombineHashTable` and never reach the BNL
     /// branch where the sketch would be consulted.
+    ///
+    /// From here on the probe holds every in-memory partition, so the
+    /// consumer's reclaimable figure is 0: a pass can spill nothing of this
+    /// table, though its partitions stay charged until they drop.
     pub(crate) fn finish_build(
         &mut self,
         extractor: &KeyExtractor,
@@ -540,6 +665,13 @@ impl GraceHashExecutor {
         budget: &MemoryArbitrator,
         combine_name: &str,
     ) -> Result<(), PipelineError> {
+        self.building_bytes = 0;
+        self.publish_reclaimable();
+        // Each partition's table build checks the hard limit in the grace
+        // consumer's name, so a pass it runs elects that consumer last. The
+        // partition's rows stay charged to that consumer while the table
+        // takes them, so the check counts only the table's index on top.
+        let requester = self.consumer_handle.requester();
         for i in 0..self.partitions.len() {
             let prev = std::mem::replace(&mut self.partitions[i], PartitionState::Done);
             let new_state = match prev {
@@ -553,34 +685,36 @@ impl GraceHashExecutor {
                         // Empty partition fast-path: still construct an
                         // empty hash table so probe lookups hit the
                         // Ready branch and emit zero matches uniformly.
-                        let table =
-                            CombineHashTable::build(records, extractor, ctx, budget, Some(0))
-                                .map_err(|e| PipelineError::MemoryBudgetExceeded {
-                                    node: combine_name.to_string(),
-                                    used: budget.peak_rss().unwrap_or(0),
-                                    limit: budget.hard_limit(),
-                                    source: BudgetCategory::Arena,
-                                    detail: Some(format!("grace hash build: {e}")),
-                                })?;
-                        PartitionState::Ready {
+                        let table = CombineHashTable::build_from_charged(
+                            records,
+                            extractor,
+                            ctx,
+                            budget,
+                            combine_name,
+                            requester,
+                            Some(0),
+                        )
+                        .map_err(|e| e.into_build_error(combine_name))?;
+                        PartitionState::Ready(Rc::new(ReadyPartition {
                             hash_table: table,
                             build_ids,
-                        }
+                        }))
                     } else {
                         let estimated = Some(records.len());
-                        let table =
-                            CombineHashTable::build(records, extractor, ctx, budget, estimated)
-                                .map_err(|e| PipelineError::MemoryBudgetExceeded {
-                                    node: combine_name.to_string(),
-                                    used: budget.peak_rss().unwrap_or(0),
-                                    limit: budget.hard_limit(),
-                                    source: BudgetCategory::Arena,
-                                    detail: Some(format!("grace hash build: {e}")),
-                                })?;
-                        PartitionState::Ready {
+                        let table = CombineHashTable::build_from_charged(
+                            records,
+                            extractor,
+                            ctx,
+                            budget,
+                            combine_name,
+                            requester,
+                            estimated,
+                        )
+                        .map_err(|e| e.into_build_error(combine_name))?;
+                        PartitionState::Ready(Rc::new(ReadyPartition {
                             hash_table: table,
                             build_ids,
-                        }
+                        }))
                     }
                 }
                 other => other,
@@ -590,26 +724,26 @@ impl GraceHashExecutor {
         Ok(())
     }
 
-    /// Probe one record. Returns matches collected from the partition's
-    /// hash table when `Ready`, or routes the record to the partition's
-    /// probe-side spill file when `OnDisk` and returns an empty Vec.
+    /// Probe one record. Returns the partition built in memory, which the
+    /// caller asks for the record's matches, when `Ready`, or routes the
+    /// record to the partition's probe-side spill file when `OnDisk`.
+    ///
+    /// The in-memory outcome holds the partition by its own `Rc`, so it
+    /// keeps no borrow of the executor.
     ///
     /// Caller must have invoked [`Self::finish_build`] before this.
-    pub(crate) fn probe_record<'a>(
-        &'a mut self,
+    pub(crate) fn probe_record<'k>(
+        &mut self,
         record: &Record,
         row_id: RecordOrder,
-        probe_keys: &'a [Value],
+        probe_keys: &'k [Value],
         hash: u64,
-    ) -> Result<ProbeOutcome<'a>, GraceSpillError> {
+    ) -> Result<ProbeOutcome<'k>, GraceSpillError> {
         let p = self.assigner.partition_for(hash) as usize;
         match &mut self.partitions[p] {
-            PartitionState::Ready {
-                hash_table,
-                build_ids,
-            } => Ok(ProbeOutcome::InMemory(ProbeMatches {
-                candidates: hash_table.probe(probe_keys),
-                build_ids,
+            PartitionState::Ready(partition) => Ok(ProbeOutcome::InMemory(InMemoryProbe {
+                partition: Rc::clone(partition),
+                probe_keys,
             })),
             PartitionState::OnDisk {
                 probe_writer,
@@ -670,8 +804,8 @@ impl GraceHashExecutor {
     /// Iterate spilled partitions, returning their reload payloads in
     /// partition order. Drains each as it yields. The HLL sketch
     /// transfers ownership from the partition state to the
-    /// `SpilledPartition` so the reload path can fold cardinality
-    /// estimates into the BNL branch's E310 diagnostic.
+    /// `SpilledPartition` so the reload path can put its cardinality
+    /// estimate on the BNL branch's E310 report.
     pub(crate) fn drain_spilled(&mut self) -> Vec<SpilledPartition> {
         let mut out = Vec::new();
         for (idx, state) in self.partitions.iter_mut().enumerate() {
@@ -708,11 +842,20 @@ impl GraceHashExecutor {
 /// function constructs the grace executor, partitions inputs, runs the
 /// probe phase, and reloads spilled partition pairs.
 ///
-/// Output preserves driver order across the in-memory probe phase and
-/// emits reloaded matches after the in-memory matches; downstream sort
-/// is the caller's responsibility (matches the IEJoin contract).
+/// Output order depends on which partitions spilled: matches against
+/// partitions still in memory are emitted in driver order during the probe,
+/// then each spilled partition's matches are appended as it is reloaded, so
+/// a driver whose partition spilled comes after drivers that follow it. A
+/// different memory limit can therefore change the order of the output (and
+/// of its dead letters), though never its rows. Unlike the IEJoin and
+/// sort-merge kernels, which sort their own output, this kernel does not yet
+/// restore driver order; #1228 tracks it.
+///
+/// Runs on the calling thread, so its budget checks and spills run there;
+/// only the per-record build-key extraction runs on `pool`.
 pub(crate) fn execute_combine_grace_hash(
     args: GraceHashExec<'_>,
+    pool: &Arc<rayon::ThreadPool>,
 ) -> Result<CombineKernelOutput, PipelineError> {
     let GraceHashExec {
         name,
@@ -733,8 +876,11 @@ pub(crate) fn execute_combine_grace_hash(
         spill_dir,
         spill_compress,
         consumer_handle,
+        consumer_id,
         strategy,
         stats_sink,
+        build_input_charge,
+        driver_input_charge,
     } = args;
 
     if decomposed.equalities.is_empty() {
@@ -792,13 +938,20 @@ pub(crate) fn execute_combine_grace_hash(
         .map(|(r, _)| r.schema().clone())
         .or_else(|| output_schema.cloned())
         .unwrap_or_else(|| SharedStorage::from_arc(Arc::new(Schema::new(Vec::new()))));
-    let mut executor = GraceHashExecutor::new(
-        partition_bits,
-        spill_dir,
-        consumer_handle,
-        spill_compress,
-        name,
-    );
+    // The partition table lives in a walk-owned cell registered under the
+    // grace consumer, so a reclaim pass another request starts can spill its
+    // building partitions; the registration drops with it on every exit.
+    let partitions = GracePartitions::register(
+        budget,
+        consumer_id,
+        GraceHashExecutor::new(
+            partition_bits,
+            spill_dir,
+            consumer_handle,
+            spill_compress,
+            name,
+        ),
+    )?;
 
     // ── Build phase ────────────────────────────────────────────────────
     //
@@ -812,24 +965,25 @@ pub(crate) fn execute_combine_grace_hash(
     // and spill timing are byte-identical to a sequential build. The
     // hash seed is cloned out of the executor first; `RandomState::clone`
     // preserves the seed, so every worker hashes identically.
-    let build_hash_state = executor.hash_state().clone();
+    let build_hash_state = partitions.hash_state();
     // Each build row's arrival position, minted here where the Combine
     // receives its build input, before partitioning moves rows apart.
-    let hashed_build: Vec<(Record, RecordOrder, BuildSeq, u64)> = build_records
-        .into_par_iter()
-        .enumerate()
-        .map(|(position, (record, row))| {
-            let keys =
-                build_extractor
-                    .extract(ctx, &record)
-                    .map_err(|e| PipelineError::Compilation {
+    let hashed_build: Vec<(Record, RecordOrder, BuildSeq, u64)> = pool.install(|| {
+        build_records
+            .into_par_iter()
+            .enumerate()
+            .map(|(position, (record, row))| {
+                let keys = build_extractor.extract(ctx, &record).map_err(|e| {
+                    PipelineError::Compilation {
                         transform_name: name.to_string(),
                         messages: vec![format!("grace hash build key eval error: {e}")],
-                    })?;
-            let hash = hash_composite_key(&keys, &build_hash_state);
-            Ok::<_, PipelineError>((record, row, BuildSeq(position as u64), hash))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+                    }
+                })?;
+                let hash = hash_composite_key(&keys, &build_hash_state);
+                Ok::<_, PipelineError>((record, row, BuildSeq(position as u64), hash))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })?;
 
     // Maintain three planner-grade sketches over the build-side join keys
     // in the single build pass, reusing the composite-key hashes already
@@ -873,10 +1027,14 @@ pub(crate) fn execute_combine_grace_hash(
                 .map(|keys| representative_key_value(&keys))
                 .unwrap_or(Value::Null)
         });
-        executor
+        partitions
             .add_build_record(record, row, seq, hash, budget)
             .map_err(|e| grace_spill_error(e, name, "build add failed"))?;
     }
+    // Every build row is now in a partition, charged there at its full
+    // figure or written to the partition's file, and the input vector is
+    // freed: the input's charge stands for nothing from here.
+    drop(build_input_charge);
 
     let crate::sketch::BuildKeySketchSummary {
         distinct,
@@ -900,7 +1058,7 @@ pub(crate) fn execute_combine_grace_hash(
             );
         }
     }
-    executor.finish_build(&build_extractor, ctx, budget, name)?;
+    partitions.finish_build(&build_extractor, ctx, budget, name)?;
 
     // ── Probe phase ───────────────────────────────────────────────────
     let mut output_records: Vec<(Record, RecordOrder)> = Vec::new();
@@ -925,6 +1083,7 @@ pub(crate) fn execute_combine_grace_hash(
         strategy,
     };
 
+    let probe_hash_state = partitions.hash_state();
     for (probe_record, rn) in driver_records {
         let row_ctx = ctx.with_row(rn.ordinal());
         let probe_resolver = CombineResolver::new(resolver_mapping, &probe_record, None);
@@ -935,19 +1094,19 @@ pub(crate) fn execute_combine_grace_hash(
                 transform_name: name.to_string(),
                 messages: vec![format!("grace hash probe key eval error: {e}")],
             })?;
-        let hash = hash_composite_key(&probe_keys_buf, executor.hash_state());
+        let hash = hash_composite_key(&probe_keys_buf, &probe_hash_state);
 
-        let outcome = executor
+        let outcome = partitions
             .probe_record(&probe_record, rn, &probe_keys_buf, hash)
             .map_err(|e| grace_spill_error(e, name, "probe failed"))?;
 
         match outcome {
-            ProbeOutcome::InMemory(matches) => {
+            ProbeOutcome::InMemory(probe) => {
                 emit_for_probe(
                     &emit_args,
                     &probe_record,
                     rn,
-                    matches,
+                    probe.matches(),
                     body_evaluator.as_mut(),
                     &row_ctx,
                     &mut GraceEmitSink {
@@ -969,19 +1128,25 @@ pub(crate) fn execute_combine_grace_hash(
         emitted_since_check += 1;
         if emitted_since_check >= MEMORY_CHECK_INTERVAL {
             emitted_since_check = 0;
-            if budget.should_abort() {
-                return Err(PipelineError::MemoryBudgetExceeded {
-                    node: name.to_string(),
-                    used: budget.peak_rss().unwrap_or(0),
-                    limit: budget.hard_limit(),
-                    source: BudgetCategory::Arena,
-                    detail: Some("grace hash probe RSS abort".to_string()),
-                });
-            }
+            #[cfg(test)]
+            observe_probe_check(budget);
+            budget
+                .check_hard_limit(
+                    name,
+                    clinker_plan::runtime_error::MemorySurface::JoinState,
+                    crate::pipeline::memory::ledger::Requester::for_consumer(consumer_id),
+                    0,
+                )
+                .map_err(|report| PipelineError::MemoryBudgetExceeded { report })?;
         }
     }
+    // Every driver row was probed against an in-memory partition and
+    // dropped, or written to its spilled partition's probe file, and the
+    // input vector is freed: the input's charge stands for nothing from
+    // here, through the reload and the output's admission.
+    drop(driver_input_charge);
 
-    executor
+    partitions
         .finalize_probe_spills(budget)
         .map_err(|e| grace_spill_error(e, name, "probe finalize failed"))?;
 
@@ -989,9 +1154,9 @@ pub(crate) fn execute_combine_grace_hash(
     // Process every spilled partition pair. A reloaded partition that
     // still exceeds soft_limit after its hash table is built triggers
     // recursive repartition via PartitionAssigner::double.
-    let spill_dir_path = executor.spill_dir_path().to_path_buf();
-    let hash_state = executor.hash_state().clone();
-    let spilled = executor.drain_spilled();
+    let spill_dir_path = partitions.spill_dir_path();
+    let hash_state = probe_hash_state;
+    let spilled = partitions.drain_spilled();
     let rc = ReloadContext {
         name,
         build_extractor: &build_extractor,
@@ -1020,12 +1185,186 @@ pub(crate) fn execute_combine_grace_hash(
 
     // Keep the executor alive until reload finishes — its TempDir owns
     // every spill file path threaded through the reload loop.
-    drop(executor);
+    drop(partitions);
 
     Ok(CombineKernelOutput {
         records: output_records,
         output_eval_failures,
     })
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// The partition table as walk-owned state
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Register node `name`'s grace-hash consumer on `budget`: the consumer the
+/// Combine's partition table charges through the returned handle, under the
+/// id [`execute_combine_grace_hash`] registers that table as walk-owned
+/// state. The caller unregisters it once the kernel has returned.
+pub(crate) fn register_grace_consumer(
+    budget: &MemoryArbitrator,
+    name: &str,
+) -> Result<(ConsumerId, Arc<ConsumerHandle>), PipelineError> {
+    let handle = ConsumerHandle::new();
+    let id = budget.register_node_consumer(
+        Arc::new(GraceHashConsumer::new(Arc::clone(&handle))),
+        Arc::clone(&handle),
+        ConsumerLabel {
+            node: name.to_string(),
+            surface: MemorySurface::JoinBuildSide,
+        },
+    )?;
+    Ok((id, handle))
+}
+
+/// A grace-hash join's partition table as walk-owned state: the executor
+/// that holds the partitions and charges them to consumer `consumer`'s
+/// handle.
+///
+/// A reclaim pass that another consumer's request starts spills its
+/// building partitions ([`WalkOwnedSpill`]) whenever the kernel is between
+/// two executor operations on it. The one operation that runs a memory check
+/// with the cell borrowed, the partition-table build, first sets the cell's
+/// reclaimable figure to 0, so no pass elects the cell while it is borrowed
+/// ([`GracePartitions`]).
+struct GracePartitionCell {
+    executor: GraceHashExecutor,
+    consumer: ConsumerId,
+}
+
+impl WalkOwnedSpill for GracePartitionCell {
+    /// A pass that elects the grace consumer spills every `Building`
+    /// partition that holds rows through the executor's own partition spill:
+    /// the same files, disk-quota charge and sketch handover. It wrote when
+    /// any partition spilled. A table whose partitions are all on disk,
+    /// built for the probe or empty wrote nothing; one whose partitions are
+    /// all done holds no state. Never reserves.
+    fn spill_owned(
+        &mut self,
+        id: ConsumerId,
+        arbitrator: &MemoryArbitrator,
+    ) -> Result<OwnedSpillResult, PipelineError> {
+        if id != self.consumer {
+            return Ok(OwnedSpillResult::NotHeld);
+        }
+        self.executor
+            .spill_every_building(arbitrator)
+            .map_err(|e| grace_spill_error(e, &self.executor.name, "reclaim spill failed"))
+    }
+}
+
+/// A grace-hash join's partition table in its walk-owned cell, registered in
+/// the walk reclaim set under the grace consumer for as long as this lives.
+///
+/// The cell is borrowed only inside one of the methods here, each one
+/// executor operation, never across the build-key extraction, the sketch
+/// observation, a probe's match emission, a spilled partition's reload or
+/// the probe loop's memory checks. The partition-table build
+/// ([`Self::finish_build`]) is the one method that runs memory checks with
+/// the cell borrowed: each partition's table build checks the hard limit,
+/// which can run a reclaim pass. It zeroes the reclaimable figure the grace
+/// consumer reports before the first of them, and a pass never elects a
+/// consumer that reports nothing reclaimable, so no pass reaches the cell
+/// while it is borrowed.
+pub(crate) struct GracePartitions {
+    cell: Rc<RefCell<GracePartitionCell>>,
+    /// Dropped with the cell, on every exit.
+    _registration: WalkOwnedRegistration,
+}
+
+impl GracePartitions {
+    /// Put `executor` in a walk-owned cell for consumer `consumer`, which
+    /// charges it through the executor's handle, and register the cell on
+    /// `budget`'s walk. On a thread with no walk frame (an executor a test
+    /// builds with no run) it registers nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`register_walk_owned`].
+    pub(crate) fn register(
+        budget: &MemoryArbitrator,
+        consumer: ConsumerId,
+        executor: GraceHashExecutor,
+    ) -> Result<Self, PipelineError> {
+        let handle = Arc::clone(&executor.consumer_handle);
+        let cell = Rc::new(RefCell::new(GracePartitionCell { executor, consumer }));
+        let registration = register_walk_owned(budget, consumer, &handle, &cell)?;
+        Ok(Self {
+            cell,
+            _registration: registration,
+        })
+    }
+
+    /// The hash state every partition is placed by.
+    pub(crate) fn hash_state(&self) -> RandomState {
+        self.cell.borrow().executor.hash_state().clone()
+    }
+
+    /// The spill directory the partitions' files are written to.
+    pub(crate) fn spill_dir_path(&self) -> PathBuf {
+        self.cell.borrow().executor.spill_dir_path().to_path_buf()
+    }
+
+    /// As [`GraceHashExecutor::add_build_record`].
+    pub(crate) fn add_build_record(
+        &self,
+        record: Record,
+        row: RecordOrder,
+        seq: BuildSeq,
+        hash: u64,
+        budget: &MemoryArbitrator,
+    ) -> Result<(), GraceSpillError> {
+        self.cell
+            .borrow_mut()
+            .executor
+            .add_build_record(record, row, seq, hash, budget)
+    }
+
+    /// As [`GraceHashExecutor::finish_build`].
+    pub(crate) fn finish_build(
+        &self,
+        extractor: &KeyExtractor,
+        ctx: &EvalContext<'_>,
+        budget: &MemoryArbitrator,
+        combine_name: &str,
+    ) -> Result<(), PipelineError> {
+        self.cell
+            .borrow_mut()
+            .executor
+            .finish_build(extractor, ctx, budget, combine_name)
+    }
+
+    /// As [`GraceHashExecutor::probe_record`]. The in-memory outcome holds
+    /// its partition by its own `Rc`, so no borrow of the cell is live
+    /// while the caller emits the matches.
+    pub(crate) fn probe_record<'k>(
+        &self,
+        record: &Record,
+        row_id: RecordOrder,
+        probe_keys: &'k [Value],
+        hash: u64,
+    ) -> Result<ProbeOutcome<'k>, GraceSpillError> {
+        self.cell
+            .borrow_mut()
+            .executor
+            .probe_record(record, row_id, probe_keys, hash)
+    }
+
+    /// As [`GraceHashExecutor::finalize_probe_spills`].
+    pub(crate) fn finalize_probe_spills(
+        &self,
+        budget: &MemoryArbitrator,
+    ) -> Result<(), GraceSpillError> {
+        self.cell
+            .borrow_mut()
+            .executor
+            .finalize_probe_spills(budget)
+    }
+
+    /// As [`GraceHashExecutor::drain_spilled`].
+    pub(crate) fn drain_spilled(&self) -> Vec<SpilledPartition> {
+        self.cell.borrow_mut().executor.drain_spilled()
+    }
 }
 
 /// `MemoryConsumer` wrapper for a `GraceHashExecutor`. Holds an
@@ -1036,6 +1375,15 @@ pub(crate) fn execute_combine_grace_hash(
 /// `try_spill` flips the handle's spill-request flag; the executor's
 /// `add_build_record` polls and elects the largest building partition
 /// to spill via `GraceSpillWriter`.
+///
+/// A reclaim pass on the walk spills the partition table directly while
+/// the build runs: the kernel registers the table as walk-owned state
+/// under this consumer, and a pass that elects it spills every building
+/// partition. `reclaimable_bytes` is the figure the executor records: the
+/// building partitions' bytes during the build, and 0 from the end of the
+/// build on, because the probe then holds every in-memory partition (and a
+/// reloaded partition is held by its own probe), so no pass can spill any
+/// of it.
 ///
 /// `spill_priority = 10`: grace-hash partition spill is cheaper than
 /// sort (each partition writes through `GraceSpillWriter` without
@@ -1057,6 +1405,12 @@ impl GraceHashConsumer {
 impl crate::pipeline::memory::MemoryConsumer for GraceHashConsumer {
     fn current_usage(&self) -> u64 {
         self.handle.bytes()
+    }
+
+    /// What spilling the building partitions frees now, as the executor
+    /// last recorded it: 0 once the probe holds the partitions.
+    fn reclaimable_bytes(&self) -> u64 {
+        self.handle.reclaimable()
     }
 
     fn peak_charged_bytes(&self) -> Option<u64> {

@@ -87,6 +87,11 @@ const MANIFEST: &[ManifestEntry] = &[
         table_row: "`node_buffers` slot (inter-stage buffer)",
     },
     ManifestEntry {
+        name: "ParkedEdgeConsumer",
+        class: SpillClass::Spillable,
+        table_row: "rows parked for a deferred (relaxed-key) consumer",
+    },
+    ManifestEntry {
         name: "GraceHashConsumer",
         class: SpillClass::Spillable,
         table_row: "grace-hash Combine",
@@ -96,16 +101,27 @@ const MANIFEST: &[ManifestEntry] = &[
         class: SpillClass::Spillable,
         table_row: "Reshape",
     },
+    // The range join's kernel registers this consumer. It spills only on its
+    // own thresholds: `reclaimable_bytes` is 0, so no reclaim pass or soft
+    // poll elects it, and an E310 lists it as `cannot spill` (maintainer
+    // decision 2026-10-05, until the join kernels move onto the input
+    // cursor).
     ManifestEntry {
         name: "SortConsumer",
         class: SpillClass::Spillable,
         table_row: "sort buffer / IEJoin build",
     },
+    // As `SortConsumer`: spills only on its own thresholds, never elected
+    // by a pass, listed as `cannot spill` (the same maintainer decision).
     ManifestEntry {
         name: "SortMergeConsumer",
         class: SpillClass::Spillable,
         table_row: "sort-merge Combine",
     },
+    // A relaxed-key Aggregate's retained table reports 0 reclaimable while
+    // it is relaxed, so no pass elects it and an E310 lists it as `cannot
+    // spill` (maintainer decision 2026-10-05, until retraction over spilled
+    // state, #1288); its other tables spill when a pass asks.
     ManifestEntry {
         name: "AggregateConsumer",
         class: SpillClass::Spillable,

@@ -408,6 +408,35 @@ impl FieldStr {
         }
     }
 
+    /// Heap bytes a clone of this value allocates, or keeps alive with no
+    /// charge in the run whose `resources` are given once the original is
+    /// gone.
+    ///
+    /// - Inline text: 0, the clone copies it inside the 24-byte value.
+    /// - Governed shared text that run admitted: 0. Its admission travels
+    ///   with the allocation to every alias until the final one is destroyed
+    ///   ([`Self::try_new`]), so the clone is already covered in that run's
+    ///   ledger.
+    /// - Governed shared text another authority admitted: its admitted size,
+    ///   as [`Self::unaccounted_heap_size`] reports it. That admission is no
+    ///   charge in this run, and the clone keeps the allocation alive.
+    /// - Ungoverned shared text: the byte length. The clone only bumps a
+    ///   reference count, but it can outlive the original whose holder
+    ///   carried the text's only charge. While both live this over-counts,
+    ///   which is preferred to a copy that becomes the text's uncharged
+    ///   holder.
+    /// - Ungoverned unique text: the byte length, which the clone copies.
+    /// - Governed unique text: the byte length. Its clone is a fresh
+    ///   ungoverned allocation that never copies the original's admission
+    ///   ([`Self::try_new_unique`]).
+    pub fn clone_allocation_bytes(&self, resources: &AllocationResources) -> usize {
+        match self.tag() {
+            TAG_GOVERNED_SHARED => self.unaccounted_heap_size(resources),
+            TAG_GOVERNED_UNIQUE => self.as_str().len(),
+            _ => self.heap_size(),
+        }
+    }
+
     /// Returns true when the value is stored in the header-free unique arm
     /// rather than the default inline-or-`Arc`-shared one. The arm is otherwise
     /// invisible through the `str` API, so this is a test-only observability

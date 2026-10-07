@@ -42,16 +42,18 @@ fn source_completion_observes_worker_teardown_and_late_peak() {
             bytes,
         };
         let handle = ConsumerHandle::new();
-        let consumer = memory.register_consumer(
-            Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+        let consumer = memory
+            .register_consumer(
+                Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                    handle.clone(),
+                )),
                 handle.clone(),
-            )),
-            handle.clone(),
-            clinker_plan::runtime_error::ConsumerLabel {
-                node: "source".to_string(),
-                surface: clinker_plan::runtime_error::MemorySurface::RowsRead,
-            },
-        );
+                clinker_plan::runtime_error::ConsumerLabel {
+                    node: "source".to_string(),
+                    surface: clinker_plan::runtime_error::MemorySurface::RowsRead,
+                },
+            )
+            .expect("a fresh handle registers");
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
         let worker_memory = memory.clone();
         let worker = std::thread::spawn(move || {
@@ -66,16 +68,23 @@ fn source_completion_observes_worker_teardown_and_late_peak() {
                 source_name: "source".to_string(),
                 total_count: 1,
                 interrupted: true,
+                abandoned: false,
                 watermark_observations: Vec::new(),
             })
         });
         let mut workers = Vec::new();
         if failed_worker {
-            workers.push(std::thread::spawn(|| {
-                Err(PipelineError::Io(std::io::Error::other("reader failure")))
-            }));
+            workers.push(ingest::SourceWorker::new(
+                "failing",
+                std::thread::spawn(|| {
+                    Err(crate::executor::source_stream::SourceReadFailure::new(
+                        "failing",
+                        PipelineError::Io(std::io::Error::other("reader failure")),
+                    ))
+                }),
+            ));
         }
-        workers.push(worker);
+        workers.push(ingest::SourceWorker::new("source", worker));
 
         assert_eq!(memory.cumulative_spill_bytes(), bytes);
         assert_eq!(memory.peak_consumer_usage(), 0);

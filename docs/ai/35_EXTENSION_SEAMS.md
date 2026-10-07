@@ -277,6 +277,39 @@ Use focused memory/spill tests and explain-output coverage before broad
 workspace tests. Follow the file-descriptor guidance in
 [the command guide](50_TESTING_AND_COMMANDS.md) for spill-heavy runs.
 
+### Streaming producers and consumers
+
+Every input a step reads ends explicitly; a channel closing is never the end of
+input. A new streaming producer or consumer follows these rules
+(`executor/stream_hop.rs`, `executor/dispatch.rs`):
+
+- A streaming consumer finishes (an Aggregate finalizes, a probe Combine
+  completes, a Sink closes its output) only on `HopMessage::End`, read through
+  `stream_hop::next_event`. A disconnect without `End` is an incomplete input:
+  the consumer finishes nothing, and a Sink records failed or interrupted,
+  never completed. Only the hop's driver sends `End`, after the producer's
+  dispatch returned `Ok`.
+- A producer whose edge is certified streaming takes its sender in every arm
+  that can run, fused or materialized, through
+  `ExecutorContext::take_streaming_hop`. A bounded `--dry-run -n` preview
+  clears producer fusion and runs the materialized arms, so a producer that
+  takes its sender only in the fused arm parks its rows in a node buffer
+  nobody reads, and the walk's end fails the run. A sender without its charge
+  handle is `PipelineError::Internal` naming the step, not a panic.
+- A producer delivers every row it emitted before it returns an error: flush
+  the pending batch, then return the error (log a failed flush with `node` and
+  `error`). A consumer then meets rows in data order and can fail first on an
+  earlier row.
+- A scoped join of a producer and its streaming consumer goes through
+  `stream_hop::settle_hop`, which ranks the consumer's own failure first and
+  logs the producer's later failure (unless it is the cancellation). Do not
+  combine the two results with `and`/`or`.
+- A new Source path reads its channel only through `consume_source_event`,
+  which stops at the reader's `Failed` before any step finishes on the rows
+  read before it, and reads `Ended` as the only end. A reader thread runs
+  through `run_source_reader`, so a panic becomes the Source's named failure
+  and its stream still ends with exactly one terminal event.
+
 ## Channel, Composition, And Edge Seams
 
 Channels and compositions expose declared boundaries rather than arbitrary

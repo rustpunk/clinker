@@ -548,18 +548,13 @@ impl<P: Serialize + DeserializeOwned + Ord> SortedRunMerger<P> {
         let limit = budget.budget.hard_limit();
         if limit != 0 && used > limit {
             let spill_bytes = merger.spill_bytes();
-            let readers = merger.reader_count();
             drop(merger);
             budget.release_spill_bytes(spill_bytes);
-            return Err(PipelineError::MemoryBudgetExceeded {
-                node: budget.node.to_string(),
+            return Err(budget.budget.refusal(
+                budget.node,
+                clinker_plan::runtime_error::MemorySurface::SortBuffer,
                 used,
-                limit,
-                source: clinker_plan::BudgetCategory::Arena,
-                detail: Some(format!(
-                    "range output merge frontier ({readers} readers, {spill_bytes} spill bytes) exceeds the local hard budget"
-                )),
-            });
+            ));
         }
         Ok(merger)
     }
@@ -963,19 +958,17 @@ mod tests {
                             "existing owner retains the successful merge's charge"
                         );
                     }
-                    Err(PipelineError::MemoryBudgetExceeded {
-                        node,
-                        used,
-                        limit: actual,
-                        source,
-                        detail,
-                    }) => {
+                    Err(PipelineError::MemoryBudgetExceeded { report }) => {
                         assert_eq!(boundary, 0);
-                        assert_eq!(node, "test");
-                        assert_eq!(used, physical);
-                        assert_eq!(actual, limit);
-                        assert_eq!(source, clinker_plan::BudgetCategory::Arena);
-                        assert!(detail.unwrap().contains("range output merge frontier"));
+                        assert_eq!(
+                            report.requester,
+                            Some(clinker_plan::runtime_error::ConsumerLabel {
+                                node: "test".to_string(),
+                                surface: clinker_plan::runtime_error::MemorySurface::SortBuffer,
+                            })
+                        );
+                        assert_eq!(report.requested_bytes, physical);
+                        assert_eq!(report.limit.bytes(), limit);
                         assert_eq!(owner.bytes(), 0);
                         assert_eq!(arb.cumulative_spill_bytes(), 777);
                     }

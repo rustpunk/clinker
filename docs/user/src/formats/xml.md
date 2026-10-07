@@ -35,8 +35,12 @@ adding an `encoding` option. Names, attributes, text and CDATA are never decoded
 with replacement characters.
 
 Validation applies to bytes the reader consumes. A pre-scan may find a late
-error before any body record is delivered; a streaming body can have already
-delivered earlier records. Each subsequent file establishes its own BOM and
+error before any body record is delivered. An error later in the body, or in a
+later file, fails the run the same way and publishes nothing: no step finishes
+on the records read before it, and rows an output had already written stay
+only in the failed run's retained attempt (see
+[failed runs](../pipelines/error-handling.md#fail_fast)). Fix or remove the
+invalid file and run again. Each subsequent file establishes its own BOM and
 declaration policy. Metadata adjacent to a selected record does not become an
 extra row, and repeated matching containers preserve body order and empty rows.
 

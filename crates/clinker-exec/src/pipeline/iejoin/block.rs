@@ -128,10 +128,10 @@
 //! derived caps. Each per-pair gate proves `phase_working_set + reservation ≤
 //! hard`; because every reserved buffer spills at its cap, the true phase-peak
 //! stays within `hard`, a provable bound rather than the earlier ~1.4×hard worst
-//! case. The per-pair EMIT loop keeps no global-pressure abort: it polls no
-//! `should_abort`, so a handle transiently summing the input footprint plus the
+//! case. The per-pair EMIT loop keeps no global-pressure abort: it makes no
+//! hard-limit check, so a handle transiently summing the input footprint plus the
 //! output sort's resident bytes is only ever an attribution reading, never an abort
-//! trigger. The deferred-miss dispatch does run one `should_abort` backstop
+//! trigger. The deferred-miss dispatch does run the run's one hard-limit backstop
 //! ([`poll_finalize_backstop`]) every
 //! [`MEMORY_CHECK_INTERVAL`](super::MEMORY_CHECK_INTERVAL) dispatched rows, but as
 //! defense-in-depth against a cross-consumer or host-RSS overrun surfacing during
@@ -151,13 +151,13 @@ use clinker_record::{Record, Schema};
 
 use cxl::eval::{EvalContext, ProgramEvaluator};
 
-use clinker_plan::BudgetCategory;
 use clinker_plan::config::ErrorStrategy;
 use clinker_plan::config::pipeline_node::{MatchMode, OnMiss, PropagateCkSpec};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::combine::RangeOp;
 
 use crate::executor::combine::CombineResolverMapping;
+use crate::executor::node_buffer::TransientNodeBufferReservation;
 use crate::pipeline::combine_verdict::{DriverVerdict, MissToken};
 use crate::pipeline::memory::{ConsumerHandle, MemoryArbitrator};
 use crate::pipeline::sort_buffer::{HeapBytes, SortBuffer, SortedOutput};
@@ -321,12 +321,12 @@ fn range_key_width(op2: Option<RangeOp>) -> usize {
 /// than of copy discipline repeated at each gate.
 fn abort_over_budget(
     consumer: &Arc<ConsumerHandle>,
+    budget: &MemoryArbitrator,
     name: &str,
     peak: u64,
-    hard: u64,
 ) -> PipelineError {
     consumer.set_bytes(0);
-    pre_output_budget_error(name, peak, hard)
+    pre_output_budget_error(budget, name, peak)
 }
 
 /// Mirror this block-pair's live working set onto the consumer handle, so the
@@ -664,6 +664,13 @@ pub(super) struct BlockBandExec<'a> {
     pub(super) spill_compress: bool,
     pub(super) strategy: ErrorStrategy,
     pub(super) options: BlockBandOptions,
+    /// The driver input's charge, ended once the driver drain has moved every
+    /// driver row into a charged buffer, onto disk, or out; `None` when the
+    /// rows arrived uncharged.
+    pub(super) driver_input_charge: Option<TransientNodeBufferReservation>,
+    /// The build input's charge, ended once the build drain has done the same
+    /// for every build row.
+    pub(super) build_input_charge: Option<TransientNodeBufferReservation>,
 }
 
 /// Execute a pure-range combine via the block-band path. Blocking on both
@@ -672,21 +679,28 @@ pub(super) struct BlockBandExec<'a> {
 /// payload-ordered, spillable sort buffer rather than an in-RAM vec. Returns a
 /// bounded [`BlockBandOutput`] — a sorted output handle the dispatcher drains
 /// incrementally — plus any deferred output-eval failures for the DLQ.
+///
+/// Runs on the calling thread, so its budget checks and spills run there;
+/// only the sort buffers' comparator sorts run on `pool`.
 pub(super) fn execute_block_band(
     exec: BlockBandExec<'_>,
+    pool: &Arc<rayon::ThreadPool>,
 ) -> Result<BlockBandOutput, PipelineError> {
     // The private kernel consumer has one byte writer; spill callbacks only
     // request work. Restore the pre-kernel contribution after failed work drops.
     let consumer = exec.consumer.clone();
     let baseline = consumer.bytes();
-    let result = execute_block_band_inner(exec);
+    let result = execute_block_band_inner(exec, pool);
     if result.is_err() {
         consumer.set_bytes(baseline);
     }
     result
 }
 
-fn execute_block_band_inner(exec: BlockBandExec<'_>) -> Result<BlockBandOutput, PipelineError> {
+fn execute_block_band_inner(
+    exec: BlockBandExec<'_>,
+    pool: &Arc<rayon::ThreadPool>,
+) -> Result<BlockBandOutput, PipelineError> {
     let BlockBandExec {
         allocation_resources,
         name,
@@ -712,6 +726,8 @@ fn execute_block_band_inner(exec: BlockBandExec<'_>) -> Result<BlockBandOutput, 
         spill_compress,
         strategy,
         options,
+        driver_input_charge,
+        build_input_charge,
     } = exec;
 
     let block_target = options
@@ -793,7 +809,14 @@ fn execute_block_band_inner(exec: BlockBandExec<'_>) -> Result<BlockBandOutput, 
     // build block is reloaded once per driver block (the inner loop), while a
     // driver block loads once, so keeping the build side in RAM saves the most
     // reloads for a fixed budget.
-    let build_blocks = drain_build_side(build_records, build_scans, &drain_ctx, &mut resident)?;
+    //
+    // Each drain consumes its side's input vector: every row ends in a buffer
+    // the drain charges, on disk, or dropped. The side's input charge stands
+    // for nothing once its drain returns, so it ends there rather than at the
+    // join's return.
+    let build_blocks =
+        drain_build_side(build_records, build_scans, &drain_ctx, &mut resident, pool)?;
+    drop(build_input_charge);
     let (driver_blocks, scan_unmatched_buf) = drain_driver_side(
         driver_records,
         driver_scans,
@@ -801,7 +824,9 @@ fn execute_block_band_inner(exec: BlockBandExec<'_>) -> Result<BlockBandOutput, 
         &driver_row_schema,
         &drain_ctx,
         &mut resident,
+        pool,
     )?;
+    drop(driver_input_charge);
 
     // Baseline resident footprint the consumer holds through the schedule/emit
     // stage: both sides' kept-in-RAM blocks plus the scan-phase unmatched
@@ -833,7 +858,8 @@ fn execute_block_band_inner(exec: BlockBandExec<'_>) -> Result<BlockBandOutput, 
         spill_compress,
         output_row_schema,
         allocation_resources.clone(),
-    );
+    )
+    .with_kernel_pool(Arc::clone(pool));
     let mut output_eval_failures = Vec::new();
     // Parallel `(order, driver_idx, build_idx)` sort key per deferred output-eval
     // failure, so the dead-letter rows re-order into the same layout-independent
@@ -856,7 +882,8 @@ fn execute_block_band_inner(exec: BlockBandExec<'_>) -> Result<BlockBandOutput, 
         spill_compress,
         driver_row_schema,
         allocation_resources.clone(),
-    );
+    )
+    .with_kernel_pool(Arc::clone(pool));
     let emit_cfg = EmitConfig {
         allocation_resources,
         name,
@@ -936,12 +963,7 @@ fn execute_block_band_inner(exec: BlockBandExec<'_>) -> Result<BlockBandOutput, 
             .saturating_add(deferred_cap)
             .saturating_add(inblock_finalize_term);
         if driver_peak > budget.hard_limit() {
-            return Err(abort_over_budget(
-                consumer,
-                name,
-                driver_peak,
-                budget.hard_limit(),
-            ));
+            return Err(abort_over_budget(consumer, budget, name, driver_peak));
         }
 
         let driver_loaded = driver_block.load("iejoin block-band driver block")?;
@@ -1074,9 +1096,9 @@ fn execute_block_band_inner(exec: BlockBandExec<'_>) -> Result<BlockBandOutput, 
             if pair_peak_reserved > budget.hard_limit() {
                 return Err(abort_over_budget(
                     consumer,
+                    budget,
                     name,
                     pair_peak_reserved,
-                    budget.hard_limit(),
                 ));
             }
 
@@ -1223,9 +1245,9 @@ fn execute_block_band_inner(exec: BlockBandExec<'_>) -> Result<BlockBandOutput, 
                         // fallback cannot rescue.
                         return Err(abort_over_budget(
                             consumer,
+                            budget,
                             name,
                             bnl_reserved.saturating_add(pair_size),
-                            budget.hard_limit(),
                         ));
                     }
                     let tile_reserve = (tile_cap as u64).saturating_mul(pair_size);
@@ -1581,6 +1603,7 @@ fn drain_driver_side(
     schema: &SharedStorage<Schema>,
     ctx: &DrainCtx<'_>,
     resident: &mut ResidentBudget,
+    pool: &Arc<rayon::ThreadPool>,
 ) -> Result<DriverSide, PipelineError> {
     // The matched, scan-phase, and in-block buffers all carry the driver schema
     // (`schema`, derived once by the caller), so every reload decodes identically.
@@ -1590,7 +1613,8 @@ fn drain_driver_side(
         ctx.spill_compress,
         schema.clone(),
         ctx.allocation_resources.clone(),
-    );
+    )
+    .with_kernel_pool(Arc::clone(pool));
     if driver_records.is_empty() {
         return Ok((Vec::new(), scan_buf));
     }
@@ -1600,7 +1624,8 @@ fn drain_driver_side(
         ctx.spill_compress,
         schema.clone(),
         ctx.allocation_resources.clone(),
-    );
+    )
+    .with_kernel_pool(Arc::clone(pool));
     for (driver_idx, ((record, order), scan)) in
         driver_records.into_iter().zip(driver_scans).enumerate()
     {
@@ -1646,6 +1671,7 @@ fn drain_build_side(
     build_scans: Vec<RecordScan>,
     ctx: &DrainCtx<'_>,
     resident: &mut ResidentBudget,
+    pool: &Arc<rayon::ThreadPool>,
 ) -> Result<BuildBlocks, PipelineError> {
     let Some((first, _)) = build_records.first() else {
         return Ok(Vec::new());
@@ -1657,7 +1683,8 @@ fn drain_build_side(
         ctx.spill_compress,
         schema.clone(),
         ctx.allocation_resources.clone(),
-    );
+    )
+    .with_kernel_pool(Arc::clone(pool));
     for (build_idx, ((record, row), scan)) in build_records.into_iter().zip(build_scans).enumerate()
     {
         if let RecordScan::Matched {
@@ -2165,7 +2192,7 @@ fn dispatch_deferred_misses(
             }
             inblock_cur = inblock_stream.next().transpose()?;
         }
-        poll_finalize_backstop(cfg, &mut emitted_since_check)?;
+        poll_finalize_backstop(cfg, sink.consumer, &mut emitted_since_check)?;
     }
     Ok(())
 }
@@ -2184,27 +2211,28 @@ fn dispatch_deferred_misses(
 /// residency, or host RSS the byte-counted view does not fully capture — so poll the
 /// global ceiling here every [`MEMORY_CHECK_INTERVAL`](super::MEMORY_CHECK_INTERVAL)
 /// dispatched rows, matching the cadence the engine's other spill operators poll at.
-/// An overshoot then aborts cleanly with the typed diagnostic instead of allocating
-/// past the hard limit in silence. [`should_abort`](MemoryArbitrator::should_abort)
-/// trips on RSS OR the byte-counted consumer sum, so the guard still fires on a host
-/// where RSS cannot be measured.
+/// The check is the run's one hard-limit backstop, made after the fact in the
+/// kernel's own consumer's name (`consumer`): on the walk it runs a reclaim round,
+/// that consumer last, before it refuses, so an overshoot another node's spill can
+/// relieve does not stop the run, and one it cannot aborts cleanly with the typed
+/// diagnostic instead of allocating past the hard limit in silence. It trips on the
+/// charged total OR the process's peak resident reading, so the guard still fires
+/// on a host where RSS cannot be measured.
 fn poll_finalize_backstop(
     cfg: &EmitConfig<'_>,
+    consumer: &ConsumerHandle,
     emitted_since_check: &mut usize,
 ) -> Result<(), PipelineError> {
     *emitted_since_check += 1;
     if *emitted_since_check >= super::MEMORY_CHECK_INTERVAL {
-        if cfg.budget.should_abort() {
-            return Err(PipelineError::MemoryBudgetExceeded {
-                node: cfg.name.to_string(),
-                used: cfg.budget.current_pressure(),
-                limit: cfg.budget.hard_limit(),
-                source: BudgetCategory::Arena,
-                detail: Some(
-                    "iejoin block-band deferred-miss finalize exceeded budget".to_string(),
-                ),
-            });
-        }
+        cfg.budget
+            .check_hard_limit(
+                cfg.name,
+                clinker_plan::runtime_error::MemorySurface::JoinState,
+                consumer.requester(),
+                0,
+            )
+            .map_err(|report| PipelineError::MemoryBudgetExceeded { report })?;
         *emitted_since_check = 0;
     }
     Ok(())
@@ -2557,36 +2585,41 @@ mod tests {
             .expect("temp dir");
         let propagate = PropagateCkSpec::Driver;
 
-        let out = execute_block_band(BlockBandExec {
-            allocation_resources: resources,
-            name: "block_test",
-            build_qualifier: "b",
-            driver_records,
-            driver_scans,
-            build_records: crate::test_support::with_build_row_ids(build_records),
-            build_scans,
-            op1: cfg.op1,
-            op2: cfg.op2,
-            residual_eval: None,
-            body_eval: matches!(cfg.on_miss, OnMiss::NullFields).then(constant_body),
-            resolver_mapping: &resolver,
-            output_schema: Some(&out_schema),
-            match_mode: cfg.match_mode,
-            on_miss: cfg.on_miss,
-            max_output_rows: None,
-            propagate_ck: &propagate,
-            ctx: &ctx,
-            budget,
-            consumer: &consumer,
-            spill_dir: tmp.path(),
-            spill_compress: false,
-            strategy: ErrorStrategy::FailFast,
-            options: BlockBandOptions {
-                block_target_override: Some(cfg.block_target),
-                sort_spill_override: cfg.sort_spill,
-                resident_budget_override: cfg.resident_budget,
+        let out = execute_block_band(
+            BlockBandExec {
+                allocation_resources: resources,
+                name: "block_test",
+                build_qualifier: "b",
+                driver_records,
+                driver_scans,
+                build_records: crate::test_support::with_build_row_ids(build_records),
+                build_scans,
+                op1: cfg.op1,
+                op2: cfg.op2,
+                residual_eval: None,
+                body_eval: matches!(cfg.on_miss, OnMiss::NullFields).then(constant_body),
+                resolver_mapping: &resolver,
+                output_schema: Some(&out_schema),
+                match_mode: cfg.match_mode,
+                on_miss: cfg.on_miss,
+                max_output_rows: None,
+                propagate_ck: &propagate,
+                ctx: &ctx,
+                budget,
+                consumer: &consumer,
+                spill_dir: tmp.path(),
+                spill_compress: false,
+                strategy: ErrorStrategy::FailFast,
+                driver_input_charge: None,
+                build_input_charge: None,
+                options: BlockBandOptions {
+                    block_target_override: Some(cfg.block_target),
+                    sort_spill_override: cfg.sort_spill,
+                    resident_budget_override: cfg.resident_budget,
+                },
             },
-        })?;
+            crate::test_support::test_kernel_pool(),
+        )?;
         assert!(
             out.output_eval_failures.is_empty(),
             "the synthetic emit path never defers an eval failure"
@@ -3427,7 +3460,7 @@ mod tests {
         // the budget instead, streaming candidates in bounded tiles.
         //
         // Fail-before / pass-after: before the fallback this run aborted with
-        // `MemoryBudgetExceeded { detail: "iejoin pre-output …" }`; it must now
+        // the pre-output gate's `MemoryBudgetExceeded`; it must now
         // return the full pair set and be byte-identical to a roomy run.
         let n = 200i64;
         let driver: Side = (0..n).map(|i| (Some((5, 5)), i)).collect();
@@ -3615,14 +3648,15 @@ mod tests {
         let err = run_block_on(&driver, &build, &cfg, &budget)
             .expect_err("a hot-value collect must stay bounded, aborting rather than OOMing");
         match err {
-            PipelineError::MemoryBudgetExceeded { detail, source, .. } => {
-                assert_eq!(source, clinker_plan::BudgetCategory::Arena);
+            PipelineError::MemoryBudgetExceeded { report } => {
+                assert_eq!(
+                    report.requester.as_ref().map(|label| &label.surface),
+                    Some(&clinker_plan::runtime_error::MemorySurface::JoinState),
+                    "the collect bound must abort via the strictly-local pre-output gate; got {report:?}"
+                );
                 assert!(
-                    detail
-                        .as_deref()
-                        .unwrap_or("")
-                        .contains("iejoin pre-output"),
-                    "the collect bound must abort via the strictly-local pre-output gate; got {detail:?}"
+                    report.oversized && report.requested_bytes > report.limit.bytes(),
+                    "the collect bound must abort via the strictly-local pre-output gate; got {report:?}"
                 );
             }
             other => {
@@ -3784,36 +3818,41 @@ mod tests {
             .tempdir()
             .expect("temp dir");
         let propagate = PropagateCkSpec::Driver;
-        let out = execute_block_band(BlockBandExec {
-            allocation_resources: &test_allocation_resources(),
-            name: "cap_test",
-            build_qualifier: "b",
-            driver_records,
-            driver_scans,
-            build_records: crate::test_support::with_build_row_ids(build_records),
-            build_scans,
-            op1: cfg.op1,
-            op2: cfg.op2,
-            residual_eval: None,
-            body_eval: None,
-            resolver_mapping: &resolver,
-            output_schema: Some(&out_schema),
-            match_mode: cfg.match_mode,
-            on_miss: cfg.on_miss,
-            max_output_rows,
-            propagate_ck: &propagate,
-            ctx: &ctx,
-            budget: &budget,
-            consumer: &consumer,
-            spill_dir: tmp.path(),
-            spill_compress: false,
-            strategy: ErrorStrategy::FailFast,
-            options: BlockBandOptions {
-                block_target_override: Some(cfg.block_target),
-                sort_spill_override: cfg.sort_spill,
-                resident_budget_override: cfg.resident_budget,
+        let out = execute_block_band(
+            BlockBandExec {
+                allocation_resources: &test_allocation_resources(),
+                name: "cap_test",
+                build_qualifier: "b",
+                driver_records,
+                driver_scans,
+                build_records: crate::test_support::with_build_row_ids(build_records),
+                build_scans,
+                op1: cfg.op1,
+                op2: cfg.op2,
+                residual_eval: None,
+                body_eval: None,
+                resolver_mapping: &resolver,
+                output_schema: Some(&out_schema),
+                match_mode: cfg.match_mode,
+                on_miss: cfg.on_miss,
+                max_output_rows,
+                propagate_ck: &propagate,
+                ctx: &ctx,
+                budget: &budget,
+                consumer: &consumer,
+                spill_dir: tmp.path(),
+                spill_compress: false,
+                strategy: ErrorStrategy::FailFast,
+                driver_input_charge: None,
+                build_input_charge: None,
+                options: BlockBandOptions {
+                    block_target_override: Some(cfg.block_target),
+                    sort_spill_override: cfg.sort_spill,
+                    resident_budget_override: cfg.resident_budget,
+                },
             },
-        })?;
+            crate::test_support::test_kernel_pool(),
+        )?;
         Ok(drain_sorted(out.sorted)?
             .into_iter()
             .map(|(r, _)| r)
@@ -4102,36 +4141,41 @@ mod tests {
                 .tempdir()
                 .expect("temp dir");
             let propagate = PropagateCkSpec::Driver;
-            execute_block_band(BlockBandExec {
-                allocation_resources: &test_allocation_resources(),
-                name: "miss_order",
-                build_qualifier: "b",
-                driver_records,
-                driver_scans,
-                build_records: crate::test_support::with_build_row_ids(build_records),
-                build_scans,
-                op1: RangeOp::Le,
-                op2: Some(RangeOp::Ge),
-                residual_eval: None,
-                body_eval: None,
-                resolver_mapping: &resolver,
-                output_schema: Some(&out_schema),
-                match_mode: MatchMode::All,
-                on_miss: OnMiss::Error,
-                max_output_rows: None,
-                propagate_ck: &propagate,
-                ctx: &ctx,
-                budget: &budget,
-                consumer: &consumer,
-                spill_dir: tmp.path(),
-                spill_compress: false,
-                strategy: ErrorStrategy::FailFast,
-                options: BlockBandOptions {
-                    block_target_override: Some(block_target),
-                    sort_spill_override: None,
-                    resident_budget_override: resident,
+            execute_block_band(
+                BlockBandExec {
+                    allocation_resources: &test_allocation_resources(),
+                    name: "miss_order",
+                    build_qualifier: "b",
+                    driver_records,
+                    driver_scans,
+                    build_records: crate::test_support::with_build_row_ids(build_records),
+                    build_scans,
+                    op1: RangeOp::Le,
+                    op2: Some(RangeOp::Ge),
+                    residual_eval: None,
+                    body_eval: None,
+                    resolver_mapping: &resolver,
+                    output_schema: Some(&out_schema),
+                    match_mode: MatchMode::All,
+                    on_miss: OnMiss::Error,
+                    max_output_rows: None,
+                    propagate_ck: &propagate,
+                    ctx: &ctx,
+                    budget: &budget,
+                    consumer: &consumer,
+                    spill_dir: tmp.path(),
+                    spill_compress: false,
+                    strategy: ErrorStrategy::FailFast,
+                    driver_input_charge: None,
+                    build_input_charge: None,
+                    options: BlockBandOptions {
+                        block_target_override: Some(block_target),
+                        sort_spill_override: None,
+                        resident_budget_override: resident,
+                    },
                 },
-            })
+                crate::test_support::test_kernel_pool(),
+            )
             .expect_err("a zero-match driver must error under on_miss: error")
         };
 
@@ -4201,36 +4245,41 @@ mod tests {
                 .tempdir()
                 .expect("temp dir");
             let propagate = PropagateCkSpec::Driver;
-            let out = execute_block_band(BlockBandExec {
-                allocation_resources: &test_allocation_resources(),
-                name: "dup_order",
-                build_qualifier: "b",
-                driver_records,
-                driver_scans,
-                build_records: crate::test_support::with_build_row_ids(build_records),
-                build_scans,
-                op1: RangeOp::Le,
-                op2: Some(RangeOp::Ge),
-                residual_eval: None,
-                body_eval: None,
-                resolver_mapping: &resolver,
-                output_schema: Some(&out_schema),
-                match_mode: MatchMode::All,
-                on_miss: OnMiss::Skip,
-                max_output_rows: None,
-                propagate_ck: &propagate,
-                ctx: &ctx,
-                budget: &budget,
-                consumer: &consumer,
-                spill_dir: tmp.path(),
-                spill_compress: false,
-                strategy: ErrorStrategy::FailFast,
-                options: BlockBandOptions {
-                    block_target_override: Some(block_target),
-                    sort_spill_override: None,
-                    resident_budget_override: resident,
+            let out = execute_block_band(
+                BlockBandExec {
+                    allocation_resources: &test_allocation_resources(),
+                    name: "dup_order",
+                    build_qualifier: "b",
+                    driver_records,
+                    driver_scans,
+                    build_records: crate::test_support::with_build_row_ids(build_records),
+                    build_scans,
+                    op1: RangeOp::Le,
+                    op2: Some(RangeOp::Ge),
+                    residual_eval: None,
+                    body_eval: None,
+                    resolver_mapping: &resolver,
+                    output_schema: Some(&out_schema),
+                    match_mode: MatchMode::All,
+                    on_miss: OnMiss::Skip,
+                    max_output_rows: None,
+                    propagate_ck: &propagate,
+                    ctx: &ctx,
+                    budget: &budget,
+                    consumer: &consumer,
+                    spill_dir: tmp.path(),
+                    spill_compress: false,
+                    strategy: ErrorStrategy::FailFast,
+                    driver_input_charge: None,
+                    build_input_charge: None,
+                    options: BlockBandOptions {
+                        block_target_override: Some(block_target),
+                        sort_spill_override: None,
+                        resident_budget_override: resident,
+                    },
                 },
-            })
+                crate::test_support::test_kernel_pool(),
+            )
             .expect("dup-order run");
             drain_sorted(out.sorted)
                 .expect("drain dup-order output")
@@ -4324,51 +4373,57 @@ mod tests {
             .tempdir()
             .expect("temp dir");
         let propagate = PropagateCkSpec::Driver;
-        let err = execute_block_band(BlockBandExec {
-            allocation_resources: &test_allocation_resources(),
-            name: "held_test",
-            build_qualifier: "b",
-            driver_records,
-            driver_scans,
-            build_records: crate::test_support::with_build_row_ids(build_records),
-            build_scans,
-            op1: RangeOp::Le,
-            op2: Some(RangeOp::Ge),
-            residual_eval: None,
-            body_eval: None,
-            resolver_mapping: &resolver,
-            output_schema: Some(&out_schema),
-            match_mode: MatchMode::First,
-            on_miss: OnMiss::Skip,
-            max_output_rows: None,
-            propagate_ck: &propagate,
-            ctx: &ctx,
-            budget: &budget,
-            consumer: &consumer,
-            spill_dir: tmp.path(),
-            spill_compress: false,
-            strategy: ErrorStrategy::FailFast,
-            options: BlockBandOptions {
-                // All 300 narrow drivers fit one block; each build block holds
-                // only a few wide builds, so the driver block iterates many build
-                // blocks and the held candidates accumulate across them.
-                block_target_override: Some(64 * 1024),
-                sort_spill_override: Some(1 << 30),
-                // Spill every block so the resident baseline stays ~zero and the
-                // growing held candidates are the term that crosses the budget.
-                resident_budget_override: Some(0),
+        let err = execute_block_band(
+            BlockBandExec {
+                allocation_resources: &test_allocation_resources(),
+                name: "held_test",
+                build_qualifier: "b",
+                driver_records,
+                driver_scans,
+                build_records: crate::test_support::with_build_row_ids(build_records),
+                build_scans,
+                op1: RangeOp::Le,
+                op2: Some(RangeOp::Ge),
+                residual_eval: None,
+                body_eval: None,
+                resolver_mapping: &resolver,
+                output_schema: Some(&out_schema),
+                match_mode: MatchMode::First,
+                on_miss: OnMiss::Skip,
+                max_output_rows: None,
+                propagate_ck: &propagate,
+                ctx: &ctx,
+                budget: &budget,
+                consumer: &consumer,
+                spill_dir: tmp.path(),
+                spill_compress: false,
+                strategy: ErrorStrategy::FailFast,
+                driver_input_charge: None,
+                build_input_charge: None,
+                options: BlockBandOptions {
+                    // All 300 narrow drivers fit one block; each build block holds
+                    // only a few wide builds, so the driver block iterates many build
+                    // blocks and the held candidates accumulate across them.
+                    block_target_override: Some(64 * 1024),
+                    sort_spill_override: Some(1 << 30),
+                    // Spill every block so the resident baseline stays ~zero and the
+                    // growing held candidates are the term that crosses the budget.
+                    resident_budget_override: Some(0),
+                },
             },
-        })
+            crate::test_support::test_kernel_pool(),
+        )
         .expect_err("accumulated held candidates over the budget must abort");
         match err {
-            PipelineError::MemoryBudgetExceeded { detail, source, .. } => {
-                assert_eq!(source, clinker_plan::BudgetCategory::Arena);
+            PipelineError::MemoryBudgetExceeded { report } => {
+                assert_eq!(
+                    report.requester.as_ref().map(|label| &label.surface),
+                    Some(&clinker_plan::runtime_error::MemorySurface::JoinState),
+                    "abort must come from the pre-output gate; got {report:?}"
+                );
                 assert!(
-                    detail
-                        .as_deref()
-                        .unwrap_or("")
-                        .contains("iejoin pre-output"),
-                    "abort must come from the pre-output gate; got {detail:?}"
+                    report.oversized && report.requested_bytes > report.limit.bytes(),
+                    "abort must come from the pre-output gate; got {report:?}"
                 );
             }
             other => {
@@ -4408,14 +4463,15 @@ mod tests {
         let err = run_block(&driver, &build, &cfg)
             .expect_err("an over-hard spilled driver block must abort at its load");
         match err {
-            PipelineError::MemoryBudgetExceeded { detail, source, .. } => {
-                assert_eq!(source, clinker_plan::BudgetCategory::Arena);
+            PipelineError::MemoryBudgetExceeded { report } => {
+                assert_eq!(
+                    report.requester.as_ref().map(|label| &label.surface),
+                    Some(&clinker_plan::runtime_error::MemorySurface::JoinState),
+                    "abort must come from the driver-load gate; got {report:?}"
+                );
                 assert!(
-                    detail
-                        .as_deref()
-                        .unwrap_or("")
-                        .contains("iejoin pre-output"),
-                    "abort must come from the driver-load gate; got {detail:?}"
+                    report.oversized && report.requested_bytes > report.limit.bytes(),
+                    "abort must come from the driver-load gate; got {report:?}"
                 );
             }
             other => {
@@ -4528,21 +4584,23 @@ mod tests {
         // allocation, so the trigger is host-independent: it does not rely on the
         // process RSS the other arm reads.
 
-        // 1 GiB hard limit sits above any host's test RSS, so the RSS arm of
-        // should_abort cannot trip; the registered pinned consumer alone pushes
-        // sum_consumer_usage past the ceiling.
+        // 1 GiB hard limit sits above any host's test RSS, so the process-memory
+        // arm of `check_hard_limit` cannot trip; the registered pinned consumer
+        // alone pushes the charged total past the ceiling.
         let hard = 1u64 << 30;
         let budget = arbitrator(hard);
         let pinned = crate::pipeline::memory::ConsumerHandle::new();
         pinned.set_bytes(hard + 1);
-        budget.register_consumer(
-            Arc::new(PinnedConsumer { bytes: hard + 1 }),
-            pinned,
-            clinker_plan::runtime_error::ConsumerLabel {
-                node: "pinned".to_string(),
-                surface: clinker_plan::runtime_error::MemorySurface::JoinState,
-            },
-        );
+        budget
+            .register_consumer(
+                Arc::new(PinnedConsumer { bytes: hard + 1 }),
+                pinned,
+                clinker_plan::runtime_error::ConsumerLabel {
+                    node: "pinned".to_string(),
+                    surface: clinker_plan::runtime_error::MemorySurface::JoinState,
+                },
+            )
+            .expect("a fresh handle registers");
         assert!(
             budget.sum_consumer_usage() > budget.hard_limit(),
             "test invariant: the pinned consumer must arm the byte-counted abort arm"
@@ -4589,51 +4647,303 @@ mod tests {
             .expect("temp dir");
         let propagate = PropagateCkSpec::Driver;
 
-        let err = execute_block_band(BlockBandExec {
-            allocation_resources: &test_allocation_resources(),
-            name: "finalize_backstop",
-            build_qualifier: "b",
-            driver_records,
-            driver_scans,
-            build_records: crate::test_support::with_build_row_ids(build_records),
-            build_scans,
-            op1: RangeOp::Le,
-            op2: Some(RangeOp::Ge),
-            residual_eval: None,
-            body_eval: Some(constant_body()),
-            resolver_mapping: &resolver,
-            output_schema: Some(&out_schema),
-            match_mode: MatchMode::All,
-            on_miss: OnMiss::NullFields,
-            max_output_rows: None,
-            propagate_ck: &propagate,
-            ctx: &ctx,
-            budget: &budget,
-            consumer: &consumer,
-            spill_dir: tmp.path(),
-            spill_compress: false,
-            strategy: ErrorStrategy::FailFast,
-            options: BlockBandOptions::default(),
-        })
+        let err = execute_block_band(
+            BlockBandExec {
+                allocation_resources: &test_allocation_resources(),
+                name: "finalize_backstop",
+                build_qualifier: "b",
+                driver_records,
+                driver_scans,
+                build_records: crate::test_support::with_build_row_ids(build_records),
+                build_scans,
+                op1: RangeOp::Le,
+                op2: Some(RangeOp::Ge),
+                residual_eval: None,
+                body_eval: Some(constant_body()),
+                resolver_mapping: &resolver,
+                output_schema: Some(&out_schema),
+                match_mode: MatchMode::All,
+                on_miss: OnMiss::NullFields,
+                max_output_rows: None,
+                propagate_ck: &propagate,
+                ctx: &ctx,
+                budget: &budget,
+                consumer: &consumer,
+                spill_dir: tmp.path(),
+                spill_compress: false,
+                strategy: ErrorStrategy::FailFast,
+                options: BlockBandOptions::default(),
+                driver_input_charge: None,
+                build_input_charge: None,
+            },
+            crate::test_support::test_kernel_pool(),
+        )
         .expect_err("the finalize backstop must abort when the ceiling is already breached");
 
         match err {
-            PipelineError::MemoryBudgetExceeded {
-                detail,
-                source,
-                limit,
-                ..
-            } => {
-                assert_eq!(source, clinker_plan::BudgetCategory::Arena);
-                assert_eq!(limit, hard);
-                assert!(
-                    detail.as_deref().unwrap_or("").contains("finalize"),
-                    "abort must come from the deferred-miss finalize backstop; got {detail:?}"
+            PipelineError::MemoryBudgetExceeded { report } => {
+                assert_eq!(
+                    report.requester,
+                    Some(clinker_plan::runtime_error::ConsumerLabel {
+                        node: "finalize_backstop".to_string(),
+                        surface: clinker_plan::runtime_error::MemorySurface::JoinState,
+                    }),
+                    "abort must come from the join's deferred-miss finalize backstop"
                 );
+                assert_eq!(report.limit.bytes(), hard);
             }
             other => {
                 panic!("expected MemoryBudgetExceeded from the finalize backstop; got {other:?}")
             }
+        }
+    }
+
+    /// Each drain consumes its side's input: every row ends in a buffer the
+    /// drain charges, on disk, or dropped. So each side's input charge ends
+    /// when its drain returns, and the deferred-miss finalize's hard-limit
+    /// check counts the rows once, in the join's own buffers. The two input
+    /// charges nearly fill the limit and the join's own charge does not fit
+    /// beside them, so a check that still counted them would refuse with E310.
+    #[test]
+    fn each_drain_ends_its_sides_input_charge() {
+        let hard = 1u64 << 30;
+        let budget = Arc::new(arbitrator(hard));
+        budget.read_no_process_memory();
+        let consumer = ConsumerHandle::new();
+        budget
+            .register_node_consumer(
+                Arc::new(crate::pipeline::sort_buffer::SortConsumer::new(
+                    consumer.clone(),
+                )),
+                consumer.clone(),
+                clinker_plan::runtime_error::ConsumerLabel {
+                    node: "drain_release".to_string(),
+                    surface: clinker_plan::runtime_error::MemorySurface::JoinState,
+                },
+            )
+            .expect("a fresh handle registers");
+        let spare = 64 * 1024;
+        let driver_charge = 600 * 1024 * 1024;
+        let reserve = |bytes, node| {
+            crate::executor::node_buffer::reserve_node_buffer_materialization(bytes, &budget, node)
+                .expect("the input charge fits the ledger")
+        };
+        let driver_input_charge = reserve(driver_charge, "drivers");
+        let build_input_charge = reserve(hard - driver_charge - spare, "builds");
+        assert_eq!(budget.charged_bytes(), hard - spare);
+        assert_eq!(budget.consumer_count(), 3);
+
+        // Every driver is scan-phase unmatched (NULL range key) and dispatched
+        // through the finalize, one more than a full check interval of them,
+        // so the finalize polls the hard limit; the pile they wait in is
+        // charged to the join and is larger than the spare room.
+        let interval = crate::pipeline::iejoin::MEMORY_CHECK_INTERVAL;
+        let d_schema = driver_schema();
+        let b_schema = build_schema();
+        let out_schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
+            "d_k1".into(),
+            "d_k2".into(),
+            "d_id".into(),
+            "b_k1".into(),
+            "b_k2".into(),
+            "b_id".into(),
+        ])));
+        let driver: Side = (0..(interval as i64 + 1)).map(|i| (None, i)).collect();
+        let build: Side = vec![(Some((5, 5)), 100)];
+        let (driver_bare, driver_scans) = to_records_scans(&driver, &d_schema);
+        let driver_records: Vec<(Record, RecordOrder)> = driver_bare
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| (r, RecordOrder::from(i as u64)))
+            .collect();
+        let (build_records, build_scans) = to_records_scans(&build, &b_schema);
+        let stable = StableEvalContext::test_default();
+        let ctx = EvalContext::test_default_borrowed(&stable);
+        let resolver = empty_resolver();
+        let tmp = tempfile::Builder::new()
+            .prefix("iejoin-drain-release-")
+            .tempdir()
+            .expect("temp dir");
+        let propagate = PropagateCkSpec::Driver;
+
+        let out = execute_block_band(
+            BlockBandExec {
+                allocation_resources: &test_allocation_resources(),
+                name: "drain_release",
+                build_qualifier: "b",
+                driver_records,
+                driver_scans,
+                build_records: crate::test_support::with_build_row_ids(build_records),
+                build_scans,
+                op1: RangeOp::Le,
+                op2: Some(RangeOp::Ge),
+                residual_eval: None,
+                body_eval: Some(constant_body()),
+                resolver_mapping: &resolver,
+                output_schema: Some(&out_schema),
+                match_mode: MatchMode::All,
+                on_miss: OnMiss::NullFields,
+                max_output_rows: None,
+                propagate_ck: &propagate,
+                ctx: &ctx,
+                budget: &budget,
+                consumer: &consumer,
+                spill_dir: tmp.path(),
+                spill_compress: false,
+                strategy: ErrorStrategy::FailFast,
+                options: BlockBandOptions::default(),
+                driver_input_charge: Some(driver_input_charge),
+                build_input_charge: Some(build_input_charge),
+            },
+            crate::test_support::test_kernel_pool(),
+        )
+        .expect("the finalize's check counts each row once and finds room");
+        assert_eq!(
+            out.row_count,
+            interval as u64 + 1,
+            "one row per missed driver"
+        );
+        assert!(
+            consumer.peak_bytes() > spare,
+            "the join's own charge ({}) must not fit beside both input charges",
+            consumer.peak_bytes()
+        );
+        assert_eq!(
+            budget.consumer_count(),
+            1,
+            "both input charges' consumers are unregistered; only the join's remains"
+        );
+        assert_eq!(budget.charged_bytes(), consumer.bytes());
+        drop(out);
+    }
+
+    /// Each side's input charge ends when that side's drain returns, checked
+    /// side by side: in each run one side's charge nearly fills the limit
+    /// and the other's is tiny, so a charge that outlived its drain would
+    /// leave no room for the join's own charge at the deferred-miss
+    /// finalize's check, which would refuse with E310. Both runs complete.
+    #[test]
+    fn a_side_whose_charge_outlives_its_drain_is_refused_at_the_finalize() {
+        let hard = 1u64 << 30;
+        let spare = 64 * 1024;
+        let tiny = 64 * 1024;
+        for (driver_charge, build_charge) in
+            [(hard - spare - tiny, tiny), (tiny, hard - spare - tiny)]
+        {
+            let budget = Arc::new(arbitrator(hard));
+            budget.read_no_process_memory();
+            let consumer = ConsumerHandle::new();
+            budget
+                .register_node_consumer(
+                    Arc::new(crate::pipeline::sort_buffer::SortConsumer::new(
+                        consumer.clone(),
+                    )),
+                    consumer.clone(),
+                    clinker_plan::runtime_error::ConsumerLabel {
+                        node: "drain_release".to_string(),
+                        surface: clinker_plan::runtime_error::MemorySurface::JoinState,
+                    },
+                )
+                .expect("a fresh handle registers");
+            let reserve = |bytes, node| {
+                crate::executor::node_buffer::reserve_node_buffer_materialization(
+                    bytes, &budget, node,
+                )
+                .expect("the input charge fits the ledger")
+            };
+            let driver_input_charge = reserve(driver_charge, "drivers");
+            let build_input_charge = reserve(build_charge, "builds");
+            assert_eq!(budget.charged_bytes(), hard - spare);
+
+            // Every driver is scan-phase unmatched (NULL range key) and
+            // dispatched through the finalize, one more than a full check
+            // interval of them, so the finalize polls the hard limit; the pile
+            // they wait in is charged to the join and is larger than the spare
+            // room beside either input's charge.
+            let interval = crate::pipeline::iejoin::MEMORY_CHECK_INTERVAL;
+            let d_schema = driver_schema();
+            let b_schema = build_schema();
+            let out_schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
+                "d_k1".into(),
+                "d_k2".into(),
+                "d_id".into(),
+                "b_k1".into(),
+                "b_k2".into(),
+                "b_id".into(),
+            ])));
+            let driver: Side = (0..(interval as i64 + 1)).map(|i| (None, i)).collect();
+            let build: Side = vec![(Some((5, 5)), 100)];
+            let (driver_bare, driver_scans) = to_records_scans(&driver, &d_schema);
+            let driver_records: Vec<(Record, RecordOrder)> = driver_bare
+                .into_iter()
+                .enumerate()
+                .map(|(i, r)| (r, RecordOrder::from(i as u64)))
+                .collect();
+            let (build_records, build_scans) = to_records_scans(&build, &b_schema);
+            let stable = StableEvalContext::test_default();
+            let ctx = EvalContext::test_default_borrowed(&stable);
+            let resolver = empty_resolver();
+            let tmp = tempfile::Builder::new()
+                .prefix("iejoin-drain-release-per-side-")
+                .tempdir()
+                .expect("temp dir");
+            let propagate = PropagateCkSpec::Driver;
+
+            let out = execute_block_band(
+                BlockBandExec {
+                    allocation_resources: &test_allocation_resources(),
+                    name: "drain_release",
+                    build_qualifier: "b",
+                    driver_records,
+                    driver_scans,
+                    build_records: crate::test_support::with_build_row_ids(build_records),
+                    build_scans,
+                    op1: RangeOp::Le,
+                    op2: Some(RangeOp::Ge),
+                    residual_eval: None,
+                    body_eval: Some(constant_body()),
+                    resolver_mapping: &resolver,
+                    output_schema: Some(&out_schema),
+                    match_mode: MatchMode::All,
+                    on_miss: OnMiss::NullFields,
+                    max_output_rows: None,
+                    propagate_ck: &propagate,
+                    ctx: &ctx,
+                    budget: &budget,
+                    consumer: &consumer,
+                    spill_dir: tmp.path(),
+                    spill_compress: false,
+                    strategy: ErrorStrategy::FailFast,
+                    options: BlockBandOptions::default(),
+                    driver_input_charge: Some(driver_input_charge),
+                    build_input_charge: Some(build_input_charge),
+                },
+                crate::test_support::test_kernel_pool(),
+            )
+            .unwrap_or_else(|err| {
+                panic!(
+                    "with the driver's input charged {driver_charge} and the build's \
+                     {build_charge}, the finalize's check must count each row once and \
+                     find room: {err:?}"
+                )
+            });
+            assert_eq!(
+                out.row_count,
+                interval as u64 + 1,
+                "one row per missed driver"
+            );
+            assert!(
+                consumer.peak_bytes() > spare,
+                "the join's own charge ({}) must not fit beside the larger input charge",
+                consumer.peak_bytes()
+            );
+            assert_eq!(
+                budget.consumer_count(),
+                1,
+                "both input charges' consumers are unregistered; only the join's remains"
+            );
+            assert_eq!(budget.charged_bytes(), consumer.bytes());
+            drop(out);
         }
     }
 
@@ -4827,36 +5137,41 @@ mod tests {
         let propagate = PropagateCkSpec::Driver;
         let budget = arbitrator(hard_limit);
 
-        let out = execute_block_band(BlockBandExec {
-            allocation_resources: &test_allocation_resources(),
-            name: "cascade_frag",
-            build_qualifier: "b",
-            driver_records,
-            driver_scans,
-            build_records: crate::test_support::with_build_row_ids(build_records),
-            build_scans,
-            op1: RangeOp::Le,
-            op2: Some(RangeOp::Ge),
-            residual_eval: None,
-            body_eval: Some(marker_body()),
-            resolver_mapping: &resolver,
-            output_schema: Some(out_schema),
-            match_mode: MatchMode::All,
-            on_miss: OnMiss::NullFields,
-            max_output_rows: None,
-            propagate_ck: &propagate,
-            ctx: &ctx,
-            budget: &budget,
-            consumer: &consumer,
-            spill_dir: tmp.path(),
-            spill_compress: false,
-            strategy: ErrorStrategy::FailFast,
-            options: BlockBandOptions {
-                block_target_override: Some(256),
-                sort_spill_override: sort_spill,
-                resident_budget_override: None,
+        let out = execute_block_band(
+            BlockBandExec {
+                allocation_resources: &test_allocation_resources(),
+                name: "cascade_frag",
+                build_qualifier: "b",
+                driver_records,
+                driver_scans,
+                build_records: crate::test_support::with_build_row_ids(build_records),
+                build_scans,
+                op1: RangeOp::Le,
+                op2: Some(RangeOp::Ge),
+                residual_eval: None,
+                body_eval: Some(marker_body()),
+                resolver_mapping: &resolver,
+                output_schema: Some(out_schema),
+                match_mode: MatchMode::All,
+                on_miss: OnMiss::NullFields,
+                max_output_rows: None,
+                propagate_ck: &propagate,
+                ctx: &ctx,
+                budget: &budget,
+                consumer: &consumer,
+                spill_dir: tmp.path(),
+                spill_compress: false,
+                strategy: ErrorStrategy::FailFast,
+                driver_input_charge: None,
+                build_input_charge: None,
+                options: BlockBandOptions {
+                    block_target_override: Some(256),
+                    sort_spill_override: sort_spill,
+                    resident_budget_override: None,
+                },
             },
-        })
+            crate::test_support::test_kernel_pool(),
+        )
         .expect("an all-unmatched null_fields shape must complete within budget");
         assert!(
             out.output_eval_failures.is_empty(),
@@ -5291,36 +5606,41 @@ mod tests {
             .expect("temp dir");
         let propagate = PropagateCkSpec::Driver;
 
-        let out = execute_block_band(BlockBandExec {
-            allocation_resources: &test_allocation_resources(),
-            name: "equi_test",
-            build_qualifier: "b",
-            driver_records,
-            driver_scans,
-            build_records: crate::test_support::with_build_row_ids(build_records),
-            build_scans,
-            op1: cfg.op1,
-            op2: cfg.op2,
-            residual_eval: None,
-            body_eval: None,
-            resolver_mapping: &resolver,
-            output_schema: Some(&out_schema),
-            match_mode: cfg.match_mode,
-            on_miss: cfg.on_miss,
-            max_output_rows: None,
-            propagate_ck: &propagate,
-            ctx: &ctx,
-            budget,
-            consumer: &consumer,
-            spill_dir: tmp.path(),
-            spill_compress: false,
-            strategy: ErrorStrategy::FailFast,
-            options: BlockBandOptions {
-                block_target_override: Some(cfg.block_target),
-                sort_spill_override: cfg.sort_spill,
-                resident_budget_override: cfg.resident_budget,
+        let out = execute_block_band(
+            BlockBandExec {
+                allocation_resources: &test_allocation_resources(),
+                name: "equi_test",
+                build_qualifier: "b",
+                driver_records,
+                driver_scans,
+                build_records: crate::test_support::with_build_row_ids(build_records),
+                build_scans,
+                op1: cfg.op1,
+                op2: cfg.op2,
+                residual_eval: None,
+                body_eval: None,
+                resolver_mapping: &resolver,
+                output_schema: Some(&out_schema),
+                match_mode: cfg.match_mode,
+                on_miss: cfg.on_miss,
+                max_output_rows: None,
+                propagate_ck: &propagate,
+                ctx: &ctx,
+                budget,
+                consumer: &consumer,
+                spill_dir: tmp.path(),
+                spill_compress: false,
+                strategy: ErrorStrategy::FailFast,
+                driver_input_charge: None,
+                build_input_charge: None,
+                options: BlockBandOptions {
+                    block_target_override: Some(cfg.block_target),
+                    sort_spill_override: cfg.sort_spill,
+                    resident_budget_override: cfg.resident_budget,
+                },
             },
-        })?;
+            crate::test_support::test_kernel_pool(),
+        )?;
         assert!(
             out.output_eval_failures.is_empty(),
             "the synthetic emit path never defers an eval failure"

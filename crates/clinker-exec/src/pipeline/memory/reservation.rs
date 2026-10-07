@@ -40,10 +40,16 @@ pub struct WriterResourceUsage {
 /// Test builds also keep an armed forced shortfall here: it is the ledger's
 /// [`AdmissionGate`], so every charge counts and fires it in the same step
 /// as its own check.
+///
+/// It also records which setting the ledger's limit is, written with the
+/// limit under this lock so a snapshot reads the two together.
 #[derive(Default)]
 pub(super) struct WriterBinding {
     pub handle: Option<Arc<ConsumerHandle>>,
     pub consumer_id: Option<ConsumerId>,
+    /// Whether the ledger's limit is a test capacity the run was held to,
+    /// below `memory.limit`, rather than `memory.limit` itself.
+    pub test_capacity: bool,
     #[cfg(any(test, feature = "test-utils"))]
     pub forced_shortfall: Option<super::ledger::ArmedShortfall>,
 }
@@ -165,24 +171,65 @@ impl MemoryArbitrator {
     /// `requester`. The caller's `AllocationLease` owns the charge from here
     /// and returns it through [`ReservationState::release_writer_memory`]
     /// with the same attribution.
+    ///
+    /// A refusal is recorded on the calling thread with its E310 report, for
+    /// the thread's wrapper to recover when the admission error ends the
+    /// thread's work; a grant clears the record.
     pub(crate) fn admit_writer_memory(
         &self,
         bytes: usize,
         requester: Requester,
     ) -> Result<(), ResourceError> {
-        match self.reserve(bytes as u64, requester) {
+        self.admitted(self.reserve(bytes as u64, requester), bytes, true)
+    }
+
+    /// [`Self::admit_writer_memory`] for an optional over-allocation, through
+    /// [`Self::reserve_if_free`]: admitted only if it fits now. Its refusal
+    /// is recorded nowhere: the caller falls back to the size it needs.
+    pub(crate) fn admit_writer_memory_if_free(
+        &self,
+        bytes: usize,
+        requester: Requester,
+    ) -> Result<(), ResourceError> {
+        self.admitted(self.reserve_if_free(bytes as u64, requester), bytes, false)
+    }
+
+    /// Hand a reserve's grant to the caller's lease, or map its shortfall to
+    /// the admission error: `Finalized` for a closed ledger, `Budget`
+    /// otherwise. With `record`, a `Budget` refusal's report is kept on this
+    /// thread and a grant clears what was kept.
+    fn admitted(
+        &self,
+        result: Result<super::ledger::Grant, super::ledger::Shortfall>,
+        bytes: usize,
+        record: bool,
+    ) -> Result<(), ResourceError> {
+        match result {
             Ok(grant) => {
                 grant.detach();
+                if record {
+                    super::ledger::clear_governed_refusal();
+                }
                 Ok(())
             }
             Err(shortfall) if shortfall.is_closed() => {
                 Err(ResourceError::new(ResourceErrorKind::Finalized, 0, 0))
             }
-            Err(shortfall) => Err(ResourceError::new(
-                ResourceErrorKind::Budget,
-                bytes,
-                shortfall.available.min(usize::MAX as u64) as usize,
-            )),
+            Err(shortfall) => {
+                let available = shortfall.available.min(usize::MAX as u64) as usize;
+                if record {
+                    super::ledger::record_governed_refusal(
+                        bytes,
+                        available,
+                        shortfall.into_report(self),
+                    );
+                }
+                Err(ResourceError::new(
+                    ResourceErrorKind::Budget,
+                    bytes,
+                    available,
+                ))
+            }
         }
     }
 

@@ -693,24 +693,6 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
 
 ## Runtime findings from documentation verification
 
-### 62. Bounded preview can fail node-buffer cleanup
-
-- Filed: 2026-09-18.
-- Status: Open; reproduced against `3b343a4e`.
-- Priority: High.
-- Evidence: Bounded previews of the first-pipeline and CSV-transform recipes
-  fail with `completed node-buffer scope retained 1 slot(s), 1 reader-count
-  entry/entries, and 1 memory registration(s)`. Their ordinary runs complete
-  and match the documented CSV bytes. The same diagnostic occurs in the
-  tutorial site's validation and DLQ fixtures, including with output parents
-  already present.
-- Files/modules involved: `crates/clinker-exec/src/executor/dispatch.rs`,
-  `crates/clinker/src/main.rs`, `docs/user/src/ops/validation.md`.
-- Suggested way to resolve it: Trace preview completion and retained reader
-  ownership; add a regression that checks cleanup and output for bounded
-  execution through typed Sources and Sinks. Do not suppress the invariant.
-- Implementation owner: CLI and executor maintainers.
-
 ### 63. Mismatched Sink names can fail writing or publish empty files
 
 - Filed: 2026-09-18.
@@ -962,6 +944,187 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
   exists, and update the Route page's Constraints section.
 - Implementation owner: Planner maintainers.
 
+## Memory attribution findings
+
+### 92. Text a Source admitted stays charged after the Source finishes, but no node is named for it
+
+- Filed: 2026-10-05.
+- Status: Open. The cannot-spill count is resolved: an E310 no longer counts
+  a finished Source's surviving rows as state that cannot spill, and the
+  ranking figure of every holder that keeps such rows is decided (below).
+  Naming the step that keeps them alive stays open.
+- Priority: Medium.
+- Evidence: Long text a Source reads is admitted once, in the Source's name,
+  and the admission travels with the allocation to every copy of the row
+  until the last copy drops (`FieldStr::try_new`). A parked cross-region edge
+  therefore does not charge that text again: its charge covers only what its
+  copy allocates itself (`Record::clone_allocation_bytes`). When the Source
+  finishes, its memory consumer is unregistered and its name leaves the
+  ledger; the plain Source arm unregisters before it hands its rows to the
+  slot downstream (`dispatch_source`), so this is the common case, not a
+  residue. Bytes still granted in the Source's name stay charged, and the
+  ledger now keeps them identifiable as a finished Source's inside the
+  unattributed remainder until the last of them drops
+  (`LedgerState::remove_consumer`; the snapshot's `retired_source`; the
+  ledger test
+  `a_finished_sources_rows_stay_identifiable_until_their_last_byte_drops`).
+  An E310 never counts them as state that cannot spill, the same rule as for
+  a Source still listed (`build_report`; the test
+  `rows_a_finished_source_read_never_count_as_state_that_cannot_spill`). The
+  run's total stays exact, so no limit is exceeded unnoticed. Two figures
+  are still weaker than they could be: an E310 can only report those bytes
+  as memory not held by any one node, so it cannot name the step (a parked
+  edge, a buffered slot) that keeps them alive; and every holder that keeps
+  such rows leaves them out of its ranking figure (below).
+- Ranking figure (decided 2026-10-06, delivered with #1394): every row
+  holder on the walk ranks as a reclaim victim by its rows' own charge,
+  which leaves out text a Source read and is charged for, even when the
+  holder keeps the last copy of that text alive and a spill would free it.
+  That covers a node-buffer slot, Output's per-document bucket and the Cull
+  and Reshape group buffers (`resident_record_reclaimable_bytes`) and a
+  parked edge (its resident segments' charge). A node-buffer slot often
+  holds the only copy, since rows move rather than copy, so it is the
+  common case, not the parked edge.
+  The effect is victim order only: a pass can spill a holder whose figure is
+  larger, find its target not yet met, and spill the next, which costs extra
+  spill I/O. It never causes a refusal: a pass keeps electing until what it
+  measured covers its target, and a resident row always has a figure above
+  0. Grace partitions and a hash Aggregate count the text in full, the
+  opposite error, which the #1394 rule removes; under `memory.backpressure:
+  both` their figures outrank row holders across priority tiers. Decided: a
+  holder ranks by its charge, derived from the same per-row charge function
+  so its ranking figure and its charge cannot disagree. The figure is the
+  charged bytes a spill releases; a spill can free more, which the pass
+  measures. It stays a lower bound, so a figure of 0 still means there is
+  nothing to spill. The #1394 rule delivers it for every holder at once.
+  Counting the text a holder alone keeps alive returns as its own change
+  only if a benchmark shows spills chosen in the wrong order. The code
+  comments and the engine page state the figure as it is.
+- Charges made in a finished Source's name (resolved): on the walk,
+  governed allocations are charged to the dispatching node's first
+  registered consumer (`dispatch_plan_node`), and the plain Source arm
+  unregisters its consumer before it builds node-rooted windows, parks
+  cross-region copies and admits its slot. `unregister_consumer` clears the
+  walk requester when it names the departing consumer, so anything those
+  steps allocate through the walk's governed view is charged to no consumer
+  and counts as state that cannot spill; it never joins the finished
+  Source's figure. None of them allocates through that view today: window
+  building, parking and slot admission charge their own labelled handles.
+- Unconfirmed general case: a consumer that is not a Source and unregisters
+  while rows granted in its name on the walk stay resident downstream leaves
+  those rows as memory not held by any one node, still counted as state that
+  cannot spill. Walk allocations are attributed to the dispatching node's
+  first consumer (`dispatch_plan_node`), so any node whose first consumer
+  unregisters before its output drops would show this; no production
+  consumer was confirmed to do so.
+- Files/modules involved:
+  `crates/clinker-exec/src/executor/parked_generations.rs` (`park`, the
+  edge's reclaimable figure), `crates/clinker-exec/src/executor/node_buffer.rs`
+  (`resident_record_reclaimable_bytes`), `crates/clinker-exec/src/executor/source_dispatch.rs`
+  (`dispatch_source`), `crates/clinker-exec/src/executor/dispatch.rs`
+  (`dispatch_plan_node`, `release_source_consumer`),
+  `crates/clinker-exec/src/pipeline/memory.rs` (`unregister_consumer`),
+  `crates/clinker-exec/src/pipeline/memory/protocol.rs` (the finished
+  Source's entry), `crates/clinker-exec/src/pipeline/memory/ledger.rs` (the
+  unattributed remainder, `retired_source` and the E310 holder list),
+  `crates/clinker-record/src/field_str.rs` (`try_new`).
+- Suggested way to resolve it: Decide, with the reclaim victim order and the
+  E310 holder report, how an E310 names the step that keeps a finished
+  Source's rows alive (by what that step alone keeps alive, or by handing
+  the charge over to it). The ranking figure is decided (above).
+- Related finding (spill read-back): rows read back from a spill file come
+  back with text the run never admitted (`Value`'s deserializer builds it
+  with `FieldStr::from`, `crates/clinker-record/src/value.rs`), so no
+  admission travels with it and it is under-charged until a consumer charges
+  it itself. This is not a regression, and the charge rule decided in
+  #1394 (question 93) covers it: a consumer that keeps such rows charges
+  what it alone keeps alive.
+- Implementation owner: Executor maintainers, with the input-cursor work that
+  hands rows over to the step that keeps them.
+
+### 93. A Combine's build table charges text its Source already holds charged
+
+- Filed: 2026-10-05.
+- Status: Decided in
+  [#1394](https://github.com/rustpunk/clinker/issues/1394), not yet
+  implemented: until that change lands, the text double below is still
+  charged.
+- Priority: Medium.
+- Evidence: A Combine's hash table sizes its build rows with
+  `Record::estimated_heap_size` (`CombineHashTable::memory_bytes`), which
+  counts long shared text at its full size even when the Source that read it
+  already carries its charge. In the cross-region test whose composition
+  body joins a Source's rows (`composition_body_crossing_parks_under_its_body_key`),
+  the build rows' notes are therefore charged twice over the run: once under
+  the Source `dept_lookup` and once under the Combine `enriched`, whose
+  charge rises by exactly the notes' growth when the notes grow. The run's
+  total overstates what is resident, so a limit can be reached, and spilling
+  or refusal begin, earlier than the memory actually held requires. A cross-
+  region park, by contrast, charges only what its copy alone keeps alive
+  (`Record::clone_allocation_bytes`).
+- Evidence (the inline hash join's build rows): the inline join's build
+  input's reservation charges each build row's slot, and the finished table
+  charges the same rows again in its own figure. Once the table is built the
+  reservation's charge is handed to the table's handle in one ledger step,
+  and the table's finished-build checks count the table less that charge,
+  so the slots are charged once and the check agrees with the ledger after
+  the hand-over. The table's figure still counts each row's text at full
+  size while the Source that read it charges it too, so near the limit an
+  inline join can still be refused for text that is resident once.
+- Files/modules involved:
+  `crates/clinker-exec/src/pipeline/combine.rs` (`memory_bytes` and the
+  other build-side sizing), `crates/clinker-exec/src/executor/combine_dispatch.rs`
+  (the inline build's check and its handle charge),
+  `crates/clinker-record/src/field_str.rs`
+  (`heap_size` against the run-aware `unaccounted_heap_size`),
+  `crates/clinker-record/src/record/mod.rs` (`clone_allocation_bytes`).
+- Decision (#1394): every consumer that keeps rows charges exactly what it
+  alone keeps alive, through one function each: held rows by their run-aware
+  heap size (`unaccounted_heap_size`), copies about to be made by what the
+  copy allocates (`clone_allocation_bytes`). Text the run admitted is
+  charged once, by the Source that read it, until its last copy drops, and
+  the record-level estimate (`Record::estimated_heap_size`) leaves every
+  charge, ranking figure and private spill trigger. The change lands in a
+  pull request of its own after the strict-memory-limits change: it audits
+  each consumer that keeps rows against the rule and adds a run-wide check
+  that every byte is charged once.
+- Implementation owner: Executor maintainers.
+
+### 95. A grace-hash join's output order depends on which partitions spilled
+
+- Filed: 2026-10-06.
+- Status: Decided 2026-09-29, not yet implemented
+  ([#1228](https://github.com/rustpunk/clinker/issues/1228)): the grace join
+  emits in driver order at every memory limit. Until that change lands the
+  order depends on which partitions spilled, as it always has.
+- Priority: Medium.
+- Evidence: A grace-hash join emits the matches of its in-memory partitions
+  in driver order during the probe, then each spilled partition's matches as
+  that partition is read back, and the dispatcher admits those rows as they
+  come. Which partitions spill depends on the memory limit, so the same input
+  joined under two limits produces the same rows in different orders, and the
+  dead letters of its output step follow the same order. The sort-merge and
+  range joins sort their own output (by the driver row's identity), so they
+  realise one order whatever the limit; the inline hash join emits in driver
+  arrival order. The grace
+  join tests that run under several limits compare sorted rows for this
+  reason (`grace_reload_run` in
+  `crates/clinker-exec/src/executor/tests/combine_consumer_lifecycle.rs`,
+  and `crates/clinker-exec/tests/combine_match_first_body_skip.rs`).
+- Files/modules involved:
+  `crates/clinker-exec/src/pipeline/grace_hash/mod.rs` (the probe and reload
+  phases), `crates/clinker-exec/src/executor/combine_dispatch.rs` (the grace
+  arm's output admission).
+- Decision: the grace join's output goes through an ordered, spillable
+  buffer keyed on each driver row's arrival, so its order is the inline hash
+  join's at every limit. The buffer is charged and replaces the uncharged
+  output vector #1228 reports. Recording the order as unspecified was
+  rejected: the Combine page promises one order for every strategy and
+  offers no ordering option of its own. Byte-identical output across memory
+  limits is asserted under
+  [#1250](https://github.com/rustpunk/clinker/issues/1250).
+- Implementation owner: Executor maintainers.
+
 ## Resolved Archive
 
 ### 61. Decoded allocation ownership
@@ -975,6 +1138,29 @@ SWIFT retained trailers carry leases through actual backing destruction. Existin
 allocations remain outside that writer guarantee, and EDIFACT, X12 and HL7
 writer migration remains outstanding. AUTH-06 is still partial. See
 [physical-text ownership](../engine/src/memory-arbitration.md#physical-text-configuration-truncation-tallies-and-trailers).
+
+### 62. Bounded preview can fail node-buffer cleanup
+
+Resolved 2026-10-07 by maintainer decision (an unfused Transform honours its
+Sink's compiled streaming writer). A bounded preview runs every Transform
+unfused so its Sources drain in a fixed order, while a Sink fed by a
+Transform the plan fuses with its Source keeps the streaming writer the
+compiled plan gave it. The unfused Transform never took that writer's
+sender: it parked its rows in a node buffer nobody read, the Sink wrote
+nothing, and the completed walk failed the run on the leaked slot. Now the
+unfused Transform sends its rows through the Sink's streaming writer, as
+the unfused Route and Merge do, and delivers the rows it produced before a
+failure ahead of its error; the cleanup invariant is unchanged and still
+checked. Full runs are unchanged, because outside a preview such a
+Transform always runs fused (`crates/clinker-exec/src/executor/transform_dispatch.rs`;
+the tests `a_preview_of_a_fusable_transform_chain_writes_its_rows` and
+`a_preview_transform_delivers_its_rows_before_its_failure_and_reports_the_same_error`
+in `crates/clinker-exec/src/executor/tests/stream_hop_end.rs`,
+`a_preview_of_a_source_transform_sink_pipeline_prints_its_first_rows` and
+`a_transform_chain_preview_writes_the_same_bytes_every_run` in
+`crates/clinker/tests/run_flag_contract.rs`, and
+`a_transform_preview_that_dead_letters_exits_2_and_writes_no_dead_letter_file`
+in `crates/clinker/tests/dlq_streaming.rs`).
 
 ### 91. A group that mixes decimals and floats
 
@@ -992,6 +1178,26 @@ the branches and the fix (`crates/cxl/src/typecheck/pass.rs`), so the mix
 reaches an aggregate only through a value typecheck cannot see (an untyped
 column, a `numeric` result such as `decimal.clamp(lo, hi)`), where the
 run-time error is the backstop. See `docs/user/src/cxl/aggregates.md`.
+
+### 94. The credential preflight refused on process memory with its own error
+
+Resolved 2026-10-06 by maintainer decision (the credential registry grows
+through a checked charge, like every other consumer). A credential lease is
+charged with `ConsumerHandle::try_resize` on the registry's handle before the
+provider allocates it, checked against the run's charged total under the
+ledger lock; the process's memory reading takes no part. A lease that does not
+fit is refused with `CredentialRegistryErrorKind::MemoryLimitExceeded`, whose
+message stays static and whose E310 report, naming the credential registry,
+is a separate field (`CredentialRegistryError::memory_report`); the report
+holds byte figures and holder labels, never a credential or profile name. A
+refusal charges nothing, so the run's peak charged total never records a
+refused lease. `MemoryArbitrator::should_abort_local` had no caller left and
+was removed (`crates/clinker/src/credential_profile.rs`,
+`acquire_attempt`; the tests
+`bounds_lease_admission_ignores_the_process_memory_reading`,
+`bounds_refused_lease_never_raises_the_run_peak_past_the_limit` and
+`bounds_refused_lease_reports_the_credential_registry_as_an_e310` in
+`crates/clinker/tests/credential_profiles.rs`).
 
 Numbers are never reused. One line per entry: the answer and its evidence.
 

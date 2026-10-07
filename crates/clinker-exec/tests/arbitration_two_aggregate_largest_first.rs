@@ -53,24 +53,28 @@ fn largest_first_picks_the_larger_aggregate() {
     // Smaller aggregate: 64 KiB
     let small_handle = ConsumerHandle::new();
     small_handle.set_bytes(64 * 1024);
-    arbitrator.register_consumer(
-        Arc::new(AggregateLike {
-            handle: small_handle.clone(),
-        }),
-        small_handle.clone(),
-        label("small_totals"),
-    );
+    arbitrator
+        .register_consumer(
+            Arc::new(AggregateLike {
+                handle: small_handle.clone(),
+            }),
+            small_handle.clone(),
+            label("small_totals"),
+        )
+        .expect("a fresh handle registers");
 
     // Larger aggregate: 256 KiB
     let large_handle = ConsumerHandle::new();
     large_handle.set_bytes(256 * 1024);
-    arbitrator.register_consumer(
-        Arc::new(AggregateLike {
-            handle: large_handle.clone(),
-        }),
-        large_handle.clone(),
-        label("large_totals"),
-    );
+    arbitrator
+        .register_consumer(
+            Arc::new(AggregateLike {
+                handle: large_handle.clone(),
+            }),
+            large_handle.clone(),
+            label("large_totals"),
+        )
+        .expect("a fresh handle registers");
 
     arbitrator.set_peak_rss_for_test(75 * 1024 * 1024 * 1024);
 
@@ -101,23 +105,27 @@ fn largest_first_picks_a_new_victim_each_round() {
 
     let small_handle = ConsumerHandle::new();
     small_handle.set_bytes(64 * 1024);
-    arbitrator.register_consumer(
-        Arc::new(AggregateLike {
-            handle: small_handle.clone(),
-        }),
-        small_handle.clone(),
-        label("small_totals"),
-    );
+    arbitrator
+        .register_consumer(
+            Arc::new(AggregateLike {
+                handle: small_handle.clone(),
+            }),
+            small_handle.clone(),
+            label("small_totals"),
+        )
+        .expect("a fresh handle registers");
 
     let large_handle = ConsumerHandle::new();
     large_handle.set_bytes(256 * 1024);
-    arbitrator.register_consumer(
-        Arc::new(AggregateLike {
-            handle: large_handle.clone(),
-        }),
-        large_handle.clone(),
-        label("large_totals"),
-    );
+    arbitrator
+        .register_consumer(
+            Arc::new(AggregateLike {
+                handle: large_handle.clone(),
+            }),
+            large_handle.clone(),
+            label("large_totals"),
+        )
+        .expect("a fresh handle registers");
 
     arbitrator.set_peak_rss_for_test(75 * 1024 * 1024 * 1024);
     assert!(arbitrator.should_spill());

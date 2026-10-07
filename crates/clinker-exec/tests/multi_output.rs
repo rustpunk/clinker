@@ -765,10 +765,14 @@ fn shared_port_writer_error_releases_backing() {
     }
 
     let shared = shared_port_csv("s");
+    // The limit must hold the Source's read of all 24 rows of 4 KiB, or the
+    // run fails at the Source before either Sink writes. Measured against the
+    // ledger capacity, the read is refused at 102,000 bytes and passes at
+    // 104,000, so 128K clears it with room to spare.
     let yaml = r#"
 pipeline:
   name: shared_port_writer_error_cleanup
-  memory: { limit: "64K", backpressure: spill }
+  memory: { limit: "128K", backpressure: spill }
 nodes:
   - type: source
     name: shared

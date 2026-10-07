@@ -1,4 +1,5 @@
-//! Inter-stage handoff storage for `ExecutorContext::node_buffers`.
+//! Inter-stage handoff storage: the node-buffer slots the walk reclaim set
+//! keeps for each dispatch scope (`NodeBufferSlots`).
 //!
 //! A single `NodeBuffer` slot can hold:
 //!
@@ -9,7 +10,8 @@
 //!   they live in the `pending_puncts` sidecar.
 //! - `Mixed`: a mem tail accumulated after a partial spill.
 //! - `ReReadable`: immutable resident or spilled backing shared by sequential
-//!   fan-out consumers, each with an independent cursor.
+//!   fan-out consumers, each with an independent cursor. A backing may chain
+//!   several others, read one after another in order.
 //!
 //! Every consumer drains a slot through [`NodeBuffer::drain`], which
 //! returns an iterator that streams memory events first, then per-spill
@@ -55,6 +57,22 @@ pub(crate) fn record_byte_cost(column_count: usize) -> u64 {
         as u64
 }
 
+/// One resident row's share of a reclaim victim's ranking figure: the row's
+/// slot cost ([`record_byte_cost`]) plus the heap payload no Source has
+/// charged (computed strings, lists, record variables). Text a Source read
+/// is governed and charged to that Source, so it is left out even when a
+/// spill would drop its last copy and free it; the figure then understates
+/// what the spill frees (open question 92). It can also overstate it: text
+/// a clone shares with another holder is counted in full, though spilling
+/// one holder frees none of it. A node-buffer slot and every
+/// operator buffer that ranks its rows against a slot count a row through
+/// this one function, so the same row ranks the same wherever it is held.
+/// A ranking figure only; never charged.
+pub(crate) fn resident_record_reclaimable_bytes(record: &Record) -> u64 {
+    record_byte_cost(record.schema().column_count())
+        .saturating_add(record.legacy_estimated_heap_size() as u64)
+}
+
 /// Existing logical-slot estimate for the actual row, excluding only a values
 /// backing already charged to the supplied run. Nested payloads are outside
 /// this fixed-row heuristic; shared allocation owners account for them.
@@ -70,7 +88,7 @@ pub(crate) fn unaccounted_record_byte_cost(
     (std::mem::size_of::<(Record, SourceRowId)>() + slots) as u64
 }
 
-/// One slot inside `ExecutorContext::node_buffers`.
+/// One node-buffer slot, kept in the walk reclaim set's `NodeBufferSlots`.
 pub(crate) enum NodeBuffer {
     /// All events live in memory — records and punctuations interleaved
     /// in arrival order.
@@ -140,7 +158,19 @@ pub(crate) enum ReReadableNodeBuffer {
         spills: Vec<(SpillFile<SourceRowId>, u64)>,
         pending_puncts: Vec<Punctuation>,
     },
+    /// Other backings read one after another, each whole before the next,
+    /// sharing them rather than copying: the segments of one parked
+    /// cross-region edge, in the order they were parked. Never nests: every
+    /// part is one of the other variants.
+    Chain(Vec<Arc<ReReadableNodeBuffer>>),
 }
+
+/// Borrowed events, from one backing or from each part of a chain in turn.
+type BorrowedEvents<'a> = Box<dyn Iterator<Item = &'a StreamEvent> + 'a>;
+
+/// Borrowed spill chunks, from one backing or from each part of a chain in
+/// turn.
+type BorrowedChunks<'a> = Box<dyn Iterator<Item = &'a (SpillFile<SourceRowId>, u64)> + 'a>;
 
 impl ReReadableNodeBuffer {
     fn len_hint(&self) -> usize {
@@ -154,28 +184,49 @@ impl ReReadableNodeBuffer {
                         .map(|(_, count)| *count as usize)
                         .sum::<usize>()
             }
+            Self::Chain(parts) => parts.iter().map(|part| part.len_hint()).sum(),
         }
     }
 
-    fn memory_events(&self) -> &[StreamEvent] {
+    /// Every resident event, a chain's parts in order.
+    fn memory_events(&self) -> BorrowedEvents<'_> {
+        match self {
+            Self::Chain(parts) => Box::new(parts.iter().flat_map(|part| part.memory_events())),
+            other => Box::new(other.leaf_memory_events().iter()),
+        }
+    }
+
+    /// Every spill chunk, a chain's parts in order.
+    fn spill_chunks(&self) -> BorrowedChunks<'_> {
+        match self {
+            Self::Chain(parts) => Box::new(parts.iter().flat_map(|part| part.spill_chunks())),
+            other => Box::new(other.leaf_spill_chunks().iter()),
+        }
+    }
+
+    /// This backing's own resident events; none for a chain, whose events
+    /// live in its parts.
+    fn leaf_memory_events(&self) -> &[StreamEvent] {
         match self {
             Self::Memory(events) => events,
             Self::Mixed { mem, .. } => mem,
-            Self::Spilled { .. } => &[],
+            Self::Spilled { .. } | Self::Chain(_) => &[],
         }
     }
 
-    fn spill_chunks(&self) -> &[(SpillFile<SourceRowId>, u64)] {
+    /// This backing's own spill chunks; none for a chain.
+    fn leaf_spill_chunks(&self) -> &[(SpillFile<SourceRowId>, u64)] {
         match self {
-            Self::Memory(_) => &[],
+            Self::Memory(_) | Self::Chain(_) => &[],
             Self::Spilled { chunks, .. } => chunks,
             Self::Mixed { spills, .. } => spills,
         }
     }
 
-    fn pending_puncts(&self) -> &[Punctuation] {
+    /// This backing's own trailing punctuations; none for a chain.
+    fn leaf_pending_puncts(&self) -> &[Punctuation] {
         match self {
-            Self::Memory(_) => &[],
+            Self::Memory(_) | Self::Chain(_) => &[],
             Self::Spilled { pending_puncts, .. } | Self::Mixed { pending_puncts, .. } => {
                 pending_puncts
             }
@@ -278,6 +329,36 @@ impl NodeBuffer {
         Ok(Self::ReReadable(backing))
     }
 
+    /// [`Self::reread`], returning the shared backing the new cursor reads
+    /// rather than the cursor, so a caller can chain it with others
+    /// ([`Self::chained`]).
+    pub(crate) fn reread_backing(&mut self) -> Result<Arc<ReReadableNodeBuffer>, PipelineError> {
+        match self.reread()? {
+            Self::ReReadable(backing) => Ok(backing),
+            _ => unreachable!("reread always returns a re-readable cursor"),
+        }
+    }
+
+    /// One cursor reading `parts` one after another, in order, each whole
+    /// before the next. Shares every part's backing (nothing is copied), so
+    /// the parts stay alive, and a spill of their owner frees nothing, until
+    /// the cursor drops. No parts is an empty slot; one part is that part's
+    /// own cursor.
+    pub(crate) fn chained(parts: Vec<Arc<ReReadableNodeBuffer>>) -> Self {
+        let mut flat: Vec<Arc<ReReadableNodeBuffer>> = Vec::with_capacity(parts.len());
+        for part in parts {
+            match part.as_ref() {
+                ReReadableNodeBuffer::Chain(inner) => flat.extend(inner.iter().cloned()),
+                _ => flat.push(part),
+            }
+        }
+        match flat.len() {
+            0 => Self::Memory(Vec::new()),
+            1 => Self::ReReadable(flat.pop().expect("one part")),
+            _ => Self::ReReadable(Arc::new(ReReadableNodeBuffer::Chain(flat))),
+        }
+    }
+
     /// Recover the ordinary owned representation for the authoritative last
     /// reader when no earlier cursor remains live. A still-shared Arc remains
     /// re-readable defensively; synchronous dispatch normally unwraps here.
@@ -303,7 +384,20 @@ impl NodeBuffer {
                 spills,
                 pending_puncts,
             },
+            // A chain has no owned form: it only ever shares its parts.
+            Ok(chain @ ReReadableNodeBuffer::Chain(_)) => Self::ReReadable(Arc::new(chain)),
             Err(backing) => Self::ReReadable(backing),
+        }
+    }
+
+    /// The slot's resident events, whatever holds them: none for a slot
+    /// whose rows are all on disk.
+    fn resident_events(&self) -> BorrowedEvents<'_> {
+        match self {
+            Self::Memory(events) => Box::new(events.iter()),
+            Self::Mixed { mem, .. } => Box::new(mem.iter()),
+            Self::Spilled { .. } | Self::MergeSpilled { .. } => Box::new(std::iter::empty()),
+            Self::ReReadable(backing) => backing.memory_events(),
         }
     }
 
@@ -389,14 +483,7 @@ impl NodeBuffer {
     /// resident rows; spill-aware pre-flight validation is part of
     /// the spill-wiring sub-issue.
     pub(crate) fn peek_mem_records(&self) -> Vec<(&Record, SourceRowId)> {
-        let mem_slice = match self {
-            Self::Memory(v) => v.as_slice(),
-            Self::Mixed { mem, .. } => mem.as_slice(),
-            Self::Spilled { .. } | Self::MergeSpilled { .. } => &[],
-            Self::ReReadable(backing) => backing.memory_events(),
-        };
-        mem_slice
-            .iter()
+        self.resident_events()
             .filter_map(|e| match e {
                 StreamEvent::Record(r, rn) => Some((r, *rn)),
                 StreamEvent::Punctuation(_) => None,
@@ -425,20 +512,15 @@ impl NodeBuffer {
                 return runs.first().map(|f| f.schema().column_count()).unwrap_or(0);
             }
             Self::ReReadable(backing) => {
-                if let Some(columns) =
-                    backing
-                        .memory_events()
-                        .iter()
-                        .find_map(|event| match event {
-                            StreamEvent::Record(record, _) => Some(record.schema().column_count()),
-                            StreamEvent::Punctuation(_) => None,
-                        })
-                {
+                if let Some(columns) = backing.memory_events().find_map(|event| match event {
+                    StreamEvent::Record(record, _) => Some(record.schema().column_count()),
+                    StreamEvent::Punctuation(_) => None,
+                }) {
                     return columns;
                 }
                 return backing
                     .spill_chunks()
-                    .first()
+                    .next()
                     .map(|(file, _)| file.schema().column_count())
                     .unwrap_or(0);
             }
@@ -462,43 +544,51 @@ impl NodeBuffer {
     /// accounted via `MemoryArbitrator::cumulative_spill_bytes` (the disk
     /// quota), not this counter, so a `Spilled` slot reports `0` here.
     pub(crate) fn estimated_memory_bytes(&self) -> u64 {
-        let events = match self {
-            Self::Memory(events) => events.as_slice(),
-            Self::Mixed { mem, .. } => mem.as_slice(),
-            Self::Spilled { .. } | Self::MergeSpilled { .. } => return 0,
-            Self::ReReadable(backing) => backing.memory_events(),
-        };
-        events.iter().fold(0u64, |bytes, event| match event {
-            StreamEvent::Record(record, _) => {
-                bytes.saturating_add(record_byte_cost(record.schema().column_count()))
-            }
-            StreamEvent::Punctuation(_) => bytes,
-        })
+        self.resident_events()
+            .fold(0u64, |bytes, event| match event {
+                StreamEvent::Record(record, _) => {
+                    bytes.saturating_add(record_byte_cost(record.schema().column_count()))
+                }
+                StreamEvent::Punctuation(_) => bytes,
+            })
+    }
+
+    /// The slot's ranking figure as a reclaim victim: each resident record's
+    /// slot cost plus the heap payload no Source has charged
+    /// ([`resident_record_reclaimable_bytes`]). Text a Source read is left
+    /// out, though a spill that drops its last copy frees it, so the figure
+    /// can understate what the spill frees. It can overstate it too: text a
+    /// clone shares with another holder is counted in full, though spilling
+    /// one holder frees none of it. The pass measures what each spill
+    /// actually frees. Rows already on disk count 0. Never charged.
+    pub(crate) fn reclaimable_bytes(&self) -> u64 {
+        self.resident_events()
+            .fold(0u64, |bytes, event| match event {
+                StreamEvent::Record(record, _) => {
+                    bytes.saturating_add(resident_record_reclaimable_bytes(record))
+                }
+                StreamEvent::Punctuation(_) => bytes,
+            })
     }
 
     /// Actual resident fixed-row attribution to this run, with each row's
     /// private values backing classified independently. Does not allocate.
     pub(crate) fn unaccounted_memory_bytes(&self, resources: &AllocationResources) -> u64 {
-        let events = match self {
-            Self::Memory(events) => events.as_slice(),
-            Self::Mixed { mem, .. } => mem.as_slice(),
-            Self::Spilled { .. } | Self::MergeSpilled { .. } => return 0,
-            Self::ReReadable(backing) => backing.memory_events(),
-        };
-        events.iter().fold(0u64, |bytes, event| match event {
-            StreamEvent::Record(record, _) => {
-                bytes.saturating_add(unaccounted_record_byte_cost(record, resources))
-            }
-            StreamEvent::Punctuation(_) => bytes,
-        })
+        self.resident_events()
+            .fold(0u64, |bytes, event| match event {
+                StreamEvent::Record(record, _) => {
+                    bytes.saturating_add(unaccounted_record_byte_cost(record, resources))
+                }
+                StreamEvent::Punctuation(_) => bytes,
+            })
     }
 
     /// Full logical-slot forecast for independently decoded disk rows.
     fn disk_materialized_bytes(&self) -> u64 {
-        let chunks = match self {
+        let chunks: BorrowedChunks<'_> = match self {
             Self::Memory(_) => return 0,
-            Self::Spilled { chunks, .. } => chunks.as_slice(),
-            Self::Mixed { spills, .. } => spills.as_slice(),
+            Self::Spilled { chunks, .. } => Box::new(chunks.iter()),
+            Self::Mixed { spills, .. } => Box::new(spills.iter()),
             Self::ReReadable(backing) => backing.spill_chunks(),
             Self::MergeSpilled {
                 runs, row_count, ..
@@ -508,7 +598,7 @@ impl NodeBuffer {
                 });
             }
         };
-        chunks.iter().fold(0u64, |bytes, (file, count)| {
+        chunks.fold(0u64, |bytes, (file, count)| {
             bytes.saturating_add(
                 record_byte_cost(file.schema().column_count()).saturating_mul(*count),
             )
@@ -638,11 +728,15 @@ impl NodeBuffer {
     /// alongside the chunk's on-disk byte size for the caller's disk-quota
     /// accounting.
     ///
-    /// The arbitrator's resident-slot spill sweep
-    /// (`dispatch::service_node_buffer_spill_requests`) calls this when it
-    /// elects a live `node_buffers` slot as a spill victim: the slot's
-    /// records leave RAM for disk and the caller discharges the slot's
-    /// in-memory charge. Punctuations never spill — they move to the
+    /// Both paths that spill a resident slot reach it here, through
+    /// `ResidentSlotSpill::spill_slot`: a reclaim pass on the walk, which
+    /// elects the slot's consumer by its ranking figure and spills it at
+    /// once, and the spill sweep
+    /// (`dispatch::service_node_buffer_spill_requests`), which spills each
+    /// slot whose consumer has a raised spill request (raised by the
+    /// soft-threshold poll, or by a pass that found the slot in use). The
+    /// slot's records leave RAM for disk and the caller discharges the
+    /// slot's in-memory charge. Punctuations never spill — they move to the
     /// `Spilled` variant's `pending_puncts` sidecar and drain after the
     /// spill chunk, preserving the "punctuation trails its document"
     /// order. A slot holding only punctuations (no records) stays `Memory`
@@ -745,6 +839,12 @@ impl NodeBuffer {
                 };
             }
             Self::ReReadable(backing) => {
+                if let ReReadableNodeBuffer::Chain(parts) = backing.as_ref() {
+                    return NodeBufferDrain::Chain {
+                        parts: parts.clone().into_iter(),
+                        current: None,
+                    };
+                }
                 return NodeBufferDrain::ReReadable {
                     current: None,
                     backing,
@@ -786,6 +886,9 @@ impl TransientNodeBufferReservation {
         id: crate::pipeline::memory::ConsumerId,
         handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
     ) -> Self {
+        // The rows leave the slot with the reservation, so no pass may elect
+        // this consumer for them any more.
+        handle.set_reclaimable(0);
         Self {
             budget,
             consumer_id: id,
@@ -798,41 +901,45 @@ impl TransientNodeBufferReservation {
     /// consumer registered. Materializing a sequential scan uses this for the
     /// interval where the immutable backing and its resident output vector
     /// coexist.
+    ///
+    /// The growth is charged through the handle, so on the walk a shortfall
+    /// first spills other walk-owned state; the error (E310) names `node`
+    /// reserving `surface`, the rows the caller is reserving for, only when
+    /// that reclaim could not make room.
     pub(crate) fn reserve_additional(
         &self,
         additional_bytes: u64,
         node: &str,
+        surface: clinker_plan::runtime_error::MemorySurface,
     ) -> Result<(), PipelineError> {
-        if additional_bytes == 0 {
+        // A zero limit has always meant that a materialization is not
+        // checked at all; the ledger itself would refuse every byte.
+        if self.budget.hard_limit() == 0 {
+            self.handle.add_bytes(additional_bytes);
             return Ok(());
         }
-        // This preflight accounts the pipeline-owned allocations represented by
-        // consumer handles. Adding an allocation estimate to process RSS would
-        // double-count tracked state already present in RSS and make a small,
-        // intentionally spill-heavy budget fail solely on the host process's
-        // fixed baseline.
-        let charged_pressure = self.budget.sum_consumer_usage();
-        let projected_pressure = charged_pressure.saturating_add(additional_bytes);
-        let hard_limit = self.budget.hard_limit();
-        if hard_limit != 0 && projected_pressure > hard_limit {
-            return Err(PipelineError::MemoryBudgetExceeded {
-                node: node.to_string(),
-                used: projected_pressure,
-                limit: hard_limit,
-                source: clinker_plan::BudgetCategory::NodeBuffer,
-                detail: Some(format!(
-                    "node-buffer materialization overlap projected {projected_pressure} bytes from charged pressure {charged_pressure} plus {additional_bytes} temporary bytes"
-                )),
-            });
-        }
-        self.handle.add_bytes(additional_bytes);
-        Ok(())
+        self.handle.try_grow(additional_bytes).map_err(|shortfall| {
+            node_buffer_shortfall_error(node, surface, shortfall, &self.budget)
+        })
     }
 
-    /// Replace the reservation's reported bytes after a representation
-    /// transition has completed.
-    pub(crate) fn set_bytes(&self, bytes: u64) {
-        self.handle.set_bytes(bytes);
+    /// Restate the reservation's bytes after a representation transition
+    /// has completed: a fall is a release; a rise is a growth, checked (and
+    /// on the walk reclaimed for) as [`Self::reserve_additional`] checks it,
+    /// failing with E310 naming `node` reserving `surface`.
+    pub(crate) fn resize(
+        &self,
+        bytes: u64,
+        node: &str,
+        surface: clinker_plan::runtime_error::MemorySurface,
+    ) -> Result<(), PipelineError> {
+        if self.budget.hard_limit() == 0 {
+            self.handle.set_bytes(bytes);
+            return Ok(());
+        }
+        self.handle.try_resize(bytes).map_err(|shortfall| {
+            node_buffer_shortfall_error(node, surface, shortfall, &self.budget)
+        })
     }
 
     /// Current bytes held by this reservation.
@@ -842,24 +949,65 @@ impl TransientNodeBufferReservation {
 
     /// Move already-charged sibling reservations onto this registration.
     ///
-    /// No allocation happens here. The sibling handles are zeroed before this
-    /// handle grows, so the arbitrator never observes a transient duplicate
-    /// charge while several harvested vectors become one node-buffer slot.
+    /// No allocation happens here. Each sibling's bytes move onto this
+    /// handle in one ledger step, so the arbitrator never observes a
+    /// transient duplicate charge, or a gap, while several harvested vectors
+    /// become one node-buffer slot.
     pub(crate) fn absorb_charges(&self, others: Vec<Self>) {
-        let charged_before = self.budget.sum_consumer_usage();
-        let mut combined = self.bytes();
+        let charged_before = self.budget.charged_bytes();
         for other in &others {
             debug_assert!(std::sync::Arc::ptr_eq(&self.budget, &other.budget));
-            combined = combined.saturating_add(other.bytes());
-            other.set_bytes(0);
+            let moved = other.bytes();
+            self.handle.take_over(&other.handle, moved, moved);
         }
         drop(others);
-        self.set_bytes(combined);
         debug_assert_eq!(
-            self.budget.sum_consumer_usage(),
+            self.budget.charged_bytes(),
             charged_before,
             "reservation charge consolidation must preserve total usage"
         );
+    }
+
+    /// Hand the reserved rows to the consumer that now holds them: release
+    /// this reservation's whole charge and charge `bytes` to `to` in one
+    /// ledger step ([`ConsumerHandle::take_over`]), unchecked, then remove
+    /// the registration. The rows are charged to exactly one owner at every
+    /// instant. Nothing here admits what `bytes` adds beyond this
+    /// reservation's charge: the caller must already have admitted that
+    /// growth, or call [`Self::hand_over_admitted`], which does.
+    ///
+    /// [`ConsumerHandle::take_over`]: crate::pipeline::memory::ConsumerHandle::take_over
+    pub(crate) fn hand_over_to(self, to: &crate::pipeline::memory::ConsumerHandle, bytes: u64) {
+        to.take_over(&self.handle, self.handle.bytes(), bytes);
+    }
+
+    /// Hand `reservation`'s rows to `to` charged at `bytes`, admitting first
+    /// what that adds. The growth, `bytes` less the reservation's charge (all
+    /// of `bytes` when the rows arrived uncharged), is a checked growth of
+    /// `to` ([`ConsumerHandle::try_grow`]): it reads only the ledger, and on
+    /// the walk it reclaims with `to`'s consumer as the requester before it
+    /// refuses. The hand-over that follows is then net zero, so the charged
+    /// total never passes the limit through it. A refusal is E310 built from
+    /// the shortfall, naming `to`'s consumer and the growth; `to` is
+    /// unchanged and the reservation drops with its charge.
+    ///
+    /// [`ConsumerHandle::try_grow`]: crate::pipeline::memory::ConsumerHandle::try_grow
+    pub(crate) fn hand_over_admitted(
+        reservation: Option<Self>,
+        to: &crate::pipeline::memory::ConsumerHandle,
+        bytes: u64,
+        budget: &crate::pipeline::memory::MemoryArbitrator,
+    ) -> Result<(), PipelineError> {
+        let held = reservation.as_ref().map_or(0, Self::bytes);
+        let growth = bytes.saturating_sub(held);
+        to.try_grow(growth)
+            .map_err(|shortfall| PipelineError::MemoryBudgetExceeded {
+                report: shortfall.into_report(budget),
+            })?;
+        if let Some(reservation) = reservation {
+            reservation.hand_over_to(to, bytes - growth);
+        }
+        Ok(())
     }
 
     /// Transfer ownership of the live registration to a node-buffer registry.
@@ -877,7 +1025,7 @@ impl TransientNodeBufferReservation {
 impl Drop for TransientNodeBufferReservation {
     fn drop(&mut self) {
         if self.owns_registration {
-            self.handle.set_bytes(0);
+            self.handle.shrink(self.handle.bytes());
             self.budget.unregister_consumer(self.consumer_id);
         }
     }
@@ -887,48 +1035,56 @@ impl Drop for TransientNodeBufferReservation {
 /// events into a new resident vector. This retains the reservation mechanism
 /// used by composition canonicalization without coupling fan-out access to a
 /// memory-only buffer clone.
+///
+/// The reservation's consumer registers empty and then grows by
+/// `reserved_bytes` through its handle, so on the walk a shortfall first
+/// spills other walk-owned state (this reservation's own consumer, elected
+/// last, holds nothing yet). E310 naming `node` and its rows collected for a
+/// full scan is returned only when that reclaim could not make room; the
+/// registration is then removed.
 pub(crate) fn reserve_node_buffer_materialization(
     reserved_bytes: u64,
     budget: &std::sync::Arc<crate::pipeline::memory::MemoryArbitrator>,
     node: &str,
 ) -> Result<TransientNodeBufferReservation, PipelineError> {
-    // Use the exact pipeline-owned charge ledger for an allocation preflight.
-    // RSS remains the asynchronous spill/abort signal; adding this estimate to
-    // RSS here would double-count charged state and include the process's fixed
-    // baseline, which a spill-backed scan cannot reclaim.
-    let charged_pressure = budget.sum_consumer_usage();
-    let projected_pressure = charged_pressure.saturating_add(reserved_bytes);
-    let hard_limit = budget.hard_limit();
-    if hard_limit != 0 && projected_pressure > hard_limit {
-        return Err(PipelineError::MemoryBudgetExceeded {
-            node: node.to_string(),
-            used: projected_pressure,
-            limit: hard_limit,
-            source: clinker_plan::BudgetCategory::NodeBuffer,
-            detail: Some(format!(
-                "transient node-buffer materialization projected {projected_pressure} bytes from charged pressure {charged_pressure} plus {reserved_bytes} reserved bytes"
-            )),
-        });
-    }
-
+    let surface = clinker_plan::runtime_error::MemorySurface::ScanMaterialization;
     let handle = crate::pipeline::memory::ConsumerHandle::new();
-    handle.set_bytes(reserved_bytes);
     let consumer_id = budget.register_node_consumer(
         std::sync::Arc::new(TransientNodeBufferConsumer::new(handle.clone())),
         handle.clone(),
         clinker_plan::runtime_error::ConsumerLabel {
             node: node.to_string(),
-            surface: clinker_plan::runtime_error::MemorySurface::ScanMaterialization,
+            surface: surface.clone(),
         },
-    );
+    )?;
     let reservation = TransientNodeBufferReservation {
         budget: std::sync::Arc::clone(budget),
         consumer_id,
         handle,
         owns_registration: true,
     };
-
+    // Dropping the reservation on a refusal unregisters its consumer.
+    reservation.reserve_additional(reserved_bytes, node, surface)?;
     Ok(reservation)
+}
+
+/// The E310 for a growth of rows the node `node` reserves as `surface`,
+/// refused after reclaiming: the refusal's own report, naming `node` and
+/// `surface` as the requester. The growth may be charged through a slot
+/// registered under another node (the producer whose buffer the reader
+/// takes); the holder list still shows that slot.
+pub(crate) fn node_buffer_shortfall_error(
+    node: &str,
+    surface: clinker_plan::runtime_error::MemorySurface,
+    shortfall: crate::pipeline::memory::ledger::Shortfall,
+    budget: &crate::pipeline::memory::MemoryArbitrator,
+) -> PipelineError {
+    let mut report = shortfall.into_report(budget);
+    report.requester = Some(clinker_plan::runtime_error::ConsumerLabel {
+        node: node.to_string(),
+        surface,
+    });
+    PipelineError::MemoryBudgetExceeded { report }
 }
 
 /// Arbitrator wrapper for a transient materialization. Unlike a resident
@@ -936,6 +1092,11 @@ pub(crate) fn reserve_node_buffer_materialization(
 /// service a spill request, so it advertises neither reclamation nor
 /// back-pressure. Its owner releases the charge only when the materialization is dropped
 /// or transfers it into a composition body slot.
+///
+/// `reclaimable_bytes` is the figure its handle records, which is 0 for the
+/// materialization itself. Only once its rows are published as a composition
+/// body's seed slot, where the walk can spill them, does the slot record
+/// their resident bytes there.
 struct TransientNodeBufferConsumer {
     handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
 }
@@ -949,6 +1110,10 @@ impl TransientNodeBufferConsumer {
 impl crate::pipeline::memory::MemoryConsumer for TransientNodeBufferConsumer {
     fn current_usage(&self) -> u64 {
         self.handle.bytes()
+    }
+
+    fn reclaimable_bytes(&self) -> u64 {
+        self.handle.reclaimable()
     }
 
     fn peak_charged_bytes(&self) -> Option<u64> {
@@ -1023,6 +1188,12 @@ pub(crate) enum NodeBufferDrain {
         memory_index: usize,
         spill_index: usize,
         punctuation_index: usize,
+    },
+    /// A chain of re-readable backings, each drained whole, in order,
+    /// before the next part opens.
+    Chain {
+        parts: VecIntoIter<Arc<ReReadableNodeBuffer>>,
+        current: Option<Box<NodeBufferDrain>>,
     },
 }
 
@@ -1125,7 +1296,7 @@ impl Iterator for NodeBufferDrain {
                 current,
                 punctuation_index,
             } => {
-                if let Some(event) = backing.memory_events().get(*memory_index) {
+                if let Some(event) = backing.leaf_memory_events().get(*memory_index) {
                     *memory_index += 1;
                     return Some(Ok(event.clone()));
                 }
@@ -1139,7 +1310,7 @@ impl Iterator for NodeBufferDrain {
                             None => *current = None,
                         }
                     }
-                    let chunks = backing.spill_chunks();
+                    let chunks = backing.leaf_spill_chunks();
                     if let Some((file, _)) = chunks.get(*spill_index) {
                         *spill_index += 1;
                         match file.reader() {
@@ -1148,18 +1319,28 @@ impl Iterator for NodeBufferDrain {
                         }
                         continue;
                     }
-                    let puncts = backing.pending_puncts();
+                    let puncts = backing.leaf_pending_puncts();
                     let punctuation = puncts.get(*punctuation_index)?.clone();
                     *punctuation_index += 1;
                     return Some(Ok(StreamEvent::punctuation(punctuation)));
                 }
             }
+            Self::Chain { parts, current } => loop {
+                if let Some(part) = current.as_mut() {
+                    match part.next() {
+                        Some(item) => return Some(item),
+                        None => *current = None,
+                    }
+                }
+                let part = parts.next()?;
+                *current = Some(Box::new(NodeBuffer::ReReadable(part).drain()));
+            },
         }
     }
 }
 
-/// `MemoryConsumer` wrapper for one `ctx.node_buffers` slot. Holds an
-/// `Arc<ConsumerHandle>` shared with the dispatcher: every producer
+/// `MemoryConsumer` wrapper for one node-buffer slot in the walk reclaim set.
+/// Holds an `Arc<ConsumerHandle>` shared with the dispatcher: every producer
 /// admission updates `handle.bytes` from `NodeBuffer::unaccounted_memory_bytes`;
 /// every consumer drain decrements it. `try_spill` flips the handle's
 /// spill-request flag but performs no I/O itself; the dispatcher's
@@ -1197,6 +1378,15 @@ impl crate::pipeline::memory::MemoryConsumer for NodeBufferConsumer {
         self.handle.bytes()
     }
 
+    /// The slot's resident rows with their payload
+    /// ([`NodeBuffer::reclaimable_bytes`]), recorded on the handle whenever
+    /// the walk publishes the slot's buffer and whenever the slot spills; 0
+    /// for a slot that holds nothing resident, and for a handle that backs
+    /// no walk-owned slot (a streaming hand-off's in-flight batches).
+    fn reclaimable_bytes(&self) -> u64 {
+        self.handle.reclaimable()
+    }
+
     fn peak_charged_bytes(&self) -> Option<u64> {
         Some(self.handle.peak_bytes())
     }
@@ -1232,6 +1422,7 @@ mod tests {
     use std::sync::Arc;
 
     use clinker_plan::plan::EntityRef;
+    use clinker_plan::runtime_error::MemorySurface;
     use clinker_record::{Schema, Value, synthetic_document_context};
 
     use crate::executor::stream_event::{Punctuation, StreamEvent};
@@ -1829,17 +2020,19 @@ mod tests {
         let baseline_id = register_fixed(&budget, baseline_usage);
 
         match reserve_node_buffer_materialization(reserved_bytes, &budget, "clone_site") {
-            Err(PipelineError::MemoryBudgetExceeded {
-                node,
-                used,
-                limit,
-                source,
-                ..
-            }) => {
-                assert_eq!(node, "clone_site");
-                assert_eq!(used, hard_limit + 1);
-                assert_eq!(limit, hard_limit);
-                assert_eq!(source, clinker_plan::BudgetCategory::NodeBuffer);
+            Err(PipelineError::MemoryBudgetExceeded { report }) => {
+                assert_eq!(
+                    report.requester,
+                    Some(clinker_plan::runtime_error::ConsumerLabel {
+                        node: "clone_site".to_string(),
+                        surface: clinker_plan::runtime_error::MemorySurface::ScanMaterialization,
+                    })
+                );
+                assert_eq!(
+                    report.charged_bytes + report.requested_bytes,
+                    hard_limit + 1
+                );
+                assert_eq!(report.limit.bytes(), hard_limit);
             }
             Ok(_) => panic!("expected pre-allocation E310 NodeBuffer; reservation succeeded"),
             Err(other) => panic!("expected pre-allocation E310 NodeBuffer; got {other:?}"),
@@ -1960,6 +2153,76 @@ mod tests {
     }
 
     #[test]
+    fn transient_reservation_resize_checks_a_rise_and_releases_a_fall() {
+        let kib = 1024u64;
+        let capacity = 64 * kib;
+        let budget = roomy_arbitrator();
+        budget.set_test_capacity(capacity);
+        let reservation = reserve_node_buffer_materialization(16 * kib, &budget, "canonicalize")
+            .expect("the first 16 KiB fit the capacity");
+        assert_eq!(budget.charged_bytes(), 16 * kib);
+
+        reservation
+            .resize(40 * kib, "canonicalize", MemorySurface::ScanMaterialization)
+            .expect("a rise that fits is granted");
+        assert_eq!(
+            budget.charged_bytes(),
+            40 * kib,
+            "a granted rise is charged exactly"
+        );
+
+        // Off the walk nothing is reclaimed, so a rise past the capacity is
+        // refused at once.
+        match reservation.resize(
+            capacity + 1,
+            "canonicalize",
+            MemorySurface::ScanMaterialization,
+        ) {
+            Err(PipelineError::MemoryBudgetExceeded { report }) => {
+                assert_eq!(
+                    report.requester,
+                    Some(clinker_plan::runtime_error::ConsumerLabel {
+                        node: "canonicalize".to_string(),
+                        surface: clinker_plan::runtime_error::MemorySurface::ScanMaterialization,
+                    })
+                );
+            }
+            Ok(()) => panic!("a rise past the capacity must be refused with E310"),
+            Err(other) => panic!("expected E310 naming the node; got {other:?}"),
+        }
+        assert_eq!(
+            budget.charged_bytes(),
+            40 * kib,
+            "a refused rise charges nothing"
+        );
+        assert_eq!(reservation.bytes(), 40 * kib);
+
+        reservation
+            .resize(8 * kib, "canonicalize", MemorySurface::ScanMaterialization)
+            .expect("a fall is a release and always succeeds");
+        assert_eq!(
+            budget.charged_bytes(),
+            8 * kib,
+            "a fall releases exactly the difference"
+        );
+        drop(reservation);
+        assert_eq!(budget.charged_bytes(), 0);
+
+        let unlimited = Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
+            0,
+            0.80,
+            0.70,
+            Box::new(crate::pipeline::memory::NoOpPolicy),
+        ));
+        let reservation = reserve_node_buffer_materialization(kib, &unlimited, "canonicalize")
+            .expect("a zero limit is unchecked");
+        reservation
+            .resize(1 << 30, "canonicalize", MemorySurface::ScanMaterialization)
+            .expect("a zero limit records a rise unchecked");
+        assert_eq!(unlimited.charged_bytes(), 1 << 30);
+    }
+
+    #[test]
     fn materialization_reservation_preserves_zero_limit_as_unlimited() {
         let s = schema();
         let buffer = NodeBuffer::Memory(vec![rec_event(&s, 1, "a", 1)]);
@@ -2001,7 +2264,7 @@ mod tests {
         let baseline = register_fixed(&budget, hard);
 
         reservation
-            .reserve_additional(0, "plain_memory")
+            .reserve_additional(0, "plain_memory", MemorySurface::ScanMaterialization)
             .expect("a zero-overlap ownership move is a true no-op");
 
         budget.unregister_consumer(baseline);
@@ -2130,6 +2393,50 @@ mod tests {
     }
 
     #[test]
+    fn a_chain_reads_each_part_whole_in_order_and_shares_its_backing() {
+        let s = schema();
+        let mut first = NodeBuffer::Memory(Vec::new());
+        first.push(rec(&s, 1, "a"), 10);
+        first.push(rec(&s, 2, "b"), 11);
+        let (mut first, _) = first
+            .spill_resident_memory(None, true)
+            .expect("resident spill ok");
+        let mut second = NodeBuffer::Memory(Vec::new());
+        second.push(rec(&s, 3, "c"), 12);
+        let mut third = NodeBuffer::Memory(Vec::new());
+        third.push(rec(&s, 4, "d"), 13);
+        third.push(rec(&s, 5, "e"), 14);
+
+        let parts = vec![
+            first.reread_backing().unwrap(),
+            second.reread_backing().unwrap(),
+            third.reread_backing().unwrap(),
+        ];
+        let view = NodeBuffer::chained(parts);
+        assert_eq!(view.len_hint(), 5);
+        assert_eq!(view.first_record_column_count(), 2);
+        // The chain copies nothing: the resident parts are shared, so a
+        // spill of their owner frees nothing while the view lives.
+        assert!(
+            matches!(&second, NodeBuffer::ReReadable(backing) if Arc::strong_count(backing) == 2)
+        );
+        let (second, freed) = second.spill_resident_memory(None, true).unwrap();
+        assert_eq!(freed, 0);
+
+        // Spilled part first, then the resident ones, each whole, in order.
+        let order: Vec<u64> = view
+            .drain()
+            .map(|event| rec_row_num(&event.unwrap()))
+            .collect();
+        assert_eq!(order, vec![10, 11, 12, 13, 14]);
+        assert!(
+            matches!(&second, NodeBuffer::ReReadable(backing) if Arc::strong_count(backing) == 1)
+        );
+        drop(first);
+        drop(third);
+    }
+
+    #[test]
     fn spill_resident_memory_keeps_punct_only_slot_in_memory() {
         let ctx = synthetic_document_context();
         let nb = NodeBuffer::Memory(vec![StreamEvent::punctuation(Punctuation::document_close(
@@ -2179,14 +2486,16 @@ mod tests {
     ) -> crate::pipeline::memory::ConsumerId {
         let handle = crate::pipeline::memory::ConsumerHandle::new();
         handle.set_bytes(bytes);
-        budget.register_consumer(
-            Arc::new(FixedUsageConsumer(bytes)),
-            handle,
-            clinker_plan::runtime_error::ConsumerLabel {
-                node: "baseline".to_string(),
-                surface: clinker_plan::runtime_error::MemorySurface::GroupState,
-            },
-        )
+        budget
+            .register_consumer(
+                Arc::new(FixedUsageConsumer(bytes)),
+                handle,
+                clinker_plan::runtime_error::ConsumerLabel {
+                    node: "baseline".to_string(),
+                    surface: clinker_plan::runtime_error::MemorySurface::GroupState,
+                },
+            )
+            .expect("a fresh handle registers")
     }
 
     impl crate::pipeline::memory::MemoryConsumer for FixedUsageConsumer {
@@ -2238,6 +2547,81 @@ mod tests {
         // Above-target: 4096 ≥ 1024 → Ok.
         handle.set_bytes(8192);
         assert_eq!(consumer.try_spill(4096).unwrap(), 8192);
+    }
+
+    /// A published slot reports as reclaimable what spilling it frees now:
+    /// each resident row's slot cost plus its record's own heap payload, not
+    /// the residue its handle charges. Once the slot spills it reports 0.
+    #[test]
+    fn node_buffer_slot_reclaims_its_resident_rows_with_their_payload() {
+        use crate::pipeline::memory::walk::{
+            SlotSpill, VictimOutcome, WalkReclaim, WalkReclaimSet, WalkSpillSettings,
+        };
+        use crate::pipeline::memory::{ConsumerHandle, MemoryConsumer, NoOpPolicy};
+        use clinker_plan::config::CompressMode;
+
+        let root = tempfile::tempdir().expect("spill root");
+        let arbitrator = crate::pipeline::memory::MemoryArbitrator::with_policy(
+            64 * 1024 * 1024,
+            0.80,
+            0.70,
+            Box::new(NoOpPolicy),
+        );
+        let handle = ConsumerHandle::new();
+        let consumer = Arc::new(NodeBufferConsumer::new(handle.clone()));
+        let id = arbitrator
+            .register_node_consumer(
+                consumer.clone(),
+                handle.clone(),
+                clinker_plan::runtime_error::ConsumerLabel {
+                    node: "rows".to_string(),
+                    surface: clinker_plan::runtime_error::MemorySurface::BufferedRows {
+                        from: "rows".to_string(),
+                        to: clinker_plan::runtime_error::NonEmptyReaders::one("next".to_string()),
+                    },
+                },
+            )
+            .expect("a fresh handle registers");
+        // The handle charges only the slot's residue; the payload is charged
+        // to whoever allocated it.
+        handle.set_bytes(16);
+        let s = schema();
+        let rows: Vec<(Record, u64)> = (0..4)
+            .map(|n| (rec(&s, n, &"x".repeat(100)), n as u64))
+            .collect();
+        let payload: u64 = rows
+            .iter()
+            .map(|(record, _)| record.legacy_estimated_heap_size() as u64)
+            .sum();
+        assert!(payload >= 400, "every row carries its string payload");
+        let expected = 4 * record_byte_cost(2) + payload;
+
+        let mut set = WalkReclaimSet::new(WalkSpillSettings {
+            spill_root: Arc::from(root.path()),
+            spill_compress: CompressMode::Auto,
+            batch_size: 1024,
+        });
+        let key =
+            crate::executor::dispatch::NodeBufferKey::from(petgraph::graph::NodeIndex::new(0));
+        set.slots_mut().register(
+            key.clone(),
+            (id, handle.clone()),
+            SlotSpill {
+                spill_allowed: true,
+                node_name: Box::from("rows"),
+            },
+        );
+        set.slots_mut()
+            .insert_buffer(key, NodeBuffer::memory_from_records(rows));
+        assert_eq!(consumer.reclaimable_bytes(), expected);
+        assert_eq!(consumer.current_usage(), 16, "the charge is unchanged");
+
+        assert_eq!(
+            set.spill_victim(id, &arbitrator).expect("spill"),
+            VictimOutcome::Spilled
+        );
+        assert_eq!(consumer.reclaimable_bytes(), 0, "nothing is resident");
+        assert!(arbitrator.unregister_consumer(id).is_some());
     }
 
     /// The block-band buffered-spilled drain adopts the emit-phase sorted runs
@@ -2488,21 +2872,18 @@ mod tests {
                 assert!(drain.next().is_none());
                 error
             };
-            let PipelineError::MemoryBudgetExceeded {
-                node,
-                used,
-                limit,
-                source,
-                detail,
-            } = error
-            else {
+            let PipelineError::MemoryBudgetExceeded { report } = error else {
                 panic!("typed range refusal: {error:?}");
             };
-            assert_eq!(node, "banded");
-            assert_eq!(limit, 1);
-            assert!(used > limit);
-            assert_eq!(source, clinker_plan::BudgetCategory::Arena);
-            assert!(detail.unwrap().contains("range output merge frontier"));
+            assert_eq!(
+                report.requester,
+                Some(clinker_plan::runtime_error::ConsumerLabel {
+                    node: "banded".to_string(),
+                    surface: clinker_plan::runtime_error::MemorySurface::SortBuffer,
+                })
+            );
+            assert_eq!(report.limit.bytes(), 1);
+            assert!(report.requested_bytes > report.limit.bytes());
             assert!(paths.iter().all(|p| !p.exists()));
             assert_eq!(arb.cumulative_spill_bytes(), 777);
         }

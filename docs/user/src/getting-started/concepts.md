@@ -145,11 +145,11 @@ the exception that *do* accumulate across records; see below.)
 
 Per-record evaluation keeps **per-row** memory usage bounded for the
 stateless parts of the graph (Transform, Route, Merge, most Combine
-probe-side work, Output). Every stage is charged against the configured
-RSS budget. Fused Source → Transform → Sink paths run streaming, with
-no per-stage materialization, so a 100 GB CSV passes through with the
-same footprint as a 100 KB CSV. A stage that hands its output to a single
-downstream Sink also avoids a charged inter-stage buffer --
+probe-side work, Output). Every stage counts the memory it holds against
+the configured `memory.limit`. Fused Source → Transform → Sink paths run
+streaming, with no per-stage materialization, so a 100 GB CSV passes
+through with the same footprint as a 100 KB CSV. A stage that hands its
+output to a single downstream Sink also avoids a charged inter-stage buffer --
 single-branch Route, non-fused Merge, streaming Aggregate, and the Combine
 probe-side stream their result straight to the writer (see
 [Streaming vs. Blocking Stages](../ops/streaming-vs-blocking.md)).
@@ -160,10 +160,10 @@ envelope. Every materialized buffer can spill past the soft threshold,
 including buffers shared by several readers and Route/Cull output-port
 buffers. Readers run sequentially over the same immutable memory-or-spill
 backing; each opens one cursor, and the final reader takes the authoritative
-buffer regardless of declaration or dispatch order. A consumer that needs a
-full resident vector reserves that materialization first. If the overlap would
-exceed the hard limit, the engine fails before allocating with a structured
-`E310 MemoryBudgetExceeded` diagnostic that names the consumer.
+buffer regardless of declaration or dispatch order. A reader that needs every
+row in memory at once asks for that memory first. If it does not fit, the
+engine first spills other buffered rows; only when that frees nothing does it
+fail, before allocating, with `E310` naming the node.
 
 Use `clinker run --explain` to see which nodes will materialize
 (`buffer: materialized`) versus which will stream (`buffer: streaming`)
@@ -174,8 +174,9 @@ budget" signal. See [the `--explain` reference](../ops/explain.md) and
 **Stateful operators must accumulate.** Aggregate, sort, and grace-hash
 Combine cannot emit until they have seen enough input -- sums need every
 addend, a full sort needs the last row, a hash join needs the build side
-complete. These operators run inside a configured RSS budget (default 512 MB)
-and **degrade gracefully** under pressure rather than OOM:
+complete. These operators count the memory they hold against the configured
+`memory.limit` (default 512 MB) and **degrade gracefully** under pressure
+rather than OOM:
 
 - **Aggregate** uses hash aggregation by default and spills partitions to
   disk when soft/hard memory thresholds trip. When the input is already

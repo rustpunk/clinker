@@ -184,6 +184,13 @@ pub struct HashAggregator {
     /// `handle.spill_requested`, which the hot loop is expected to
     /// read at batch boundaries once that integration lands.
     consumer_handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
+    /// Whether a spill a reclaim pass asks for could free this table's
+    /// charge now: it has a spill directory, no finalize has taken it, and
+    /// it is not kept for retraction ([`Self::keep_for_retraction`]).
+    /// Every charge mirror records the reclaimable figure from it (the
+    /// charge when true, 0 when false), so the figure is never more than a
+    /// spill would free.
+    reclaim_by_spill: bool,
     /// Shared arbitrator for disk-spill-cap accounting. Each `spill()`
     /// charges the committed spill file's on-disk byte size against it via
     /// `record_spill_bytes`; crossing `storage.spill.disk_cap_bytes` surfaces
@@ -297,6 +304,9 @@ impl HashAggregator {
         } else {
             None
         };
+        // A table with no spill directory never spills for a pass, so it
+        // never ranks as reclaimable.
+        let reclaim_by_spill = spill_dir.is_some();
         Self {
             groups: hashbrown::HashMap::new(),
             factory,
@@ -320,6 +330,7 @@ impl HashAggregator {
             buffered_groups: hashbrown::HashMap::new(),
             buffer_mode,
             consumer_handle,
+            reclaim_by_spill,
             arbitrator,
         }
     }
@@ -333,7 +344,11 @@ impl HashAggregator {
     /// counter at every batch boundary.
     fn add_value_heap_bytes(&mut self, n: usize) {
         self.value_heap_bytes = self.value_heap_bytes.saturating_add(n);
-        self.consumer_handle.set_bytes(self.value_heap_bytes as u64);
+        mirror_charge(
+            &self.consumer_handle,
+            self.value_heap_bytes,
+            self.reclaim_by_spill,
+        );
     }
 
     /// Subtract `n` from `value_heap_bytes` with saturating arithmetic
@@ -343,7 +358,11 @@ impl HashAggregator {
     /// discharge over-counts.
     fn sub_value_heap_bytes(&mut self, n: usize) {
         self.value_heap_bytes = self.value_heap_bytes.saturating_sub(n);
-        self.consumer_handle.set_bytes(self.value_heap_bytes as u64);
+        mirror_charge(
+            &self.consumer_handle,
+            self.value_heap_bytes,
+            self.reclaim_by_spill,
+        );
     }
 
     /// Reset `value_heap_bytes` to zero on spill drain and mirror to
@@ -351,7 +370,36 @@ impl HashAggregator {
     /// zero in lockstep with the in-memory drain.
     fn reset_value_heap_bytes(&mut self) {
         self.value_heap_bytes = 0;
-        self.consumer_handle.set_bytes(0);
+        mirror_charge(&self.consumer_handle, 0, self.reclaim_by_spill);
+    }
+
+    /// Mark the table as taken for its finalize: from here on no spill a
+    /// reclaim pass could ask for frees anything, so it ranks by 0 while its
+    /// charge stays until the table drops. Idempotent; every finalize calls
+    /// it first, and a walk arm calls it as the table leaves its cell.
+    pub(crate) fn begin_finalize(&mut self) {
+        self.leave_reclaim();
+    }
+
+    /// Mark the table as kept for the correlation commit's retraction, for
+    /// its whole life: it ranks by 0 while it ingests, after its in-place
+    /// finalize and while the commit keeps it, so no reclaim pass and no
+    /// soft-threshold poll elects it, and a refused request's report lists
+    /// it as unable to spill. Neither [`Self::finalize_in_place`] nor
+    /// [`Self::retract_row`] can read groups a spill wrote, so a spill of
+    /// this table ends the run with an internal error or loses its groups
+    /// at the commit; it never frees memory the run can go on without
+    /// (#1288). The table's own spill triggers are unchanged. Its charge
+    /// stays until it drops.
+    pub(crate) fn keep_for_retraction(&mut self) {
+        self.leave_reclaim();
+    }
+
+    /// From here on no spill a reclaim pass could ask for frees anything:
+    /// record 0 and keep every later charge mirror at 0.
+    fn leave_reclaim(&mut self) {
+        self.reclaim_by_spill = false;
+        self.consumer_handle.set_reclaimable(0);
     }
 
     /// Borrow the in-memory group table. Public for finalize and tests.
@@ -440,6 +488,12 @@ impl HashAggregator {
     /// spill writer.
     pub fn spill_files(&self) -> &[AggSpillFile] {
         &self.spill_files
+    }
+
+    /// The handle this table's charge is mirrored onto, shared with its
+    /// [`AggregateConsumer`]: what a walk arm registers the table under.
+    pub(crate) fn consumer_handle(&self) -> &Arc<crate::pipeline::memory::ConsumerHandle> {
+        &self.consumer_handle
     }
 
     /// Borrow the disk-spill-cap arbitrator so a test can seed a finite
@@ -565,14 +619,18 @@ impl HashAggregator {
             // bounded) and folded into the flat-vec accounting below.
             // Inlined add: a live `group_state` borrow into `self.groups`
             // prevents going through `add_value_heap_bytes(&mut self)`.
-            // Field-level borrows of `value_heap_bytes` and the
-            // `&self`-method `consumer_handle.set_bytes` are non-
-            // overlapping borrows the borrow checker can split.
+            // Field-level borrows of `value_heap_bytes`, `reclaim_by_spill`
+            // and `consumer_handle` are non-overlapping borrows the borrow
+            // checker can split.
             self.value_heap_bytes = self.value_heap_bytes.saturating_add(
                 std::mem::size_of::<(u64, u32)>()
                     + std::mem::size_of::<(crate::executor::stream_event::SourceRowId, Arc<str>)>(),
             );
-            self.consumer_handle.set_bytes(self.value_heap_bytes as u64);
+            mirror_charge(
+                &self.consumer_handle,
+                self.value_heap_bytes,
+                self.reclaim_by_spill,
+            );
         }
 
         // 5. BindingArg dispatch hot loop (D1).
@@ -643,7 +701,11 @@ impl HashAggregator {
             // Inlined add — same `group_state` split-borrow as the
             // lineage path above.
             self.value_heap_bytes = self.value_heap_bytes.saturating_add(row_charge);
-            self.consumer_handle.set_bytes(self.value_heap_bytes as u64);
+            mirror_charge(
+                &self.consumer_handle,
+                self.value_heap_bytes,
+                self.reclaim_by_spill,
+            );
             group_state.retract_values.push(row_values);
         } else {
             for (arg, acc) in self
@@ -987,6 +1049,9 @@ impl HashAggregator {
         ctx: &EvalContext,
         out: &mut Vec<SortRow>,
     ) -> Result<(), HashAggError> {
+        // The table finalized in place is kept for retraction and is never
+        // spilled again, so it ranks by nothing from here on.
+        self.begin_finalize();
         if !self.spill_files.is_empty() {
             return Err(HashAggError::Spill(
                 "finalize_in_place called on aggregator with spilled groups".to_string(),
@@ -1036,6 +1101,24 @@ impl HashAggregator {
             }
         }
         Ok(())
+    }
+
+    /// Spill the groups resident now to one new run, as the table's own
+    /// triggers do, for the owner a reclaim pass elected: the table's charge
+    /// falls to 0 and the run is recorded under the node. Writes nothing and
+    /// returns `false` when no group is resident (every group is already on
+    /// disk, or none was added); returns `true` when it wrote. Blocks on the
+    /// spill's I/O; never reserves memory.
+    ///
+    /// # Errors
+    ///
+    /// As the table's own spill: a failed write, or E320 past the spill cap.
+    pub(crate) fn spill_resident(&mut self) -> Result<bool, HashAggError> {
+        if self.groups.is_empty() && self.buffered_groups.is_empty() {
+            return Ok(false);
+        }
+        self.spill()?;
+        Ok(true)
     }
 
     /// Spill the in-memory groups to disk as postcard, optionally LZ4.
@@ -1167,6 +1250,7 @@ impl HashAggregator {
         ctx: &EvalContext,
         out: &mut Vec<SortRow>,
     ) -> Result<(), HashAggError> {
+        self.begin_finalize();
         // Global-fold empty-input special case. Delegated to the shared
         // `empty_global_fold_row` helper so the streaming path produces
         // a byte-identical record.
@@ -1358,6 +1442,19 @@ impl HashAggregator {
     }
 }
 
+/// Mirror a table's `charged` value-heap bytes onto its consumer's handle,
+/// and record there what a spill would free now: the same bytes while the
+/// table can spill for a reclaim pass (`reclaim_by_spill`), else 0.
+fn mirror_charge(
+    handle: &crate::pipeline::memory::ConsumerHandle,
+    charged: usize,
+    reclaim_by_spill: bool,
+) {
+    let charged = charged as u64;
+    handle.set_bytes(charged);
+    handle.set_reclaimable(if reclaim_by_spill { charged } else { 0 });
+}
+
 /// `MemoryConsumer` wrapper for a `HashAggregator`. Holds an
 /// `Arc<ConsumerHandle>` shared with the aggregator: the aggregator
 /// updates `handle.bytes` as it admits records and drains on spill;
@@ -1372,6 +1469,18 @@ impl HashAggregator {
 /// victim. `can_back_pressure = false`: an in-flight aggregate has
 /// no upstream channel to gate; pausing mid-aggregation would either
 /// lose accumulation or require additional buffering with no payoff.
+///
+/// It ranks by the figure the table records on the handle at every charge
+/// change: what spilling its resident groups frees now. That is the table's
+/// charge while it can spill, and 0 once a spill wrote its groups, from the
+/// moment a finalize takes the table (in place or consuming), and always for
+/// a table with no spill directory or kept for retraction (the relaxed-key
+/// arm's, which no pass can spill until retraction can read spilled groups).
+/// A table on the strict per-document or
+/// time-windowed arm is walk-owned state any reclaim pass on the walk can
+/// spill while the table is in its arm's cell; the streaming-ingest
+/// worker's tables are reached only once lent to the walk, and a pass that
+/// elects one before then skips it.
 pub struct AggregateConsumer {
     handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
 }
@@ -1385,6 +1494,12 @@ impl AggregateConsumer {
 impl crate::pipeline::memory::MemoryConsumer for AggregateConsumer {
     fn current_usage(&self) -> u64 {
         self.handle.bytes()
+    }
+
+    /// What a spill of the table's resident groups frees now, as the table
+    /// last recorded it.
+    fn reclaimable_bytes(&self) -> u64 {
+        self.handle.reclaimable()
     }
 
     fn peak_charged_bytes(&self) -> Option<u64> {

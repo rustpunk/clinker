@@ -425,7 +425,7 @@ nodes:
 }
 
 #[test]
-fn nested_modes_invalid_second_physical_file_preserves_first_file_prefix() {
+fn nested_modes_invalid_second_physical_file_fails_with_no_rows_written() {
     use clinker_exec::source::{SourceInput, multi_file::FileSlot};
     for format in ["json", "xml"] {
         for failure in ["bom", "utf8", "declaration-or-bom32"] {
@@ -471,7 +471,7 @@ nodes:
             let result = common::run_config(&config, [("rows".into(), SourceInput::Files(files))].into(), writers, &params());
             let error = result.expect_err("invalid second input must fail");
             assert!(error.to_string().contains("UTF"), "{format}/{failure}: {error}");
-            assert_eq!(output.contents(), b"{\"id\":1}\n", "{format}/{failure}: only the first physical file is valid");
+            assert_eq!(output.contents(), b"", "{format}/{failure}: a failed Source writes no rows");
         }
     }
 }

@@ -772,6 +772,47 @@ impl AggregateStream {
         }
     }
 
+    /// Spill a hash table's resident groups for the reclaim pass that
+    /// elected it ([`HashAggregator::spill_resident`]); `false` when nothing
+    /// was resident. The streaming arm holds no table and writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`HashAggregator::spill_resident`].
+    pub(crate) fn spill_resident(&mut self) -> Result<bool, HashAggError> {
+        match self {
+            Self::Hash(h) => h.spill_resident(),
+            Self::Streaming(_) => Ok(false),
+        }
+    }
+
+    /// Mark a hash table as taken for its finalize, so it ranks by 0
+    /// ([`HashAggregator::begin_finalize`]). The streaming arm holds no
+    /// table.
+    pub(crate) fn begin_finalize(&mut self) {
+        if let Self::Hash(h) = self {
+            h.begin_finalize();
+        }
+    }
+
+    /// Mark the hash table as kept for retraction
+    /// ([`HashAggregator::keep_for_retraction`]). The streaming arm holds no
+    /// table.
+    pub(crate) fn keep_for_retraction(&mut self) {
+        if let Self::Hash(h) = self {
+            h.keep_for_retraction();
+        }
+    }
+
+    /// The handle a hash table's charge is mirrored onto; `None` for the
+    /// streaming arm, which holds no table and charges nothing.
+    pub(crate) fn consumer_handle(&self) -> Option<&Arc<crate::pipeline::memory::ConsumerHandle>> {
+        match self {
+            Self::Hash(h) => Some(h.consumer_handle()),
+            Self::Streaming(_) => None,
+        }
+    }
+
     /// Convert the stream into a boxed [`HashAggregator`] owning the
     /// in-memory state, plus a snapshot of the Hash-arm group-by indices.
     /// Returns `None` for the `Streaming` arm — that path is rejected

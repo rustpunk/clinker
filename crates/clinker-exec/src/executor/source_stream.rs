@@ -59,6 +59,13 @@ pub(crate) struct AttemptPopulationDelta {
 /// them. Rejections are consumed before downstream [`StreamEvent`] buffers are
 /// built.
 ///
+/// A stream ends with exactly one terminal event, [`Self::Ended`],
+/// [`Self::Interrupted`] or [`Self::Failed`], sent after the reader has
+/// returned and released what it held, and nothing follows it. A channel
+/// that disconnects without one ended on a failure the reader could not
+/// report (a panic): the walk treats it as a failure, never as the end of the
+/// input.
+///
 /// Not `Clone`: an attempt carries its own charge on the Source's handle,
 /// which exactly one event may release.
 #[derive(Debug)]
@@ -71,6 +78,107 @@ pub(crate) enum SourceStreamEvent {
         queued: QueuedCharge,
     },
     Punctuation(Punctuation),
+    /// The reader read its whole input. Every event before this one is the
+    /// Source's complete output. A read limit applied at the reader, such as
+    /// a bounded preview's per-Source limit, ends the input it admits this
+    /// way too: the rows it read are the input that was asked for.
+    Ended,
+    /// The reader stopped short of the end of its input because the run was
+    /// cancelled: a shutdown signal, a required report that could not be
+    /// written, or the reader's own transport reporting the cancellation. The
+    /// events before this one are a prefix of the input, not the input: no
+    /// step may finish on them, and the walk stops as an interrupted run. A
+    /// reader whose walk stopped listening ends this way too, into a channel
+    /// no one reads: it stopped short as well, and never claims [`Self::Ended`].
+    Interrupted,
+    /// The reader stopped on an error. The events before this one are a
+    /// prefix of the input, not the input: no step may finish on them.
+    Failed(SourceReadFailure),
+}
+
+/// A Source reader's error, held once for whichever side reports it.
+///
+/// The reader sends it in its [`SourceStreamEvent::Failed`] and keeps a
+/// clone as its thread's result. The walk takes the error when it reaches
+/// the event and returns it as the run's error. When the walk failed first
+/// and never reached the event, the error is still in place when the
+/// reader's thread is joined, and the join reports it. Exactly one side can
+/// take it, so it is never reported twice and never lost.
+#[derive(Clone)]
+pub(crate) struct SourceReadFailure {
+    source: Arc<str>,
+    error: Arc<std::sync::Mutex<Option<clinker_plan::error::PipelineError>>>,
+}
+
+impl SourceReadFailure {
+    /// `error`, raised by the reader of `source`, not yet reported.
+    pub(crate) fn new(source: &str, error: clinker_plan::error::PipelineError) -> Self {
+        Self {
+            source: Arc::from(source),
+            error: Arc::new(std::sync::Mutex::new(Some(error))),
+        }
+    }
+
+    /// Take the error to report it. `None` once the other side has taken it.
+    pub(crate) fn take(&self) -> Option<clinker_plan::error::PipelineError> {
+        self.error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
+impl std::fmt::Debug for SourceReadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceReadFailure")
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The sender that ends a Source's stream.
+///
+/// Taken from the channel before the reader starts and held by the reader's
+/// thread outside the reader, so it outlives every other sender: the
+/// terminal event is the last thing the channel carries, and it is sent only
+/// after the reader and everything it held in the Source's name have been
+/// released. Dropped without [`Self::finish`] (the thread panicked), it
+/// closes the channel with no terminal event, which the walk reports as a
+/// failure.
+pub(crate) struct SourceStreamEnd {
+    tx: crossbeam_channel::Sender<SourceStreamEvent>,
+    source: Arc<str>,
+}
+
+impl SourceStreamEnd {
+    /// Send the terminal event for `result` and hand back the thread's
+    /// result: [`SourceStreamEvent::Ended`] only for a read that reached the
+    /// end of its input; [`SourceStreamEvent::Interrupted`] for one that
+    /// stopped short, on the run's cancellation or because the walk stopped
+    /// listening; [`SourceStreamEvent::Failed`] for an error. Blocks like a
+    /// record send while the channel is full. A walk that has stopped
+    /// reading this Source (it dropped the receiver) leaves the failure with
+    /// the thread's result alone.
+    pub(super) fn finish(
+        self,
+        result: Result<super::ingest::IngestTaskOutcome, clinker_plan::error::PipelineError>,
+    ) -> Result<super::ingest::IngestTaskOutcome, SourceReadFailure> {
+        match result {
+            Ok(outcome) => {
+                let _ = self.tx.send(if outcome.stopped_short() {
+                    SourceStreamEvent::Interrupted
+                } else {
+                    SourceStreamEvent::Ended
+                });
+                Ok(outcome)
+            }
+            Err(error) => {
+                let failure = SourceReadFailure::new(&self.source, error);
+                let _ = self.tx.send(SourceStreamEvent::Failed(failure.clone()));
+                Err(failure)
+            }
+        }
+    }
 }
 
 /// The heap a queued attempt holds outside the run's ledger: the part of a
@@ -217,6 +325,10 @@ pub(crate) struct SourceIngestChannel {
     allocation_resources: clinker_record::owned_storage::AllocationResources,
     /// Present only for a source declaring record-level `sort_order`.
     order_barrier: Option<crate::source::order_barrier::SourceFileOrderBarrier>,
+    /// A push met the closed channel: the walk dropped the receiver. Kept
+    /// because a closure can surface on any push, a document boundary's
+    /// included, while only the driver can report the read as stopped short.
+    receiver_dropped: bool,
 }
 
 impl SourceIngestChannel {
@@ -245,11 +357,46 @@ impl SourceIngestChannel {
     /// paces back-pressure.
     pub(crate) const DEFAULT_CAPACITY: usize = 1024;
 
+    /// The sender that ends this stream, named for `source`. Take it before
+    /// the channel moves to the reader; see [`SourceStreamEnd`].
+    pub(crate) fn end(&self, source: &str) -> SourceStreamEnd {
+        SourceStreamEnd {
+            tx: self.tx.clone(),
+            source: Arc::from(source),
+        }
+    }
+
+    /// Whether a push has met the closed channel: the walk dropped the
+    /// receiver before this Source's input ended.
+    pub(crate) fn receiver_dropped(&self) -> bool {
+        self.receiver_dropped
+    }
+
+    /// Remember a closed channel `result` reports, and pass it on.
+    fn note_closed<T>(
+        &mut self,
+        result: Result<T, SourceStreamError>,
+    ) -> Result<T, SourceStreamError> {
+        if matches!(result, Err(SourceStreamError::Closed)) {
+            self.receiver_dropped = true;
+        }
+        result
+    }
+
     /// Whether this source needs explicit physical-file lifecycle events.
     /// Ordinary sources retain the historical record-driven boundary path;
     /// an order barrier also needs zero-record files to reach verification.
     pub(crate) fn has_order_barrier(&self) -> bool {
         self.order_barrier.is_some()
+    }
+
+    /// Give the order barrier the run's kernel pool, so its staged rows sort
+    /// there instead of sequentially on the Source thread. A channel without
+    /// a barrier sorts nothing and ignores the pool.
+    pub(crate) fn set_kernel_pool(&mut self, pool: Arc<rayon::ThreadPool>) {
+        if let Some(barrier) = self.order_barrier.as_mut() {
+            barrier.set_kernel_pool(pool);
+        }
     }
 
     /// Create a new channel + paired receiver. The receiver is what the
@@ -271,6 +418,7 @@ impl SourceIngestChannel {
                 source,
                 allocation_resources,
                 order_barrier: None,
+                receiver_dropped: false,
             },
             rx,
         )
@@ -308,6 +456,7 @@ impl SourceIngestChannel {
                 source,
                 allocation_resources,
                 order_barrier: Some(order_barrier),
+                receiver_dropped: false,
             },
             rx,
         )
@@ -333,7 +482,8 @@ impl SourceIngestChannel {
             .ok_or(SourceStreamError::OrdinalExhausted {
                 source: self.source,
             })?;
-        self.send_attempt(SourceAttemptEvent::Record(record, row_id))?;
+        let sent = self.send_attempt(SourceAttemptEvent::Record(record, row_id));
+        self.note_closed(sent)?;
         self.next_row_id = row_id.checked_next();
         Ok(row_id)
     }
@@ -386,7 +536,8 @@ impl SourceIngestChannel {
         event: crate::executor::dlq::SourceRejectionEvent,
     ) -> Result<(), SourceStreamError> {
         self.consumer_handle.wait_while_paused();
-        self.send_attempt(SourceAttemptEvent::Rejection(Box::new(event)))
+        let sent = self.send_attempt(SourceAttemptEvent::Rejection(Box::new(event)));
+        self.note_closed(sent)
     }
 
     /// Push a document-boundary punctuation. One `DocumentOpen` and
@@ -396,13 +547,14 @@ impl SourceIngestChannel {
     /// Route pass through). Punctuations carry no record bytes, so they
     /// carry no charge on the `ConsumerHandle`.
     pub(crate) fn push_punctuation(&mut self, punct: Punctuation) -> Result<(), SourceStreamError> {
-        if let Some(barrier) = self.order_barrier.as_mut() {
+        let sent = if let Some(barrier) = self.order_barrier.as_mut() {
             barrier.observe_punctuation(punct).map(|_| ())
         } else {
             self.tx
                 .send(SourceStreamEvent::Punctuation(punct))
                 .map_err(|_| SourceStreamError::Closed)
-        }
+        };
+        self.note_closed(sent)
     }
 
     /// Bring an ordered Source's barrier figure (staged rows, rows being
@@ -427,7 +579,10 @@ impl SourceIngestChannel {
 ///
 /// Sources do not spill: `try_spill` returns `Ok(0)` and the
 /// arbitrator's policy is expected to choose `pause` instead via
-/// `BackPressurePreferred`. `spill_priority = i32::MAX` so the
+/// `BackPressurePreferred`. The queued-event charge is heap no spill can
+/// free (a Source is relieved by pausing and by the walk draining its
+/// channel), so `reclaimable_bytes` is 0 and no reclaim pass ranks a Source
+/// by that charge. `spill_priority = i32::MAX` so the
 /// `Priority` fallback ranks Sources last among the spill candidates
 /// when no back-pressureable consumer is available.
 /// `can_back_pressure = true`; `pause` / `resume` forward to the
@@ -446,6 +601,10 @@ impl SourceConsumer {
 impl crate::pipeline::memory::MemoryConsumer for SourceConsumer {
     fn current_usage(&self) -> u64 {
         self.handle.bytes()
+    }
+
+    fn reclaimable_bytes(&self) -> u64 {
+        0
     }
 
     fn peak_charged_bytes(&self) -> Option<u64> {
@@ -768,14 +927,16 @@ nodes:
         let run = provider.allocation();
         let handle = ConsumerHandle::new();
         let consumer = Arc::new(SourceConsumer::new(handle.clone()));
-        let id = arb.register_node_consumer(
-            consumer.clone(),
-            handle.clone(),
-            ConsumerLabel {
-                node: "events".to_string(),
-                surface: MemorySurface::RowsRead,
-            },
-        );
+        let id = arb
+            .register_node_consumer(
+                consumer.clone(),
+                handle.clone(),
+                ConsumerLabel {
+                    node: "events".to_string(),
+                    surface: MemorySurface::RowsRead,
+                },
+            )
+            .expect("a fresh handle registers");
         let view = provider.attributed_allocation(Requester::for_consumer(id));
         assert_eq!(view.identity(), run.identity());
         let (mut channel, rx) =
@@ -863,14 +1024,16 @@ nodes:
         .unwrap();
         let foreign = MemoryOnlyResources::new(NonZeroUsize::new(1024 * 1024).unwrap());
         let handle = ConsumerHandle::new();
-        let id = arb.register_node_consumer(
-            Arc::new(SourceConsumer::new(handle.clone())),
-            handle.clone(),
-            ConsumerLabel {
-                node: "rows".to_string(),
-                surface: MemorySurface::RowsRead,
-            },
-        );
+        let id = arb
+            .register_node_consumer(
+                Arc::new(SourceConsumer::new(handle.clone())),
+                handle.clone(),
+                ConsumerLabel {
+                    node: "rows".to_string(),
+                    surface: MemorySurface::RowsRead,
+                },
+            )
+            .expect("a fresh handle registers");
         (arb, provider, foreign, handle, id)
     }
 

@@ -34,7 +34,7 @@ pub use overlay_ops::{
 pub use plan::{
     BoundBody, ColumnLookup, CompositionBodyId, QualifiedField, Row, RowTail, TailVarId,
 };
-pub use runtime_error::{BudgetCategory, SpillError};
+pub use runtime_error::SpillError;
 
 #[cfg(test)]
 mod rename_gates {

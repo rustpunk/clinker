@@ -1166,6 +1166,34 @@ fn is_cancelled_transport_error(error: &PipelineError) -> bool {
     }
 }
 
+/// The error a run reports once its executor has returned `error`.
+///
+/// A source cancelled mid-read reports whatever its transport produced: a
+/// file source drains and returns a report flagged interrupted, while a socket
+/// read unwinds with the transport's own I/O error. Both are one operator
+/// action, so while `shutdown` is requested an error the cancellation tore
+/// down ([`is_cancelled_transport_error`]) becomes
+/// [`PipelineError::Interrupted`]. Otherwise the same cancellation would be an
+/// infrastructure failure or a cancellation depending on which source noticed
+/// first, and under load that varies run to run. A signal arriving while the
+/// run was already failing for its own reasons is not that case, and the error
+/// keeps its identity.
+///
+/// The full run and the bounded preview both pass their executor's error
+/// through this one function, so the two cannot classify the same error
+/// differently.
+fn normalize_cancelled_run_error(
+    error: PipelineError,
+    shutdown: &clinker_exec::pipeline::shutdown::ShutdownToken,
+) -> PipelineError {
+    if shutdown.is_requested() && is_cancelled_transport_error(&error) {
+        tracing::warn!(error = %error, "cancelled run unwound through a transport error");
+        PipelineError::Interrupted
+    } else {
+        error
+    }
+}
+
 /// Recognize explicit cancellation without inferring it from shutdown state.
 /// Source and executor boundaries own normalization inside error wrappers.
 fn is_explicit_cancellation(error: &PipelineError) -> bool {
@@ -3501,9 +3529,19 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 &preview_params,
                 run_policy,
                 compile_ctx.without_overlay_ops(),
-            )?;
+            )
+            .map_err(|error| normalize_cancelled_run_error(error, &shutdown_token))?;
         source_stager.cleanup(true);
-        return Ok(if report.counters.dlq_count > 0 { 2 } else { 0 });
+        // A preview's read limit ends its input normally; a cancellation
+        // that cut the preview short is a cancelled run like any other, so
+        // it reports 130 rather than the status of a finished preview.
+        return Ok(if report.interrupted {
+            130
+        } else if report.counters.dlq_count > 0 {
+            2
+        } else {
+            0
+        });
     }
 
     // Every output writes to a hidden destination-local leaf admitted through
@@ -3870,22 +3908,9 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
             // the exact inputs the failure saw (cleanup = on_success); only
             // cleanup = always reaps them on failure.
             source_stager.cleanup(false);
-            // A source cancelled mid-read reports whatever its transport
-            // produced: a file source drains and returns a report flagged
-            // interrupted, while a socket read unwinds with the transport's own
-            // I/O error. Both are one operator action, so normalize before the
-            // outcome is derived — otherwise the same cancellation is an
-            // infrastructure failure or a cancellation depending on which
-            // source noticed first, and under load that varies run to run.
-            //
-            // A signal arriving while the run was already failing for its own
-            // reasons is not that case, and the error keeps its identity.
-            let e = if shutdown_token.is_requested() && is_cancelled_transport_error(&e) {
-                tracing::warn!(error = %e, "cancelled run unwound through a transport error");
-                PipelineError::Interrupted
-            } else {
-                e
-            };
+            // Normalize before the outcome is derived, so the lifecycle
+            // terminal and the exit status read the same cancellation.
+            let e = normalize_cancelled_run_error(e, &shutdown_token);
             let terminal_error = match run_attempt.abandon() {
                 Ok(()) => e,
                 Err(attempt_error) => PipelineError::Io(std::io::Error::other(format!(
@@ -7726,6 +7751,85 @@ mod tests {
         }
     }
 
+    /// The run and the preview read a cancelled run's error through one rule.
+    ///
+    /// While the shutdown is requested, a transport error the cancellation tore
+    /// down, bare or inside a format error, is the cancellation and exits 130.
+    /// Without a requested shutdown the same error keeps its identity, and so
+    /// does every error of another shape, including a REST reply cut off after
+    /// the server answered, which the REST source reports as its own failure.
+    #[test]
+    fn a_transport_error_the_cancellation_tore_down_is_the_cancellation() {
+        use clinker_exec::pipeline::shutdown::ShutdownToken;
+
+        let torn_down = || {
+            [
+                PipelineError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "peer reset",
+                )),
+                PipelineError::Format(clinker_format::FormatError::Io(std::io::Error::from(
+                    std::io::ErrorKind::UnexpectedEof,
+                ))),
+                PipelineError::Format(clinker_format::FormatError::Io(std::io::Error::from(
+                    std::io::ErrorKind::BrokenPipe,
+                ))),
+            ]
+        };
+
+        let idle = ShutdownToken::new();
+        for error in torn_down() {
+            let shown = error.to_string();
+            let kept = normalize_cancelled_run_error(error, &idle);
+            assert!(
+                !matches!(kept, PipelineError::Interrupted),
+                "{shown} without a requested shutdown is a failure"
+            );
+            assert_eq!(pipeline_error_exit_code(&kept), 4, "{shown}");
+        }
+
+        let requested = ShutdownToken::new();
+        requested.request();
+        for error in torn_down() {
+            let shown = error.to_string();
+            let normalized = normalize_cancelled_run_error(error, &requested);
+            assert!(
+                matches!(normalized, PipelineError::Interrupted),
+                "{shown} under a requested shutdown is the cancellation"
+            );
+            assert_eq!(pipeline_error_exit_code(&normalized), 130, "{shown}");
+            assert_eq!(
+                run_terminal_outcome(&normalized),
+                RunTerminalOutcome::Abort,
+                "{shown}"
+            );
+        }
+
+        for error in [
+            PipelineError::Format(clinker_format::FormatError::Classified {
+                code: "infrastructure.runtime.source_unavailable",
+                message: "rest source \"api\": request_failed class=response_io_unexpectedeof"
+                    .to_owned(),
+            }),
+            PipelineError::Io(std::io::Error::other(
+                "spill run decode failed during k-way merge",
+            )),
+            PipelineError::SortOrderViolation {
+                message: "sort order violation at node `by_date`: row 41 precedes row 40"
+                    .to_owned(),
+            },
+        ] {
+            let shown = error.to_string();
+            let code = pipeline_error_exit_code(&error);
+            let kept = normalize_cancelled_run_error(error, &requested);
+            assert!(
+                !matches!(kept, PipelineError::Interrupted),
+                "{shown} keeps its identity when a signal races it"
+            );
+            assert_eq!(pipeline_error_exit_code(&kept), code, "{shown}");
+        }
+    }
+
     /// The registered message is what leaves the host, so it must never be the
     /// error's own text: two rounds of shape-matching sanitizers let a record
     /// value and then a relative path through.
@@ -7803,16 +7907,35 @@ mod tests {
     #[test]
     fn runtime_failure_classification_distinguishes_policy_from_transience() {
         use clinker_core_types::RetryAdvice;
-        use clinker_plan::runtime_error::{BudgetCategory, SpillError};
+        use clinker_plan::runtime_error::{
+            ConsumerLabel, EnforcedLimit, LimitReading, MemoryShortfallReport, MemorySurface,
+            SpillError, suggested_limit_floor,
+        };
 
         let cases = [
             (
                 PipelineError::MemoryBudgetExceeded {
-                    node: "aggregate".to_owned(),
-                    used: 2,
-                    limit: 1,
-                    source: BudgetCategory::Arena,
-                    detail: None,
+                    report: Box::new(MemoryShortfallReport {
+                        requester: Some(ConsumerLabel {
+                            node: "aggregate".to_owned(),
+                            surface: MemorySurface::GroupState,
+                        }),
+                        group_first_row: None,
+                        join_partition_distinct_keys: None,
+                        reading: LimitReading::Charged,
+                        requested_bytes: 1,
+                        limit: EnforcedLimit::MemoryLimit(1),
+                        charged_bytes: 1,
+                        private_bytes: None,
+                        holders: Vec::new(),
+                        other_holders_count: 0,
+                        other_holders_bytes: 0,
+                        unattributed_bytes: 1,
+                        unspillable_bytes: 1,
+                        reclaim: None,
+                        suggested_limit_bytes: suggested_limit_floor(1, 1),
+                        oversized: false,
+                    }),
                 },
                 "runtime.resource.memory_budget_exceeded",
                 RetryAdvice::PolicyRequired,

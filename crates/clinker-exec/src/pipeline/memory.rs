@@ -16,9 +16,14 @@
 //!
 //! `MemoryArbitrator` is the single seat that governs every spill / abort
 //! decision in the executor. Each spill-capable operator (Aggregate, sort,
-//! grace-hash, sort-merge join, IEJoin, inter-stage `node_buffers`) polls
-//! the same arbitrator instance and trusts its `should_spill` /
-//! `should_abort` answer. The trait surface (`MemoryConsumer`,
+//! grace-hash, sort-merge join, IEJoin, inter-stage `node_buffers`) charges
+//! the same arbitrator instance, spills when it asks (a reclaim pass on the
+//! walk, a spill request, or the `should_spill` soft-threshold poll), and is
+//! refused only by it: a shortfall from a reservation or a handle's growth,
+//! the one hard-limit backstop, `check_hard_limit`, which reclaims on the
+//! walk before it refuses, or the local checks that refuse one piece larger
+//! than the whole limit (the IEJoin's loaded block pair among them; the
+//! engine's memory-arbitration page lists them). The trait surface (`MemoryConsumer`,
 //! `ArbitrationPolicy`) lets policies pick a victim across operators
 //! instead of reacting independently. Production paths install a policy
 //! chosen by the pipeline-level `memory.backpressure` knob:
@@ -31,12 +36,24 @@ use arc_swap::ArcSwap;
 pub mod ledger;
 pub(crate) mod protocol;
 pub mod reservation;
+pub(crate) mod walk;
 
 /// The synchronization primitives the ledger core locks through, kept behind
 /// one path so the core can be compiled against a model checker's primitives
 /// instead.
 pub(crate) mod sync {
     pub(crate) use std::sync::{Mutex, MutexGuard};
+    pub(crate) use std::thread::ThreadId;
+
+    std::thread_local! {
+        static CURRENT: ThreadId = std::thread::current().id();
+    }
+
+    /// The calling thread's id, or `None` while its thread-local storage is
+    /// being torn down, when no thread can be named.
+    pub(crate) fn current_thread() -> Option<ThreadId> {
+        CURRENT.try_with(|id| *id).ok()
+    }
 }
 use clinker_format::preparation::{ResourceError, ResourceErrorKind};
 use clinker_plan::plan::scheduling_hint::SchedulingHint;
@@ -462,6 +479,11 @@ pub struct ConsumerHandle {
     /// The ledger this handle charges while its consumer is registered.
     /// Locked before the ledger, never after it.
     binding: Mutex<Option<HandleBinding>>,
+    /// What a spill of the owner's state would free now, set by the owner
+    /// for a consumer whose resident state differs from its charge (a
+    /// node-buffer slot's rows carry a payload charged to whoever allocated
+    /// it). Ranking only: never charged, never summed into the ledger.
+    reclaimable: AtomicU64,
     spill_requested: AtomicBool,
     pause_signal: PauseSignal,
     /// Set while the walk thread is actively draining this consumer's
@@ -488,6 +510,7 @@ impl ConsumerHandle {
             bytes: AtomicU64::new(0),
             peak: AtomicU64::new(0),
             binding: Mutex::new(None),
+            reclaimable: AtomicU64::new(0),
             spill_requested: AtomicBool::new(false),
             pause_signal: PauseSignal::new(),
             active: AtomicBool::new(false),
@@ -496,6 +519,16 @@ impl ConsumerHandle {
 
     fn binding(&self) -> std::sync::MutexGuard<'_, Option<HandleBinding>> {
         self.binding.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The requester a check made for this handle's owner names: the
+    /// consumer it is registered under, or the run as a whole when it is not
+    /// registered. Takes the binding lock.
+    pub(crate) fn requester(&self) -> ledger::Requester {
+        match &*self.binding() {
+            Some(binding) => ledger::Requester::for_consumer(binding.id),
+            None => ledger::Requester::governed(),
+        }
     }
 
     /// The handle's current charge. Lock-free read.
@@ -575,7 +608,43 @@ impl ConsumerHandle {
     /// ledger's lock together with every other charge; on a shortfall
     /// nothing is charged. A growth raises the mark. A handle never
     /// registered has no limit to check and always grows.
+    ///
+    /// On the run's walk a growth that does not fit first runs reclaim
+    /// passes with this handle's consumer as the requester (elected last),
+    /// as [`MemoryArbitrator::reserve`] does, and is refused only by their
+    /// failure rule. The handle's locks are not held while a pass spills.
     pub fn try_grow(&self, n: u64) -> Result<(), ledger::Shortfall> {
+        self.charge_or_reclaim(n, || self.try_grow_now(n))
+    }
+
+    /// Run `attempt`, a checked charge of `need` bytes to this handle; on
+    /// the walk of the run the handle is bound to, reclaim before accepting
+    /// its shortfall.
+    fn charge_or_reclaim(
+        &self,
+        need: u64,
+        mut attempt: impl FnMut() -> Result<(), ledger::Shortfall>,
+    ) -> Result<(), ledger::Shortfall> {
+        let first = match attempt() {
+            Ok(()) => return Ok(()),
+            Err(shortfall) => shortfall,
+        };
+        let bound = self
+            .binding()
+            .as_ref()
+            .map(|binding| (Arc::clone(&binding.state), binding.id));
+        match bound.and_then(|(state, id)| walk::walk_arbitrator(&state).map(|arb| (arb, id))) {
+            Some((arbitrator, id)) => arbitrator.reclaim_until_granted(
+                need,
+                ledger::Requester::for_consumer(id),
+                first,
+                attempt,
+            ),
+            None => Err(first),
+        }
+    }
+
+    fn try_grow_now(&self, n: u64) -> Result<(), ledger::Shortfall> {
         let binding = self.binding();
         match &*binding {
             Some(binding) => {
@@ -595,10 +664,15 @@ impl ConsumerHandle {
         }
     }
 
-    /// Set the charge to exactly `total` bytes: a growth is checked as
-    /// [`Self::try_grow`] checks it, a reduction is a release. On a
-    /// shortfall the charge is unchanged.
+    /// Set the charge to exactly `total` bytes: a growth is checked (and on
+    /// the walk reclaimed for) as [`Self::try_grow`] does it, a reduction is
+    /// a release. On a shortfall the charge is unchanged.
     pub fn try_resize(&self, total: u64) -> Result<(), ledger::Shortfall> {
+        let growth = total.saturating_sub(self.bytes());
+        self.charge_or_reclaim(growth, || self.try_resize_now(total))
+    }
+
+    fn try_resize_now(&self, total: u64) -> Result<(), ledger::Shortfall> {
         let binding = self.binding();
         match &*binding {
             Some(binding) => {
@@ -680,39 +754,58 @@ impl ConsumerHandle {
     }
 
     /// Bind this handle to `state`'s ledger for consumer `id` under `label`,
-    /// charging the bytes it already holds. Returns `false`, changing
-    /// nothing, when the handle is already bound.
+    /// charging the bytes it already holds. When the handle is already
+    /// bound, changes nothing and returns the consumer it charges for.
     fn bind(
         &self,
         state: Arc<reservation::ReservationState>,
         id: ConsumerId,
         label: ConsumerLabel,
-    ) -> bool {
+    ) -> Result<(), ConsumerId> {
         let mut binding = self.binding();
-        if binding.is_some() {
-            return false;
+        if let Some(bound) = &*binding {
+            return Err(bound.id);
         }
         state
             .ledger
             .lock()
             .bind_handle(id.0, label, self.bytes.load(Ordering::Relaxed));
         *binding = Some(HandleBinding { state, id });
-        true
+        Ok(())
     }
 
     /// End consumer `id`'s binding: release the handle's remaining charge,
     /// remove the consumer's ledger entry, and keep its final mark as the
     /// handle's own. A no-op when the handle is not bound for `id`.
-    fn unbind(&self, id: ConsumerId) {
+    ///
+    /// `departure` says whether the consumer was a Source. A Source's bytes
+    /// still granted in its name are the rows it read: they stay
+    /// identifiable as a finished Source's until their grants release them,
+    /// and are never re-charged.
+    fn unbind(&self, id: ConsumerId, departure: protocol::Departure) {
         let mut binding = self.binding();
         if binding.as_ref().is_none_or(|binding| binding.id != id) {
             return;
         }
         if let Some(binding) = binding.take()
-            && let Some(mark) = binding.state.ledger.lock().remove_consumer(id.0)
+            && let Some(mark) = binding.state.ledger.lock().remove_consumer(id.0, departure)
         {
             self.raise_peak(mark);
         }
+    }
+
+    /// Record what a spill of the owner's state would free now. The owner
+    /// sets it where that state becomes resident and where it spills or
+    /// leaves; a consumer that reads it reports it as its
+    /// [`MemoryConsumer::reclaimable_bytes`]. Lock-free.
+    pub(crate) fn set_reclaimable(&self, bytes: u64) {
+        self.reclaimable.store(bytes, Ordering::Relaxed);
+    }
+
+    /// The figure [`Self::set_reclaimable`] last recorded; 0 until then.
+    /// Lock-free.
+    pub(crate) fn reclaimable(&self) -> u64 {
+        self.reclaimable.load(Ordering::Relaxed)
     }
 
     /// Flip the spill-request flag to `true`. Called by the consumer
@@ -785,20 +878,33 @@ impl ConsumerHandle {
 /// `MemoryArbitrator::register_consumer`) and unregister on every exit path,
 /// including error, cancellation and drop;
 /// report true resident bytes, collection overhead included, charging
-/// growth through the consumer's [`ConsumerHandle`] no later than the batch
-/// boundary where the operator next polls the arbitrator; spill only when
-/// the arbitrator asks, which today means the spill request `try_spill`
-/// posts (read with [`ConsumerHandle::take_spill_request`] at a batch
-/// boundary; [`MemoryArbitrator::spill_reclaimable`] posts the same request
-/// before a paused Source resumes) or `should_spill` / `should_spill_self`
-/// reporting the soft threshold crossed at a batch boundary, never on a
-/// byte, row or count threshold or an RSS reading of its own; refuse growth
-/// only through the arbitrator's limit checks (`should_abort`,
-/// `should_abort_local`), never on its own RSS reading or a limit of its
-/// own; take `spill_priority` and `can_back_pressure` from the per-operator
-/// arbitration-parameters table in `docs/engine/src/memory-arbitration.md`,
-/// adding a row there when none fits. The arbitrator does not yet ask
-/// spillable state to reclaim before a refusal. A consumer whose `try_spill`
+/// growth through the consumer's [`ConsumerHandle`] with
+/// [`ConsumerHandle::try_grow`] / [`ConsumerHandle::try_resize`] no later
+/// than the batch boundary where the operator next polls the arbitrator;
+/// spill only when the arbitrator asks, which today means a reclaim pass on
+/// the walk that elects the consumer and spills its state there, the
+/// consumer's own growth falling short, the spill request `try_spill` posts
+/// (read with [`ConsumerHandle::take_spill_request`] at a batch boundary),
+/// or `should_spill` / `should_spill_self` reporting the soft threshold
+/// crossed at a batch boundary, never on a byte, row or count threshold or
+/// an RSS reading of its own. [`MemoryArbitrator::spill_reclaimable`], which
+/// runs before a paused Source resumes, runs the reclaim round: on the walk
+/// it spills walk-owned victims now; with no walk frame it raises their
+/// spill requests. Refuse growth only
+/// through the arbitrator: a shortfall from [`MemoryArbitrator::reserve`],
+/// `try_grow` or `try_resize`, or, for a hard-limit backstop, the one check
+/// [`MemoryArbitrator::check_hard_limit`] given the bytes the site is about
+/// to hold that no consumer has charged yet. Never pair `should_abort` with
+/// a refusal of the consumer's own, and never refuse on its own RSS reading
+/// or a limit of its own. A growth charged on the
+/// walk through `reserve`, `try_grow` or `try_resize` runs a reclaim pass
+/// before it is refused: the walk spills the state the pass elects, the
+/// requesting consumer last, and retries, and a refusal comes only after a
+/// pass that freed nothing with no release during it, followed by a final
+/// pass that also freed nothing. Take `spill_priority` and
+/// `can_back_pressure` from the per-operator arbitration-parameters table in
+/// `docs/engine/src/memory-arbitration.md`, adding a row there when none
+/// fits. A consumer whose `try_spill`
 /// frees nothing needs the maintainer's recorded approval and is listed as
 /// charged-only in `crates/clinker-exec/tests/memory_consumer_inventory.rs`;
 /// the existing charged-only consumers are approved exceptions, not
@@ -808,9 +914,10 @@ impl ConsumerHandle {
 /// Implementations live with their operator (Aggregate, sort,
 /// grace-hash, sort-merge join, IEJoin, inter-stage buffers). The
 /// arbitrator holds them as `Arc<dyn MemoryConsumer>` in a copy-on-write
-/// snapshot and reads `current_usage` / `spill_priority` /
-/// `can_back_pressure` on every arbitration round; `pause` / `resume` /
-/// `try_spill` fire only when a policy selects the consumer as a victim.
+/// snapshot and reads `current_usage` / `reclaimable_bytes` /
+/// `spill_priority` / `can_back_pressure` on every arbitration round;
+/// `pause` / `resume` / `try_spill` fire only when a policy selects the
+/// consumer as a victim.
 ///
 /// All methods take `&self`: the arbitrator drives them from a shared
 /// snapshot read, and every implementation routes its mutable state
@@ -821,11 +928,31 @@ impl ConsumerHandle {
 /// without compromising the existing pipeline-context concurrency
 /// posture.
 pub trait MemoryConsumer: Send + Sync {
-    /// Live bytes the consumer currently holds, as the victim policies rank
-    /// it. Read every arbitration round; must be cheap. The charged total the
+    /// Live bytes the consumer currently holds. Victims are ranked by
+    /// [`Self::reclaimable_bytes`], not by this figure. Read every
+    /// arbitration round; must be cheap. The charged total the
     /// limit is checked against is the ledger's, which a handle-backed
     /// consumer's handle charges; this figure is not summed into it.
     fn current_usage(&self) -> u64;
+
+    /// An estimate of what a spill of this consumer would free now. Used
+    /// only to rank victims: a reclaim pass and the victim policies order
+    /// candidates by it, and a consumer reporting 0 is never elected,
+    /// however much it has charged. A pass counts what each spill actually
+    /// releases, not this figure, toward its target. The default is
+    /// [`Self::current_usage`], for a consumer whose every charged byte a
+    /// spill releases. A consumer whose charge a spill cannot free
+    /// (charged-only state, a pause-only producer, a fixed staging floor)
+    /// reports 0; one that can free only part of it reports that part. A row
+    /// holder counts its rows' own charge and leaves out text a Source read
+    /// and is charged for, even when the spill would drop that text's last
+    /// copy, so its figure can understate what the spill frees (open
+    /// question 92). It can overstate it too: text a clone shares with
+    /// another holder is counted in full, though spilling one holder frees
+    /// none of it. Read every arbitration round; must be cheap.
+    fn reclaimable_bytes(&self) -> u64 {
+        self.current_usage()
+    }
 
     /// The most bytes this consumer has held charged, when it keeps an exact
     /// high-water mark. A consumer backed by a [`ConsumerHandle`] returns
@@ -925,6 +1052,73 @@ pub trait ArbitrationPolicy: Send + Sync {
     fn prefers_backpressure(&self) -> bool {
         false
     }
+
+    /// The order a reclaim pass asks `candidates` to spill in, first to spill
+    /// first. Each candidate's figures were read once, when the pass began,
+    /// and are taken to hold for the whole pass. `consumers` are the same
+    /// candidates' live consumers, in the same order; `candidates` arrive in
+    /// ascending id order.
+    ///
+    /// The default asks [`Self::select_victim`] over `consumers` for one
+    /// victim at a time among those still unordered, once in id order and
+    /// once reversed, and takes the lower id of the two, so a tie goes to the
+    /// older consumer whichever way the policy breaks it. It stops at the
+    /// first round the policy elects nothing. Each selection reads the
+    /// consumers' figures again, so a policy whose choice is a fixed ranking
+    /// overrides it with one sort over `candidates` and reads nothing more.
+    fn order_candidates(
+        &self,
+        _candidates: &[ReclaimCandidate],
+        consumers: &[(ConsumerId, &dyn MemoryConsumer)],
+    ) -> Vec<ConsumerId> {
+        order_by_selection(self, consumers)
+    }
+}
+
+/// One consumer's figures as a reclaim pass read them, once, when it began:
+/// what [`ArbitrationPolicy::order_candidates`] ranks it by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReclaimCandidate {
+    /// The consumer.
+    pub id: ConsumerId,
+    /// [`MemoryConsumer::reclaimable_bytes`] as read.
+    pub reclaimable_bytes: u64,
+    /// [`MemoryConsumer::spill_priority`] as read.
+    pub spill_priority: i32,
+    /// [`MemoryConsumer::can_back_pressure`] as read.
+    pub can_back_pressure: bool,
+}
+
+/// [`ArbitrationPolicy::order_candidates`]'s default: `policy`'s
+/// [`ArbitrationPolicy::select_victim`] asked once per pick, forwards and
+/// reversed, over `consumers`.
+fn order_by_selection<P: ArbitrationPolicy + ?Sized>(
+    policy: &P,
+    consumers: &[(ConsumerId, &dyn MemoryConsumer)],
+) -> Vec<ConsumerId> {
+    let mut others = consumers.to_vec();
+    others.sort_by_key(|(id, _)| id.0);
+    let mut order = Vec::with_capacity(others.len());
+    while !others.is_empty() {
+        let forward = policy.select_victim(&others, 0);
+        let reversed: Vec<(ConsumerId, &dyn MemoryConsumer)> =
+            others.iter().rev().copied().collect();
+        let backward = policy.select_victim(&reversed, 0);
+        let pick = match (forward, backward) {
+            (Some(a), Some(b)) => {
+                if a.0 <= b.0 {
+                    a
+                } else {
+                    b
+                }
+            }
+            (Some(only), None) | (None, Some(only)) => only,
+            (None, None) => break,
+        };
+        order.push(pick);
+        others.retain(|(id, _)| *id != pick);
+    }
+    order
 }
 
 /// Policy that selects no victim under any pressure.
@@ -951,8 +1145,9 @@ impl ArbitrationPolicy for NoOpPolicy {
     }
 }
 
-/// Policy that elects whichever consumer is currently holding the
-/// most bytes. On a tie, the last equally-maximum entry in the
+/// Policy that elects whichever consumer a spill would free the most
+/// bytes from now ([`MemoryConsumer::reclaimable_bytes`]). On a tie, the
+/// last equally-maximum entry in the
 /// snapshot wins (per `std`'s `max_by_key` contract); the snapshot
 /// preserves registration order, so the tie-break is deterministic
 /// within a single arbitrator instance for a given `consumers`
@@ -971,18 +1166,35 @@ impl ArbitrationPolicy for LargestFirst {
     ) -> Option<ConsumerId> {
         consumers
             .iter()
-            .max_by_key(|(_, c)| c.current_usage())
+            .max_by_key(|(_, c)| c.reclaimable_bytes())
             .map(|(id, _)| *id)
     }
 
     fn policy_name(&self) -> Cow<'static, str> {
         Cow::Borrowed("LargestFirst")
     }
+
+    /// Most reclaimable bytes first, the older consumer first on a tie: one
+    /// sort giving exactly the order repeated selection gives.
+    fn order_candidates(
+        &self,
+        candidates: &[ReclaimCandidate],
+        _consumers: &[(ConsumerId, &dyn MemoryConsumer)],
+    ) -> Vec<ConsumerId> {
+        let mut ranked = candidates.to_vec();
+        ranked.sort_by_key(|candidate| {
+            (
+                std::cmp::Reverse(candidate.reclaimable_bytes),
+                candidate.id.0,
+            )
+        });
+        ranked.into_iter().map(|candidate| candidate.id).collect()
+    }
 }
 
 /// Policy that elects the consumer with the lowest
 /// `spill_priority()` value (lower = spill first). Ties broken by
-/// `current_usage()` (largest first) so that two equally-priority
+/// `reclaimable_bytes()` (largest first) so that two equally-priority
 /// consumers still produce deterministic, headroom-maximizing
 /// selection.
 ///
@@ -1002,13 +1214,31 @@ impl ArbitrationPolicy for Priority {
             .min_by(|(_, a), (_, b)| {
                 a.spill_priority()
                     .cmp(&b.spill_priority())
-                    .then_with(|| b.current_usage().cmp(&a.current_usage()))
+                    .then_with(|| b.reclaimable_bytes().cmp(&a.reclaimable_bytes()))
             })
             .map(|(id, _)| *id)
     }
 
     fn policy_name(&self) -> Cow<'static, str> {
         Cow::Borrowed("Priority")
+    }
+
+    /// Lowest priority first, then most reclaimable bytes, then the older
+    /// consumer: one sort giving exactly the order repeated selection gives.
+    fn order_candidates(
+        &self,
+        candidates: &[ReclaimCandidate],
+        _consumers: &[(ConsumerId, &dyn MemoryConsumer)],
+    ) -> Vec<ConsumerId> {
+        let mut ranked = candidates.to_vec();
+        ranked.sort_by_key(|candidate| {
+            (
+                candidate.spill_priority,
+                std::cmp::Reverse(candidate.reclaimable_bytes),
+                candidate.id.0,
+            )
+        });
+        ranked.into_iter().map(|candidate| candidate.id).collect()
     }
 }
 
@@ -1057,6 +1287,17 @@ impl ArbitrationPolicy for BackPressurePreferred {
     fn prefers_backpressure(&self) -> bool {
         true
     }
+
+    /// A reclaim pass never lists a candidate able to back-pressure (pausing
+    /// is the resume controller's, not a pass's), so every selection would
+    /// fall to the wrapped policy: its order is the pass's.
+    fn order_candidates(
+        &self,
+        candidates: &[ReclaimCandidate],
+        consumers: &[(ConsumerId, &dyn MemoryConsumer)],
+    ) -> Vec<ConsumerId> {
+        self.fallback.order_candidates(candidates, consumers)
+    }
 }
 
 /// Build the boxed [`ArbitrationPolicy`] a `pipeline.memory.backpressure`
@@ -1103,8 +1344,10 @@ pub fn build_policy(knob: clinker_plan::config::BackpressureKnob) -> Box<dyn Arb
 /// `should_spill` is the single polling entry used by every spill-
 /// capable operator. It updates `peak_rss`, consults the registered
 /// `ArbitrationPolicy`, and reports whether the soft threshold has
-/// been crossed. `should_abort` mirrors the same check against the
-/// hard `limit`.
+/// been crossed. A hard-limit backstop goes through
+/// [`Self::check_hard_limit`], which reclaims on the walk before it
+/// refuses; `should_abort` only mirrors the soft check against the hard
+/// `limit` and refuses nothing.
 ///
 /// `max_spill_bytes` is a disk-spill quota distinct from the RSS
 /// envelope: even when RSS is fine, an unbounded stream of spill
@@ -1191,7 +1434,38 @@ pub struct MemoryArbitrator {
     next_consumer_id: AtomicU32,
     /// Constructor-set; immutable thereafter.
     policy: Box<dyn ArbitrationPolicy>,
+    /// Reclaim passes run so far this run, of every kind.
+    reclaim_rounds: AtomicU64,
+    /// The consumer governed allocations made on the walk are charged to,
+    /// as its raw id, or [`NO_WALK_REQUESTER`]. Written and read only on the
+    /// walk.
+    walk_requester: AtomicU64,
+    /// The first spill a reclaim pass could not complete (an I/O failure or
+    /// the disk quota passed). The request that ran the pass sees only a
+    /// shortfall, so the walk takes this at its next dispatch boundary and
+    /// fails the run with it.
+    reclaim_failure: Mutex<Option<clinker_plan::error::PipelineError>>,
+    /// A test run reads no process memory, as on a target where
+    /// [`rss_bytes`] is `None`: every reading the arbitrator takes of the
+    /// process is absent, so only the charged total can trip a limit. Set
+    /// once, before the run, by
+    /// [`crate::executor::MemoryTestOverrides::with_no_process_memory`].
+    #[cfg(any(test, feature = "test-utils"))]
+    process_memory_unread: std::sync::atomic::AtomicBool,
+    /// Where [`Self::check_hard_limit`] records each check that runs a
+    /// reclaim round, when a test asked for it. Set once, before the run, by
+    /// [`crate::executor::MemoryTestOverrides::with_hard_limit_reclaims`].
+    #[cfg(any(test, feature = "test-utils"))]
+    hard_limit_reclaims: Mutex<Option<crate::executor::HardLimitReclaims>>,
+    /// Where [`Self::note_source_drain`] records each drained Source's
+    /// charge, when a test asked for it. Set once, before the run, by
+    /// [`crate::executor::MemoryTestOverrides::with_source_drain_charges`].
+    #[cfg(any(test, feature = "test-utils"))]
+    source_drain_charges: Mutex<Option<crate::executor::SourceDrainCharges>>,
 }
+
+/// [`MemoryArbitrator::walk_requester`]'s "no consumer" value.
+const NO_WALK_REQUESTER: u64 = u64::MAX;
 
 impl Drop for MemoryArbitrator {
     fn drop(&mut self) {
@@ -1248,6 +1522,15 @@ impl MemoryArbitrator {
             consumers: ArcSwap::from_pointee(Vec::new()),
             next_consumer_id: AtomicU32::new(0),
             policy,
+            reclaim_rounds: AtomicU64::new(0),
+            walk_requester: AtomicU64::new(NO_WALK_REQUESTER),
+            reclaim_failure: Mutex::new(None),
+            #[cfg(any(test, feature = "test-utils"))]
+            process_memory_unread: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-utils"))]
+            hard_limit_reclaims: Mutex::new(None),
+            #[cfg(any(test, feature = "test-utils"))]
+            source_drain_charges: Mutex::new(None),
         }
     }
 
@@ -1267,12 +1550,99 @@ impl MemoryArbitrator {
     }
 
     /// Poll current RSS and update `peak_rss` if it exceeds the
-    /// recorded peak. Called at chunk boundaries by every spill-
-    /// capable operator; also called from `should_spill()` and
-    /// `should_abort()`. Lock-free `fetch_max`.
+    /// recorded peak. Called from `should_spill()`, `should_spill_self()`,
+    /// `should_abort()` and [`Self::check_hard_limit`]. Lock-free
+    /// `fetch_max`.
     pub fn observe(&self) {
-        if let Some(rss) = rss_bytes() {
+        if let Some(rss) = self.process_resident_bytes() {
             self.peak_rss.fetch_max(rss, Ordering::Relaxed);
+        }
+    }
+
+    /// The process's resident memory as this run reads it: [`rss_bytes`],
+    /// or none when a test run was set to read no process memory. Every
+    /// decision the arbitrator takes on the process's memory reads it here.
+    fn process_resident_bytes(&self) -> Option<u64> {
+        #[cfg(any(test, feature = "test-utils"))]
+        if self.process_memory_unread.load(Ordering::Relaxed) {
+            return None;
+        }
+        rss_bytes()
+    }
+
+    /// Read no process memory for the rest of this run, as on a target
+    /// where [`rss_bytes`] is `None`, so the charged total is the only
+    /// reading that can trip a limit. An in-process test shares its process
+    /// with the harness and every sibling test, whose resident memory would
+    /// otherwise trip a small test capacity before any charge could.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn read_no_process_memory(&self) {
+        self.process_memory_unread.store(true, Ordering::Relaxed);
+    }
+
+    /// Record in `record`, for the rest of this run, every hard-limit check
+    /// that runs a reclaim round.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn record_hard_limit_reclaims(&self, record: crate::executor::HardLimitReclaims) {
+        *self
+            .hard_limit_reclaims
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(record);
+    }
+
+    /// Record in `record`, for the rest of this run, each Source's charge
+    /// once the walk has drained its input.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn record_source_drain_charges(&self, record: crate::executor::SourceDrainCharges) {
+        *self
+            .source_drain_charges
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(record);
+    }
+
+    /// Note the charge of Source `node`, registered as `id`, if a test asked
+    /// for the record: the bytes granted in its name and its handle's charge,
+    /// read in one ledger step. The caller has seen the Source's channel
+    /// report that its reader finished and has not yet released the
+    /// registration.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn note_source_drain(&self, node: &str, id: ConsumerId) {
+        let record = self
+            .source_drain_charges
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(record) = record.as_ref() {
+            let (charged, handle) = {
+                let ledger = self.admission.ledger.lock();
+                (ledger.consumer_charged(id.0), ledger.handle_bytes(id.0))
+            };
+            record.record(crate::executor::SourceDrainCharge {
+                node: node.to_string(),
+                granted: charged.saturating_sub(handle),
+                handle,
+            });
+        }
+    }
+
+    /// Note that the hard-limit check naming `node` and `surface` with
+    /// `uncharged` bytes ran a reclaim round, if a test asked for the record.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn note_hard_limit_reclaim(
+        &self,
+        node: &str,
+        surface: &clinker_plan::runtime_error::MemorySurface,
+        uncharged: u64,
+    ) {
+        let record = self
+            .hard_limit_reclaims
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(record) = record.as_ref() {
+            record.record(crate::executor::HardLimitReclaim {
+                node: node.to_string(),
+                surface: surface.clone(),
+                uncharged,
+            });
         }
     }
 
@@ -1377,7 +1747,7 @@ impl MemoryArbitrator {
     /// use this to drive deterministic overflow scenarios without spawning
     /// processes of the requested RSS size.
     pub fn set_limit(&self, n: u64) -> Result<(), ResourceError> {
-        self.set_runtime_limit(n)?;
+        self.set_runtime_limit(n, false)?;
         self.configured_limit.store(n, Ordering::Relaxed);
         Ok(())
     }
@@ -1385,11 +1755,22 @@ impl MemoryArbitrator {
     /// Hold the runtime limit to `capacity`, never above the configured
     /// limit. Refused, leaving the limit unchanged, when more than the new
     /// limit is already charged.
+    ///
+    /// Records which of the two the run then enforces, for the E310 report
+    /// to name: the test capacity when it is below `memory.limit`, else
+    /// `memory.limit`, which a capacity at or above it leaves in force.
     pub(crate) fn cap_runtime_limit(&self, capacity: u64) -> Result<(), ResourceError> {
-        self.set_runtime_limit(capacity.min(self.configured_limit()))
+        let configured = self.configured_limit();
+        if capacity < configured {
+            self.set_runtime_limit(capacity, true)
+        } else {
+            self.set_runtime_limit(configured, false)
+        }
     }
 
-    fn set_runtime_limit(&self, n: u64) -> Result<(), ResourceError> {
+    /// Install `n` as the runtime limit, recording under the ledger lock
+    /// whether it is a test capacity (`test_capacity`) or `memory.limit`.
+    fn set_runtime_limit(&self, n: u64, test_capacity: bool) -> Result<(), ResourceError> {
         let mut ledger = self.admission.ledger.lock();
         if let Err(charged) = ledger.set_limit(n) {
             return Err(ResourceError::new(
@@ -1398,6 +1779,7 @@ impl MemoryArbitrator {
                 n as usize,
             ));
         }
+        ledger.attachment.test_capacity = test_capacity;
         self.limit.store(n, Ordering::Relaxed);
         Ok(())
     }
@@ -1422,7 +1804,7 @@ impl MemoryArbitrator {
 
     /// Resume watermark in absolute bytes: the low edge of the
     /// pause/resume hysteresis band. A producer paused under memory
-    /// pressure resumes once `current_pressure()` recedes below this.
+    /// pressure resumes once the charged total recedes below this.
     /// Equals `limit * resume_threshold_pct` (default 0.70·limit).
     pub fn resume_limit(&self) -> u64 {
         (self.limit.load(Ordering::Relaxed) as f64 * self.resume_threshold_pct) as u64
@@ -1445,7 +1827,9 @@ impl MemoryArbitrator {
     /// where `rss_bytes()` is `None`, and tests can drive it
     /// deterministically through registered-consumer bytes.
     pub fn current_pressure(&self) -> u64 {
-        rss_bytes().unwrap_or(0).max(self.sum_consumer_usage())
+        self.process_resident_bytes()
+            .unwrap_or(0)
+            .max(self.sum_consumer_usage())
     }
 
     /// Spike allowance between soft and hard limits (default 20%).
@@ -1453,38 +1837,19 @@ impl MemoryArbitrator {
         self.hard_limit() - self.soft_limit()
     }
 
-    /// True when EITHER RSS or the pull-mode charged-byte sum exceeds the
-    /// hard limit. Check periodically in probe loops (every 10K output
-    /// records) to prevent unbounded fan-out from blowing the ceiling
-    /// between spill polls.
+    /// True when EITHER the process's peak resident reading or the
+    /// pull-mode charged-byte sum exceeds the hard limit: the soft poll's
+    /// mirror against the hard `limit`.
     ///
-    /// The charged-byte arm is the RSS-independent backstop: see
-    /// [`Self::should_spill`]. Without it the hard-abort gate is
-    /// permanently false whenever `rss_bytes()` returns `None`, so a join
-    /// or aggregate grows unbounded until the OS kills the process instead
-    /// of aborting cleanly under the configured budget.
+    /// It reclaims nothing and builds no report, so it is not a hard-limit
+    /// backstop: an operator that must stop at the limit checks through
+    /// [`Self::check_hard_limit`], which reclaims on the walk before it
+    /// refuses and reports the reading that tripped. Never pair this with a
+    /// refusal of the caller's own.
     pub fn should_abort(&self) -> bool {
         self.observe();
         let hard = self.limit.load(Ordering::Relaxed);
         self.peak_rss.load(Ordering::Relaxed) > hard || self.sum_consumer_usage() > hard
-    }
-
-    /// True when the hard limit is breached by RSS, by the pull-mode
-    /// charged-byte sum, or by an operator-supplied `local_bytes`
-    /// estimate of in-progress state that is not yet reflected in a
-    /// registered consumer handle.
-    ///
-    /// The combine equi-join build loop registers its `MemoryConsumer`
-    /// wrapper with a zero-seeded handle and only mirrors the table's
-    /// footprint into it *after* the build completes, so the build loop's
-    /// growing bytes are invisible to [`Self::sum_consumer_usage`] while
-    /// the build runs. Passing the running `partial_memory_bytes` here is
-    /// the RSS-independent gate for that window — it aborts the build when
-    /// the in-memory table alone exceeds the budget, even on a target
-    /// where `rss_bytes()` returns `None`. Mirrors the arena's own
-    /// `local_bytes_used > hard_limit` self-trigger.
-    pub fn should_abort_local(&self, local_bytes: u64) -> bool {
-        local_bytes > self.limit.load(Ordering::Relaxed) || self.should_abort()
     }
 
     /// Peak RSS observed so far, or `None` on platforms where
@@ -1670,13 +2035,30 @@ impl MemoryArbitrator {
     /// atomically swaps it in. `O(N)` in the registry size, but
     /// registration is a once-per-operator-lifetime event, so the cost
     /// is off the per-batch hot path readers traverse.
+    ///
+    /// # Errors
+    ///
+    /// [`PipelineError::Internal`](clinker_plan::error::PipelineError::Internal)
+    /// when `handle` already charges for a registered consumer: a handle
+    /// charges for one consumer at a time. Nothing is registered and the
+    /// handle stays with its consumer.
     pub fn register_consumer(
         &self,
         consumer: Arc<dyn MemoryConsumer>,
         handle: Arc<ConsumerHandle>,
         label: ConsumerLabel,
-    ) -> ConsumerId {
+    ) -> Result<ConsumerId, clinker_plan::error::PipelineError> {
         self.register_owned_consumer(false, consumer, handle, label)
+    }
+
+    /// The consumer registered as `id`, while it is registered.
+    #[cfg(test)]
+    pub(crate) fn registered_consumer(&self, id: ConsumerId) -> Option<Arc<dyn MemoryConsumer>> {
+        self.consumers
+            .load()
+            .iter()
+            .find(|(registered, _)| *registered == id)
+            .map(|(_, consumer)| Arc::clone(consumer))
     }
 
     /// Register a consumer that holds the retained state of the node named
@@ -1692,12 +2074,16 @@ impl MemoryArbitrator {
     /// [`Self::register_consumer`] only for state no single node owns (writer
     /// output staging, the credential registry, the document dead-letter
     /// state).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::register_consumer`].
     pub fn register_node_consumer(
         &self,
         consumer: Arc<dyn MemoryConsumer>,
         handle: Arc<ConsumerHandle>,
         label: ConsumerLabel,
-    ) -> ConsumerId {
+    ) -> Result<ConsumerId, clinker_plan::error::PipelineError> {
         self.register_owned_consumer(true, consumer, handle, label)
     }
 
@@ -1711,28 +2097,35 @@ impl MemoryArbitrator {
         consumer: Arc<dyn MemoryConsumer>,
         handle: Arc<ConsumerHandle>,
         label: ConsumerLabel,
-    ) -> ConsumerId {
+    ) -> Result<ConsumerId, clinker_plan::error::PipelineError> {
         let id = ConsumerId(self.next_consumer_id.fetch_add(1, Ordering::Relaxed));
         {
             let mut owners = self
                 .consumer_owners
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if node_owned {
-                owners.live.insert(id, label.node.clone());
-            }
+            let node = label.node.clone();
             // Bound before the consumer enters the snapshot, so its bytes are
-            // charged by the time any reader can see it. A second binding of
-            // one handle is a caller bug: its charges keep going to the first
-            // consumer, and this consumer's unregistration leaves them alone.
-            let bound = handle.bind(Arc::clone(&self.admission), id, label);
-            debug_assert!(
-                bound,
-                "a handle charges for one registered consumer at a time"
-            );
-            if bound {
-                owners.handles.insert(id, handle);
+            // charged by the time any reader can see it. A handle charges for
+            // one consumer: a second binding would leave this consumer's
+            // charges with the first and its unregistration releasing none of
+            // them, so it registers nothing. The owner lock is held across the
+            // bind, so no reader sees the binding before the owner.
+            if let Err(bound_to) = handle.bind(Arc::clone(&self.admission), id, label) {
+                return Err(clinker_plan::error::PipelineError::Internal {
+                    op: "memory consumer registration",
+                    node,
+                    detail: format!(
+                        "its handle already charges for consumer {}; a handle charges for one \
+                         registered consumer at a time",
+                        bound_to.0
+                    ),
+                });
             }
+            if node_owned {
+                owners.live.insert(id, node);
+            }
+            owners.handles.insert(id, handle);
         }
         self.consumers.rcu(|current| {
             let mut next = Vec::with_capacity(current.len() + 1);
@@ -1740,7 +2133,7 @@ impl MemoryArbitrator {
             next.push((id, Arc::clone(&consumer)));
             next
         });
-        id
+        Ok(id)
     }
 
     /// Atomically replace the wrapper stored under an existing consumer id.
@@ -1791,7 +2184,16 @@ impl MemoryArbitrator {
     /// handle's remaining charge is released (advancing the ledger's release
     /// epoch when nonzero), its ledger entry is removed and its handle keeps
     /// the final mark. Bytes still granted in its name stay charged until
-    /// their grants release them.
+    /// their grants release them. When the consumer is a Source (it can be
+    /// paused, [`MemoryConsumer::can_back_pressure`], read once here) those
+    /// bytes are the rows it read: they stay identifiable as a finished
+    /// Source's until the last of them drops, so a memory report never counts
+    /// them as state that cannot spill. A Source must therefore unregister
+    /// here while the handle it registered with is still bound to the ledger,
+    /// since only that path marks its entry. Lock order is unchanged: the
+    /// owner map, then the ledger. When the walk requester names the
+    /// consumer, it is cleared: the walk's later governed allocations are
+    /// charged to no consumer, never to one that has left.
     ///
     /// Clones the snapshot minus the removed entry and swaps it in.
     /// The `id` lookup is a linear scan, acceptable because the
@@ -1811,6 +2213,11 @@ impl MemoryArbitrator {
                 .collect::<Vec<_>>()
         });
         if let Some(consumer) = &removed {
+            let departure = if consumer.can_back_pressure() {
+                protocol::Departure::Source
+            } else {
+                protocol::Departure::Other
+            };
             let mut owners = self
                 .consumer_owners
                 .lock()
@@ -1818,10 +2225,35 @@ impl MemoryArbitrator {
             owners.retain_peak(id, consumer.as_ref());
             owners.live.remove(&id);
             if let Some(handle) = owners.handles.remove(&id) {
-                handle.unbind(id);
+                handle.unbind(id, departure);
             }
+            // A consumer that has left requests nothing more on the walk: the
+            // rest of its arm charges no consumer. Otherwise a finished
+            // Source would go on naming every later walk allocation, and
+            // each would join its rows instead of the memory that cannot
+            // spill.
+            let _ = self.walk_requester.compare_exchange(
+                u64::from(id.0),
+                NO_WALK_REQUESTER,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
         }
         removed
+    }
+
+    /// The earliest-registered consumer still registered through
+    /// [`Self::register_node_consumer`] for the node named `node`, if any.
+    /// Takes the owner map's lock.
+    pub(crate) fn first_node_consumer(&self, node: &str) -> Option<ConsumerId> {
+        self.consumer_owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .live
+            .iter()
+            .filter(|(_, owner)| owner.as_str() == node)
+            .map(|(id, _)| *id)
+            .min_by_key(|id| id.0)
     }
 
     /// Number of consumers currently registered. Diagnostics surface
@@ -2001,8 +2433,14 @@ impl MemoryArbitrator {
         if consumers.is_empty() {
             return self.policy.select_victim(&[], pressure);
         }
+        // A consumer a spill frees nothing from is never a spill victim; a
+        // back-pressureable one stays a candidate, because electing it is
+        // how `BackPressurePreferred` chooses pausing over spilling.
         let snapshot: Vec<(ConsumerId, &dyn MemoryConsumer)> = consumers
             .iter()
+            .filter(|(_, consumer)| {
+                consumer.can_back_pressure() || consumer.reclaimable_bytes() > 0
+            })
             .map(|(id, consumer)| (*id, consumer.as_ref()))
             .collect();
         let charged_sum = self.sum_consumer_usage();
@@ -2017,14 +2455,15 @@ impl MemoryArbitrator {
         }
         let victim = self.policy.select_victim(&snapshot, pressure);
         // Spill arm only. Pausing a back-pressureable producer is owned by
-        // `reconcile_backpressure` (current pressure + hysteresis), so here
+        // `reconcile_backpressure` (charged bytes + hysteresis), so here
         // the elected victim is asked to spill only when it is
         // non-back-pressureable. The policy may still elect a
         // back-pressureable consumer (`BackPressurePreferred` prefers one) —
         // in that case no one spills, preserving the pause-over-spill
         // posture the `pause`/`both` knobs mean, exactly as before this
         // split (the pause it used to issue here now happens in
-        // `reconcile_backpressure` on the sound current-pressure signal).
+        // `reconcile_backpressure` on the charged total, which falls as state
+        // is released).
         // The action routes through the shared `&` the snapshot provides;
         // every consumer mutates through atomics behind a shared handle, so
         // no exclusive access is needed.
@@ -2037,9 +2476,10 @@ impl MemoryArbitrator {
         victim
     }
 
-    /// Pause/resume back-pressureable producers against CURRENT pressure
-    /// with a hysteresis band — the resume controller. Runs on the walk
-    /// thread inside `should_spill`'s tripped branch.
+    /// Pause/resume back-pressureable producers against the bytes charged
+    /// to the ledger now, with a hysteresis band — the resume controller.
+    /// Runs on the walk thread inside `should_spill`'s tripped branch. It
+    /// only pauses and resumes; it never spills.
     ///
     /// - Above the soft limit: pause the first back-pressureable consumer
     ///   the walk is NOT currently draining. Skipping an `is_active`
@@ -2054,21 +2494,23 @@ impl MemoryArbitrator {
     ///   a single admit/discharge swing cannot cross both thresholds and
     ///   thrash pause/resume every poll.
     ///
-    /// Reads CURRENT pressure, never the monotonic `peak_rss`: `peak_rss`
-    /// only rises, so a resume keyed on it could never fire. The spill arm
-    /// (`poll_arbitration`) keeps its peak-based trip — spilling is
-    /// monotone-safe and never deadlocks. Iterates the small lock-free
-    /// consumer snapshot and mutates only shared atomics, so it stays cheap
-    /// inside the already-guarded tripped branch.
+    /// Reads the charged bytes, never a reading of the process's memory:
+    /// the charged total falls as state is released, which a resume
+    /// decision needs, and it moves only with what the run itself holds, so
+    /// memory the process holds for other reasons never pauses a Source.
+    /// The spill arm (`poll_arbitration`) keeps its peak-based trip —
+    /// spilling is monotone-safe and never deadlocks. Iterates the small
+    /// lock-free consumer snapshot and mutates only shared atomics, so it
+    /// stays cheap inside the already-guarded tripped branch.
     ///
     /// A no-op under a non-pausing policy (`spill` / bare `Priority`), so a
     /// `spill`-knob run never parks a producer — its pressure is shed
     /// entirely through `poll_arbitration`'s spill arm.
-    fn reconcile_backpressure(&self) {
+    pub(crate) fn reconcile_backpressure(&self) {
         if !self.policy.prefers_backpressure() {
             return;
         }
-        let cur = self.current_pressure();
+        let cur = self.charged_bytes();
         let soft = self.soft_limit();
         let consumers = self.consumers.load();
         if cur > soft {
@@ -2083,40 +2525,6 @@ impl MemoryArbitrator {
                 if consumer.can_back_pressure() && consumer.is_paused() {
                     consumer.resume();
                 }
-            }
-        }
-    }
-
-    /// Best-effort spill of reclaimable (non-back-pressureable) consumers in
-    /// ascending `spill_priority` order, the order of the per-operator
-    /// arbitration-parameters table in `docs/engine/src/memory-arbitration.md`,
-    /// shedding up to `target_bytes` of downstream state.
-    ///
-    /// Called at a drain arm's progress boundary, just before a Source that
-    /// a prior round paused under pressure is resumed, so the resumed
-    /// producer does not immediately re-trip the soft limit (Spark's "spill
-    /// other consumers before you proceed"). Overshoot reduction only:
-    /// liveness never depends on it — the drain arm makes progress
-    /// regardless — so a partial or zero spill is fine and no error is
-    /// surfaced. `try_spill` flips each victim's `spill_requested` flag,
-    /// which its operator reads at the next batch boundary.
-    pub fn spill_reclaimable(&self, target_bytes: u64) {
-        if target_bytes == 0 {
-            return;
-        }
-        let consumers = self.consumers.load();
-        let mut ordered: Vec<&(ConsumerId, Arc<dyn MemoryConsumer>)> = consumers
-            .iter()
-            .filter(|(_, c)| !c.can_back_pressure())
-            .collect();
-        ordered.sort_by_key(|(_, c)| c.spill_priority());
-        let mut remaining = target_bytes;
-        for (_, consumer) in ordered {
-            if remaining == 0 {
-                break;
-            }
-            if let Ok(freed) = consumer.try_spill(remaining) {
-                remaining = remaining.saturating_sub(freed);
             }
         }
     }
@@ -2203,7 +2611,6 @@ pub(crate) fn assert_spill_cap_overflow(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clinker_plan::BudgetCategory;
 
     #[test]
     fn pause_signal_fast_path_when_not_paused() {
@@ -2710,32 +3117,6 @@ mod tests {
     }
 
     #[test]
-    fn should_abort_local_trips_on_operator_bytes_without_rss() {
-        // The combine build loop's gate: in-progress bytes that are not yet
-        // in any registered consumer handle must still abort the build when
-        // they exceed the hard limit, independent of RSS. The registry is
-        // empty here (the build's handle is zero-seeded until build
-        // completes) and the 100 GiB limit keeps the RSS arm inert, so only
-        // the `local_bytes` arm can fire.
-        let arbitrator = MemoryArbitrator::with_policy(
-            100 * 1024 * 1024 * 1024,
-            0.80,
-            0.70,
-            Box::new(NoOpPolicy),
-        );
-        let hard = arbitrator.hard_limit();
-        assert_eq!(arbitrator.sum_consumer_usage(), 0);
-        assert!(
-            !arbitrator.should_abort_local(hard),
-            "local bytes at exactly the limit must not abort"
-        );
-        assert!(
-            arbitrator.should_abort_local(hard + 1),
-            "local bytes over the hard limit must abort with the RSS arm inert and no registered consumer"
-        );
-    }
-
-    #[test]
     fn should_spill_self_trips_on_charged_bytes_without_rss() {
         // The streaming-stage variant carries the same backstop so a
         // streaming batch still spills itself when RSS is unavailable. The
@@ -2946,6 +3327,65 @@ mod tests {
         assert_eq!(handle.peak_bytes(), 55);
     }
 
+    /// A handle charges for one registered consumer at a time. Registering a
+    /// second consumer through a handle still bound to the first is an
+    /// internal error that registers nothing: the second consumer never
+    /// enters the registry or the node attribution, and the handle's charge
+    /// stays the first consumer's, released when that one leaves.
+    #[test]
+    fn registering_a_second_consumer_through_a_bound_handle_is_an_internal_error() {
+        use crate::pipeline::arena::ArenaConsumer;
+        let arbitrator =
+            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
+        let handle = ConsumerHandle::new();
+        let first = arbitrator
+            .register_node_consumer(
+                Arc::new(ArenaConsumer::new(handle.clone())),
+                handle.clone(),
+                test_label("first"),
+            )
+            .expect("a fresh handle registers");
+        handle.set_bytes(4_096);
+        let registered_before = arbitrator.consumers.load().len();
+
+        let second = arbitrator.register_node_consumer(
+            Arc::new(ArenaConsumer::new(handle.clone())),
+            handle.clone(),
+            test_label("second"),
+        );
+
+        match second {
+            Err(clinker_plan::error::PipelineError::Internal { node, detail, .. }) => {
+                assert_eq!(node, "second", "the error names the refused consumer");
+                assert!(
+                    detail.contains("one registered consumer at a time"),
+                    "the error names the invariant: {detail}"
+                );
+            }
+            other => panic!("a second binding of one handle must be refused: {other:?}"),
+        }
+        assert_eq!(
+            arbitrator.consumers.load().len(),
+            registered_before,
+            "the refused consumer never enters the registry"
+        );
+        assert!(
+            !arbitrator
+                .per_node_peak_charged_bytes()
+                .contains_key("second"),
+            "the refused consumer is attributed to no node"
+        );
+        assert_eq!(arbitrator.charged_bytes(), 4_096);
+        handle.set_bytes(0);
+        arbitrator.unregister_consumer(first);
+        handle.set_bytes(1_024);
+        assert_eq!(
+            arbitrator.charged_bytes(),
+            0,
+            "the handle was the first consumer's alone, so it charges nothing once that one leaves"
+        );
+    }
+
     #[test]
     fn node_peak_is_each_nodes_own_high_water_mark() {
         use crate::pipeline::arena::ArenaConsumer;
@@ -2956,16 +3396,20 @@ mod tests {
         // consumer's, never the sum across nodes.
         let small = ConsumerHandle::new();
         let large = ConsumerHandle::new();
-        let small_id = arbitrator.register_node_consumer(
-            Arc::new(ArenaConsumer::new(small.clone())),
-            small.clone(),
-            test_label("sort_by_amount"),
-        );
-        let large_id = arbitrator.register_node_consumer(
-            Arc::new(ArenaConsumer::new(large.clone())),
-            large.clone(),
-            test_label("dept_totals"),
-        );
+        let small_id = arbitrator
+            .register_node_consumer(
+                Arc::new(ArenaConsumer::new(small.clone())),
+                small.clone(),
+                test_label("sort_by_amount"),
+            )
+            .expect("a fresh handle registers");
+        let large_id = arbitrator
+            .register_node_consumer(
+                Arc::new(ArenaConsumer::new(large.clone())),
+                large.clone(),
+                test_label("dept_totals"),
+            )
+            .expect("a fresh handle registers");
         small.set_bytes(100);
         large.set_bytes(900);
         small.set_bytes(20);
@@ -2973,11 +3417,13 @@ mod tests {
         // A consumer no node owns is charged but attributed to no node.
         let run_scoped = ConsumerHandle::new();
         run_scoped.set_bytes(5_000);
-        let run_scoped_id = arbitrator.register_consumer(
-            Arc::new(ArenaConsumer::new(run_scoped.clone())),
-            run_scoped.clone(),
-            test_label("run"),
-        );
+        let run_scoped_id = arbitrator
+            .register_consumer(
+                Arc::new(ArenaConsumer::new(run_scoped.clone())),
+                run_scoped.clone(),
+                test_label("run"),
+            )
+            .expect("a fresh handle registers");
 
         let peaks = arbitrator.per_node_peak_charged_bytes();
         assert_eq!(peaks.get("sort_by_amount"), Some(&100));
@@ -2996,11 +3442,13 @@ mod tests {
         // A node that registers again later reports the larger of its two
         // consumers' marks, not their sum.
         let again = ConsumerHandle::new();
-        let again_id = arbitrator.register_node_consumer(
-            Arc::new(ArenaConsumer::new(again.clone())),
-            again.clone(),
-            test_label("dept_totals"),
-        );
+        let again_id = arbitrator
+            .register_node_consumer(
+                Arc::new(ArenaConsumer::new(again.clone())),
+                again.clone(),
+                test_label("dept_totals"),
+            )
+            .expect("a fresh handle registers");
         again.set_bytes(300);
         assert_eq!(
             arbitrator.per_node_peak_charged_bytes().get("dept_totals"),
@@ -3057,12 +3505,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_budget_category_display_shape() {
-        assert_eq!(BudgetCategory::Arena.to_string(), "arena");
-        assert_eq!(BudgetCategory::NodeBuffer.to_string(), "node_buffer");
-    }
-
     /// A label for a test registration, naming `node`.
     fn test_label(node: &str) -> ConsumerLabel {
         ConsumerLabel {
@@ -3080,7 +3522,9 @@ mod tests {
     ) -> ConsumerId {
         let handle = ConsumerHandle::new();
         handle.set_bytes(consumer.current_usage());
-        arbitrator.register_consumer(consumer, handle, test_label("test"))
+        arbitrator
+            .register_consumer(consumer, handle, test_label("test"))
+            .expect("a fresh handle registers")
     }
 
     /// Minimal `MemoryConsumer` used to exercise the trait surface
@@ -3259,11 +3703,13 @@ mod tests {
         let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
         let handle = ConsumerHandle::new();
         handle.set_bytes(100);
-        let id = arbitrator.register_consumer(
-            Arc::new(MockConsumer::new(100, 40, 0)),
-            handle.clone(),
-            test_label("test"),
-        );
+        let id = arbitrator
+            .register_consumer(
+                Arc::new(MockConsumer::new(100, 40, 0)),
+                handle.clone(),
+                test_label("test"),
+            )
+            .expect("a fresh handle registers");
         assert_eq!(arbitrator.consumer_count(), 1);
         assert_eq!(arbitrator.sum_consumer_usage(), 100);
 
@@ -3332,11 +3778,13 @@ mod tests {
         // does: a fresh handle seeded to the arena's measured bytes.
         let handle = ConsumerHandle::new();
         handle.set_bytes(ARENA_BYTES);
-        let id = arbitrator.register_consumer(
-            Arc::new(ArenaConsumer::new(handle.clone())),
-            handle.clone(),
-            test_label("rolling"),
-        );
+        let id = arbitrator
+            .register_consumer(
+                Arc::new(ArenaConsumer::new(handle.clone())),
+                handle.clone(),
+                test_label("rolling"),
+            )
+            .expect("a fresh handle registers");
 
         // Attribution: the arena's bytes now flow through pull-mode.
         assert_eq!(arbitrator.sum_consumer_usage(), ARENA_BYTES);
@@ -3381,11 +3829,13 @@ mod tests {
         arena_handle.set_bytes(512 * 1024 * 1024);
         // The arena is far larger than the spillable; only the priority
         // ordering keeps it from being elected, which is the point.
-        arbitrator.register_consumer(
-            Arc::new(ArenaConsumer::new(arena_handle.clone())),
-            arena_handle,
-            test_label("rolling"),
-        );
+        arbitrator
+            .register_consumer(
+                Arc::new(ArenaConsumer::new(arena_handle.clone())),
+                arena_handle,
+                test_label("rolling"),
+            )
+            .expect("a fresh handle registers");
         let spillable = Arc::new(ReclaimableMock::new(1024, 10));
         register_charged(&arbitrator, spillable.clone());
 
@@ -3932,7 +4382,8 @@ mod tests {
             Arc::new(SourceConsumer::new(handle.clone())),
             handle.clone(),
             test_label("orders"),
-        );
+        )
+        .expect("a fresh handle registers");
 
         // Above soft: pause. Repeated polls stay paused (single victim,
         // idempotent) — no per-poll thrash.
@@ -3971,6 +4422,67 @@ mod tests {
     }
 
     #[test]
+    fn sources_pause_on_charged_bytes_without_the_poll() {
+        use crate::executor::node_buffer::NodeBufferConsumer;
+        use crate::executor::source_stream::SourceConsumer;
+        // A 1 MiB limit: the test process's own memory is far above it, so a
+        // decision read from the process's memory would pause at once. The
+        // resume controller decides on charged bytes alone.
+        let mib = 1024u64 * 1024;
+        let arb = MemoryArbitrator::with_policy(
+            mib,
+            0.80,
+            0.70,
+            Box::new(BackPressurePreferred::wrapping(Priority)),
+        );
+        assert!(
+            rss_bytes().is_none_or(|rss| rss > 4 * mib),
+            "the premise: the process holds far more than the limit"
+        );
+        let source = ConsumerHandle::new();
+        arb.register_consumer(
+            Arc::new(SourceConsumer::new(source.clone())),
+            source.clone(),
+            test_label("orders"),
+        )
+        .expect("a fresh handle registers");
+        let slot = ConsumerHandle::new();
+        arb.register_node_consumer(
+            Arc::new(NodeBufferConsumer::new(slot.clone())),
+            slot.clone(),
+            test_label("orders_slot"),
+        )
+        .expect("a fresh handle registers");
+
+        slot.set_bytes(mib / 2);
+        arb.reconcile_backpressure();
+        assert!(
+            !source.is_paused(),
+            "charged bytes below the soft limit pause nothing, however much the process holds"
+        );
+
+        slot.set_bytes(mib * 9 / 10);
+        arb.reconcile_backpressure();
+        assert!(
+            source.is_paused(),
+            "charged bytes above 0.80 of the limit pause"
+        );
+
+        slot.set_bytes(mib / 2);
+        arb.reconcile_backpressure();
+        assert!(
+            !source.is_paused(),
+            "charged bytes below the resume watermark resume"
+        );
+
+        assert!(
+            !slot.take_spill_request(),
+            "reconciling pauses and resumes only; it asks nothing to spill"
+        );
+        assert!(arb.per_stage_spill_bytes_written().is_empty());
+    }
+
+    #[test]
     fn reconcile_backpressure_exempts_the_actively_drained_source() {
         use crate::executor::source_stream::SourceConsumer;
         // A Source the walk is currently draining (active) is never paused,
@@ -3988,7 +4500,8 @@ mod tests {
             Arc::new(SourceConsumer::new(handle.clone())),
             handle.clone(),
             test_label("orders"),
-        );
+        )
+        .expect("a fresh handle registers");
 
         handle.set_active();
         handle.set_bytes(60 * gib); // above soft
@@ -4022,7 +4535,8 @@ mod tests {
             Arc::new(SourceConsumer::new(source_handle.clone())),
             source_handle.clone(),
             test_label("orders"),
-        );
+        )
+        .expect("a fresh handle registers");
         let reclaimable = Arc::new(ReclaimableMock::new(60 * gib, 0));
         register_charged(&arb, reclaimable.clone());
 
@@ -4055,7 +4569,8 @@ mod tests {
             Arc::new(SourceConsumer::new(source_handle.clone())),
             source_handle.clone(),
             test_label("orders"),
-        );
+        )
+        .expect("a fresh handle registers");
         let reclaimable = Arc::new(ReclaimableMock::new(4096, 0));
         register_charged(&arb, reclaimable.clone());
 

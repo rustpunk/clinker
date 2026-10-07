@@ -22,6 +22,7 @@ use clinker_plan::credentials::{
     CredentialCapability, CredentialHandleUnits, CredentialLifetime, CredentialProviderKind,
     CredentialRenewal, CredentialRequirement, CredentialRequirementName, CredentialRevocation,
 };
+use clinker_plan::runtime_error::MemoryShortfallReport;
 
 /// An explicitly selected deployment credential profile name.
 ///
@@ -1098,6 +1099,13 @@ impl MemoryConsumer for CredentialRegistryConsumer {
         self.handle.bytes()
     }
 
+    /// Credentials are never written to disk, so no spill frees any of the
+    /// registry's charge: it is never elected, and its bytes still count
+    /// toward the ledger.
+    fn reclaimable_bytes(&self) -> u64 {
+        0
+    }
+
     fn peak_charged_bytes(&self) -> Option<u64> {
         Some(self.handle.peak_bytes())
     }
@@ -1133,14 +1141,16 @@ mod memory_consumer_contract_tests {
         let consumer = Arc::new(CredentialRegistryConsumer::new(Arc::clone(&handle)));
         let arbitrator =
             MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, MemoryArbitrator::default_policy());
-        let consumer_id = arbitrator.register_consumer(
-            consumer.clone(),
-            Arc::clone(&handle),
-            clinker_plan::runtime_error::ConsumerLabel {
-                node: "credentials".to_string(),
-                surface: clinker_plan::runtime_error::MemorySurface::CredentialRegistry,
-            },
-        );
+        let consumer_id = arbitrator
+            .register_consumer(
+                consumer.clone(),
+                Arc::clone(&handle),
+                clinker_plan::runtime_error::ConsumerLabel {
+                    node: "credentials".to_string(),
+                    surface: clinker_plan::runtime_error::MemorySurface::CredentialRegistry,
+                },
+            )
+            .expect("a fresh handle registers");
 
         let result = consumer.try_spill(2_048);
 
@@ -1156,13 +1166,42 @@ mod memory_consumer_contract_tests {
         assert!(handle.take_spill_request());
         assert!(arbitrator.unregister_consumer(consumer_id).is_some());
     }
+
+    /// Credentials are never written to disk, so a spill frees none of the
+    /// registry's bytes: it reports nothing reclaimable, which keeps every
+    /// reclaim pass from electing it, while its whole charge still counts
+    /// toward the run's ledger.
+    #[test]
+    fn credential_registry_reclaims_nothing_and_stays_charged() {
+        let handle = ConsumerHandle::new();
+        let consumer = Arc::new(CredentialRegistryConsumer::new(Arc::clone(&handle)));
+        let arbitrator =
+            MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, MemoryArbitrator::default_policy());
+        let consumer_id = arbitrator
+            .register_consumer(
+                consumer.clone(),
+                Arc::clone(&handle),
+                clinker_plan::runtime_error::ConsumerLabel {
+                    node: "credentials".to_string(),
+                    surface: clinker_plan::runtime_error::MemorySurface::CredentialRegistry,
+                },
+            )
+            .expect("a fresh handle registers");
+        handle.set_bytes(4_096);
+
+        assert_eq!(consumer.reclaimable_bytes(), 0);
+        assert_eq!(consumer.current_usage(), 4_096);
+        assert_eq!(arbitrator.charged_bytes(), 4_096);
+        assert!(arbitrator.unregister_consumer(consumer_id).is_some());
+    }
 }
 
 /// Run-local owner for every credential lease acquired during preflight.
 ///
 /// The registry preallocates a fixed handle table, registers exactly one
 /// [`MemoryConsumer`], and charges each provider-declared lease plus its
-/// secret-free handle metadata before the provider may allocate it. Credential
+/// secret-free handle metadata through the run's memory ledger, checked against
+/// the limit, before the provider may allocate it. Credential
 /// state is never written to spill. The consumer reports zero bytes freed when
 /// the arbitrator requests a spill, then the registry revokes and releases the
 /// complete preflight set at its next owned memory-signal checkpoint.
@@ -1186,15 +1225,22 @@ where
 {
     /// Create an empty registry and register its single memory consumer.
     ///
-    /// The fixed handle-slot table is allocated before registration and holds
-    /// no credential state. Its actual capacity bytes are charged immediately;
-    /// every subsequent lease allocation is precharged before provider work.
+    /// The consumer is registered with nothing charged. The fixed handle-slot
+    /// table, which holds no credential state, is then admitted through the
+    /// ledger before it is allocated, as every later lease is admitted before
+    /// provider work; if the allocation's capacity exceeds the admitted
+    /// figure, the difference is admitted too.
     ///
     /// # Errors
     ///
     /// Returns [`CredentialRegistryErrorKind::AllocationFailed`] when the
     /// fixed handle table cannot be reserved or its byte size cannot be
-    /// represented by the memory consumer.
+    /// represented by the memory consumer,
+    /// [`CredentialRegistryErrorKind::RegistrationFailed`] when the arbitrator
+    /// refuses to register that consumer, and
+    /// [`CredentialRegistryErrorKind::MemoryLimitExceeded`], carrying the E310
+    /// report, when the table does not fit beside what the run has charged.
+    /// Every error leaves no registered consumer and nothing charged.
     pub fn new(
         arbitrator: &'catalog MemoryArbitrator,
         catalog: &'catalog CredentialProfileCatalog<'run>,
@@ -1211,8 +1257,7 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`CredentialRegistryErrorKind::AllocationFailed`] under the
-    /// same fixed-table conditions as [`Self::new`].
+    /// As [`Self::new`].
     pub fn new_with_telemetry(
         arbitrator: &'catalog MemoryArbitrator,
         catalog: &'catalog CredentialProfileCatalog<'run>,
@@ -1226,40 +1271,74 @@ where
         catalog: &'catalog CredentialProfileCatalog<'run>,
         telemetry: Option<TelemetryProducer>,
     ) -> Result<Self, CredentialRegistryError> {
-        let mut handles = Vec::new();
-        handles
-            .try_reserve_exact(catalog.limits.max_live_handles)
-            .map_err(|_| {
-                CredentialRegistryError::new(CredentialRegistryErrorKind::AllocationFailed)
-            })?;
-        let table_bytes = handles
-            .capacity()
-            .checked_mul(std::mem::size_of::<LeasedCredentialHandle<'run>>())
-            .and_then(|bytes| u64::try_from(bytes).ok())
+        let planned_table_bytes = Self::handle_table_bytes(catalog.limits.max_live_handles)
             .ok_or_else(|| {
                 CredentialRegistryError::new(CredentialRegistryErrorKind::AllocationFailed)
             })?;
         let memory_handle = ConsumerHandle::new();
-        memory_handle.set_bytes(table_bytes);
         let consumer = Arc::new(CredentialRegistryConsumer::new(Arc::clone(&memory_handle)));
-        let consumer_id = arbitrator.register_consumer(
-            consumer.clone(),
-            Arc::clone(&memory_handle),
-            clinker_plan::runtime_error::ConsumerLabel {
-                node: "credentials".to_string(),
-                surface: clinker_plan::runtime_error::MemorySurface::CredentialRegistry,
-            },
-        );
-        Ok(Self {
+        let consumer_id = arbitrator
+            .register_consumer(
+                consumer.clone(),
+                Arc::clone(&memory_handle),
+                clinker_plan::runtime_error::ConsumerLabel {
+                    node: "credentials".to_string(),
+                    surface: clinker_plan::runtime_error::MemorySurface::CredentialRegistry,
+                },
+            )
+            .map_err(|_| {
+                CredentialRegistryError::new(CredentialRegistryErrorKind::RegistrationFailed)
+            })?;
+        let mut registry = Self {
             arbitrator,
             catalog,
             memory_handle,
             consumer,
             consumer_id: Some(consumer_id),
-            handles,
-            retained_bytes: table_bytes,
+            handles: Vec::new(),
+            retained_bytes: 0,
             telemetry,
-        })
+        };
+        // The table is charged before it is allocated, checked against the
+        // run's charged total under the ledger lock, exactly as a lease is: a
+        // refusal charges and allocates nothing, so the run's peak never
+        // records a table that did not fit.
+        registry.admit_table(planned_table_bytes)?;
+        if registry
+            .handles
+            .try_reserve_exact(catalog.limits.max_live_handles)
+            .is_err()
+        {
+            return Err(registry.fail_and_close(CredentialRegistryErrorKind::AllocationFailed));
+        }
+        let Some(table_bytes) = Self::handle_table_bytes(registry.handles.capacity()) else {
+            return Err(registry.fail_and_close(CredentialRegistryErrorKind::AllocationFailed));
+        };
+        if table_bytes > registry.retained_bytes {
+            registry.admit_table(table_bytes)?;
+        }
+        Ok(registry)
+    }
+
+    /// Bytes of a handle table with room for `slots` leases, or `None` when
+    /// the figure cannot be represented. One function sizes both the figure
+    /// admitted before the table is allocated and the allocation's actual
+    /// capacity.
+    fn handle_table_bytes(slots: usize) -> Option<u64> {
+        slots
+            .checked_mul(std::mem::size_of::<LeasedCredentialHandle<'run>>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+    }
+
+    /// Charge the handle table at `table_bytes` through a checked resize, or
+    /// fail closed with the E310 report of the refusal.
+    fn admit_table(&mut self, table_bytes: u64) -> Result<(), CredentialRegistryError> {
+        if let Err(shortfall) = self.memory_handle.try_resize(table_bytes) {
+            let report = shortfall.into_report(self.arbitrator);
+            return Err(self.fail_and_close_with_report(report));
+        }
+        self.retained_bytes = table_bytes;
+        Ok(())
     }
 
     /// Acquire and retain one requirement through the explicit profile.
@@ -1273,7 +1352,10 @@ where
     ///
     /// Returns a sanitized resolution, capacity, memory, accounting, or
     /// provider error. Every error leaves zero live handles and no registered
-    /// consumer.
+    /// consumer. A lease that does not fit beside what the run has charged is
+    /// refused before the provider allocates it, with
+    /// [`CredentialRegistryErrorKind::MemoryLimitExceeded`] carrying the E310
+    /// report; the process's memory reading takes no part in that decision.
     pub fn acquire(
         &mut self,
         selected: &CredentialProfileName,
@@ -1318,9 +1400,12 @@ where
             return Err(self.fail_and_close(CredentialRegistryErrorKind::RetainedBytesOverflow));
         };
 
-        self.memory_handle.set_bytes(prospective_bytes);
-        if self.arbitrator.should_abort_local(prospective_bytes) {
-            return Err(self.fail_and_close(CredentialRegistryErrorKind::MemoryLimitExceeded));
+        // The lease is charged before the provider allocates it, checked
+        // against the run's charged total under the ledger lock. A refusal
+        // charges nothing, so the run's peak never records a refused lease.
+        if let Err(shortfall) = self.memory_handle.try_resize(prospective_bytes) {
+            let report = shortfall.into_report(self.arbitrator);
+            return Err(self.fail_and_close_with_report(report));
         }
 
         let mut lease = match provider.resolve(requirement) {
@@ -1433,6 +1518,18 @@ where
         CredentialRegistryError::new(kind)
     }
 
+    /// Fail closed on a memory refusal, carrying its E310 report. The report
+    /// is built by the caller before cleanup, while the registry is still a
+    /// registered holder of the ledger the refusal read.
+    fn fail_and_close_with_report(
+        &mut self,
+        report: Box<MemoryShortfallReport>,
+    ) -> CredentialRegistryError {
+        let mut error = self.fail_and_close(CredentialRegistryErrorKind::MemoryLimitExceeded);
+        error.report = Some(report);
+        error
+    }
+
     fn release_all(&mut self) -> bool {
         let mut cleanup_failed = false;
         while let Some(mut handle) = self.handles.pop() {
@@ -1470,7 +1567,9 @@ pub enum CredentialRegistryErrorKind {
     Resolution(CredentialResolutionErrorKind),
     /// The fixed handle-entry ceiling was reached.
     HandleLimitExceeded,
-    /// Prospective retained bytes exceeded the run memory budget.
+    /// The run's memory ledger refused the fixed table's or a lease's bytes:
+    /// the E310 refusal, whose report [`CredentialRegistryError::memory_report`]
+    /// carries.
     MemoryLimitExceeded,
     /// The arbitrator requested release before another acquisition.
     SpillRequested,
@@ -1482,24 +1581,41 @@ pub enum CredentialRegistryErrorKind {
     CleanupFailed,
     /// The fixed handle table could not be allocated or represented.
     AllocationFailed,
+    /// The registry's memory consumer could not be registered with the run's
+    /// memory arbitrator.
+    RegistrationFailed,
     /// An acquisition was attempted after the registry closed.
     Closed,
 }
 
 /// A sanitized credential-registry failure.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// The message is a static string per [`CredentialRegistryErrorKind`]. A
+/// memory refusal also carries the run's E310 report as a separate field,
+/// read through [`Self::memory_report`]; it holds byte figures and the run's
+/// holder labels, never a credential value, profile or requirement name.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CredentialRegistryError {
     kind: CredentialRegistryErrorKind,
+    report: Option<Box<MemoryShortfallReport>>,
 }
 
 impl CredentialRegistryError {
     const fn new(kind: CredentialRegistryErrorKind) -> Self {
-        Self { kind }
+        Self { kind, report: None }
     }
 
     /// Stable failure category.
-    pub const fn kind(self) -> CredentialRegistryErrorKind {
+    pub const fn kind(&self) -> CredentialRegistryErrorKind {
         self.kind
+    }
+
+    /// The E310 report of a [`CredentialRegistryErrorKind::MemoryLimitExceeded`]
+    /// refusal: the run's memory ledger as the refused table or lease found
+    /// it, naming the credential registry as the requester. `None` for every
+    /// other kind.
+    pub fn memory_report(&self) -> Option<&MemoryShortfallReport> {
+        self.report.as_deref()
     }
 }
 
@@ -1529,6 +1645,9 @@ impl fmt::Display for CredentialRegistryError {
             }
             CredentialRegistryErrorKind::AllocationFailed => {
                 "credential handle registry could not allocate its fixed table"
+            }
+            CredentialRegistryErrorKind::RegistrationFailed => {
+                "credential handle registry could not register its memory consumer"
             }
             CredentialRegistryErrorKind::Closed => "credential handle registry is already closed",
         };

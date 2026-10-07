@@ -30,9 +30,13 @@ rules.
 Input is strict UTF-8. One leading UTF-8 BOM is accepted and removed at each
 physical file open, including an envelope pre-scan. UTF-16 and UTF-32 BOMs and
 malformed UTF-8 are rejected; convert the file to UTF-8 before running it.
-There is no JSON `encoding` option or lossy fallback. A later invalid file does
-not erase records already delivered from earlier files. Validation follows the
-reader: it does not promise to discover malformed bytes beyond what it reads.
+There is no JSON `encoding` option or lossy fallback. When any file is invalid,
+the run fails and publishes nothing: no step finishes on the records read from
+the files before it. Rows an output had already written stay only in the
+failed run's retained attempt, unpublished, for inspection (see
+[failed runs](../pipelines/error-handling.md#fail_fast)). Fix or remove the
+invalid file and run again. Validation follows the reader: it does not promise
+to discover malformed bytes beyond what it reads.
 
 Output is UTF-8 without a BOM. Ordinary `format: ndjson` always writes one
 compact object followed by exactly one LF, including the last record;

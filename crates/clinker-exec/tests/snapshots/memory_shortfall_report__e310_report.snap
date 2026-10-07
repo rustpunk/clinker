@@ -1,0 +1,21 @@
+---
+source: crates/clinker-exec/tests/memory_shortfall_report.rs
+expression: text
+---
+E310 "totals": needed 2.0 MiB more for group state, but only 704.0 KiB of memory.limit 8.0 MiB was left
+  charged 7.3 MiB of 8.0 MiB (91%) · private memory 200.0 MiB
+  largest holders:
+    "enrich"  join build side  3.5 MiB  cannot spill
+    "totals"  group state  1.0 MiB  requester
+    "sorted"  rows buffered between "orders" and "sorted"  1.0 MiB  in use
+    "orders"  rows read from the source  768.0 KiB  paused source
+    "dedupe"  decision state  256.0 KiB  cannot spill
+    +2 more holders  192.0 KiB
+    not held by any one node  640.0 KiB
+  reclaim: none attempted
+  fix: raise the limit to at least 10M — the smallest limit with room for this request and what the run already holds; later stages may need more
+    pipeline:
+      memory: { limit: "10M" }
+    or: --memory-limit 10M
+  remedy: "enrich"'s join build side holds 3.5 MiB and could not be spilled; see "Join build side" in clinker explain --code E310
+  See: clinker explain --code E310

@@ -57,6 +57,7 @@ use cxl::typecheck::TypedProgram;
 use indexmap::IndexMap;
 
 use crate::executor::combine::{CombineResolver, CombineResolverMapping};
+use crate::executor::node_buffer::TransientNodeBufferReservation;
 use crate::executor::widen_record_to_schema;
 use crate::pipeline::combine::{CombineOutputEvalFailure, KeyExtractor, MatchedBuildFailure};
 use crate::pipeline::combine_verdict::{
@@ -68,7 +69,6 @@ use crate::pipeline::memory::NoOpPolicy;
 use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
 use crate::pipeline::spill::{SpillFile, SpillWriter};
 use crate::pipeline::spill_merge::{MergeBudget, SortedRunMerger};
-use clinker_plan::BudgetCategory;
 use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::combine::{DecomposedPredicate, RangeOp};
@@ -79,13 +79,14 @@ use clinker_plan::plan::combine::{DecomposedPredicate, RangeOp};
 /// threshold.
 const COLLECT_PER_GROUP_CAP: usize = 10_000;
 
-/// Emitted-row period between global [`MemoryArbitrator::should_abort`] polls
-/// during the merge walk. The self-spilling output sort is the primary bound on
-/// this operator's own residency; this poll is the last-resort defense that
-/// catches cross-consumer or under-counted global pressure the output sort
-/// cannot see — the same cadence `pipeline::grace_hash` and `pipeline::combine`
-/// use. `should_abort` trips on either RSS or the byte-counted consumer sum, so
-/// the backstop still fires on targets where RSS is unmeasurable.
+/// Emitted-row period between the run's hard-limit checks during the merge
+/// walk. The self-spilling output sort is the primary bound on this operator's
+/// own residency; this check is the last-resort defense that catches
+/// cross-consumer or under-counted global pressure the output sort cannot see —
+/// the same cadence `pipeline::grace_hash` and `pipeline::combine` use. On the
+/// walk it reclaims other state before it refuses. It trips on either the
+/// process's peak resident reading or the charged total, so the backstop still
+/// fires on targets where RSS is unmeasurable.
 const MEMORY_CHECK_INTERVAL: usize = 10_000;
 
 /// Per-side external-sort spill threshold in bytes: half the soft RSS limit,
@@ -656,12 +657,24 @@ pub(crate) struct SortMergeExec<'a> {
     /// rows accumulate and released as they spill. Each side's transient Phase A
     /// sort-buffer charge nets to zero once that side lands (spilled records are
     /// off-process; a resident driver's charge is retained, not double-counted).
+    /// The drivers whose range key is null wait in a miss pile charged here
+    /// from the end of Phase A until each is dispatched after the walk.
     pub consumer_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
     /// Error strategy governing output-stage eval failures. Under
     /// `FailFast` a residual / body eval error propagates immediately;
     /// under `Continue` the failing row is deferred to the dispatcher via
     /// [`SortMergeOutput::output_eval_failures`].
     pub strategy: clinker_plan::config::ErrorStrategy,
+    /// The charge the driver input's rows carried into the join, `None` when
+    /// they arrived uncharged. The kernel owns it: it stays on the ledger
+    /// while Phase A holds the rows in vectors the kernel does not charge,
+    /// and Phase A's driver side hands it to `consumer_handle` where it
+    /// first charges those rows, the miss pile's share included.
+    pub driver_input_charge: Option<TransientNodeBufferReservation>,
+    /// The charge the build input's rows carried into the join, `None` when
+    /// they arrived uncharged; handed to `consumer_handle` where Phase A's
+    /// build side first charges those rows.
+    pub build_input_charge: Option<TransientNodeBufferReservation>,
 }
 
 /// Snapshot of which phases ran during a sort-merge execution. Used by
@@ -715,10 +728,15 @@ struct SortMergeStats {
 /// or body evaluation errors, and `on_miss: error` driver misses.
 /// Returns [`PipelineError::Internal`] on planner-shape violations
 /// (e.g. invocation with no range conjuncts) and on spill I/O failures.
+///
+/// Runs on the calling thread, so its budget checks and spills run there;
+/// only range-key extraction and the sort buffers' comparator sorts run on
+/// `pool`.
 pub(crate) fn execute_combine_sort_merge(
     args: SortMergeExec<'_>,
+    pool: &Arc<rayon::ThreadPool>,
 ) -> Result<SortMergeOutput, PipelineError> {
-    let (output, _stats) = execute_combine_sort_merge_with_stats(args)?;
+    let (output, _stats) = execute_combine_sort_merge_with_stats(args, pool)?;
     Ok(output)
 }
 
@@ -746,12 +764,13 @@ pub(crate) struct SortMergeOutput {
 /// through [`execute_combine_sort_merge`].
 fn execute_combine_sort_merge_with_stats(
     args: SortMergeExec<'_>,
+    pool: &Arc<rayon::ThreadPool>,
 ) -> Result<(SortMergeOutput, SortMergeStats), PipelineError> {
     // This kernel is the sole byte writer for its operator-private handle.
     // Restore only its prior attribution after error-owned locals have dropped.
     let consumer = args.consumer_handle.clone();
     let baseline = consumer.bytes();
-    let result = execute_combine_sort_merge_inner(args);
+    let result = execute_combine_sort_merge_inner(args, pool);
     if result.is_err() {
         consumer.set_bytes(baseline);
     }
@@ -760,6 +779,7 @@ fn execute_combine_sort_merge_with_stats(
 
 fn execute_combine_sort_merge_inner(
     args: SortMergeExec<'_>,
+    pool: &Arc<rayon::ThreadPool>,
 ) -> Result<(SortMergeOutput, SortMergeStats), PipelineError> {
     let SortMergeExec {
         allocation_resources,
@@ -782,6 +802,8 @@ fn execute_combine_sort_merge_inner(
         spill_compress,
         consumer_handle,
         strategy,
+        driver_input_charge,
+        build_input_charge,
     } = args;
 
     let mut stats = SortMergeStats::default();
@@ -905,23 +927,25 @@ fn execute_combine_sort_merge_inner(
     // driver keeps its unique global input index (`driver_idx`) as the
     // deterministic output-order tie-break under a repeated `RecordOrder` (a
     // chained upstream can fan one input row into several sharing one order).
-    let driver_keyed: Vec<(Record, RecordOrder, u64, Option<Value>)> = driver_records
-        .into_par_iter()
-        .enumerate()
-        .map(|(driver_idx, (record, order))| {
-            let mut range_buf: Vec<Value> = Vec::new();
-            let key = extract_range_key(
-                &driver_extractor,
-                ctx,
-                &record,
-                resolver_mapping,
-                true,
-                &mut range_buf,
-            )
-            .map_err(|e| key_eval_error(name, "driving", e))?;
-            Ok::<_, PipelineError>((record, order, driver_idx as u64, key))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let driver_keyed: Vec<(Record, RecordOrder, u64, Option<Value>)> = pool.install(|| {
+        driver_records
+            .into_par_iter()
+            .enumerate()
+            .map(|(driver_idx, (record, order))| {
+                let mut range_buf: Vec<Value> = Vec::new();
+                let key = extract_range_key(
+                    &driver_extractor,
+                    ctx,
+                    &record,
+                    resolver_mapping,
+                    true,
+                    &mut range_buf,
+                )
+                .map_err(|e| key_eval_error(name, "driving", e))?;
+                Ok::<_, PipelineError>((record, order, driver_idx as u64, key))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })?;
     // `(record, key, (order, driver_idx))`: the range key drives Phase A's sort;
     // `(order, driver_idx)` is the payload carried verbatim through the spill
     // envelope — the order tag plus the deterministic tie-break under a repeated
@@ -929,31 +953,42 @@ fn execute_combine_sort_merge_inner(
     let mut driver_pairs: Vec<(Record, Value, (RecordOrder, u64))> = Vec::new();
     // NULL / non-orderable-key drivers never satisfy a CXL ternary comparison,
     // so they match nothing and route through the miss dispatch after the walk.
-    let mut driver_unmatched: Vec<(Record, RecordOrder, u64)> = Vec::new();
+    let mut driver_unmatched: Vec<MissPileEntry> = Vec::new();
     for (record, order, driver_idx, key) in driver_keyed {
         match key {
             Some(k) => driver_pairs.push((record, k, (order, driver_idx))),
             None => driver_unmatched.push((record, order, driver_idx)),
         }
     }
+    // The pile stays resident until the miss dispatch after the walk. The
+    // driver input's charge covers it until Phase A's driver side hands that
+    // charge to the kernel, which then charges the pile at this figure.
+    let miss_pile_shells = miss_pile_slot_bytes(&driver_unmatched);
+    let miss_pile_charge = driver_unmatched
+        .iter()
+        .fold(miss_pile_shells, |sum, (record, _, _)| {
+            sum.saturating_add(record.unaccounted_heap_size(allocation_resources) as u64)
+        });
 
-    let build_keyed: Vec<(Record, BuildTag, Option<Value>)> = build_records
-        .into_par_iter()
-        .enumerate()
-        .map(|(build_idx, (record, row))| {
-            let mut range_buf: Vec<Value> = Vec::new();
-            let key = extract_range_key(
-                &build_extractor,
-                ctx,
-                &record,
-                resolver_mapping,
-                false,
-                &mut range_buf,
-            )
-            .map_err(|e| key_eval_error(name, "build", e))?;
-            Ok::<_, PipelineError>((record, (build_idx as u64, row), key))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let build_keyed: Vec<(Record, BuildTag, Option<Value>)> = pool.install(|| {
+        build_records
+            .into_par_iter()
+            .enumerate()
+            .map(|(build_idx, (record, row))| {
+                let mut range_buf: Vec<Value> = Vec::new();
+                let key = extract_range_key(
+                    &build_extractor,
+                    ctx,
+                    &record,
+                    resolver_mapping,
+                    false,
+                    &mut range_buf,
+                )
+                .map_err(|e| key_eval_error(name, "build", e))?;
+                Ok::<_, PipelineError>((record, (build_idx as u64, row), key))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })?;
     let mut build_pairs: Vec<(Record, Value, BuildTag)> = Vec::new();
     for (record, tag, key) in build_keyed {
         if let Some(k) = key {
@@ -972,30 +1007,40 @@ fn execute_combine_sort_merge_inner(
     //    build merge lazily one record per open run, the window spills past
     //    `byte_limit`, and the output spills past its own threshold. The
     //    pre-sorted path only avoids the sort *work*.
-    let (driver_stream, driver_charge) = sort_side_stream(SideStreamBuild {
-        allocation_resources,
-        pairs: driver_pairs,
-        name,
-        range_field: &driver_field,
-        budget,
-        spill_compress,
-        consumer_handle: &consumer_handle,
-        spill_dir,
-        presorted,
-        side: "driver",
-    })?;
-    let (build_cursor, build_resident_charge) = sort_side_stream(SideStreamBuild {
-        allocation_resources,
-        pairs: build_pairs,
-        name,
-        range_field: &build_field,
-        budget,
-        spill_compress,
-        consumer_handle: &consumer_handle,
-        spill_dir,
-        presorted,
-        side: "build",
-    })?;
+    let (driver_stream, driver_charge) = sort_side_stream(
+        SideStreamBuild {
+            allocation_resources,
+            pairs: driver_pairs,
+            name,
+            range_field: &driver_field,
+            budget,
+            spill_compress,
+            consumer_handle: &consumer_handle,
+            spill_dir,
+            presorted,
+            side: "driver",
+            input_charge: driver_input_charge,
+            extra_bytes: miss_pile_charge,
+        },
+        pool,
+    )?;
+    let (build_cursor, build_resident_charge) = sort_side_stream(
+        SideStreamBuild {
+            allocation_resources,
+            pairs: build_pairs,
+            name,
+            range_field: &build_field,
+            budget,
+            spill_compress,
+            consumer_handle: &consumer_handle,
+            spill_dir,
+            presorted,
+            side: "build",
+            input_charge: build_input_charge,
+            extra_bytes: 0,
+        },
+        pool,
+    )?;
     if !presorted {
         stats.phase_a_sort_invocations = 2;
     }
@@ -1025,7 +1070,8 @@ fn execute_combine_sort_merge_inner(
         spill_compress,
         output_row_schema,
         allocation_resources.clone(),
-    );
+    )
+    .with_kernel_pool(Arc::clone(pool));
     // Parallel `(order, driver_idx, build_idx)` sort key per deferred output-eval
     // failure, so the dead-letter rows re-order into the same layout-independent
     // order as the emitted rows.
@@ -1159,7 +1205,9 @@ fn execute_combine_sort_merge_inner(
     // They never entered the merge, so each matches nothing: one collect row
     // (empty array) or the on_miss policy, routed through the same output sort so
     // their canonical order is realized alongside the walk's matched rows.
-    for (driver_record, driver_order, driver_idx) in driver_unmatched {
+    // Each dispatched miss drops its record, so its heap is discharged then;
+    // the pile's slots go with its vector once the loop ends.
+    for (driver_record, driver_order, driver_idx) in driver_unmatched.drain(..) {
         dispatch_driver_miss(DispatchMiss {
             ectx: &ectx,
             mspill: &mspill,
@@ -1174,7 +1222,12 @@ fn execute_combine_sort_merge_inner(
             failure_tags: &mut failure_tags,
             min_miss: &mut min_miss,
         })?;
+        let heap = driver_record.unaccounted_heap_size(allocation_resources) as u64;
+        drop(driver_record);
+        consumer_handle.sub_bytes(heap);
     }
+    consumer_handle.sub_bytes(miss_pile_slot_bytes(&driver_unmatched));
+    drop(driver_unmatched);
 
     // `on_miss: error` cites the globally lowest-RecordOrder miss, independent of
     // the walk order and the memory limit — identical to the pre-streaming flush.
@@ -1257,6 +1310,46 @@ struct SideStreamBuild<'a, P> {
     presorted: bool,
     /// `"driver"` or `"build"` — labels the side in spill / invariant messages.
     side: &'static str,
+    /// The side input's charge, which still covers `pairs` (and, for the
+    /// driver, the miss pile). Every successful return hands it to
+    /// `consumer_handle` where the side's first resident charge is made, so
+    /// the rows are charged once at every instant: never twice once the
+    /// kernel charges them, never to nobody while they sit uncharged in
+    /// `pairs` or the pile.
+    input_charge: Option<TransientNodeBufferReservation>,
+    /// Bytes the kernel charges beside the side's own resident rows when it
+    /// takes the input charge over: the driver's miss pile, 0 for the build.
+    extra_bytes: u64,
+}
+
+/// One driver whose range key is null or not orderable, held from Phase A
+/// until the miss dispatch after the walk: its record, order and input
+/// index.
+type MissPileEntry = (Record, RecordOrder, u64);
+
+/// The bytes the miss pile's vector allocated for its slots: every slot of
+/// its capacity, in use or not. The pile is charged and discharged at this
+/// one figure, so the two cannot diverge.
+fn miss_pile_slot_bytes(pile: &Vec<MissPileEntry>) -> u64 {
+    (pile.capacity() * std::mem::size_of::<MissPileEntry>()) as u64
+}
+
+/// End a side input's charge where the kernel first charges its rows: the
+/// rows' `bytes` move onto `consumer` and the input's whole charge is
+/// released, in one ledger step. `bytes` can exceed the input's charge (it
+/// covers the rows' heap and, for the driver, the null-key pile), so what it
+/// adds is admitted first as a checked growth of the join's consumer, which
+/// reads only the ledger and on the walk reclaims before it refuses. A
+/// refusal is E310 naming the join; the input's charge then drops with its
+/// reservation and `consumer` is unchanged. Rows that arrived uncharged are
+/// admitted whole.
+fn take_over_input(
+    input_charge: Option<TransientNodeBufferReservation>,
+    consumer: &crate::pipeline::memory::ConsumerHandle,
+    bytes: u64,
+    budget: &MemoryArbitrator,
+) -> Result<(), PipelineError> {
+    TransientNodeBufferReservation::hand_over_admitted(input_charge, consumer, bytes, budget)
 }
 
 /// Resident byte charge of a `(record, key, payload)` entry once it lives in a
@@ -1343,6 +1436,15 @@ fn checked_presorted_charge<P>(
 /// pulls into the match window (which re-charges under the same metric), while a
 /// resident driver is discharged wholesale once the walk ends.
 ///
+/// The side's input charge stays on the ledger until this returns: until then
+/// it is the only charge on the rows waiting in `pairs`, and while the sort
+/// buffer fills, the vector `pairs` was is still allocated. Each successful
+/// return hands it to the kernel's consumer in one ledger step with the
+/// side's first resident charge plus `extra_bytes`, after admitting what that
+/// adds to the input's charge; a spilled side hands over only `extra_bytes`,
+/// its rows being on disk. A hand-over that does not fit is E310 naming the
+/// join.
+///
 /// A pre-sorted simple-field side that fits budget is walked in place, with no
 /// redundant stable sort and Vec rebuild; only an over-budget pre-sorted side
 /// funnels through the spillable sort (a stable sort of already-ascending input
@@ -1353,13 +1455,16 @@ fn checked_presorted_charge<P>(
 /// caller's pre-sorted certification is verified in release (not merely
 /// `debug_assert`ed): a mis-certified input fails loud rather than diverging
 /// across budgets.
-fn sort_side_stream<P>(args: SideStreamBuild<'_, P>) -> Result<(SideStream<P>, u64), PipelineError>
+fn sort_side_stream<P>(
+    args: SideStreamBuild<'_, P>,
+    pool: &Arc<rayon::ThreadPool>,
+) -> Result<(SideStream<P>, u64), PipelineError>
 where
     P: Serialize + DeserializeOwned + Send + Ord + crate::pipeline::sort_buffer::HeapBytes,
 {
     let consumer = args.consumer_handle.clone();
     let baseline = consumer.bytes();
-    let result = sort_side_stream_inner(args);
+    let result = sort_side_stream_inner(args, pool);
     if result.is_err() {
         consumer.set_bytes(baseline);
     }
@@ -1368,6 +1473,7 @@ where
 
 fn sort_side_stream_inner<P>(
     args: SideStreamBuild<'_, P>,
+    pool: &Arc<rayon::ThreadPool>,
 ) -> Result<(SideStream<P>, u64), PipelineError>
 where
     P: Serialize + DeserializeOwned + Send + Ord + crate::pipeline::sort_buffer::HeapBytes,
@@ -1383,8 +1489,11 @@ where
         spill_dir,
         presorted,
         side,
+        input_charge,
+        extra_bytes,
     } = args;
     if pairs.is_empty() {
+        take_over_input(input_charge, consumer_handle, extra_bytes, budget)?;
         return Ok((SideStream::InMemory(Vec::new().into_iter()), 0));
     }
     let spill_threshold = spill_threshold_bytes(budget);
@@ -1407,7 +1516,12 @@ where
             });
         }
         let (_, charged) = checked_presorted_charge(&pairs, name, side, allocation_resources)?;
-        consumer_handle.add_bytes(charged);
+        take_over_input(
+            input_charge,
+            consumer_handle,
+            charged.saturating_add(extra_bytes),
+            budget,
+        )?;
         return Ok((SideStream::InMemory(pairs.into_iter()), charged));
     };
 
@@ -1415,7 +1529,12 @@ where
         let (total, charged) = checked_presorted_charge(&pairs, name, side, allocation_resources)?;
         if total <= spill_threshold as u64 {
             // Fits budget: walk in place — no redundant stable sort + rebuild.
-            consumer_handle.add_bytes(charged);
+            take_over_input(
+                input_charge,
+                consumer_handle,
+                charged.saturating_add(extra_bytes),
+                budget,
+            )?;
             return Ok((SideStream::InMemory(pairs.into_iter()), charged));
         }
         // Over budget: fall through to the spillable sort (stable no-op on
@@ -1437,7 +1556,8 @@ where
         spill_compress,
         schema,
         allocation_resources.clone(),
-    );
+    )
+    .with_kernel_pool(Arc::clone(pool));
 
     let mut local_charged: u64 = 0;
     for (record, _key, payload) in pairs {
@@ -1499,7 +1619,12 @@ where
                 .iter()
                 .map(|(r, _, _)| side_entry_unaccounted_bytes::<P>(r, allocation_resources))
                 .sum();
-            consumer_handle.add_bytes(charged);
+            take_over_input(
+                input_charge,
+                consumer_handle,
+                charged.saturating_add(extra_bytes),
+                budget,
+            )?;
             Ok((SideStream::InMemory(v.into_iter()), charged))
         }
         SortedOutput::Spilled(files) => {
@@ -1526,6 +1651,8 @@ where
                     charge_owner: None,
                 },
             )?;
+            // The side's rows are on disk; only the extra share stays resident.
+            take_over_input(input_charge, consumer_handle, extra_bytes, budget)?;
             Ok((
                 SideStream::Spilled {
                     merger,
@@ -1630,15 +1757,17 @@ fn push_output_row(
     let emitted = mspill.emitted_since_check.get() + 1;
     if emitted >= MEMORY_CHECK_INTERVAL {
         mspill.emitted_since_check.set(0);
-        if mspill.budget.should_abort() {
-            return Err(PipelineError::MemoryBudgetExceeded {
-                node: mspill.name.to_string(),
-                used: mspill.budget.current_pressure(),
-                limit: mspill.budget.hard_limit(),
-                source: BudgetCategory::Arena,
-                detail: Some("sort-merge output-axis global memory backstop".to_string()),
-            });
-        }
+        // Checked after the fact in the kernel's own consumer's name: on the
+        // walk a reclaim round runs (that consumer last) before a refusal.
+        mspill
+            .budget
+            .check_hard_limit(
+                mspill.name,
+                clinker_plan::runtime_error::MemorySurface::JoinState,
+                mspill.consumer.requester(),
+                0,
+            )
+            .map_err(|report| PipelineError::MemoryBudgetExceeded { report })?;
     } else {
         mspill.emitted_since_check.set(emitted);
     }
@@ -2297,6 +2426,14 @@ impl crate::pipeline::memory::MemoryConsumer for SortMergeConsumer {
         self.handle.bytes()
     }
 
+    /// 0: no reclaim pass can reach the sort-merge kernel that owns this state,
+    /// which spills on its own thresholds, so a pass would elect it and free
+    /// nothing. A refused request's E310 lists it as `cannot spill` and
+    /// counts its bytes as state that cannot spill.
+    fn reclaimable_bytes(&self) -> u64 {
+        0
+    }
+
     fn peak_charged_bytes(&self) -> Option<u64> {
         Some(self.handle.peak_bytes())
     }
@@ -2599,8 +2736,8 @@ mod tests {
     /// body-less synthetic path, so a test can observe the build's identity and
     /// pin tie ordering) and an optional co-resident consumer pinned to a fixed
     /// byte count and registered with the arbitrator, so the global memory
-    /// backstop can be driven through the host-independent byte-counted arm of
-    /// `should_abort` rather than the test process's real RSS.
+    /// backstop can be driven through the host-independent charged arm of
+    /// `check_hard_limit` rather than the test process's real RSS.
     fn run_kernel_result_pinned<R>(
         rk: RunKernel<'_, R>,
         output_schema: Option<&SharedStorage<Schema>>,
@@ -2623,16 +2760,7 @@ mod tests {
         pinned_consumer_bytes: Option<u64>,
         resources: &clinker_record::owned_storage::AllocationResources,
     ) -> Result<(Vec<(Record, RecordOrder)>, SortMergeStats), PipelineError> {
-        let resolver_mapping = make_test_resolver_mapping(
-            rk.driver_qual,
-            rk.driver_schema,
-            rk.build_qual,
-            rk.build_schema,
-        );
-        let stable = cxl::eval::StableEvalContext::test_default();
-        let source_file: Arc<str> = Arc::from("");
-        let ctx = EvalContext::test_with_file(&stable, &source_file, 0);
-        let mut budget = match rk.budget_bytes {
+        let budget = match rk.budget_bytes {
             Some(b) => MemoryArbitrator::with_policy(b, 0.80, 0.70, Box::new(NoOpPolicy)),
             None => MemoryArbitrator::with_policy(
                 clinker_plan::config::utils::parse_memory_limit_bytes(None)
@@ -2643,20 +2771,58 @@ mod tests {
             ),
         };
         // A co-resident consumer pinned to a fixed byte count, registered so its
-        // usage sums into `should_abort`'s byte-counted arm. The arbitrator keeps
+        // bytes count in the charged total `check_hard_limit` compares with the
+        // limit before it reads the process. The arbitrator keeps
         // the `Arc` alive in its consumer list for the run's duration.
         if let Some(bytes) = pinned_consumer_bytes {
             let pinned = crate::pipeline::memory::ConsumerHandle::new();
             pinned.add_bytes(bytes);
-            budget.register_consumer(
-                Arc::new(SortMergeConsumer::new(pinned.clone())),
-                pinned,
-                clinker_plan::runtime_error::ConsumerLabel {
-                    node: "pinned".to_string(),
-                    surface: clinker_plan::runtime_error::MemorySurface::JoinState,
-                },
-            );
+            budget
+                .register_consumer(
+                    Arc::new(SortMergeConsumer::new(pinned.clone())),
+                    pinned,
+                    clinker_plan::runtime_error::ConsumerLabel {
+                        node: "pinned".to_string(),
+                        surface: clinker_plan::runtime_error::MemorySurface::JoinState,
+                    },
+                )
+                .expect("a fresh handle registers");
         }
+        run_kernel_on(
+            rk,
+            output_schema,
+            resources,
+            &budget,
+            KernelCharges::default(),
+        )
+    }
+
+    /// What a test hands the kernel beyond its rows: the consumer it charges
+    /// (a fresh unregistered one when `None`) and the input charges it owns.
+    #[derive(Default)]
+    struct KernelCharges {
+        consumer_handle: Option<Arc<crate::pipeline::memory::ConsumerHandle>>,
+        driver_input_charge: Option<TransientNodeBufferReservation>,
+        build_input_charge: Option<TransientNodeBufferReservation>,
+    }
+
+    /// Drive the kernel against `budget` with `charges`, draining its output.
+    fn run_kernel_on<R: Into<RecordOrder>>(
+        rk: RunKernel<'_, R>,
+        output_schema: Option<&SharedStorage<Schema>>,
+        resources: &clinker_record::owned_storage::AllocationResources,
+        budget: &MemoryArbitrator,
+        charges: KernelCharges,
+    ) -> Result<(Vec<(Record, RecordOrder)>, SortMergeStats), PipelineError> {
+        let resolver_mapping = make_test_resolver_mapping(
+            rk.driver_qual,
+            rk.driver_schema,
+            rk.build_qual,
+            rk.build_schema,
+        );
+        let stable = cxl::eval::StableEvalContext::test_default();
+        let source_file: Arc<str> = Arc::from("");
+        let ctx = EvalContext::test_with_file(&stable, &source_file, 0);
         let dir = tempfile::Builder::new()
             .prefix("sm-test-")
             .tempdir()
@@ -2682,15 +2848,22 @@ mod tests {
             presorted: rk.presorted,
             propagate_ck: &clinker_plan::config::pipeline_node::PropagateCkSpec::Driver,
             ctx: &ctx,
-            budget: &mut budget,
+            budget,
             spill_dir: dir.path(),
             spill_compress: true,
-            consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
+            consumer_handle: charges
+                .consumer_handle
+                .unwrap_or_else(crate::pipeline::memory::ConsumerHandle::new),
             strategy: clinker_plan::config::ErrorStrategy::FailFast,
+            driver_input_charge: charges.driver_input_charge,
+            build_input_charge: charges.build_input_charge,
         };
         // Drain the output handle while the TempDir is still alive: a spilled
         // handle's sorted runs live inside it, so the drain must precede the drop.
-        let out = match execute_combine_sort_merge_with_stats(args) {
+        let out = match execute_combine_sort_merge_with_stats(
+            args,
+            crate::test_support::test_kernel_pool(),
+        ) {
             Ok((output, stats)) => drain_sorted(output.sorted).map(|records| (records, stats)),
             Err(e) => Err(e),
         };
@@ -3877,7 +4050,7 @@ mod tests {
     /// polls the arbitrator's global hard-limit gate every `MEMORY_CHECK_INTERVAL`
     /// emitted rows so such a breach surfaces as a clean typed
     /// `MemoryBudgetExceeded`, never an OS OOM. A co-resident consumer pinned
-    /// above the hard limit trips the byte-counted arm of `should_abort` — host
+    /// above the hard limit trips the charged arm of `check_hard_limit` — host
     /// independent, with no reliance on the test process's real RSS — while an
     /// otherwise-identical run without it completes, proving the poll neither
     /// spuriously aborts nor misses the breach.
@@ -3912,8 +4085,8 @@ mod tests {
             let rc = extract_range_conjunct(&typed, "drivers", "builds");
             decomposed_pure_range(rc, Arc::clone(&typed))
         };
-        // A hard limit far above any plausible test-process RSS, so `should_abort`
-        // can only trip through the byte-counted consumer sum, never real RSS.
+        // A hard limit far above any plausible test-process RSS, so the hard-limit
+        // check can only refuse on the charged total, never on real RSS.
         let hard = 8u64 * 1024 * 1024 * 1024;
         let run = |pinned: Option<u64>| {
             run_kernel_result_pinned(
@@ -3946,25 +4119,625 @@ mod tests {
             "the unpressured walk emits one row per driver"
         );
 
-        // Pin a consumer above the hard limit: the byte-counted arm of
-        // `should_abort` trips at the first poll and the walk aborts cleanly.
+        // Pin a consumer above the hard limit: the charged arm of
+        // `check_hard_limit` refuses at its first run and the walk aborts cleanly.
         let err = run(Some(hard + 64 * 1024))
             .expect_err("a co-resident consumer over the hard limit must abort the walk");
         match err {
-            PipelineError::MemoryBudgetExceeded {
-                node,
-                limit,
-                source,
-                ..
-            } => {
-                assert_eq!(node, "sm_test");
-                assert_eq!(limit, hard);
-                assert_eq!(source, BudgetCategory::Arena);
+            PipelineError::MemoryBudgetExceeded { report } => {
+                assert_eq!(
+                    report.requester,
+                    Some(clinker_plan::runtime_error::ConsumerLabel {
+                        node: "sm_test".to_string(),
+                        surface: clinker_plan::runtime_error::MemorySurface::JoinState,
+                    })
+                );
+                assert_eq!(report.limit.bytes(), hard);
             }
             other => {
                 panic!("the global backstop must surface MemoryBudgetExceeded; got {other:?}")
             }
         }
+    }
+
+    /// A ledger the kernel charges: an arbitrator holding `limit` bytes that
+    /// reads no process memory, the kernel's consumer registered on it as the
+    /// join's state, and each input's charge reserved on it as the dispatcher
+    /// reserves a collected input before the join runs.
+    fn ledger_with_input_charges(
+        limit: u64,
+        driver_charge: u64,
+        build_charge: u64,
+    ) -> (
+        Arc<MemoryArbitrator>,
+        Arc<crate::pipeline::memory::ConsumerHandle>,
+        KernelCharges,
+    ) {
+        let budget = Arc::new(MemoryArbitrator::with_policy(
+            limit,
+            0.80,
+            0.70,
+            Box::new(NoOpPolicy),
+        ));
+        budget.read_no_process_memory();
+        let handle = crate::pipeline::memory::ConsumerHandle::new();
+        budget
+            .register_node_consumer(
+                Arc::new(SortMergeConsumer::new(handle.clone())),
+                handle.clone(),
+                clinker_plan::runtime_error::ConsumerLabel {
+                    node: "sm_test".to_string(),
+                    surface: clinker_plan::runtime_error::MemorySurface::JoinState,
+                },
+            )
+            .expect("a fresh handle registers");
+        let reserve = |bytes, node| {
+            crate::executor::node_buffer::reserve_node_buffer_materialization(bytes, &budget, node)
+                .expect("the input charge fits the ledger")
+        };
+        let charges = KernelCharges {
+            consumer_handle: Some(handle.clone()),
+            driver_input_charge: Some(reserve(driver_charge, "drivers")),
+            build_input_charge: Some(reserve(build_charge, "builds")),
+        };
+        (budget, handle, charges)
+    }
+
+    /// `drivers.k < builds.k` over one Integer column each.
+    fn drivers_below_builds() -> DecomposedPredicate {
+        let typed = compile_pure_range(
+            "filter drivers.k < builds.k",
+            &[
+                ("drivers", "k", cxl::typecheck::Type::Int),
+                ("builds", "k", cxl::typecheck::Type::Int),
+            ],
+        );
+        let rc = extract_range_conjunct(&typed, "drivers", "builds");
+        decomposed_pure_range(rc, Arc::clone(&typed))
+    }
+
+    /// Once Phase A charges each side's rows to the join, the inputs' charges
+    /// are gone: the merge walk's check counts the rows once. The inputs'
+    /// charges together nearly fill the limit and the walk's own charge does
+    /// not fit beside them, so a check that still counted them would refuse
+    /// with E310 for the join's state at the first poll.
+    #[test]
+    fn the_merge_walk_check_counts_rows_the_join_took_over_once() {
+        let drivers_schema = schema_with(&["k"]);
+        let builds_schema = schema_with(&["k"]);
+        // More drivers than the walk's check interval, each matching the one
+        // build, so the walk polls the hard limit at least once.
+        let n_drivers = MEMORY_CHECK_INTERVAL + 1_000;
+        let limit = 64 * 1024 * 1024;
+        let spare = 256 * 1024;
+        let driver_charge = 40 * 1024 * 1024;
+        let build_charge = limit - driver_charge - spare;
+        let (budget, handle, charges) =
+            ledger_with_input_charges(limit, driver_charge, build_charge);
+        assert_eq!(budget.charged_bytes(), limit - spare);
+        let (records, _) = run_kernel_on(
+            RunKernel {
+                driver_records: (0..n_drivers)
+                    .map(|i| {
+                        (
+                            rec(&drivers_schema, vec![Value::Integer(i as i64)]),
+                            RecordOrder::from(i as u64),
+                        )
+                    })
+                    .collect(),
+                build_records: vec![rec(&builds_schema, vec![Value::Integer(5_000_000)])],
+                decomposed: drivers_below_builds(),
+                driver_qual: "drivers",
+                build_qual: "builds",
+                driver_schema: &drivers_schema,
+                build_schema: &builds_schema,
+                match_mode: MatchMode::All,
+                on_miss: OnMiss::Skip,
+                presorted: true,
+                body_program: None,
+                budget_bytes: None,
+            },
+            None,
+            &test_allocation_resources(),
+            &budget,
+            charges,
+        )
+        .expect("the walk's check counts the rows once and finds room");
+        assert_eq!(records.len(), n_drivers, "one row per driver");
+        assert!(
+            handle.peak_bytes() > spare,
+            "the walk's own charge ({}) must not fit beside the inputs' charges",
+            handle.peak_bytes()
+        );
+        assert_eq!(
+            budget.charged_bytes(),
+            0,
+            "the join ends holding nothing and the inputs' charges are gone"
+        );
+        assert_eq!(
+            budget.consumer_count(),
+            1,
+            "only the join's consumer remains"
+        );
+    }
+
+    /// While Phase A sorts a side, both inputs' charges stay on the ledger
+    /// beside the sort buffer's charge: the rows waiting to be sorted, and the
+    /// other side's rows, are charged nowhere else. The ledger's peak therefore
+    /// passes the two input charges together; ending them when the join
+    /// starts would leave it at that sum.
+    #[test]
+    fn phase_a_keeps_each_input_charged_until_its_side_is_charged() {
+        let drivers_schema = schema_with(&["k"]);
+        let builds_schema = schema_with(&["k"]);
+        let driver_charge = 4 * 1024 * 1024;
+        let build_charge = 4 * 1024 * 1024;
+        let (budget, handle, charges) =
+            ledger_with_input_charges(1024 * 1024 * 1024, driver_charge, build_charge);
+        // Descending keys, so each side runs through the sort buffer.
+        let (records, stats) = run_kernel_on(
+            RunKernel {
+                driver_records: (0..500i64)
+                    .map(|i| {
+                        (
+                            rec(&drivers_schema, vec![Value::Integer(500 - i)]),
+                            RecordOrder::from(i as u64),
+                        )
+                    })
+                    .collect(),
+                build_records: (0..50i64)
+                    .map(|i| rec(&builds_schema, vec![Value::Integer(1_000 - i)]))
+                    .collect(),
+                decomposed: drivers_below_builds(),
+                driver_qual: "drivers",
+                build_qual: "builds",
+                driver_schema: &drivers_schema,
+                build_schema: &builds_schema,
+                match_mode: MatchMode::First,
+                on_miss: OnMiss::Skip,
+                presorted: false,
+                body_program: None,
+                budget_bytes: None,
+            },
+            None,
+            &test_allocation_resources(),
+            &budget,
+            charges,
+        )
+        .expect("the join completes");
+        assert_eq!(stats.phase_a_sort_invocations, 2, "both sides were sorted");
+        assert_eq!(records.len(), 500, "every driver matches a build");
+        assert!(
+            budget.peak_charged_bytes() > driver_charge + build_charge,
+            "the sort buffer's charge must stack on both input charges: peak {}",
+            budget.peak_charged_bytes()
+        );
+        assert_eq!(handle.bytes(), 0);
+        assert_eq!(budget.charged_bytes(), 0);
+    }
+
+    /// Drivers whose range key is null wait in a pile from Phase A until the
+    /// miss dispatch after the walk. When the driver side's charge passes to
+    /// the join, the pile's share passes with it: the join's charge, and so
+    /// its per-node peak, covers the pile until each miss is dispatched.
+    #[test]
+    fn the_null_key_pile_stays_charged_until_its_misses_are_dispatched() {
+        let drivers_schema = schema_with(&["k", "pad"]);
+        let builds_schema = schema_with(&["k"]);
+        let pad = "x".repeat(4096);
+        let mut pile_text = 0u64;
+        let driver_records: Vec<(Record, RecordOrder)> = (0..300i64)
+            .map(|i| {
+                let record = if i % 3 == 0 {
+                    pile_text += pad.len() as u64;
+                    rec(
+                        &drivers_schema,
+                        vec![Value::Null, Value::String(pad.as_str().into())],
+                    )
+                } else {
+                    rec(
+                        &drivers_schema,
+                        vec![Value::Integer(i), Value::String("".into())],
+                    )
+                };
+                (record, RecordOrder::from(i as u64))
+            })
+            .collect();
+        let (budget, handle, charges) =
+            ledger_with_input_charges(1024 * 1024 * 1024, 1024 * 1024, 64 * 1024);
+        let (records, _) = run_kernel_on(
+            RunKernel {
+                driver_records,
+                build_records: vec![rec(&builds_schema, vec![Value::Integer(1_000)])],
+                decomposed: drivers_below_builds(),
+                driver_qual: "drivers",
+                build_qual: "builds",
+                driver_schema: &drivers_schema,
+                build_schema: &builds_schema,
+                match_mode: MatchMode::First,
+                on_miss: OnMiss::Skip,
+                presorted: true,
+                body_program: None,
+                budget_bytes: None,
+            },
+            None,
+            &test_allocation_resources(),
+            &budget,
+            charges,
+        )
+        .expect("the join completes");
+        assert_eq!(
+            records.len(),
+            200,
+            "each keyed driver matches; misses are skipped"
+        );
+        let join_peak = budget.per_node_peak_charged_bytes()["sm_test"];
+        assert!(
+            join_peak >= pile_text,
+            "the join's peak charge ({join_peak}) must cover the null-key pile's text \
+             ({pile_text})"
+        );
+        assert_eq!(
+            handle.bytes(),
+            0,
+            "every miss dispatched, the pile is discharged"
+        );
+        assert_eq!(budget.charged_bytes(), 0);
+
+        // The peak is reached when the pile's share passes to the join, so it
+        // cannot show the share stays. The walk emits one row short of the
+        // memory check's interval, so the check first runs as the first miss
+        // is dispatched. The hand-over that gives the join the pile's share is
+        // admitted before the join holds it, so a limit of the pile's text
+        // alone is refused there, by the join, before the walk starts. The
+        // second run's limit is the floor that refusal suggests: it admits
+        // the hand-over, and the walk's rows do not reach it without the
+        // pile, so the check refuses only if the pile is still charged when
+        // its misses are dispatched.
+        let big_pad = "y".repeat(256 * 1024);
+        let pile_rows = 64usize;
+        let keyed_rows = MEMORY_CHECK_INTERVAL - 1;
+        let big_pile_text = (pile_rows * big_pad.len()) as u64;
+        // Collect mode emits a row per miss; its array lands in `builds`.
+        let collect_schema = schema_with(&["k", "pad", "builds"]);
+        let run_with_limit = |limit: u64| {
+            let driver_records: Vec<(Record, RecordOrder)> = (0..pile_rows + keyed_rows)
+                .map(|i| {
+                    let record = if i < pile_rows {
+                        rec(
+                            &collect_schema,
+                            vec![
+                                Value::Null,
+                                Value::String(big_pad.as_str().into()),
+                                Value::Null,
+                            ],
+                        )
+                    } else {
+                        rec(
+                            &collect_schema,
+                            vec![
+                                Value::Integer(i as i64),
+                                Value::String("".into()),
+                                Value::Null,
+                            ],
+                        )
+                    };
+                    (record, RecordOrder::from(i as u64))
+                })
+                .collect();
+            let (budget, handle, charges) =
+                ledger_with_input_charges(limit, 1024 * 1024, 64 * 1024);
+            let outcome = run_kernel_on(
+                RunKernel {
+                    driver_records,
+                    build_records: vec![rec(&builds_schema, vec![Value::Integer(1_000_000)])],
+                    decomposed: drivers_below_builds(),
+                    driver_qual: "drivers",
+                    build_qual: "builds",
+                    driver_schema: &collect_schema,
+                    build_schema: &builds_schema,
+                    match_mode: MatchMode::Collect,
+                    on_miss: OnMiss::Skip,
+                    presorted: true,
+                    body_program: None,
+                    budget_bytes: None,
+                },
+                None,
+                &test_allocation_resources(),
+                &budget,
+                charges,
+            )
+            .map(|(records, _)| records.len());
+            (outcome, budget, handle)
+        };
+        let join_label = Some(clinker_plan::runtime_error::ConsumerLabel {
+            node: "sm_test".to_string(),
+            surface: clinker_plan::runtime_error::MemorySurface::JoinState,
+        });
+
+        let (outcome, budget, handle) = run_with_limit(big_pile_text);
+        let hand_over_peak = budget.peak_charged_bytes();
+        let err = outcome.expect_err("a limit of the pile's text alone refuses the hand-over");
+        let hand_over_report = match err {
+            PipelineError::MemoryBudgetExceeded { report } => report,
+            other => panic!("expected E310 at the hand-over, got {other:?}"),
+        };
+        assert_eq!(hand_over_report.requester, join_label);
+        assert!(
+            hand_over_report.requested_bytes > 0,
+            "the hand-over is refused for the growth it asked for"
+        );
+        assert!(
+            hand_over_peak <= big_pile_text,
+            "the refused hand-over never takes the ledger ({hand_over_peak}) past the \
+             limit ({big_pile_text})"
+        );
+        assert_eq!(handle.bytes(), 0);
+        assert_eq!(budget.charged_bytes(), 0);
+
+        let (outcome, budget, handle) = run_with_limit(hand_over_report.suggested_limit_bytes);
+        let err = outcome
+            .expect_err("the check at the first miss counts the pile, which passes the limit");
+        let report = match err {
+            PipelineError::MemoryBudgetExceeded { report } => report,
+            other => panic!("expected E310 at the miss dispatch's check, got {other:?}"),
+        };
+        assert_eq!(report.requester, join_label);
+        assert_eq!(
+            report.requested_bytes, 0,
+            "the refusal is the emitted-row check, made after the fact"
+        );
+        let join_bytes = report
+            .holders
+            .iter()
+            .find(|holder| holder.node == "sm_test")
+            .map(|holder| holder.bytes)
+            .expect("the join holds charged bytes at the refusal");
+        assert!(
+            join_bytes > big_pile_text,
+            "at the first miss's dispatch the join's charge ({join_bytes}) must still \
+             cover the null-key pile ({big_pile_text} bytes of text)"
+        );
+        assert_eq!(
+            handle.bytes(),
+            0,
+            "the refused join returns to its baseline"
+        );
+        assert_eq!(budget.charged_bytes(), 0);
+    }
+
+    /// The null-key pile's slots are charged as the vector holding them
+    /// allocated them: every slot of its capacity, not only the ones in use.
+    /// Five null-key drivers leave the pile's vector with spare capacity, so a
+    /// charge counted by length would fall short of what it holds.
+    #[test]
+    fn the_null_key_pile_is_charged_for_its_capacity() {
+        let drivers_schema = schema_with(&["k"]);
+        let builds_schema = schema_with(&["k"]);
+        let pile_rows = 5u64;
+        let driver_records: Vec<(Record, RecordOrder)> = (0..pile_rows)
+            .map(|i| {
+                (
+                    rec(&drivers_schema, vec![Value::Null]),
+                    RecordOrder::from(i),
+                )
+            })
+            .collect();
+        let resources = test_allocation_resources();
+        let pile_heap: u64 = driver_records
+            .iter()
+            .map(|(record, _)| record.unaccounted_heap_size(&resources) as u64)
+            .sum();
+        // The pile grows one push at a time from empty, as this vector does.
+        let mut grown: Vec<MissPileEntry> = Vec::new();
+        for (record, order) in &driver_records {
+            grown.push((record.clone(), *order, 0));
+        }
+        assert!(
+            grown.capacity() > grown.len(),
+            "test invariant: the pile's vector has spare capacity"
+        );
+        let pile_slots = (grown.capacity() * std::mem::size_of::<MissPileEntry>()) as u64;
+        drop(grown);
+
+        let (budget, handle, charges) =
+            ledger_with_input_charges(1024 * 1024 * 1024, 1024 * 1024, 64 * 1024);
+        let (records, _) = run_kernel_on(
+            RunKernel {
+                driver_records,
+                build_records: Vec::new(),
+                decomposed: drivers_below_builds(),
+                driver_qual: "drivers",
+                build_qual: "builds",
+                driver_schema: &drivers_schema,
+                build_schema: &builds_schema,
+                match_mode: MatchMode::First,
+                on_miss: OnMiss::Skip,
+                presorted: true,
+                body_program: None,
+                budget_bytes: None,
+            },
+            None,
+            &resources,
+            &budget,
+            charges,
+        )
+        .expect("the join completes");
+        assert!(records.is_empty(), "every driver misses and is skipped");
+        assert_eq!(
+            handle.peak_bytes(),
+            pile_slots + pile_heap,
+            "the join holds the pile's every slot and its rows' heap, and nothing else"
+        );
+        assert_eq!(
+            handle.bytes(),
+            0,
+            "every miss dispatched, the pile is discharged"
+        );
+        assert_eq!(budget.charged_bytes(), 0);
+    }
+
+    /// A side's hand-over to the join can raise the ledger, because the join
+    /// charges the rows' heap and the null-key pile that the input's charge
+    /// did not. The growth is admitted before the join holds it: a pile of
+    /// null-key drivers whose text alone fills the limit is refused at the
+    /// hand-over, naming the join with the growth it asked for, and the
+    /// ledger never passes the limit. No walk row is emitted, so no later
+    /// check would have seen the overshoot.
+    #[test]
+    fn a_hand_over_past_the_limit_is_refused_before_the_join_holds_it() {
+        let drivers_schema = schema_with(&["k", "pad"]);
+        let builds_schema = schema_with(&["k"]);
+        let pad = "y".repeat(256 * 1024);
+        let pile_rows = 64u64;
+        let pile_text = pile_rows * pad.len() as u64;
+        let driver_records: Vec<(Record, RecordOrder)> = (0..pile_rows)
+            .map(|i| {
+                (
+                    rec(
+                        &drivers_schema,
+                        vec![Value::Null, Value::String(pad.as_str().into())],
+                    ),
+                    RecordOrder::from(i),
+                )
+            })
+            .collect();
+        let limit = pile_text;
+        let (budget, handle, charges) = ledger_with_input_charges(limit, 1024 * 1024, 64 * 1024);
+        let outcome = run_kernel_on(
+            RunKernel {
+                driver_records,
+                build_records: vec![rec(&builds_schema, vec![Value::Integer(1_000)])],
+                decomposed: drivers_below_builds(),
+                driver_qual: "drivers",
+                build_qual: "builds",
+                driver_schema: &drivers_schema,
+                build_schema: &builds_schema,
+                match_mode: MatchMode::First,
+                on_miss: OnMiss::Skip,
+                presorted: true,
+                body_program: None,
+                budget_bytes: None,
+            },
+            None,
+            &test_allocation_resources(),
+            &budget,
+            charges,
+        )
+        .map(|(records, _)| records.len());
+        let peak = budget.peak_charged_bytes();
+        let err = outcome.expect_err(&format!(
+            "a hand-over past the limit must be refused (peak {peak}, limit {limit})"
+        ));
+        let report = match err {
+            PipelineError::MemoryBudgetExceeded { report } => report,
+            other => panic!("expected E310 at the hand-over's admission, got {other:?}"),
+        };
+        assert_eq!(
+            report.requester,
+            Some(clinker_plan::runtime_error::ConsumerLabel {
+                node: "sm_test".to_string(),
+                surface: clinker_plan::runtime_error::MemorySurface::JoinState,
+            })
+        );
+        assert!(
+            report.requested_bytes > 0,
+            "the refusal names the growth the hand-over asked for"
+        );
+        assert!(
+            peak <= limit,
+            "the ledger's peak ({peak}) must never pass the limit ({limit})"
+        );
+        assert_eq!(
+            handle.bytes(),
+            0,
+            "the refused join returns to its baseline"
+        );
+        assert_eq!(budget.charged_bytes(), 0);
+    }
+
+    /// A join that fails while both inputs are still charged releases each
+    /// input's charge once and returns its own consumer to the figure it
+    /// held before it ran. The driver side's Phase A sort spills past a
+    /// one-byte disk cap before either side's rows pass to the join, so both
+    /// input charges are outstanding at the failure. Another holder's charge
+    /// stays on the ledger throughout, so a release of anything beyond the
+    /// inputs would show.
+    #[test]
+    fn a_join_that_fails_releases_each_input_charge_once() {
+        let drivers_schema = schema_with(&["k", "pad"]);
+        let builds_schema = schema_with(&["k"]);
+        let pad = "x".repeat(1024);
+        let (budget, handle, charges) =
+            ledger_with_input_charges(1024 * 1024, 256 * 1024, 128 * 1024);
+        budget.set_max_spill_bytes(1).unwrap();
+        let other = crate::executor::node_buffer::reserve_node_buffer_materialization(
+            64 * 1024,
+            &budget,
+            "other",
+        )
+        .expect("the other holder's charge fits");
+        handle.add_bytes(777);
+        let held_before_inputs = 64 * 1024 + 777;
+        assert_eq!(
+            budget.charged_bytes(),
+            held_before_inputs + 256 * 1024 + 128 * 1024
+        );
+        assert_eq!(budget.consumer_count(), 4, "join, two inputs, other holder");
+        // Descending keys, so the driver side runs through the sort buffer,
+        // which passes the spill threshold well before its last row.
+        let err = run_kernel_on(
+            RunKernel {
+                driver_records: (0..1_000i64)
+                    .map(|i| {
+                        (
+                            rec(
+                                &drivers_schema,
+                                vec![
+                                    Value::Integer(1_000 - i),
+                                    Value::String(pad.as_str().into()),
+                                ],
+                            ),
+                            RecordOrder::from(i as u64),
+                        )
+                    })
+                    .collect(),
+                build_records: vec![rec(&builds_schema, vec![Value::Integer(5_000)])],
+                decomposed: drivers_below_builds(),
+                driver_qual: "drivers",
+                build_qual: "builds",
+                driver_schema: &drivers_schema,
+                build_schema: &builds_schema,
+                match_mode: MatchMode::First,
+                on_miss: OnMiss::Skip,
+                presorted: false,
+                body_program: None,
+                budget_bytes: None,
+            },
+            None,
+            &test_allocation_resources(),
+            &budget,
+            charges,
+        )
+        .map(|(records, _)| records.len())
+        .expect_err("the driver side's spill passes the one-byte disk cap");
+        assert!(
+            matches!(err, PipelineError::SpillCapExceeded { .. }),
+            "expected the disk cap's refusal, got {err:?}"
+        );
+        assert_eq!(handle.bytes(), 777, "the join returns to its baseline");
+        assert_eq!(
+            budget.charged_bytes(),
+            held_before_inputs,
+            "each input's charge is released once and nothing else is"
+        );
+        assert_eq!(
+            budget.consumer_count(),
+            2,
+            "both inputs' consumers are gone; the join and the other holder remain"
+        );
+        drop(other);
+        assert_eq!(budget.charged_bytes(), 777);
     }
 
     /// Build `n` phase A driver pairs whose sort key `k` is an Integer and
@@ -4001,18 +4774,23 @@ mod tests {
         budget.set_max_spill_bytes(1).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let handle = crate::pipeline::memory::ConsumerHandle::new();
-        let err = sort_side_stream(SideStreamBuild {
-            allocation_resources: &test_allocation_resources(),
-            pairs,
-            name: "sm",
-            range_field: &Some("k".to_string()),
-            budget: &budget,
-            spill_compress: true,
-            consumer_handle: &handle,
-            spill_dir: dir.path(),
-            presorted: false,
-            side: "driver",
-        })
+        let err = sort_side_stream(
+            SideStreamBuild {
+                allocation_resources: &test_allocation_resources(),
+                pairs,
+                name: "sm",
+                range_field: &Some("k".to_string()),
+                budget: &budget,
+                spill_compress: true,
+                consumer_handle: &handle,
+                spill_dir: dir.path(),
+                presorted: false,
+                side: "driver",
+                input_charge: None,
+                extra_bytes: 0,
+            },
+            crate::test_support::test_kernel_pool(),
+        )
         .err()
         .expect("a one-byte disk cap must abort the driver phase A spill");
         match err {
@@ -4055,18 +4833,23 @@ mod tests {
         budget.set_max_spill_bytes(1).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let handle = crate::pipeline::memory::ConsumerHandle::new();
-        let err = sort_side_stream(SideStreamBuild {
-            allocation_resources: &test_allocation_resources(),
-            pairs,
-            name: "sm",
-            range_field: &Some("k".to_string()),
-            budget: &budget,
-            spill_compress: true,
-            consumer_handle: &handle,
-            spill_dir: dir.path(),
-            presorted: false,
-            side: "build",
-        })
+        let err = sort_side_stream(
+            SideStreamBuild {
+                allocation_resources: &test_allocation_resources(),
+                pairs,
+                name: "sm",
+                range_field: &Some("k".to_string()),
+                budget: &budget,
+                spill_compress: true,
+                consumer_handle: &handle,
+                spill_dir: dir.path(),
+                presorted: false,
+                side: "build",
+                input_charge: None,
+                extra_bytes: 0,
+            },
+            crate::test_support::test_kernel_pool(),
+        )
         .err()
         .expect("a one-byte disk cap must abort the build phase A spill");
         match err {
@@ -4095,18 +4878,23 @@ mod tests {
         std::fs::create_dir(&spill_root).unwrap();
         std::fs::remove_dir(&spill_root).unwrap();
         let handle = crate::pipeline::memory::ConsumerHandle::new();
-        let err = sort_side_stream(SideStreamBuild {
-            allocation_resources: &test_allocation_resources(),
-            pairs,
-            name: "sm",
-            range_field: &Some("k".to_string()),
-            budget: &budget,
-            spill_compress: true,
-            consumer_handle: &handle,
-            spill_dir: &spill_root,
-            presorted: false,
-            side: "driver",
-        })
+        let err = sort_side_stream(
+            SideStreamBuild {
+                allocation_resources: &test_allocation_resources(),
+                pairs,
+                name: "sm",
+                range_field: &Some("k".to_string()),
+                budget: &budget,
+                spill_compress: true,
+                consumer_handle: &handle,
+                spill_dir: &spill_root,
+                presorted: false,
+                side: "driver",
+                input_charge: None,
+                extra_bytes: 0,
+            },
+            crate::test_support::test_kernel_pool(),
+        )
         .err()
         .expect(
             "phase A must spill into the configured (now-removed) root and fail \
@@ -4827,18 +5615,23 @@ mod tests {
         consumer.set_bytes(777);
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing");
-        let error = sort_side_stream(SideStreamBuild {
-            allocation_resources: &resources,
-            pairs: phase_a_driver_pairs(30),
-            name: "open-failure",
-            range_field: &Some("k".into()),
-            budget: &budget,
-            spill_compress: false,
-            consumer_handle: &consumer,
-            spill_dir: &missing,
-            presorted: false,
-            side: "driver",
-        })
+        let error = sort_side_stream(
+            SideStreamBuild {
+                allocation_resources: &resources,
+                pairs: phase_a_driver_pairs(30),
+                name: "open-failure",
+                range_field: &Some("k".into()),
+                budget: &budget,
+                spill_compress: false,
+                consumer_handle: &consumer,
+                spill_dir: &missing,
+                presorted: false,
+                side: "driver",
+                input_charge: None,
+                extra_bytes: 0,
+            },
+            crate::test_support::test_kernel_pool(),
+        )
         .err()
         .expect("missing spill directory must fail");
         assert!(matches!(error, PipelineError::Io(_)));

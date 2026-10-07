@@ -165,6 +165,14 @@ pub struct MemoryTestOverrides {
     baseline_rss: Option<u64>,
     #[cfg(any(test, feature = "test-utils"))]
     forced_shortfall: Option<ForcedShortfall>,
+    #[cfg(any(test, feature = "test-utils"))]
+    no_process_memory: bool,
+    #[cfg(any(test, feature = "test-utils"))]
+    hard_limit_reclaims: Option<HardLimitReclaims>,
+    #[cfg(any(test, feature = "test-utils"))]
+    source_drain_charges: Option<SourceDrainCharges>,
+    #[cfg(any(test, feature = "test-utils"))]
+    streaming_ends: Option<StreamingEnds>,
 }
 
 impl MemoryTestOverrides {
@@ -176,6 +184,14 @@ impl MemoryTestOverrides {
             baseline_rss: None,
             #[cfg(any(test, feature = "test-utils"))]
             forced_shortfall: None,
+            #[cfg(any(test, feature = "test-utils"))]
+            no_process_memory: false,
+            #[cfg(any(test, feature = "test-utils"))]
+            hard_limit_reclaims: None,
+            #[cfg(any(test, feature = "test-utils"))]
+            source_drain_charges: None,
+            #[cfg(any(test, feature = "test-utils"))]
+            streaming_ends: None,
         }
     }
 
@@ -259,6 +275,188 @@ impl MemoryTestOverrides {
     /// The baseline this value injects in place of a measurement, if any.
     pub fn injected_baseline_rss(&self) -> Option<u64> {
         self.baseline_rss
+    }
+
+    /// Make the run read no process memory, as on a target where the
+    /// process's resident memory cannot be read: its limits trip only on the
+    /// charged total. For an in-process test of what a charged check does
+    /// under a small test capacity, which the test process's own resident
+    /// memory, shared with the harness and sibling tests, would otherwise
+    /// trip first. The startup check still judges the injected baseline.
+    pub fn with_no_process_memory(mut self) -> Self {
+        self.no_process_memory = true;
+        self
+    }
+
+    /// Whether the run reads no process memory.
+    pub(crate) fn reads_no_process_memory(&self) -> bool {
+        self.no_process_memory
+    }
+
+    /// Record in `record` every hard-limit check of the run that runs a
+    /// reclaim round. For an in-process test that must tell which of several
+    /// checks on one node and surface made room, which the spill figures
+    /// and the charged peaks cannot: the same victims spill whichever check
+    /// asks.
+    pub fn with_hard_limit_reclaims(mut self, record: HardLimitReclaims) -> Self {
+        self.hard_limit_reclaims = Some(record);
+        self
+    }
+
+    /// The record to keep the run's reclaiming hard-limit checks in, if any.
+    pub(crate) fn hard_limit_reclaims(&self) -> Option<&HardLimitReclaims> {
+        self.hard_limit_reclaims.as_ref()
+    }
+
+    /// Record in `record` each Source's charge at the moment the walk has
+    /// drained its input, before the Source leaves the memory registry. For
+    /// an in-process test that compares what a Source holds charged across
+    /// runs: its charged peak also counts the rows queued in its channel at
+    /// that instant, which depends on how far its reader ran ahead of the
+    /// walk, while once the input is drained nothing is queued and the
+    /// reader has stopped charging.
+    pub fn with_source_drain_charges(mut self, record: SourceDrainCharges) -> Self {
+        self.source_drain_charges = Some(record);
+        self
+    }
+
+    /// The record to keep the run's Source drain charges in, if any.
+    pub(crate) fn source_drain_charges(&self) -> Option<&SourceDrainCharges> {
+        self.source_drain_charges.as_ref()
+    }
+
+    /// Record in `record` how each streaming consumer of the run (a
+    /// streaming Sink, Aggregate ingest or Combine probe, on its own thread)
+    /// stopped: on its producer's end, on an input that closed without it,
+    /// or on its own failure, and whether it finished its work. For an
+    /// in-process test of a failed or cancelled run, whose published output
+    /// cannot show whether a step finished on the rows it was given.
+    pub fn with_streaming_ends(mut self, record: StreamingEnds) -> Self {
+        self.streaming_ends = Some(record);
+        self
+    }
+
+    /// The record to keep the run's streaming consumer ends in, if any.
+    pub(crate) fn streaming_ends(&self) -> Option<&StreamingEnds> {
+        self.streaming_ends.as_ref()
+    }
+}
+
+/// How each streaming consumer of a run stopped, in the order they stopped.
+/// Every clone shares the one record, so a test keeps a clone before handing
+/// the value to a run through [`MemoryTestOverrides::with_streaming_ends`].
+/// It grows by one entry per streaming consumer and is for in-process tests
+/// only.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone, Debug, Default)]
+pub struct StreamingEnds(std::sync::Arc<std::sync::Mutex<Vec<StreamingEnd>>>);
+
+/// How one streaming consumer stopped.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamingEnd {
+    /// The consumer's node name.
+    pub node: String,
+    /// How its input ended, or that it failed first.
+    pub input: StreamingInputEnd,
+    /// Whether it finished its work: an Aggregate finalized its groups, a
+    /// Combine completed its probe, a Sink closed its output.
+    pub finished: bool,
+}
+
+/// How a streaming consumer's input ended.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamingInputEnd {
+    /// The consumer read its producer's end.
+    Ended,
+    /// The input closed without its producer's end.
+    Incomplete,
+    /// The consumer failed before its input ended.
+    ConsumerFailed,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl StreamingEnds {
+    /// The consumer ends recorded so far, in the order they stopped.
+    pub fn ends(&self) -> Vec<StreamingEnd> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub(crate) fn record(&self, end: StreamingEnd) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).push(end);
+    }
+}
+
+/// The hard-limit checks of a run that ran a reclaim round, in the order
+/// they ran. Every clone shares the one record, so a test keeps a clone
+/// before handing the value to a run through
+/// [`MemoryTestOverrides::with_hard_limit_reclaims`]. It grows by one entry
+/// per reclaiming check and is for in-process tests only.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone, Debug, Default)]
+pub struct HardLimitReclaims(std::sync::Arc<std::sync::Mutex<Vec<HardLimitReclaim>>>);
+
+/// One hard-limit check that ran a reclaim round: the node and surface it
+/// named and the bytes it counted as not yet charged.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HardLimitReclaim {
+    pub node: String,
+    pub surface: clinker_plan::runtime_error::MemorySurface,
+    pub uncharged: u64,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl HardLimitReclaims {
+    /// The checks recorded so far, in the order they ran.
+    pub fn checks(&self) -> Vec<HardLimitReclaim> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub(crate) fn record(&self, check: HardLimitReclaim) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).push(check);
+    }
+}
+
+/// Each Source's charge when the walk finished draining its input, in the
+/// order the Sources drained. Every clone shares the one record, so a test
+/// keeps a clone before handing the value to a run through
+/// [`MemoryTestOverrides::with_source_drain_charges`]. It grows by one entry
+/// per drained Source and is for in-process tests only.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone, Debug, Default)]
+pub struct SourceDrainCharges(std::sync::Arc<std::sync::Mutex<Vec<SourceDrainCharge>>>);
+
+/// One Source's charge, read from the run's ledger in one step after its
+/// channel reported that its reader had finished and before its
+/// registration was released.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceDrainCharge {
+    /// The Source's node name.
+    pub node: String,
+    /// Bytes granted in the Source's name: the admitted text of the rows it
+    /// read that are still alive.
+    pub granted: u64,
+    /// The Source's own handle charge: what its queued rows hold outside the
+    /// ledger (nothing is queued once the input is drained) plus an ordered
+    /// Source's barrier figure.
+    pub handle: u64,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl SourceDrainCharges {
+    /// The drain charges recorded so far, in the order the Sources drained.
+    pub fn charges(&self) -> Vec<SourceDrainCharge> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub(crate) fn record(&self, charge: SourceDrainCharge) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(charge);
     }
 }
 
@@ -509,14 +707,13 @@ pub struct ExecutionReport {
     pub per_source_rollback_cursors: BTreeMap<String, u64>,
     /// Finalized per-source ingest record counts, keyed by
     /// Source-node name. Equals each source's `total_count`
-    /// contribution to the aggregate `counters.total_count`. Sources
-    /// whose ingest thread never finalized (e.g. fatal abort before
-    /// the crossbeam `Receiver` disconnected) are absent rather than
-    /// reported as zero — distinguishes "stream closed with zero records"
-    /// from
-    /// "never finished". The synthetic pipeline-wide rollup slot
-    /// stamped internally under `<merged>` is filtered out before
-    /// surfacing here.
+    /// contribution to the aggregate `counters.total_count`. A count is
+    /// finalized only when the walk reads the Source's stream to its
+    /// `Ended`: a Source whose read was interrupted, or that the walk never
+    /// read to the end, is absent rather than reported as zero, which
+    /// distinguishes "read to the end with zero records" from "never
+    /// finished". The synthetic pipeline-wide rollup slot stamped
+    /// internally under `<merged>` is filtered out before surfacing here.
     pub per_source_record_counts: BTreeMap<String, u64>,
     /// Per-source DLQ entry counts, keyed by Source-node name. A
     /// source with no DLQ entries is absent from the map, matching

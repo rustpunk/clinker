@@ -15,11 +15,10 @@
 //! Aggregate inner reductions, Output writer admission) lives in
 //! `dispatch_plan_node`'s arms and runs identically on the forward and
 //! commit passes. The forward pass parks narrow producer emits into
-//! `node_buffers[producer]`, tees cross-region inputs into
-//! `region_input_buffers`, and short-circuits members. The commit pass
-//! seeds each region's producer slot with post-recompute narrow rows,
-//! re-feeds cross-region inputs out of `region_input_buffers`, then
-//! re-walks the same arms.
+//! `node_buffers[producer]`, parks cross-region inputs in the run's
+//! parked-row store, and short-circuits members. The commit pass seeds each
+//! region's producer slot with post-recompute narrow rows, publishes a fresh
+//! cursor over each parked cross-region input, then re-walks the same arms.
 //!
 //! Composition body recursion: when a region member is a
 //! `PlanNode::Composition` whose body carries body-internal regions
@@ -28,13 +27,13 @@
 //! onto `window_runtime.active_stack` (mirroring
 //! `execute_composition_body` in `dispatch.rs`), recursively dispatches
 //! the body's regions on the body's transient DAG, then restores the
-//! parent context. This keeps the EdgeIndex namespace
-//! (`region_input_buffers` keys by `(Option<CompositionBodyId>,
-//! EdgeIndex)`) consistent across nesting: the body id on the active
+//! parent context. This keeps the EdgeIndex namespace (parked rows are
+//! keyed by `(Option<CompositionBodyId>, EdgeIndex)`) consistent across
+//! nesting: the body id on the active
 //! stack disambiguates body-local edge ids from parent edge ids that
 //! happen to number the same.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use clinker_record::Record;
 use petgraph::Direction;
@@ -45,12 +44,12 @@ use super::DlqEvent;
 use super::detect::RetractScope;
 use crate::executor::dispatch::{
     DlqCaptureMark, ExecutorContext, NodeBufferKey, admit_node_buffer,
-    admit_node_buffer_transferred, admit_node_buffer_with_readers, dispatch_plan_node,
+    admit_node_buffer_transferred, crosses_into_deferred_consumer, dispatch_plan_node,
     drain_node_buffer_slot, estimate_node_buffer_unaccounted_bytes, node_buffer_spill_allowed,
-    planned_materialized_reader_counts, require_node_buffer_input,
+    planned_materialized_reader_counts, publish_node_buffer_view, require_node_buffer_input,
     validate_completed_node_buffer_scope,
 };
-use crate::executor::node_buffer::NodeBuffer;
+use crate::pipeline::memory::walk::{NodeBufferSlots, WalkReclaimSet};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::CompositionBodyId;
 use clinker_plan::plan::deferred_region::{DeferredRegion, ParentContinuation};
@@ -117,20 +116,7 @@ fn dispatch_deferred_inner(
     current_dag: &ExecutionPlanDag,
     events: &mut Vec<DlqEvent>,
 ) -> Result<(), PipelineError> {
-    // Top-level region walk. `current_dag.deferred_regions` keys every
-    // participating NodeIndex (producer + members + outputs) to a
-    // shared `DeferredRegion`, so deduplicate by producer to walk each
-    // region exactly once.
-    let mut walked_producers: HashSet<NodeIndex> = HashSet::new();
-    let region_keys: Vec<NodeIndex> = current_dag.deferred_regions.keys().copied().collect();
-    for key in region_keys {
-        let producer = match current_dag.deferred_regions.get(&key) {
-            Some(r) => r.producer,
-            None => continue,
-        };
-        if !walked_producers.insert(producer) {
-            continue;
-        }
+    for producer in region_walk_order(current_dag) {
         // Clone the region metadata so the borrow on `current_dag`
         // releases before each recursive `dispatch_plan_node` call.
         let region = current_dag
@@ -184,9 +170,67 @@ fn dispatch_deferred_inner(
     Ok(())
 }
 
+/// The producers of `current_dag`'s deferred regions, in the order the
+/// commit walks their regions, each once.
+///
+/// Every participating node belongs to the one region
+/// `ExecutionPlanDag::deferred_region_at` names, even where the regions of
+/// two relaxed aggregates overlap downstream. An edge from a node of one
+/// region into a node of another carries rows the first parks for the
+/// second, so the first is walked before the second; regions with no such
+/// edge between them follow their producers' topological order, never map
+/// order. The edges between regions always run the same way (from the
+/// region the planner registered first), so the order exists; should it
+/// not, the regions left over follow in topological order.
+pub(crate) fn region_walk_order(current_dag: &ExecutionPlanDag) -> Vec<NodeIndex> {
+    let owner = |node: NodeIndex| {
+        current_dag
+            .deferred_region_at(node)
+            .map(|region| region.producer)
+    };
+    let mut topo_position: HashMap<NodeIndex, usize> = HashMap::new();
+    let mut topo_walk = Topo::new(&current_dag.graph);
+    while let Some(node) = topo_walk.next(&current_dag.graph) {
+        let next = topo_position.len();
+        topo_position.insert(node, next);
+    }
+    let position = |node: &NodeIndex| topo_position.get(node).copied().unwrap_or(usize::MAX);
+
+    let producers: BTreeSet<(usize, NodeIndex)> = current_dag
+        .deferred_regions
+        .values()
+        .map(|region| (position(&region.producer), region.producer))
+        .collect();
+    let mut reads_from: HashMap<NodeIndex, HashSet<NodeIndex>> = HashMap::new();
+    for edge in current_dag.graph.edge_references() {
+        if let (Some(from), Some(to)) = (owner(edge.source()), owner(edge.target()))
+            && from != to
+        {
+            reads_from.entry(to).or_default().insert(from);
+        }
+    }
+
+    let mut order: Vec<NodeIndex> = Vec::with_capacity(producers.len());
+    let mut pending = producers;
+    while let Some(ready) = pending
+        .iter()
+        .find(|(_, producer)| {
+            reads_from
+                .get(producer)
+                .is_none_or(|sources| sources.iter().all(|source| order.contains(source)))
+        })
+        .or_else(|| pending.first())
+        .copied()
+    {
+        pending.remove(&ready);
+        order.push(ready.1);
+    }
+    order
+}
+
 /// Walk one region's members in topological order over a sub-graph
 /// filter (`members ∪ {producer}`), seeding cross-region inputs from
-/// `region_input_buffers` before each member dispatch and capturing
+/// the parked-row store before each member dispatch and capturing
 /// any DLQ entries the arm produced.
 fn dispatch_one_region(
     ctx: &mut ExecutorContext<'_>,
@@ -202,12 +246,21 @@ fn dispatch_one_region(
     // The producer itself is NOT redispatched — its `node_buffers`
     // slot is already populated by `recompute_aggregates` with the
     // post-recompute narrow rows. Members and outputs run.
+    // Where the regions of two relaxed aggregates overlap downstream, a node
+    // is in both regions' member sets but belongs to one of them; it runs
+    // once per iteration, in the walk of the region it belongs to, reading
+    // what the other region parked for it.
     let in_region: HashSet<NodeIndex> = region
         .members
         .iter()
         .chain(region.outputs.iter())
         .chain(std::iter::once(&region.producer))
         .copied()
+        .filter(|&node| {
+            current_dag
+                .deferred_region_at(node)
+                .is_some_and(|owner| owner.producer == region.producer)
+        })
         .collect();
 
     let mut topo_walk = Topo::new(&current_dag.graph);
@@ -229,7 +282,10 @@ fn dispatch_one_region(
     // producer's slot is preserved — `recompute_aggregates` populates it with
     // the post-recompute narrow rows.
     let stale_ported: Vec<NodeBufferKey> = ctx
-        .node_buffers
+        .walk_reclaim
+        .borrow()
+        .slots()
+        .buffers()
         .keys()
         .filter(|k| {
             k.producer_port.is_some()
@@ -256,7 +312,7 @@ fn dispatch_one_region(
             // do not redispatch.
             continue;
         }
-        seed_cross_region_inputs_for(ctx, current_dag, idx, region, active_body)?;
+        seed_cross_region_inputs_for(ctx, current_dag, idx, active_body)?;
         let capture = ctx.dlq.arm_capture();
         // Count one partition emit per windowed-Transform member
         // dispatched on the commit pass. Each such Transform
@@ -298,73 +354,58 @@ fn drain_dlq_capture(
         .take_capture(capture, |source_row| events.push(DlqEvent { source_row }));
 }
 
-/// For each in-edge of `consumer_idx` whose source is OUTSIDE the
-/// region (or in a different region), drain
-/// `region_input_buffers[(active_body, edge_idx)]` and append the
-/// records onto the consumer's `node_buffers` slot. Internal-region
-/// edges are skipped — `node_buffers` already carries those records
-/// from the upstream member's emit on this same commit pass.
+/// For each in-edge of `consumer_idx` whose rows were parked (its source is
+/// outside every region, or in another region), publish a fresh cursor over
+/// the rows parked for `(active_body, edge_idx)`. Internal-region edges are
+/// skipped — `node_buffers` already carries those records from the upstream
+/// member's emit on this same commit pass.
 ///
 /// The Combine arm (and any other multi-input member) reads its inputs
 /// by upstream-name lookup against incoming neighbors, so dropping the
 /// records into the consumer's own `node_buffers` slot would not be
-/// addressable by the Combine arm. Instead, the records are appended
-/// onto the SOURCE of each crossing edge — the upstream node's slot —
-/// so the consumer's existing predecessor-walk logic finds them.
+/// addressable by the Combine arm. Instead, the cursor is published as the
+/// SOURCE of each crossing edge — the upstream node's slot — so the
+/// consumer's existing predecessor-walk logic finds it. The parked rows stay
+/// where they are, so every retraction iteration reads all of them.
 fn seed_cross_region_inputs_for(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     consumer_idx: NodeIndex,
-    region: &DeferredRegion,
     active_body: Option<CompositionBodyId>,
 ) -> Result<(), PipelineError> {
+    // Exactly the edges whose rows were parked: the one predicate decides
+    // both, so an in-region edge (whose rows `node_buffers` carries from
+    // this same commit pass) is never looked for among the parked ones.
     let crossings: Vec<(NodeIndex, EdgeIndex)> = current_dag
         .graph
         .edges_directed(consumer_idx, Direction::Incoming)
-        .filter_map(|e| {
-            let source = e.source();
-            // Skip in-region edges — node_buffers already carries the
-            // upstream member's commit-pass emit.
-            let in_region = region.members.contains(&source)
-                || region.outputs.contains(&source)
-                || source == region.producer;
-            if in_region {
-                None
-            } else {
-                Some((source, e.id()))
-            }
-        })
+        .filter(|e| crosses_into_deferred_consumer(current_dag, e.source(), consumer_idx))
+        .map(|e| (e.source(), e.id()))
         .collect();
 
     for (source_idx, edge_id) in crossings {
         let key = (active_body, edge_id);
-        let Some(parked) = ctx.region_input_buffers.remove(&key) else {
+        let Some(view) = ctx.parked_generations.borrow_mut().publish_view(&key)? else {
             continue;
         };
-        // Re-seed the source node's buffer keyed by the crossing edge's producer
+        // Seed the source node's slot keyed by the crossing edge's producer
         // output port, so a multi-output source (Route branch / Cull port) lands
-        // in the exact slot the consumer's edge-based drain reads. The parked
-        // tee holds exactly the records this crossing edge delivered on the
-        // forward pass, so REPLACE the slot rather than append: the forward-pass
-        // producer emit left its own copy in this same slot, and appending would
-        // double it. Draining first releases that forward copy's registered
-        // consumer; `admit_node_buffer` then re-registers the re-seeded slot so
-        // its bytes are attributed and bound-checked like every other slot (a
-        // raw insert would leave the replayed records off the arbitrator's
-        // books). Producer-port identity lives in `slot_key`; it does not
-        // restrict spilling because every reader reopens the exact immutable
-        // port-scoped backing for its own sequential scan.
+        // in the exact slot the consumer's edge-based drain reads. The view
+        // reads exactly the rows this crossing edge delivered on the forward
+        // pass, so it REPLACES the slot rather than appending: the forward-pass
+        // producer emit may have left its own copy in this same slot, and
+        // appending would double it. The parked rows stay in the store, which
+        // charges them, so the next retraction iteration reads them again; the
+        // view adds no charge of its own.
         let producer_port = current_dag.graph[edge_id].producer_port.as_deref();
         let slot_key = NodeBufferKey::with_port(source_idx, producer_port);
         drain_node_buffer_slot(ctx, slot_key.clone());
-        let source_name = current_dag.graph[source_idx].name();
-        admit_node_buffer_with_readers(
+        publish_node_buffer_view(
             ctx,
-            source_name,
-            slot_key.clone(),
-            parked,
-            Vec::new(),
-            node_buffer_spill_allowed(current_dag, source_idx),
+            current_dag.graph[source_idx].name(),
+            current_dag.graph[consumer_idx].name(),
+            slot_key,
+            view,
             1,
         )?;
     }
@@ -398,8 +439,9 @@ fn seed_cross_region_inputs_for(
 /// the parent's buffers (otherwise the body-local entries would be
 /// dropped on the floor). After the swap, the harvested rows are
 /// seeded into the parent's slot; pull-mode attribution flows through
-/// the slot's registered `NodeBufferConsumer` and the arbitrator's
-/// `should_abort` poll guards the pipeline-wide hard limit. The
+/// the slot's registered `NodeBufferConsumer`, and the harvested rows'
+/// reservations are resized through checked growth, which refuses past
+/// the run's limit. The
 /// continuation walk then runs against the parent DAG so its members
 /// see the seeded slot via the same predecessor-walk logic the
 /// forward pass uses.
@@ -416,18 +458,20 @@ fn recurse_into_body(
     };
     let body_dag = ExecutionPlanDag::from_body(bound_body);
 
-    // Swap to body-scope buffers so body NodeIndices index a fresh
-    // namespace (parent-scope NodeIndex 0 and body-scope NodeIndex 0
-    // collide numerically). Restore on every exit. The paired
-    // consumer-id map swaps alongside so body-scope NodeBufferConsumer
-    // registrations don't survive into the parent scope's arbitrator.
-    let body_buffers: HashMap<NodeBufferKey, NodeBuffer> = HashMap::new();
-    let saved_buffers = std::mem::replace(&mut ctx.node_buffers, body_buffers);
-    let saved_consumer_ids = std::mem::take(&mut ctx.node_buffer_consumer_ids);
-    // Remaining-reader counts key by the body-local `NodeBufferKey` space;
-    // swap alongside `node_buffers` so a body fanout does not collide with a
-    // parent count.
-    let saved_readers = std::mem::take(&mut ctx.node_buffer_readers);
+    // Push an empty body-scope frame of node-buffer slots so body
+    // NodeIndices index a fresh namespace (parent-scope NodeIndex 0 and
+    // body-scope NodeIndex 0 collide numerically). The buffers, their
+    // registrations and the remaining-reader counts move as one frame, so
+    // body-scope NodeBufferConsumer registrations don't survive into the
+    // parent scope and a body fanout does not collide with a parent count.
+    // The parent's frame stays beneath, where a reclaim started inside the
+    // body can still spill the parent's resident slots. The guard pops the
+    // frame on an early return or an unwind; every other exit pops it below.
+    let body_frame = WalkReclaimSet::push_frame(
+        &ctx.walk_reclaim,
+        NodeBufferSlots::default(),
+        &ctx.memory_budget,
+    );
     let saved_planned_readers = std::mem::replace(
         &mut ctx.planned_node_buffer_readers,
         planned_materialized_reader_counts(&body_dag),
@@ -443,7 +487,7 @@ fn recurse_into_body(
         .replace(bound_body.node_input_refs.clone());
 
     // Push body context onto the window-runtime stack so
-    // `region_input_buffers` keys land under
+    // parked-row keys land under
     // `(Some(body_id), edge_id)` — the same key the forward-pass
     // body walker used when it tee'd cross-region inputs.
     ctx.window_runtime.active_stack.push(body_id);
@@ -467,12 +511,13 @@ fn recurse_into_body(
     // `correlation_buffers`.
     //
     // Wrapped in an immediately-invoked closure so the parent-scope
-    // borrows can be restored explicitly on every exit path below
+    // context fields can be restored explicitly on every exit path below
     // regardless of whether the inner walk succeeds: the harvest result
     // is bound here, the swaps are reversed, then the result is
-    // unwrapped via `?`. A `Drop`-guard would extend the `&mut ctx`
-    // borrow through the recursive dispatch calls, which the borrow
-    // checker rejects.
+    // unwrapped via `?`. A `Drop`-guard over those fields would extend the
+    // `&mut ctx` borrow through the recursive dispatch calls, which the
+    // borrow checker rejects; the slot frame's guard holds the reclaim set
+    // by `Rc`, not through `ctx`.
     type CommitHarvest = (
         Vec<(Record, crate::executor::stream_event::SourceRowId)>,
         Vec<crate::executor::node_buffer::TransientNodeBufferReservation>,
@@ -502,7 +547,12 @@ fn recurse_into_body(
         // body region.
         for body_region in body_dag.deferred_regions.values() {
             let producer = body_region.producer;
-            if ctx.node_buffers.contains_key(&producer.into()) {
+            if ctx
+                .walk_reclaim
+                .borrow()
+                .slots()
+                .contains_buffer(&producer.into())
+            {
                 continue;
             }
             if !ctx.relaxed_aggregator_states.contains_key(&producer) {
@@ -543,10 +593,17 @@ fn recurse_into_body(
             // re-emit at the parent's call site; here we take records only.
             let (records, _puncts) = input.drain_split()?;
             if let Some(reservation) = reservation.as_ref() {
-                reservation.set_bytes(estimate_node_buffer_unaccounted_bytes(
-                    &records,
-                    &ctx.allocation_resources,
-                ));
+                // The body's output rows, buffered back into the call site.
+                reservation.resize(
+                    estimate_node_buffer_unaccounted_bytes(&records, &ctx.allocation_resources),
+                    parent_dag.graph[composition_idx].name(),
+                    clinker_plan::runtime_error::MemorySurface::BufferedRows {
+                        from: body_dag.graph[*body_out_idx].name().to_string(),
+                        to: clinker_plan::runtime_error::NonEmptyReaders::one(
+                            parent_dag.graph[composition_idx].name().to_string(),
+                        ),
+                    },
+                )?;
             }
             harvested.extend(records);
             if let Some(reservation) = reservation {
@@ -557,12 +614,16 @@ fn recurse_into_body(
         Ok((harvested, harvest_reservations))
     })();
 
-    // Unregister every body-local NodeBufferConsumer so the
-    // arbitrator's registry stays aligned with the post-swap parent
-    // scope's `node_buffers` map. The body-scope `node_buffer_consumer_ids`
-    // map is replaced below; failing to unregister here would leak
-    // wrappers whose `current_usage` reads zero forever.
-    let body_consumer_ids = std::mem::take(&mut ctx.node_buffer_consumer_ids);
+    // Unregister every body-local NodeBufferConsumer, taken from the body's
+    // frame while it is still the top, so the arbitrator's registry stays
+    // aligned with the parent scope's slots once that frame pops below;
+    // failing to unregister here would leak wrappers whose `current_usage`
+    // reads zero forever.
+    let body_consumer_ids = ctx
+        .walk_reclaim
+        .borrow_mut()
+        .slots_mut()
+        .take_registrations();
     for (_, (id, _)) in body_consumer_ids {
         ctx.memory_budget.unregister_consumer(id);
     }
@@ -583,9 +644,9 @@ fn recurse_into_body(
     ctx.window_runtime.remove_body_scope(bound_body.body_scope);
     ctx.current_body_node_input_refs = saved_body_refs;
     ctx.source_records = saved_combine;
-    ctx.node_buffers = saved_buffers;
-    ctx.node_buffer_consumer_ids = saved_consumer_ids;
-    ctx.node_buffer_readers = saved_readers;
+    // Pop the body's frame; its remaining buffers drop here, after their
+    // registrations left.
+    drop(body_frame.pop());
     ctx.planned_node_buffer_readers = saved_planned_readers;
     ctx.window_arena_consumer_ids = saved_arena_ids;
 
@@ -601,6 +662,17 @@ fn recurse_into_body(
         // read; discard its count/registration before combining the rows.
         let mut rows = match drain_node_buffer_slot(ctx, composition_idx) {
             Some(slot) => {
+                // The re-charge names the call site's own buffered rows,
+                // under the label its slot is admitted under: the rows it
+                // buffers for its readers.
+                let slot_rows = ctx
+                    .planned_node_buffer_readers
+                    .slot_label(
+                        parent_dag.graph[composition_idx].name(),
+                        &crate::executor::dispatch::NodeBufferKey::from(composition_idx),
+                        &ctx.composition_call_sites,
+                    )
+                    .surface;
                 let reservation =
                     crate::executor::node_buffer::reserve_node_buffer_materialization(
                         slot.replacement_materialization_bytes_after_unregister(
@@ -610,10 +682,11 @@ fn recurse_into_body(
                         parent_dag.graph[composition_idx].name(),
                     )?;
                 let rows = slot.drain_split()?.0;
-                reservation.set_bytes(estimate_node_buffer_unaccounted_bytes(
-                    &rows,
-                    &ctx.allocation_resources,
-                ));
+                reservation.resize(
+                    estimate_node_buffer_unaccounted_bytes(&rows, &ctx.allocation_resources),
+                    parent_dag.graph[composition_idx].name(),
+                    slot_rows,
+                )?;
                 harvest_reservations.push(reservation);
                 rows
             }

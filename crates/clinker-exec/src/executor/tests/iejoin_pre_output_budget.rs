@@ -85,37 +85,32 @@ fn assert_spilled_below_ample_peak(
     );
 }
 
-/// Assert `err` is the typed pre-output budget abort: the `banded` combine node,
-/// arena-class memory, the reported limit equal to `expected_limit`, a footprint
-/// above it, and a pre-output detail string. Shared by the block-band and
-/// equi+range abort tests, whose pre-output gates surface the same shape.
+/// Assert `err` is the typed pre-output budget abort: the `banded` combine
+/// node's join state, the reported limit equal to `expected_limit`, and one
+/// request above it — the strictly local gate, which refuses a working set
+/// larger than the limit on its own, not a backstop reporting how far the run
+/// went over. Shared by the block-band and equi+range abort tests, whose
+/// pre-output gates surface the same shape.
 fn assert_pre_output_abort(err: PipelineError, expected_limit: u64) {
     match err {
-        PipelineError::MemoryBudgetExceeded {
-            node,
-            used,
-            limit,
-            source,
-            detail,
-        } => {
-            assert_eq!(node, "banded", "the abort must name the combine node");
+        PipelineError::MemoryBudgetExceeded { report } => {
             assert_eq!(
-                source,
-                clinker_plan::BudgetCategory::Arena,
-                "pre-output state is arena-class memory"
+                report.requester,
+                Some(clinker_plan::runtime_error::ConsumerLabel {
+                    node: "banded".to_string(),
+                    surface: clinker_plan::runtime_error::MemorySurface::JoinState,
+                }),
+                "the abort must name the combine node's join state"
             );
             assert_eq!(
-                limit, expected_limit,
+                report.limit.bytes(),
+                expected_limit,
                 "the reported limit must be the hard budget"
             );
             assert!(
-                used > expected_limit,
-                "the reported footprint ({used}) must exceed the budget ({expected_limit})"
-            );
-            let detail = detail.expect("the pre-output abort must carry a detail string");
-            assert!(
-                detail.contains("iejoin pre-output"),
-                "the abort must come from the pre-output gate; got: {detail:?}"
+                report.oversized && report.requested_bytes > expected_limit,
+                "the pre-output gate refuses one working set ({}) above the budget ({expected_limit})",
+                report.requested_bytes
             );
         }
         other => panic!("expected MemoryBudgetExceeded from the pre-output gate; got: {other:?}"),
@@ -354,14 +349,17 @@ fn file_csv_retention_refuses_tight_budget_and_completes_with_roomy_budget() {
     let tight_destination = root.path().join("refused.csv");
     let (result, tight_staging) = run_files(&tight, &tight_destination);
     match result.expect_err("retained decoded fields exceed finite source headroom") {
-        PipelineError::Format(clinker_format::FormatError::Resource(resource)) => {
+        PipelineError::MemoryBudgetExceeded { report } => {
             assert_eq!(
-                resource.kind,
-                clinker_record::owned_storage::ResourceErrorKind::Budget
+                report.requester.as_ref().map(|label| &label.surface),
+                Some(&clinker_plan::runtime_error::MemorySurface::RowsRead),
+                "the CSV Source's refused read is reported for its rows"
             );
-            assert!(resource.requested > resource.available);
+            assert!(
+                report.requested_bytes > report.limit.bytes().saturating_sub(report.charged_bytes)
+            );
         }
-        other => panic!("expected typed CSV resource budget refusal; got {other:?}"),
+        other => panic!("expected the CSV Source's typed budget refusal; got {other:?}"),
     }
     assert!(
         !tight_destination.exists(),
@@ -408,6 +406,7 @@ fn refused_frontier_then_feasible_output(
     let frontier = assert_range_output_frontier_abort(
         result.expect_err("the compressed frontier cannot fit the original budget"),
         TIGHT_LIMIT,
+        &low,
     );
     assert!(
         output.is_empty(),
@@ -465,33 +464,33 @@ fn refused_frontier_then_feasible_output(
     (output, feasible)
 }
 
-fn assert_range_output_frontier_abort(error: PipelineError, expected_limit: u64) -> u64 {
-    let PipelineError::MemoryBudgetExceeded {
-        node,
-        used,
-        limit,
-        source,
-        detail,
-    } = error
-    else {
+/// Assert `error` is the refusal of the range output's merge frontier at
+/// `expected_limit`, after `arb`'s run wrote real spill runs for it, and
+/// return the frontier's bytes.
+fn assert_range_output_frontier_abort(
+    error: PipelineError,
+    expected_limit: u64,
+    arb: &crate::pipeline::memory::MemoryArbitrator,
+) -> u64 {
+    let PipelineError::MemoryBudgetExceeded { report } = error else {
         panic!("expected typed range-output frontier refusal, got {error:?}");
     };
-    assert_eq!(node, "banded");
-    assert_eq!(source, clinker_plan::BudgetCategory::Arena);
-    assert_eq!(limit, expected_limit);
-    assert!(used > limit);
-    let detail = detail.expect("range refusal explains retained readers and spill bytes");
-    let retained = detail
-        .strip_prefix("range output merge frontier (")
-        .expect("range frontier diagnostic");
-    let (readers, retained) = retained.split_once(" readers, ").unwrap();
-    let (spill_bytes, _) = retained.split_once(" spill bytes)").unwrap();
-    assert!(readers.parse::<u64>().unwrap() > 0);
+    assert_eq!(
+        report.requester,
+        Some(clinker_plan::runtime_error::ConsumerLabel {
+            node: "banded".to_string(),
+            surface: clinker_plan::runtime_error::MemorySurface::SortBuffer,
+        })
+    );
+    assert_eq!(report.limit.bytes(), expected_limit);
+    assert!(report.requested_bytes > report.limit.bytes());
     assert!(
-        spill_bytes.parse::<u64>().unwrap() > 0,
+        arb.per_stage_spill_bytes_written()
+            .get("banded")
+            .is_some_and(|written| *written > 0),
         "refusal must retain real, nonempty spill files"
     );
-    used
+    report.requested_bytes
 }
 
 #[test]
@@ -509,7 +508,7 @@ fn range_output_frontier_refusal_precedes_json_lines_writer_publication() {
         "json-frontier",
         &arb,
     );
-    assert_range_output_frontier_abort(result.unwrap_err(), TIGHT_LIMIT);
+    assert_range_output_frontier_abort(result.unwrap_err(), TIGHT_LIMIT, &arb);
     assert!(
         output.contents().is_empty(),
         "JSON output must publish no bytes before frontier refusal"
@@ -999,12 +998,10 @@ fn block_band_output_explosion_refuses_insufficient_frontier_budget() {
 }
 
 /// An equi+range predicate (one equality conjunct plus one range conjunct) so
-/// the planner selects `CombineStrategy::HashPartitionIEJoin`, which holds its
-/// hash partitions and per-group sort arrays resident with no spill path. Its
-/// pre-output gate is the RSS-independent `should_abort_local` check on the
-/// partition / group state — the coverage the deleted test guarded and that no
-/// block-band test can exercise (the block-band path spills instead of
-/// aborting under input pressure).
+/// the planner selects `CombineStrategy::HashPartitionIEJoin`. It runs on the
+/// same block-band kernel as a pure-range join, with the equality hash as an
+/// extra prune axis, so its inputs spill under pressure and its pre-output
+/// gate is the same strictly-local per-pair check.
 const EQUI_RANGE_YAML: &str = r#"
 pipeline:
   name: iejoin_equi_range

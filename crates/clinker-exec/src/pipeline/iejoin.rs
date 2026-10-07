@@ -63,8 +63,8 @@
 //! ordered sort buffer that spills on its own byte threshold (charging resident
 //! bytes through the handle) and the dispatcher drains it incrementally, so the
 //! O(N·M) result never sits in RAM. The pre-output abort returns a typed
-//! `PipelineError::MemoryBudgetExceeded` carrying the combine node's name and
-//! `BudgetCategory::Arena`; it is a strictly LOCAL last resort — a single
+//! `PipelineError::MemoryBudgetExceeded` naming the combine node and its join
+//! state; it is a strictly LOCAL last resort — a single
 //! block-pair plus kernel aux exceeding the hard limit even alone — so a
 //! spilling, bounded-residency run never aborts merely because process RSS sits
 //! above a tight budget. Global pressure on either axis is answered by spilling,
@@ -86,6 +86,7 @@ use indexmap::IndexMap;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use crate::executor::combine::{CombineResolver, CombineResolverMapping};
+use crate::executor::node_buffer::TransientNodeBufferReservation;
 use crate::executor::widen_record_to_schema;
 use crate::pipeline::combine::{
     CombineOutputEvalFailure, KeyExtractor, MatchedBuildFailure, canonical_key_bytes,
@@ -96,7 +97,6 @@ use crate::pipeline::combine_verdict::{
 };
 use crate::pipeline::memory::{ConsumerHandle, MemoryArbitrator};
 use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
-use clinker_plan::BudgetCategory;
 use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::combine::{DecomposedPredicate, RangeKeyType, RangeOp};
@@ -108,8 +108,8 @@ mod block;
 /// truncate at the same threshold.
 const COLLECT_PER_GROUP_CAP: usize = 10_000;
 
-/// Period (matched pairs emitted) between [`MemoryArbitrator::should_abort`]
-/// polls during the IEJoin scan. Same cadence as the hash probe loop.
+/// Period (rows dispatched) between the run's hard-limit checks during the
+/// IEJoin finalize. Same cadence as the hash probe loop.
 const MEMORY_CHECK_INTERVAL: usize = 10_000;
 
 /// Order-tracking sidecar carried alongside every record in the
@@ -584,10 +584,21 @@ pub(crate) struct IEJoinExec<'a> {
     /// under `Continue` the failing row is deferred to the dispatcher via
     /// [`BlockBandOutput::output_eval_failures`].
     pub strategy: clinker_plan::config::ErrorStrategy,
+    /// The charge the driver input's rows carried into the join, `None` when
+    /// they arrived uncharged. The kernel owns it and ends it once its drain
+    /// has moved every driver row into a charged buffer, onto disk, or out.
+    pub driver_input_charge: Option<TransientNodeBufferReservation>,
+    /// The charge the build input's rows carried into the join, `None` when
+    /// they arrived uncharged; ended once the build drain has consumed them.
+    pub build_input_charge: Option<TransientNodeBufferReservation>,
 }
 
+/// Runs on the calling thread, so its budget checks and spills run there;
+/// only the per-record key scan and the sort buffers' comparator sorts run on
+/// `pool`.
 pub(crate) fn execute_combine_iejoin(
     args: IEJoinExec<'_>,
+    pool: &Arc<rayon::ThreadPool>,
 ) -> Result<BlockBandOutput, PipelineError> {
     let IEJoinExec {
         allocation_resources,
@@ -609,6 +620,8 @@ pub(crate) fn execute_combine_iejoin(
         spill_dir,
         spill_compress,
         strategy,
+        driver_input_charge,
+        build_input_charge,
     } = args;
     if decomposed.ranges.is_empty() {
         return Err(PipelineError::Internal {
@@ -762,38 +775,43 @@ pub(crate) fn execute_combine_iejoin(
     // an independent `RecordScan`; the block-band drain replays those outcomes
     // in ascending index order into the external-sort buffers, so the sliced
     // blocks are a pure function of the data, not of pool scheduling.
-    let driver_scans: Vec<RecordScan> = driver_records
-        .par_iter()
-        .map(|(rec, _rn)| {
-            // Driver-side key extraction routes through `CombineResolver` so
-            // chain-buried qualifiers (e.g. `b.id` against an N-ary
-            // decomposition step's encoded intermediate record) resolve via the
-            // resolved column map rather than `Record`'s bare-name fallback.
-            let driver_resolver = CombineResolver::new(resolver_mapping, rec, None);
-            scan_record(
-                &driver_extractor,
-                &driver_range_extractor,
-                &range_kinds,
-                ctx,
-                &driver_resolver,
-            )
-            .map_err(|e| scan_key_error(name, "driving", e))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let driver_scans: Vec<RecordScan> = pool.install(|| {
+        driver_records
+            .par_iter()
+            .map(|(rec, _rn)| {
+                // Driver-side key extraction routes through `CombineResolver` so
+                // chain-buried qualifiers (e.g. `b.id` against an N-ary
+                // decomposition step's encoded intermediate record) resolve via
+                // the resolved column map rather than `Record`'s bare-name
+                // fallback.
+                let driver_resolver = CombineResolver::new(resolver_mapping, rec, None);
+                scan_record(
+                    &driver_extractor,
+                    &driver_range_extractor,
+                    &range_kinds,
+                    ctx,
+                    &driver_resolver,
+                )
+                .map_err(|e| scan_key_error(name, "driving", e))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })?;
 
-    let build_scans: Vec<RecordScan> = build_records
-        .par_iter()
-        .map(|(rec, _)| {
-            scan_record(
-                &build_extractor,
-                &build_range_extractor,
-                &range_kinds,
-                ctx,
-                rec,
-            )
-            .map_err(|e| scan_key_error(name, "build", e))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let build_scans: Vec<RecordScan> = pool.install(|| {
+        build_records
+            .par_iter()
+            .map(|(rec, _)| {
+                scan_record(
+                    &build_extractor,
+                    &build_range_extractor,
+                    &range_kinds,
+                    ctx,
+                    rec,
+                )
+                .map_err(|e| scan_key_error(name, "build", e))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })?;
 
     let op1 = range_ops[0];
     let op2 = if n_ranges >= 2 {
@@ -811,32 +829,37 @@ pub(crate) fn execute_combine_iejoin(
     // axes spill, so the join completes within the budget instead of aborting —
     // a hot equality value degrades to a pure-range band join over its own
     // same-hash blocks rather than materializing that group resident.
-    block::execute_block_band(block::BlockBandExec {
-        allocation_resources,
-        name,
-        build_qualifier,
-        driver_records,
-        driver_scans,
-        build_records,
-        build_scans,
-        op1,
-        op2,
-        residual_eval,
-        body_eval,
-        resolver_mapping,
-        output_schema,
-        match_mode,
-        on_miss,
-        max_output_rows,
-        propagate_ck,
-        ctx,
-        budget,
-        consumer,
-        spill_dir,
-        spill_compress,
-        strategy,
-        options: block::BlockBandOptions::default(),
-    })
+    block::execute_block_band(
+        block::BlockBandExec {
+            allocation_resources,
+            name,
+            build_qualifier,
+            driver_records,
+            driver_scans,
+            build_records,
+            build_scans,
+            op1,
+            op2,
+            residual_eval,
+            body_eval,
+            resolver_mapping,
+            output_schema,
+            match_mode,
+            on_miss,
+            max_output_rows,
+            propagate_ck,
+            ctx,
+            budget,
+            consumer,
+            spill_dir,
+            spill_compress,
+            strategy,
+            options: block::BlockBandOptions::default(),
+            driver_input_charge,
+            build_input_charge,
+        },
+        pool,
+    )
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -1585,9 +1608,9 @@ fn emit_pairs(
                         if peak > pair_budget.budget.hard_limit() {
                             pair_budget.consumer.set_bytes(0);
                             return Err(pre_output_budget_error(
+                                pair_budget.budget,
                                 pair_budget.name,
                                 peak,
-                                pair_budget.budget.hard_limit(),
                             ));
                         }
                     }
@@ -2091,21 +2114,21 @@ fn pwmj_numeric_state_bytes(n_left: usize, n_right: usize) -> usize {
     index_arrays.saturating_add(sort_scratch)
 }
 
-/// Build the typed pre-output budget-abort error. It is a strictly LOCAL last
-/// resort — the one loaded block-pair's resident bytes plus kernel aux exceed
-/// the hard limit even alone — gated by a direct `peak > hard_limit`
-/// comparison, never by global process pressure, because the block-band path
-/// answers pressure by spilling. It surfaces `MemoryBudgetExceeded` with `BudgetCategory::Arena`,
-/// the same shape the output-buffer poll and every other budget-checked
-/// operator surface use.
-fn pre_output_budget_error(name: &str, used: u64, limit: u64) -> PipelineError {
-    PipelineError::MemoryBudgetExceeded {
-        node: name.to_string(),
-        used,
-        limit,
-        source: BudgetCategory::Arena,
-        detail: Some("iejoin pre-output state exceeded budget".to_string()),
-    }
+/// Build the typed pre-output budget-abort error for the block-band kernel,
+/// which serves pure-range and equi+range combines alike. It is a strictly
+/// LOCAL last resort: a gate compares the `peak` bytes it measured — one
+/// loaded block-pair's resident bytes plus kernel aux, or a hot collect
+/// value's held candidates — directly against the hard limit, never against
+/// the process's memory, because the kernel answers pressure by spilling.
+/// It is the E310 refusal of the `peak` bytes the join's state needed,
+/// reported from `budget`'s ledger as every other refusal is, but it does
+/// not pass through [`MemoryArbitrator::check_hard_limit`].
+fn pre_output_budget_error(budget: &MemoryArbitrator, name: &str, peak: u64) -> PipelineError {
+    budget.refusal(
+        name,
+        clinker_plan::runtime_error::MemorySurface::JoinState,
+        peak,
+    )
 }
 
 fn key_eval_error(name: &str, side: &'static str, err: EvalError) -> PipelineError {
@@ -2389,7 +2412,7 @@ mod tests {
             );
             if limit < actual_peak {
                 assert!(
-                    matches!(result, Err(PipelineError::MemoryBudgetExceeded { used, limit: actual_limit, source: BudgetCategory::Arena, .. }) if used == actual_peak && actual_limit == limit)
+                    matches!(&result, Err(PipelineError::MemoryBudgetExceeded { report }) if report.requested_bytes == actual_peak && report.limit.bytes() == limit && report.requester.as_ref().map(|label| &label.surface) == Some(&clinker_plan::runtime_error::MemorySurface::JoinState))
                 );
             } else {
                 result.unwrap();
@@ -2534,23 +2557,9 @@ mod tests {
         // pre-output abort trip earlier on wider inputs.
         assert!(iejoin_numeric_state_bytes(1_000, 1_000) > iejoin_numeric_state_bytes(100, 100));
 
-        // The estimate for a non-trivial group must exceed a 1-byte budget,
-        // so `should_abort_local` short-circuits on the local arm WITHOUT
-        // consulting RSS — the RSS-blind backstop the gate exists to
-        // provide. Uses `NoOpPolicy` so no victim selection interferes.
-        let budget = MemoryArbitrator::with_policy(
-            1,
-            0.8,
-            0.70,
-            Box::new(crate::pipeline::memory::NoOpPolicy),
-        );
+        // A non-trivial group estimates a working set larger than one byte.
         let est = iejoin_numeric_state_bytes(500, 500) as u64;
         assert!(est > 1);
-        assert!(
-            budget.should_abort_local(est),
-            "a {est}-byte working-set estimate must trip a 1-byte budget on the \
-             local arm regardless of RSS availability"
-        );
 
         // Per-pair charge cadence (block-band path). The block scheduler
         // charges this estimator with BLOCK-sized arguments once per surviving

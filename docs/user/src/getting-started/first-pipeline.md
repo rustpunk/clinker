@@ -95,10 +95,6 @@ pipeline with several Sources, the limit applies separately to each Source;
 output counts can differ after filters, joins, or aggregates. Use
 `--dry-run-output preview.csv` to select an explicit preview destination.
 
-At revision `3b343a4e`, this example's bounded preview can fail with an internal
-node-buffer cleanup error. Its ordinary run produces the output below. See
-[the preview limitation](../ops/validation.md#bounded-execution-preview).
-
 ## 5. Understand the execution plan
 
 To see how Clinker will execute the pipeline:

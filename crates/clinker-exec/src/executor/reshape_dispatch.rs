@@ -35,7 +35,9 @@
 //! smaller groups stay resident under the byte budget. The consumer registers
 //! at priority `15` (between grace-hash and external sort) and cannot
 //! back-pressure: there is no upstream channel to gate once the predecessor
-//! has drained.
+//! has drained. The buffer itself is walk-owned state registered in the
+//! walk reclaim set, so a reclaim pass that another node's request starts
+//! spills its resident groups as well.
 //!
 //! # No-cascade contract
 //!
@@ -44,7 +46,9 @@
 //! the whole group is rolled back rather than silently order-dependent.
 
 use clinker_record::owned_storage::SharedStorage;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use clinker_record::{FieldMetadata, GroupByKey, Record, Schema, Value};
@@ -56,10 +60,15 @@ use crate::executor::dispatch::{
     require_single_input_node_buffer_slot, source_file_arc_of, source_name_arc_of,
     tee_emit_to_region_input_buffers,
 };
+use crate::executor::giant_group_error;
+use crate::executor::node_buffer::resident_record_reclaimable_bytes;
+use crate::executor::stream_event::SourceRowId;
 use crate::executor::{DlqEntry, DlqFailureStamp};
-use crate::executor::{GroupedNodeKind, giant_group_error};
+use crate::pipeline::memory::walk::{
+    OwnedSpillResult, WalkOwnedRegistration, WalkOwnedSpill, register_walk_owned,
+};
 use crate::pipeline::memory::{
-    ConsumerHandle, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
+    ConsumerHandle, ConsumerId, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
 };
 use crate::pipeline::sort_key::compare_authored_keys;
 use crate::pipeline::spill::{SpillFile, SpillWriter};
@@ -73,7 +82,7 @@ use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{
     CompiledReshapeRule, ExecutionPlanDag, PlanNode, single_predecessor,
 };
-use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface};
+use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface, RowPosition};
 
 use crate::executor::NullStorage;
 
@@ -121,6 +130,12 @@ const MAX_SKEW_PARTITION_BITS: u32 = 12;
 /// handle's spill-request flag; the dispatch loop reads it at the next
 /// grouping boundary and evicts resident groups to disk in-thread, mirroring
 /// the aggregate spill-request handshake.
+///
+/// The buffer is also walk-owned state registered under this consumer
+/// ([`ReshapeGroups`]), so a reclaim pass that elects it spills the resident
+/// groups at once. It ranks by the figure the buffer records on the handle:
+/// what that spill frees now. Rows already on disk count 0, and so do rows
+/// taken out of the buffer for the rules, which no spill can reach.
 struct ReshapeConsumer {
     handle: Arc<ConsumerHandle>,
 }
@@ -134,6 +149,12 @@ impl ReshapeConsumer {
 impl MemoryConsumer for ReshapeConsumer {
     fn current_usage(&self) -> u64 {
         self.handle.bytes()
+    }
+
+    /// What a spill of the resident groups frees now, as the buffer last
+    /// recorded it after a push, spill or take.
+    fn reclaimable_bytes(&self) -> u64 {
+        self.handle.reclaimable()
     }
 
     fn peak_charged_bytes(&self) -> Option<u64> {
@@ -287,15 +308,7 @@ where
     // empty-input guard, so the no-work path never leaks a consumer. The
     // handle's byte counter tracks live resident-group bytes; the wrapper
     // reads it on every arbitration round.
-    let handle = ConsumerHandle::new();
-    let consumer_id = ctx.memory_budget.register_node_consumer(
-        Arc::new(ReshapeConsumer::new(handle.clone())),
-        handle.clone(),
-        ConsumerLabel {
-            node: name.to_string(),
-            surface: MemorySurface::ReshapeGroups,
-        },
-    );
+    let (consumer_id, handle) = register_reshape_consumer(&ctx.memory_budget, name)?;
 
     // Every exit path past this point must deregister `consumer_id`, so the
     // grouping/finalize work runs inside a closure whose result is matched
@@ -314,11 +327,30 @@ where
         compiled_rules,
         input,
         input_puncts,
+        consumer_id,
         &handle,
         &order_fields,
     );
     ctx.memory_budget.unregister_consumer(consumer_id);
     result
+}
+
+/// Register the consumer that charges node `name`'s group buffer, as a
+/// Reshape's held group rows.
+fn register_reshape_consumer(
+    budget: &MemoryArbitrator,
+    name: &str,
+) -> Result<(ConsumerId, Arc<ConsumerHandle>), PipelineError> {
+    let handle = ConsumerHandle::new();
+    let consumer_id = budget.register_node_consumer(
+        Arc::new(ReshapeConsumer::new(handle.clone())),
+        handle.clone(),
+        ConsumerLabel {
+            node: name.to_string(),
+            surface: MemorySurface::ReshapeGroups,
+        },
+    )?;
+    Ok((consumer_id, handle))
 }
 
 /// Group the drained input, spilling resident groups to disk under memory
@@ -339,6 +371,7 @@ fn run_reshape_grouped(
     compiled_rules: &[CompiledReshapeRule],
     input: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
     input_puncts: Vec<crate::executor::stream_event::Punctuation>,
+    consumer_id: ConsumerId,
     handle: &Arc<ConsumerHandle>,
     order_fields: &[SortField],
 ) -> Result<(), PipelineError> {
@@ -372,11 +405,20 @@ fn run_reshape_grouped(
     let budget = Arc::clone(&ctx.memory_budget);
     let spill_root = Arc::clone(&ctx.spill_root_path);
 
-    let mut buffer = ReshapeGroupBuffer::new(input_schema.clone(), spill_compress);
+    // The buffer lives in a walk-owned cell, borrowed only inside one push,
+    // one spill or one take of a group; every other step below runs with it
+    // free.
+    let groups = ReshapeGroups::register(
+        &budget,
+        consumer_id,
+        handle,
+        name,
+        &spill_root,
+        ReshapeGroupBuffer::new(input_schema.clone(), spill_compress),
+    )?;
     for (record, row_num) in input {
         let key = partition_key(&record, &config.partition_by);
-        buffer.push(key, record, row_num);
-        handle.set_bytes(buffer.resident_bytes() as u64);
+        groups.push(key, record, row_num);
         // Poll for self-spill pressure at every admission. `should_spill_self`
         // updates the peak and reports the soft-threshold crossing WITHOUT
         // running the pausing arbitration round: Reshape relieves pressure by
@@ -386,8 +428,7 @@ fn run_reshape_grouped(
         // same way. `take_spill_request` still honors a spill nudge another
         // stage's arbitration round set on this consumer.
         if budget.should_spill_self() || handle.take_spill_request() {
-            buffer.spill_until_under_budget(name, &budget, &spill_root, handle)?;
-            handle.set_bytes(buffer.resident_bytes() as u64);
+            groups.spill_until_under_budget(&budget)?;
         }
     }
 
@@ -399,10 +440,9 @@ fn run_reshape_grouped(
     // a single correlation group that is too large to observe whole.
     let hard_limit = budget.hard_limit();
     let mut out: Vec<(Record, crate::executor::stream_event::SourceRowId)> = Vec::new();
-    let group_order = buffer.take_group_order();
+    let group_order = groups.take_group_order();
     for key in group_order {
-        let mut group = buffer.take_group(name, &config.partition_by, &key, hard_limit)?;
-        handle.set_bytes(buffer.resident_bytes() as u64);
+        let mut group = groups.take_group(&key, hard_limit, &budget)?;
         if !order_fields.is_empty() {
             // The Sort node's order, so each group's rows reach the rules in
             // the order a Sink `sort_order` would write them, with the
@@ -411,6 +451,9 @@ fn run_reshape_grouped(
         }
         process_group(ctx, name, &mut rules, output_schema, group, &mut out)?;
     }
+    // Every group is taken: the buffer and its registration leave before
+    // the output is emitted.
+    drop(groups);
 
     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &out)?;
     admit_node_buffer(
@@ -469,19 +512,27 @@ struct ReshapeGroupState {
     /// limit cannot be observed whole, so finalize fails loud rather than
     /// OOMing on reload.
     spilled_bytes: usize,
+    /// What spilling `resident` frees now, each row counted as a slot
+    /// counts it ([`resident_record_reclaimable_bytes`]).
+    reclaimable_bytes: u64,
     /// Input-record slices already written to disk, oldest first. Reloaded at
     /// finalize and merged with `resident` back into arrival order (by the
     /// admission sequence) so a spilled group emits identically to a resident
     /// one.
     spilled: Vec<SpillFile<ReshapeSpillPayload>>,
+    /// The source-row identity of the group's first record, which names the
+    /// group in a diagnostic without printing its key.
+    first_row: SourceRowId,
 }
 
 impl ReshapeGroupState {
-    fn new() -> Self {
+    fn new(first_row: SourceRowId) -> Self {
         Self {
+            first_row,
             resident: Vec::new(),
             resident_bytes: 0,
             spilled_bytes: 0,
+            reclaimable_bytes: 0,
             spilled: Vec::new(),
         }
     }
@@ -509,10 +560,17 @@ struct ReshapeGroupBuffer {
     /// Sum of every group's `resident_bytes`. Mirrored into the consumer
     /// handle so the arbitrator sees the live resident footprint.
     resident_bytes: usize,
+    /// Sum of every group's `reclaimable_bytes`: what spilling every
+    /// resident group frees now. Rows on disk or taken out count 0.
+    reclaimable_bytes: u64,
     /// Next Reshape-local admission sequence. Incremented once per admitted
     /// record so the value stamped on each record is globally unique and
     /// monotonic in true (merged) arrival order across every source.
     next_seq: u64,
+    /// The Source name behind each Source identity a group's first record
+    /// carried, read from that record's `$source.name` stamp, or `None` when
+    /// that record carried no stamp; one entry per Source identity seen.
+    source_names: Vec<(clinker_plan::plan::PlanNodeId, Option<Arc<str>>)>,
 }
 
 impl ReshapeGroupBuffer {
@@ -523,13 +581,37 @@ impl ReshapeGroupBuffer {
             group_order: Vec::new(),
             groups: HashMap::new(),
             resident_bytes: 0,
+            reclaimable_bytes: 0,
             next_seq: 0,
+            source_names: Vec::new(),
         }
+    }
+
+    /// Where `row` came from, as the dead-letter output names a row: its
+    /// Source's name and its number among that Source's rows. `None` when no
+    /// Source name is known for it (the group's first row carried no
+    /// `$source.name` stamp): the report then names no group rather than an
+    /// engine placeholder in the Source's place.
+    fn row_position(&self, row: SourceRowId) -> Option<RowPosition> {
+        let (_, name) = self
+            .source_names
+            .iter()
+            .find(|(source, _)| *source == row.source())?;
+        Some(RowPosition {
+            source: name.as_deref()?.to_string(),
+            row: row.ordinal(),
+        })
     }
 
     /// Total resident (in-memory) input-record bytes across all groups.
     fn resident_bytes(&self) -> usize {
         self.resident_bytes
+    }
+
+    /// What spilling every resident group frees now; 0 once nothing is
+    /// resident.
+    fn reclaimable_bytes(&self) -> u64 {
+        self.reclaimable_bytes
     }
 
     /// Admit one record into its group, stamping a Reshape-local admission
@@ -541,12 +623,20 @@ impl ReshapeGroupBuffer {
         row_num: crate::executor::stream_event::SourceRowId,
     ) {
         let bytes = estimated_input_bytes(&record);
+        let reclaimable = resident_record_reclaimable_bytes(&record);
         let seq = self.next_seq;
         self.next_seq += 1;
         let order = &mut self.group_order;
+        let names = &mut self.source_names;
         let state = self.groups.entry(key.clone()).or_insert_with(|| {
             order.push(key);
-            ReshapeGroupState::new()
+            if !names.iter().any(|(source, _)| *source == row_num.source()) {
+                names.push((
+                    row_num.source(),
+                    crate::executor::dispatch::source_name_of(&record).map(Arc::from),
+                ));
+            }
+            ReshapeGroupState::new(row_num)
         });
         state.resident.push(BufferedRecord {
             record,
@@ -555,6 +645,8 @@ impl ReshapeGroupBuffer {
         });
         state.resident_bytes += bytes;
         self.resident_bytes += bytes;
+        state.reclaimable_bytes += reclaimable;
+        self.reclaimable_bytes += reclaimable;
     }
 
     /// Take the first-seen group order, consuming it for the finalize drain.
@@ -592,7 +684,30 @@ impl ReshapeGroupBuffer {
         // A zero/absent soft limit means "spill everything on any trip" — the
         // caller only enters this loop when the arbitrator already reported
         // pressure, so fall back to draining all resident groups.
-        while self.resident_bytes > soft {
+        self.spill_resident_above(node_name, budget, spill_root, soft, |buffer| {
+            handle.set_bytes(buffer.resident_bytes as u64);
+            handle.set_reclaimable(buffer.reclaimable_bytes);
+        })
+        .map(|_| ())
+    }
+
+    /// Evict resident groups, largest first, until at most `keep` bytes stay
+    /// resident, calling `evicted` after each eviction. A group larger than
+    /// the soft threshold is sliced ([`Self::spill_group_partitioned`]),
+    /// any other is spilled whole: the one per-group choice the Reshape's
+    /// own spill and a reclaim pass both make. Returns whether any group was
+    /// written.
+    fn spill_resident_above(
+        &mut self,
+        node_name: &str,
+        budget: &MemoryArbitrator,
+        spill_root: &std::path::Path,
+        keep: usize,
+        mut evicted: impl FnMut(&Self),
+    ) -> Result<bool, PipelineError> {
+        let soft = budget.spill_threshold_bytes() as usize;
+        let mut wrote = false;
+        while self.resident_bytes > keep {
             let Some(key) = self.largest_resident_group() else {
                 break;
             };
@@ -605,9 +720,10 @@ impl ReshapeGroupBuffer {
             } else {
                 self.spill_group_whole(node_name, budget, spill_root, &key)?;
             }
-            handle.set_bytes(self.resident_bytes as u64);
+            wrote = true;
+            evicted(self);
         }
-        Ok(())
+        Ok(wrote)
     }
 
     /// Key of the resident group holding the most in-memory bytes, or `None`
@@ -635,6 +751,7 @@ impl ReshapeGroupBuffer {
         let records = std::mem::take(&mut state.resident);
         let freed = std::mem::take(&mut state.resident_bytes);
         self.resident_bytes -= freed;
+        self.reclaimable_bytes -= std::mem::take(&mut state.reclaimable_bytes);
         let file = write_spill_slice(
             node_name,
             budget,
@@ -676,6 +793,7 @@ impl ReshapeGroupBuffer {
         let resident = std::mem::take(&mut state.resident);
         let total_bytes = std::mem::take(&mut state.resident_bytes);
         self.resident_bytes -= total_bytes;
+        self.reclaimable_bytes -= std::mem::take(&mut state.reclaimable_bytes);
 
         // Fan-out sized so each partition is roughly one `soft`-sized slice:
         // ceil(total / soft) rounded up to a power of two, capped at 4096.
@@ -732,12 +850,18 @@ impl ReshapeGroupBuffer {
         // the group's on-disk total for the finalize-budget guard.
         let tail: Vec<BufferedRecord> = buckets.into_iter().flatten().collect();
         let spilled_now = total_bytes - remaining;
+        let retained_reclaimable = tail
+            .iter()
+            .map(|row| resident_record_reclaimable_bytes(&row.record))
+            .sum::<u64>();
         let state = self
             .groups
             .get_mut(key)
             .expect("partition-spill target group present");
         state.resident = tail;
         state.resident_bytes = remaining;
+        state.reclaimable_bytes = retained_reclaimable;
+        self.reclaimable_bytes += retained_reclaimable;
         state.spilled_bytes += spilled_now;
         state.spilled.extend(spilled_files);
         self.resident_bytes += remaining;
@@ -776,24 +900,24 @@ impl ReshapeGroupBuffer {
     fn take_group(
         &mut self,
         node_name: &str,
-        partition_by: &[String],
         key: &[GroupByKey],
         hard_limit: u64,
+        arbitrator: &MemoryArbitrator,
     ) -> Result<Vec<(Record, crate::executor::stream_event::SourceRowId)>, PipelineError> {
         let state = self.groups.remove(key).expect("group key present in order");
         self.resident_bytes -= state.resident_bytes;
+        self.reclaimable_bytes -= state.reclaimable_bytes;
 
         // Bounded-memory pillar: a group larger than the finalize budget
         // cannot be observed whole, so refuse it rather than OOM on reload.
         let group_bytes = (state.resident_bytes + state.spilled_bytes) as u64;
         if hard_limit > 0 && group_bytes > hard_limit {
             return Err(giant_group_error(
-                GroupedNodeKind::Reshape,
+                arbitrator,
                 node_name,
-                partition_by,
-                key,
+                MemorySurface::ReshapeGroups,
                 group_bytes,
-                hard_limit,
+                self.row_position(state.first_row),
             ));
         }
 
@@ -827,6 +951,164 @@ impl ReshapeGroupBuffer {
         // sequence to emit identically to a resident group.
         group.sort_by_key(|b| b.seq);
         Ok(group.into_iter().map(|b| (b.record, b.row_num)).collect())
+    }
+}
+
+/// A Reshape's group buffer as walk-owned state: the buffer, and what
+/// spilling it needs (the Reshape's node name, the run's spill root and the
+/// handle of the consumer that charges it).
+///
+/// A reclaim pass that another consumer's request starts spills it
+/// ([`WalkOwnedSpill`]) whenever the Reshape is between two of its own
+/// operations on it, which is all the time but one push, one spill or one
+/// take of a group.
+struct ReshapeGroupCell {
+    buffer: ReshapeGroupBuffer,
+    node_name: String,
+    spill_root: Arc<std::path::Path>,
+    consumer: ConsumerId,
+    handle: Arc<ConsumerHandle>,
+}
+
+impl ReshapeGroupCell {
+    /// Mirror the buffer's resident charge onto the consumer's handle, and
+    /// record there what spilling its resident groups frees now: the
+    /// figure the consumer ranks by as a reclaim victim.
+    fn publish(&self) {
+        self.handle.set_bytes(self.buffer.resident_bytes() as u64);
+        self.handle.set_reclaimable(self.buffer.reclaimable_bytes());
+    }
+}
+
+impl WalkOwnedSpill for ReshapeGroupCell {
+    /// A pass that elects the Reshape's consumer spills every resident
+    /// group, each with the choice the Reshape's own spill makes, and
+    /// records the files under the Reshape's node. It wrote when any group
+    /// had rows resident. A buffer whose groups are all on disk or taken
+    /// wrote nothing; one that holds no group holds no state. Never
+    /// reserves.
+    fn spill_owned(
+        &mut self,
+        id: ConsumerId,
+        arbitrator: &MemoryArbitrator,
+    ) -> Result<OwnedSpillResult, PipelineError> {
+        if id != self.consumer || self.buffer.groups.is_empty() {
+            return Ok(OwnedSpillResult::NotHeld);
+        }
+        let spilled = self.buffer.spill_resident_above(
+            &self.node_name,
+            arbitrator,
+            &self.spill_root,
+            0,
+            |_| {},
+        );
+        self.publish();
+        Ok(if spilled? {
+            OwnedSpillResult::Wrote
+        } else {
+            OwnedSpillResult::NothingToWrite
+        })
+    }
+}
+
+/// A Reshape's group buffer in its walk-owned cell, registered in the walk
+/// reclaim set under the Reshape's consumer for as long as this lives.
+///
+/// The cell is borrowed only inside one of the methods here (one push, one
+/// spill, one take of a group), never across `partition_key`, a group's
+/// sort, the rules, the dead-letter routing of a conflict or the emission
+/// of the output, so a pass another request starts can always spill the
+/// groups still resident.
+struct ReshapeGroups {
+    cell: Rc<RefCell<ReshapeGroupCell>>,
+    /// Dropped with the cell, on every exit.
+    _registration: WalkOwnedRegistration,
+}
+
+impl ReshapeGroups {
+    /// Put `buffer` in a walk-owned cell for node `node_name`, whose consumer
+    /// `consumer` charges it through `handle`, and register the cell on
+    /// `budget`'s walk.
+    ///
+    /// # Errors
+    ///
+    /// As [`register_walk_owned`].
+    fn register(
+        budget: &MemoryArbitrator,
+        consumer: ConsumerId,
+        handle: &Arc<ConsumerHandle>,
+        node_name: &str,
+        spill_root: &Arc<std::path::Path>,
+        buffer: ReshapeGroupBuffer,
+    ) -> Result<Self, PipelineError> {
+        let cell = Rc::new(RefCell::new(ReshapeGroupCell {
+            buffer,
+            node_name: node_name.to_string(),
+            spill_root: Arc::clone(spill_root),
+            consumer,
+            handle: Arc::clone(handle),
+        }));
+        let registration = register_walk_owned(budget, consumer, handle, &cell)?;
+        Ok(Self {
+            cell,
+            _registration: registration,
+        })
+    }
+
+    /// Admit one record into its group.
+    fn push(
+        &self,
+        key: Vec<GroupByKey>,
+        record: Record,
+        row_num: crate::executor::stream_event::SourceRowId,
+    ) {
+        let mut cell = self.cell.borrow_mut();
+        cell.buffer.push(key, record, row_num);
+        cell.publish();
+    }
+
+    /// The Reshape's own spill: evict resident groups until the buffer is
+    /// back under the soft threshold.
+    ///
+    /// # Errors
+    ///
+    /// A failed spill, including E320 past the spill cap.
+    fn spill_until_under_budget(&self, budget: &MemoryArbitrator) -> Result<(), PipelineError> {
+        let mut cell = self.cell.borrow_mut();
+        let cell = &mut *cell;
+        let spilled = cell.buffer.spill_until_under_budget(
+            &cell.node_name,
+            budget,
+            &cell.spill_root,
+            &cell.handle,
+        );
+        cell.publish();
+        spilled
+    }
+
+    /// Take the first-seen group order for the finalize drain.
+    fn take_group_order(&self) -> Vec<Vec<GroupByKey>> {
+        self.cell.borrow_mut().buffer.take_group_order()
+    }
+
+    /// Take group `key` out of the buffer, reloaded whole in arrival order.
+    ///
+    /// # Errors
+    ///
+    /// As [`ReshapeGroupBuffer::take_group`].
+    fn take_group(
+        &self,
+        key: &[GroupByKey],
+        hard_limit: u64,
+        budget: &MemoryArbitrator,
+    ) -> Result<Vec<(Record, crate::executor::stream_event::SourceRowId)>, PipelineError> {
+        let mut cell = self.cell.borrow_mut();
+        let cell = &mut *cell;
+        let group = cell
+            .buffer
+            .take_group(&cell.node_name, key, hard_limit, budget);
+        cell.publish();
+        group
     }
 }
 
@@ -1206,7 +1488,6 @@ fn reshape_eval_error(
 mod tests {
     use super::*;
     use crate::pipeline::memory::NoOpPolicy;
-    use clinker_plan::BudgetCategory;
     use clinker_plan::plan::{EntityRef, PlanNodeId};
 
     fn schema() -> SharedStorage<Schema> {
@@ -1226,9 +1507,42 @@ mod tests {
         crate::executor::stream_event::SourceRowId::new(PlanNodeId::new(23), ordinal)
     }
 
+    /// [`schema`] with the `$source.name` stamp Source ingest adds.
+    fn stamped_schema() -> SharedStorage<Schema> {
+        clinker_record::SchemaBuilder::with_capacity(3)
+            .with_field("gid")
+            .with_field("payload")
+            .with_field_meta("$source.name", FieldMetadata::SourceName)
+            .build()
+    }
+
+    /// [`rec`] as Source `orders` read it, over [`stamped_schema`].
+    fn stamped_rec(schema: &SharedStorage<Schema>, gid: &str, payload: &str) -> Record {
+        Record::new(
+            schema.clone(),
+            vec![
+                Value::String(gid.into()),
+                Value::String(payload.into()),
+                Value::from("orders"),
+            ],
+        )
+    }
+
+    /// The identity Source ingest mints for its `index`-th row (from 0):
+    /// ordinals count from the first row, as the dead-letter output does.
+    fn ingest_row(index: u64) -> crate::executor::stream_event::SourceRowId {
+        source_row(crate::executor::stream_event::SourceRowId::FIRST_ORDINAL + index)
+    }
+
     /// An arbitrator whose soft limit is `soft_bytes` and whose seeded peak
     /// RSS is well below it, so `should_spill_self` is driven purely by the
     /// caller's explicit spill calls rather than the live process RSS.
+    /// An arbitrator held to exactly `limit` bytes, for a report that must
+    /// name the limit a finalize gate enforced.
+    fn limit_of(limit: u64) -> MemoryArbitrator {
+        MemoryArbitrator::with_policy(limit, 0.80, 0.70, Box::new(NoOpPolicy))
+    }
+
     fn arbitrator(soft_bytes: u64) -> MemoryArbitrator {
         // soft = limit * 0.80, so limit = soft / 0.80.
         let limit = (soft_bytes as f64 / 0.80) as u64;
@@ -1259,15 +1573,28 @@ mod tests {
         spill_root: &std::path::Path,
         n: u64,
     ) -> ReshapeGroupBuffer {
+        fill_single_group_with(
+            schema,
+            arb,
+            spill_root,
+            (0..n).map(|row_num| {
+                let payload = format!("{row_num:063}");
+                (rec(schema, "g", &payload), source_row(row_num))
+            }),
+        )
+    }
+
+    /// [`fill_single_group`] over the given rows and their identities.
+    fn fill_single_group_with(
+        schema: &SharedStorage<Schema>,
+        arb: &MemoryArbitrator,
+        spill_root: &std::path::Path,
+        rows: impl IntoIterator<Item = (Record, crate::executor::stream_event::SourceRowId)>,
+    ) -> ReshapeGroupBuffer {
         let handle = ConsumerHandle::new();
         let mut buffer = ReshapeGroupBuffer::new(schema.clone(), true);
-        for row_num in 0..n {
-            let payload = format!("{row_num:063}");
-            buffer.push(
-                single_group_key(),
-                rec(schema, "g", &payload),
-                source_row(row_num),
-            );
+        for (row, row_num) in rows {
+            buffer.push(single_group_key(), row, row_num);
             handle.set_bytes(buffer.resident_bytes() as u64);
             if arb.spill_threshold_bytes() < buffer.resident_bytes() as u64 {
                 buffer
@@ -1296,7 +1623,7 @@ mod tests {
             !buffer.groups[&key].spilled.is_empty(),
             "the single oversized group must have partition-spilled"
         );
-        let group = buffer.take_group("rs", &partition_by(), &key, 0).unwrap();
+        let group = buffer.take_group("rs", &key, 0, &arb).unwrap();
         let row_nums: Vec<u64> = group.iter().map(|(_, rn)| rn.ordinal()).collect();
         let expected: Vec<u64> = (0..64).collect();
         assert_eq!(
@@ -1364,88 +1691,127 @@ mod tests {
     // reload of one giant group.
     #[test]
     fn take_group_rejects_a_group_larger_than_the_hard_limit() {
-        let schema = schema();
+        // Rows as Source ingest delivers them: stamped with the Source that
+        // read them and numbered from that Source's first row.
+        let schema = stamped_schema();
         let spill_root = tempfile::tempdir().unwrap();
         let arb = arbitrator(512);
         let key = single_group_key();
-        let mut buffer = fill_single_group(&schema, &arb, spill_root.path(), 64);
+        let mut buffer = fill_single_group_with(
+            &schema,
+            &arb,
+            spill_root.path(),
+            (0..64u64).map(|index| {
+                let payload = format!("{index:063}");
+                (stamped_rec(&schema, "g", &payload), ingest_row(index))
+            }),
+        );
         // A hard limit far below the group's reloaded footprint must fail loud.
+        // The finalize gate and the report read the same limit in production
+        // (`budget.hard_limit()` of the run's arbitrator); here the report
+        // comes from an arbitrator held to the 256-byte limit the gate uses.
+        let limit_in_force = limit_of(256);
         let err = buffer
-            .take_group("rs", &partition_by(), &key, 256)
+            .take_group("rs", &key, 256, &limit_in_force)
             .expect_err("a group exceeding the hard limit must be rejected at finalize");
 
         // A group that outgrew the budget is an ordinary operational limit,
         // not an engine invariant violation, so it must carry the standard
-        // memory surface — typed, not merely reworded.
-        match &err {
-            PipelineError::MemoryBudgetExceeded {
-                node,
-                used,
-                limit,
-                source,
-                detail,
-            } => {
-                assert_eq!(node, "rs", "the diagnostic must name the Reshape node");
-                assert_eq!(*limit, 256, "the limit must be the hard budget in force");
-                assert!(
-                    *used > *limit,
-                    "the reported footprint ({used}) must be the overrun, above the limit ({limit})"
-                );
-                assert_eq!(*source, BudgetCategory::Arena);
-                let detail = detail.as_deref().expect("the overrun must carry detail");
-                assert!(
-                    detail.contains("Reshape correlation group [gid=\"g\"]"),
-                    "the detail must name the offending partition_by group: {detail}"
-                );
-                assert!(
-                    detail.contains("no-cascade"),
-                    "the detail must explain why one group must fit the budget: {detail}"
-                );
-                assert!(
-                    detail.contains("memory.limit")
-                        && detail.contains("only fix that leaves your output unchanged"),
-                    "the detail must name raising the budget as the one output-preserving fix: \
-                     {detail}"
-                );
-                // The column-dropping remedy must be offered AND must carry its
-                // consequence: this node writes every input column through, so
-                // dropped columns leave the written output as well. Asserting
-                // the pair rather than "consequence-if-offered" keeps the check
-                // live — the implication form passes vacuously the moment the
-                // remedy is reworded, which is how the two node messages drifted
-                // apart before.
-                assert!(
-                    detail.contains("upstream Transform"),
-                    "the detail must offer the column-drop remedy: {detail}"
-                );
-                assert!(
-                    detail.contains("leave the output too"),
-                    "offering the column-drop remedy requires disclosing that it changes which \
-                     columns are written: {detail}"
-                );
-                // The engine must never recommend narrowing `partition_by` as a
-                // memory fix. It redefines the group the rules evaluate
-                // against, so it clears the abort by silently changing the
-                // answer — the exact failure class this milestone exists to
-                // remove. The warning must be present and the suggestion absent.
-                assert!(
-                    !detail.contains("add a finer `partition_by`"),
-                    "the remediation must not recommend narrowing partition_by: {detail}"
-                );
-                assert!(
-                    detail.contains("Narrowing `partition_by`")
-                        && detail.contains("changes results"),
-                    "the detail must warn that narrowing partition_by changes results: {detail}"
-                );
-            }
-            other => panic!("a giant correlation group must surface E310; got {other:?}"),
-        }
+        // memory report — typed, not merely reworded.
+        let PipelineError::MemoryBudgetExceeded { report } = &err else {
+            panic!("a giant correlation group must surface E310; got {err:?}");
+        };
+        assert_eq!(
+            report.requester,
+            Some(ConsumerLabel {
+                node: "rs".to_string(),
+                surface: MemorySurface::ReshapeGroups,
+            }),
+            "the diagnostic must name the Reshape node and its held group rows"
+        );
+        assert_eq!(
+            report.limit.bytes(),
+            256,
+            "the limit must be the hard budget in force"
+        );
+        assert!(
+            report.oversized && report.requested_bytes > report.limit.bytes(),
+            "the reported request ({}) must be the group's footprint, above the limit ({})",
+            report.requested_bytes,
+            report.limit.bytes()
+        );
+        // The group is named by where its first row came from, never by its
+        // key (a record value): the Source that read it and its row number,
+        // counted from 1 as the dead-letter output counts it.
+        assert_eq!(
+            report.group_first_row,
+            Some(RowPosition {
+                source: "orders".to_string(),
+                row: 1,
+            }),
+            "the diagnostic must identify the offending group"
+        );
 
-        // Rendered form: the E310 code and the budget figures reach the user.
+        // Rendered form: the E310 code, the node and the group reach the user,
+        // with a route to the remedy for a Reshape group.
         let rendered = err.to_string();
         assert!(
-            rendered.starts_with("E310 rs:"),
+            rendered.starts_with("E310 \"rs\":"),
             "the rendered diagnostic must lead with the E310 code and the node: {rendered}"
+        );
+        assert!(
+            rendered.contains("\n  group: the one whose first row is row 1 of source \"orders\""),
+            "the rendered diagnostic must name the group: {rendered}"
+        );
+        assert!(
+            !rendered.contains("\"g\""),
+            "the group's key is a record value and must not be printed: {rendered}"
+        );
+        assert!(
+            rendered
+                .contains("see \"Rows held for Reshape groups\" in clinker explain --code E310"),
+            "the diagnostic must route to the remedy for a Reshape group: {rendered}"
+        );
+        assert!(
+            !rendered.contains("finer `partition_by`"),
+            "the remediation must not recommend narrowing partition_by: {rendered}"
+        );
+
+        let remedy = crate::executor::util::e310_section("Rows held for Reshape groups");
+        assert!(
+            remedy.contains("every rule sees"),
+            "the remedy must explain why one group must fit the budget: {remedy}"
+        );
+        assert!(
+            remedy.contains("memory.limit")
+                && remedy.contains("only fix")
+                && remedy.contains("leaves your output unchanged"),
+            "the remedy must name raising the budget as the one output-preserving fix: {remedy}"
+        );
+        // The column-dropping remedy must be offered AND must carry its
+        // consequence: this node writes every input column through, so
+        // dropped columns leave the written output as well. Asserting the
+        // pair rather than "consequence-if-offered" keeps the check live.
+        assert!(
+            remedy.contains("upstream Transform"),
+            "the remedy must offer the column-drop remedy: {remedy}"
+        );
+        assert!(
+            remedy.contains("leave the output too"),
+            "offering the column-drop remedy requires disclosing that it changes which \
+             columns are written: {remedy}"
+        );
+        // The engine must never recommend narrowing `partition_by` as a
+        // memory fix. It redefines the group the rules evaluate against, so
+        // it clears the abort by silently changing the answer. The warning
+        // must be present and the suggestion absent.
+        assert!(
+            !remedy.contains("add a finer `partition_by`"),
+            "the remediation must not recommend narrowing partition_by: {remedy}"
+        );
+        assert!(
+            remedy.contains("Narrowing `partition_by`") && remedy.contains("changes results"),
+            "the remedy must warn that narrowing partition_by changes results: {remedy}"
         );
     }
 
@@ -1456,15 +1822,15 @@ mod tests {
     // remediation would tell them to narrow a key they never declared.
     #[test]
     fn a_whole_input_group_names_itself_and_offers_no_key_to_narrow() {
-        let schema = schema();
+        let schema = stamped_schema();
         let mut buffer = ReshapeGroupBuffer::new(schema.clone(), true);
         // Every record keys to the empty tuple, so all 8 land in one group.
-        for row_num in 0..8u64 {
-            let payload = format!("{row_num:063}");
+        for index in 0..8u64 {
+            let payload = format!("{index:063}");
             buffer.push(
                 Vec::new(),
-                rec(&schema, "any", &payload),
-                source_row(row_num),
+                stamped_rec(&schema, "any", &payload),
+                ingest_row(index),
             );
         }
         assert_eq!(
@@ -1474,53 +1840,53 @@ mod tests {
         );
 
         let err = buffer
-            .take_group("rs", &[], &[], 64)
+            .take_group("rs", &[], 64, &limit_of(64))
             .expect_err("a group exceeding the hard limit must be rejected at finalize");
-        let PipelineError::MemoryBudgetExceeded { detail, .. } = &err else {
+        let PipelineError::MemoryBudgetExceeded { report } = &err else {
             panic!("a giant correlation group must surface E310; got {err:?}");
         };
-        let detail = detail.as_deref().expect("the overrun must carry detail");
+        // The whole-input group is named by its first row, like any other
+        // group, never as an empty bracket pair that names nothing.
+        assert_eq!(
+            report.group_first_row.as_ref().map(|first| first.row),
+            Some(1),
+            "the whole-input group must be named readably: {report:?}"
+        );
+        let rendered = err.to_string();
         assert!(
-            detail.contains("correlation group [whole input]"),
-            "the whole-input group must be named readably, not as an empty bracket pair: {detail}"
+            !rendered.contains("[]"),
+            "the empty bracket pair names nothing and must not reach the author: {rendered}"
+        );
+        // With no declared fields there is nothing to narrow; the remedy the
+        // report routes to says so, and still states what declaring fields
+        // would change.
+        let remedy = crate::executor::util::e310_section("Rows held for Reshape groups");
+        assert!(
+            remedy.contains("`partition_by: []`") && remedy.contains("there is no key to narrow"),
+            "the remedy must say the whole-input group offers no key: {remedy}"
         );
         assert!(
-            !detail.contains("[]"),
-            "the empty bracket pair names nothing and must not reach the author: {detail}"
-        );
-        // With no declared fields there is nothing to narrow, so the standard
-        // narrowing warning would send the author editing a key they never
-        // wrote. The result-changing consequence still has to be stated.
-        assert!(
-            !detail.contains("Narrowing `partition_by`"),
-            "with no partition key declared there is nothing to narrow: {detail}"
-        );
-        assert!(
-            detail.contains("`partition_by` is empty here")
-                && detail.contains("there is no key to narrow"),
-            "the detail must say the group covers the whole input and offers no key: {detail}"
-        );
-        assert!(
-            detail.contains("Declaring fields in `partition_by`")
-                && detail.contains("changes results"),
-            "splitting the whole-input group changes results, and the detail must say so: {detail}"
+            remedy.contains("Declaring fields in an empty `partition_by`")
+                && remedy.contains("changes results"),
+            "splitting the whole-input group changes results, and the remedy must say so: \
+             {remedy}"
         );
     }
 
     // This node folds a blank partition value into the null group
     // (`partition_key`), and a blank key is exactly the case most likely to
-    // produce a giant group, since every blank row merges into one. Naming
-    // that group `[gid=null]` alone would send the author hunting for missing
-    // values they do not have, so the diagnostic must say that `null` covers
-    // empty strings too.
+    // produce a giant group, since every blank row merges into one. The report
+    // names such a group by its first row like any other, and the remedy it
+    // routes to must say that `null` covers empty strings too, or the author
+    // hunts for missing values they do not have.
     #[test]
     fn a_blank_partition_value_group_is_named_unambiguously() {
-        let schema = schema();
+        let schema = stamped_schema();
         let spill_root = tempfile::tempdir().unwrap();
         let arb = arbitrator(512);
         let handle = ConsumerHandle::new();
         // A blank `gid` keys to Null through this node's `partition_key`.
-        let key = partition_key(&rec(&schema, "", "x"), &partition_by());
+        let key = partition_key(&stamped_rec(&schema, "", "x"), &partition_by());
         assert_eq!(
             key,
             vec![GroupByKey::Null],
@@ -1528,9 +1894,13 @@ mod tests {
         );
 
         let mut buffer = ReshapeGroupBuffer::new(schema.clone(), true);
-        for row_num in 0..64u64 {
-            let payload = format!("{row_num:063}");
-            buffer.push(key.clone(), rec(&schema, "", &payload), source_row(row_num));
+        for index in 0..64u64 {
+            let payload = format!("{index:063}");
+            buffer.push(
+                key.clone(),
+                stamped_rec(&schema, "", &payload),
+                ingest_row(index),
+            );
             handle.set_bytes(buffer.resident_bytes() as u64);
             if arb.spill_threshold_bytes() < buffer.resident_bytes() as u64 {
                 buffer
@@ -1540,30 +1910,31 @@ mod tests {
         }
 
         let err = buffer
-            .take_group("rs", &partition_by(), &key, 256)
+            .take_group("rs", &key, 256, &limit_of(256))
             .expect_err("a group exceeding the hard limit must be rejected at finalize");
-        let PipelineError::MemoryBudgetExceeded { detail, .. } = &err else {
+        let PipelineError::MemoryBudgetExceeded { report } = &err else {
             panic!("a giant correlation group must surface E310; got {err:?}");
         };
-        let detail = detail.as_deref().expect("the overrun must carry detail");
-        assert!(
-            detail.contains("[gid=null]"),
-            "the group must still be named: {detail}"
+        assert_eq!(
+            report.group_first_row.as_ref().map(|first| first.row),
+            Some(1),
+            "the group must still be named: {report:?}"
         );
-        // `partition_key` funnels six distinct causes into the null group, and
-        // naming only the blank case sends an author looking for blanks, finding
-        // too few to explain the size, and stopping. Every cause the code folds
-        // in must be named.
+        // `partition_key` funnels several distinct causes into the null group,
+        // and naming only the blank case sends an author looking for blanks,
+        // finding too few to explain the size, and stopping. The remedy the
+        // report routes to must name every cause the code folds in. A NaN is
+        // its own group key, so it is not one of them.
+        let remedy = crate::executor::util::e310_section("Rows held for Reshape groups");
         for cause in [
             "missing column",
             "explicit null",
             "empty string",
-            "NaN",
             "array- or map-valued",
         ] {
             assert!(
-                detail.contains(cause),
-                "a null-keyed group must disclose that {cause:?} lands here too: {detail}"
+                remedy.contains(cause),
+                "the remedy must disclose that {cause:?} lands in a null group too: {remedy}"
             );
         }
     }
@@ -1615,5 +1986,131 @@ mod tests {
             arb.cumulative_spill_bytes() > 1,
             "cumulative_spill_bytes must reflect the overflowing write"
         );
+    }
+
+    /// Rows a reclaim test buffers: row `i` belongs to group `3i mod 4`, so
+    /// the groups are first seen out of key order, and carries a 1 KiB
+    /// payload.
+    fn grouped_rows(schema: &SharedStorage<Schema>) -> Vec<(Vec<GroupByKey>, Record, SourceRowId)> {
+        (0..48u64)
+            .map(|i| {
+                let record = rec(schema, &((3 * i) % 4).to_string(), &format!("{i:0>1024}"));
+                (
+                    partition_key(&record, &partition_by()),
+                    record,
+                    source_row(i),
+                )
+            })
+            .collect()
+    }
+
+    /// Every group, taken in first-seen order, as row ordinals and values.
+    fn take_every_group(
+        take_order: Vec<Vec<GroupByKey>>,
+        mut take: impl FnMut(&[GroupByKey]) -> Vec<(Record, SourceRowId)>,
+    ) -> Vec<(u64, Vec<Value>)> {
+        take_order
+            .iter()
+            .flat_map(|key| take(key))
+            .map(|(record, row)| (row.ordinal(), record.values().to_vec()))
+            .collect()
+    }
+
+    /// A walk request another consumer makes for more than is free, while a
+    /// Reshape holds its groups resident, is granted by spilling those
+    /// groups: the Reshape's figure falls to 0, every group is on disk, the
+    /// spill is recorded under the Reshape's node, and taking every group
+    /// yields the rows an unspilled buffer of the same input yields, in the
+    /// same order.
+    #[test]
+    fn reshape_groups_spill_when_another_walk_request_falls_short() {
+        use crate::pipeline::memory::walk::walk_test_support::{
+            foreign_walk_request, with_test_walk_frame,
+        };
+        const FREE: u64 = 4 * 1024;
+        let root = tempfile::tempdir().expect("spill root");
+        let arbitrator = Arc::new(MemoryArbitrator::with_policy(
+            64 * 1024 * 1024,
+            0.80,
+            0.70,
+            Box::new(crate::pipeline::memory::Priority),
+        ));
+        with_test_walk_frame(&arbitrator, || {
+            let schema = schema();
+            let (id, handle) = register_reshape_consumer(&arbitrator, "reshaped")
+                .expect("a fresh handle registers");
+            let groups = ReshapeGroups::register(
+                &arbitrator,
+                id,
+                &handle,
+                "reshaped",
+                &Arc::from(root.path()),
+                ReshapeGroupBuffer::new(schema.clone(), false),
+            )
+            .expect("registered");
+            for (key, record, row) in grouped_rows(&schema) {
+                groups.push(key, record, row);
+            }
+            let resident = handle.bytes();
+            assert!(resident > 0);
+            arbitrator
+                .set_limit(arbitrator.charged_bytes() + FREE)
+                .expect("limit");
+            let spilled_before = arbitrator
+                .per_stage_spill_bytes()
+                .get("reshaped")
+                .copied()
+                .unwrap_or(0);
+
+            let grant = foreign_walk_request(&arbitrator, FREE + resident / 2)
+                .expect("the pass spills the Reshape's groups and the request fits");
+            assert_eq!(
+                handle.reclaimable(),
+                0,
+                "nothing the Reshape holds is resident"
+            );
+            assert!(
+                groups
+                    .cell
+                    .borrow()
+                    .buffer
+                    .groups
+                    .values()
+                    .all(|group| group.resident.is_empty() && !group.spilled.is_empty()),
+                "every group is on disk"
+            );
+            assert!(
+                arbitrator
+                    .per_stage_spill_bytes()
+                    .get("reshaped")
+                    .copied()
+                    .unwrap_or(0)
+                    > spilled_before,
+                "the spill is recorded under the Reshape's node"
+            );
+            drop(grant);
+
+            let spilled = take_every_group(groups.take_group_order(), |key| {
+                groups
+                    .take_group(key, u64::MAX, &arbitrator)
+                    .expect("group reloads")
+            });
+            let mut unspilled = ReshapeGroupBuffer::new(schema.clone(), false);
+            for (key, record, row) in grouped_rows(&schema) {
+                unspilled.push(key, record, row);
+            }
+            let expected = take_every_group(unspilled.take_group_order(), |key| {
+                unspilled
+                    .take_group("reshaped", key, u64::MAX, &arbitrator)
+                    .expect("group taken")
+            });
+            assert_eq!(spilled.len(), 48);
+            assert_eq!(
+                spilled, expected,
+                "spilled groups come back as an unspilled buffer gives them"
+            );
+            drop(groups);
+            arbitrator.unregister_consumer(id);
+        });
     }
 }

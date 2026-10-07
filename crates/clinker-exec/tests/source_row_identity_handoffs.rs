@@ -358,7 +358,9 @@ fn fanout_dispatch_has_no_scalar_cull_reconstruction_and_charges_typed_carriers(
         !cull.contains("fnpush<R>") && !cull.contains("row_num.into()"),
         "Cull production admission must require SourceRowId directly"
     );
-    assert!(route.contains("size_of::<(Record,crate::executor::stream_event::SourceRowId)>"));
+    // Route charges the rows it parks for a deferred consumer through the
+    // shared park, whose per-row cost is `record_byte_cost` below.
+    assert!(route.contains("park_cross_region(ctx,current_dag,node_idx,edge_id,records)?"));
     assert!(dispatch.contains("fnestimate_node_buffer_unaccounted_bytes("));
     assert!(dispatch.contains("unaccounted_record_byte_cost(record,resources,)"));
     assert!(node_buffer.contains("size_of::<(Record,SourceRowId)>()"));
