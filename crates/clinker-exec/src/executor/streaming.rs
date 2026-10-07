@@ -279,6 +279,60 @@ impl StreamingOutputTaskOutput {
     }
 }
 
+/// A streaming Sink's writer thread, with the producer that feeds it and the
+/// Sink's name.
+pub(crate) struct StreamingSinkThread {
+    /// The step whose top-level turn feeds this Sink.
+    pub(crate) producer: petgraph::graph::NodeIndex,
+    pub(crate) sink: String,
+    pub(crate) handle: std::thread::JoinHandle<StreamingOutputTaskOutput>,
+}
+
+/// What a joined streaming Sink reports to the walk.
+pub(crate) struct StreamingSinkOutcome {
+    pub(crate) sink: String,
+    /// Every error the Sink met, in the order it met them. A thread that
+    /// panicked reports one [`PipelineError::Internal`] naming the Sink.
+    pub(crate) errors: Vec<PipelineError>,
+    /// How the Sink's input ended; `None` when a record stopped it first or
+    /// its thread panicked.
+    pub(crate) input_end: Option<super::stream_hop::HopVerdict>,
+}
+
+impl StreamingSinkThread {
+    /// Wait for the Sink's thread and fold its counters, timers, metrics and
+    /// dead letters into `ctx`, returning its errors instead of leaving them
+    /// in `ctx.output_errors`.
+    ///
+    /// Blocks until the Sink has read its input to End or to the channel's
+    /// close, so the caller must already have ended or dropped the hop's end
+    /// and dropped the producer's sender. The wait is then bounded by the
+    /// events still on the channel (at most its 256) and the Sink's flush.
+    pub(crate) fn join_into(self, ctx: &mut dispatch::ExecutorContext<'_>) -> StreamingSinkOutcome {
+        match self.handle.join() {
+            Ok(output) => {
+                let input_end = output.input_end;
+                let pushed_before = ctx.output_errors.len();
+                output.fold_into(ctx);
+                StreamingSinkOutcome {
+                    sink: self.sink,
+                    errors: ctx.output_errors.split_off(pushed_before),
+                    input_end,
+                }
+            }
+            Err(_panic) => StreamingSinkOutcome {
+                errors: vec![PipelineError::Internal {
+                    op: "streaming_sink",
+                    node: self.sink.clone(),
+                    detail: String::from("streaming output thread panicked"),
+                }],
+                sink: self.sink,
+                input_end: None,
+            },
+        }
+    }
+}
+
 /// A streaming consumer plugged into [`drain_streaming_channel`].
 ///
 /// The skeleton owns the channel recv loop, the per-record memory

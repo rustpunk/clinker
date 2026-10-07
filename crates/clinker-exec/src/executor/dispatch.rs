@@ -2094,15 +2094,12 @@ pub(crate) struct ExecutorContext<'a> {
     /// driver → Source. Empty for pipelines with no streaming-probe
     /// Combine.
     pub(crate) streaming_combine_probe_edges: HashMap<NodeIndex, NodeIndex>,
-    /// `JoinHandle`s for spawned streaming-output writer threads. Owned
-    /// by the dispatcher so the end-of-DAG join surface (in
-    /// `execute_dag_branching`) folds per-thread counter / timer /
-    /// error accounting back into the dispatcher's
-    /// `counters` / `records_emitted` / `write_timer` /
-    /// `projection_timer` / `ok_source_rows` / `output_errors`.
-    /// Drained via `std::mem::take` at the join surface.
-    pub(crate) streaming_output_tasks:
-        Vec<std::thread::JoinHandle<crate::executor::StreamingOutputTaskOutput>>,
+    /// The streaming Sinks' writer threads not yet joined, in the order
+    /// their specs were built. The walk joins a Sink's thread at the end of
+    /// its producer's top-level turn and folds its counters, timers and
+    /// errors back into this context; a Sink whose producer never had that
+    /// turn (the walk failed or was cancelled first) is joined at teardown.
+    pub(crate) streaming_output_tasks: Vec<crate::executor::StreamingSinkThread>,
 
     /// The run's Rayon pool for the parallel sections of the CPU-bound
     /// kernels (sort, grace-hash, IEJoin, sort-merge). Sized off the run's

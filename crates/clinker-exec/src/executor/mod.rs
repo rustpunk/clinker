@@ -83,7 +83,7 @@ pub use storage_validate::{
     validate_storage_config,
 };
 pub use stream_event::{OutputDeliveryId, SourceRowId};
-pub(crate) use streaming::StreamingOutputTaskOutput;
+pub(crate) use streaming::StreamingSinkThread;
 use streaming::{compute_streaming_sink_specs, streaming_sink};
 pub(crate) use transform::{
     WindowedEvalCtx, evaluate_single_transform, evaluate_single_transform_windowed,
@@ -1827,8 +1827,7 @@ impl PipelineExecutor {
         > = HashMap::new();
         let hop_ends = stream_hop::HopEndLog::for_run(&params.memory_test);
         let mut streaming_sink_nodes: HashSet<petgraph::graph::NodeIndex> = HashSet::new();
-        let mut streaming_output_tasks: Vec<std::thread::JoinHandle<StreamingOutputTaskOutput>> =
-            Vec::new();
+        let mut streaming_output_tasks: Vec<StreamingSinkThread> = Vec::new();
         let mut streaming_charge_consumers: HashMap<
             petgraph::graph::NodeIndex,
             (
@@ -1926,13 +1925,17 @@ impl PipelineExecutor {
             streaming_sink_ends.insert(
                 producer_idx,
                 crate::executor::stream_hop::SinkHopEnd {
-                    sink: writer_end_name,
+                    sink: writer_end_name.clone(),
                     end: crate::executor::stream_hop::HopEnd::new(tx.clone()),
                 },
             );
             streaming_output_senders.insert(producer_idx, tx);
             streaming_sink_nodes.insert(output_idx);
-            streaming_output_tasks.push(handle);
+            streaming_output_tasks.push(StreamingSinkThread {
+                producer: producer_idx,
+                sink: writer_end_name,
+                handle,
+            });
             streaming_charge_consumers.insert(producer_idx, (charge_consumer_id, charge_handle));
         }
 
@@ -2097,16 +2100,15 @@ impl PipelineExecutor {
         // dispatcher call, so the resolved `Vec<NodeIndex>` is what the
         // loop iterates instead of re-borrowing `plan` per step.
         //
-        // Wrapped in an immediately-invoked closure so a `?` error inside
-        // doesn't short-circuit past the streaming-output thread join
-        // below — the spawned threads own writers we still need to close
-        // or abandon before the function returns. A Sink closes its output
-        // only on its hop's End, which the loop sends after its producer's
-        // turn returns `Ok`; on the error path the held ends and senders are
-        // dropped instead, so each Sink's channel closes without End and the
-        // Sink abandons its output. A tripped shutdown token surfaces as
-        // `PipelineError::Interrupted` from a per-node poll, which lands
-        // here too so the same drain-then-join cleanup runs.
+        // A turn's failure stops the loop without returning, so the teardown
+        // below still joins every streaming Sink thread: those threads own
+        // writers that must be closed or abandoned before the function
+        // returns. A Sink closes its output only on its hop's End, which a
+        // turn sends once its producer returned `Ok`; a failed turn drops the
+        // end instead, so the Sink's channel closes without End and the Sink
+        // abandons its output. A tripped shutdown token surfaces as
+        // `PipelineError::Interrupted` from a per-node poll, which stops the
+        // loop the same way.
         // Under document dead-lettering every Sink waits for every operator
         // of its pass, so each document's verdict is final before any Sink
         // writes; the plan orders Sinks last on the same predicate.
@@ -2145,20 +2147,21 @@ impl PipelineExecutor {
             )
         };
 
-        let mut walk_result: Result<(), PipelineError> = (|| {
-            for node_idx in dispatch_sequence {
-                ctx.check_shutdown()?;
-                dispatch::dispatch_plan_node(&mut ctx, plan, node_idx)?;
-                // The producer's turn returned `Ok`, so its whole output is
-                // on its streaming Sink's channel: end the Sink's input. A
-                // failed or interrupted turn leaves the end held, and the
-                // Sink finishes nothing.
-                if let Some(held) = ctx.streaming_sink_ends.remove(&node_idx) {
-                    held.end.end();
-                }
+        let pipeline_name = ctx.config.pipeline.name.clone();
+        let mut failures = WalkFailures::default();
+        let mut walk_end = WalkEnd::Completed;
+        let mut turns = 0;
+        for (turn, node_idx) in dispatch_sequence.into_iter().enumerate() {
+            turns = turn + 1;
+            let node = plan.graph[node_idx].name().to_string();
+            let result = ctx
+                .check_shutdown()
+                .and_then(|()| dispatch::dispatch_plan_node(&mut ctx, plan, node_idx));
+            if let Some(end) = settle_turn(&mut ctx, &mut failures, turn, node_idx, &node, result) {
+                walk_end = end;
+                break;
             }
-            Ok(())
-        })();
+        }
         // The walk has stopped, however it stopped: publish the rows it read
         // and has not yet published. This is the one place that establishes
         // the observer's final count, so a walk that failed or was cancelled
@@ -2167,37 +2170,33 @@ impl PipelineExecutor {
         // A spill a reclaim pass met between dispatches (none is expected:
         // every allocation of the walk runs inside a dispatch) still fails
         // the run rather than being lost.
-        if walk_result.is_ok()
+        if walk_end == WalkEnd::Completed
             && let Some(failure) = ctx.memory_budget.take_reclaim_failure()
         {
-            walk_result = Err(failure);
+            failures.push(turns, &pipeline_name, failure);
+            walk_end = WalkEnd::Failed;
         }
 
-        // Streaming-output drain. Let go of every Sink hop end the walk
-        // still holds, then of every remaining sender, BEFORE joining: a
+        // Streaming-output drain for the Sinks the walk did not settle: their
+        // producers never finished a turn. Let go of every Sink hop end the
+        // walk still holds, then of every remaining sender, BEFORE joining: a
         // writer thread waits on its channel until End or until the channel
         // closes, so joining first would deadlock. An end still held after a
         // completed walk names a Sink no producer turn finished, an engine
         // defect; after a failed or interrupted walk the held ends are the
-        // Sinks whose producers never finished, which close nothing.
+        // Sinks whose producers never ran, which close nothing. What those
+        // Sinks report enters the record after the walk's own failure.
         if let Err(error) = stream_hop::release_sink_hop_ends(
             std::mem::take(&mut ctx.streaming_sink_ends),
-            walk_result.is_ok(),
+            walk_end == WalkEnd::Completed,
         ) {
-            walk_result = Err(error);
+            failures.push(turns, &pipeline_name, error);
+            walk_end = WalkEnd::Failed;
         }
         ctx.streaming_output_senders.clear();
-        for handle in std::mem::take(&mut ctx.streaming_output_tasks) {
-            match handle.join() {
-                Ok(out) => out.fold_into(&mut ctx),
-                Err(_panic) => {
-                    ctx.output_errors.push(PipelineError::Internal {
-                        op: "streaming_sink",
-                        node: String::from("<unknown>"),
-                        detail: String::from("streaming output thread panicked"),
-                    });
-                }
-            }
+        for sink in std::mem::take(&mut ctx.streaming_output_tasks) {
+            let outcome = sink.join_into(&mut ctx);
+            failures.extend(turns, &outcome.sink, outcome.errors);
         }
 
         // Every streaming writer has joined, so its discharge is
@@ -2228,17 +2227,18 @@ impl PipelineExecutor {
             ctx.memory_budget.unregister_consumer(id);
         }
 
-        if walk_result.is_ok()
+        if walk_end == WalkEnd::Completed
             && let Err(error) =
                 dispatch::validate_completed_node_buffer_scope(&ctx, &ctx.config.pipeline.name)
         {
-            walk_result = Err(error);
+            failures.push(turns, &pipeline_name, error);
+            walk_end = WalkEnd::Failed;
         }
 
         // The walk is finished (success, interruption, or error), so no
         // top-scope node buffer can be consumed again. Drop every residual
         // allocation while its pull-mode wrapper is still registered, then
-        // unregister the matching ids before propagating `walk_result`.
+        // unregister the matching ids before the run's error is decided.
         // Successful reads consume every declared reader and leave no slot;
         // this sweep is the early-error/interruption backstop for partially
         // consumed fan-out and composition inputs.
@@ -2248,28 +2248,18 @@ impl PipelineExecutor {
         // returns; a walk that never reached the commit releases them here.
         ctx.parked_generations.borrow_mut().release_all();
 
-        // A tripped shutdown token unwinds the walk via
-        // `PipelineError::Interrupted`; that is a graceful early stop, not
-        // a failure, so swallow it here (the interruption is recorded in
-        // `ctx.interrupted` and surfaced through the report) and let the
-        // run finish draining. Every other walk error still propagates.
-        let cancelled_output = ctx
-            .output_errors
-            .iter()
-            .any(preparation::is_explicit_cancellation);
-        if cancelled_output {
-            ctx.interrupted = true;
-            ctx.output_errors
-                .retain(|error| !preparation::is_explicit_cancellation(error));
-        }
-        let walk_completed = match walk_result {
-            Ok(()) => !cancelled_output,
-            Err(error) if preparation::is_explicit_cancellation(&error) => {
-                ctx.interrupted = true;
-                false
-            }
-            Err(other) => return Err(other),
-        };
+        // Output errors the walk's arms collected so sibling Sinks still ran.
+        failures.extend(
+            turns,
+            &pipeline_name,
+            std::mem::take(&mut ctx.output_errors),
+        );
+        // A tripped shutdown token stops the walk with
+        // `PipelineError::Interrupted`; that is a graceful early stop, not a
+        // failure, so the run finishes draining and reports the interruption
+        // (unless a step failed first, which the record decides below). A
+        // Sink stopped by the cancellation is the same stop.
+        let walk_completed = walk_end == WalkEnd::Completed && !failures.any_cancellation();
 
         // Document-level DLQ terminal sweep. The walk's Output arms already
         // flushed-or-rejected every document whose close arrived or whose
@@ -2280,6 +2270,11 @@ impl PipelineExecutor {
         // rather than a completed drain.
         if walk_completed {
             crate::executor::document_dlq::reject_unclosed_failed_documents(&mut ctx)?;
+            failures.extend(
+                turns,
+                &pipeline_name,
+                std::mem::take(&mut ctx.output_errors),
+            );
         }
 
         // Top-scope teardown: the run has drained, so unregister every
@@ -2324,7 +2319,6 @@ impl PipelineExecutor {
         let projection_timer = ctx.projection_timer;
         let write_timer = ctx.write_timer;
         let records_emitted = ctx.records_emitted;
-        let output_errors = ctx.output_errors;
         let collector = ctx.collector;
         let total_records: u64 = ctx.total_per_source.values().sum();
         *counters = ctx.counters;
@@ -2350,18 +2344,12 @@ impl PipelineExecutor {
             records_emitted,
         ));
 
-        // Aggregate Output errors collected during the topo walk.
-        // Single error → bare error; ≥2 errors →
-        // `PipelineError::Multiple` (the DataFusion collection-pattern
-        // shape). Zero errors → fall through to Ok. An early return here drops
+        // The one place the run's error is decided, from every failure the
+        // walk met in the order it met them. An early return here drops
         // `ctx` (and with it the sole `SpillDir` guard), whose `Drop` releases
-        // the lock before removing the directory — the error path is cleaned up
-        // identically to the clean path.
-        match output_errors.len() {
-            0 => {}
-            1 => return Err(output_errors.into_iter().next().unwrap()),
-            _ => return Err(PipelineError::Multiple(output_errors)),
-        }
+        // the lock before removing the directory — the error path is cleaned
+        // up identically to the clean path.
+        failures.resolve(walk_end, &mut ctx.interrupted)?;
 
         // Every dead letter of the walk has been pushed: the streaming Sink
         // threads were joined and folded above, and the document terminal
@@ -2441,6 +2429,237 @@ impl PipelineExecutor {
             .compile(&clinker_plan::config::CompileContext::default())
             .map_err(PipelineError::plan_diagnostics_unanchored)?;
         Ok((validated_plan.dag().clone(), ()))
+    }
+}
+
+/// How the walk stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WalkEnd {
+    /// Every turn ran and every post-walk check passed.
+    Completed,
+    /// The run's cancellation stopped a turn.
+    Cancelled,
+    /// A failure stopped the walk; the record holds it.
+    Failed,
+}
+
+/// One failure the walk met: the turn it belongs to, the step it names, and
+/// the error. Failures met after the last turn carry the turn count.
+struct WalkFailure {
+    turn: usize,
+    node: String,
+    error: PipelineError,
+}
+
+/// Every failure a run's walk met, in the order the walk met them: turn by
+/// turn, and within a turn in the order the turn settled them.
+///
+/// Kept on the walk's thread only: each verdict, a streaming Sink's
+/// included, is settled on the walk before it is recorded, so the order is
+/// the walk's own and needs no synchronization. It holds the errors the run
+/// already collected for its report, plus at most one walk failure and the
+/// post-walk checks, so it is bounded by the plan, not by the input.
+#[derive(Default)]
+struct WalkFailures {
+    entries: Vec<WalkFailure>,
+}
+
+impl WalkFailures {
+    fn push(&mut self, turn: usize, node: &str, error: PipelineError) {
+        self.entries.push(WalkFailure {
+            turn,
+            node: node.to_string(),
+            error,
+        });
+    }
+
+    fn extend(&mut self, turn: usize, node: &str, errors: impl IntoIterator<Item = PipelineError>) {
+        for error in errors {
+            self.push(turn, node, error);
+        }
+    }
+
+    /// Record how turn `turn` of `node` ended: `None` to go on to the next
+    /// turn, or how the walk stopped.
+    fn stop(
+        &mut self,
+        turn: usize,
+        node: &str,
+        result: Result<(), PipelineError>,
+    ) -> Option<WalkEnd> {
+        match result {
+            Ok(()) => None,
+            Err(error) if preparation::is_explicit_cancellation(&error) => Some(WalkEnd::Cancelled),
+            Err(error) => {
+                self.push(turn, node, error);
+                Some(WalkEnd::Failed)
+            }
+        }
+    }
+
+    /// Whether any recorded failure is the run's cancellation.
+    fn any_cancellation(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| preparation::is_explicit_cancellation(&entry.error))
+    }
+
+    /// Decide the run's error from the walk's end and every failure it met.
+    ///
+    /// - A failed walk reports the first failure in the record, and every
+    ///   later one is logged on the walk's thread with the step it names.
+    /// - A cancelled walk, or a Sink stopped by the cancellation, marks the
+    ///   run interrupted; any other failure the walk collected is still the
+    ///   run's error.
+    /// - Otherwise the Sinks' failures are the run's error: one as itself,
+    ///   several as [`PipelineError::Multiple`] in the order they were met.
+    ///
+    /// A cancellation in the record is never a failure to report or log.
+    fn resolve(self, end: WalkEnd, interrupted: &mut bool) -> Result<(), PipelineError> {
+        let mut cancelled = end == WalkEnd::Cancelled;
+        let mut failed = Vec::with_capacity(self.entries.len());
+        for entry in self.entries {
+            if preparation::is_explicit_cancellation(&entry.error) {
+                cancelled = true;
+            } else {
+                failed.push(entry);
+            }
+        }
+        if end == WalkEnd::Failed {
+            let mut failed = failed.into_iter();
+            let Some(first) = failed.next() else {
+                return Err(PipelineError::Internal {
+                    op: "executor",
+                    node: String::new(),
+                    detail: "the walk failed without recording its failure".to_string(),
+                });
+            };
+            for later in failed {
+                tracing::warn!(
+                    node = %later.node,
+                    turn = later.turn,
+                    error = %later.error,
+                    "this step also failed, after the run's first failure; the run reports \
+                     its first failure"
+                );
+            }
+            return Err(first.error);
+        }
+        if cancelled {
+            *interrupted = true;
+        }
+        let mut errors: Vec<PipelineError> = failed.into_iter().map(|entry| entry.error).collect();
+        match errors.len() {
+            0 => Ok(()),
+            1 => Err(errors.remove(0)),
+            _ => Err(PipelineError::Multiple(errors)),
+        }
+    }
+}
+
+/// Settle turn `turn` of `node` on the walk's thread: end or release its
+/// streaming Sink's hop, settle that Sink in this turn, and record how the
+/// turn ended. `None` lets the walk go on to its next turn.
+fn settle_turn(
+    ctx: &mut dispatch::ExecutorContext<'_>,
+    failures: &mut WalkFailures,
+    turn: usize,
+    node_idx: petgraph::graph::NodeIndex,
+    node: &str,
+    result: Result<(), PipelineError>,
+) -> Option<WalkEnd> {
+    // The producer's turn returned `Ok`, so its whole output is on its
+    // streaming Sink's channel: end the Sink's input. A failed or interrupted
+    // turn drops the end unsent, and the Sink finishes nothing.
+    if let Some(held) = ctx.streaming_sink_ends.remove(&node_idx) {
+        if result.is_ok() {
+            held.end.end();
+        } else {
+            drop(held);
+        }
+    }
+    let sink = ctx
+        .streaming_output_tasks
+        .iter()
+        .position(|sink| sink.producer == node_idx)
+        .map(|at| ctx.streaming_output_tasks.remove(at));
+    match sink {
+        Some(sink) => settle_streaming_sink(ctx, failures, turn, node, sink, result),
+        None => failures.stop(turn, node, result),
+    }
+}
+
+/// Join the streaming Sink `node` feeds at the end of `node`'s turn and
+/// settle the turn with [`stream_hop::settle_hop`] over the Sink's verdict
+/// and the producer's `result`.
+///
+/// The Sink's own failure was met on a row `node` emitted before any failure
+/// `node` reports, so it enters the record first and `settle_hop` logs the
+/// producer's later failure. A Sink failure stops the walk only when its
+/// producer's turn stopped it too: a Sink that failed beside a producer that
+/// finished leaves the walk running, as a Sink's failure always has, so the
+/// other Sinks still report theirs. A Sink stopped only by the cancellation
+/// takes its producer's result, and a Sink whose input closed without End
+/// beside a producer that finished is an engine defect.
+fn settle_streaming_sink(
+    ctx: &mut dispatch::ExecutorContext<'_>,
+    failures: &mut WalkFailures,
+    turn: usize,
+    node: &str,
+    sink: StreamingSinkThread,
+    result: Result<(), PipelineError>,
+) -> Option<WalkEnd> {
+    // A producer that failed before it took its sender would otherwise keep
+    // the Sink's channel open, and the join below would never return.
+    ctx.streaming_output_senders.remove(&sink.producer);
+    let streaming::StreamingSinkOutcome {
+        sink,
+        mut errors,
+        input_end,
+    } = sink.join_into(ctx);
+    if errors.is_empty() && input_end.is_none() {
+        errors.push(PipelineError::Internal {
+            op: "streaming_sink",
+            node: sink.clone(),
+            detail: "the Sink stopped before the end of its input without reporting why"
+                .to_string(),
+        });
+    }
+    let own_failure = errors
+        .iter()
+        .position(|error| !preparation::is_explicit_cancellation(error));
+    match (own_failure, input_end) {
+        (Some(at), _) => {
+            let stops_walk = match &result {
+                Ok(()) => None,
+                Err(error) if preparation::is_explicit_cancellation(error) => {
+                    Some(WalkEnd::Cancelled)
+                }
+                Err(_) => Some(WalkEnd::Failed),
+            };
+            let own = errors.remove(at);
+            let own = match stream_hop::settle_hop(&sink, node, Err(own), result) {
+                Err(own) => own,
+                Ok(()) => PipelineError::Internal {
+                    op: "streaming-hop",
+                    node: sink.clone(),
+                    detail: "the hop settled as finished over the Sink's own failure".to_string(),
+                },
+            };
+            errors.insert(at, own);
+            failures.extend(turn, &sink, errors);
+            stops_walk
+        }
+        // Stopped only by the cancellation: the producer's result stands.
+        (None, _) if !errors.is_empty() => {
+            failures.extend(turn, &sink, errors);
+            failures.stop(turn, node, result)
+        }
+        (None, Some(verdict)) => {
+            let settled = stream_hop::settle_hop(&sink, node, Ok(verdict), result);
+            failures.stop(turn, node, settled)
+        }
+        (None, None) => failures.stop(turn, node, result),
     }
 }
 
