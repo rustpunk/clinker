@@ -1125,18 +1125,41 @@ const _: () = {
 };
 
 /// Fixed-cardinality resource failure, without record values or copied strings.
+///
+/// Most kinds report that a resource could not be had. [`Self::Cancelled`]
+/// reports aborted work, and [`Self::Finalized`] and [`Self::Authority`]
+/// report a broken internal invariant; none of those three is a capacity
+/// refusal, whatever figures accompany it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResourceErrorKind {
+    /// A memory budget had fewer bytes free than the request asked for.
     Budget,
+    /// The allocator could not supply memory for an admitted layout.
     Allocation,
+    /// The requested size or alignment cannot form an allocation layout, or
+    /// its size overflows.
     Layout,
+    /// The spill-disk quota had fewer bytes left than the request asked for.
     DiskQuota,
+    /// The open-descriptor quota had no descriptor left.
     DescriptorQuota,
+    /// The work was cancelled. Callers recognise this as an aborted run
+    /// before they classify failures; it is never a resource shortage.
     Cancelled,
+    /// Writing to temporary storage failed.
     Storage,
+    /// Reading staged bytes back from temporary storage failed.
     Readback,
+    /// A destination refuses further output because an earlier delivery to
+    /// it failed.
     DeliveryPoisoned,
+    /// The resource was already finalized or closed, so nothing more can be
+    /// done through it: an internal invariant.
     Finalized,
+    /// An ownership or authority contract was broken, such as a lease moved
+    /// to another authority, a split larger than the lease, a merge across
+    /// owners, an exhausted identity counter, or a second binding of a handle
+    /// that admits one: an internal invariant.
     Authority,
 }
 
@@ -1145,7 +1168,16 @@ pub enum ResourceErrorKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResourceError {
     pub kind: ResourceErrorKind,
+    /// What the failing operation asked for, in that operation's unit: bytes
+    /// for memory, allocation, layout, spill-disk, storage and readback
+    /// failures and for a lease's transfer, split or merge; one for a
+    /// descriptor, an attachment, a binding or an identity. 0 when the
+    /// failure carries no figure, as for cancellation, a finalized or
+    /// poisoned resource, or an I/O error that reported none.
     pub requested: usize,
+    /// What the authority had toward the request, in the same unit as
+    /// [`Self::requested`]; 0 when it had nothing or the failure carries no
+    /// figure.
     pub available: usize,
     pub field: Option<usize>,
     pub offset: Option<u64>,

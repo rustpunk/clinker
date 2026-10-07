@@ -1357,9 +1357,12 @@ mod tests {
                 },
             )
             .expect("a fresh handle registers");
-        assert!(
-            establish_writer_consumer(&arb, &bound).is_err(),
-            "a second binding of the handle is refused"
+        let refusal = establish_writer_consumer(&arb, &bound)
+            .expect_err("a second binding of the handle is refused");
+        assert_eq!(
+            refusal.kind,
+            ResourceErrorKind::Authority,
+            "a second binding is the writer handle's authority conflict, not a capacity refusal"
         );
         assert_eq!(arb.consumer_count(), 1, "the refusal registered nothing");
         arb.unregister_consumer(first);
