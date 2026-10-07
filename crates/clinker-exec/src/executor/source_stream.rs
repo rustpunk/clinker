@@ -83,11 +83,13 @@ pub(crate) enum SourceStreamEvent {
     /// a bounded preview's per-Source limit, ends the input it admits this
     /// way too: the rows it read are the input that was asked for.
     Ended,
-    /// The reader stopped because the run was cancelled: a shutdown signal,
-    /// a required report that could not be written, or the reader's own
-    /// transport reporting the cancellation. The events before this one are
-    /// a prefix of the input, not the input: no step may finish on them, and
-    /// the walk stops as an interrupted run.
+    /// The reader stopped short of the end of its input because the run was
+    /// cancelled: a shutdown signal, a required report that could not be
+    /// written, or the reader's own transport reporting the cancellation. The
+    /// events before this one are a prefix of the input, not the input: no
+    /// step may finish on them, and the walk stops as an interrupted run. A
+    /// reader whose walk stopped listening ends this way too, into a channel
+    /// no one reads: it stopped short as well, and never claims [`Self::Ended`].
     Interrupted,
     /// The reader stopped on an error. The events before this one are a
     /// prefix of the input, not the input: no step may finish on them.
@@ -115,11 +117,6 @@ impl SourceReadFailure {
             source: Arc::from(source),
             error: Arc::new(std::sync::Mutex::new(Some(error))),
         }
-    }
-
-    /// The Source whose reader failed.
-    pub(crate) fn source(&self) -> &str {
-        &self.source
     }
 
     /// Take the error to report it. `None` once the other side has taken it.
@@ -155,19 +152,20 @@ pub(crate) struct SourceStreamEnd {
 
 impl SourceStreamEnd {
     /// Send the terminal event for `result` and hand back the thread's
-    /// result: [`SourceStreamEvent::Interrupted`] for an outcome that observed
-    /// cancellation, [`SourceStreamEvent::Ended`] for any other outcome,
-    /// [`SourceStreamEvent::Failed`] for an error. Blocks like a record send
-    /// while the channel is full. A walk that has stopped reading this
-    /// Source (it dropped the receiver) leaves the failure with the thread's
-    /// result alone.
+    /// result: [`SourceStreamEvent::Ended`] only for a read that reached the
+    /// end of its input; [`SourceStreamEvent::Interrupted`] for one that
+    /// stopped short, on the run's cancellation or because the walk stopped
+    /// listening; [`SourceStreamEvent::Failed`] for an error. Blocks like a
+    /// record send while the channel is full. A walk that has stopped
+    /// reading this Source (it dropped the receiver) leaves the failure with
+    /// the thread's result alone.
     pub(super) fn finish(
         self,
         result: Result<super::ingest::IngestTaskOutcome, clinker_plan::error::PipelineError>,
     ) -> Result<super::ingest::IngestTaskOutcome, SourceReadFailure> {
         match result {
             Ok(outcome) => {
-                let _ = self.tx.send(if outcome.interrupted {
+                let _ = self.tx.send(if outcome.stopped_short() {
                     SourceStreamEvent::Interrupted
                 } else {
                     SourceStreamEvent::Ended
@@ -327,6 +325,10 @@ pub(crate) struct SourceIngestChannel {
     allocation_resources: clinker_record::owned_storage::AllocationResources,
     /// Present only for a source declaring record-level `sort_order`.
     order_barrier: Option<crate::source::order_barrier::SourceFileOrderBarrier>,
+    /// A push met the closed channel: the walk dropped the receiver. Kept
+    /// because a closure can surface on any push, a document boundary's
+    /// included, while only the driver can report the read as stopped short.
+    receiver_dropped: bool,
 }
 
 impl SourceIngestChannel {
@@ -364,6 +366,23 @@ impl SourceIngestChannel {
         }
     }
 
+    /// Whether a push has met the closed channel: the walk dropped the
+    /// receiver before this Source's input ended.
+    pub(crate) fn receiver_dropped(&self) -> bool {
+        self.receiver_dropped
+    }
+
+    /// Remember a closed channel `result` reports, and pass it on.
+    fn note_closed<T>(
+        &mut self,
+        result: Result<T, SourceStreamError>,
+    ) -> Result<T, SourceStreamError> {
+        if matches!(result, Err(SourceStreamError::Closed)) {
+            self.receiver_dropped = true;
+        }
+        result
+    }
+
     /// Whether this source needs explicit physical-file lifecycle events.
     /// Ordinary sources retain the historical record-driven boundary path;
     /// an order barrier also needs zero-record files to reach verification.
@@ -399,6 +418,7 @@ impl SourceIngestChannel {
                 source,
                 allocation_resources,
                 order_barrier: None,
+                receiver_dropped: false,
             },
             rx,
         )
@@ -436,6 +456,7 @@ impl SourceIngestChannel {
                 source,
                 allocation_resources,
                 order_barrier: Some(order_barrier),
+                receiver_dropped: false,
             },
             rx,
         )
@@ -461,7 +482,8 @@ impl SourceIngestChannel {
             .ok_or(SourceStreamError::OrdinalExhausted {
                 source: self.source,
             })?;
-        self.send_attempt(SourceAttemptEvent::Record(record, row_id))?;
+        let sent = self.send_attempt(SourceAttemptEvent::Record(record, row_id));
+        self.note_closed(sent)?;
         self.next_row_id = row_id.checked_next();
         Ok(row_id)
     }
@@ -514,7 +536,8 @@ impl SourceIngestChannel {
         event: crate::executor::dlq::SourceRejectionEvent,
     ) -> Result<(), SourceStreamError> {
         self.consumer_handle.wait_while_paused();
-        self.send_attempt(SourceAttemptEvent::Rejection(Box::new(event)))
+        let sent = self.send_attempt(SourceAttemptEvent::Rejection(Box::new(event)));
+        self.note_closed(sent)
     }
 
     /// Push a document-boundary punctuation. One `DocumentOpen` and
@@ -524,13 +547,14 @@ impl SourceIngestChannel {
     /// Route pass through). Punctuations carry no record bytes, so they
     /// carry no charge on the `ConsumerHandle`.
     pub(crate) fn push_punctuation(&mut self, punct: Punctuation) -> Result<(), SourceStreamError> {
-        if let Some(barrier) = self.order_barrier.as_mut() {
+        let sent = if let Some(barrier) = self.order_barrier.as_mut() {
             barrier.observe_punctuation(punct).map(|_| ())
         } else {
             self.tx
                 .send(SourceStreamEvent::Punctuation(punct))
                 .map_err(|_| SourceStreamError::Closed)
-        }
+        };
+        self.note_closed(sent)
     }
 
     /// Bring an ordered Source's barrier figure (staged rows, rows being

@@ -163,34 +163,39 @@ impl SourceActivationController {
             let lifecycle_telemetry = telemetry.cloned();
             let source_runtime = self.source_runtime.clone();
             let stream_end = stream.end(&logical_source_name);
+            let worker_name = logical_source_name.clone();
             let spawn = std::thread::Builder::new()
                 .name(format!("clinker-body-source-{source_name}"))
                 .spawn(move || {
-                    // The stream's last event reports how the read ended,
-                    // after the reader has released what it held.
-                    stream_end.finish(observe_source(lifecycle_telemetry.as_ref(), || {
-                        // A governed allocation this Source was refused
-                        // ends its ingest here, on the thread that recorded
-                        // the refusal's report.
-                        let mut outcome =
-                            crate::pipeline::memory::ledger::convert_governed_refusal(
-                                ingest_source_body(
-                                    body,
-                                    input,
-                                    stream,
-                                    worker_shutdown,
-                                    None,
-                                    source_runtime,
-                                ),
-                                &logical_source_name,
-                                clinker_plan::runtime_error::MemorySurface::RowsRead,
-                            )?;
-                        outcome.source_name = logical_source_name;
-                        Ok(outcome)
-                    }))
+                    let reader_name = logical_source_name.clone();
+                    run_source_reader(
+                        &reader_name,
+                        lifecycle_telemetry.as_ref(),
+                        stream_end,
+                        || {
+                            // A governed allocation this Source was refused
+                            // ends its ingest here, on the thread that
+                            // recorded the refusal's report.
+                            let mut outcome =
+                                crate::pipeline::memory::ledger::convert_governed_refusal(
+                                    ingest_source_body(
+                                        body,
+                                        input,
+                                        stream,
+                                        worker_shutdown,
+                                        None,
+                                        source_runtime,
+                                    ),
+                                    &logical_source_name,
+                                    clinker_plan::runtime_error::MemorySurface::RowsRead,
+                                )?;
+                            outcome.source_name = logical_source_name;
+                            Ok(outcome)
+                        },
+                    )
                 });
             match spawn {
-                Ok(worker) => workers.push(worker),
+                Ok(worker) => workers.push(super::ingest::SourceWorker::new(&worker_name, worker)),
                 Err(error) => {
                     drop(activated.receivers);
                     for (_, (id, handle)) in activated.consumers {
@@ -198,7 +203,7 @@ impl SourceActivationController {
                         handle.set_bytes(0);
                         memory.unregister_consumer(id);
                     }
-                    super::ingest::join_source_workers_after_failure(workers, "body-source-thread");
+                    super::ingest::join_source_workers_after_failure(workers);
                     return Err(PipelineError::Internal {
                         op: "body-source-spawn",
                         node: String::new(),
@@ -262,10 +267,7 @@ impl SourceActivationController {
 impl Drop for SourceActivationController {
     fn drop(&mut self) {
         while let Some((_, mut runtime)) = self.active.pop_last() {
-            super::ingest::join_source_workers_after_failure(
-                runtime.workers.drain(..).rev(),
-                "body-source-thread",
-            );
+            super::ingest::join_source_workers_after_failure(runtime.workers.drain(..).rev());
             drop(runtime.group);
         }
     }
@@ -335,6 +337,41 @@ fn observe_open<T>(
     result.map_err(capability_error)
 }
 
+/// The body of a Source reader's thread, at the top level and in a
+/// composition body alike.
+///
+/// Runs `read` under the Source's lifecycle telemetry and ends the Source's
+/// stream through `end` with exactly one terminal event, after `read` has
+/// returned and released everything it held. A panic inside `read` is caught
+/// here, on the reader's thread, and becomes the read's failure, naming
+/// `source` and carrying the panic's message: the lifecycle records a failed
+/// Source and the stream ends with `Failed`, so the walk reports the panic
+/// where it meets it in the Source's data. A build that aborts on panic never
+/// reaches this; an unwinding one (tests, debug builds, embedders) does.
+pub(super) fn run_source_reader(
+    source: &str,
+    telemetry: Option<&TelemetryProducer>,
+    end: super::source_stream::SourceStreamEnd,
+    read: impl FnOnce() -> Result<IngestTaskOutcome, PipelineError>,
+) -> Result<IngestTaskOutcome, super::source_stream::SourceReadFailure> {
+    end.finish(observe_source(telemetry, || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(read)).unwrap_or_else(|payload| {
+            Err(PipelineError::Internal {
+                op: "source-read",
+                node: source.to_string(),
+                detail: format!(
+                    "the Source's reader panicked: {}",
+                    super::ingest::panic_message(payload.as_ref())
+                ),
+            })
+        })
+    }))
+}
+
+/// Run `operation`, a Source's read, recording its lifecycle: started, then
+/// failed (an error), interrupted (a read that stopped short, on the run's
+/// cancellation or because the walk stopped listening) or completed (a read
+/// that reached the end of its input).
 pub(super) fn observe_source(
     producer: Option<&TelemetryProducer>,
     operation: impl FnOnce() -> Result<IngestTaskOutcome, PipelineError>,
@@ -347,7 +384,7 @@ pub(super) fn observe_source(
     let result = operation();
     let (metric, status) = match &result {
         Err(_) => (MetricKey::SourceFailed, SpanStatus::Error),
-        Ok(outcome) if outcome.interrupted => (MetricKey::SourceInterrupted, SpanStatus::Unset),
+        Ok(outcome) if outcome.stopped_short() => (MetricKey::SourceInterrupted, SpanStatus::Unset),
         Ok(_) => (MetricKey::SourceCompleted, SpanStatus::Ok),
     };
     producer.record_metric(metric, 1);
@@ -1068,6 +1105,7 @@ mode = "none"
                 total_count: 1,
                 watermark_observations: Vec::new(),
                 interrupted: false,
+                abandoned: false,
             })
         })
         .unwrap();

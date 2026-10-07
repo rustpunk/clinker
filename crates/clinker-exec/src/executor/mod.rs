@@ -1216,10 +1216,10 @@ impl PipelineExecutor {
                 let handle = std::thread::Builder::new()
                     .name(format!("clinker-ingest-{}", src_cfg.name))
                     .spawn(move || {
-                        // The stream's last event reports how the read
-                        // ended, after the reader has released what it held.
-                        stream_end.finish(source_activation::observe_source(
+                        source_activation::run_source_reader(
+                            &ingest_node,
                             lifecycle_telemetry.as_ref(),
+                            stream_end,
                             || {
                                 // A governed allocation this Source was
                                 // refused ends its ingest here, on the thread
@@ -1238,14 +1238,14 @@ impl PipelineExecutor {
                                     clinker_plan::runtime_error::MemorySurface::RowsRead,
                                 )
                             },
-                        ))
+                        )
                     })
                     .map_err(|e| PipelineError::Internal {
                         op: "source-ingest-spawn",
                         node: src_cfg.name.clone(),
                         detail: format!("failed to spawn source ingest thread: {e}"),
                     })?;
-                ingest_handles.push(handle);
+                ingest_handles.push(ingest::SourceWorker::new(&src_cfg.name, handle));
             }
             Ok(())
         })();
@@ -1256,7 +1256,7 @@ impl PipelineExecutor {
                 handle.set_bytes(0);
                 memory_budget.unregister_consumer(id);
             }
-            ingest::join_source_workers_after_failure(ingest_handles, "source-ingest-thread");
+            ingest::join_source_workers_after_failure(ingest_handles);
             return Err(error);
         }
 
@@ -1302,7 +1302,7 @@ impl PipelineExecutor {
                 // walk's error is the first failure in data order, a
                 // reader's it reached included; a reader failure it never
                 // reached is logged, not dropped.
-                ingest::join_source_workers_after_failure(ingest_handles, "source-ingest-thread");
+                ingest::join_source_workers_after_failure(ingest_handles);
                 return Err(dispatch_error);
             }
         };
@@ -2134,6 +2134,11 @@ impl PipelineExecutor {
             }
             Ok(())
         })();
+        // The walk has stopped, however it stopped: publish the rows it read
+        // and has not yet published. This is the one place that establishes
+        // the observer's final count, so a walk that failed or was cancelled
+        // between publishing boundaries still reports every row it took.
+        dispatch::publish_record_progress(&mut ctx);
         // A spill a reclaim pass met between dispatches (none is expected:
         // every allocation of the walk runs inside a dispatch) still fails
         // the run rather than being lost.

@@ -828,18 +828,14 @@ pub(crate) fn apply_source_attempt_population(
 /// rows that came before it. A read the run's cancellation cut off becomes
 /// the walk's graceful interruption at that same point, so no step finishes
 /// on its rows either. A channel that disconnects without a terminal event
-/// means the reader stopped without reporting (a panic), and is a failure
-/// too.
+/// means the reader's thread stopped without reporting how its read ended,
+/// and is a failure too.
 pub(crate) fn consume_source_event(
     ctx: &mut ExecutorContext<'_>,
     expected_source: &Arc<str>,
     item: Option<crate::executor::source_stream::SourceStreamEvent>,
 ) -> Result<ConsumedSourceEvent, PipelineError> {
-    // A failure ends the walk before `finalize_source_count` flushes the
-    // staged tail, so each failure arm publishes it first: the observer's
-    // count of rows read includes the rows read before the reader stopped.
     let Some(event) = item else {
-        publish_record_progress(ctx);
         return Err(PipelineError::Internal {
             op: "source-read",
             node: expected_source.to_string(),
@@ -851,12 +847,10 @@ pub(crate) fn consume_source_event(
     match event {
         crate::executor::source_stream::SourceStreamEvent::Ended => Ok(ConsumedSourceEvent::Ended),
         crate::executor::source_stream::SourceStreamEvent::Interrupted => {
-            publish_record_progress(ctx);
             ctx.interrupted = true;
             Err(PipelineError::Interrupted)
         }
         crate::executor::source_stream::SourceStreamEvent::Failed(failure) => {
-            publish_record_progress(ctx);
             Err(failure.take().unwrap_or_else(|| PipelineError::Internal {
                 op: "source-read",
                 node: expected_source.to_string(),
