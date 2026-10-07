@@ -3503,7 +3503,16 @@ fn run(args: &RunArgs, machine: Option<&MachineEmitter>) -> Result<u8, PipelineE
                 compile_ctx.without_overlay_ops(),
             )?;
         source_stager.cleanup(true);
-        return Ok(if report.counters.dlq_count > 0 { 2 } else { 0 });
+        // A preview's read limit ends its input normally; a cancellation
+        // that cut the preview short is a cancelled run like any other, so
+        // it reports 130 rather than the status of a finished preview.
+        return Ok(if report.interrupted {
+            130
+        } else if report.counters.dlq_count > 0 {
+            2
+        } else {
+            0
+        });
     }
 
     // Every output writes to a hidden destination-local leaf admitted through

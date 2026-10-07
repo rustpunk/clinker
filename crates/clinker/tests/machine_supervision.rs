@@ -1141,6 +1141,92 @@ fn sigterm_inside_a_rest_read_records_an_abort_lineage_terminal() {
     );
 }
 
+/// A bounded preview cancelled while its Source is still reading exits as a
+/// cancellation. The preview's read limit is a normal end of input; a signal
+/// is not, so the preview reports 130 like any other cancelled run rather
+/// than the success status of a preview that read what it asked for.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_interrupted_preview_exits_as_cancelled() {
+    let directory = fixture();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+    let address = listener.local_addr().expect("listener address");
+    write_hanging_rest_pipeline(directory.path(), address);
+
+    let (request_ready_tx, request_ready_rx) = mpsc::sync_channel(1);
+    let (sigterm_sent_tx, sigterm_sent_rx) = mpsc::sync_channel(1);
+    let server = std::thread::spawn(move || {
+        // Bounded, so a child that never sends its request fails the test
+        // rather than leaving this thread waiting for ever.
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let deadline = Instant::now() + PROCESS_DEADLINE;
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the preview never sent its request"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept request: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).expect("blocking stream");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let bytes = stream.read(&mut buffer).expect("read request");
+            assert!(bytes > 0, "request closed before its headers completed");
+            request.extend_from_slice(&buffer[..bytes]);
+        }
+        request_ready_tx.send(()).expect("announce live request");
+        sigterm_sent_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("supervisor sent SIGTERM");
+        // Let the child handle the signal before the read it is blocked in
+        // ends, so the reader stops as cancelled rather than on a transport
+        // failure.
+        std::thread::sleep(Duration::from_millis(250));
+        drop(stream);
+    });
+
+    // A preview takes no `--machine` stream; the process status is its
+    // whole result.
+    let mut command = Command::new(clinker_bin());
+    command.current_dir(directory.path()).args([
+        "run",
+        "pipeline.yaml",
+        "--dry-run",
+        "-n",
+        "5",
+        "--dry-run-output",
+        "preview.csv",
+    ]);
+    let result = run_child(
+        command,
+        ProcessConfig::new(Duration::from_secs(5)).graceful_trigger(
+            request_ready_rx,
+            sigterm_sent_tx,
+            Duration::from_secs(2),
+        ),
+    )
+    .expect("gracefully supervised preview");
+    server.join().expect("server thread");
+
+    assert_eq!(
+        result.status_code(),
+        Some(130),
+        "an interrupted preview is a cancelled run: {result:?}"
+    );
+}
+
 /// The liveness worker's verdict survives a run that never reaches `finish`.
 ///
 /// The worker returns `Err` only for a record it can never encode, or for a

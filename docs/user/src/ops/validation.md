@@ -237,6 +237,11 @@ Without `-n`, `--dry-run` performs planning only and reads no input records.
 sample validates only the sampled data; it does not prove that the rest of
 the input will pass. See [CLI options](cli-reference.md).
 
+Reaching `N` records is a normal end of a Source's input, so every step
+finishes on the sample. A preview cancelled by SIGINT or SIGTERM before it
+finishes exits `130`, like any cancelled run, and what it wrote to stdout or
+`--dry-run-output` is incomplete.
+
 > **Known limitation:** At revision `3b343a4e`, some bounded previews fail
 > during cleanup with `completed node-buffer scope retained ...`, even when
 > the same pipeline completes in an ordinary run. Treat that nonzero exit as
