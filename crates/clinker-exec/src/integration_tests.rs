@@ -1666,11 +1666,15 @@ nodes:
             "result".to_string(),
             Box::new(out_buf.clone()) as Box<dyn std::io::Write + Send>,
         )]);
+        // The test proves dispatch order, not admission. Reading the test
+        // process's resident memory, which parallel tests share, could
+        // refuse the join's tiny build side under load.
         let params = PipelineRunParams {
             execution_id: "test-exec-id".to_string(),
             batch_id: "test-batch-id".to_string(),
             pipeline_vars: Default::default(),
             shutdown_token: None,
+            memory_test: crate::executor::MemoryTestOverrides::default().with_no_process_memory(),
             ..Default::default()
         };
 
