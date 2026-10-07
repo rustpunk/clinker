@@ -910,9 +910,9 @@ nodes:
 
     /// Two body Sources feed an interleave, so they start together. The run
     /// is cancelled as they open, and the body walk stops before it reads
-    /// either; one of their readers then fails. The run is cancelled, as the
-    /// operator asked; the failure is logged, not reported in place of the
-    /// cancellation.
+    /// either; `read`'s reader then fails. The run is cancelled, as the
+    /// operator asked; the failure is logged once, naming `read` as the run
+    /// knows it (inside `call`), not reported in place of the cancellation.
     #[test]
     fn a_cancelled_body_stays_cancelled_when_a_body_source_it_never_read_fails() {
         const UNREACHED_FAILURE: &str = "bad byte in a body file the run never reached";
@@ -1081,11 +1081,18 @@ nodes:
             failed.load(std::sync::atomic::Ordering::SeqCst),
             "the unread body Source's reader failed"
         );
+        let lines: Vec<&String> = warnings
+            .iter()
+            .filter(|line| line.contains(UNREACHED_FAILURE))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "the failure the run never reached is logged once: {warnings:?}"
+        );
         assert!(
-            warnings
-                .iter()
-                .any(|line| line.contains(UNREACHED_FAILURE) && line.contains("read")),
-            "the failure the run never reached is logged, naming its Source: {warnings:?}"
+            lines[0].contains(r#"source="call.read""#),
+            "the log line names the failed body Source by its name in the run: {warnings:?}"
         );
         assert_eq!(memory.consumer_count(), 0);
         assert_eq!(memory.sum_consumer_usage(), 0);
