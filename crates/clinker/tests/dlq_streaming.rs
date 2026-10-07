@@ -353,6 +353,92 @@ fn preview_exit_code_reflects_dead_letters() {
     );
 }
 
+/// Source -> Transform -> Sink, where the Transform is the one a full run
+/// fuses with its Source and streams into its Sink; `ratio` fails on a row
+/// whose `amount` is zero.
+const SOURCE_TRANSFORM_SINK: &str = r#"pipeline:
+  name: dlq_streaming_transform_preview
+error_handling:
+  strategy: continue
+  dlq:
+    path: rejects.csv
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+    schema:
+      - { name: id, type: int }
+      - { name: amount, type: int }
+- type: transform
+  name: ratio
+  input: src
+  config:
+    cxl: |
+      emit id = id
+      emit ratio = id / amount
+- type: sink
+  name: out
+  input: ratio
+  config:
+    name: out
+    path: out.csv
+    type: csv
+"#;
+
+#[test]
+fn a_transform_preview_that_dead_letters_exits_2_and_writes_no_dead_letter_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = run_clinker(
+        dir.path(),
+        SOURCE_TRANSFORM_SINK,
+        &[("input.csv", "id,amount\n1,1\n2,0\n3,3\n4,4\n")],
+        &["--dry-run", "-n", "3", "--dry-run-output", "preview.csv"],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a preview that dead-letters exits 2: {}",
+        describe(&output)
+    );
+    assert!(
+        !dir.path().join("rejects.csv").exists(),
+        "a preview writes no dead-letter file"
+    );
+    assert_eq!(
+        csv_files(dir.path()),
+        ["input.csv", "preview.csv"],
+        "a preview publishes nothing"
+    );
+
+    // The full run over the rows the preview read writes the same rows.
+    let full_dir = tempfile::tempdir().expect("tempdir");
+    let full = run_clinker(
+        full_dir.path(),
+        SOURCE_TRANSFORM_SINK,
+        &[("input.csv", "id,amount\n1,1\n2,0\n3,3\n")],
+        &[],
+    );
+    assert_eq!(
+        full.status.code(),
+        Some(2),
+        "the full run dead-letters the same row: {}",
+        describe(&full)
+    );
+    let written = std::fs::read_to_string(full_dir.path().join("out.csv")).expect("full output");
+    assert_eq!(
+        column_values(&full_dir.path().join("out.csv"), "id"),
+        ["1", "3"],
+        "the full run writes the rows for ids 1 and 3"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("preview.csv")).expect("preview bytes"),
+        written
+    );
+}
+
 /// `src → ratio → split → {high, low}`: `ratio` fails on a row whose
 /// `amount` is zero, and `split`'s condition fails on a row whose `d` is
 /// zero. One source and no interleave, so the row order is fixed by the

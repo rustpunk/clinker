@@ -3185,5 +3185,6 @@ nodes:
     mod source_pause_liveness;
     mod spill_backed_drain_overshoot;
     mod spill_dir_unavailable_midrun;
+    mod stream_hop_end;
     mod transient_node_buffer_reservations;
 }
