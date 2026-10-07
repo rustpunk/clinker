@@ -1755,18 +1755,23 @@ fn drive_record_source(
                 }
             }
         }
+        // A document boundary's push carries no outcome, so the channel keeps
+        // the closure it met; a read whose last pushes were boundaries is
+        // reported short here, before anything more is pushed into a channel
+        // no one reads.
+        if stream.receiver_dropped() {
+            stop_on_closed_channel(outcome, shutdown_for_poll.as_ref());
+        }
         if !outcome.stopped_short() {
             // Close every level still open at end-of-input, innermost first.
             // This balances both the file-level document and any nested level
             // a reader left open (a truncated `--dry-run -n` read, or a reader
             // that opens a level it never explicitly closes).
             close_open_levels(&mut stream, &mut doc_stack)?;
-        }
-        // A document boundary's push carries no outcome, so the channel keeps
-        // the closure it met; a read whose last pushes were boundaries is
-        // reported short here.
-        if stream.receiver_dropped() {
-            stop_on_closed_channel(outcome, shutdown_for_poll.as_ref());
+            // A close can be the push that meets the closed channel.
+            if stream.receiver_dropped() {
+                stop_on_closed_channel(outcome, shutdown_for_poll.as_ref());
+            }
         }
         // On a short read the still-open ordered barrier is deliberately not
         // closed: dropping `stream` aborts it, removes partial spill files,
@@ -3387,6 +3392,139 @@ nodes:
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
         drop(resources);
         assert_eq!(resource_memory.writer_resource_usage().memory, 0);
+    }
+
+    /// An ordered read whose channel the walk closed is short even when only
+    /// a document boundary met the closure: the file still staged at end of
+    /// input is dropped with the stream, never sorted and released into a
+    /// channel no one reads.
+    ///
+    /// The walk has stopped listening before the read starts. The first
+    /// file's release, at the boundary into the second, meets the closed
+    /// channel; the second file is out of order, so releasing it would repair
+    /// it and warn.
+    #[test]
+    fn an_ordered_read_abandoned_at_a_file_boundary_releases_no_later_file() {
+        use crate::pipeline::memory::{ConsumerHandle, MemoryArbitrator, NoOpPolicy};
+        struct TwoFiles {
+            schema: SharedStorage<Schema>,
+            files: [Arc<str>; 2],
+            rows: std::collections::VecDeque<(usize, i64)>,
+            current: usize,
+        }
+        impl crate::source::RecordSource for TwoFiles {
+            fn schema(&mut self) -> Result<SharedStorage<Schema>, clinker_format::FormatError> {
+                Ok(self.schema.clone())
+            }
+            fn next_record(
+                &mut self,
+            ) -> Result<Option<clinker_record::Record>, clinker_format::FormatError> {
+                let Some((file, id)) = self.rows.pop_front() else {
+                    return Ok(None);
+                };
+                self.current = file;
+                Ok(Some(clinker_record::Record::new(
+                    self.schema.clone(),
+                    vec![Value::Integer(id)],
+                )))
+            }
+            fn current_source_file(&self) -> Option<&Arc<str>> {
+                Some(&self.files[self.current])
+            }
+        }
+        let plan = clinker_plan::config::parse_config(
+            r#"
+pipeline: { name: abandoned_ordered_read }
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: csv
+      path: input.csv
+      schema: [{ name: id, type: int }]
+      sort_order: [id]
+      on_unsorted: warn
+  - type: sink
+    name: out
+    input: rows
+    config: { name: out, type: csv, path: out.csv }
+"#,
+        )
+        .unwrap()
+        .compile(&clinker_plan::config::CompileContext::default())
+        .unwrap();
+        let body = plan.config().source_bodies().next().unwrap().clone();
+        let order = &plan.dag().order_contract().source_orders[0];
+        let config = crate::source::order_barrier::SourceOrderConfig::from_compiled(
+            order,
+            order.source_id,
+            "rows",
+            &body.schema,
+        )
+        .unwrap();
+        let memory = Arc::new(MemoryArbitrator::with_policy(
+            16 * 1024 * 1024,
+            0.8,
+            0.7,
+            Box::new(NoOpPolicy),
+        ));
+        let resources = crate::executor::preparation::ExecutorResources::new(
+            memory.clone(),
+            crate::pipeline::shutdown::ShutdownToken::detached(),
+            None,
+            std::num::NonZeroUsize::new(8).unwrap(),
+            None,
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let (stream, receiver) = crate::executor::source_stream::SourceIngestChannel::new_ordered(
+            32,
+            ConsumerHandle::new(),
+            order.source_id,
+            config,
+            memory.clone(),
+            directory.path().to_path_buf(),
+            false,
+            resources.allocation(),
+        );
+        drop(receiver);
+        let reader = TwoFiles {
+            schema: clinker_record::SchemaBuilder::new()
+                .with_field("id")
+                .build(),
+            files: [Arc::from("first.csv"), Arc::from("second.csv")],
+            rows: [(0, 1), (1, 5), (1, 3)].into_iter().collect(),
+            current: 0,
+        };
+        let (result, warnings) = crate::executor::tests::capture_warnings(|| {
+            ingest_source_body(
+                body,
+                crate::source::SourceInput::Records(Box::new(reader)),
+                stream,
+                None,
+                None,
+                SourceRuntimePolicy::new(crate::executor::RunPolicy::new(
+                    std::num::NonZeroUsize::MIN,
+                    crate::executor::PreviewPolicy::Disabled,
+                )),
+            )
+        });
+        let outcome = result.expect("an abandoned read keeps its progress");
+        assert!(outcome.abandoned, "the read stopped short: {outcome:?}");
+        assert!(!outcome.interrupted);
+        assert_eq!(outcome.total_count, 3);
+        let repairs: Vec<&String> = warnings
+            .iter()
+            .filter(|line| line.contains("W307"))
+            .collect();
+        assert!(
+            repairs.is_empty(),
+            "the staged second file must not be sorted and released after the walk stopped \
+             listening, but it was repaired: {repairs:?}"
+        );
+        assert_eq!(memory.cumulative_spill_bytes(), 0);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 
     /// What a reader's `Drop` saw on its Source's channel.
