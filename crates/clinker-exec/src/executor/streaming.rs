@@ -158,10 +158,10 @@ pub(super) fn compute_streaming_sink_specs(
 /// references that anchor the dispatcher's `ExecutorContext`.
 pub(crate) struct StreamingSinkSpec {
     /// `NodeIndex` of the upstream producer node whose arm writes records
-    /// into the streaming channel — either a fused `Merge.interleave` or
-    /// a fused `Source → Transform`. The producer arm looks up its sender
-    /// in [`dispatch::ExecutorContext::streaming_output_senders`] keyed by
-    /// this index.
+    /// into the streaming channel: whichever producer
+    /// `certify_streaming_edge` certified for this Sink. Its arm takes the
+    /// sender from [`dispatch::ExecutorContext::streaming_output_senders`],
+    /// keyed by this index, whether that arm runs fused or materialized.
     pub(crate) producer_idx: petgraph::graph::NodeIndex,
     /// `NodeIndex` of the downstream `Sink` node. The Sink arm
     /// short-circuits when its index appears in
@@ -170,9 +170,8 @@ pub(crate) struct StreamingSinkSpec {
     /// Stable compiled identity of the terminal Sink consumer.
     pub(crate) consumer: clinker_plan::plan::PlanNodeId,
     pub(crate) output_name: String,
-    /// Name of the upstream producer (`Merge` or fused `Transform`), used
-    /// as the upstream-node label in the streaming task's E314
-    /// schema-mismatch diagnostics.
+    /// Name of the certified upstream producer, used as the upstream-node
+    /// label in the streaming task's E314 schema-mismatch diagnostics.
     pub(crate) producer_name: String,
     pub(crate) out_cfg: SinkConfig,
     /// Compile-time input schema for the Output; used by the streaming

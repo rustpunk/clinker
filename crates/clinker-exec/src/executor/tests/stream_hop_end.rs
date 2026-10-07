@@ -6,6 +6,9 @@
 //! compiled plan gave it. The Transform's rows reach that writer, not a
 //! buffer nobody reads.
 //!
+//! A producer that fails delivers the rows it emitted before its failure,
+//! then reports its own error.
+//!
 //! The writers are raw in-memory buffers, so anything a step finished is
 //! visible here even though a production run would leave it staged and
 //! unpublished.
