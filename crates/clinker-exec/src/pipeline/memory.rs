@@ -1288,22 +1288,15 @@ impl ArbitrationPolicy for BackPressurePreferred {
         true
     }
 
-    /// With no candidate able to back-pressure, every selection falls to the
-    /// wrapped policy, so its order is the pass's; a reclaim pass never
-    /// lists one that can.
+    /// A reclaim pass never lists a candidate able to back-pressure (pausing
+    /// is the resume controller's, not a pass's), so every selection would
+    /// fall to the wrapped policy: its order is the pass's.
     fn order_candidates(
         &self,
         candidates: &[ReclaimCandidate],
         consumers: &[(ConsumerId, &dyn MemoryConsumer)],
     ) -> Vec<ConsumerId> {
-        if candidates
-            .iter()
-            .any(|candidate| candidate.can_back_pressure)
-        {
-            order_by_selection(self, consumers)
-        } else {
-            self.fallback.order_candidates(candidates, consumers)
-        }
+        self.fallback.order_candidates(candidates, consumers)
     }
 }
 
