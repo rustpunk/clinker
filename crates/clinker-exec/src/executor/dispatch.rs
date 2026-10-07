@@ -5638,14 +5638,28 @@ pub(crate) fn dispatch_plan_node(
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
 ) -> Result<(), PipelineError> {
-    let node_consumer = current_dag
-        .graph
-        .node_weight(node_idx)
-        .and_then(|node| ctx.memory_budget.first_node_consumer(node.name()));
+    let node = current_dag.graph.node_weight(node_idx);
+    let node_consumer = node.and_then(|node| ctx.memory_budget.first_node_consumer(node.name()));
     let previous = ctx.memory_budget.set_walk_requester(node_consumer);
     let result = dispatch_plan_node_arm(ctx, current_dag, node_idx);
     ctx.memory_budget.set_walk_requester(previous);
-    match ctx.memory_budget.take_reclaim_failure() {
+    settle_reclaim_slot(
+        &ctx.memory_budget,
+        node.map_or("", |node| node.name()),
+        result,
+    )
+}
+
+/// The result of `node`'s dispatch turn, given the reclaim slot: a spill a
+/// reclaim pass could not complete while the turn ran fails the node with
+/// that spill's error, ahead of whatever the turn returned.
+pub(crate) fn settle_reclaim_slot(
+    arbitrator: &crate::pipeline::memory::MemoryArbitrator,
+    node: &str,
+    result: Result<(), PipelineError>,
+) -> Result<(), PipelineError> {
+    let _ = node;
+    match arbitrator.take_reclaim_failure() {
         Some(failure) => Err(failure),
         None => result,
     }

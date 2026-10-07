@@ -16,18 +16,44 @@ use super::*;
 use clinker_bench_support::io::SharedBuffer;
 use std::collections::HashMap;
 
-/// The error a [`RefusingWriter`] returns.
+/// The error a [`RefusingWriter`] returns, followed by its Sink's name.
 const SINK_WRITE_FAILURE: &str = "the sink's disk is full";
 
 /// The `v` value the Transform cannot convert.
 const TRANSFORM_BAD_V: &str = "transform_bad";
 
+/// The Sinks whose writers were written to, in the order each was first
+/// written to. A buffered Sink writes only in its own turn, so this is the
+/// order of those turns.
+#[derive(Clone, Default)]
+struct WriteAttempts(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl WriteAttempts {
+    fn record(&self, sink: &str) {
+        let mut attempts = self.0.lock().expect("attempts lock");
+        if !attempts.iter().any(|seen| seen == sink) {
+            attempts.push(sink.to_string());
+        }
+    }
+
+    fn sinks(&self) -> Vec<String> {
+        self.0.lock().expect("attempts lock").clone()
+    }
+}
+
 /// A writer whose every write fails, as on a full disk.
-struct RefusingWriter;
+struct RefusingWriter {
+    sink: String,
+    attempts: WriteAttempts,
+}
 
 impl std::io::Write for RefusingWriter {
     fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-        Err(std::io::Error::other(SINK_WRITE_FAILURE))
+        self.attempts.record(&self.sink);
+        Err(std::io::Error::other(format!(
+            "{SINK_WRITE_FAILURE} ({})",
+            self.sink
+        )))
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
@@ -36,16 +62,23 @@ impl std::io::Write for RefusingWriter {
 
 /// What one Sink writes to.
 enum SinkWriter {
-    /// Every write fails.
-    Refusing,
+    /// Every write fails, and is recorded.
+    Refusing(WriteAttempts),
     /// The bytes land in this buffer; clones share it.
     Buffer(SharedBuffer),
 }
 
 impl SinkWriter {
-    fn boxed(&self) -> Box<dyn std::io::Write + Send> {
+    fn refusing() -> Self {
+        Self::Refusing(WriteAttempts::default())
+    }
+
+    fn boxed(&self, sink: &str) -> Box<dyn std::io::Write + Send> {
         match self {
-            Self::Refusing => Box::new(RefusingWriter),
+            Self::Refusing(attempts) => Box::new(RefusingWriter {
+                sink: sink.to_string(),
+                attempts: attempts.clone(),
+            }),
             Self::Buffer(buffer) => Box::new(buffer.clone()),
         }
     }
@@ -72,7 +105,7 @@ fn run(
     let config = clinker_plan::config::parse_config(yaml).expect("parse pipeline YAML");
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = sinks
         .iter()
-        .map(|(sink, writer)| (sink.to_string(), writer.boxed()))
+        .map(|(sink, writer)| (sink.to_string(), writer.boxed(sink)))
         .collect();
     let ends = crate::executor::StreamingEnds::default();
     let params = PipelineRunParams {
@@ -291,7 +324,7 @@ fn assert_the_sink_failed_first(ends: &[crate::executor::StreamingEnd]) {
 /// walk's thread naming the Transform.
 #[test]
 fn a_streaming_sinks_failure_beats_its_producers_later_failure() {
-    let refusing = SinkWriter::Refusing;
+    let refusing = SinkWriter::refusing();
     let run = run(
         CONVERTING_CHAIN,
         ScriptedRows::new(6000).bad_v_at(5001).readers(),
@@ -319,7 +352,7 @@ fn a_streaming_sinks_failure_beats_its_producers_later_failure() {
 /// cancelled.
 #[test]
 fn a_streaming_sinks_failure_stands_when_the_run_is_cancelled_after_it() {
-    let refusing = SinkWriter::Refusing;
+    let refusing = SinkWriter::refusing();
     let token = crate::pipeline::shutdown::ShutdownToken::detached();
     let run = run(
         CONVERTING_CHAIN,
@@ -344,7 +377,7 @@ fn a_streaming_sinks_failure_stands_when_the_run_is_cancelled_after_it() {
 /// the same pipeline does, and both log the Transform's.
 #[test]
 fn a_preview_and_a_full_run_report_a_streaming_sinks_earlier_failure() {
-    let refusing = SinkWriter::Refusing;
+    let refusing = SinkWriter::refusing();
     for preview in [Some(6000), None] {
         let run = run(
             CONVERTING_CHAIN,
@@ -474,4 +507,261 @@ fn first_difference(written: &str, expected: &str) -> Option<String> {
         around(written),
         around(expected)
     ))
+}
+
+/// The nodes `first`, then one Source -> Sink branch per name in
+/// `buffered`, each Sink buffered (fed by its Source, not streamed).
+fn buffered_branches(name: &str, first: &str, buffered: &[&str]) -> String {
+    let mut nodes = String::new();
+    for branch in buffered {
+        nodes.push_str(&format!(
+            r#"
+- type: source
+  name: src_{branch}
+  config:
+    name: src_{branch}
+    type: csv
+    path: src_{branch}.csv
+    schema:
+      - {{ name: id, type: string }}
+- type: sink
+  name: {branch}_out
+  input: src_{branch}
+  config:
+    name: {branch}_out
+    type: csv
+    path: {branch}_out.csv
+"#
+        ));
+    }
+    format!(
+        "pipeline:\n  name: {name}\nerror_handling:\n  strategy: fail_fast\nnodes:{first}{nodes}"
+    )
+}
+
+/// Three rows of `id` as the CSV text of Source `src_{branch}`.
+fn branch_rows(branch: &str) -> (String, crate::source::SourceInput) {
+    (
+        format!("src_{branch}"),
+        crate::executor::single_file_reader(
+            format!("src_{branch}.csv"),
+            Box::new(std::io::Cursor::new(b"id\n1\n2\n3\n".to_vec())),
+        ),
+    )
+}
+
+/// The Source -> Transform -> Sink chain of [`CONVERTING_CHAIN`], as nodes
+/// to append to another pipeline.
+fn converting_chain_nodes() -> &'static str {
+    let at = CONVERTING_CHAIN
+        .find("nodes:")
+        .expect("the chain lists its nodes");
+    &CONVERTING_CHAIN[at + "nodes:".len()..]
+}
+
+/// Two independent branches: a buffered Sink `a_out` fed by its own Source,
+/// whose writer refuses its bytes, and the converting chain, whose Transform
+/// fails on row 5,001. With no memory estimates the scheduler takes the
+/// runnable step that comes first in the plan's topological order, which
+/// here puts `a_out`'s turn before the Transform's: the test confirms it
+/// from the writes the walk made before it stopped. The run reports the
+/// Sink's failure and logs the Transform's with its step.
+#[test]
+fn a_sinks_failure_in_an_earlier_turn_beats_a_later_steps_failure() {
+    let attempts = WriteAttempts::default();
+    let refusing = SinkWriter::Refusing(attempts.clone());
+    let rows_out = SinkWriter::Buffer(SharedBuffer::new());
+    let mut readers = csv_rows(6000, 5001);
+    readers.extend([branch_rows("a")]);
+    let run = run(
+        &buffered_branches("two_branches", converting_chain_nodes(), &["a"]),
+        readers,
+        &[("a_out", &refusing), ("rows_out", &rows_out)],
+        None,
+        None,
+    );
+    assert_eq!(
+        attempts.sinks(),
+        vec!["a_out".to_string()],
+        "a_out wrote before the walk stopped, so its turn came first"
+    );
+    assert!(
+        !run.ends.iter().any(|end| end.node == "a_out"),
+        "a_out is buffered, so it writes only in its own turn: {:?}",
+        run.ends
+    );
+    let error = run
+        .result
+        .as_ref()
+        .expect_err("the Sink's failure fails the run");
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("{SINK_WRITE_FAILURE} (a_out)")),
+        "the run reports the earlier turn's failure: {error}"
+    );
+    let lines = lines_carrying_the_transforms_failure(&run.warnings);
+    assert_eq!(
+        lines.len(),
+        1,
+        "the later failure is logged once: {:?}",
+        run.warnings
+    );
+    assert!(
+        lines[0].contains(r#"node="pass""#),
+        "the logged failure names the Transform: {lines:?}"
+    );
+}
+
+/// Two buffered Sinks fail and the walk completes: the run reports both, in
+/// the order of their turns, and logs neither.
+#[test]
+fn sink_only_failures_still_report_every_sink() {
+    let attempts = WriteAttempts::default();
+    let refusing = SinkWriter::Refusing(attempts.clone());
+    let run = run(
+        &buffered_branches("two_sinks", "", &["a", "b"]),
+        HashMap::from([branch_rows("a"), branch_rows("b")]),
+        &[("a_out", &refusing), ("b_out", &refusing)],
+        None,
+        None,
+    );
+    let turns = attempts.sinks();
+    assert_eq!(turns.len(), 2, "both Sinks wrote: {turns:?}");
+    match run.result {
+        Err(PipelineError::Multiple(errors)) => {
+            let reported: Vec<String> = errors.iter().map(ToString::to_string).collect();
+            assert_eq!(reported.len(), 2, "{reported:?}");
+            for (error, sink) in reported.iter().zip(&turns) {
+                assert!(
+                    error.contains(&format!("{SINK_WRITE_FAILURE} ({sink})")),
+                    "the failures are in turn order {turns:?}: {reported:?}"
+                );
+            }
+        }
+        other => panic!("both Sinks' failures are the run's error: {other:?}"),
+    }
+    assert!(
+        !run.warnings
+            .iter()
+            .any(|line| line.contains(SINK_WRITE_FAILURE)),
+        "a reported failure is not also logged: {:?}",
+        run.warnings
+    );
+}
+
+/// The reclaim pass a step's request starts fails its spill; the step then
+/// fails too. The spill's failure, met first, is the step's result, and the
+/// step's own error is logged with the step's name, not dropped.
+#[test]
+fn a_reclaim_spill_failure_wins_and_the_steps_own_error_is_logged() {
+    use crate::pipeline::memory::walk::{
+        VictimOutcome, WalkContextGuard, WalkReclaim, WalkReclaimSet, WalkSpillSettings,
+        with_test_reclaim,
+    };
+    use crate::pipeline::memory::{ConsumerHandle, ConsumerId, MemoryArbitrator, MemoryConsumer};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    const KIB: u64 = 1024;
+    const SPILL_FAILURE: &str = "the spill file could not be written";
+    const STEP_FAILURE: &str = "the step's own failure";
+
+    /// Holds its handle's charge and frees nothing until spilled.
+    struct Held(Arc<ConsumerHandle>);
+    impl MemoryConsumer for Held {
+        fn current_usage(&self) -> u64 {
+            self.0.bytes()
+        }
+        fn spill_priority(&self) -> i32 {
+            0
+        }
+        fn try_spill(&self, _: u64) -> Result<u64, crate::pipeline::memory::ConsumerSpillError> {
+            Ok(0)
+        }
+        fn can_back_pressure(&self) -> bool {
+            false
+        }
+    }
+
+    /// Every spill the pass asks for fails.
+    struct FailingSpill;
+    impl WalkReclaim for FailingSpill {
+        fn spill_victim(
+            &mut self,
+            _: ConsumerId,
+            _: &MemoryArbitrator,
+        ) -> Result<VictimOutcome, PipelineError> {
+            Err(PipelineError::Internal {
+                op: "spill",
+                node: "held".to_string(),
+                detail: SPILL_FAILURE.to_string(),
+            })
+        }
+    }
+
+    let arbitrator = Arc::new(MemoryArbitrator::with_policy(
+        1024 * KIB,
+        0.80,
+        0.70,
+        Box::new(crate::pipeline::memory::Priority),
+    ));
+    let handle = ConsumerHandle::new();
+    arbitrator
+        .register_node_consumer(
+            Arc::new(Held(Arc::clone(&handle))),
+            Arc::clone(&handle),
+            clinker_plan::runtime_error::ConsumerLabel {
+                node: "held".to_string(),
+                surface: clinker_plan::runtime_error::MemorySurface::BufferedRows {
+                    from: "held".to_string(),
+                    to: clinker_plan::runtime_error::NonEmptyReaders::one("totals".to_string()),
+                },
+            },
+        )
+        .expect("a fresh handle registers");
+    handle.set_bytes(200 * KIB);
+    let _filler = arbitrator
+        .reserve(
+            600 * KIB,
+            crate::pipeline::memory::ledger::Requester::governed(),
+        )
+        .expect("the filler fits");
+    let set = Rc::new(RefCell::new(WalkReclaimSet::new(WalkSpillSettings {
+        spill_root: Arc::from(std::env::temp_dir().as_path()),
+        spill_compress: clinker_plan::config::CompressMode::Auto,
+        batch_size: 1024,
+    })));
+    let _walk = WalkContextGuard::install(&arbitrator, set);
+    let stand_in: Rc<RefCell<dyn WalkReclaim>> = Rc::new(RefCell::new(FailingSpill));
+    let refused = with_test_reclaim(stand_in, || {
+        arbitrator.reserve(
+            500 * KIB,
+            crate::pipeline::memory::ledger::Requester::governed(),
+        )
+    });
+    assert!(refused.is_err(), "the step's request falls short");
+
+    let (result, warnings) = super::capture_warnings(|| {
+        crate::executor::dispatch::settle_reclaim_slot(
+            &arbitrator,
+            "totals",
+            Err(PipelineError::Internal {
+                op: "test",
+                node: "totals".to_string(),
+                detail: STEP_FAILURE.to_string(),
+            }),
+        )
+    });
+    let error = result.expect_err("the step fails");
+    assert!(
+        error.to_string().contains(SPILL_FAILURE),
+        "the spill's failure is the step's result: {error}"
+    );
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains(r#"node="totals""#) && warnings[0].contains(STEP_FAILURE),
+        "the step's own error is logged with its name: {warnings:?}"
+    );
 }
