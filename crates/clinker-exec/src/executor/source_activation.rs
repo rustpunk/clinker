@@ -221,13 +221,15 @@ impl SourceActivationController {
 
     /// Join and close every active group in `scope` after its receivers drop.
     ///
-    /// `walk_failed` says the body's walk failed (other than by an
-    /// interruption): its error then stands as the run's, and a reader
-    /// failure it never reached is logged rather than returned.
+    /// `walk_end` says how the body's walk ended. After it failed, its error
+    /// stands as the run's; after the run's cancellation stopped it, the
+    /// cancellation stands. Either way a reader failure the walk never
+    /// reached is logged rather than returned. Only after a walk that ran to
+    /// its end is such a failure the error returned here.
     pub(super) fn finish_scope(
         &mut self,
         scope: BodyScopeId,
-        walk_failed: bool,
+        walk_end: super::ingest::WalkEnd,
     ) -> Result<Vec<IngestTaskOutcome>, PipelineError> {
         let group_ids: Vec<_> = self
             .active
@@ -241,18 +243,9 @@ impl SourceActivationController {
                 .active
                 .remove(&id)
                 .expect("active group id was collected from the same map");
-            if walk_failed {
-                super::ingest::join_source_workers_after_failure(
-                    runtime.workers.drain(..).rev(),
-                    "body-source-thread",
-                );
-                drop(runtime.group);
-                continue;
-            }
-            match super::ingest::join_source_workers(
-                runtime.workers.drain(..).rev(),
-                "body-source-thread",
-            ) {
+            match walk_end
+                .join_source_workers(runtime.workers.drain(..).rev(), "body-source-thread")
+            {
                 Ok(group_outcomes) => outcomes.extend(group_outcomes),
                 Err(error) if first_error.is_none() => first_error = Some(error),
                 Err(_) => {}
@@ -873,6 +866,189 @@ nodes:
         assert_eq!(
             report.counters.ok_count, 0,
             "nothing read before the interruption reaches the parent Sink"
+        );
+        assert_eq!(memory.consumer_count(), 0);
+        assert_eq!(memory.sum_consumer_usage(), 0);
+    }
+
+    /// Two body Sources feed an interleave, so they start together. The run
+    /// is cancelled as they open, and the body walk stops before it reads
+    /// either; one of their readers then fails. The run is cancelled, as the
+    /// operator asked; the failure is logged, not reported in place of the
+    /// cancellation.
+    #[test]
+    fn a_cancelled_body_stays_cancelled_when_a_body_source_it_never_read_fails() {
+        const UNREACHED_FAILURE: &str = "bad byte in a body file the run never reached";
+        const TWO_SOURCE_BODY: &str = r#"_compose:
+  name: memory_reader
+  inputs: {}
+  outputs: { out: both }
+  config_schema: {}
+  resources_schema:
+    input: { kind: file, required: true }
+    other_input: { kind: file, required: true }
+nodes:
+  - type: source
+    name: read
+    config:
+      name: read
+      type: csv
+      resource: input
+      on_unmapped: { mode: drop }
+      schema: [{ name: id, type: int }]
+  - type: source
+    name: other
+    config:
+      name: other
+      type: csv
+      resource: other_input
+      on_unmapped: { mode: drop }
+      schema: [{ name: id, type: int }]
+  - type: merge
+    name: both
+    inputs: [read, other]
+    config: { mode: interleave }
+"#;
+        const TWO_SOURCE_PIPELINE: &str = r#"pipeline: { name: body_sources_cancelled }
+nodes:
+  - type: source
+    name: driver
+    config:
+      name: driver
+      type: csv
+      path: driver.csv
+      schema: [{ name: seed, type: string }]
+  - type: composition
+    name: call
+    input: driver
+    use: ../compositions/memory_reader.comp.yaml
+    inputs: {}
+    resources: { input: shared_input, other_input: shared_input }
+  - type: sink
+    name: out
+    input: call
+    config: { name: out, type: csv, path: out.csv }
+"#;
+        fn schema() -> clinker_record::owned_storage::SharedStorage<clinker_record::Schema> {
+            clinker_record::SchemaBuilder::new()
+                .with_field("id")
+                .build()
+        }
+        /// Fails with a genuine read error before its first row, whether
+        /// or not the run is cancelled, and records that it did.
+        struct Fails(Arc<std::sync::atomic::AtomicBool>);
+        impl crate::source::RecordSource for Fails {
+            fn schema(
+                &mut self,
+            ) -> Result<
+                clinker_record::owned_storage::SharedStorage<clinker_record::Schema>,
+                clinker_format::FormatError,
+            > {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(clinker_format::FormatError::Io(std::io::Error::other(
+                    UNREACHED_FAILURE,
+                )))
+            }
+            fn next_record(
+                &mut self,
+            ) -> Result<Option<clinker_record::Record>, clinker_format::FormatError> {
+                panic!("a failed schema cannot produce rows");
+            }
+        }
+        /// An input with no rows.
+        struct Empty;
+        impl crate::source::RecordSource for Empty {
+            fn schema(
+                &mut self,
+            ) -> Result<
+                clinker_record::owned_storage::SharedStorage<clinker_record::Schema>,
+                clinker_format::FormatError,
+            > {
+                Ok(schema())
+            }
+            fn next_record(
+                &mut self,
+            ) -> Result<Option<clinker_record::Record>, clinker_format::FormatError> {
+                Ok(None)
+            }
+        }
+        /// Cancels the run as it opens its Source.
+        struct CancellingOpener {
+            input: Option<SourceInput>,
+            shutdown: ShutdownToken,
+        }
+        impl CapabilityOpener for CancellingOpener {
+            fn open(
+                mut self: Box<Self>,
+            ) -> Result<Box<dyn CapabilitySession>, CapabilityOpenError> {
+                self.shutdown.request();
+                Ok(Box::new(InputSession {
+                    input: self.input.take(),
+                }))
+            }
+        }
+        let (workspace, plan) = fixture_with(TWO_SOURCE_BODY, TWO_SOURCE_PIPELINE);
+        let shutdown = ShutdownToken::detached();
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut inputs = vec![
+            SourceInput::Records(Box::new(Fails(failed.clone()))),
+            SourceInput::Records(Box::new(Empty)),
+        ]
+        .into_iter();
+        let activation = plan.dag().source_activation();
+        let groups = activation
+            .groups()
+            .iter()
+            .map(|group| {
+                let members = group
+                    .members()
+                    .iter()
+                    .copied()
+                    .map(|member| {
+                        if matches!(
+                            member.scope,
+                            clinker_plan::plan::execution::CompiledSourceScope::TopLevel
+                        ) {
+                            AdmittedSourceOpener::caller_supplied(member)
+                        } else {
+                            AdmittedSourceOpener::new(
+                                member,
+                                Box::new(CancellingOpener {
+                                    input: inputs.next(),
+                                    shutdown: shutdown.clone(),
+                                }),
+                            )
+                        }
+                    })
+                    .collect();
+                AdmittedActivationGroup::uncredentialed(group.id(), group.capacity(), members)
+            })
+            .collect();
+        let resources = AdmittedRunCapabilities::admit(activation, groups).unwrap();
+        let memory = memory();
+        let (result, warnings) = crate::executor::tests::capture_warnings(|| {
+            run(
+                workspace.path(),
+                &plan,
+                resources,
+                &PipelineRunParams {
+                    shutdown_token: Some(shutdown.clone()),
+                    ..Default::default()
+                },
+                memory.clone(),
+            )
+        });
+        let report = result.expect("a cancelled run stays cancelled");
+        assert!(report.interrupted, "the run reports the cancellation");
+        assert!(
+            failed.load(std::sync::atomic::Ordering::SeqCst),
+            "the unread body Source's reader failed"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|line| line.contains(UNREACHED_FAILURE) && line.contains("read")),
+            "the failure the run never reached is logged, naming its Source: {warnings:?}"
         );
         assert_eq!(memory.consumer_count(), 0);
         assert_eq!(memory.sum_consumer_usage(), 0);
