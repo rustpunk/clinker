@@ -677,9 +677,22 @@ access = "read"
             );
             if failure {
                 assert!(shutdown.is_requested());
+                // The body walk reaches the reader's failure, so the error is
+                // wrapped like any other failure inside the body.
                 assert!(
-                    matches!(result, Err(PipelineError::Format(clinker_format::FormatError::Resource(error)))
-                    if error.kind == clinker_record::owned_storage::ResourceErrorKind::Budget && error.requested == 42 && error.available == 7)
+                    matches!(
+                        &result,
+                        Err(PipelineError::CompositionBodyError { composition_name, inner })
+                            if composition_name == "call"
+                                && matches!(
+                                    inner.as_ref(),
+                                    PipelineError::Format(clinker_format::FormatError::Resource(error))
+                                        if error.kind == clinker_record::owned_storage::ResourceErrorKind::Budget
+                                            && error.requested == 42
+                                            && error.available == 7
+                                )
+                    ),
+                    "{result:?}"
                 );
             } else {
                 assert!(
