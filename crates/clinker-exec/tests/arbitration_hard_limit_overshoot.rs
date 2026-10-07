@@ -2,9 +2,10 @@
 //!
 //! When peak RSS exceeds the arbitrator's hard limit, `should_abort()`
 //! must return true regardless of how many consumers are registered
-//! or what policy is installed. Operator hot loops poll this in their
-//! 10K-record cadence and surface `PipelineError::MemoryBudgetExceeded`
-//! when the abort gate trips.
+//! or what policy is installed. Operator hot loops do not poll it: their
+//! 10K-record backstop is `MemoryArbitrator::check_hard_limit`, whose
+//! process-memory arm reads the same peak and surfaces
+//! `PipelineError::MemoryBudgetExceeded`.
 //!
 //! Pairs with the existing per-category abort tests in
 //! `pipeline/memory.rs` — this one focuses on the multi-consumer

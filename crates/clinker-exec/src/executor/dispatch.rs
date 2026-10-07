@@ -2635,10 +2635,11 @@ pub(crate) fn project_rows_to_buffer_schema(
 /// Park `emit_rows` for every outgoing edge from `producer_idx` whose target
 /// is a deferred-region member or output AND whose source (`producer_idx`)
 /// is NOT in the same region ([`park_cross_region`]). Internal-region edges
-/// are skipped — they live in `node_buffers` already. Edges leaving the
+/// are skipped — they live in node-buffer slots already. Edges leaving the
 /// region's producer toward a member are also skipped because the
-/// producer's own `node_buffers[producer_idx]` is the canonical entry point
-/// the commit-time deferred dispatcher reads from.
+/// producer's own slot (in the walk reclaim set's slots for the running
+/// scope) is the canonical entry point the commit-time deferred dispatcher
+/// reads from.
 pub(crate) fn tee_emit_to_region_input_buffers(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,

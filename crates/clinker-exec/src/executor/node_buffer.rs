@@ -1,4 +1,5 @@
-//! Inter-stage handoff storage for `ExecutorContext::node_buffers`.
+//! Inter-stage handoff storage: the node-buffer slots the walk reclaim set
+//! keeps for each dispatch scope (`NodeBufferSlots`).
 //!
 //! A single `NodeBuffer` slot can hold:
 //!
@@ -61,7 +62,9 @@ pub(crate) fn record_byte_cost(column_count: usize) -> u64 {
 /// charged (computed strings, lists, record variables). Text a Source read
 /// is governed and charged to that Source, so it is left out even when a
 /// spill would drop its last copy and free it; the figure then understates
-/// what the spill frees (open question 92). A node-buffer slot and every
+/// what the spill frees (open question 92). It can also overstate it: text
+/// a clone shares with another holder is counted in full, though spilling
+/// one holder frees none of it. A node-buffer slot and every
 /// operator buffer that ranks its rows against a slot count a row through
 /// this one function, so the same row ranks the same wherever it is held.
 /// A ranking figure only; never charged.
@@ -85,7 +88,7 @@ pub(crate) fn unaccounted_record_byte_cost(
     (std::mem::size_of::<(Record, SourceRowId)>() + slots) as u64
 }
 
-/// One slot inside `ExecutorContext::node_buffers`.
+/// One node-buffer slot, kept in the walk reclaim set's `NodeBufferSlots`.
 pub(crate) enum NodeBuffer {
     /// All events live in memory — records and punctuations interleaved
     /// in arrival order.
@@ -554,8 +557,10 @@ impl NodeBuffer {
     /// slot cost plus the heap payload no Source has charged
     /// ([`resident_record_reclaimable_bytes`]). Text a Source read is left
     /// out, though a spill that drops its last copy frees it, so the figure
-    /// can understate what the spill frees; the pass measures what each
-    /// spill actually frees. Rows already on disk count 0. Never charged.
+    /// can understate what the spill frees. It can overstate it too: text a
+    /// clone shares with another holder is counted in full, though spilling
+    /// one holder frees none of it. The pass measures what each spill
+    /// actually frees. Rows already on disk count 0. Never charged.
     pub(crate) fn reclaimable_bytes(&self) -> u64 {
         self.resident_events()
             .fold(0u64, |bytes, event| match event {
@@ -723,11 +728,15 @@ impl NodeBuffer {
     /// alongside the chunk's on-disk byte size for the caller's disk-quota
     /// accounting.
     ///
-    /// The arbitrator's resident-slot spill sweep
-    /// (`dispatch::service_node_buffer_spill_requests`) calls this when it
-    /// elects a live `node_buffers` slot as a spill victim: the slot's
-    /// records leave RAM for disk and the caller discharges the slot's
-    /// in-memory charge. Punctuations never spill — they move to the
+    /// Both paths that spill a resident slot reach it here, through
+    /// `ResidentSlotSpill::spill_slot`: a reclaim pass on the walk, which
+    /// elects the slot's consumer by its ranking figure and spills it at
+    /// once, and the spill sweep
+    /// (`dispatch::service_node_buffer_spill_requests`), which spills each
+    /// slot whose consumer has a raised spill request (raised by the
+    /// soft-threshold poll, or by a pass that found the slot in use). The
+    /// slot's records leave RAM for disk and the caller discharges the
+    /// slot's in-memory charge. Punctuations never spill — they move to the
     /// `Spilled` variant's `pending_puncts` sidecar and drain after the
     /// spill chunk, preserving the "punctuation trails its document"
     /// order. A slot holding only punctuations (no records) stays `Memory`

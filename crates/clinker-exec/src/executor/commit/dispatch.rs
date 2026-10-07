@@ -439,8 +439,9 @@ fn seed_cross_region_inputs_for(
 /// the parent's buffers (otherwise the body-local entries would be
 /// dropped on the floor). After the swap, the harvested rows are
 /// seeded into the parent's slot; pull-mode attribution flows through
-/// the slot's registered `NodeBufferConsumer` and the arbitrator's
-/// `should_abort` poll guards the pipeline-wide hard limit. The
+/// the slot's registered `NodeBufferConsumer`, and the harvested rows'
+/// reservations are resized through checked growth, which refuses past
+/// the run's limit. The
 /// continuation walk then runs against the parent DAG so its members
 /// see the seeded slot via the same predecessor-walk logic the
 /// forward pass uses.

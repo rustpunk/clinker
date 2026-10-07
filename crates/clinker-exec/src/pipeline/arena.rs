@@ -46,10 +46,10 @@ impl Arena {
     ///
     /// `fields`: field names to project into the Arena (from `IndexSpec.arena_fields`).
     /// `mem_limit`: hard byte limit threaded through this call only — the
-    /// caller's per-arena cap, distinct from the pipeline-wide budget
-    /// the arbitrator's `should_abort()` poll guards. Each admitted record
-    /// also polls the arbitrator at the per-row boundary so a runaway
-    /// arena trips the pipeline-wide ceiling alongside the per-call cap.
+    /// caller's per-arena cap, distinct from the run's limit
+    /// ([`MemoryArbitrator::hard_limit`]). Each admitted record's projected
+    /// footprint is also compared with that run-wide limit, so a runaway
+    /// arena trips it alongside the per-call cap.
     /// Returns `ArenaError::MemoryBudgetExceeded` when either gate fires.
     pub fn build(
         reader: &mut dyn FormatReader,
@@ -122,11 +122,11 @@ impl Arena {
             }
             // Single-arena overflow against the pipeline-wide ceiling.
             // The arena's own projected footprint is the right gate
-            // here — whole-process RSS (the arbitrator's `should_abort`)
-            // includes the criterion harness, input buffers, and
-            // allocator slack, which would false-trip a benchmark whose
-            // arena fits but whose process footprint does not. Cross-
-            // arena attribution comes from registered consumers.
+            // here — whole-process RSS (the reading the hard-limit check's
+            // process-memory arm refuses on) includes the criterion harness,
+            // input buffers, and allocator slack, which would false-trip a
+            // benchmark whose arena fits but whose process footprint does
+            // not. Cross-arena attribution comes from registered consumers.
             let hard_limit = budget.hard_limit() as usize;
             if hard_limit > 0 && local_bytes_used > hard_limit {
                 return Err(ArenaError::MemoryBudgetExceeded {
@@ -313,10 +313,11 @@ where
         let minimal = MinimalRecord::new(projected);
         local_bytes_used += estimated_size(&minimal);
         // Gate on this arena's own projected footprint against the
-        // pipeline ceiling. Whole-process RSS (`should_abort`) is the
-        // wrong signal here — it folds in unrelated resident memory and
-        // would false-trip a node-rooted arena that fits. Cross-arena
-        // attribution comes from registered consumers.
+        // pipeline ceiling. Whole-process RSS (the reading the hard-limit
+        // check's process-memory arm refuses on) is the wrong signal here —
+        // it folds in unrelated resident memory and would false-trip a
+        // node-rooted arena that fits. Cross-arena attribution comes from
+        // registered consumers.
         if hard_limit > 0 && local_bytes_used > hard_limit {
             return Err(ArenaError::MemoryBudgetExceeded {
                 used: local_bytes_used,

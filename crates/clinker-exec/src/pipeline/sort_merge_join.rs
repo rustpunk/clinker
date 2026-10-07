@@ -2728,8 +2728,8 @@ mod tests {
     /// body-less synthetic path, so a test can observe the build's identity and
     /// pin tie ordering) and an optional co-resident consumer pinned to a fixed
     /// byte count and registered with the arbitrator, so the global memory
-    /// backstop can be driven through the host-independent byte-counted arm of
-    /// `should_abort` rather than the test process's real RSS.
+    /// backstop can be driven through the host-independent charged arm of
+    /// `check_hard_limit` rather than the test process's real RSS.
     fn run_kernel_result_pinned<R>(
         rk: RunKernel<'_, R>,
         output_schema: Option<&SharedStorage<Schema>>,
@@ -2763,7 +2763,8 @@ mod tests {
             ),
         };
         // A co-resident consumer pinned to a fixed byte count, registered so its
-        // usage sums into `should_abort`'s byte-counted arm. The arbitrator keeps
+        // bytes count in the charged total `check_hard_limit` compares with the
+        // limit before it reads the process. The arbitrator keeps
         // the `Arc` alive in its consumer list for the run's duration.
         if let Some(bytes) = pinned_consumer_bytes {
             let pinned = crate::pipeline::memory::ConsumerHandle::new();
@@ -4041,7 +4042,7 @@ mod tests {
     /// polls the arbitrator's global hard-limit gate every `MEMORY_CHECK_INTERVAL`
     /// emitted rows so such a breach surfaces as a clean typed
     /// `MemoryBudgetExceeded`, never an OS OOM. A co-resident consumer pinned
-    /// above the hard limit trips the byte-counted arm of `should_abort` — host
+    /// above the hard limit trips the charged arm of `check_hard_limit` — host
     /// independent, with no reliance on the test process's real RSS — while an
     /// otherwise-identical run without it completes, proving the poll neither
     /// spuriously aborts nor misses the breach.
@@ -4076,8 +4077,8 @@ mod tests {
             let rc = extract_range_conjunct(&typed, "drivers", "builds");
             decomposed_pure_range(rc, Arc::clone(&typed))
         };
-        // A hard limit far above any plausible test-process RSS, so `should_abort`
-        // can only trip through the byte-counted consumer sum, never real RSS.
+        // A hard limit far above any plausible test-process RSS, so the hard-limit
+        // check can only refuse on the charged total, never on real RSS.
         let hard = 8u64 * 1024 * 1024 * 1024;
         let run = |pinned: Option<u64>| {
             run_kernel_result_pinned(
@@ -4110,8 +4111,8 @@ mod tests {
             "the unpressured walk emits one row per driver"
         );
 
-        // Pin a consumer above the hard limit: the byte-counted arm of
-        // `should_abort` trips at the first poll and the walk aborts cleanly.
+        // Pin a consumer above the hard limit: the charged arm of
+        // `check_hard_limit` refuses at its first run and the walk aborts cleanly.
         let err = run(Some(hard + 64 * 1024))
             .expect_err("a co-resident consumer over the hard limit must abort the walk");
         match err {

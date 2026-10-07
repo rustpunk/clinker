@@ -187,11 +187,12 @@ fn relaxed_aggregate_seeds_a_deferred_region_with_downstream_members() {
 ///
 /// Sibling to [`memory_budget_overflow_on_deferred_buffer_raises_e310`],
 /// which drives the per-arena logical charge with a tight byte budget.
-/// This one drives the RSS-based `should_abort` gate instead: it seeds
-/// the pipeline-scoped arbitrator's `peak_rss` above the hard limit and
-/// runs the combine-in-deferred-region topology through the executor's
-/// arbitrator-injection seam. The Combine's build phase polls
-/// `should_abort` and surfaces an E310 for the Combine's join build side,
+/// This one drives the process-memory arm of the hard-limit check
+/// (`MemoryArbitrator::check_hard_limit`) instead: it seeds the
+/// pipeline-scoped arbitrator's `peak_rss` above the hard limit and runs
+/// the combine-in-deferred-region topology through the executor's
+/// arbitrator-injection seam. The Combine's build phase runs that check
+/// and surfaces an E310 for the Combine's join build side,
 /// whose request is how far the observed peak RSS stands past the hard
 /// limit.
 ///
@@ -325,8 +326,8 @@ nodes:
     };
 
     // 100 GiB hard limit so the seeded peak RSS stays dominant; seed
-    // just above the hard limit so `should_abort` trips on the first
-    // poll inside the Combine build.
+    // just above the hard limit so the hard-limit check's process-memory
+    // arm refuses at its first run inside the Combine build.
     const HARD_LIMIT: u64 = 100 * 1024 * 1024 * 1024;
     let arbitrator = std::sync::Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
         HARD_LIMIT,

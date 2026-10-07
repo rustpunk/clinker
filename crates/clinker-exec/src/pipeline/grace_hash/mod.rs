@@ -536,8 +536,8 @@ impl GraceHashExecutor {
     fn spill_largest_building(&mut self, budget: &MemoryArbitrator) -> Result<(), GraceSpillError> {
         // Iterate until RSS drops below soft limit OR no Building
         // partition is left to evict. The soft limit is checked through
-        // `should_spill` rather than `should_abort`: we want to catch
-        // overshoots before they breach the hard limit.
+        // `should_spill`, so the build spills before the hard-limit check
+        // (`MemoryArbitrator::check_hard_limit`) would refuse it.
         loop {
             // Scan once to find the largest Building partition.
             let mut victim: Option<(usize, usize)> = None;

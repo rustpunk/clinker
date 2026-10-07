@@ -118,8 +118,9 @@ fn compile_key(
 }
 
 /// Budget calibrated to fire `should_spill` continuously (so the
-/// largest-Building eviction loop takes effect) without firing
-/// `should_abort` (which would short-circuit the build phase).
+/// largest-Building eviction loop takes effect) without the hard-limit
+/// check (`MemoryArbitrator::check_hard_limit`) refusing, which would
+/// short-circuit the build phase.
 /// `limit` is 10 GiB so RSS-vs-hard-limit always falls inside;
 /// `spill_threshold_pct` is set so soft limit = 1 KiB, well below
 /// any host's resident set.
@@ -325,7 +326,7 @@ fn spill_activates_on_charged_bytes_without_rss() {
     );
 
     // Pre-charge the handle above the soft limit but below the 1 GiB hard
-    // limit (so `should_spill` trips while `should_abort` does not). One
+    // limit (so `should_spill` trips while the hard-limit check does not). One
     // real build record then carries enough Building bytes for
     // `spill_largest_building` to have a victim.
     consumer_handle.set_bytes(soft + 1);
@@ -827,7 +828,7 @@ fn execute_grace_hash_spill_then_reload_correct() {
     let source_file: Arc<str> = Arc::from("test.csv");
     let ctx = EvalContext::test_with_file(&stable, &source_file, 0);
 
-    // Big hard limit so should_abort never fires; tiny spill
+    // Big hard limit so the hard-limit check never refuses; tiny spill
     // threshold so should_spill fires immediately (process RSS
     // far exceeds 1 KiB on any host). This decouples spill
     // activation from build abort.
@@ -900,8 +901,8 @@ fn execute_grace_hash_spill_then_reload_correct() {
 /// Disk-quota gate: a build phase that spills more than the
 /// configured `max_spill_bytes` aborts with the dedicated
 /// `SpillCapExceeded` (E320) surface instead of continuing to fill
-/// the disk. The hard memory limit is large (so `should_abort`
-/// never fires); only the disk quota can cause this combine to
+/// the disk. The hard memory limit is large (so the hard-limit check
+/// never refuses); only the disk quota can cause this combine to
 /// fail, and the cap error must NOT masquerade as an out-of-memory
 /// E310.
 #[test]
@@ -1026,7 +1027,7 @@ fn execute_grace_hash_aborts_on_disk_quota_overflow() {
     let source_file: Arc<str> = Arc::from("test.csv");
     let ctx = EvalContext::test_with_file(&stable, &source_file, 0);
 
-    // Memory hard limit huge so should_abort never fires; spill
+    // Memory hard limit huge so the hard-limit check never refuses; spill
     // threshold tiny so spills happen; disk quota tight so the
     // first partition flush trips it.
     let budget = MemoryArbitrator::with_policy(
@@ -1126,8 +1127,8 @@ fn build_eviction_spill_commit_trips_disk_cap_mid_stream() {
     );
 
     // Tiny soft limit so `should_spill` fires continuously; 1-byte cap so
-    // the first eviction commit overshoots; hard limit huge so
-    // `should_abort` never fires.
+    // the first eviction commit overshoots; hard limit huge so the
+    // hard-limit check never refuses.
     let budget = tiny_budget();
     budget.set_max_spill_bytes(1).unwrap();
 
@@ -2002,7 +2003,7 @@ fn test_bnl_bounded_memory() {
         .collect();
     let sp = spill_for_bnl(&h, &builds, &probes, 0, 2);
 
-    // Budget with hard_limit huge (so should_abort never fires) and
+    // Budget with hard_limit huge (so the hard-limit check never refuses) and
     // soft_limit just below PROBE_BUFFER_RESERVATION (so the chunk
     // formula's saturating_sub bottoms out at zero and the `max(1)`
     // floor kicks in). spill_threshold_pct expresses soft as a
@@ -2055,7 +2056,7 @@ fn test_bnl_bounded_memory() {
     // Now drive the same input with a soft-limit large enough for
     // one chunk and confirm the formula resolves to the expected
     // (soft - reservation) / 2 value. hard_limit stays at u64::MAX
-    // so should_abort cannot fire on RSS.
+    // so the hard-limit check cannot refuse on RSS.
     let big_soft = (PROBE_BUFFER_RESERVATION as u64) * 8;
     let big_budget = MemoryArbitrator::with_policy(
         u64::MAX,
@@ -2122,10 +2123,10 @@ fn test_bnl_bounded_memory() {
     );
 }
 
-/// Hard-gate 4: BNL emits results in 10 K-record batches and polls
-/// `should_abort` between them. Verified by producing enough output
-/// to cross multiple batch boundaries and asserting on
-/// `stats.batches_emitted`.
+/// Hard-gate 4: BNL emits results in 10 K-record batches and runs the
+/// hard-limit check (`MemoryArbitrator::check_hard_limit`) between them.
+/// Verified by producing enough output to cross multiple batch boundaries
+/// and asserting on `stats.batches_emitted`.
 ///
 /// Strategy: a single hot key K shared by 200 build rows and 60
 /// probe rows yields 200 × 60 = 12 000 join records per chunk, so
@@ -2427,13 +2428,13 @@ fn a_deep_partition_of_many_keys_does_not_report_one_key() {
 
 /// Hard-gate 5: hard-limit abort surfaces E310 for the combine's join
 /// build side with the partition's approximate distinct-key count. The
-/// host RSS trivially exceeds a 1-byte limit, so `should_abort` returns
-/// true on the very first poll inside BNL.
+/// host RSS trivially exceeds a 1-byte limit, so the hard-limit check
+/// refuses at its very first run inside BNL.
 #[test]
 fn test_e310_hard_limit_abort() {
     if crate::pipeline::memory::rss_bytes().is_none() {
-        // RSS measurement unavailable; should_abort() returns
-        // false on this platform and the test cannot fire.
+        // RSS measurement unavailable; the hard-limit check's process-memory
+        // arm cannot refuse on this platform and the test cannot fire.
         return;
     }
     let h = build_bnl_harness();
@@ -2458,7 +2459,7 @@ fn test_e310_hard_limit_abort() {
         .collect();
     let sp = spill_for_bnl(&h, &builds, &probes, 7, 2);
 
-    // 1-byte hard limit → should_abort fires immediately.
+    // 1-byte hard limit → the hard-limit check refuses immediately.
     let budget = MemoryArbitrator::with_policy(1, 1.0, 0.70, Box::new(NoOpPolicy));
     let mut output: Vec<(Record, RecordOrder)> = Vec::new();
     let mut stats = BnlStats::default();

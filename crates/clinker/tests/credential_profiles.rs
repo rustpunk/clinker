@@ -769,8 +769,8 @@ fn bounds_memory_overshoot_is_rejected_before_provider_allocation() {
     );
 }
 
-/// One registry over a single `release` profile whose provider's lease
-/// declares `lease_bytes`, under a run limit of `limit` bytes.
+/// A provider for a single `release` profile whose lease size each test sets
+/// through `declared_lease_bytes`.
 fn overshoot_fixture() -> FixtureProvider {
     provider(
         vec![CredentialCapability::AuthenticateRequest],

@@ -20,8 +20,10 @@
 //! the same arbitrator instance, spills when it asks (a reclaim pass on the
 //! walk, a spill request, or the `should_spill` soft-threshold poll), and is
 //! refused only by it: a shortfall from a reservation or a handle's growth,
-//! or the one hard-limit backstop, `check_hard_limit`, which reclaims on the
-//! walk before it refuses. The trait surface (`MemoryConsumer`,
+//! the one hard-limit backstop, `check_hard_limit`, which reclaims on the
+//! walk before it refuses, or the local checks that refuse one piece larger
+//! than the whole limit (the IEJoin's loaded block pair among them; the
+//! engine's memory-arbitration page lists them). The trait surface (`MemoryConsumer`,
 //! `ArbitrationPolicy`) lets policies pick a victim across operators
 //! instead of reacting independently. Production paths install a policy
 //! chosen by the pipeline-level `memory.backpressure` knob:
@@ -945,7 +947,9 @@ pub trait MemoryConsumer: Send + Sync {
     /// holder counts its rows' own charge and leaves out text a Source read
     /// and is charged for, even when the spill would drop that text's last
     /// copy, so its figure can understate what the spill frees (open
-    /// question 92). Read every arbitration round; must be cheap.
+    /// question 92). It can overstate it too: text a clone shares with
+    /// another holder is counted in full, though spilling one holder frees
+    /// none of it. Read every arbitration round; must be cheap.
     fn reclaimable_bytes(&self) -> u64 {
         self.current_usage()
     }

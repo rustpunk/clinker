@@ -4584,9 +4584,9 @@ mod tests {
         // allocation, so the trigger is host-independent: it does not rely on the
         // process RSS the other arm reads.
 
-        // 1 GiB hard limit sits above any host's test RSS, so the RSS arm of
-        // should_abort cannot trip; the registered pinned consumer alone pushes
-        // sum_consumer_usage past the ceiling.
+        // 1 GiB hard limit sits above any host's test RSS, so the process-memory
+        // arm of `check_hard_limit` cannot trip; the registered pinned consumer
+        // alone pushes the charged total past the ceiling.
         let hard = 1u64 << 30;
         let budget = arbitrator(hard);
         let pinned = crate::pipeline::memory::ConsumerHandle::new();
