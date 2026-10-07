@@ -2030,6 +2030,11 @@ pub(crate) struct ExecutorContext<'a> {
     /// How each streaming consumer stopped, recorded only for an in-process
     /// test that asks for it; production records nothing.
     pub(crate) hop_ends: crate::executor::stream_hop::HopEndLog,
+    /// The end of each streaming Sink's hop, keyed by the Sink's producer,
+    /// held until that producer's top-level turn returns `Ok`; the walk loop
+    /// then sends End. Ends left here when the walk stops are released before
+    /// the writer threads are joined.
+    pub(crate) streaming_sink_ends: HashMap<NodeIndex, crate::executor::stream_hop::SinkHopEnd>,
     /// Per-streaming-producer-slot arbitrator registration. One
     /// `NodeBufferConsumer` is registered per logical streaming slot at
     /// executor entry (keyed by the producer's `NodeIndex`); its shared
@@ -2395,6 +2400,34 @@ impl<'a> ExecutorContext<'a> {
             self.batch_size,
             self.allocation_resources.clone(),
         ))
+    }
+
+    /// Take the streaming hop installed for the producer at `node_idx`, with
+    /// the charge handle its batches cross, if the compiled plan certified
+    /// one and the producer runs at the top level. Its spill classification
+    /// is the slot's [`node_buffer_spill_allowed`].
+    ///
+    /// A sender with no streaming charge consumer registered for it is
+    /// [`PipelineError::Internal`] naming `node_name`: both are installed
+    /// together, so the pair cannot be split outside an engine defect.
+    pub(crate) fn take_streaming_hop(
+        &mut self,
+        current_dag: &ExecutionPlanDag,
+        node_idx: NodeIndex,
+        node_name: &str,
+    ) -> Result<
+        Option<(
+            crate::executor::stream_hop::HopSender,
+            crate::executor::batch_handoff::StreamingChargeHandle,
+        )>,
+        PipelineError,
+    > {
+        let sender = self.take_streaming_sender(node_idx);
+        let charge = sender.as_ref().and_then(|_| {
+            let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
+            self.streaming_charge_handle(node_idx, node_name, spill_allowed)
+        });
+        pair_streaming_hop(sender, charge, node_name)
     }
 
     /// Resolve the streaming-handoff batch size for the Transform named
@@ -2819,6 +2852,27 @@ pub(crate) fn estimate_node_buffer_unaccounted_bytes(
 /// re-readable cursors over immutable memory/spill backing, and producer-port
 /// identity remains part of [`NodeBufferKey`], so neither multiple outgoing
 /// edges nor port-scoped edges require a memory-only clone.
+/// Pair a producer's streaming sender with its slot's charge handle. No
+/// sender is no hop; a sender without a charge is an invariant violation
+/// naming `node_name`, reported rather than unwrapped.
+pub(crate) fn pair_streaming_hop<C>(
+    sender: Option<crate::executor::stream_hop::HopSender>,
+    charge: Option<C>,
+    node_name: &str,
+) -> Result<Option<(crate::executor::stream_hop::HopSender, C)>, PipelineError> {
+    match (sender, charge) {
+        (None, _) => Ok(None),
+        (Some(sender), Some(charge)) => Ok(Some((sender, charge))),
+        (Some(_), None) => Err(PipelineError::Internal {
+            op: "executor",
+            node: node_name.to_string(),
+            detail: "the step holds its streaming hop's sender but no streaming charge \
+                     consumer is registered for it"
+                .to_string(),
+        }),
+    }
+}
+
 pub(crate) fn node_buffer_spill_allowed(
     _current_dag: &ExecutionPlanDag,
     _slot_key: NodeIndex,
@@ -4649,153 +4703,177 @@ pub(crate) fn merge_fused_interleave(
         ctx.activate_source_for_drain(&state.source_name_string);
     }
     let n = receivers.len();
-    loop {
-        // Honor cooperative shutdown at the chunk boundary before blocking on
-        // the next `select()`. Without this poll a long fused
-        // Merge.interleave -> streaming-Output stream ignores a tripped token
-        // and runs to natural EOF, blowing the shutdown-latency bound that the
-        // non-fused operator loops already respect.
-        ctx.check_shutdown()?;
-        let start = {
-            let s = if n == 0 { 0 } else { cursor % n };
-            cursor = cursor.wrapping_add(1);
-            s
-        };
-        let mut sel = crossbeam_channel::Select::new();
-        // Map each registered select operation index back to its
-        // predecessor index.
-        let mut op_to_pred: Vec<usize> = Vec::with_capacity(n);
-        for offset in 0..n {
-            let i = (start + offset) % n;
-            if let Some(rx) = receivers[i].as_ref() {
-                sel.recv(rx);
-                op_to_pred.push(i);
-            }
-        }
-        if op_to_pred.is_empty() {
-            // Every source closed.
-            break;
-        }
-        // Publish the staged tail before blocking. This loop has no
-        // record-count boundary of its own, so without this a fused
-        // interleave over several sources would report a frozen count for
-        // its whole run and jump only as each source closed — the stalled
-        // reading this counter exists to rule out.
-        let oper = match sel.try_select() {
-            Ok(ready) => ready,
-            Err(_) => {
-                publish_record_progress(ctx);
-                sel.select()
-            }
-        };
-        let op_index = oper.index();
-        let i = op_to_pred[op_index];
-        // Complete the chosen operation on its receiver. `Err(RecvError)`
-        // means that source's channel disconnected (all senders dropped);
-        // `ok()` hands it to `consume_source_event` as `None`, a failure.
-        let item: Option<crate::executor::source_stream::SourceStreamEvent> = oper
-            .recv(
-                receivers[i]
-                    .as_ref()
-                    .expect("select op_index maps to an active receiver"),
-            )
-            .ok();
-        // A document-boundary punctuation off a Source channel is collected
-        // for the close-time reconcile rather than forwarded inline; only
-        // records flow into the per-record pipeline below.
-        let consumed = consume_source_event(ctx, &states[i].source_name_arc, item)?;
-        let item: Option<(Record, crate::executor::stream_event::SourceRowId)> = match consumed {
-            ConsumedSourceEvent::Record(record, row_id) => Some((record, row_id)),
-            ConsumedSourceEvent::Rejected => {
-                per_source_counts[i] += 1;
-                continue;
-            }
-            ConsumedSourceEvent::Punctuation(p) => {
-                // A structural-count close condemns its whole file; mark it
-                // failed before the reconcile so the Output arm's per-file
-                // buffer rejects every already-streamed record of the file.
-                crate::executor::document_dlq::mark_structural_reject_if_present(
-                    ctx,
-                    &p,
-                    &states[i].source_name_arc,
-                )?;
-                collected_puncts.push(p);
-                continue;
-            }
-            ConsumedSourceEvent::Population => continue,
-            ConsumedSourceEvent::Ended => None,
-        };
-        match item {
-            Some((record, rn)) => {
-                let state = &states[i];
-                let mut rec = match state.source_schema.as_ref() {
-                    Some(target) => {
-                        canonicalize_to_source_schema(&record, target, &state.engine_stamped)
-                    }
-                    None => record,
-                };
-                if has_record_seed {
-                    rec.seed_record_vars(ctx.record_var_seed);
+    let loop_result: Result<(), PipelineError> = (|| {
+        loop {
+            // Honor cooperative shutdown at the chunk boundary before blocking on
+            // the next `select()`. Without this poll a long fused
+            // Merge.interleave -> streaming-Output stream ignores a tripped token
+            // and runs to natural EOF, blowing the shutdown-latency bound that the
+            // non-fused operator loops already respect.
+            ctx.check_shutdown()?;
+            let start = {
+                let s = if n == 0 { 0 } else { cursor % n };
+                cursor = cursor.wrapping_add(1);
+                s
+            };
+            let mut sel = crossbeam_channel::Select::new();
+            // Map each registered select operation index back to its
+            // predecessor index.
+            let mut op_to_pred: Vec<usize> = Vec::with_capacity(n);
+            for offset in 0..n {
+                let i = (start + offset) % n;
+                if let Some(rx) = receivers[i].as_ref() {
+                    sel.recv(rx);
+                    op_to_pred.push(i);
                 }
-                seed_source_vars_for_record(ctx, &state.source_name_string, &rec)?;
-                per_source_counts[i] += 1;
-                // Re-canonicalize onto the Merge's output schema so
-                // downstream operators hit `Arc::ptr_eq` regardless of which
-                // Source produced the record. The rebuild carries the
-                // record's document context across, so a downstream
-                // per-document operator still buckets each row by the
-                // document its Source opened — otherwise the rebuilt row
-                // would carry the synthetic sentinel id and every document's
-                // `DocumentClose` would flush an empty bucket.
-                if let Some(merge_schema) = merge_schema_arc.as_ref() {
-                    check_input_schema(
-                        merge_schema,
-                        rec.schema(),
-                        merge_name,
-                        "merge",
-                        &state.source_name_string,
+            }
+            if op_to_pred.is_empty() {
+                // Every source closed.
+                break;
+            }
+            // Publish the staged tail before blocking. This loop has no
+            // record-count boundary of its own, so without this a fused
+            // interleave over several sources would report a frozen count for
+            // its whole run and jump only as each source closed — the stalled
+            // reading this counter exists to rule out.
+            let oper = match sel.try_select() {
+                Ok(ready) => ready,
+                Err(_) => {
+                    publish_record_progress(ctx);
+                    sel.select()
+                }
+            };
+            let op_index = oper.index();
+            let i = op_to_pred[op_index];
+            // Complete the chosen operation on its receiver. `Err(RecvError)`
+            // means that source's channel disconnected (all senders dropped);
+            // `ok()` hands it to `consume_source_event` as `None`, a failure.
+            let item: Option<crate::executor::source_stream::SourceStreamEvent> = oper
+                .recv(
+                    receivers[i]
+                        .as_ref()
+                        .expect("select op_index maps to an active receiver"),
+                )
+                .ok();
+            // A document-boundary punctuation off a Source channel is collected
+            // for the close-time reconcile rather than forwarded inline; only
+            // records flow into the per-record pipeline below.
+            let consumed = consume_source_event(ctx, &states[i].source_name_arc, item)?;
+            let item: Option<(Record, crate::executor::stream_event::SourceRowId)> = match consumed
+            {
+                ConsumedSourceEvent::Record(record, row_id) => Some((record, row_id)),
+                ConsumedSourceEvent::Rejected => {
+                    per_source_counts[i] += 1;
+                    continue;
+                }
+                ConsumedSourceEvent::Punctuation(p) => {
+                    // A structural-count close condemns its whole file; mark it
+                    // failed before the reconcile so the Output arm's per-file
+                    // buffer rejects every already-streamed record of the file.
+                    crate::executor::document_dlq::mark_structural_reject_if_present(
+                        ctx,
+                        &p,
+                        &states[i].source_name_arc,
                     )?;
-                    let doc_ctx = rec.doc_ctx().clone();
-                    let values = rec.values().to_vec();
-                    rec = Record::new(merge_schema.clone(), values);
-                    rec.set_doc_ctx(doc_ctx);
+                    collected_puncts.push(p);
+                    continue;
                 }
-                match stream_batch.as_mut() {
-                    // Streaming: accumulate into the current batch and flush
-                    // it through the charge handle once it fills. The
-                    // charge handle's bounded `send` is the back-pressure
-                    // pivot — a slow writer stalls the Merge thread here,
-                    // stopping its `select()` calls and letting the Source
-                    // channels fill.
-                    Some(batch) => {
-                        batch.push_record(rec, rn);
-                        if batch.len() >= batch_size {
-                            let full = std::mem::replace(
-                                batch,
-                                crate::executor::batch_handoff::EventBatch::with_capacity(
-                                    batch_size,
-                                ),
-                            );
-                            flush_stream_batch(full)?;
+                ConsumedSourceEvent::Population => continue,
+                ConsumedSourceEvent::Ended => None,
+            };
+            match item {
+                Some((record, rn)) => {
+                    let state = &states[i];
+                    let mut rec = match state.source_schema.as_ref() {
+                        Some(target) => {
+                            canonicalize_to_source_schema(&record, target, &state.engine_stamped)
                         }
+                        None => record,
+                    };
+                    if has_record_seed {
+                        rec.seed_record_vars(ctx.record_var_seed);
                     }
-                    None => merged.push((rec, rn)),
+                    seed_source_vars_for_record(ctx, &state.source_name_string, &rec)?;
+                    per_source_counts[i] += 1;
+                    // Re-canonicalize onto the Merge's output schema so
+                    // downstream operators hit `Arc::ptr_eq` regardless of which
+                    // Source produced the record. The rebuild carries the
+                    // record's document context across, so a downstream
+                    // per-document operator still buckets each row by the
+                    // document its Source opened — otherwise the rebuilt row
+                    // would carry the synthetic sentinel id and every document's
+                    // `DocumentClose` would flush an empty bucket.
+                    if let Some(merge_schema) = merge_schema_arc.as_ref() {
+                        check_input_schema(
+                            merge_schema,
+                            rec.schema(),
+                            merge_name,
+                            "merge",
+                            &state.source_name_string,
+                        )?;
+                        let doc_ctx = rec.doc_ctx().clone();
+                        let values = rec.values().to_vec();
+                        rec = Record::new(merge_schema.clone(), values);
+                        rec.set_doc_ctx(doc_ctx);
+                    }
+                    match stream_batch.as_mut() {
+                        // Streaming: accumulate into the current batch and flush
+                        // it through the charge handle once it fills. The
+                        // charge handle's bounded `send` is the back-pressure
+                        // pivot — a slow writer stalls the Merge thread here,
+                        // stopping its `select()` calls and letting the Source
+                        // channels fill.
+                        Some(batch) => {
+                            batch.push_record(rec, rn);
+                            if batch.len() >= batch_size {
+                                let full = std::mem::replace(
+                                    batch,
+                                    crate::executor::batch_handoff::EventBatch::with_capacity(
+                                        batch_size,
+                                    ),
+                                );
+                                flush_stream_batch(full)?;
+                            }
+                        }
+                        None => merged.push((rec, rn)),
+                    }
                 }
-            }
-            None => {
-                // Source ended. Stamp finalized per-source count, drop
-                // the receiver slot so subsequent iterations skip it, and
-                // release the source's arbitrator registration — its
-                // channel is drained, so the Source's per-attempt queued
-                // charge must leave the ledger total `sum_consumer_usage`
-                // reads.
-                let count = per_source_counts[i];
-                let name_arc = Arc::clone(&states[i].source_name_arc);
-                receivers[i] = None;
-                ctx.finalize_source_count(&name_arc, count);
-                ctx.release_source_consumer(&states[i].source_name_string);
+                None => {
+                    // Source ended. Stamp finalized per-source count, drop
+                    // the receiver slot so subsequent iterations skip it, and
+                    // release the source's arbitrator registration — its
+                    // channel is drained, so the Source's per-attempt queued
+                    // charge must leave the ledger total `sum_consumer_usage`
+                    // reads.
+                    let count = per_source_counts[i];
+                    let name_arc = Arc::clone(&states[i].source_name_arc);
+                    receivers[i] = None;
+                    ctx.finalize_source_count(&name_arc, count);
+                    ctx.release_source_consumer(&states[i].source_name_string);
+                }
             }
         }
+        Ok(())
+    })();
+    // A producer delivers every row it took before it reports its failure,
+    // so the step it streams into meets the rows in data order and fails on
+    // the earliest row it cannot take. On a loop error the pending batch is
+    // flushed first. The loop's error is earlier in data order than any row
+    // that batch carries, so it is the error returned even when the flush
+    // fails too.
+    if let Err(loop_error) = loop_result {
+        if let Some(batch) = stream_batch.take()
+            && !batch.is_empty()
+            && let Err(flush_error) = flush_stream_batch(batch)
+        {
+            tracing::warn!(
+                node = merge_name,
+                error = %flush_error,
+                "the Merge could not hand the rows it took before its failure to the step \
+                 it streams into; the run reports the Merge's failure"
+            );
+        }
+        return Err(loop_error);
     }
 
     // Flush the trailing partial record batch (streaming mode only) before
@@ -4963,16 +5041,12 @@ pub(crate) fn transform_fused_consume(
     // a blocking operator), each batch drains into the stage's full output
     // accumulator and `admit_node_buffer` charges it as one slot, the
     // existing materialized path.
-    let streaming_sender = ctx.streaming_output_senders.remove(&node_idx);
-    let streaming = streaming_sender.is_some();
-    // The per-batch charge handle for the streaming slot. Built before the
-    // batcher closure that moves it; `None` in materialized mode where the
-    // batch drains into the stage accumulator and `admit_node_buffer`
-    // charges the full slot instead.
-    let charge = streaming_sender.as_ref().and_then(|_| {
-        let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
-        ctx.streaming_charge_handle(node_idx, name, spill_allowed)
-    });
+    // The sender comes with the per-batch charge handle for the streaming
+    // slot; `None` in materialized mode, where the batch drains into the
+    // stage accumulator and `admit_node_buffer` charges the full slot
+    // instead.
+    let streaming_hop = ctx.take_streaming_hop(current_dag, node_idx, name)?;
+    let streaming = streaming_hop.is_some();
 
     let (mut evaluator_opt, directives, log_conditions): FusedTransformParts<'_> =
         match transform_payload {
@@ -5054,14 +5128,13 @@ pub(crate) fn transform_fused_consume(
     // batch) or, in materialized mode, splits the batch into the
     // records-only accumulator (the input to the window/region helpers)
     // and the punctuation list. A send error or accumulation error
-    // bubbles out through `loop_result`. The closure owns
-    // `streaming_sender` by value so the bounded channel's sender drops
-    // when the batcher drops — clean exit then disconnects the writer
-    // thread's `recv` loop and triggers its flush.
+    // bubbles out through `loop_result`. The consumer finishes only on the
+    // hop's End, which the hop's driver sends once this arm returns `Ok`;
+    // when the sender drops does not matter to it.
     let mut event_batcher = crate::executor::batch_handoff::EventBatcher::new(
         batch_size,
         |batch: crate::executor::batch_handoff::EventBatch| -> Result<(), PipelineError> {
-            if let Some(tx) = streaming_sender.as_ref() {
+            if let Some((tx, charge)) = streaming_hop.as_ref() {
                 // Route the flushed batch through the slot's charge handle:
                 // it `add_bytes` the batch footprint to the arbitrator
                 // wrapper, optionally spills the batch on a soft-threshold
@@ -5071,9 +5144,6 @@ pub(crate) fn transform_fused_consume(
                 // channel fill. A send error means the writer dropped its
                 // receiver, so the streaming chain is broken; surface it
                 // rather than silently dropping the record.
-                let charge = charge
-                    .as_ref()
-                    .expect("streaming sender implies a registered charge handle");
                 return charge.charge_and_route(
                     batch,
                     |event: crate::executor::stream_event::StreamEvent| {

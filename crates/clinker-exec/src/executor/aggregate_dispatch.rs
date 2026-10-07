@@ -510,12 +510,8 @@ fn finalize_aggregate_emit(
         // deferred-region producer, so the helper calls below are
         // correctly skipped. Dropping the sender disconnects the
         // writer's recv loop.
-        if let Some(sender) = ctx.take_streaming_sender(node_idx) {
+        if let Some((sender, charge)) = ctx.take_streaming_hop(current_dag, node_idx, name)? {
             let batch_size = ctx.batch_size;
-            let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
-            let charge = ctx
-                .streaming_charge_handle(node_idx, name, spill_allowed)
-                .expect("streaming sender implies a registered charge consumer");
             stream_linear_producer_emit(
                 &sender,
                 batch_size,
@@ -1848,7 +1844,7 @@ fn run_streaming_aggregate_ingest(
                     &allocation_resources,
                 );
             }
-            hop_ends.record(name, &result, finalized);
+            hop_ends.record(name, result.as_ref().ok().copied(), finalized);
             result
         });
 

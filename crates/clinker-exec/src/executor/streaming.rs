@@ -228,6 +228,11 @@ pub(crate) struct StreamingOutputTaskOutput {
     /// arms never created. Owned for the same reason the rest of
     /// [`StreamingSinkSpec`] is: the thread outlives the borrow.
     pub(crate) out_cfg: SinkConfig,
+    /// How the Sink's input ended: `Some(Ended)` when it read its producer's
+    /// End and closed its output, `Some(UpstreamIncomplete)` when its
+    /// channel closed without End and it closed nothing (its staged output
+    /// is abandoned), `None` when a fatal record stopped it first.
+    pub(crate) input_end: Option<super::stream_hop::HopVerdict>,
 }
 
 impl StreamingOutputTaskOutput {
@@ -266,6 +271,11 @@ impl StreamingOutputTaskOutput {
             ctx.collector.record(sm);
         }
         ctx.merge_mapping_probe(&self.output_name, &self.out_cfg, &self.mapping_probe);
+        ctx.hop_ends.record(
+            &self.output_name,
+            self.input_end,
+            self.input_end == Some(super::stream_hop::HopVerdict::Ended),
+        );
     }
 }
 
@@ -285,9 +295,10 @@ pub(super) trait StreamingConsumer {
     /// Handle one body record (already discharged from the shared charge
     /// handle by the skeleton). Return [`ControlFlow::Continue`] to keep
     /// draining or [`ControlFlow::Break`] on a fatal consumer error; on
-    /// `Break` the skeleton drains the rest of the channel (so the bounded
-    /// producer `send` never deadlocks), zeroes the charge, and returns
-    /// without calling [`StreamingConsumer::on_close`].
+    /// `Break` the skeleton drains the rest of the channel (so neither the
+    /// bounded producer `send` nor the hop's End can deadlock), discharges
+    /// what it discards, and returns without calling
+    /// [`StreamingConsumer::on_close`].
     fn on_record(
         &mut self,
         record: Record,
@@ -300,15 +311,15 @@ pub(super) trait StreamingConsumer {
     /// symmetric.
     fn on_punctuation(&mut self, punct: Punctuation);
 
-    /// Finalize at channel disconnect (every sender dropped). Called
-    /// exactly once on the clean-drain path, never after an `on_record`
-    /// `Break`.
+    /// Finish on the producer's End: the events before it are the
+    /// producer's whole output. Called at most once, and never when the
+    /// channel closed without End or after an `on_record` `Break`.
     fn on_close(&mut self);
 }
 
-/// Drain a streaming consumer's bounded channel to disconnect, applying
-/// the per-record memory discharge and deadlock-safe fatal handling that
-/// every streaming consumer shares.
+/// Drain a streaming consumer's bounded channel until its producer's End or
+/// until the channel closes, applying the per-record memory discharge and
+/// deadlock-safe fatal handling that every streaming consumer shares.
 ///
 /// Streaming, not blocking: back-pressure flows consumer → producer →
 /// Source through the bounded channel, and the per-batch admit/discharge
@@ -320,19 +331,25 @@ pub(super) trait StreamingConsumer {
 /// drained stream nets the counter back to zero. On an `on_record`
 /// `Break`, the skeleton drains the rest of the channel (so the producer's
 /// bounded `send` never blocks forever on a dead consumer) and discharges each
-/// discarded row without finalizing the consumer. On clean disconnect it
-/// finalizes the consumer. Both paths preserve any unrelated reservation on
-/// the shared counter; exact discharge is never replaced by a reset.
+/// discarded row without finalizing the consumer, and returns `None`. On
+/// the producer's End it finishes the consumer and returns
+/// [`HopVerdict::Ended`]; on a channel that closes without End (the producer
+/// failed or was stopped) it returns [`HopVerdict::UpstreamIncomplete`] and
+/// finishes nothing. Every path preserves any unrelated reservation on the
+/// shared counter; exact discharge is never replaced by a reset.
+///
+/// [`HopVerdict::Ended`]: super::stream_hop::HopVerdict::Ended
+/// [`HopVerdict::UpstreamIncomplete`]: super::stream_hop::HopVerdict::UpstreamIncomplete
 pub(super) fn drain_streaming_channel<C: StreamingConsumer>(
     rx: &super::stream_hop::HopReceiver,
     charge_handle: &Arc<crate::pipeline::memory::ConsumerHandle>,
     consumer: &mut C,
     resources: &clinker_record::owned_storage::AllocationResources,
-) {
-    loop {
-        let event = match rx.recv() {
-            Ok(super::stream_hop::HopMessage::Event(event)) => event,
-            Ok(super::stream_hop::HopMessage::End) | Err(_) => break,
+) -> Option<super::stream_hop::HopVerdict> {
+    let verdict = loop {
+        let event = match super::stream_hop::next_event(rx) {
+            ControlFlow::Continue(event) => event,
+            ControlFlow::Break(verdict) => break verdict,
         };
         let (record, rn) = match event {
             StreamEvent::Record(r, rn) => (r, rn),
@@ -362,14 +379,18 @@ pub(super) fn drain_streaming_channel<C: StreamingConsumer>(
             // channel. The consumer is not finalized: a fatal `on_record`
             // already abandoned its work.
             super::stream_hop::discard_until_closed(rx, charge_handle, resources);
-            return;
+            return None;
         }
-    }
+    };
 
-    // Channel closed — every sender dropped (`recv` returned `Err`), so no
-    // more records will arrive. Let the consumer finalize (flush a writer,
-    // emit a final group), without changing unrelated reservations.
-    consumer.on_close();
+    // Only the producer's End means its whole output has arrived: let the
+    // consumer finish (flush a writer, emit a final group) without changing
+    // unrelated reservations. A channel closed without End carries a prefix
+    // of the output, and the consumer finishes nothing on it.
+    if verdict == super::stream_hop::HopVerdict::Ended {
+        consumer.on_close();
+    }
+    Some(verdict)
 }
 
 /// The `Output` instantiation of [`StreamingConsumer`]: projects each
@@ -383,10 +404,6 @@ struct SinkStreamConsumer {
     truncation_ledger: super::truncation_report::TruncationLedger,
     spec: StreamingSinkSpec,
     out: StreamingOutputTaskOutput,
-    /// Set only when channel disconnect reached the writer-finalization hook.
-    /// A fatal record error drains the channel without closing the writer work
-    /// unit, so its Sink observation must omit the completed metric.
-    closed_cleanly: bool,
     /// Pending `SchemaScan` timer, finished on the first writer build (or
     /// on close for the empty-stream case).
     scan_timer_slot: Option<stage_metrics::StageTimer>,
@@ -425,11 +442,11 @@ impl SinkStreamConsumer {
                 errors: Vec::new(),
                 stage_metrics: Vec::new(),
                 dlq_pending: Vec::new(),
+                input_end: None,
                 mapping_probe,
                 output_name,
                 out_cfg,
             },
-            closed_cleanly: false,
             scan_timer_slot: Some(stage_metrics::StageTimer::new(
                 stage_metrics::StageName::SchemaScan,
             )),
@@ -628,7 +645,6 @@ impl StreamingConsumer for SinkStreamConsumer {
                 self.out.errors.push(PipelineError::from(e));
             }
         }
-        self.closed_cleanly = true;
     }
 }
 
@@ -673,9 +689,14 @@ pub(super) fn streaming_sink(
         writer_resources,
         truncation_ledger.clone(),
     );
-    drain_streaming_channel(&rx, &charge_handle, &mut consumer, &allocation_resources);
-    // The writer is finished (flushed on close, or abandoned on a fatal
-    // record); dropping it now settles its truncations before they are read.
+    let input_end =
+        drain_streaming_channel(&rx, &charge_handle, &mut consumer, &allocation_resources);
+    let closed = input_end == Some(super::stream_hop::HopVerdict::Ended);
+    consumer.out.input_end = input_end;
+    // The writer is finished: flushed on the producer's End, or abandoned
+    // unflushed when the input closed without End or a record was fatal, so
+    // an abandoned output never gets its closing framing. Dropping it now
+    // settles its truncations before they are read.
     drop(consumer.writer.take());
     let errors = consumer
         .out
@@ -706,7 +727,8 @@ pub(super) fn streaming_sink(
             || shutdown_token
                 .as_ref()
                 .is_some_and(crate::pipeline::shutdown::ShutdownToken::is_requested);
-        if has_failure || (!consumer.closed_cleanly && !interrupted) {
+        // A Sink that did not close its output never reports completion.
+        if has_failure || (!closed && !interrupted) {
             signal.fail();
         } else if interrupted {
             signal.interrupt();
@@ -889,6 +911,8 @@ mod tests {
                 tx.send_event(StreamEvent::record(record, i as u64))
                     .unwrap();
             }
+            // The producer finished: its End follows its events.
+            tx.send(HopMessage::End).unwrap();
             drop(tx);
             let mut consumer = Observe {
                 charge: charge.clone(),
@@ -930,6 +954,8 @@ mod tests {
             tx.send_event(StreamEvent::record(rec(rn as i64), rn))
                 .unwrap();
         }
+        // The producer finished: its End follows its events.
+        tx.send(HopMessage::End).unwrap();
         drop(tx);
 
         let mut consumer = Recorder::new(None);
@@ -1035,14 +1061,15 @@ mod tests {
     }
 
     #[test]
-    fn disconnect_fires_close_once_then_zeroes_charge() {
+    fn an_ended_empty_stream_closes_once_then_zeroes_charge() {
         let (tx, rx) = crossbeam_channel::unbounded::<HopMessage>();
         let charge = ConsumerHandle::new();
-        // Empty stream: no records charged, immediate disconnect.
+        // Empty stream: no records charged, the producer's End at once.
+        tx.send(HopMessage::End).unwrap();
         drop(tx);
 
         let mut consumer = Recorder::new(None);
-        drain_streaming_channel(
+        let input_end = drain_streaming_channel(
             &rx,
             &charge,
             &mut consumer,
@@ -1056,7 +1083,47 @@ mod tests {
         assert!(consumer.records.is_empty(), "no records on an empty stream");
         assert_eq!(
             consumer.closes, 1,
-            "on_close fires exactly once on disconnect"
+            "on_close fires exactly once on the producer's End"
+        );
+        assert_eq!(
+            input_end,
+            Some(crate::executor::stream_hop::HopVerdict::Ended)
+        );
+        assert_eq!(charge.bytes(), 0);
+    }
+
+    /// A channel whose senders all drop without the producer's End carries
+    /// a prefix of the producer's output: the consumer sees every row it was
+    /// sent and is never finished.
+    #[test]
+    fn a_stream_closed_without_its_end_never_closes_and_zeroes_charge() {
+        let (tx, rx) = crossbeam_channel::unbounded::<HopMessage>();
+        let charge = ConsumerHandle::new();
+        let n = 3u64;
+        charge.add_bytes(record_byte_cost(1) * n);
+        for rn in 0..n {
+            tx.send_event(StreamEvent::record(rec(rn as i64), rn))
+                .unwrap();
+        }
+        drop(tx);
+
+        let mut consumer = Recorder::new(None);
+        let input_end = drain_streaming_channel(
+            &rx,
+            &charge,
+            &mut consumer,
+            clinker_format::preparation::MemoryOnlyResources::new(
+                std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+            )
+            .resources()
+            .allocation(),
+        );
+
+        assert_eq!(consumer.records, vec![0, 1, 2], "every row sent is seen");
+        assert_eq!(consumer.closes, 0, "an incomplete input is never finished");
+        assert_eq!(
+            input_end,
+            Some(crate::executor::stream_hop::HopVerdict::UpstreamIncomplete)
         );
         assert_eq!(charge.bytes(), 0);
     }

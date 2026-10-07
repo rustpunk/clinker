@@ -193,22 +193,18 @@ impl HopEndLog {
         }
     }
 
-    /// Record that the consumer `node` stopped with `outcome`, having
-    /// `finished` its work (finalized, completed or closed) or not.
-    pub(crate) fn record(
-        &self,
-        node: &str,
-        outcome: &Result<HopVerdict, PipelineError>,
-        finished: bool,
-    ) {
+    /// Record that the consumer `node` stopped with its input ended as
+    /// `input` (`None` when it failed first), having `finished` its work
+    /// (finalized, completed or closed) or not.
+    pub(crate) fn record(&self, node: &str, input: Option<HopVerdict>, finished: bool) {
         #[cfg(any(test, feature = "test-utils"))]
         if let Some(record) = &self.record {
-            let input = match outcome {
-                Ok(HopVerdict::Ended) => crate::executor::StreamingInputEnd::Ended,
-                Ok(HopVerdict::UpstreamIncomplete) => {
+            let input = match input {
+                Some(HopVerdict::Ended) => crate::executor::StreamingInputEnd::Ended,
+                Some(HopVerdict::UpstreamIncomplete) => {
                     crate::executor::StreamingInputEnd::Incomplete
                 }
-                Err(_) => crate::executor::StreamingInputEnd::ConsumerFailed,
+                None => crate::executor::StreamingInputEnd::ConsumerFailed,
             };
             record.record(crate::executor::StreamingEnd {
                 node: node.to_string(),
@@ -218,9 +214,43 @@ impl HopEndLog {
         }
         #[cfg(not(any(test, feature = "test-utils")))]
         {
-            let _ = (node, outcome, finished);
+            let _ = (node, input, finished);
         }
     }
+}
+
+/// The end of a streaming Sink's hop, held by the walk until the Sink's
+/// producer finishes its top-level turn.
+pub(crate) struct SinkHopEnd {
+    /// The Sink the hop feeds.
+    pub(crate) sink: String,
+    pub(crate) end: HopEnd,
+}
+
+/// Let go of every streaming Sink hop end the walk still holds once it has
+/// stopped, before the Sinks' threads are joined: each Sink then sees its
+/// channel close without End and finishes nothing.
+///
+/// A walk that completed has ended every Sink's hop as each producer's turn
+/// returned, so one still held there names a Sink no producer finished:
+/// [`PipelineError::Internal`] naming that Sink. After a failed or
+/// interrupted walk, the ends held are expected and dropped silently.
+pub(crate) fn release_sink_hop_ends(
+    ends: std::collections::HashMap<petgraph::graph::NodeIndex, SinkHopEnd>,
+    walk_completed: bool,
+) -> Result<(), PipelineError> {
+    let mut sinks: Vec<String> = ends.into_values().map(|held| held.sink).collect();
+    if !walk_completed || sinks.is_empty() {
+        return Ok(());
+    }
+    sinks.sort_unstable();
+    Err(PipelineError::Internal {
+        op: "streaming-hop",
+        node: sinks[0].clone(),
+        detail: "the walk completed without ending this streaming Sink's input; no producer \
+                 turn finished it"
+            .to_string(),
+    })
 }
 
 /// The receiving end of a streaming hop a consumer drains on its own thread,
@@ -357,6 +387,76 @@ mod tests {
         assert!(matches!(
             next_event(&rx),
             ControlFlow::Break(HopVerdict::UpstreamIncomplete)
+        ));
+    }
+
+    /// A completed walk that still holds a Sink's hop end reports the Sink
+    /// no producer finished; a failed or interrupted walk lets every held
+    /// end go silently. Either way each held end is dropped unsent, so its
+    /// Sink sees its input close without End.
+    #[test]
+    fn a_completed_walk_holding_a_sink_hop_end_is_an_engine_defect() {
+        let held = |sink: &str| {
+            let (tx, rx) = crossbeam_channel::unbounded::<HopMessage>();
+            let end = SinkHopEnd {
+                sink: sink.to_string(),
+                end: HopEnd::new(tx),
+            };
+            (end, rx)
+        };
+        let (b, b_rx) = held("b_out");
+        let (a, a_rx) = held("a_out");
+        let ends = std::collections::HashMap::from([
+            (petgraph::graph::NodeIndex::new(1), b),
+            (petgraph::graph::NodeIndex::new(2), a),
+        ]);
+        let result = release_sink_hop_ends(ends, true);
+        assert!(
+            matches!(
+                &result,
+                Err(PipelineError::Internal { op: "streaming-hop", node, .. }) if node == "a_out"
+            ),
+            "the first Sink by name is reported: {result:?}"
+        );
+        for rx in [&a_rx, &b_rx] {
+            assert!(matches!(
+                next_event(rx),
+                ControlFlow::Break(HopVerdict::UpstreamIncomplete)
+            ));
+        }
+
+        let (c, c_rx) = held("c_out");
+        let ends = std::collections::HashMap::from([(petgraph::graph::NodeIndex::new(3), c)]);
+        assert!(release_sink_hop_ends(ends, false).is_ok());
+        assert!(matches!(
+            next_event(&c_rx),
+            ControlFlow::Break(HopVerdict::UpstreamIncomplete)
+        ));
+        assert!(release_sink_hop_ends(std::collections::HashMap::new(), true).is_ok());
+    }
+
+    /// A producer's streaming sender pairs with its slot's charge; a sender
+    /// without one is an invariant violation naming the producer, reported
+    /// instead of panicking, and no sender is no hop.
+    #[test]
+    fn a_streaming_sender_without_its_charge_is_an_internal_error_naming_the_step() {
+        let (tx, _rx) = crossbeam_channel::unbounded::<HopMessage>();
+        let result = crate::executor::dispatch::pair_streaming_hop(Some(tx), None::<()>, "routed");
+        assert!(
+            matches!(
+                &result,
+                Err(PipelineError::Internal { node, .. }) if node == "routed"
+            ),
+            "{result:?}"
+        );
+        let (tx, _rx) = crossbeam_channel::unbounded::<HopMessage>();
+        assert!(matches!(
+            crate::executor::dispatch::pair_streaming_hop(Some(tx), Some(()), "routed"),
+            Ok(Some((_, ())))
+        ));
+        assert!(matches!(
+            crate::executor::dispatch::pair_streaming_hop(None, None::<()>, "routed"),
+            Ok(None)
         ));
     }
 }

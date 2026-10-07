@@ -114,21 +114,9 @@ fn take_certified_sink_hop(
     node_idx: NodeIndex,
     name: &str,
 ) -> Result<Option<CertifiedSinkHop>, PipelineError> {
-    let Some(sender) = ctx.take_streaming_sender(node_idx) else {
-        return Ok(None);
-    };
-    let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
-    let charge = ctx
-        .streaming_charge_handle(node_idx, name, spill_allowed)
-        .ok_or_else(|| PipelineError::Internal {
-            op: "executor",
-            node: name.to_string(),
-            detail: format!(
-                "transform {name:?} holds its Sink's streaming sender but no streaming \
-                 charge consumer is registered for it"
-            ),
-        })?;
-    Ok(Some(CertifiedSinkHop { sender, charge }))
+    Ok(ctx
+        .take_streaming_hop(current_dag, node_idx, name)?
+        .map(|(sender, charge)| CertifiedSinkHop { sender, charge }))
 }
 
 /// Execute the `Transform` arm for `node_idx`: drive per-record CXL

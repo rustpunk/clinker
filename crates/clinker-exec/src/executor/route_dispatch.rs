@@ -296,12 +296,8 @@ where
     // streaming Route → terminal Output crosses no deferred
     // region, so the cross-region tee below is correctly skipped.
     // Dropping the sender disconnects the writer's recv.
-    if let Some(sender) = ctx.take_streaming_sender(node_idx) {
+    if let Some((sender, charge)) = ctx.take_streaming_hop(current_dag, node_idx, name)? {
         let batch_size = ctx.batch_size;
-        let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
-        let charge = ctx
-            .streaming_charge_handle(node_idx, name, spill_allowed)
-            .expect("streaming sender implies a registered charge consumer");
         let merged: Vec<(Record, crate::executor::stream_event::SourceRowId)> =
             branch_records.into_values().flatten().collect();
         stream_linear_producer_emit(&sender, batch_size, name, merged, input_puncts, &charge)?;

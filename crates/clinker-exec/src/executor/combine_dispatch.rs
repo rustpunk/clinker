@@ -48,6 +48,73 @@ const COLLECT_PER_GROUP_CAP: usize = 10_000;
 #[cfg(test)]
 mod output_ownership_tests {
     use clinker_record::owned_storage::SharedStorage;
+
+    /// An output drain that fails reading a later row first hands the step
+    /// it streams into every row it produced before the failure, then
+    /// reports the failure; the rows still in its pending batch are not
+    /// dropped.
+    #[test]
+    fn an_output_drain_delivers_its_pending_rows_before_a_read_failure() {
+        use crate::executor::stream_event::StreamEvent;
+        use crate::executor::stream_hop::HopMessage;
+        use clinker_plan::error::PipelineError;
+        use clinker_record::{Record, Schema, Value};
+        let schema = SharedStorage::from_arc(std::sync::Arc::new(Schema::new(vec!["v".into()])));
+        let row = |v: i64| Record::new(schema.clone(), vec![Value::Integer(v)]);
+        let resources = clinker_format::preparation::MemoryOnlyResources::new(
+            std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+        );
+        let charge = crate::executor::batch_handoff::StreamingChargeHandle::new(
+            crate::pipeline::memory::ConsumerHandle::new(),
+            std::sync::Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
+                1024 * 1024,
+                0.8,
+                0.7,
+                Box::new(crate::pipeline::memory::NoOpPolicy),
+            )),
+            std::sync::Arc::from(std::path::Path::new(".")),
+            "joined".into(),
+            false,
+            clinker_plan::config::CompressMode::Off,
+            8,
+            resources.resources().allocation().clone(),
+        );
+        let (tx, rx) = crossbeam_channel::unbounded::<HopMessage>();
+        let rows = super::OutputDrainRows::Scripted(
+            vec![
+                Ok((row(1), 1u64.into())),
+                Ok((row(2), 2u64.into())),
+                Err(PipelineError::Internal {
+                    op: "test",
+                    node: "joined".into(),
+                    detail: "spill run read failed".into(),
+                }),
+            ]
+            .into_iter(),
+        );
+        let result =
+            super::stream_block_band_rows(&tx, 8, "joined", rows, Vec::new(), &charge, None);
+        drop(tx);
+        assert!(
+            matches!(&result, Err(PipelineError::Internal { detail, .. }) if detail == "spill run read failed"),
+            "the drain reports its read failure: {result:?}"
+        );
+        let delivered: Vec<i64> = rx
+            .iter()
+            .map(|message| match message {
+                HopMessage::Event(StreamEvent::Record(record, _)) => match record.values()[0] {
+                    Value::Integer(v) => v,
+                    ref other => panic!("unexpected value {other:?}"),
+                },
+                other => panic!("unexpected message {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            delivered,
+            vec![1, 2],
+            "the rows before the failure are delivered in order"
+        );
+    }
     #[test]
     fn output_drain_excludes_only_local_grants_and_retains_vector_capacity() {
         use clinker_format::preparation::MemoryOnlyResources;
@@ -1365,12 +1432,8 @@ where
         // harmlessly. The per-fold snapshot is dropped here; the
         // hash-table consumer is released by the shared unregister
         // funnel every exit from this arm passes through.
-        if let Some(sender) = ctx.take_streaming_sender(node_idx) {
+        if let Some((sender, charge)) = ctx.take_streaming_hop(current_dag, node_idx, name)? {
             let batch_size = ctx.batch_size;
-            let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
-            let charge = ctx
-                .streaming_charge_handle(node_idx, name, spill_allowed)
-                .expect("streaming sender implies a registered charge consumer");
             stream_linear_producer_emit(
                 &sender,
                 batch_size,
@@ -1563,21 +1626,28 @@ fn run_streaming_combine_probe(
 
     // Run the probe recv loop and the driver producer concurrently. The
     // scoped thread owns the channel drain + probe; the main thread
-    // redispatches the driver (which streams into the channel and drops its
-    // sender at clean exit, disconnecting the channel). Both the driver's
-    // `?` error and the probe thread's error surface; the probe thread
-    // always drains to disconnect first so a driver `send` can never
-    // deadlock on a dead consumer.
+    // redispatches the driver, which streams into the channel, and then
+    // ends the hop if the driver returned `Ok`. The probe completes only on
+    // that End: a channel that closes without it means the driver failed or
+    // was stopped, and the probe completes nothing. Both results are
+    // settled together by `settle_hop`; the probe thread drains to
+    // disconnect on every error exit so neither a driver `send` nor the End
+    // can block on a dead consumer.
+    let hop_ends = ctx.hop_ends.clone();
     let probe_result: Result<(), PipelineError> = std::thread::scope(|scope| {
-        let handle = scope.spawn(|| -> Result<(), PipelineError> {
-            let mut probe = || -> Result<(), PipelineError> {
+        let handle = scope.spawn(|| {
+            // The thread owns the receiver, so a panic on it drops the
+            // receiver and a driver's next `send` fails instead of blocking.
+            let rx = rx;
+            let mut completed = false;
+            let mut probe = || -> Result<crate::executor::stream_hop::HopVerdict, PipelineError> {
                 let mut probe_keys_buf: Vec<Value> =
                     Vec::with_capacity(kernel.probe_extractor.len());
                 let mut budget_cadence: usize = 0;
-                loop {
-                    let event = match rx.recv() {
-                        Ok(crate::executor::stream_hop::HopMessage::Event(event)) => event,
-                        Ok(crate::executor::stream_hop::HopMessage::End) | Err(_) => break,
+                let verdict = loop {
+                    let event = match crate::executor::stream_hop::next_event(&rx) {
+                        std::ops::ControlFlow::Continue(event) => event,
+                        std::ops::ControlFlow::Break(verdict) => break verdict,
                     };
                     let (record, rn) = match event {
                         StreamEvent::Record(r, rn) => (r, rn),
@@ -1713,16 +1783,21 @@ fn run_streaming_combine_probe(
                     if budget_cadence >= 10_000 {
                         budget_cadence = 0;
                     }
-                }
-                Ok(())
+                };
+                // Only the driver's End completes the probe: a closed channel
+                // is a prefix of the driver's output, which joins nothing.
+                completed = verdict == crate::executor::stream_hop::HopVerdict::Ended;
+                Ok(verdict)
             };
             // A governed allocation this worker was refused ends the probe
             // here, on the thread that recorded the refusal's report.
-            crate::pipeline::memory::ledger::convert_governed_refusal(
+            let result = crate::pipeline::memory::ledger::convert_governed_refusal(
                 probe(),
                 name,
                 clinker_plan::runtime_error::MemorySurface::JoinState,
-            )
+            );
+            hop_ends.record(name, result.as_ref().ok().copied(), completed);
+            result
         });
 
         // Redispatch the driver producer on the main thread. Clear its
@@ -1730,22 +1805,31 @@ fn run_streaming_combine_probe(
         // short-circuit (which made the producer's own topo turn a no-op)
         // does not fire again here — this is the one turn the producer must
         // actually run. It takes the sender we installed and streams into
-        // the channel, dropping it at clean exit.
+        // the channel.
         ctx.streaming_combine_probe_edges.remove(&producer_idx);
         let producer_result =
             crate::executor::dispatch::dispatch_plan_node(ctx, current_dag, producer_idx);
-        // Belt-and-suspenders: ensure the channel disconnects even if a
-        // producer error left a sender lingering on `ctx`, so the probe
-        // thread's `recv` returns `Err` and the join below cannot hang.
+        // Belt-and-suspenders: a producer error may leave its sender on
+        // `ctx`; remove it so only the hop's end still holds the channel.
         ctx.streaming_output_senders.remove(&producer_idx);
-        drop(hop_end);
+        // The driver's whole output is on the channel only when it returned
+        // `Ok`. Otherwise the end is dropped unsent, and the channel closes
+        // without End once the last sender is gone, so the join below cannot
+        // wait on a channel that stays open.
+        if producer_result.is_ok() {
+            hop_end.end();
+        } else {
+            drop(hop_end);
+        }
 
-        let probe = handle.join().map_err(|_| PipelineError::Internal {
-            op: "combine",
-            node: name.to_string(),
-            detail: "streaming combine probe thread panicked".to_string(),
-        })?;
-        producer_result.and(probe)
+        let probe = handle.join().unwrap_or_else(|_| {
+            Err(PipelineError::Internal {
+                op: "combine",
+                node: name.to_string(),
+                detail: "streaming combine probe thread panicked".to_string(),
+            })
+        });
+        crate::executor::stream_hop::settle_hop(name, &upstream_name, probe, producer_result)
     });
 
     // Charge bookkeeping is complete: the driver charged each batch and the
@@ -2496,11 +2580,11 @@ fn drain_block_band_output(
     // cross-region tee — those consume the whole slice) AND a sender is
     // present: taking it without draining would strand the writer thread on
     // records that never arrive.
-    if !needs_materialization && let Some(sender) = ctx.take_streaming_sender(node_idx) {
+    if !needs_materialization
+        && let Some((sender, charge)) =
+            ctx.take_streaming_hop(current_dag, node_idx, combine_name)?
+    {
         let batch_size = ctx.batch_size;
-        let charge = ctx
-            .streaming_charge_handle(node_idx, combine_name, spill_allowed)
-            .expect("streaming sender implies a registered charge consumer");
         // Both output shapes drain the identical `(order, driver_idx,
         // build_idx)` sort, so the streamed rows arrive in the same order the
         // buffered path admits — the determinism the cross-limit tests pin
@@ -2687,7 +2771,25 @@ fn stream_block_band_rows(
     };
     let mut count: u64 = 0;
     while let Some(item) = rows.rows.next() {
-        let (record, rn) = item?;
+        let (record, rn) = match item {
+            Ok(row) => row,
+            Err(read_error) => {
+                // A producer delivers every row it emitted before it reports
+                // its failure, so the step it streams into meets the rows in
+                // order and fails on the earliest one it cannot take. The
+                // read failure is later in the output than any pending row,
+                // so it is the error returned even when the delivery fails.
+                if let Err(delivery_error) = route(batch) {
+                    tracing::warn!(
+                        node = node_name,
+                        error = %delivery_error,
+                        "the Combine could not hand the rows it produced before its failure \
+                         to the step it streams into; the run reports the Combine's failure"
+                    );
+                }
+                return Err(read_error);
+            }
+        };
         rows.retained.transfer_row(
             &mut batch.pending,
             rows.rows.retained_heap_bytes(charge.allocation_resources()) as u64,
@@ -2791,6 +2893,10 @@ enum OutputDrainRows {
         allocation_resources: clinker_record::owned_storage::AllocationResources,
     },
     Spilled(crate::pipeline::spill_merge::SortedRunMerger<(RecordOrder, u64, u64)>),
+    /// Rows and failures in a fixed order, for a test of the drain's failure
+    /// path; it holds no charged storage.
+    #[cfg(test)]
+    Scripted(std::vec::IntoIter<Result<(Record, RecordOrder), PipelineError>>),
 }
 impl OutputDrainRows {
     fn memory(
@@ -2820,6 +2926,8 @@ impl OutputDrainRows {
                 ..
             } => *backing_bytes + *record_heap_bytes,
             Self::Spilled(merger) => merger.retained_unaccounted_heap_bytes(resources),
+            #[cfg(test)]
+            Self::Scripted(_) => 0,
         }
     }
 }
@@ -2837,6 +2945,8 @@ impl Iterator for OutputDrainRows {
                 Ok(pair)
             }),
             Self::Spilled(merger) => merger.next(),
+            #[cfg(test)]
+            Self::Scripted(rows) => return rows.next(),
         }
         .map(|item| item.map(|(record, (order, _, _))| (record, order)))
     }

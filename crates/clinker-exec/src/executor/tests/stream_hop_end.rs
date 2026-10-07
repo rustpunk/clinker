@@ -12,11 +12,13 @@
 //! A step fed over a streaming hop finishes its work only on its producer's
 //! end, which the producer's driver sends once the producer has finished
 //! without failing. A streaming Aggregate whose producer failed or was
-//! stopped finalizes no group over the rows it was given. Because each step
-//! meets its rows in data order, the run reports the first failure in that
-//! order: a step's failure on an earlier row stands over its producer's
-//! later failure, and over a later cancellation, and the later failure is
-//! logged on the walk's thread.
+//! stopped finalizes no group over the rows it was given, a streaming
+//! Combine completes no probe, and a streaming Sink leaves its output
+//! unclosed and records a failure or an interruption, never a completion.
+//! Because each step meets its rows in data order, the run reports the first
+//! failure in that order: a step's failure on an earlier row stands over its
+//! producer's later failure, and over a later cancellation, and the later
+//! failure is logged on the walk's thread.
 //!
 //! The writers are raw in-memory buffers, so anything a step finished is
 //! visible here even though a production run would leave it staged and
@@ -1065,16 +1067,45 @@ nodes:
     path: rows_out.json
 "#;
 
-/// Each of the Sink lifecycle outcomes `receiver` holds, as
-/// `(completed, failed, interrupted)`.
-fn sink_outcomes(receiver: &crate::telemetry::TelemetryReceiver) -> (u64, u64, u64) {
-    let (mut completed, mut failed, mut interrupted) = (0, 0, 0);
+/// The rows the Sinks `receiver` reports on wrote, and how many of them
+/// ended with each lifecycle outcome, as
+/// `(records, (completed, failed, interrupted))`.
+fn sink_signals(receiver: &crate::telemetry::TelemetryReceiver) -> (u64, (u64, u64, u64)) {
+    let (mut records, mut completed, mut failed, mut interrupted) = (0, 0, 0, 0);
     while let Some(batch) = receiver.try_recv_batch() {
+        records += batch.metric(crate::telemetry::MetricKey::SinkRecords);
         completed += batch.metric(crate::telemetry::MetricKey::SinkCompleted);
         failed += batch.metric(crate::telemetry::MetricKey::SinkFailed);
         interrupted += batch.metric(crate::telemetry::MetricKey::SinkInterrupted);
     }
-    (completed, failed, interrupted)
+    (records, (completed, failed, interrupted))
+}
+
+/// Run [`FUSED_CHAIN_INTO_JSON`] over `reader` with the run's telemetry kept,
+/// asserting the Sink's JSON document was not closed, and return the run
+/// with the Sink's signals.
+fn run_unclosed_json(
+    case: &str,
+    reader: ScriptedRows,
+    token: Option<&crate::pipeline::shutdown::ShutdownToken>,
+) -> (ScriptedRun, (u64, (u64, u64, u64))) {
+    let (producer, receiver) = telemetry_arena();
+    let scripted = run_scripted_with(
+        FUSED_CHAIN_INTO_JSON,
+        reader,
+        Vec::new(),
+        &["rows_out"],
+        token,
+        Some(producer),
+    );
+    let written = &scripted.run.outputs["rows_out"];
+    assert!(
+        !written.trim_end().ends_with(']'),
+        "{case}: the document is not closed: ...{:?}",
+        &written[written.len().saturating_sub(40)..]
+    );
+    let signals = sink_signals(&receiver);
+    (scripted, signals)
 }
 
 /// A streaming Sink whose producer fails or is stopped never closes its
@@ -1083,56 +1114,47 @@ fn sink_outcomes(receiver: &crate::telemetry::TelemetryReceiver) -> (u64, u64, u
 /// cancelled, never a completion.
 #[test]
 fn a_streaming_sink_never_closes_its_output_without_its_producers_end() {
+    let case = "the reader fails";
+    let (scripted, (records, outcomes)) =
+        run_unclosed_json(case, ScriptedRows::new(6000).fail_after(3000), None);
+    assert_eq!(
+        records, 3000,
+        "{case}: the Sink wrote every row its producer handed it before failing"
+    );
+    assert_eq!(
+        outcomes,
+        (0, 1, 0),
+        "{case}: (completed, failed, interrupted)"
+    );
+    assert_eq!(
+        only_end(&scripted.ends, "rows_out"),
+        crate::executor::StreamingEnd {
+            node: "rows_out".to_string(),
+            input: crate::executor::StreamingInputEnd::Incomplete,
+            finished: false,
+        },
+        "{case}: the Sink's input closed without its producer's end"
+    );
+
+    // Once the run is cancelled the Sink's writer may also refuse to start,
+    // depending on whether the cancellation came before the Sink's first row:
+    // either way the Sink does not close its output.
+    let case = "the reader cancels the run";
     let token = crate::pipeline::shutdown::ShutdownToken::detached();
-    let cases = [
-        (
-            "the reader fails",
-            ScriptedRows::new(6000).fail_after(3000),
-            None,
-            (0, 1, 0),
-        ),
-        (
-            "the reader cancels the run",
-            ScriptedRows::new(6000).cancel_at(3000, &token),
-            Some(&token),
-            (0, 0, 1),
-        ),
-    ];
-    for (case, reader, token, outcomes) in cases {
-        let (producer, receiver) = telemetry_arena();
-        let scripted = run_scripted_with(
-            FUSED_CHAIN_INTO_JSON,
-            reader,
-            Vec::new(),
-            &["rows_out"],
-            token,
-            Some(producer),
-        );
-        let written = &scripted.run.outputs["rows_out"];
-        assert!(
-            written.starts_with('['),
-            "{case}: the Sink wrote rows before its producer stopped: {written:?}"
-        );
-        assert!(
-            !written.trim_end().ends_with(']'),
-            "{case}: the document is not closed: ...{:?}",
-            &written[written.len().saturating_sub(40)..]
-        );
-        assert_eq!(
-            sink_outcomes(&receiver),
-            outcomes,
-            "{case}: (completed, failed, interrupted)"
-        );
-        assert_eq!(
-            only_end(&scripted.ends, "rows_out"),
-            crate::executor::StreamingEnd {
-                node: "rows_out".to_string(),
-                input: crate::executor::StreamingInputEnd::Incomplete,
-                finished: false,
-            },
-            "{case}"
-        );
-    }
+    let (scripted, (_, outcomes)) = run_unclosed_json(
+        case,
+        ScriptedRows::new(6000).cancel_at(3000, &token),
+        Some(&token),
+    );
+    assert_eq!(
+        outcomes,
+        (0, 0, 1),
+        "{case}: (completed, failed, interrupted)"
+    );
+    assert!(
+        !only_end(&scripted.ends, "rows_out").finished,
+        "{case}: the Sink did not close its output"
+    );
 }
 
 /// A complete run ends its streaming Sink's input once the producer's turn
@@ -1161,7 +1183,7 @@ fn a_completed_walk_ends_every_streaming_sink() {
         6000,
         "every row is written"
     );
-    assert_eq!(sink_outcomes(&receiver), (1, 0, 0));
+    assert_eq!(sink_signals(&receiver), (6000, (1, 0, 0)));
     assert_eq!(
         only_end(&scripted.ends, "rows_out"),
         crate::executor::StreamingEnd {

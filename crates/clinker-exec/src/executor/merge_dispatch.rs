@@ -176,19 +176,18 @@ where
     // inputs) accumulates `merged` then streams it through
     // `stream_linear_producer_emit` below, skipping the
     // materialized `admit_node_buffer` slot.
-    let streaming_sender = ctx.take_streaming_sender(node_idx);
-    let fused_streaming_handoff = fused_mode && streaming_sender.is_some();
-    // The per-batch charge handle for the streaming slot, shared by
-    // both fused and non-fused streaming paths. `None` when this
-    // Merge is materialized (no streaming sender installed).
-    let merge_charge = streaming_sender.as_ref().and_then(|_| {
-        let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
-        ctx.streaming_charge_handle(node_idx, name, spill_allowed)
-    });
+    // The sender comes with the per-batch charge handle for the streaming
+    // slot, shared by both fused and non-fused streaming paths; `None` when
+    // this Merge is materialized (no streaming sender installed).
+    let streaming_hop = ctx.take_streaming_hop(current_dag, node_idx, name)?;
+    let fused_streaming_handoff = fused_mode && streaming_hop.is_some();
     let merge_batch_size = ctx.batch_size;
     // Held only on the non-fused streaming path; the fused path
     // consumes its sender inside `merge_fused_interleave`.
-    let mut nonfused_sender: Option<crate::executor::stream_hop::HopSender> = None;
+    let mut nonfused_hop: Option<(
+        crate::executor::stream_hop::HopSender,
+        crate::executor::batch_handoff::StreamingChargeHandle,
+    )> = None;
     // Shared-input materialization reservations belong to the complete Merge
     // arm, not only the input-conversion block: collected records remain live through
     // boundary reconciliation, window finalization, and output admission.
@@ -197,24 +196,27 @@ where
         records: merged,
         puncts: fused_deduped_puncts,
     } = if fused_mode {
-        let handoff = match (streaming_sender, merge_charge.as_ref()) {
-            (Some(sender), Some(charge)) => Some(MergeStreamHandoff {
-                sender,
+        let handoff = streaming_hop
+            .as_ref()
+            .map(|(sender, charge)| MergeStreamHandoff {
+                sender: sender.clone(),
                 charge,
                 batch_size: merge_batch_size,
-            }),
-            _ => None,
-        };
-        merge_fused_interleave(
+            });
+        let merged = merge_fused_interleave(
             ctx,
             current_dag,
             name,
             &sorted_preds,
             merge_output_schema.as_ref(),
             handoff,
-        )?
+        );
+        // The interleave's handoff held a clone of the sender; release the
+        // arm's own so only the hop's end still holds the channel.
+        drop(streaming_hop);
+        merged?
     } else {
-        nonfused_sender = streaming_sender;
+        nonfused_hop = streaming_hop;
         // Ordered incoming inputs as `(source, producer_port)` — one per incoming
         // edge, keyed by the producer output port the edge draws. A Merge that
         // draws several ports of one producer (Route branches, or a Cull's `main`
@@ -430,17 +432,14 @@ where
     // region, so the helper calls below are correctly skipped.
     // Dropping `nonfused_sender` at the end of this branch
     // disconnects the writer thread's `recv` loop.
-    if let Some(sender) = nonfused_sender {
-        let charge = merge_charge
-            .as_ref()
-            .expect("streaming sender implies a registered charge handle");
+    if let Some((sender, charge)) = nonfused_hop {
         stream_linear_producer_emit(
             &sender,
             merge_batch_size,
             name,
             merged,
             deduped_puncts,
-            charge,
+            &charge,
         )?;
         return Ok(());
     }

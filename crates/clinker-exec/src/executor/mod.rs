@@ -1819,6 +1819,13 @@ impl PipelineExecutor {
             petgraph::graph::NodeIndex,
             crate::executor::stream_hop::HopSender,
         > = HashMap::new();
+        // The walk ends each streaming Sink's hop once its producer's
+        // top-level turn returns `Ok`; until then it holds the hop's end.
+        let mut streaming_sink_ends: HashMap<
+            petgraph::graph::NodeIndex,
+            crate::executor::stream_hop::SinkHopEnd,
+        > = HashMap::new();
+        let hop_ends = stream_hop::HopEndLog::for_run(&params.memory_test);
         let mut streaming_sink_nodes: HashSet<petgraph::graph::NodeIndex> = HashSet::new();
         let mut streaming_output_tasks: Vec<std::thread::JoinHandle<StreamingOutputTaskOutput>> =
             Vec::new();
@@ -1881,6 +1888,7 @@ impl PipelineExecutor {
                 truncation_ledger: truncation_ledger.clone(),
             };
             let writer_node = output_name.clone();
+            let writer_end_name = output_name.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("clinker-output-{output_name}"))
                 .spawn(move || {
@@ -1915,6 +1923,13 @@ impl PipelineExecutor {
                     node: output_name,
                     detail: format!("failed to spawn streaming output thread: {e}"),
                 })?;
+            streaming_sink_ends.insert(
+                producer_idx,
+                crate::executor::stream_hop::SinkHopEnd {
+                    sink: writer_end_name,
+                    end: crate::executor::stream_hop::HopEnd::new(tx.clone()),
+                },
+            );
             streaming_output_senders.insert(producer_idx, tx);
             streaming_sink_nodes.insert(output_idx);
             streaming_output_tasks.push(handle);
@@ -2017,7 +2032,8 @@ impl PipelineExecutor {
                 params.telemetry_producer.clone(),
             ),
             streaming_output_senders,
-            hop_ends: stream_hop::HopEndLog::for_run(&params.memory_test),
+            hop_ends,
+            streaming_sink_ends,
             streaming_sink_nodes,
             streaming_aggregate_ingest_edges,
             streaming_combine_probe_edges,
@@ -2132,6 +2148,13 @@ impl PipelineExecutor {
             for node_idx in dispatch_sequence {
                 ctx.check_shutdown()?;
                 dispatch::dispatch_plan_node(&mut ctx, plan, node_idx)?;
+                // The producer's turn returned `Ok`, so its whole output is
+                // on its streaming Sink's channel: end the Sink's input. A
+                // failed or interrupted turn leaves the end held, and the
+                // Sink finishes nothing.
+                if let Some(held) = ctx.streaming_sink_ends.remove(&node_idx) {
+                    held.end.end();
+                }
             }
             Ok(())
         })();
@@ -2149,15 +2172,19 @@ impl PipelineExecutor {
             walk_result = Err(failure);
         }
 
-        // Streaming-output drain. Drop every remaining sender BEFORE
-        // joining so the writer threads' `rx.recv` returns `Err`
-        // (channel disconnected) and they fall through to their flush
-        // path — joining before dropping would deadlock, the thread
-        // blocked on a `recv` that never disconnects. The fused Merge arm
-        // normally removes its sender at clean exit; remaining entries
-        // here are the error-/interrupt-path leftovers (Merge arm never
-        // ran) or pipelines where no streaming chain was eligible (the
-        // map is empty).
+        // Streaming-output drain. Let go of every Sink hop end the walk
+        // still holds, then of every remaining sender, BEFORE joining: a
+        // writer thread waits on its channel until End or until the channel
+        // closes, so joining first would deadlock. An end still held after a
+        // completed walk names a Sink no producer turn finished, an engine
+        // defect; after a failed or interrupted walk the held ends are the
+        // Sinks whose producers never finished, which close nothing.
+        if let Err(error) = stream_hop::release_sink_hop_ends(
+            std::mem::take(&mut ctx.streaming_sink_ends),
+            walk_result.is_ok(),
+        ) {
+            walk_result = Err(error);
+        }
         ctx.streaming_output_senders.clear();
         for handle in std::mem::take(&mut ctx.streaming_output_tasks) {
             match handle.join() {
