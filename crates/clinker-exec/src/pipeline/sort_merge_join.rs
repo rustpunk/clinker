@@ -963,7 +963,7 @@ fn execute_combine_sort_merge_inner(
     // The pile stays resident until the miss dispatch after the walk. The
     // driver input's charge covers it until Phase A's driver side hands that
     // charge to the kernel, which then charges the pile at this figure.
-    let miss_pile_shells = (driver_unmatched.len() * std::mem::size_of::<MissPileEntry>()) as u64;
+    let miss_pile_shells = miss_pile_slot_bytes(&driver_unmatched);
     let miss_pile_charge = driver_unmatched
         .iter()
         .fold(miss_pile_shells, |sum, (record, _, _)| {
@@ -1207,7 +1207,7 @@ fn execute_combine_sort_merge_inner(
     // their canonical order is realized alongside the walk's matched rows.
     // Each dispatched miss drops its record, so its heap is discharged then;
     // the pile's slots go with its vector once the loop ends.
-    for (driver_record, driver_order, driver_idx) in driver_unmatched {
+    for (driver_record, driver_order, driver_idx) in driver_unmatched.drain(..) {
         dispatch_driver_miss(DispatchMiss {
             ectx: &ectx,
             mspill: &mspill,
@@ -1226,7 +1226,8 @@ fn execute_combine_sort_merge_inner(
         drop(driver_record);
         consumer_handle.sub_bytes(heap);
     }
-    consumer_handle.sub_bytes(miss_pile_shells);
+    consumer_handle.sub_bytes(miss_pile_slot_bytes(&driver_unmatched));
+    drop(driver_unmatched);
 
     // `on_miss: error` cites the globally lowest-RecordOrder miss, independent of
     // the walk order and the memory limit — identical to the pre-streaming flush.
@@ -1325,6 +1326,13 @@ struct SideStreamBuild<'a, P> {
 /// until the miss dispatch after the walk: its record, order and input
 /// index.
 type MissPileEntry = (Record, RecordOrder, u64);
+
+/// The bytes the miss pile's vector allocated for its slots: every slot of
+/// its capacity, in use or not. The pile is charged and discharged at this
+/// one figure, so the two cannot diverge.
+fn miss_pile_slot_bytes(pile: &Vec<MissPileEntry>) -> u64 {
+    (pile.capacity() * std::mem::size_of::<MissPileEntry>()) as u64
+}
 
 /// End a side input's charge where the kernel first charges its rows: the
 /// rows' `bytes` move onto `consumer` and the input's whole charge is
@@ -4494,6 +4502,77 @@ mod tests {
             handle.bytes(),
             0,
             "the refused join returns to its baseline"
+        );
+        assert_eq!(budget.charged_bytes(), 0);
+    }
+
+    /// The null-key pile's slots are charged as the vector holding them
+    /// allocated them: every slot of its capacity, not only the ones in use.
+    /// Five null-key drivers leave the pile's vector with spare capacity, so a
+    /// charge counted by length would fall short of what it holds.
+    #[test]
+    fn the_null_key_pile_is_charged_for_its_capacity() {
+        let drivers_schema = schema_with(&["k"]);
+        let builds_schema = schema_with(&["k"]);
+        let pile_rows = 5u64;
+        let driver_records: Vec<(Record, RecordOrder)> = (0..pile_rows)
+            .map(|i| {
+                (
+                    rec(&drivers_schema, vec![Value::Null]),
+                    RecordOrder::from(i),
+                )
+            })
+            .collect();
+        let resources = test_allocation_resources();
+        let pile_heap: u64 = driver_records
+            .iter()
+            .map(|(record, _)| record.unaccounted_heap_size(&resources) as u64)
+            .sum();
+        // The pile grows one push at a time from empty, as this vector does.
+        let mut grown: Vec<MissPileEntry> = Vec::new();
+        for (record, order) in &driver_records {
+            grown.push((record.clone(), *order, 0));
+        }
+        assert!(
+            grown.capacity() > grown.len(),
+            "test invariant: the pile's vector has spare capacity"
+        );
+        let pile_slots = (grown.capacity() * std::mem::size_of::<MissPileEntry>()) as u64;
+        drop(grown);
+
+        let (budget, handle, charges) =
+            ledger_with_input_charges(1024 * 1024 * 1024, 1024 * 1024, 64 * 1024);
+        let (records, _) = run_kernel_on(
+            RunKernel {
+                driver_records,
+                build_records: Vec::new(),
+                decomposed: drivers_below_builds(),
+                driver_qual: "drivers",
+                build_qual: "builds",
+                driver_schema: &drivers_schema,
+                build_schema: &builds_schema,
+                match_mode: MatchMode::First,
+                on_miss: OnMiss::Skip,
+                presorted: true,
+                body_program: None,
+                budget_bytes: None,
+            },
+            None,
+            &resources,
+            &budget,
+            charges,
+        )
+        .expect("the join completes");
+        assert!(records.is_empty(), "every driver misses and is skipped");
+        assert_eq!(
+            handle.peak_bytes(),
+            pile_slots + pile_heap,
+            "the join holds the pile's every slot and its rows' heap, and nothing else"
+        );
+        assert_eq!(
+            handle.bytes(),
+            0,
+            "every miss dispatched, the pile is discharged"
         );
         assert_eq!(budget.charged_bytes(), 0);
     }

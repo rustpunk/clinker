@@ -495,6 +495,37 @@ impl MemoryConsumer for WriterResourceConsumer {
         false
     }
 }
+/// Register the writer's output staging consumer over `handle`, then make
+/// `handle` the run's writer handle, bound to that consumer. The handle is
+/// attached only once its consumer is registered, and a refused attachment
+/// unregisters the consumer, so a failure at either step leaves neither
+/// behind.
+fn establish_writer_consumer(
+    arbitrator: &MemoryArbitrator,
+    handle: &Arc<ConsumerHandle>,
+) -> Result<ConsumerId, ResourceError> {
+    // A refused registration is a second binding of the writer's handle,
+    // the same authority conflict a second attachment reports.
+    let id = arbitrator
+        .register_consumer(
+            Arc::new(WriterResourceConsumer {
+                handle: handle.clone(),
+            }),
+            handle.clone(),
+            clinker_plan::runtime_error::ConsumerLabel {
+                node: "output".to_string(),
+                surface: clinker_plan::runtime_error::MemorySurface::OutputStaging,
+            },
+        )
+        .map_err(|_| ResourceError::new(ResourceErrorKind::Authority, 1, 0))?;
+    if let Err(error) = arbitrator.attach_writer_handle(handle.clone()) {
+        arbitrator.unregister_consumer(id);
+        return Err(error);
+    }
+    arbitrator.bind_writer_consumer(id)?;
+    Ok(id)
+}
+
 impl ExecutorResources {
     /// Establish one run consumer. The control blocks are fixed run-startup
     /// allowances; storage inventory/path allocations are admitted separately.
@@ -527,22 +558,7 @@ impl ExecutorResources {
         telemetry: Option<TelemetryProducer>,
     ) -> Result<Self, ResourceError> {
         let handle = ConsumerHandle::new();
-        arbitrator.attach_writer_handle(handle.clone())?;
-        // A refused registration is a second binding of the writer's handle,
-        // the same authority conflict a second attachment reports.
-        let id = arbitrator
-            .register_consumer(
-                Arc::new(WriterResourceConsumer {
-                    handle: handle.clone(),
-                }),
-                handle.clone(),
-                clinker_plan::runtime_error::ConsumerLabel {
-                    node: "output".to_string(),
-                    surface: clinker_plan::runtime_error::MemorySurface::OutputStaging,
-                },
-            )
-            .map_err(|_| ResourceError::new(ResourceErrorKind::Authority, 1, 0))?;
-        arbitrator.bind_writer_consumer(id)?;
+        let id = establish_writer_consumer(&arbitrator, &handle)?;
         let release = Arc::new(ReleaseAuthority {
             state: arbitrator.writer_reservation_state(),
             arbitrator: Arc::downgrade(&arbitrator),
@@ -1316,6 +1332,51 @@ impl Drop for SpillStorage {
 mod tests {
     use super::*;
     use crate::pipeline::memory::NoOpPolicy;
+
+    /// A writer registration the ledger refuses leaves no writer handle
+    /// attached, so the run can still establish its writer consumer.
+    #[test]
+    fn a_refused_writer_registration_leaves_no_writer_handle_attached() {
+        let arb = Arc::new(MemoryArbitrator::with_policy(
+            1024 * 1024,
+            0.8,
+            0.7,
+            Box::new(NoOpPolicy),
+        ));
+        // A handle already bound to a consumer cannot be registered again.
+        let bound = ConsumerHandle::new();
+        let first = arb
+            .register_consumer(
+                Arc::new(WriterResourceConsumer {
+                    handle: bound.clone(),
+                }),
+                bound.clone(),
+                clinker_plan::runtime_error::ConsumerLabel {
+                    node: "output".to_string(),
+                    surface: clinker_plan::runtime_error::MemorySurface::OutputStaging,
+                },
+            )
+            .expect("a fresh handle registers");
+        assert!(
+            establish_writer_consumer(&arb, &bound).is_err(),
+            "a second binding of the handle is refused"
+        );
+        assert_eq!(arb.consumer_count(), 1, "the refusal registered nothing");
+        arb.unregister_consumer(first);
+
+        let provider = ExecutorResources::new(
+            arb.clone(),
+            ShutdownToken::detached(),
+            None,
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        );
+        assert!(
+            provider.is_ok(),
+            "the refused registration left no writer handle attached: {:?}",
+            provider.err()
+        );
+    }
 
     #[test]
     fn allocation_lease_drops_live_control_before_final_release() {

@@ -1220,7 +1220,10 @@ pub(crate) fn register_grace_consumer(
 ///
 /// A reclaim pass that another consumer's request starts spills its
 /// building partitions ([`WalkOwnedSpill`]) whenever the kernel is between
-/// two executor operations on it.
+/// two executor operations on it. The one operation that runs a memory check
+/// with the cell borrowed, the partition-table build, first sets the cell's
+/// reclaimable figure to 0, so no pass elects the cell while it is borrowed
+/// ([`GracePartitions`]).
 struct GracePartitionCell {
     executor: GraceHashExecutor,
     consumer: ConsumerId,
@@ -1253,7 +1256,13 @@ impl WalkOwnedSpill for GracePartitionCell {
 /// The cell is borrowed only inside one of the methods here, each one
 /// executor operation, never across the build-key extraction, the sketch
 /// observation, a probe's match emission, a spilled partition's reload or
-/// the kernel's own memory checks.
+/// the probe loop's memory checks. The partition-table build
+/// ([`Self::finish_build`]) is the one method that runs memory checks with
+/// the cell borrowed: each partition's table build checks the hard limit,
+/// which can run a reclaim pass. It zeroes the reclaimable figure the grace
+/// consumer reports before the first of them, and a pass never elects a
+/// consumer that reports nothing reclaimable, so no pass reaches the cell
+/// while it is borrowed.
 pub(crate) struct GracePartitions {
     cell: Rc<RefCell<GracePartitionCell>>,
     /// Dropped with the cell, on every exit.

@@ -1043,9 +1043,14 @@ impl<K: Eq + std::hash::Hash + Clone> KeyedGroupTables for WindowTables<K> {
 /// A reclaim pass that another consumer's request starts spills an elected
 /// table whenever the arm is between two of its own operations on the cell,
 /// which is all the time but one build-and-add of a record and one take of a
-/// table. The cell is never borrowed across the record's evaluation context,
-/// a cursor advance, dead-letter routing, a table's finalize or the routing
-/// of its result, so none of those can find it busy. A table taken out of
+/// table. The build-and-add evaluates the record and folds it into its group
+/// with the cell borrowed. Nothing in that evaluation or fold makes a
+/// checked charge, so no pass can start while the cell is borrowed; a change
+/// that moves group growth onto a checked charge must first split the
+/// record's evaluation from its fold, so the cell is not borrowed across
+/// the charge. The cell is never borrowed across a cursor advance,
+/// dead-letter routing, a table's finalize or the routing of its result, so
+/// none of those can find it busy. A table taken out of
 /// the cell for its finalize leaves the walk reclaim set with it.
 ///
 /// Holds an `Rc`, so it is `!Send`: it lives on the walk. Its registrations
