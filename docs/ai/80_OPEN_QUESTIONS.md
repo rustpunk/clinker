@@ -693,24 +693,6 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
 
 ## Runtime findings from documentation verification
 
-### 62. Bounded preview can fail node-buffer cleanup
-
-- Filed: 2026-09-18.
-- Status: Open; reproduced against `3b343a4e`.
-- Priority: High.
-- Evidence: Bounded previews of the first-pipeline and CSV-transform recipes
-  fail with `completed node-buffer scope retained 1 slot(s), 1 reader-count
-  entry/entries, and 1 memory registration(s)`. Their ordinary runs complete
-  and match the documented CSV bytes. The same diagnostic occurs in the
-  tutorial site's validation and DLQ fixtures, including with output parents
-  already present.
-- Files/modules involved: `crates/clinker-exec/src/executor/dispatch.rs`,
-  `crates/clinker/src/main.rs`, `docs/user/src/ops/validation.md`.
-- Suggested way to resolve it: Trace preview completion and retained reader
-  ownership; add a regression that checks cleanup and output for bounded
-  execution through typed Sources and Sinks. Do not suppress the invariant.
-- Implementation owner: CLI and executor maintainers.
-
 ### 63. Mismatched Sink names can fail writing or publish empty files
 
 - Filed: 2026-09-18.
@@ -1156,6 +1138,29 @@ SWIFT retained trailers carry leases through actual backing destruction. Existin
 allocations remain outside that writer guarantee, and EDIFACT, X12 and HL7
 writer migration remains outstanding. AUTH-06 is still partial. See
 [physical-text ownership](../engine/src/memory-arbitration.md#physical-text-configuration-truncation-tallies-and-trailers).
+
+### 62. Bounded preview can fail node-buffer cleanup
+
+Resolved 2026-10-07 by maintainer decision (an unfused Transform honours its
+Sink's compiled streaming writer). A bounded preview runs every Transform
+unfused so its Sources drain in a fixed order, while a Sink fed by a
+Transform the plan fuses with its Source keeps the streaming writer the
+compiled plan gave it. The unfused Transform never took that writer's
+sender: it parked its rows in a node buffer nobody read, the Sink wrote
+nothing, and the completed walk failed the run on the leaked slot. Now the
+unfused Transform sends its rows through the Sink's streaming writer, as
+the unfused Route and Merge do, and delivers the rows it produced before a
+failure ahead of its error; the cleanup invariant is unchanged and still
+checked. Full runs are unchanged, because outside a preview such a
+Transform always runs fused (`crates/clinker-exec/src/executor/transform_dispatch.rs`;
+the tests `a_preview_of_a_fusable_transform_chain_writes_its_rows` and
+`a_preview_transform_delivers_its_rows_before_its_failure_and_reports_the_same_error`
+in `crates/clinker-exec/src/executor/tests/stream_hop_end.rs`,
+`a_preview_of_a_source_transform_sink_pipeline_prints_its_first_rows` and
+`a_transform_chain_preview_writes_the_same_bytes_every_run` in
+`crates/clinker/tests/run_flag_contract.rs`, and
+`a_transform_preview_that_dead_letters_exits_2_and_writes_no_dead_letter_file`
+in `crates/clinker/tests/dlq_streaming.rs`).
 
 ### 91. A group that mixes decimals and floats
 

@@ -4,6 +4,19 @@ All notable changes to Clinker are tracked here.
 
 ## Unreleased
 
+### Fixed — a bounded preview of a Transform that reads one Source and feeds one Sink prints its rows
+
+`clinker run pipeline.yaml --dry-run -n N` failed with an internal error
+(exit 1, `completed node-buffer scope retained ...`) when a Transform read one
+Source and fed one Sink, the shape of the getting-started walkthrough and the
+CSV-to-CSV recipe, and wrote nothing. It now prints the first `N` transformed
+rows, the same rows a full run writes first for that input. The preview exits
+0, or 2 when it dead-letters a row, and still writes no dead-letter file or
+configured output. A preview whose Transform fails part way reports the same
+error as a full run. Full runs are unchanged.
+
+Closes [#1220](https://github.com/rustpunk/clinker/issues/1220).
+
 ### Changed — aggregates follow one numeric rule: exact decimal totals, a typed error for every failure, and no decimal–float mixing
 
 This is a breaking change. A numeric aggregate now gives the exact value of its

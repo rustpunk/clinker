@@ -242,12 +242,6 @@ finishes on the sample. A preview cancelled by SIGINT or SIGTERM before it
 finishes exits `130`, like any cancelled run, and what it wrote to stdout or
 `--dry-run-output` is incomplete.
 
-> **Known limitation:** At revision `3b343a4e`, some bounded previews fail
-> during cleanup with `completed node-buffer scope retained ...`, even when
-> the same pipeline completes in an ordinary run. Treat that nonzero exit as
-> a failed preview. Planning-only validation remains available; use an ordinary
-> run with disposable output paths to verify actual results.
-
 ## Advisory workspace schema analysis
 
 `clinker-schema` is a separate advisory authoring library. It reuses the
