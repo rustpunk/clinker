@@ -485,13 +485,32 @@ fn run_scripted(
     sinks: &[&'static str],
     token: Option<&crate::pipeline::shutdown::ShutdownToken>,
 ) -> ScriptedRun {
-    let readers: crate::executor::SourceReaders = HashMap::from([(
+    run_scripted_with(yaml, reader, Vec::new(), sinks, token, None)
+}
+
+/// [`run_scripted`] with every Source in `csv_sources` read from its CSV
+/// text, reporting the run's telemetry to `telemetry` when given.
+fn run_scripted_with(
+    yaml: &str,
+    reader: ScriptedRows,
+    csv_sources: Vec<(&str, &str)>,
+    sinks: &[&'static str],
+    token: Option<&crate::pipeline::shutdown::ShutdownToken>,
+    telemetry: Option<crate::telemetry::TelemetryProducer>,
+) -> ScriptedRun {
+    let mut readers: crate::executor::SourceReaders = HashMap::from([(
         "src".to_string(),
         crate::source::SourceInput::Records(Box::new(reader)),
     )]);
+    readers.extend(
+        csv_sources
+            .into_iter()
+            .map(|(name, csv)| csv_reader(name, csv.to_string())),
+    );
     let ends = crate::executor::StreamingEnds::default();
     let params = PipelineRunParams {
         shutdown_token: token.cloned(),
+        telemetry_producer: telemetry,
         memory_test: crate::executor::MemoryTestOverrides::default()
             .with_streaming_ends(ends.clone()),
         ..PipelineRunParams::default()
@@ -747,4 +766,477 @@ fn a_failing_fused_transform_delivers_its_rows_before_its_failure_to_its_sink() 
         sink_records, 2,
         "the Sink received the two rows produced before the failing row"
     );
+}
+
+/// The build side of [`fused_chain_into_combine`]: one product per group.
+const PRODUCTS: &str = "grp,name\ng0,p0\ng1,p1\ng2,p2\ng3,p3\n";
+
+/// Source -> Transform -> Combine(driver) -> Sink, with `products` as the
+/// Combine's build side. The Transform is fused with its Source and streams
+/// into the Combine's probe; it fails on a row whose `v` is not a number.
+/// `body` is the Combine's CXL, run on every matched driver row inside the
+/// probe.
+fn fused_chain_into_combine(body: &str) -> String {
+    format!(
+        r#"
+pipeline:
+  name: fused_chain_into_combine
+error_handling:
+  strategy: fail_fast
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    type: csv
+    path: src.csv
+    schema:
+      - {{ name: grp, type: string }}
+      - {{ name: id, type: string }}
+      - {{ name: v, type: string }}
+- type: source
+  name: products
+  config:
+    name: products
+    type: csv
+    path: products.csv
+    schema:
+      - {{ name: grp, type: string }}
+      - {{ name: name, type: string }}
+- type: transform
+  name: pass
+  input: src
+  config:
+    cxl: |
+      emit grp = grp
+      emit id = id
+      emit v = v.to_int()
+- type: combine
+  name: joined
+  input:
+    pass: pass
+    products: products
+  config:
+    where: "pass.grp == products.grp"
+    match: first
+    on_miss: skip
+    drive: pass
+    cxl: |
+{body}
+    propagate_ck: driver
+- type: sink
+  name: joined_out
+  input: joined
+  config:
+    name: joined_out
+    type: csv
+    path: joined_out.csv
+"#
+    )
+}
+
+/// The Combine's body converts every driver row's `id`, so under
+/// `fail_fast` the probe fails on the first driver row whose `id` is not a
+/// number, inside its probe loop.
+const CONVERTING_BODY: &str = "      emit id = pass.id\n      emit n = pass.id.to_int()";
+
+/// The Combine's body only copies columns, so it never fails.
+const COPYING_BODY: &str = "      emit id = pass.id\n      emit name = products.name";
+
+/// Run [`fused_chain_into_combine`] with `body` over `reader`.
+fn run_combine(
+    body: &str,
+    reader: ScriptedRows,
+    token: Option<&crate::pipeline::shutdown::ShutdownToken>,
+) -> ScriptedRun {
+    run_scripted_with(
+        &fused_chain_into_combine(body),
+        reader,
+        vec![("products", PRODUCTS)],
+        &["joined_out"],
+        token,
+        None,
+    )
+}
+
+/// The run fails with the Combine's own conversion error, the first failure
+/// in data order; the Combine streamed and failed before its input ended,
+/// and nothing is written.
+fn assert_the_probes_failure(scripted: &ScriptedRun) {
+    let error = scripted
+        .run
+        .result
+        .as_ref()
+        .expect_err("the probe's failure fails the run");
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("cannot convert '{AGGREGATE_BAD_ID}'")),
+        "the run reports the probe's own failure, the first in data order: {error}"
+    );
+    assert_eq!(
+        only_end(&scripted.ends, "joined").input,
+        crate::executor::StreamingInputEnd::ConsumerFailed,
+        "the Combine probes its streamed driver and fails on its own row"
+    );
+    assert_eq!(scripted.run.outputs["joined_out"], "", "nothing is written");
+}
+
+/// The warnings that name the Combine `joined`.
+fn lines_naming_joined(warnings: &[String]) -> Vec<&String> {
+    warnings
+        .iter()
+        .filter(|line| line.contains(r#"node="joined""#))
+        .collect()
+}
+
+/// The Combine's probe fails on its first driver row; the reader feeding
+/// the driver fails later, past the driver's first batch. The run reports
+/// the probe's failure and logs the reader's once, naming the Combine.
+#[test]
+fn a_streaming_probes_earlier_failure_beats_a_later_reader_failure() {
+    let scripted = run_combine(
+        CONVERTING_BODY,
+        ScriptedRows::new(6000).bad_id_at(1).fail_after(3000),
+        None,
+    );
+    assert_the_probes_failure(&scripted);
+    let lines = lines_naming_joined(&scripted.warnings);
+    assert_eq!(
+        lines.len(),
+        1,
+        "the later failure is logged once: {:?}",
+        scripted.warnings
+    );
+    assert!(
+        lines[0].contains(READ_FAILURE),
+        "the logged failure is the reader's: {lines:?}"
+    );
+}
+
+/// The Combine's probe fails on its first driver row; the Transform driving
+/// it fails on row 5,001. The run reports the probe's failure and logs the
+/// Transform's.
+#[test]
+fn a_streaming_probes_earlier_failure_beats_its_producers_later_failure() {
+    let scripted = run_combine(
+        CONVERTING_BODY,
+        ScriptedRows::new(6000).bad_id_at(1).bad_v_at(5001),
+        None,
+    );
+    assert_the_probes_failure(&scripted);
+    let lines = lines_naming_joined(&scripted.warnings);
+    assert_eq!(
+        lines.len(),
+        1,
+        "the later failure is logged once: {:?}",
+        scripted.warnings
+    );
+    assert!(
+        lines[0].contains(&format!("cannot convert '{TRANSFORM_BAD_V}'")),
+        "the logged failure is the Transform's: {lines:?}"
+    );
+}
+
+/// The Combine's probe fails on its first driver row; the run is cancelled
+/// at row 3,000. The probe's failure stands, and the cancellation is not
+/// logged as a failure.
+#[test]
+fn a_streaming_probes_failure_stands_when_the_run_is_cancelled_after_it() {
+    let token = crate::pipeline::shutdown::ShutdownToken::detached();
+    let scripted = run_combine(
+        CONVERTING_BODY,
+        ScriptedRows::new(6000).bad_id_at(1).cancel_at(3000, &token),
+        Some(&token),
+    );
+    assert!(
+        token.is_requested(),
+        "the reader requested the cancellation"
+    );
+    assert_the_probes_failure(&scripted);
+    assert_eq!(
+        lines_naming_joined(&scripted.warnings),
+        Vec::<&String>::new(),
+        "a cancellation is not a failure to log"
+    );
+}
+
+/// A streaming Combine whose driver fails or is stopped never completes its
+/// probe over the driver rows it was given. Three ways the driver stops: its
+/// reader fails, its reader cancels the run, the Transform itself fails.
+#[test]
+fn a_streaming_probe_never_completes_without_its_producers_end() {
+    let token = crate::pipeline::shutdown::ShutdownToken::detached();
+    let cases = [
+        (
+            "the reader fails",
+            ScriptedRows::new(6000).fail_after(3000),
+            None,
+        ),
+        (
+            "the reader cancels the run",
+            ScriptedRows::new(6000).cancel_at(3000, &token),
+            Some(&token),
+        ),
+        (
+            "the Transform fails",
+            ScriptedRows::new(6000).bad_v_at(3000),
+            None,
+        ),
+    ];
+    for (case, reader, token) in cases {
+        let scripted = run_combine(COPYING_BODY, reader, token);
+        assert_eq!(
+            only_end(&scripted.ends, "joined"),
+            crate::executor::StreamingEnd {
+                node: "joined".to_string(),
+                input: crate::executor::StreamingInputEnd::Incomplete,
+                finished: false,
+            },
+            "{case}: the probe's input closed without its driver's end, and it \
+             completed nothing"
+        );
+        assert_eq!(
+            scripted.run.outputs["joined_out"], "",
+            "{case}: nothing written"
+        );
+    }
+}
+
+/// A complete read through the fused chain into the streaming Combine ends
+/// the probe's input, completes the probe and joins every driver row.
+#[test]
+fn a_complete_fused_chain_into_a_streaming_probe_joins_every_row() {
+    let scripted = run_combine(COPYING_BODY, ScriptedRows::new(6000), None);
+    scripted
+        .run
+        .result
+        .as_ref()
+        .expect("a complete read succeeds");
+    let output = &scripted.run.outputs["joined_out"];
+    let mut lines: Vec<&str> = output.lines().skip(1).collect();
+    lines.sort_unstable();
+    let mut expected: Vec<String> = (1..=6000)
+        .map(|row| format!("{row},p{}", row % 4))
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(output.lines().next(), Some("id,name"));
+    assert_eq!(lines, expected);
+    assert_eq!(
+        only_end(&scripted.ends, "joined"),
+        crate::executor::StreamingEnd {
+            node: "joined".to_string(),
+            input: crate::executor::StreamingInputEnd::Ended,
+            finished: true,
+        }
+    );
+}
+
+/// Source -> Transform -> JSON Sink: the Transform is fused with its Source
+/// and streams into the Sink's writer thread.
+const FUSED_CHAIN_INTO_JSON: &str = r#"
+pipeline:
+  name: fused_chain_into_json
+error_handling:
+  strategy: fail_fast
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    type: csv
+    path: src.csv
+    schema:
+      - { name: grp, type: string }
+      - { name: id, type: string }
+      - { name: v, type: string }
+- type: transform
+  name: pass
+  input: src
+  config:
+    cxl: |
+      emit id = id
+- type: sink
+  name: rows_out
+  input: pass
+  config:
+    name: rows_out
+    type: json
+    path: rows_out.json
+"#;
+
+/// Each of the Sink lifecycle outcomes `receiver` holds, as
+/// `(completed, failed, interrupted)`.
+fn sink_outcomes(receiver: &crate::telemetry::TelemetryReceiver) -> (u64, u64, u64) {
+    let (mut completed, mut failed, mut interrupted) = (0, 0, 0);
+    while let Some(batch) = receiver.try_recv_batch() {
+        completed += batch.metric(crate::telemetry::MetricKey::SinkCompleted);
+        failed += batch.metric(crate::telemetry::MetricKey::SinkFailed);
+        interrupted += batch.metric(crate::telemetry::MetricKey::SinkInterrupted);
+    }
+    (completed, failed, interrupted)
+}
+
+/// A streaming Sink whose producer fails or is stopped never closes its
+/// output: the JSON document it was writing gets no closing bracket, and its
+/// lifecycle records a failure, or an interruption when the run was
+/// cancelled, never a completion.
+#[test]
+fn a_streaming_sink_never_closes_its_output_without_its_producers_end() {
+    let token = crate::pipeline::shutdown::ShutdownToken::detached();
+    let cases = [
+        (
+            "the reader fails",
+            ScriptedRows::new(6000).fail_after(3000),
+            None,
+            (0, 1, 0),
+        ),
+        (
+            "the reader cancels the run",
+            ScriptedRows::new(6000).cancel_at(3000, &token),
+            Some(&token),
+            (0, 0, 1),
+        ),
+    ];
+    for (case, reader, token, outcomes) in cases {
+        let (producer, receiver) = telemetry_arena();
+        let scripted = run_scripted_with(
+            FUSED_CHAIN_INTO_JSON,
+            reader,
+            Vec::new(),
+            &["rows_out"],
+            token,
+            Some(producer),
+        );
+        let written = &scripted.run.outputs["rows_out"];
+        assert!(
+            written.starts_with('['),
+            "{case}: the Sink wrote rows before its producer stopped: {written:?}"
+        );
+        assert!(
+            !written.trim_end().ends_with(']'),
+            "{case}: the document is not closed: ...{:?}",
+            &written[written.len().saturating_sub(40)..]
+        );
+        assert_eq!(
+            sink_outcomes(&receiver),
+            outcomes,
+            "{case}: (completed, failed, interrupted)"
+        );
+        assert_eq!(
+            only_end(&scripted.ends, "rows_out"),
+            crate::executor::StreamingEnd {
+                node: "rows_out".to_string(),
+                input: crate::executor::StreamingInputEnd::Incomplete,
+                finished: false,
+            },
+            "{case}"
+        );
+    }
+}
+
+/// A complete run ends its streaming Sink's input once the producer's turn
+/// returns, and the Sink closes its document and completes.
+#[test]
+fn a_completed_walk_ends_every_streaming_sink() {
+    let (producer, receiver) = telemetry_arena();
+    let scripted = run_scripted_with(
+        FUSED_CHAIN_INTO_JSON,
+        ScriptedRows::new(6000),
+        Vec::new(),
+        &["rows_out"],
+        None,
+        Some(producer),
+    );
+    scripted
+        .run
+        .result
+        .as_ref()
+        .expect("a complete read succeeds");
+    let written = &scripted.run.outputs["rows_out"];
+    assert!(written.starts_with('['), "{written:?}");
+    assert!(written.trim_end().ends_with(']'), "the document is closed");
+    assert_eq!(
+        written.matches(r#""id":"#).count(),
+        6000,
+        "every row is written"
+    );
+    assert_eq!(sink_outcomes(&receiver), (1, 0, 0));
+    assert_eq!(
+        only_end(&scripted.ends, "rows_out"),
+        crate::executor::StreamingEnd {
+            node: "rows_out".to_string(),
+            input: crate::executor::StreamingInputEnd::Ended,
+            finished: true,
+        }
+    );
+}
+
+/// Two Sources -> Merge (interleave) -> Aggregate -> Sink: the fused
+/// interleave streams into the Aggregate's ingest. `other` is empty, so the
+/// interleave hands on `src`'s rows in their order.
+fn interleave_into_aggregate() -> String {
+    pipeline(
+        "interleave_into_aggregate",
+        &[r#"
+- type: source
+  name: src
+  config:
+    name: src
+    type: csv
+    path: src.csv
+    schema:
+      - { name: grp, type: string }
+      - { name: id, type: string }
+      - { name: v, type: string }
+- type: source
+  name: other
+  config:
+    name: other
+    type: csv
+    path: other.csv
+    schema:
+      - { name: grp, type: string }
+      - { name: id, type: string }
+      - { name: v, type: string }
+- type: merge
+  name: merged
+  inputs: [src, other]
+  config:
+    mode: interleave
+- type: aggregate
+  name: totals
+  input: merged
+  config:
+    group_by: [grp]
+    cxl: |
+      emit grp = grp
+      emit n = sum(id.to_int())
+- type: sink
+  name: agg_out
+  input: totals
+  config:
+    name: agg_out
+    type: csv
+    path: agg_out.csv
+"#],
+    )
+}
+
+/// The Aggregate fails on row 4,999 and `src`'s reader fails right after
+/// it, both past the interleave's second batch. The interleave hands the
+/// Aggregate every row it took before the reader's failure, so the
+/// Aggregate meets its own failing row and the run reports it.
+#[test]
+fn an_interleave_feeding_a_streaming_aggregate_delivers_its_rows_before_a_read_failure() {
+    let scripted = run_scripted_with(
+        &interleave_into_aggregate(),
+        ScriptedRows::new(6000).bad_id_at(4999).fail_after(4999),
+        vec![("other", "grp,id,v\n")],
+        &["agg_out"],
+        None,
+        None,
+    );
+    assert_the_aggregates_failure(&scripted.run);
+    assert_the_aggregate_failed_first(&scripted.ends);
 }
