@@ -286,3 +286,354 @@ fn a_preview_transform_delivers_its_rows_before_its_failure_and_reports_the_same
         "the Sink received the two rows produced before the failing row"
     );
 }
+
+/// The read error a scripted reader reports.
+const READ_FAILURE: &str = "disk read failed mid-file";
+
+/// The `id` value the Aggregate cannot convert.
+const AGGREGATE_BAD_ID: &str = "aggregate_bad";
+
+/// The `v` value the Transform cannot convert.
+const TRANSFORM_BAD_V: &str = "transform_bad";
+
+/// What a scripted reader does once it has yielded its `at`-th row.
+enum ReadStop {
+    /// Fails its next read with [`READ_FAILURE`].
+    Fail,
+    /// Requests the run's cancellation; the reader then sees it and stops.
+    Cancel(crate::pipeline::shutdown::ShutdownToken),
+}
+
+/// Rows `1..=rows` of `grp,id,v` in four groups, with `id` a whole number and
+/// `v` `1`, except where a failure is scripted: the row whose `id` the
+/// Aggregate cannot convert, the row whose `v` the Transform cannot convert,
+/// and the row after which the reader stops.
+struct ScriptedRows {
+    schema: clinker_record::owned_storage::SharedStorage<clinker_record::Schema>,
+    rows: usize,
+    sent: usize,
+    bad_id_at: Option<usize>,
+    bad_v_at: Option<usize>,
+    stop: Option<(usize, ReadStop)>,
+}
+
+impl ScriptedRows {
+    fn new(rows: usize) -> Self {
+        Self {
+            schema: clinker_record::SchemaBuilder::new()
+                .with_field("grp")
+                .with_field("id")
+                .with_field("v")
+                .build(),
+            rows,
+            sent: 0,
+            bad_id_at: None,
+            bad_v_at: None,
+            stop: None,
+        }
+    }
+
+    /// The Aggregate cannot convert row `row`'s `id`.
+    fn bad_id_at(mut self, row: usize) -> Self {
+        self.bad_id_at = Some(row);
+        self
+    }
+
+    /// The Transform cannot convert row `row`'s `v`.
+    fn bad_v_at(mut self, row: usize) -> Self {
+        self.bad_v_at = Some(row);
+        self
+    }
+
+    /// The reader fails its read after row `row`.
+    fn fail_after(mut self, row: usize) -> Self {
+        self.stop = Some((row, ReadStop::Fail));
+        self
+    }
+
+    /// The reader requests `token` as it yields row `row`.
+    fn cancel_at(mut self, row: usize, token: &crate::pipeline::shutdown::ShutdownToken) -> Self {
+        self.stop = Some((row, ReadStop::Cancel(token.clone())));
+        self
+    }
+}
+
+impl crate::source::RecordSource for ScriptedRows {
+    fn schema(
+        &mut self,
+    ) -> Result<
+        clinker_record::owned_storage::SharedStorage<clinker_record::Schema>,
+        clinker_format::FormatError,
+    > {
+        Ok(self.schema.clone())
+    }
+
+    fn next_record(
+        &mut self,
+    ) -> Result<Option<clinker_record::Record>, clinker_format::FormatError> {
+        match &self.stop {
+            Some((at, ReadStop::Fail)) if self.sent == *at => {
+                return Err(clinker_format::FormatError::Io(std::io::Error::other(
+                    READ_FAILURE,
+                )));
+            }
+            Some((at, ReadStop::Cancel(token))) if self.sent + 1 == *at => token.request(),
+            _ => {}
+        }
+        if self.sent == self.rows {
+            return Ok(None);
+        }
+        self.sent += 1;
+        let row = self.sent;
+        let id = if self.bad_id_at == Some(row) {
+            AGGREGATE_BAD_ID.to_string()
+        } else {
+            row.to_string()
+        };
+        let v = if self.bad_v_at == Some(row) {
+            TRANSFORM_BAD_V
+        } else {
+            "1"
+        };
+        Ok(Some(clinker_record::Record::new(
+            self.schema.clone(),
+            vec![
+                clinker_record::Value::from(format!("g{}", row % 4).as_str()),
+                clinker_record::Value::from(id.as_str()),
+                clinker_record::Value::from(v),
+            ],
+        )))
+    }
+}
+
+/// Source -> Transform -> Aggregate -> Sink, the Transform fused with its
+/// Source and streaming into the Aggregate's ingest. The Transform fails on
+/// a row whose `v` is not a number; the Aggregate, when `summed` is
+/// `sum(id.to_int())`, fails on a row whose `id` is not one.
+fn fused_chain_into_aggregate(summed: &str) -> String {
+    format!(
+        r#"
+pipeline:
+  name: fused_chain_into_aggregate
+error_handling:
+  strategy: fail_fast
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    type: csv
+    path: src.csv
+    schema:
+      - {{ name: grp, type: string }}
+      - {{ name: id, type: string }}
+      - {{ name: v, type: string }}
+- type: transform
+  name: pass
+  input: src
+  config:
+    cxl: |
+      emit grp = grp
+      emit id = id
+      emit v = v.to_int()
+- type: aggregate
+  name: totals
+  input: pass
+  config:
+    group_by: [grp]
+    cxl: |
+      emit grp = grp
+      emit n = {summed}
+- type: sink
+  name: agg_out
+  input: totals
+  config:
+    name: agg_out
+    type: csv
+    path: agg_out.csv
+"#
+    )
+}
+
+/// The Aggregate sums every row's `id`, so it fails on a row it cannot
+/// convert.
+const SUM_OF_IDS: &str = "sum(id.to_int())";
+
+/// Run `yaml` with `src` read by `reader`, its one Sink `agg_out`, under
+/// `token` when given, keeping every warning logged on the walk's thread.
+fn run_scripted(
+    yaml: &str,
+    reader: ScriptedRows,
+    token: Option<&crate::pipeline::shutdown::ShutdownToken>,
+) -> (Run, Vec<String>) {
+    let readers: crate::executor::SourceReaders = HashMap::from([(
+        "src".to_string(),
+        crate::source::SourceInput::Records(Box::new(reader)),
+    )]);
+    let params = PipelineRunParams {
+        shutdown_token: token.cloned(),
+        ..PipelineRunParams::default()
+    };
+    super::capture_warnings(|| run_with(yaml, readers, &["agg_out"], params, None))
+}
+
+/// The run fails with the Aggregate's own conversion error, the first
+/// failure in data order, and its output holds nothing.
+fn assert_the_aggregates_failure(run: &Run) {
+    let error = run
+        .result
+        .as_ref()
+        .expect_err("the Aggregate's failure fails the run");
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("cannot convert '{AGGREGATE_BAD_ID}'")),
+        "the run reports the Aggregate's own failure, the first in data order: {error}"
+    );
+    assert_eq!(run.outputs["agg_out"], "", "nothing is written");
+}
+
+/// The warnings that name the Aggregate `totals`.
+fn lines_naming_totals(warnings: &[String]) -> Vec<&String> {
+    warnings
+        .iter()
+        .filter(|line| line.contains(r#"node="totals""#))
+        .collect()
+}
+
+/// The Aggregate fails on its first row; the reader feeding its producer
+/// fails later, past the producer's first batch. The run reports the
+/// Aggregate's failure, and the reader's, which came later in data order, is
+/// logged once on the walk's thread naming the Aggregate.
+#[test]
+fn a_streaming_aggregates_earlier_failure_beats_a_later_reader_failure() {
+    let (run, warnings) = run_scripted(
+        &fused_chain_into_aggregate(SUM_OF_IDS),
+        ScriptedRows::new(6000).bad_id_at(1).fail_after(3000),
+        None,
+    );
+    assert_the_aggregates_failure(&run);
+    let lines = lines_naming_totals(&warnings);
+    assert_eq!(
+        lines.len(),
+        1,
+        "the later failure is logged once: {warnings:?}"
+    );
+    assert!(
+        lines[0].contains(READ_FAILURE),
+        "the logged failure is the reader's: {lines:?}"
+    );
+}
+
+/// The Aggregate fails on its first row; the Transform feeding it fails on
+/// row 5,001. The run reports the Aggregate's failure and logs the
+/// Transform's.
+#[test]
+fn a_streaming_aggregates_earlier_failure_beats_its_producers_later_failure() {
+    let (run, warnings) = run_scripted(
+        &fused_chain_into_aggregate(SUM_OF_IDS),
+        ScriptedRows::new(6000).bad_id_at(1).bad_v_at(5001),
+        None,
+    );
+    assert_the_aggregates_failure(&run);
+    let lines = lines_naming_totals(&warnings);
+    assert_eq!(
+        lines.len(),
+        1,
+        "the later failure is logged once: {warnings:?}"
+    );
+    assert!(
+        lines[0].contains(&format!("cannot convert '{TRANSFORM_BAD_V}'")),
+        "the logged failure is the Transform's: {lines:?}"
+    );
+}
+
+/// The Aggregate fails on row 4,999 and the Transform on row 5,000, both
+/// past the Transform's second batch. The Transform hands the Aggregate
+/// every row it produced before its failure, so the Aggregate meets its own
+/// failing row and the run reports it.
+#[test]
+fn a_streaming_aggregate_failing_on_the_row_before_its_producer_fails_reports_its_own_error() {
+    let (run, _) = run_scripted(
+        &fused_chain_into_aggregate(SUM_OF_IDS),
+        ScriptedRows::new(6000).bad_id_at(4999).bad_v_at(5000),
+        None,
+    );
+    assert_the_aggregates_failure(&run);
+}
+
+/// The Aggregate fails on its first row; the run is cancelled at row 3,000.
+/// The Aggregate's failure stands: the run fails rather than stopping as
+/// cancelled, and the cancellation is not logged as a failure.
+#[test]
+fn a_streaming_aggregates_failure_stands_when_the_run_is_cancelled_after_it() {
+    let token = crate::pipeline::shutdown::ShutdownToken::detached();
+    let (run, warnings) = run_scripted(
+        &fused_chain_into_aggregate(SUM_OF_IDS),
+        ScriptedRows::new(6000).bad_id_at(1).cancel_at(3000, &token),
+        Some(&token),
+    );
+    assert!(
+        token.is_requested(),
+        "the reader requested the cancellation"
+    );
+    assert_the_aggregates_failure(&run);
+    assert_eq!(
+        lines_naming_totals(&warnings),
+        Vec::<&String>::new(),
+        "a cancellation is not a failure to log"
+    );
+}
+
+/// A complete read through the fused chain into the streaming Aggregate
+/// writes every group's total over every row.
+#[test]
+fn a_complete_fused_chain_into_a_streaming_aggregate_writes_every_total() {
+    let (run, _) = run_scripted(
+        &fused_chain_into_aggregate(SUM_OF_IDS),
+        ScriptedRows::new(6000),
+        None,
+    );
+    run.result.as_ref().expect("a complete read succeeds");
+    let mut lines: Vec<&str> = run.outputs["agg_out"].lines().collect();
+    lines.sort_unstable();
+    // Group g is every row r <= 6000 with r % 4 == g: 1,500 rows each.
+    assert_eq!(
+        lines,
+        vec![
+            "g0,4503000",
+            "g1,4498500",
+            "g2,4500000",
+            "g3,4501500",
+            "grp,n",
+        ]
+    );
+}
+
+/// The full-run counterpart of the preview delivery test: the Transform runs
+/// fused with its Source and fails on row 3. Its Sink receives the two rows
+/// produced before the failure, as the preview's does.
+#[test]
+fn a_failing_fused_transform_delivers_its_rows_before_its_failure_to_its_sink() {
+    let (producer, receiver) = telemetry_arena();
+    let full = run_with(
+        DIVIDING_CHAIN,
+        HashMap::from([csv_reader("src", DIVIDING_ROWS.to_string())]),
+        &["rows_out"],
+        PipelineRunParams {
+            telemetry_producer: Some(producer),
+            ..PipelineRunParams::default()
+        },
+        None,
+    );
+    full.result
+        .expect_err("the full run fails on the zero divisor");
+    let mut sink_records = 0;
+    while let Some(batch) = receiver.try_recv_batch() {
+        sink_records += batch.metric(crate::telemetry::MetricKey::SinkRecords);
+    }
+    assert_eq!(
+        sink_records, 2,
+        "the Sink received the two rows produced before the failing row"
+    );
+}
