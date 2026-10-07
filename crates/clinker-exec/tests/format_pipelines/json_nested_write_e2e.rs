@@ -471,7 +471,7 @@ nodes:
             let result = common::run_config(&config, [("rows".into(), SourceInput::Files(files))].into(), writers, &params());
             let error = result.expect_err("invalid second input must fail");
             assert!(error.to_string().contains("UTF"), "{format}/{failure}: {error}");
-            assert_eq!(output.contents(), b"{\"id\":1}\n", "{format}/{failure}: only the first physical file is valid");
+            assert_eq!(output.contents(), b"", "{format}/{failure}: a failed Source writes no rows");
         }
     }
 }

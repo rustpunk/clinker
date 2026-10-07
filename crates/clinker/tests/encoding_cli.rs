@@ -1499,14 +1499,9 @@ fn nested_input_rows_enforce_utf8_and_independent_physical_file_policy() {
                     "{id}: failed run must not publish"
                 );
                 let partials = nested_partial_outputs(root.path());
-                let expected = if variant == "invalid-second"
-                    || (variant == "malformed-late"
-                        && !matches!(mode, "xml-ordinary" | "xml-prescan"))
-                {
-                    first
-                } else {
-                    b""
-                };
+                // The walk stops at the reader's failure, so the retained
+                // attempt holds none of the rows read before it.
+                let expected: &[u8] = b"";
                 assert!(
                     partials.iter().any(|bytes| bytes == expected),
                     "{id}: retained prefix {partials:?}"
@@ -1915,12 +1910,16 @@ nodes:
         "source.data.invalid"
     );
     assert!(!root.path().join("output.json").exists());
+    // The walk stops at the reader's failure, so the retained attempt holds
+    // none of the rows read before it.
     let partials = nested_partial_outputs(root.path());
-    assert!(partials.iter().any(|bytes| bytes == b"{\"number\":1}\n"));
     assert!(
-        partials
-            .iter()
-            .all(|bytes| bytes == b"{\"number\":1}\n" || bytes.is_empty())
+        partials.iter().any(|bytes| bytes.is_empty()),
+        "{partials:?}"
+    );
+    assert!(
+        partials.iter().all(|bytes| bytes.is_empty()),
+        "{partials:?}"
     );
     let diagnostic = String::from_utf8_lossy(&result.stderr);
     assert!(
@@ -2021,12 +2020,9 @@ nodes:
                     "{format}/{variant}: {outcome}"
                 );
                 assert!(!root.path().join("output.json").exists());
-                let expected =
-                    if variant == "second" || (variant == "late" && format == "fixed_width") {
-                        first
-                    } else {
-                        b""
-                    };
+                // The walk stops at the reader's failure, so the retained
+                // attempt holds none of the rows read before it.
+                let expected: &[u8] = b"";
                 let partials = nested_partial_outputs(root.path());
                 assert!(
                     partials.iter().any(|bytes| bytes == expected),

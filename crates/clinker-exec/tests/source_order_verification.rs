@@ -633,12 +633,16 @@ fn barrier_verifies_each_physical_file_independently() {
     let rendered = result.expect_err("the second file is inverted").to_string();
     assert!(rendered.contains("bad.csv"), "{rendered}");
     assert!(
-        output.contains("good-one"),
-        "the verified first file was not released: {output}"
+        !rendered.contains("good.csv"),
+        "the verified first file was blamed: {rendered}"
     );
     assert!(
         !output.contains("bad-one"),
         "the inverted second file leaked: {output}"
+    );
+    assert!(
+        output.is_empty(),
+        "a failed Source wrote rows before the run failed: {output}"
     );
 }
 
