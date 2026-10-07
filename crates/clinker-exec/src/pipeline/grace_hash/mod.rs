@@ -102,10 +102,13 @@ use spill::{ReloadContext, SpilledPartition, process_spilled_partition};
 /// during the probe loop. Same cadence as the inline hash probe.
 const MEMORY_CHECK_INTERVAL: usize = 10_000;
 
+/// What a test observes at a grace probe loop's first memory check.
+#[cfg(test)]
+type ProbeCheckObserver = Box<dyn FnOnce(&MemoryArbitrator)>;
+
 #[cfg(test)]
 thread_local! {
-    static PROBE_CHECK_OBSERVER: RefCell<Option<Box<dyn FnOnce(&MemoryArbitrator)>>> =
-        const { RefCell::new(None) };
+    static PROBE_CHECK_OBSERVER: RefCell<Option<ProbeCheckObserver>> = const { RefCell::new(None) };
 }
 
 /// Run `body` with `observer` called once, with the run's arbitrator, at the
