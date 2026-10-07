@@ -272,8 +272,10 @@ describes spill and cleanup debt.
 
 Memory, disk, allocation, descriptor and temporary-storage errors remain typed
 resource failures and are fatal even under `strategy: continue`. Cancellation
-is interrupted work, not a Sink error; a real failure retains its classification
-when shutdown also occurs. The CSV cell encoder preserves its original failure
+is interrupted work, not a Sink error. A real failure the walk reached retains
+its classification when shutdown also occurs; a reader failure the walk never
+reached because the cancellation stopped it first is logged and the run stays
+cancelled. The CSV cell encoder preserves its original failure
 across the library writer's drop-time flush. Malformed UTF-8 in source headers
 and body cells is an input-data failure, including schema discovery; unsupported
 authored encodings fail configuration admission instead.
@@ -326,8 +328,10 @@ not invent data-column influence edges.
 Fault tests in `writer_preparation` and `writer_resources` cover all native
 operation boundaries, storage failures, exact destination prefixes, cancellation,
 cache rollback and telemetry admission loss. `encoding_cli` and
-`encoding_runtime_contract` cover literal files, publication, exit codes and
-source/sink count prefixes. See [native ownership](memory-arbitration.md#native-jsonxml-configuration-and-schema-caches)
+`encoding_runtime_contract` cover literal files, publication, exit codes,
+Source read counts, and what a later file's failure leaves: nothing published,
+and in the failed attempt only the rows a streaming Sink had already written.
+See [native ownership](memory-arbitration.md#native-jsonxml-configuration-and-schema-caches)
 for configuration, schema lifetime and the remaining reader allowance.
 
 ## Streaming vs. buffered
@@ -407,9 +411,32 @@ Counter behavior under the streaming path matches the buffered Sink arm **exactl
   run-scoped counters, so it keeps its collisions in a pending list, capped
   at 65,536 entries (the cap fails the run with an internal error), and the
   walk pushes them through the same funnel, in arrival order, when it joins
-  the thread at the end of the DAG.
+  the thread at the end of its producer's turn.
 
-Stage metrics (`SchemaScan`, `Write`, `Projection`) accumulate into the same fields the buffered path uses. The dispatcher folds the streaming task's per-task accounting back into the run-wide totals at end of DAG, so a streaming run and a buffered run over the same input produce identical counter output.
+Stage metrics (`SchemaScan`, `Write`, `Projection`) accumulate into the same fields the buffered path uses. The walk folds the streaming task's per-task accounting back into the run-wide totals when it joins the Sink's thread at the end of its producer's turn, so a streaming run and a buffered run over the same input produce identical counter output.
+
+### End of input and failure
+
+The channel carries the producer's events and then, only once the producer's
+dispatch has returned `Ok`, one `HopMessage::End` that the walk sends after the
+producer's turn. A streaming Sink closes its output, and with it any document
+syntax (a JSON array's `]`, an XML wrapper's end tag), only when it reads that
+`End`. A channel that closes without `End` (the producer failed, or the run was
+cancelled) is an incomplete input and finishes nothing: the Sink abandons its
+staged file unpublished, keeping the rows it had already written, without
+closing framing, and records the Sink as failed (`clinker.sink.failed`, at least
+one Sink error) or, on a cancelled run, interrupted. A failed run publishes
+nothing; its retained attempt holds exactly what each Sink had written.
+
+A producer delivers every row it emitted before it returns an error, so the
+Sink meets its rows in data order. The walk joins the Sink's writer thread at
+the end of its producer's turn and settles the turn with `settle_hop`: a Sink
+that failed on a row its producer emitted earlier is the run's error, and the
+producer's later failure is logged on the walk thread with `node` and
+`upstream`. A Sink's own failure stops the walk only when its producer's turn
+failed too; beside a producer that finished, the walk goes on, so every other
+Sink still reports its own failure. A Sink whose input closed without `End`
+beside a producer that finished is an engine defect (`PipelineError::Internal`).
 
 ## Memory, telemetry, and lineage
 

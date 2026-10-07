@@ -240,7 +240,12 @@ the input will pass. See [CLI options](cli-reference.md).
 Reaching `N` records is a normal end of a Source's input, so every step
 finishes on the sample. A preview cancelled by SIGINT or SIGTERM before it
 finishes exits `130`, like any cancelled run, and what it wrote to stdout or
-`--dry-run-output` is incomplete.
+`--dry-run-output` is incomplete. That includes a preview whose Source read the
+cancellation cut off before the server answered. Otherwise a preview reports a
+failure exactly as a full run of the same input would, by the
+[same rules](../pipelines/error-handling.md#fail_fast): a REST reply cut off
+after the server began answering, for example, fails both with the Source's
+error and exit `4`.
 
 ## Advisory workspace schema analysis
 

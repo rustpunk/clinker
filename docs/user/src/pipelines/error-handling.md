@@ -30,6 +30,15 @@ The safest strategy. Any record-level error (type coercion failure, validation e
 
 Some failures abort the run under **either** strategy, because they are not record-scoped: an unwritable output path, a config or CXL compile error, and the DLQ-rate ceiling ([`dlq.max_rate`](#bounding-how-much-can-dead-letter), E315/E316) all end the run regardless of the strategy.
 
+A Source that cannot read its input to the end ends the run with its own error
+once the run reaches that point: a read failure part-way through a file, input
+it cannot parse, or the memory limit refusing the rows it reads (an E310 that
+names the Source). The rows it read before the failure are not treated as its
+input. No later step finishes on them, so an Aggregate never reports totals
+over part of a file, and the run publishes nothing. When a Source reads several
+files, a failure in a later file leaves nothing finished on the earlier files
+either. Fix or remove the input the error names, then run again.
+
 CSV, JSON and XML resource failures are also fatal under either strategy. Memory or disk
 admission refusal, allocation failure, descriptor exhaustion and temporary-storage
 failure are not bad-record errors, so `continue` cannot turn them into successful
@@ -40,14 +49,49 @@ accepted a prefix; see [output preparation](../ops/storage.md#output-preparation
 Malformed JSON/XML input encoding is a data failure, including when discovered
 during schema discovery or envelope pre-scan. Under `fail_fast`, the CLI returns
 exit `4` and machine code `source.data.invalid`. It does not report a compilation
-error merely because no record has reached the pipeline. A late error can leave
-an already delivered prefix; an envelope pre-scan may discover it before any
-body records. Failed runs do not publish their staged normal output files.
+error merely because no record has reached the pipeline. A late error fails the
+run like an early one; an envelope pre-scan may discover it before any body
+records.
+
+A failed run publishes nothing: no configured output file is created or
+replaced. Its retained attempt keeps what each output had written before the
+run stopped, without the closing syntax a finished file ends with, so you can
+inspect how far it got (see
+[retained attempts](../ops/storage.md#output-publication-and-retained-attempts)).
+An output Clinker writes as rows arrive, which `--explain` shows as
+`buffer: streaming` on the step that feeds it, can hold rows written before the
+failure; an output written only once its input was complete holds none. A
+`--dry-run -n N` preview can likewise have printed rows before it failed.
 
 Explicit cancellation ends an interrupted run with exit `130`; it does not add a
-Sink error. If a real I/O or resource failure occurs alongside a shutdown request,
-the real failure retains its classification. Record and byte counters describe
-established progress, not rows merely attempted or prepared.
+Sink error. When more than one thing goes wrong, the run reports the first
+failure Clinker met and logs the rest:
+
+- Clinker runs the steps in an order that follows the data, which need not be
+  the order they are written in the file. When several steps or Sources fail,
+  the run reports the failure that came first in that order. A Sink that writes
+  rows as they arrive counts as part of the step that feeds it, so a Sink that
+  fails on a row beats a later failure of the step that sent it that row. Every
+  later failure is logged as a warning that names its step or Source.
+- A failure Clinker had reached before it stopped fails the run with its own
+  classification, even if a shutdown was also requested. The exception is a
+  read the cancellation itself cut off before the server answered, such as a
+  REST request still waiting for its reply: that is reported as cancelled,
+  exit `130`. A reply the server had already begun sending stays the Source's
+  failure.
+- A failure in input Clinker had not reached when the cancellation stopped the
+  run does not change the outcome. The run still exits `130` as cancelled, and
+  the failure is logged as a warning that names the Source. A rerun that
+  reaches that input reports the failure.
+- When Clinker writes held rows to disk to make room for a step and that write
+  fails, the run reports the write's failure; if the step also failed, its own
+  error is logged as a warning that names it.
+
+Warnings go to the run's log: standard output, or standard error when standard
+output carries data (`--machine`, a `--dry-run -n N` preview without
+`--dry-run-output`, `--explain json` or `dot`, or a lineage export to `-`).
+`--log-level error` hides them. Record and byte counters describe established
+progress, not rows merely attempted or prepared.
 
 An executor invariant failure also aborts under either strategy with exit code
 `1`. In particular, if a planned materialized input is unavailable when its

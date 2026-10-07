@@ -17,6 +17,40 @@ error as a full run. Full runs are unchanged.
 
 Closes [#1220](https://github.com/rustpunk/clinker/issues/1220).
 
+### Fixed — a failed or interrupted read never lets a later step finish on part of its input, and the run reports the first failure
+
+This is a breaking change in which error a failed run reports and in what it
+leaves behind.
+
+A Source that failed or was cancelled part-way through its input used to end
+that input as if it were complete, so a later step could finish on the rows
+read so far, an Aggregate writing totals over part of a file, before the run
+failed. Every step's input now ends only when the step feeding it says it has
+ended: a Source's when its reader has read all of it (or reached the
+`--dry-run -n` limit), and a streaming step's when the step feeding it
+finished. A read failure or a cancellation ends the input as incomplete, and
+nothing finishes on it.
+
+- **Which error you see.** When several steps or Sources fail, the run reports
+  the first failure in the order Clinker runs its steps and logs each later
+  one as a warning naming its step or Source. A Sink that fails on a row now
+  wins over a later failure of the step that sent it that row; before, the
+  later failure could be reported instead and the Sink's dropped.
+- **A failing later file leaves nothing finished.** When a Source fails on a
+  later file, no step finishes on the earlier files' rows, and nothing is
+  published. An output that was being written as rows arrived keeps the rows
+  it had written, without its closing syntax, in the failed run's retained
+  attempt; nothing reaches a configured output path.
+- **Cancellation.** A cancelled run stays cancelled (exit 130) when another
+  Source fails on input the run never reached; that failure is logged. A
+  failure the run had already reached still wins over a cancellation, except a
+  Source read the cancellation itself cut off before the server answered,
+  which is reported as cancelled. A `--dry-run -n` preview follows the same
+  rules as a full run.
+- **Logged warnings.** The later failures are logged at `warn` level, on
+  standard output or, when standard output carries data, standard error. The
+  [CLI reference](docs/user/src/ops/cli-reference.md) lists their forms.
+
 ### Changed — aggregates follow one numeric rule: exact decimal totals, a typed error for every failure, and no decimal–float mixing
 
 This is a breaking change. A numeric aggregate now gives the exact value of its

@@ -129,8 +129,32 @@ destination and does not establish rollback.
 Explicit resource cancellation is an aborted run, reported as `cancelled` in
 machine mode with exit `130` and no failure classification. It does not depend
 on telemetry delivery or a pending shutdown signal. A genuine resource or data
-failure retains its classification even when a shutdown signal is pending;
-malformed source data remains `source.data.invalid` with `do_not_retry` advice.
+failure that the run reached before it stopped retains its classification even
+when a shutdown signal is pending; malformed source data remains
+`source.data.invalid` with `do_not_retry` advice. A source read the
+cancellation cut off before the server answered is reported as `cancelled`. A
+failure in input the run had not reached when a cancellation stopped it does
+not replace the cancellation: the run still reports `cancelled` with exit
+`130`, and the failure is logged as a warning rather than added to the
+`cancelled` record.
+
+A run reports one failure, the first it met in the order it runs its steps.
+Every other failure it met is logged at `warn` level with its step or source
+and its error. The common forms:
+
+| Log message | Logged when |
+|---|---|
+| `this step also failed, after the run's first failure; the run reports its first failure` | A step failed after an earlier step had already failed the run. |
+| `the step feeding this one also failed, after this step had failed on an earlier row; the run reports this step's failure` | A step failed on a row, and the step that sent it that row failed later. |
+| `the Source's reader also failed after the run had already failed; the run reports its first failure` | A source's input failed in a part the failed run never reached. |
+| `the Source's reader stopped with an error after the run was cancelled; the run reports the cancellation` | A source's input failed in a part the cancelled run never reached. |
+| `this step also failed, after a spill a reclaim pass started for it had failed; the run reports the spill's failure` | Writing held rows to disk to make room for a step failed, and the step failed too. |
+
+The log line names the step as `node="<name>"` or the source as
+`source="<name>"`, and carries the logged failure as `error=...`; when a step
+that sent rows failed after the step it fed, `node` is the step whose failure
+the run reports and `upstream` the one that failed later. See
+[which failure a run reports](../pipelines/error-handling.md#fail_fast).
 
 ---
 
