@@ -1256,6 +1256,179 @@ fn an_interrupted_preview_exits_as_cancelled() {
     );
 }
 
+/// A bounded preview whose output pipe closes once the run is cancelled exits
+/// as a cancellation, by the same rule a full run applies to a transport error
+/// the cancellation tore down.
+///
+/// This is `clinker run --dry-run -n N | head` stopped with Ctrl-C: the signal
+/// reaches both processes, the pipe's reader goes away, and the preview's
+/// blocked write fails with a broken pipe. The test reads the first rows and
+/// no more, so the pipe fills. The pause before the signal lets the preview
+/// block in that write instead of meeting the signal between two chunks of
+/// rows, where it would stop as cancelled without writing again; the exit
+/// status asserted is the same either way. The pipe closes only once the child
+/// has handled the signal.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_preview_whose_output_pipe_closes_after_the_cancellation_exits_as_cancelled() {
+    let directory = fixture();
+    write_pipeline(directory.path(), "out.csv", 100_000, false);
+    let marker = directory.path().join("shutdown-handled");
+    let mut child = Command::new(clinker_bin())
+        .current_dir(directory.path())
+        .args(["run", "pipeline.yaml", "--dry-run", "-n", "100000"])
+        .env("CLINKER_TEST_SHUTDOWN_MARKER", &marker)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the preview");
+    let stderr = child.stderr.take().expect("preview stderr");
+    let stderr_drain = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::BufReader::new(stderr).read_to_string(&mut text);
+        text
+    });
+    let mut stdout = child.stdout.take().expect("preview stdout");
+    let mut first_rows = [0_u8; 4096];
+    stdout
+        .read_exact(&mut first_rows)
+        .expect("the preview starts writing its rows");
+
+    std::thread::sleep(Duration::from_millis(300));
+    clinker_exec::pipeline::shutdown::request_direct_child_sigterm(&mut child)
+        .expect("send SIGTERM to the preview");
+    wait_for_shutdown_marker(&marker, Instant::now() + PROCESS_DEADLINE);
+    drop(stdout);
+
+    let deadline = Instant::now() + PROCESS_DEADLINE;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll the preview") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the preview did not exit after its output pipe closed");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let stderr = stderr_drain.join().expect("stderr drain");
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "a preview whose output pipe closed after the cancellation is a cancelled run\nstderr: {stderr}"
+    );
+}
+
+/// Run `clinker run pipeline.yaml <extra>` against a REST server that answers
+/// with its status line, headers and part of the body, waits until the child
+/// has handled SIGTERM, then drops the connection. Returns the exit status and
+/// the child's stderr.
+#[cfg(target_os = "linux")]
+fn run_against_a_reply_cut_off_after_the_cancellation(extra: &[&str]) -> (Option<i32>, String) {
+    let directory = fixture();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+    let address = listener.local_addr().expect("listener address");
+    write_hanging_rest_pipeline(directory.path(), address);
+    let marker = directory.path().join("shutdown-handled");
+    let server_marker = marker.clone();
+
+    let (request_ready_tx, request_ready_rx) = mpsc::sync_channel(1);
+    let (sigterm_sent_tx, sigterm_sent_rx) = mpsc::sync_channel(1);
+    let server = std::thread::spawn(move || {
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let deadline = Instant::now() + PROCESS_DEADLINE;
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "the run never sent its request");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept request: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).expect("blocking stream");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let bytes = stream.read(&mut buffer).expect("read request");
+            assert!(bytes > 0, "request closed before its headers completed");
+            request.extend_from_slice(&buffer[..bytes]);
+        }
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n[{\"id\":1},",
+            )
+            .expect("send part of the reply");
+        stream.flush().expect("flush part of the reply");
+        request_ready_tx.send(()).expect("announce the live reply");
+        sigterm_sent_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("supervisor sent SIGTERM");
+        wait_for_shutdown_marker(&server_marker, deadline);
+        drop(stream);
+    });
+
+    let mut command = Command::new(clinker_bin());
+    command
+        .current_dir(directory.path())
+        .args(["run", "pipeline.yaml"])
+        .args(extra)
+        .env("CLINKER_TEST_SHUTDOWN_MARKER", &marker);
+    let result = run_child(
+        command,
+        ProcessConfig::new(Duration::from_secs(5))
+            .stderr_tail_bytes(8 * 1024)
+            .graceful_trigger(request_ready_rx, sigterm_sent_tx, Duration::from_secs(2)),
+    )
+    .expect("gracefully supervised run");
+    server.join().expect("server thread");
+    (
+        result.status_code(),
+        String::from_utf8_lossy(result.stderr.retained_tail()).into_owned(),
+    )
+}
+
+/// A REST reply cut off after the server began answering is the Source's own
+/// failure, in a bounded preview exactly as in a full run, even when the
+/// connection drops after the run was cancelled: the server reached its
+/// verdict before the signal, and a signal arriving afterwards does not undo
+/// it. Only a read the cancellation stopped before the server answered is
+/// reported as cancelled.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_reply_cut_off_after_the_server_answered_fails_a_preview_and_a_run_alike() {
+    let (preview_status, preview_stderr) = run_against_a_reply_cut_off_after_the_cancellation(&[
+        "--dry-run",
+        "-n",
+        "5",
+        "--dry-run-output",
+        "preview.csv",
+    ]);
+    let (run_status, run_stderr) = run_against_a_reply_cut_off_after_the_cancellation(&[]);
+    for (name, status, stderr) in [
+        ("preview", preview_status, &preview_stderr),
+        ("full run", run_status, &run_stderr),
+    ] {
+        assert_eq!(
+            status,
+            Some(4),
+            "the {name} reports the Source's failure\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("[infrastructure.runtime.source_unavailable]")
+                && stderr.contains("class=response_io_unexpectedeof"),
+            "the {name} names the Source's cut-off reply\nstderr: {stderr}"
+        );
+    }
+}
+
 /// The liveness worker's verdict survives a run that never reaches `finish`.
 ///
 /// The worker returns `Err` only for a record it can never encode, or for a
