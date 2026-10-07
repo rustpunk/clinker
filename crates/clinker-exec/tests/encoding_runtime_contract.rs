@@ -577,7 +577,7 @@ nodes:
             "xml-ordinary" => b"<row><id>1</id></row>",
             _ => b"<Root><items><row><id>1</id></row></items><manifest><batch>7</batch></manifest></Root>",
         };
-        let expected: &[u8] = if *mode == "xml-prescan" {
+        let accepted: &[u8] = if *mode == "xml-prescan" {
             b"{\"id\":1,\"batch\":7}\n"
         } else {
             b"{\"id\":1}\n"
@@ -604,12 +604,12 @@ nodes:
             } else {
                 vec![valid, invalid]
             };
-            let expected = if late && matches!(*mode, "xml-ordinary" | "xml-prescan") {
+            let accepted = if late && matches!(*mode, "xml-ordinary" | "xml-prescan") {
                 b"".as_slice()
             } else {
-                expected
+                accepted
             };
-            let count = u64::from(!expected.is_empty());
+            let count = u64::from(!accepted.is_empty());
             let root = tempfile::tempdir().unwrap();
             let mut files = Vec::new();
             for (index, bytes) in inputs.iter().enumerate() {
@@ -648,7 +648,9 @@ nodes:
                 "{mode}: {error:?}"
             );
             assert_eq!(progress.sample().records_read, count, "{mode}/{variant}");
-            assert_eq!(std::fs::read(&path).unwrap(), expected, "{mode}");
+            // The walk stops at the reader's failure, so the Sink writes none
+            // of the rows read before it.
+            assert_eq!(std::fs::read(&path).unwrap(), b"", "{mode}");
             let mut records = 0;
             let mut bytes = 0;
             let mut source_failed = 0;
@@ -658,11 +660,7 @@ nodes:
                 source_failed += batch.metric(MetricKey::SourceFailed);
                 assert_eq!(batch.metric(MetricKey::SinkErrors), 0, "{mode}");
             }
-            assert_eq!(
-                (records, bytes, source_failed),
-                (count, expected.len() as u64, 1),
-                "{mode}"
-            );
+            assert_eq!((records, bytes, source_failed), (0, 0, 1), "{mode}");
         }
         assert!(executed.insert(*mode));
     }
@@ -770,7 +768,7 @@ nodes:
                 ],
                 _ => vec![invalid.to_vec()],
             };
-            let expected = if variant.ends_with("second")
+            let accepted = if variant.ends_with("second")
                 || variant == "numeric-continue"
                 || (variant == "late" && format == "fixed_width")
             {
@@ -778,7 +776,7 @@ nodes:
             } else {
                 b""
             };
-            let count = u64::from(!expected.is_empty());
+            let count = u64::from(!accepted.is_empty());
             let root = tempfile::tempdir().unwrap();
             let mut files = Vec::new();
             for (index, bytes) in inputs.iter().enumerate() {
@@ -821,11 +819,9 @@ nodes:
                 "{format}/{variant}: {error:?}"
             );
             assert_eq!(progress.sample().records_read, count, "{format}/{variant}");
-            assert_eq!(
-                std::fs::read(&output).unwrap(),
-                expected,
-                "{format}/{variant}"
-            );
+            // The walk stops at the reader's failure, so the Sink writes none
+            // of the rows read before it.
+            assert_eq!(std::fs::read(&output).unwrap(), b"", "{format}/{variant}");
             let (mut records, mut bytes, mut started, mut failed, mut completed) = (0, 0, 0, 0, 0);
             while let Some(batch) = receiver.try_recv_batch() {
                 records += batch.metric(MetricKey::SinkRecords);
@@ -838,7 +834,7 @@ nodes:
             }
             assert_eq!(
                 (records, bytes, started, failed, completed),
-                (count, expected.len() as u64, 1, 1, 0),
+                (0, 0, 1, 1, 0),
                 "{format}/{variant}"
             );
         }
