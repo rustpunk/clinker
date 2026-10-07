@@ -1232,12 +1232,12 @@ fn drive_record_source(
                         })
                         .is_none()
                         .then(|| widened_record.clone());
-                    // A closed channel means the consumer stopped pulling —
-                    // a shutdown-token unwind dropped the receiver, or the
-                    // downstream finished early. That is a graceful stop, not
-                    // a failure: stop producing and return the records pushed
-                    // so far. The dispatch side surfaces the interruption (if
-                    // any) through `report.interrupted`.
+                    // A closed channel means the walk dropped this Source's
+                    // receiver before the reader reached the end of its
+                    // input: the run's cancellation tore the walk down, or
+                    // the walk failed elsewhere and stopped listening. Either
+                    // way the read is not complete: stop producing and record
+                    // it as interrupted or abandoned.
                     match stream.push(widened_record) {
                         Ok(row_id) => {
                             if let Some(record) = representative_record {

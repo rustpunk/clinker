@@ -1321,13 +1321,12 @@ impl PipelineExecutor {
 
         // Collect ingest-task outcomes: per-source row counts and the
         // per-(source, file) watermark observations each task captured
-        // locally. The dispatch path consumed each task's receiver
-        // already, so a clean ingest task's join is the synchronization
-        // point that confirms readers + spill writers closed without
-        // error. A task error here (reader I/O, spill writer failure,
-        // closed-receiver — which can only fire if dispatch aborted
-        // before draining, in which case the dispatch error fires
-        // first) propagates after dispatch's own result.
+        // locally. A clean join confirms the reader and its spill writers
+        // closed without error. A reader failure the walk reached already
+        // failed dispatch above, so a failure here is one the walk never
+        // reached. After a completed walk it is the run's error, and so is
+        // a read whose receiver the walk dropped before the reader's end:
+        // a completed walk reads every Source to its end.
         let mut total_ingested: u64 = 0;
         let mut counters = counters;
         // Join every worker before selecting the terminal result. An earlier
