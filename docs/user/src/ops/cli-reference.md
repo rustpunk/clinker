@@ -129,13 +129,8 @@ destination and does not establish rollback.
 Explicit resource cancellation is an aborted run, reported as `cancelled` in
 machine mode with exit `130` and no failure classification. It does not depend
 on telemetry delivery or a pending shutdown signal. A genuine resource or data
-failure that the run reached before it stopped retains its classification even
-when a shutdown signal is pending; malformed source data remains
-`source.data.invalid` with `do_not_retry` advice. A failure in input the run
-had not reached when a cancellation stopped it does not replace the
-cancellation: the run still reports `cancelled` with exit `130`, and the
-failure is logged as a warning naming the source rather than added to the
-`cancelled` record.
+failure retains its classification even when a shutdown signal is pending;
+malformed source data remains `source.data.invalid` with `do_not_retry` advice.
 
 ---
 
