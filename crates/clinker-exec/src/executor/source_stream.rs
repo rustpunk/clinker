@@ -59,12 +59,11 @@ pub(crate) struct AttemptPopulationDelta {
 /// them. Rejections are consumed before downstream [`StreamEvent`] buffers are
 /// built.
 ///
-/// A stream ends with exactly one terminal event, [`Self::Ended`],
-/// [`Self::Interrupted`] or [`Self::Failed`], sent after the reader has
-/// returned and released what it held, and nothing follows it. A channel
-/// that disconnects without one ended on a failure the reader could not
-/// report (a panic): the walk treats it as a failure, never as the end of the
-/// input.
+/// A stream ends with exactly one terminal event, [`Self::Ended`] or
+/// [`Self::Failed`], sent after the reader has returned and released what it
+/// held, and nothing follows it. A channel that disconnects without one ended
+/// on a failure the reader could not report (a panic): the walk treats it as
+/// a failure, never as the end of the input.
 ///
 /// Not `Clone`: an attempt carries its own charge on the Source's handle,
 /// which exactly one event may release.
@@ -78,17 +77,10 @@ pub(crate) enum SourceStreamEvent {
         queued: QueuedCharge,
     },
     Punctuation(Punctuation),
-    /// The reader read its whole input. Every event before this one is the
-    /// Source's complete output. A read limit applied at the reader, such as
-    /// a bounded preview's per-Source limit, ends the input it admits this
-    /// way too: the rows it read are the input that was asked for.
+    /// The reader read its whole input, or stopped because the run was
+    /// cancelled (its outcome says which). Every event before this one is
+    /// the Source's complete output.
     Ended,
-    /// The reader stopped because the run was cancelled: a shutdown signal,
-    /// a required report that could not be written, or the reader's own
-    /// transport reporting the cancellation. The events before this one are
-    /// a prefix of the input, not the input: no step may finish on them, and
-    /// the walk stops as an interrupted run.
-    Interrupted,
     /// The reader stopped on an error. The events before this one are a
     /// prefix of the input, not the input: no step may finish on them.
     Failed(SourceReadFailure),
@@ -155,23 +147,18 @@ pub(crate) struct SourceStreamEnd {
 
 impl SourceStreamEnd {
     /// Send the terminal event for `result` and hand back the thread's
-    /// result: [`SourceStreamEvent::Interrupted`] for an outcome that observed
-    /// cancellation, [`SourceStreamEvent::Ended`] for any other outcome,
+    /// result: [`SourceStreamEvent::Ended`] for an outcome,
     /// [`SourceStreamEvent::Failed`] for an error. Blocks like a record send
     /// while the channel is full. A walk that has stopped reading this
     /// Source (it dropped the receiver) leaves the failure with the thread's
     /// result alone.
-    pub(super) fn finish(
+    pub(crate) fn finish<T>(
         self,
-        result: Result<super::ingest::IngestTaskOutcome, clinker_plan::error::PipelineError>,
-    ) -> Result<super::ingest::IngestTaskOutcome, SourceReadFailure> {
+        result: Result<T, clinker_plan::error::PipelineError>,
+    ) -> Result<T, SourceReadFailure> {
         match result {
             Ok(outcome) => {
-                let _ = self.tx.send(if outcome.interrupted {
-                    SourceStreamEvent::Interrupted
-                } else {
-                    SourceStreamEvent::Ended
-                });
+                let _ = self.tx.send(SourceStreamEvent::Ended);
                 Ok(outcome)
             }
             Err(error) => {

@@ -705,8 +705,7 @@ pub(crate) enum ConsumedSourceEvent {
     Population,
     /// The Source's reader reached the end of its input: every event before
     /// this one is the Source's complete output, and the channel carries
-    /// nothing more. Only a complete read ends this way; an interrupted or
-    /// failed read is the walk's error instead.
+    /// nothing more.
     Ended,
 }
 
@@ -825,11 +824,9 @@ pub(crate) fn apply_source_attempt_population(
 /// [`Ended`](crate::executor::source_stream::SourceStreamEvent::Ended) ends
 /// it. A reader's failure becomes the walk's error at the point in the
 /// Source's data where the reader stopped, before any step finishes on the
-/// rows that came before it. A read the run's cancellation cut off becomes
-/// the walk's graceful interruption at that same point, so no step finishes
-/// on its rows either. A channel that disconnects without a terminal event
-/// means the reader stopped without reporting (a panic), and is a failure
-/// too.
+/// rows that came before it; a channel that disconnects without either
+/// terminal event means the reader stopped without reporting (a panic), and
+/// is a failure too.
 pub(crate) fn consume_source_event(
     ctx: &mut ExecutorContext<'_>,
     expected_source: &Arc<str>,
@@ -850,11 +847,6 @@ pub(crate) fn consume_source_event(
     };
     match event {
         crate::executor::source_stream::SourceStreamEvent::Ended => Ok(ConsumedSourceEvent::Ended),
-        crate::executor::source_stream::SourceStreamEvent::Interrupted => {
-            publish_record_progress(ctx);
-            ctx.interrupted = true;
-            Err(PipelineError::Interrupted)
-        }
         crate::executor::source_stream::SourceStreamEvent::Failed(failure) => {
             publish_record_progress(ctx);
             Err(failure.take().unwrap_or_else(|| PipelineError::Internal {

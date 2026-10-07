@@ -1752,9 +1752,7 @@ mod tests {
                         assert_eq!((p.attempted, p.rejected), (12, 3));
                         result.push(format!("population:{}:{}", p.attempted, p.rejected));
                     }
-                    SourceStreamEvent::Ended
-                    | SourceStreamEvent::Interrupted
-                    | SourceStreamEvent::Failed(_) => {
+                    SourceStreamEvent::Ended | SourceStreamEvent::Failed(_) => {
                         panic!("the barrier sends no terminal event")
                     }
                 }
