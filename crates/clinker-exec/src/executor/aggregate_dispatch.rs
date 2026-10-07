@@ -1005,8 +1005,23 @@ impl KeyedGroupTables for RegisteredTables {
 
 /// A time-windowed Aggregate's tables: one per window (tumbling, hopping) or
 /// per group's session, keyed by `K`. Every table finalizes at end of input.
+///
+/// Like [`RegisteredTables`], it is the arm's guard: a table still here when
+/// it drops (an error exit before the finalize took it) has its consumer
+/// unregistered, so an error cannot strand a charged consumer in the
+/// arbitrator's registry that every later pass would elect and find out of
+/// the walk's reach.
 pub(crate) struct WindowTables<K> {
     tables: HashMap<K, GroupTable>,
+    arbitrator: Arc<crate::pipeline::memory::MemoryArbitrator>,
+}
+
+impl<K> Drop for WindowTables<K> {
+    fn drop(&mut self) {
+        for (_, (_, consumer_id)) in self.tables.drain() {
+            self.arbitrator.unregister_consumer(consumer_id);
+        }
+    }
 }
 
 impl<K: 'static> WalkOwnedSpill for WindowTables<K> {
@@ -1241,6 +1256,7 @@ impl<K: Eq + std::hash::Hash + Clone + 'static> WalkGroupTables<WindowTables<K>>
             arbitrator,
             WindowTables {
                 tables: HashMap::new(),
+                arbitrator: Arc::clone(arbitrator),
             },
         )
     }

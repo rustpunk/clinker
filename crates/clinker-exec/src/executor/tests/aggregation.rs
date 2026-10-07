@@ -2717,3 +2717,111 @@ mod walk_owned_tables {
         });
     }
 }
+
+mod window_tables_error_exit {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use clinker_bench_support::io::SharedBuffer;
+    use clinker_plan::error::PipelineError;
+
+    use crate::executor::{PipelineExecutor, PipelineRunParams, single_file_reader};
+    use crate::pipeline::memory::MemoryArbitrator;
+
+    /// A tumbling-window Aggregate over two hourly windows. The earlier
+    /// window's sum overflows at its finalize, so the run fails there while
+    /// the later window's table is still waiting for its own.
+    const YAML: &str = r#"
+pipeline:
+  name: window_tables_error_exit
+error_handling:
+  strategy: fail_fast
+nodes:
+- type: source
+  name: events
+  config:
+    name: events
+    type: csv
+    path: events.csv
+    watermark: { column: event_ts }
+    schema:
+      - { name: k, type: string }
+      - { name: v, type: int }
+      - { name: event_ts, type: date_time }
+- type: aggregate
+  name: hourly
+  input: events
+  config:
+    group_by: [k]
+    time_window:
+      tumbling: { size: 1h }
+    cxl: |
+      emit k = k
+      emit total = sum(v)
+- type: sink
+  name: out
+  input: hourly
+  config:
+    name: out
+    type: csv
+    path: out.csv
+"#;
+
+    const EVENTS_CSV: &str = "\
+k,v,event_ts
+g,9223372036854775807,2026-05-14T10:00:00
+g,1,2026-05-14T10:30:00
+g,1,2026-05-14T11:00:00
+";
+
+    /// A time-windowed Aggregate that fails with window tables still open
+    /// unregisters each of their consumers on the way out, as the
+    /// per-document arm does: a consumer left registered keeps its charge
+    /// and stays electable by every later reclaim pass, which can no longer
+    /// reach its table.
+    #[test]
+    fn a_failed_windowed_aggregate_unregisters_its_open_window_tables() {
+        let arbitrator = Arc::new(MemoryArbitrator::with_policy(
+            100 * 1024 * 1024 * 1024,
+            0.80,
+            0.70,
+            MemoryArbitrator::default_policy(),
+        ));
+        let config = clinker_plan::config::parse_config(YAML).expect("parse pipeline YAML");
+        let readers = HashMap::from([(
+            "events".to_string(),
+            single_file_reader(
+                "events.csv",
+                Box::new(std::io::Cursor::new(EVENTS_CSV.as_bytes().to_vec())),
+            ),
+        )]);
+        let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+            "out".to_string(),
+            Box::new(SharedBuffer::new()) as Box<dyn std::io::Write + Send>,
+        )]);
+        let params = PipelineRunParams {
+            execution_id: "window-tables-error-exit".to_string(),
+            batch_id: "batch-0".to_string(),
+            ..Default::default()
+        };
+        let result = PipelineExecutor::run_with_readers_writers_with_arbitrator(
+            &config,
+            readers,
+            writers.into(),
+            &params,
+            clinker_plan::config::CompileContext::default(),
+            Arc::clone(&arbitrator),
+        );
+
+        assert!(
+            matches!(result, Err(PipelineError::Accumulator { .. })),
+            "the earlier window's overflowing sum must fail the run at its finalize, got {result:?}"
+        );
+        assert_eq!(
+            arbitrator.consumer_count(),
+            0,
+            "the later window's table, never finalized, must not leave its consumer registered"
+        );
+        assert_eq!(arbitrator.sum_consumer_usage(), 0);
+    }
+}
