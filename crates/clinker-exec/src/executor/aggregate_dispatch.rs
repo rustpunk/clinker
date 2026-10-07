@@ -1734,8 +1734,8 @@ fn run_streaming_aggregate_ingest(
                     let source_file_arc = source_file_arc_of(&record);
                     let source_name_arc = source_name_arc_of(&record);
                     // Mid-stream `$source.count` is `None` (defer-emit) — the
-                    // total is unknown until the source disconnects, exactly as
-                    // the per-record eval sites resolve it.
+                    // total is unknown until the Source's stream ends, exactly
+                    // as the per-record eval sites resolve it.
                     let eval_ctx = EvalContext {
                         stable,
                         source_file: &source_file_arc,
