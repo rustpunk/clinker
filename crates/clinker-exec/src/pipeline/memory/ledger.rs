@@ -915,17 +915,18 @@ impl MemoryArbitrator {
     ) -> Result<(), Box<MemoryShortfallReport>> {
         self.observe();
         let limit = self.hard_limit();
-        if self.charged_bytes().saturating_add(uncharged) > limit {
-            #[cfg(any(test, feature = "test-utils"))]
-            let rounds_before = self.reclaim_rounds();
-            let reclaimed = self.reclaim_before_abort(requester, uncharged);
-            #[cfg(any(test, feature = "test-utils"))]
-            if self.reclaim_rounds() > rounds_before {
-                self.note_hard_limit_reclaim(node, &surface, uncharged);
-            }
-            if let Err(shortfall) = reclaimed {
-                return Err(self.backstop_shortfall_report(shortfall, node, surface));
-            }
+        // `reclaim_before_abort` checks the projection under the ledger lock
+        // and returns at once when it fits, so no separate reading of the
+        // charged total gates it: one check, one reading.
+        #[cfg(any(test, feature = "test-utils"))]
+        let rounds_before = self.reclaim_rounds();
+        let reclaimed = self.reclaim_before_abort(requester, uncharged);
+        #[cfg(any(test, feature = "test-utils"))]
+        if self.reclaim_rounds() > rounds_before {
+            self.note_hard_limit_reclaim(node, &surface, uncharged);
+        }
+        if let Err(shortfall) = reclaimed {
+            return Err(self.backstop_shortfall_report(shortfall, node, surface));
         }
         match self.peak_rss().filter(|peak| *peak > limit) {
             Some(peak) => Err(self.process_memory_report(
