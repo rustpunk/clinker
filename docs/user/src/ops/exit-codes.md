@@ -156,11 +156,11 @@ completed run into a cancellation or discards computed output. A supervisor
 should therefore read 130 as "nothing was published", never as "an advisory
 record went missing".
 
-A source whose input fails after the cancellation has stopped the run, on
-input Clinker had not reached yet, does not change the outcome either: the run
-still exits 130, and the failure is logged as a warning naming the source. A
-failure Clinker had already reached when it stopped fails the run with that
-failure's own exit code instead.
+A source failure in input Clinker had not reached when the cancellation
+stopped the run does not change the outcome either, whichever happened first:
+the run still exits 130, and the failure is logged as a warning naming the
+source. A failure in input Clinker had already read up to fails the run with
+that failure's own exit code instead.
 
 Cancellation is also recorded as a cancellation everywhere else it is
 reported: the OpenLineage terminal is `ABORT` and the `--machine` terminal is
