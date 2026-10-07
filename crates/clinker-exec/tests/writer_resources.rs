@@ -2491,7 +2491,7 @@ nodes:
 }
 
 #[test]
-fn multiple_source_failures_beat_cancellation_in_either_join_order() {
+fn reached_source_failures_beat_cancellation_but_unreached_ones_do_not() {
     use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, WriterRegistry};
     use clinker_exec::source::{RecordSource, SourceInput};
     use clinker_format::FormatError;
@@ -2694,7 +2694,7 @@ fn decode_cancelled_source_lifecycle_is_independent_of_telemetry_admission() {
 }
 
 #[test]
-fn decode_source_failure_stays_failed_when_shutdown_is_requested() {
+fn decode_source_failure_unreached_by_a_cancelled_run_stays_cancelled() {
     use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, WriterRegistry};
     use clinker_exec::source::{RecordSource, SourceInput};
     use clinker_exec::telemetry::{MetricKey, SpanName, SpanStatus};

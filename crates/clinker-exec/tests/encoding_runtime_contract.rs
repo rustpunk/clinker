@@ -486,7 +486,7 @@ mode = "none"
 }
 
 #[test]
-fn nested_failed_second_file_preserves_source_and_sink_count_prefixes() {
+fn nested_failed_second_file_keeps_source_count_and_writes_no_rows() {
     use clinker_exec::progress::RunProgress;
     use clinker_exec::telemetry::{MetricKey, TelemetryArena};
     use clinker_plan::config::ClinkerToml;
@@ -668,7 +668,7 @@ nodes:
 }
 
 #[test]
-fn physical_failed_files_preserve_source_population_sink_bytes_and_lifecycle() {
+fn physical_failed_files_keep_source_population_and_lifecycle_and_write_no_rows() {
     use clinker_exec::progress::RunProgress;
     use clinker_exec::telemetry::{MetricKey, TelemetryArena};
     use clinker_plan::config::ClinkerToml;
