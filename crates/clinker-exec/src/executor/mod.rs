@@ -2157,6 +2157,9 @@ impl PipelineExecutor {
             let result = ctx
                 .check_shutdown()
                 .and_then(|()| dispatch::dispatch_plan_node(&mut ctx, plan, node_idx));
+            // The output errors this turn collected (so sibling Sinks still
+            // ran) belong to this turn, ahead of how the turn itself ended.
+            failures.extend(turn, &node, std::mem::take(&mut ctx.output_errors));
             if let Some(end) = settle_turn(&mut ctx, &mut failures, turn, node_idx, &node, result) {
                 walk_end = end;
                 break;
@@ -2248,7 +2251,7 @@ impl PipelineExecutor {
         // returns; a walk that never reached the commit releases them here.
         ctx.parked_generations.borrow_mut().release_all();
 
-        // Output errors the walk's arms collected so sibling Sinks still ran.
+        // Output errors collected outside every turn (the teardown above).
         failures.extend(
             turns,
             &pipeline_name,
@@ -2268,13 +2271,19 @@ impl PipelineExecutor {
         // all suppressed before any Output — emitting their trigger entry
         // once each. Skipped on an interrupted run, which is a graceful stop
         // rather than a completed drain.
+        // What the sweep collects and any failure it returns come after the
+        // last turn.
         if walk_completed {
-            crate::executor::document_dlq::reject_unclosed_failed_documents(&mut ctx)?;
+            let swept = crate::executor::document_dlq::reject_unclosed_failed_documents(&mut ctx);
             failures.extend(
                 turns,
                 &pipeline_name,
                 std::mem::take(&mut ctx.output_errors),
             );
+            if let Err(error) = swept {
+                failures.push(turns, &pipeline_name, error);
+                walk_end = WalkEnd::Failed;
+            }
         }
 
         // Top-scope teardown: the run has drained, so unregister every
@@ -2344,19 +2353,25 @@ impl PipelineExecutor {
             records_emitted,
         ));
 
+        // Every dead letter of the walk has been pushed: the streaming Sink
+        // threads were joined and folded above, and the document terminal
+        // sweep has run. Close the walk's writer so its rows are flushed into
+        // the staged files before the caller can publish them; a run that
+        // already failed publishes nothing, so its writer is left unflushed.
+        // A failed close is the run's failure, after the last turn.
+        if !failures.has_failure(walk_end)
+            && let Err(error) = ctx.dlq.close(counters.dlq_count)
+        {
+            failures.push(turns, &pipeline_name, error);
+            walk_end = WalkEnd::Failed;
+        }
+
         // The one place the run's error is decided, from every failure the
         // walk met in the order it met them. An early return here drops
         // `ctx` (and with it the sole `SpillDir` guard), whose `Drop` releases
         // the lock before removing the directory — the error path is cleaned
         // up identically to the clean path.
         failures.resolve(walk_end, &mut ctx.interrupted)?;
-
-        // Every dead letter of the walk has been pushed: the streaming Sink
-        // threads were joined and folded above, and the document terminal
-        // sweep has run. Close the walk's writer so its rows are flushed into
-        // the staged files before the caller can publish them. A flush error
-        // fails the run.
-        ctx.dlq.close(counters.dlq_count)?;
 
         // Clean-exit teardown of the spill directory. Dropping the guard here —
         // after every operator-side spill path has been drained and the metrics
@@ -2497,6 +2512,16 @@ impl WalkFailures {
         }
     }
 
+    /// Whether the run fails: the walk failed, or the record holds a
+    /// failure that is not the run's cancellation.
+    fn has_failure(&self, end: WalkEnd) -> bool {
+        end == WalkEnd::Failed
+            || self
+                .entries
+                .iter()
+                .any(|entry| !preparation::is_explicit_cancellation(&entry.error))
+    }
+
     /// Whether any recorded failure is the run's cancellation.
     fn any_cancellation(&self) -> bool {
         self.entries
@@ -2536,7 +2561,7 @@ impl WalkFailures {
             };
             for later in failed {
                 tracing::warn!(
-                    node = %later.node,
+                    node = later.node.as_str(),
                     turn = later.turn,
                     error = %later.error,
                     "this step also failed, after the run's first failure; the run reports \

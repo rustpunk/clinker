@@ -5630,9 +5630,10 @@ impl ResidentSlotSpill<'_> {
 /// While the arm runs, governed allocations on the walk are charged to the
 /// node's own first registered consumer when it has one, so a reclaim they
 /// start elects that node's state last; the previous walk requester is
-/// restored afterwards, unless it unregistered while the arm ran. A spill a reclaim pass could not complete during the
-/// arm fails the node with that spill's error, ahead of whatever the arm
-/// returned, since the request that met it saw only a shortfall.
+/// restored afterwards, unless it unregistered while the arm ran. A spill a
+/// reclaim pass could not complete during the arm fails the node with that
+/// spill's error, ahead of whatever the arm returned (see
+/// [`settle_reclaim_slot`]).
 pub(crate) fn dispatch_plan_node(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
@@ -5650,18 +5651,34 @@ pub(crate) fn dispatch_plan_node(
     )
 }
 
-/// The result of `node`'s dispatch turn, given the reclaim slot: a spill a
-/// reclaim pass could not complete while the turn ran fails the node with
-/// that spill's error, ahead of whatever the turn returned.
+/// The result of `node`'s dispatch turn, given the reclaim slot. Runs on the
+/// walk's thread, once the turn's arm has returned.
+///
+/// A spill a reclaim pass could not complete while the turn ran fails the
+/// node with that spill's error, ahead of whatever the arm returned: it is
+/// earlier in data order, since the request that met it saw only a
+/// shortfall and the arm went on from there. An error of the arm's own that
+/// it replaces is logged with the node's name, unless it is the run's
+/// cancellation, which is not a failure; it is never dropped silently.
 pub(crate) fn settle_reclaim_slot(
     arbitrator: &crate::pipeline::memory::MemoryArbitrator,
     node: &str,
     result: Result<(), PipelineError>,
 ) -> Result<(), PipelineError> {
-    let _ = node;
-    match arbitrator.take_reclaim_failure() {
-        Some(failure) => Err(failure),
-        None => result,
+    match (arbitrator.take_reclaim_failure(), result) {
+        (Some(failure), Err(arm)) => {
+            if !super::preparation::is_explicit_cancellation(&arm) {
+                tracing::warn!(
+                    node,
+                    error = %arm,
+                    "this step also failed, after a spill a reclaim pass started for it had \
+                     failed; the run reports the spill's failure"
+                );
+            }
+            Err(failure)
+        }
+        (Some(failure), Ok(())) => Err(failure),
+        (None, result) => result,
     }
 }
 
