@@ -1067,10 +1067,27 @@ fn a_lost_periodic_observation_does_not_cancel_a_completed_run() {
     );
 }
 
+/// Wait, until `deadline`, for the shutdown marker a debug build's signal
+/// handler creates once it has cancelled every run it registered.
+#[cfg(target_os = "linux")]
+fn wait_for_shutdown_marker(marker: &std::path::Path, deadline: Instant) {
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the child never handled the shutdown signal"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// A shutdown signal that trips while a REST request is already in flight
 /// unwinds the run as an error rather than through the drained-report flag.
 /// Both paths are the same operator action, so both must record the same
 /// lineage terminal; a `FAIL` here would page an on-call for a cancellation.
+///
+/// The server drops the connection only once the child's handler has
+/// cancelled the run, which the child marks with a file, so the reader
+/// always meets the drop as a cancelled run, never as a transport failure.
 #[cfg(target_os = "linux")]
 #[test]
 fn sigterm_inside_a_rest_read_records_an_abort_lineage_terminal() {
@@ -1079,6 +1096,8 @@ fn sigterm_inside_a_rest_read_records_an_abort_lineage_terminal() {
     let address = listener.local_addr().expect("listener address");
     write_hanging_rest_pipeline(directory.path(), address);
     write_local_lineage_policy(directory.path());
+    let marker = directory.path().join("shutdown-handled");
+    let server_marker = marker.clone();
 
     let (request_ready_tx, request_ready_rx) = mpsc::sync_channel(1);
     let (sigterm_sent_tx, sigterm_sent_rx) = mpsc::sync_channel(1);
@@ -1102,9 +1121,8 @@ fn sigterm_inside_a_rest_read_records_an_abort_lineage_terminal() {
         // is the order of the two: the reader must already know the run is
         // cancelled when the connection goes away, or it reads the drop as an
         // ordinary transport failure and reports infrastructure instead of an
-        // abort. Delivery and handling are separated by the child's scheduler,
-        // so the drop waits well past any plausible gap rather than racing it.
-        std::thread::sleep(Duration::from_millis(250));
+        // abort. So the drop waits for the child to say it has handled it.
+        wait_for_shutdown_marker(&server_marker, Instant::now() + Duration::from_secs(5));
         // Then drop without a response. The child is blocked inside the
         // request, so the teardown lands after cancellation and the reader
         // reports the interruption rather than a clean page boundary.
@@ -1112,7 +1130,9 @@ fn sigterm_inside_a_rest_read_records_an_abort_lineage_terminal() {
     });
 
     let mut command = machine_command(directory.path(), "rest-abort");
-    command.args(["--lineage-events", "lineage.ndjson"]);
+    command
+        .args(["--lineage-events", "lineage.ndjson"])
+        .env("CLINKER_TEST_SHUTDOWN_MARKER", &marker);
     let result = run_child(
         command,
         ProcessConfig::new(Duration::from_secs(5)).graceful_trigger(
@@ -1145,6 +1165,10 @@ fn sigterm_inside_a_rest_read_records_an_abort_lineage_terminal() {
 /// cancellation. The preview's read limit is a normal end of input; a signal
 /// is not, so the preview reports 130 like any other cancelled run rather
 /// than the success status of a preview that read what it asked for.
+///
+/// The server drops the connection only once the child's handler has
+/// cancelled the run, which the child marks with a file, so the reader
+/// always stops as cancelled rather than on a transport failure.
 #[cfg(target_os = "linux")]
 #[test]
 fn an_interrupted_preview_exits_as_cancelled() {
@@ -1152,6 +1176,8 @@ fn an_interrupted_preview_exits_as_cancelled() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
     let address = listener.local_addr().expect("listener address");
     write_hanging_rest_pipeline(directory.path(), address);
+    let marker = directory.path().join("shutdown-handled");
+    let server_marker = marker.clone();
 
     let (request_ready_tx, request_ready_rx) = mpsc::sync_channel(1);
     let (sigterm_sent_tx, sigterm_sent_rx) = mpsc::sync_channel(1);
@@ -1190,25 +1216,28 @@ fn an_interrupted_preview_exits_as_cancelled() {
         sigterm_sent_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("supervisor sent SIGTERM");
-        // Let the child handle the signal before the read it is blocked in
-        // ends, so the reader stops as cancelled rather than on a transport
-        // failure.
-        std::thread::sleep(Duration::from_millis(250));
+        // The child must have handled the signal before the read it is
+        // blocked in ends, so the reader stops as cancelled rather than on a
+        // transport failure.
+        wait_for_shutdown_marker(&server_marker, deadline);
         drop(stream);
     });
 
     // A preview takes no `--machine` stream; the process status is its
     // whole result.
     let mut command = Command::new(clinker_bin());
-    command.current_dir(directory.path()).args([
-        "run",
-        "pipeline.yaml",
-        "--dry-run",
-        "-n",
-        "5",
-        "--dry-run-output",
-        "preview.csv",
-    ]);
+    command
+        .current_dir(directory.path())
+        .args([
+            "run",
+            "pipeline.yaml",
+            "--dry-run",
+            "-n",
+            "5",
+            "--dry-run-output",
+            "preview.csv",
+        ])
+        .env("CLINKER_TEST_SHUTDOWN_MARKER", &marker);
     let result = run_child(
         command,
         ProcessConfig::new(Duration::from_secs(5)).graceful_trigger(

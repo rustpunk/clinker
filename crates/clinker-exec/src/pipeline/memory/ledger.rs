@@ -1230,12 +1230,20 @@ impl MemoryArbitrator {
         reclaim: &mut dyn WalkReclaim,
         kind: PassKind,
     ) -> Result<PassOutcome, PipelineError> {
-        self.reclaim_rounds.fetch_add(1, Ordering::Relaxed);
         let target = {
             let mut ledger = self.admission.ledger.lock();
             if let Some(walk) = super::sync::current_thread() {
+                // A request that falls short inside a victim's spill would
+                // otherwise start a pass over the open one and lose what its
+                // victim has freed so far. A spill never reserves, so this
+                // refuses only a request that broke that rule: it frees
+                // nothing and its shortfall stands.
+                if ledger.pass_open_on(walk) {
+                    return Ok(PassOutcome::default());
+                }
                 ledger.begin_pass(walk);
             }
+            self.reclaim_rounds.fetch_add(1, Ordering::Relaxed);
             match aim {
                 PassAim::Request(need) => {
                     let short = need.saturating_sub(ledger.available());
@@ -3879,6 +3887,53 @@ mod walk_pass_tests {
         assert!(
             text.contains("), freed 200.0 KiB; paused 0 sources\n"),
             "{text}"
+        );
+    }
+
+    /// A victim's spill that releases bytes and then makes a request that
+    /// falls short, inside the pass that elected it: that request starts no
+    /// pass of its own and returns its shortfall, and the open pass still
+    /// counts what the victim released.
+    #[test]
+    fn a_shortfall_inside_a_pass_starts_no_pass_and_keeps_the_open_one() {
+        let arbitrator = run(MIB, Box::new(Priority));
+        let (victim, victim_handle) = register(&arbitrator, "victim", 0, 400 * KIB);
+        let _filler = arbitrator
+            .reserve(500 * KIB, governed())
+            .expect("filler fits");
+        let released = 100 * KIB;
+        let nested: Rc<RefCell<Option<(bool, u64)>>> = Rc::default();
+        let during = {
+            let arbitrator = Arc::clone(&arbitrator);
+            let handle = Arc::clone(&victim_handle);
+            let nested = Rc::clone(&nested);
+            move || {
+                handle.shrink(released);
+                let rounds_before = arbitrator.reclaim_rounds();
+                let refused = arbitrator.reserve(300 * KIB, governed()).is_err();
+                *nested.borrow_mut() = Some((refused, arbitrator.reclaim_rounds() - rounds_before));
+            }
+        };
+        let set = empty_set();
+        let _walk = walk(&arbitrator, &set);
+        let victims = Scripted::default()
+            .held(victim, &victim_handle)
+            .during_spill(during)
+            .shared();
+        let shortfall = scripted(&victims, || arbitrator.reserve(600 * KIB, governed()))
+            .expect_err("what the victim released does not cover the request");
+
+        let (refused, nested_rounds) = (*nested.borrow()).expect("the victim's spill ran");
+        assert!(refused, "the request inside the pass returns its shortfall");
+        assert_eq!(
+            nested_rounds, 0,
+            "the request inside the pass starts no pass"
+        );
+        let report = shortfall.into_report(&arbitrator);
+        let round = report.reclaim.as_ref().expect("the walk ran a round");
+        assert_eq!(
+            round.bytes_freed, released,
+            "the open pass still counts what its victim released"
         );
     }
 

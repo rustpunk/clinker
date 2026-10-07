@@ -118,14 +118,32 @@ fn install_process_signal_handler() -> Result<(), String> {
         return Err("injected signal-handler installation failure".to_owned());
     }
 
-    // ctrlc with "termination" feature handles both SIGINT and SIGTERM.
+    // A subprocess test needs to know when the signal has been handled, not
+    // only sent, before it changes what the cancelled run is blocked on;
+    // the file this names is created once every registered run is
+    // cancelled. Release builds compile none of it.
+    #[cfg(debug_assertions)]
+    let shutdown_marker = std::env::var_os("CLINKER_TEST_SHUTDOWN_MARKER");
+
+    // ctrlc with "termination" feature handles both SIGINT and SIGTERM. The
+    // handler runs on ctrlc's own thread, not in signal context.
     ctrlc::set_handler(move || {
-        let guard = registry().lock().expect("shutdown registry poisoned");
-        for weak in guard.iter() {
-            if let Some(state) = weak.upgrade() {
-                let _ =
-                    state.compare_exchange(ACTIVE, CANCELLED, Ordering::SeqCst, Ordering::SeqCst);
+        {
+            let guard = registry().lock().expect("shutdown registry poisoned");
+            for weak in guard.iter() {
+                if let Some(state) = weak.upgrade() {
+                    let _ = state.compare_exchange(
+                        ACTIVE,
+                        CANCELLED,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    );
+                }
             }
+        }
+        #[cfg(debug_assertions)]
+        if let Some(marker) = &shutdown_marker {
+            let _ = std::fs::File::create(marker);
         }
     })
     .map_err(|error| error.to_string())

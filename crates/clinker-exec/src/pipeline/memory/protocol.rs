@@ -406,9 +406,17 @@ impl<L, A> LedgerState<L, A> {
         }
     }
 
-    /// Start tracking a reclaim pass run by the thread `walk`. A pass
-    /// already open is replaced, which only a pass that never ended (a
-    /// panic between its start and end) can leave behind.
+    /// Whether a reclaim pass run by the thread `walk` is open: a request
+    /// that falls short inside a victim's spill finds its own pass here.
+    pub(crate) fn pass_open_on(&self, walk: ThreadId) -> bool {
+        self.pass.as_ref().is_some_and(|pass| pass.walk == walk)
+    }
+
+    /// Start tracking a reclaim pass run by the thread `walk`. Never reached
+    /// while a pass is open on `walk` ([`Self::pass_open_on`] is checked
+    /// first), so a request a victim makes inside a pass cannot replace the
+    /// open pass's measurement. A pass ends on return or on unwind, so none
+    /// is left open behind it.
     pub(crate) fn begin_pass(&mut self, walk: ThreadId) {
         self.pass = Some(PassTrack {
             walk,

@@ -1594,14 +1594,16 @@ fn assert_grace_reload_completes(capacity: u64, ample_rows: &[String]) {
     );
 }
 
-/// Once a grace join's build loop has moved every build row into a
-/// partition, the build input's charge ends: the partitions charge each row
-/// at its full figure, and rows already written to disk hold no memory. The
-/// capacity holds the driver's charge beside the hot partition's reloaded
-/// table, and both inputs together when they are collected, but not the
-/// build input's charge beside the reloaded table as well. Counting that
-/// charge until the join returns refuses the reload with E310 for the
-/// join's build side.
+/// A grace join that spills and reloads its partitions completes under a
+/// capacity that holds the driver's charge beside the hot partition's
+/// reloaded table, and both inputs together when they are collected, but
+/// not the build input's charge beside the reloaded table as well. The
+/// capacity alone does not show where the build input's charge ends: the
+/// join finishes under it even when the charge is kept until the join
+/// returns. That drop point, once the build loop has moved every build row
+/// into a partition and before the probe starts, is pinned by
+/// `a_grace_join_has_released_its_build_input_before_it_probes` in the
+/// grace join's unit tests.
 #[test]
 fn a_grace_join_reloading_spilled_partitions_does_not_count_its_build_input() {
     let (_, ample_rows, orders, products) = grace_reload_ample();

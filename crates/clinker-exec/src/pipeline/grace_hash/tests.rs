@@ -2530,6 +2530,19 @@ fn run_grace_arrival_order(
     match_mode: clinker_plan::config::pipeline_node::MatchMode,
     budget: &MemoryArbitrator,
 ) -> Vec<Record> {
+    run_grace_join(GRACE_ORDER_KEYS, match_mode, budget, None, None)
+}
+
+/// [`run_grace_arrival_order`]'s join over drivers `0..driver_keys`, each
+/// key past `GRACE_ORDER_KEYS` a miss, with the inputs' charges handed to
+/// the join.
+fn run_grace_join(
+    driver_keys: i64,
+    match_mode: clinker_plan::config::pipeline_node::MatchMode,
+    budget: &MemoryArbitrator,
+    build_input_charge: Option<TransientNodeBufferReservation>,
+    driver_input_charge: Option<TransientNodeBufferReservation>,
+) -> Vec<Record> {
     use crate::executor::combine::CombineResolverMapping;
     use clinker_plan::plan::combine::{DecomposedPredicate, EqualityConjunct};
     use clinker_plan::plan::types::JoinSide;
@@ -2537,7 +2550,7 @@ fn run_grace_arrival_order(
 
     let driver_schema = schema_with(&["dk", "v"]);
     let build_schema = schema_with(&["bk", "name"]);
-    let drivers: Vec<(Record, RecordOrder)> = (0..GRACE_ORDER_KEYS)
+    let drivers: Vec<(Record, RecordOrder)> = (0..driver_keys)
         .map(|i| {
             (
                 Record::new(
@@ -2670,8 +2683,8 @@ fn run_grace_arrival_order(
             consumer_id: unregistered_consumer_id(),
             strategy: clinker_plan::config::ErrorStrategy::FailFast,
             stats_sink: test_stats_sink(&stats_catalog, "products", "products"),
-            build_input_charge: None,
-            driver_input_charge: None,
+            build_input_charge,
+            driver_input_charge,
         },
         crate::test_support::test_kernel_pool(),
     )
@@ -2750,6 +2763,68 @@ fn grace_hash_candidates_follow_build_arrival_order_resident_and_spilled() {
 
 /// Free capacity a foreign request is made short of, past the charged total.
 const FOREIGN_FREE: u64 = 4 * 1024;
+
+/// A grace join's build input charge ends once its build loop has moved
+/// every build row into a partition, so the probe loop never runs with it
+/// on the ledger: at the probe's first memory check the build input's
+/// consumer is no longer registered and the charged total excludes its
+/// charge, while the driver input's charge, still standing for the rows the
+/// loop is probing, remains.
+#[test]
+fn a_grace_join_has_released_its_build_input_before_it_probes() {
+    const BUILD_INPUT: u64 = 64 * 1024 * 1024;
+    const DRIVER_INPUT: u64 = 1024 * 1024;
+    let budget = Arc::new(MemoryArbitrator::with_policy(
+        1024 * 1024 * 1024,
+        0.80,
+        0.70,
+        Box::new(NoOpPolicy),
+    ));
+    budget.read_no_process_memory();
+    let reserve = |bytes, node| {
+        crate::executor::node_buffer::reserve_node_buffer_materialization(bytes, &budget, node)
+            .expect("the input charge fits the ledger")
+    };
+    let build_input_charge = reserve(BUILD_INPUT, "products");
+    let driver_input_charge = reserve(DRIVER_INPUT, "orders");
+    let consumers_with_inputs = budget.consumer_count();
+    let seen: Rc<RefCell<Option<(usize, u64)>>> = Rc::default();
+    let records = {
+        let seen = Rc::clone(&seen);
+        with_probe_check_observer(
+            move |arbitrator| {
+                *seen.borrow_mut() =
+                    Some((arbitrator.consumer_count(), arbitrator.charged_bytes()));
+            },
+            || {
+                run_grace_join(
+                    MEMORY_CHECK_INTERVAL as i64 + 1,
+                    clinker_plan::config::pipeline_node::MatchMode::All,
+                    &budget,
+                    Some(build_input_charge),
+                    Some(driver_input_charge),
+                )
+            },
+        )
+    };
+    assert_eq!(
+        records.len(),
+        (GRACE_ORDER_KEYS * GRACE_ORDER_PER_KEY) as usize,
+        "each keyed driver joins each of its builds; the rest miss"
+    );
+    let (consumers, charged) = (*seen.borrow()).expect("the probe loop reached a memory check");
+    assert_eq!(
+        consumers,
+        consumers_with_inputs - 1,
+        "at the probe's first check only the build input's consumer has left the registry"
+    );
+    assert!(
+        (DRIVER_INPUT..BUILD_INPUT).contains(&charged),
+        "the probe runs with the driver input charged and the build input's charge \
+         gone: {charged} bytes charged"
+    );
+    assert_eq!(budget.charged_bytes(), 0, "every charge ends with the join");
+}
 
 /// Build rows keyed `0..GRACE_ORDER_KEYS`, [`GRACE_ORDER_PER_KEY`] per key,
 /// delivered interleaved across keys, and one driver per key.

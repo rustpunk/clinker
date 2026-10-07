@@ -368,23 +368,28 @@ impl WalkReclaimSet {
             })
             .collect();
         let mut wrote = false;
-        let mut unwritten = Vec::new();
+        let mut unwritten = false;
+        // Each unwritten cell's request is raised as it is found, so a later
+        // cell's spill failure cannot leave it unraised.
         for (cell, handle) in &live {
-            match cell.try_borrow_mut() {
+            let written = match cell.try_borrow_mut() {
                 Ok(mut owner) => match owner.spill_owned(id, arbitrator)? {
-                    OwnedSpillResult::Wrote => wrote = true,
-                    OwnedSpillResult::NothingToWrite => unwritten.push(handle),
-                    OwnedSpillResult::NotHeld => {}
+                    OwnedSpillResult::Wrote => true,
+                    OwnedSpillResult::NothingToWrite => false,
+                    OwnedSpillResult::NotHeld => continue,
                 },
-                Err(_) => unwritten.push(handle),
+                Err(_) => false,
+            };
+            if written {
+                wrote = true;
+            } else {
+                unwritten = true;
+                handle.request_spill();
             }
-        }
-        for handle in &unwritten {
-            handle.request_spill();
         }
         if wrote {
             Ok(VictimOutcome::Spilled)
-        } else if !unwritten.is_empty() {
+        } else if unwritten {
             Ok(VictimOutcome::Busy)
         } else {
             self.owned.remove(&id);
@@ -1743,6 +1748,60 @@ mod walk_owned_tests {
                 drop(owners);
                 arbitrator.unregister_consumer(id);
             }
+        });
+    }
+
+    /// A stand-in owner whose spill fails.
+    struct FailingOwner;
+
+    impl WalkOwnedSpill for FailingOwner {
+        fn spill_owned(
+            &mut self,
+            _id: ConsumerId,
+            _arbitrator: &MemoryArbitrator,
+        ) -> Result<OwnedSpillResult, PipelineError> {
+            Err(PipelineError::Internal {
+                op: "spill",
+                node: "sorted".to_string(),
+                detail: "the stand-in's spill fails".to_string(),
+            })
+        }
+    }
+
+    /// A cell found holding state it could not write has its consumer's
+    /// spill request raised even when a later cell's spill fails: the
+    /// failure is the victim's result, and the state that could not be
+    /// written still answers the request at its owner's next boundary.
+    #[test]
+    fn a_cell_left_unwritten_raises_its_request_when_a_later_cell_fails() {
+        let arbitrator = arbitrator();
+        with_test_walk_frame(&arbitrator, || {
+            let (id, handle) = sort_consumer(&arbitrator);
+            let unwritten = Rc::new(RefCell::new(ReportingOwner {
+                consumer: id,
+                result: OwnedSpillResult::NothingToWrite,
+                asked: 0,
+            }));
+            let _unwritten_registration =
+                register_walk_owned(&arbitrator, id, &handle, &unwritten).expect("registered");
+            let failing = Rc::new(RefCell::new(FailingOwner));
+            let _failing_registration =
+                register_walk_owned(&arbitrator, id, &handle, &failing).expect("registered");
+
+            let outcome = walk_reclaim_set(&arbitrator)
+                .expect("on the walk")
+                .borrow_mut()
+                .spill_victim(id, &arbitrator);
+            assert!(
+                matches!(outcome, Err(PipelineError::Internal { .. })),
+                "the later cell's failure is the victim's result, got {outcome:?}"
+            );
+            assert_eq!(unwritten.borrow().asked, 1, "the first cell was asked");
+            assert!(
+                handle.take_spill_request(),
+                "the cell left unwritten has its spill request raised"
+            );
+            arbitrator.unregister_consumer(id);
         });
     }
 

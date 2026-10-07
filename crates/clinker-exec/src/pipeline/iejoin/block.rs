@@ -4817,6 +4817,136 @@ mod tests {
         drop(out);
     }
 
+    /// Each side's input charge ends when that side's drain returns, checked
+    /// side by side: in each run one side's charge nearly fills the limit
+    /// and the other's is tiny, so a charge that outlived its drain would
+    /// leave no room for the join's own charge at the deferred-miss
+    /// finalize's check, which would refuse with E310. Both runs complete.
+    #[test]
+    fn a_side_whose_charge_outlives_its_drain_is_refused_at_the_finalize() {
+        let hard = 1u64 << 30;
+        let spare = 64 * 1024;
+        let tiny = 64 * 1024;
+        for (driver_charge, build_charge) in
+            [(hard - spare - tiny, tiny), (tiny, hard - spare - tiny)]
+        {
+            let budget = Arc::new(arbitrator(hard));
+            budget.read_no_process_memory();
+            let consumer = ConsumerHandle::new();
+            budget
+                .register_node_consumer(
+                    Arc::new(crate::pipeline::sort_buffer::SortConsumer::new(
+                        consumer.clone(),
+                    )),
+                    consumer.clone(),
+                    clinker_plan::runtime_error::ConsumerLabel {
+                        node: "drain_release".to_string(),
+                        surface: clinker_plan::runtime_error::MemorySurface::JoinState,
+                    },
+                )
+                .expect("a fresh handle registers");
+            let reserve = |bytes, node| {
+                crate::executor::node_buffer::reserve_node_buffer_materialization(
+                    bytes, &budget, node,
+                )
+                .expect("the input charge fits the ledger")
+            };
+            let driver_input_charge = reserve(driver_charge, "drivers");
+            let build_input_charge = reserve(build_charge, "builds");
+            assert_eq!(budget.charged_bytes(), hard - spare);
+
+            // Every driver is scan-phase unmatched (NULL range key) and
+            // dispatched through the finalize, one more than a full check
+            // interval of them, so the finalize polls the hard limit; the pile
+            // they wait in is charged to the join and is larger than the spare
+            // room beside either input's charge.
+            let interval = crate::pipeline::iejoin::MEMORY_CHECK_INTERVAL;
+            let d_schema = driver_schema();
+            let b_schema = build_schema();
+            let out_schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
+                "d_k1".into(),
+                "d_k2".into(),
+                "d_id".into(),
+                "b_k1".into(),
+                "b_k2".into(),
+                "b_id".into(),
+            ])));
+            let driver: Side = (0..(interval as i64 + 1)).map(|i| (None, i)).collect();
+            let build: Side = vec![(Some((5, 5)), 100)];
+            let (driver_bare, driver_scans) = to_records_scans(&driver, &d_schema);
+            let driver_records: Vec<(Record, RecordOrder)> = driver_bare
+                .into_iter()
+                .enumerate()
+                .map(|(i, r)| (r, RecordOrder::from(i as u64)))
+                .collect();
+            let (build_records, build_scans) = to_records_scans(&build, &b_schema);
+            let stable = StableEvalContext::test_default();
+            let ctx = EvalContext::test_default_borrowed(&stable);
+            let resolver = empty_resolver();
+            let tmp = tempfile::Builder::new()
+                .prefix("iejoin-drain-release-per-side-")
+                .tempdir()
+                .expect("temp dir");
+            let propagate = PropagateCkSpec::Driver;
+
+            let out = execute_block_band(
+                BlockBandExec {
+                    allocation_resources: &test_allocation_resources(),
+                    name: "drain_release",
+                    build_qualifier: "b",
+                    driver_records,
+                    driver_scans,
+                    build_records: crate::test_support::with_build_row_ids(build_records),
+                    build_scans,
+                    op1: RangeOp::Le,
+                    op2: Some(RangeOp::Ge),
+                    residual_eval: None,
+                    body_eval: Some(constant_body()),
+                    resolver_mapping: &resolver,
+                    output_schema: Some(&out_schema),
+                    match_mode: MatchMode::All,
+                    on_miss: OnMiss::NullFields,
+                    max_output_rows: None,
+                    propagate_ck: &propagate,
+                    ctx: &ctx,
+                    budget: &budget,
+                    consumer: &consumer,
+                    spill_dir: tmp.path(),
+                    spill_compress: false,
+                    strategy: ErrorStrategy::FailFast,
+                    options: BlockBandOptions::default(),
+                    driver_input_charge: Some(driver_input_charge),
+                    build_input_charge: Some(build_input_charge),
+                },
+                crate::test_support::test_kernel_pool(),
+            )
+            .unwrap_or_else(|err| {
+                panic!(
+                    "with the driver's input charged {driver_charge} and the build's \
+                     {build_charge}, the finalize's check must count each row once and \
+                     find room: {err:?}"
+                )
+            });
+            assert_eq!(
+                out.row_count,
+                interval as u64 + 1,
+                "one row per missed driver"
+            );
+            assert!(
+                consumer.peak_bytes() > spare,
+                "the join's own charge ({}) must not fit beside the larger input charge",
+                consumer.peak_bytes()
+            );
+            assert_eq!(
+                budget.consumer_count(),
+                1,
+                "both input charges' consumers are unregistered; only the join's remains"
+            );
+            assert_eq!(budget.charged_bytes(), consumer.bytes());
+            drop(out);
+        }
+    }
+
     #[test]
     fn all_unmatched_collect_streams_scan_phase_identically_across_budgets() {
         // Every driver is scan-phase unmatched; under Collect each emits one

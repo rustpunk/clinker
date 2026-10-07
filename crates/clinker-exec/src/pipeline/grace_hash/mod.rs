@@ -102,6 +102,33 @@ use spill::{ReloadContext, SpilledPartition, process_spilled_partition};
 /// during the probe loop. Same cadence as the inline hash probe.
 const MEMORY_CHECK_INTERVAL: usize = 10_000;
 
+#[cfg(test)]
+thread_local! {
+    static PROBE_CHECK_OBSERVER: RefCell<Option<Box<dyn FnOnce(&MemoryArbitrator)>>> =
+        const { RefCell::new(None) };
+}
+
+/// Run `body` with `observer` called once, with the run's arbitrator, at the
+/// first memory check of a grace probe loop this thread runs, so a test can
+/// see what the ledger holds while the probe runs.
+#[cfg(test)]
+pub(crate) fn with_probe_check_observer<R>(
+    observer: impl FnOnce(&MemoryArbitrator) + 'static,
+    body: impl FnOnce() -> R,
+) -> R {
+    let previous = PROBE_CHECK_OBSERVER.with_borrow_mut(|slot| slot.replace(Box::new(observer)));
+    let result = body();
+    PROBE_CHECK_OBSERVER.with_borrow_mut(|slot| *slot = previous);
+    result
+}
+
+#[cfg(test)]
+fn observe_probe_check(budget: &MemoryArbitrator) {
+    if let Some(observer) = PROBE_CHECK_OBSERVER.with_borrow_mut(Option::take) {
+        observer(budget);
+    }
+}
+
 /// Render a composite join key into a single representative [`Value`] for
 /// heavy-hitter reporting. A single-component key keeps its own value so a
 /// string or integer key reports unchanged; a multi-component key renders
@@ -1098,6 +1125,8 @@ pub(crate) fn execute_combine_grace_hash(
         emitted_since_check += 1;
         if emitted_since_check >= MEMORY_CHECK_INTERVAL {
             emitted_since_check = 0;
+            #[cfg(test)]
+            observe_probe_check(budget);
             budget
                 .check_hard_limit(
                     name,
