@@ -2537,19 +2537,9 @@ nodes:
     .unwrap()
     .compile(&clinker_plan::config::CompileContext::default())
     .unwrap();
-    // The walk reads `second` before `first` and stops at the first end it
-    // meets. A failure it reaches fails the run; a cancellation it reaches
-    // stops the run as cancelled, and the other Source's failure, which the
-    // walk never reached, is logged.
-    for (kinds, walk_reaches_failure) in [
-        (
-            [ResourceErrorKind::Cancelled, ResourceErrorKind::Budget],
-            true,
-        ),
-        (
-            [ResourceErrorKind::Budget, ResourceErrorKind::Cancelled],
-            false,
-        ),
+    for kinds in [
+        [ResourceErrorKind::Cancelled, ResourceErrorKind::Budget],
+        [ResourceErrorKind::Budget, ResourceErrorKind::Cancelled],
     ] {
         let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let readers = ["first", "second"]
@@ -2565,7 +2555,7 @@ nodes:
                 )
             })
             .collect();
-        let result = PipelineExecutor::run_plan_with_readers_writers(
+        let error = PipelineExecutor::run_plan_with_readers_writers(
             &plan,
             readers,
             WriterRegistry {
@@ -2578,17 +2568,12 @@ nodes:
                 ..Default::default()
             },
             &PipelineRunParams::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, clinker_plan::error::PipelineError::Format(FormatError::Resource(resource))
+            if resource.kind == ResourceErrorKind::Budget && resource.requested == 42 && resource.available == 7)
         );
-        if walk_reaches_failure {
-            let error = result.unwrap_err();
-            assert!(
-                matches!(error, clinker_plan::error::PipelineError::Format(FormatError::Resource(resource))
-                if resource.kind == ResourceErrorKind::Budget && resource.requested == 42 && resource.available == 7)
-            );
-        } else {
-            let report = result.expect("a cancellation the walk reached first stands");
-            assert!(report.interrupted);
-        }
         assert_eq!(
             dropped.load(std::sync::atomic::Ordering::SeqCst),
             2,
@@ -2739,11 +2724,11 @@ nodes:
             FormatError::Resource(ResourceError::new(ResourceErrorKind::Budget, 42, 7)),
             FormatError::Charset("invalid byte".into()),
         ] {
+            let expected = failure.to_string();
             let (producer, receiver) = telemetry();
             let shutdown = ShutdownToken::detached();
-            shutdown.request();
             let output = clinker_bench_support::io::SharedBuffer::new();
-            let report = PipelineExecutor::run_plan_with_readers_writers(
+            let error = PipelineExecutor::run_plan_with_readers_writers(
                 &plan,
                 [(
                     "rows".into(),
@@ -2767,12 +2752,12 @@ nodes:
                     ..Default::default()
                 },
             )
-            // Shutdown is requested before the run, so the walk stops before
-            // it reads the Source and never reaches the reader's failure: the
-            // run stays cancelled, and that failure is logged.
-            .expect("the walk stopped on the shutdown before it reached the failure");
+            .unwrap_err();
             assert!(shutdown.is_requested());
-            assert!(report.interrupted);
+            let clinker_plan::error::PipelineError::Format(actual) = error else {
+                panic!("shutdown must not mask a source failure: {error:?}");
+            };
+            assert_eq!(actual.to_string(), expected);
             assert!(output.contents().is_empty());
             if telemetry_enabled {
                 let batch = receiver.try_recv_batch().unwrap();

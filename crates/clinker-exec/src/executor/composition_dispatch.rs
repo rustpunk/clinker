@@ -591,13 +591,10 @@ fn execute_composition_body(
         handle.set_bytes(0);
         ctx.memory_budget.unregister_consumer(id);
     }
-    let walk_end = match &walk_and_harvest {
-        Ok(_) => super::ingest::WalkEnd::Completed,
-        Err(PipelineError::Interrupted) => super::ingest::WalkEnd::Interrupted,
-        Err(_) => super::ingest::WalkEnd::Failed,
-    };
+    let walk_failed =
+        matches!(&walk_and_harvest, Err(error) if !matches!(error, PipelineError::Interrupted));
     let activation_cleanup = match ctx.source_activation.as_mut() {
-        Some(controller) => controller.finish_scope(bound_body.body_scope, walk_end),
+        Some(controller) => controller.finish_scope(bound_body.body_scope, walk_failed),
         None => Ok(Vec::new()),
     };
     let activation_cleanup = activation_cleanup.and_then(|outcomes| {
@@ -640,9 +637,6 @@ fn execute_composition_body(
     ctx.composition_call_sites.pop();
     ctx.window_runtime.remove_body_scope(bound_body.body_scope);
 
-    // After an interrupted walk the cleanup fails only on an invariant
-    // violation: a reader failure the walk never reached was logged, not
-    // returned, so it never replaces the cancellation.
     match (walk_and_harvest, activation_cleanup) {
         (Err(PipelineError::Interrupted), Err(error)) => Err(error),
         (Err(error), _) => Err(error),

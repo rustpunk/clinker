@@ -1332,14 +1332,6 @@ impl PipelineExecutor {
         let mut counters = counters;
         // Join every worker before selecting the terminal result. An earlier
         // failure must never detach later workers holding readers or grants.
-        // A walk the run's cancellation stopped keeps the cancellation as the
-        // run's outcome: a reader failure it never reached is logged, while
-        // one it reached already failed the walk above.
-        let walk_end = if interrupted {
-            ingest::WalkEnd::Interrupted
-        } else {
-            ingest::WalkEnd::Completed
-        };
         let SourceCompletion {
             outcomes,
             cumulative_spill_bytes,
@@ -1349,7 +1341,7 @@ impl PipelineExecutor {
             per_node_peak_charged_bytes,
             memory_limit_bytes,
         } = SourceCompletion::join(&memory_budget, || {
-            walk_end.join_source_workers(ingest_handles, "source-ingest-thread")
+            ingest::join_source_workers(ingest_handles, "source-ingest-thread")
         })?;
         for outcome in outcomes {
             interrupted |= outcome.interrupted;
@@ -2481,48 +2473,6 @@ mod tests {
     //! in-crate symbols.
 
     use super::*;
-
-    /// Runs `run` with a subscriber on this thread that keeps every warning
-    /// and error logged, each as its message followed by its fields, and
-    /// returns them with `run`'s result. Events logged on other threads are
-    /// not seen.
-    pub(super) fn capture_warnings<T>(run: impl FnOnce() -> T) -> (T, Vec<String>) {
-        struct Capture(Arc<std::sync::Mutex<Vec<String>>>);
-        struct Line(String);
-        impl tracing::field::Visit for Line {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                if !self.0.is_empty() {
-                    self.0.push(' ');
-                }
-                if field.name() == "message" {
-                    self.0.push_str(&format!("{value:?}"));
-                } else {
-                    self.0.push_str(&format!("{}={value:?}", field.name()));
-                }
-            }
-        }
-        impl tracing::Subscriber for Capture {
-            fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-                *metadata.level() <= tracing::Level::WARN
-            }
-            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-                tracing::span::Id::from_u64(1)
-            }
-            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-            fn event(&self, event: &tracing::Event<'_>) {
-                let mut line = Line(String::new());
-                event.record(&mut line);
-                self.0.lock().expect("capture lock").push(line.0);
-            }
-            fn enter(&self, _: &tracing::span::Id) {}
-            fn exit(&self, _: &tracing::span::Id) {}
-        }
-        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let result = tracing::subscriber::with_default(Capture(Arc::clone(&lines)), run);
-        let lines = std::mem::take(&mut *lines.lock().expect("capture lock"));
-        (result, lines)
-    }
 
     #[test]
     fn run_policy_capacity_sizes_the_kernel_pool() {

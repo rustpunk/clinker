@@ -544,49 +544,13 @@ pub(super) type SourceWorker = std::thread::JoinHandle<
     Result<IngestTaskOutcome, crate::executor::source_stream::SourceReadFailure>,
 >;
 
-/// How a walk over a scope's Sources ended. It decides what a reader failure
-/// the walk never reached becomes once the scope's workers are joined.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum WalkEnd {
-    /// The walk ran to its end: an unreached reader failure is the run's
-    /// error ([`join_source_workers`]).
-    Completed,
-    /// The walk stopped on the run's cancellation: the run is cancelled, and
-    /// an unreached reader failure is logged
-    /// ([`join_source_workers_after_interrupt`]).
-    Interrupted,
-    /// The walk failed: its error is the run's, and an unreached reader
-    /// failure is logged ([`join_source_workers_after_failure`]).
-    Failed,
-}
-
-impl WalkEnd {
-    /// Join every finite worker as this walk end requires, returning the
-    /// outcomes a completed or interrupted walk keeps. After a failed walk
-    /// the outcomes are empty: the walk's error is the run's.
-    pub(super) fn join_source_workers(
-        self,
-        workers: impl IntoIterator<Item = SourceWorker>,
-        op: &'static str,
-    ) -> Result<Vec<IngestTaskOutcome>, PipelineError> {
-        match self {
-            Self::Completed => join_source_workers(workers, op),
-            Self::Interrupted => join_source_workers_after_interrupt(workers, op),
-            Self::Failed => {
-                join_source_workers_after_failure(workers, op);
-                Ok(Vec::new())
-            }
-        }
-    }
-}
-
-/// Join every finite worker after a walk that ran to its end, before
-/// returning a genuine failure or all progress. The caller must drop
-/// receivers and release paused consumers before entry.
+/// Join every finite worker after a walk that completed, before returning a
+/// genuine failure or all progress. The caller must drop receivers and
+/// release paused consumers before entry.
 ///
-/// A reader failure here is one the walk never reached: a Source the walk
-/// stopped reading early. It is the run's error. A failure the walk did take,
-/// yet ran to its end anyway, is an invariant violation.
+/// A completed walk took every Source's `Ended`, so a reader failure here is
+/// one no walk reached: a Source the walk stopped reading early. A failure
+/// the walk did take, yet completed anyway, is an invariant violation.
 pub(super) fn join_source_workers(
     workers: impl IntoIterator<Item = SourceWorker>,
     op: &'static str,
@@ -611,57 +575,6 @@ pub(super) fn join_source_workers(
             Ok(outcome) => outcomes.push(outcome),
             Err(error) if first_error.is_none() => first_error = Some(error),
             Err(_) => {}
-        }
-    }
-    match first_error {
-        Some(error) => Err(error),
-        None => Ok(outcomes),
-    }
-}
-
-/// Join every finite worker after the walk stopped on the run's
-/// cancellation, keeping the cancellation as the run's outcome and the
-/// progress of every reader that did not fail. The caller must drop
-/// receivers and release paused consumers before entry.
-///
-/// A reader failure the walk had reached would have failed the walk instead,
-/// so a failure here is one the walk never reached: later in its Source's
-/// data, or on a Source the walk had not read. It is logged as a further
-/// failure of the run, never reported in place of the cancellation. A
-/// failure the walk did take, yet stopped as cancelled anyway, is an
-/// invariant violation.
-pub(super) fn join_source_workers_after_interrupt(
-    workers: impl IntoIterator<Item = SourceWorker>,
-    op: &'static str,
-) -> Result<Vec<IngestTaskOutcome>, PipelineError> {
-    let mut outcomes = Vec::new();
-    let mut first_error = None;
-    for worker in workers {
-        match worker.join() {
-            Ok(Ok(outcome)) => outcomes.push(outcome),
-            Ok(Err(failure)) => match failure.take() {
-                Some(error) => tracing::warn!(
-                    source = failure.source(),
-                    error = %error,
-                    "the Source's reader failed on input the run never reached \
-                     before it was cancelled; the run reports the cancellation"
-                ),
-                None if first_error.is_none() => {
-                    first_error = Some(PipelineError::Internal {
-                        op,
-                        node: failure.source().to_string(),
-                        detail: "the walk stopped as cancelled after it took the Source's \
-                                 reader failure"
-                            .to_string(),
-                    });
-                }
-                None => {}
-            },
-            Err(_) => tracing::warn!(
-                op,
-                "a Source's reader panicked on input the run never reached before it \
-                 was cancelled; the run reports the cancellation"
-            ),
         }
     }
     match first_error {
