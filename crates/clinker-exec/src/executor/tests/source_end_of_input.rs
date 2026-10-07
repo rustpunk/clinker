@@ -1087,15 +1087,31 @@ fn lifecycle(receiver: &crate::telemetry::TelemetryReceiver) -> Lifecycle {
     counts
 }
 
-/// Source `a`, whose rows a Transform fused with it reads, and Source `b`,
-/// each to its own Sink. Every Source precedes every other node in the walk
-/// and `a` is declared first, so the walk reads `a` before it reaches `b`.
-/// The Transform fails on `a`'s first row: `to_int` cannot convert a group
-/// name. Two read slots, so `b`'s reader never waits for `a`'s.
+/// Source `b` to its Sink, and Source `a`, whose rows a Transform fused with
+/// it reads, to its own. The compiled walk dispatches `a`'s chain before it
+/// reaches `b`; every test checks that through `b_out` staying empty. The
+/// Transform fails on `a`'s first row: `to_int` cannot convert a group name.
+/// Two read slots, so `b`'s reader never waits for `a`'s.
 fn a_then_b() -> String {
     format!(
         "pipeline:\n  name: a_then_b\n  concurrency: {{ threads: 2 }}\nnodes:{}",
         r#"
+- type: source
+  name: b
+  config:
+    name: b
+    type: csv
+    path: b.csv
+    schema:
+      - { name: grp, type: string }
+      - { name: id, type: string }
+- type: sink
+  name: b_out
+  input: b
+  config:
+    name: b_out
+    type: csv
+    path: b_out.csv
 - type: source
   name: a
   config:
@@ -1118,22 +1134,6 @@ fn a_then_b() -> String {
     name: a_out
     type: csv
     path: a_out.csv
-- type: source
-  name: b
-  config:
-    name: b
-    type: csv
-    path: b.csv
-    schema:
-      - { name: grp, type: string }
-      - { name: id, type: string }
-- type: sink
-  name: b_out
-  input: b
-  config:
-    name: b_out
-    type: csv
-    path: b_out.csv
 "#
     )
 }

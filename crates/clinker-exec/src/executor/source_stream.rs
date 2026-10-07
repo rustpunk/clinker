@@ -59,6 +59,13 @@ pub(crate) struct AttemptPopulationDelta {
 /// them. Rejections are consumed before downstream [`StreamEvent`] buffers are
 /// built.
 ///
+/// A stream ends with exactly one terminal event, [`Self::Ended`],
+/// [`Self::Interrupted`] or [`Self::Failed`], sent after the reader has
+/// returned and released what it held, and nothing follows it. A channel
+/// that disconnects without one ended on a failure the reader could not
+/// report (a panic): the walk treats it as a failure, never as the end of the
+/// input.
+///
 /// Not `Clone`: an attempt carries its own charge on the Source's handle,
 /// which exactly one event may release.
 #[derive(Debug)]
@@ -71,6 +78,109 @@ pub(crate) enum SourceStreamEvent {
         queued: QueuedCharge,
     },
     Punctuation(Punctuation),
+    /// The reader read its whole input. Every event before this one is the
+    /// Source's complete output. A read limit applied at the reader, such as
+    /// a bounded preview's per-Source limit, ends the input it admits this
+    /// way too: the rows it read are the input that was asked for.
+    Ended,
+    /// The reader stopped because the run was cancelled: a shutdown signal,
+    /// a required report that could not be written, or the reader's own
+    /// transport reporting the cancellation. The events before this one are
+    /// a prefix of the input, not the input: no step may finish on them, and
+    /// the walk stops as an interrupted run.
+    Interrupted,
+    /// The reader stopped on an error. The events before this one are a
+    /// prefix of the input, not the input: no step may finish on them.
+    Failed(SourceReadFailure),
+}
+
+/// A Source reader's error, held once for whichever side reports it.
+///
+/// The reader sends it in its [`SourceStreamEvent::Failed`] and keeps a
+/// clone as its thread's result. The walk takes the error when it reaches
+/// the event and returns it as the run's error. When the walk failed first
+/// and never reached the event, the error is still in place when the
+/// reader's thread is joined, and the join reports it. Exactly one side can
+/// take it, so it is never reported twice and never lost.
+#[derive(Clone)]
+pub(crate) struct SourceReadFailure {
+    source: Arc<str>,
+    error: Arc<std::sync::Mutex<Option<clinker_plan::error::PipelineError>>>,
+}
+
+impl SourceReadFailure {
+    /// `error`, raised by the reader of `source`, not yet reported.
+    pub(crate) fn new(source: &str, error: clinker_plan::error::PipelineError) -> Self {
+        Self {
+            source: Arc::from(source),
+            error: Arc::new(std::sync::Mutex::new(Some(error))),
+        }
+    }
+
+    /// The Source whose reader failed.
+    pub(crate) fn source(&self) -> &str {
+        &self.source
+    }
+
+    /// Take the error to report it. `None` once the other side has taken it.
+    pub(crate) fn take(&self) -> Option<clinker_plan::error::PipelineError> {
+        self.error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
+impl std::fmt::Debug for SourceReadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceReadFailure")
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The sender that ends a Source's stream.
+///
+/// Taken from the channel before the reader starts and held by the reader's
+/// thread outside the reader, so it outlives every other sender: the
+/// terminal event is the last thing the channel carries, and it is sent only
+/// after the reader and everything it held in the Source's name have been
+/// released. Dropped without [`Self::finish`] (the thread panicked), it
+/// closes the channel with no terminal event, which the walk reports as a
+/// failure.
+pub(crate) struct SourceStreamEnd {
+    tx: crossbeam_channel::Sender<SourceStreamEvent>,
+    source: Arc<str>,
+}
+
+impl SourceStreamEnd {
+    /// Send the terminal event for `result` and hand back the thread's
+    /// result: [`SourceStreamEvent::Interrupted`] for an outcome that observed
+    /// cancellation, [`SourceStreamEvent::Ended`] for any other outcome,
+    /// [`SourceStreamEvent::Failed`] for an error. Blocks like a record send
+    /// while the channel is full. A walk that has stopped reading this
+    /// Source (it dropped the receiver) leaves the failure with the thread's
+    /// result alone.
+    pub(super) fn finish(
+        self,
+        result: Result<super::ingest::IngestTaskOutcome, clinker_plan::error::PipelineError>,
+    ) -> Result<super::ingest::IngestTaskOutcome, SourceReadFailure> {
+        match result {
+            Ok(outcome) => {
+                let _ = self.tx.send(if outcome.interrupted {
+                    SourceStreamEvent::Interrupted
+                } else {
+                    SourceStreamEvent::Ended
+                });
+                Ok(outcome)
+            }
+            Err(error) => {
+                let failure = SourceReadFailure::new(&self.source, error);
+                let _ = self.tx.send(SourceStreamEvent::Failed(failure.clone()));
+                Err(failure)
+            }
+        }
+    }
 }
 
 /// The heap a queued attempt holds outside the run's ledger: the part of a
@@ -244,6 +354,15 @@ impl SourceIngestChannel {
     /// `send` blocks once this many events are buffered, so the value
     /// paces back-pressure.
     pub(crate) const DEFAULT_CAPACITY: usize = 1024;
+
+    /// The sender that ends this stream, named for `source`. Take it before
+    /// the channel moves to the reader; see [`SourceStreamEnd`].
+    pub(crate) fn end(&self, source: &str) -> SourceStreamEnd {
+        SourceStreamEnd {
+            tx: self.tx.clone(),
+            source: Arc::from(source),
+        }
+    }
 
     /// Whether this source needs explicit physical-file lifecycle events.
     /// Ordinary sources retain the historical record-driven boundary path;

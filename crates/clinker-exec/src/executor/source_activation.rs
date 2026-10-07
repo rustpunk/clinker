@@ -27,7 +27,7 @@ const SOURCE_LIFECYCLE_SCOPE: &str = "source";
 struct ActiveGroupRuntime {
     scope: BodyScopeId,
     group: ActiveActivationGroup,
-    workers: Vec<std::thread::JoinHandle<Result<IngestTaskOutcome, PipelineError>>>,
+    workers: Vec<super::ingest::SourceWorker>,
 }
 
 /// Receivers and memory registrations produced by one atomic group activation.
@@ -162,10 +162,13 @@ impl SourceActivationController {
             let worker_shutdown = shutdown.clone();
             let lifecycle_telemetry = telemetry.cloned();
             let source_runtime = self.source_runtime.clone();
+            let stream_end = stream.end(&logical_source_name);
             let spawn = std::thread::Builder::new()
                 .name(format!("clinker-body-source-{source_name}"))
                 .spawn(move || {
-                    observe_source(lifecycle_telemetry.as_ref(), || {
+                    // The stream's last event reports how the read ended,
+                    // after the reader has released what it held.
+                    stream_end.finish(observe_source(lifecycle_telemetry.as_ref(), || {
                         // A governed allocation this Source was refused
                         // ends its ingest here, on the thread that recorded
                         // the refusal's report.
@@ -184,7 +187,7 @@ impl SourceActivationController {
                             )?;
                         outcome.source_name = logical_source_name;
                         Ok(outcome)
-                    })
+                    }))
                 });
             match spawn {
                 Ok(worker) => workers.push(worker),
@@ -195,9 +198,7 @@ impl SourceActivationController {
                         handle.set_bytes(0);
                         memory.unregister_consumer(id);
                     }
-                    for worker in workers {
-                        let _ = worker.join();
-                    }
+                    super::ingest::join_source_workers_after_failure(workers, "body-source-thread");
                     return Err(PipelineError::Internal {
                         op: "body-source-spawn",
                         node: String::new(),
@@ -219,9 +220,16 @@ impl SourceActivationController {
     }
 
     /// Join and close every active group in `scope` after its receivers drop.
+    ///
+    /// `walk_end` says how the body's walk ended. After it failed, its error
+    /// stands as the run's; after the run's cancellation stopped it, the
+    /// cancellation stands. Either way a reader failure the walk never
+    /// reached is logged rather than returned. Only after a walk that ran to
+    /// its end is such a failure the error returned here.
     pub(super) fn finish_scope(
         &mut self,
         scope: BodyScopeId,
+        walk_end: super::ingest::WalkEnd,
     ) -> Result<Vec<IngestTaskOutcome>, PipelineError> {
         let group_ids: Vec<_> = self
             .active
@@ -235,10 +243,9 @@ impl SourceActivationController {
                 .active
                 .remove(&id)
                 .expect("active group id was collected from the same map");
-            match super::ingest::join_source_workers(
-                runtime.workers.drain(..).rev(),
-                "body-source-thread",
-            ) {
+            match walk_end
+                .join_source_workers(runtime.workers.drain(..).rev(), "body-source-thread")
+            {
                 Ok(group_outcomes) => outcomes.extend(group_outcomes),
                 Err(error) if first_error.is_none() => first_error = Some(error),
                 Err(_) => {}
@@ -255,9 +262,10 @@ impl SourceActivationController {
 impl Drop for SourceActivationController {
     fn drop(&mut self) {
         while let Some((_, mut runtime)) = self.active.pop_last() {
-            while let Some(worker) = runtime.workers.pop() {
-                let _ = worker.join();
-            }
+            super::ingest::join_source_workers_after_failure(
+                runtime.workers.drain(..).rev(),
+                "body-source-thread",
+            );
             drop(runtime.group);
         }
     }
@@ -449,6 +457,13 @@ nodes:
     }
 
     fn fixture() -> (tempfile::TempDir, clinker_plan::plan::CompiledPlan) {
+        fixture_with(BODY, PIPELINE)
+    }
+
+    fn fixture_with(
+        body: &str,
+        pipeline: &str,
+    ) -> (tempfile::TempDir, clinker_plan::plan::CompiledPlan) {
         let workspace = tempfile::tempdir().expect("workspace");
         std::fs::create_dir_all(workspace.path().join("compositions"))
             .expect("composition directory");
@@ -460,7 +475,7 @@ nodes:
             workspace
                 .path()
                 .join("compositions/memory_reader.comp.yaml"),
-            BODY,
+            body,
         )
         .expect("composition body");
         std::fs::write(
@@ -472,7 +487,7 @@ access = "read"
 "#,
         )
         .expect("catalog");
-        let config = parse_config(PIPELINE).expect("pipeline parses");
+        let config = parse_config(pipeline).expect("pipeline parses");
         let plan = config
             .compile(&CompileContext::with_pipeline_dir(
                 workspace.path(),
@@ -686,6 +701,344 @@ access = "read"
             assert_eq!(memory.consumer_count(), 0);
             assert_eq!(memory.sum_consumer_usage(), 0);
         }
+    }
+
+    /// A body Source whose reader is cancelled after one row feeds a body
+    /// Aggregate. The body walk stops at the Source: its count is never
+    /// finalized and the Aggregate never finishes on the cut-off row.
+    #[test]
+    fn an_interrupted_body_read_stops_the_body_walk_before_a_step_finishes() {
+        const AGGREGATE_BODY: &str = r#"_compose:
+  name: memory_reader
+  inputs: {}
+  outputs: { out: totals }
+  config_schema: {}
+  resources_schema:
+    input: { kind: file, required: true }
+nodes:
+  - type: source
+    name: read
+    config:
+      name: read
+      type: csv
+      resource: input
+      on_unmapped: { mode: drop }
+      schema: [{ name: id, type: int }]
+  - type: aggregate
+    name: totals
+    input: read
+    config:
+      group_by: []
+      cxl: |
+        emit n = count(*)
+"#;
+        const AGGREGATE_PIPELINE: &str = r#"pipeline: { name: body_source_interrupted }
+nodes:
+  - type: source
+    name: driver
+    config:
+      name: driver
+      type: csv
+      path: driver.csv
+      schema: [{ name: seed, type: string }]
+  - type: composition
+    name: call
+    input: driver
+    use: ../compositions/memory_reader.comp.yaml
+    inputs: {}
+    resources: { input: shared_input }
+  - type: sink
+    name: out
+    input: call
+    config: { name: out, type: csv, path: out.csv }
+"#;
+        struct Reader {
+            schema: clinker_record::owned_storage::SharedStorage<clinker_record::Schema>,
+            row: bool,
+        }
+        impl crate::source::RecordSource for Reader {
+            fn schema(
+                &mut self,
+            ) -> Result<
+                clinker_record::owned_storage::SharedStorage<clinker_record::Schema>,
+                clinker_format::FormatError,
+            > {
+                Ok(self.schema.clone())
+            }
+            fn next_record(
+                &mut self,
+            ) -> Result<Option<clinker_record::Record>, clinker_format::FormatError> {
+                if !std::mem::replace(&mut self.row, true) {
+                    return Ok(Some(clinker_record::Record::new(
+                        self.schema.clone(),
+                        vec![clinker_record::Value::Integer(1)],
+                    )));
+                }
+                Err(clinker_format::FormatError::Resource(
+                    clinker_record::owned_storage::ResourceError::new(
+                        clinker_record::owned_storage::ResourceErrorKind::Cancelled,
+                        0,
+                        0,
+                    ),
+                ))
+            }
+        }
+        struct Opener(Option<SourceInput>);
+        impl CapabilityOpener for Opener {
+            fn open(
+                mut self: Box<Self>,
+            ) -> Result<Box<dyn CapabilitySession>, CapabilityOpenError> {
+                Ok(Box::new(InputSession {
+                    input: self.0.take(),
+                }))
+            }
+        }
+        let (workspace, plan) = fixture_with(AGGREGATE_BODY, AGGREGATE_PIPELINE);
+        let mut input = Some(SourceInput::Records(Box::new(Reader {
+            schema: clinker_record::SchemaBuilder::new()
+                .with_field("id")
+                .build(),
+            row: false,
+        })));
+        let activation = plan.dag().source_activation();
+        let groups = activation
+            .groups()
+            .iter()
+            .map(|group| {
+                let members = group
+                    .members()
+                    .iter()
+                    .copied()
+                    .map(|member| {
+                        if matches!(
+                            member.scope,
+                            clinker_plan::plan::execution::CompiledSourceScope::TopLevel
+                        ) {
+                            AdmittedSourceOpener::caller_supplied(member)
+                        } else {
+                            AdmittedSourceOpener::new(member, Box::new(Opener(input.take())))
+                        }
+                    })
+                    .collect();
+                AdmittedActivationGroup::uncredentialed(group.id(), group.capacity(), members)
+            })
+            .collect();
+        let resources = AdmittedRunCapabilities::admit(activation, groups).unwrap();
+        let memory = memory();
+        let result = run(
+            workspace.path(),
+            &plan,
+            resources,
+            &PipelineRunParams {
+                shutdown_token: Some(ShutdownToken::detached()),
+                ..Default::default()
+            },
+            memory.clone(),
+        );
+        let report = result.expect("an interrupted body read ends the run as an interruption");
+        assert!(report.interrupted);
+        assert_eq!(
+            report.per_source_record_counts.get("call.read"),
+            None,
+            "an interrupted read never finalizes the body Source's count"
+        );
+        assert!(
+            report
+                .stages
+                .iter()
+                .all(|stage| stage.name != crate::executor::stage_metrics::StageName::Sort),
+            "the body Aggregate never finishes on the cut-off row: {:?}",
+            report.stages
+        );
+        assert_eq!(
+            report.counters.ok_count, 0,
+            "nothing read before the interruption reaches the parent Sink"
+        );
+        assert_eq!(memory.consumer_count(), 0);
+        assert_eq!(memory.sum_consumer_usage(), 0);
+    }
+
+    /// Two body Sources feed an interleave, so they start together. The run
+    /// is cancelled as they open, and the body walk stops before it reads
+    /// either; one of their readers then fails. The run is cancelled, as the
+    /// operator asked; the failure is logged, not reported in place of the
+    /// cancellation.
+    #[test]
+    fn a_cancelled_body_stays_cancelled_when_a_body_source_it_never_read_fails() {
+        const UNREACHED_FAILURE: &str = "bad byte in a body file the run never reached";
+        const TWO_SOURCE_BODY: &str = r#"_compose:
+  name: memory_reader
+  inputs: {}
+  outputs: { out: both }
+  config_schema: {}
+  resources_schema:
+    input: { kind: file, required: true }
+    other_input: { kind: file, required: true }
+nodes:
+  - type: source
+    name: read
+    config:
+      name: read
+      type: csv
+      resource: input
+      on_unmapped: { mode: drop }
+      schema: [{ name: id, type: int }]
+  - type: source
+    name: other
+    config:
+      name: other
+      type: csv
+      resource: other_input
+      on_unmapped: { mode: drop }
+      schema: [{ name: id, type: int }]
+  - type: merge
+    name: both
+    inputs: [read, other]
+    config: { mode: interleave }
+"#;
+        const TWO_SOURCE_PIPELINE: &str = r#"pipeline: { name: body_sources_cancelled }
+nodes:
+  - type: source
+    name: driver
+    config:
+      name: driver
+      type: csv
+      path: driver.csv
+      schema: [{ name: seed, type: string }]
+  - type: composition
+    name: call
+    input: driver
+    use: ../compositions/memory_reader.comp.yaml
+    inputs: {}
+    resources: { input: shared_input, other_input: shared_input }
+  - type: sink
+    name: out
+    input: call
+    config: { name: out, type: csv, path: out.csv }
+"#;
+        fn schema() -> clinker_record::owned_storage::SharedStorage<clinker_record::Schema> {
+            clinker_record::SchemaBuilder::new()
+                .with_field("id")
+                .build()
+        }
+        /// Fails with a genuine read error before its first row, whether
+        /// or not the run is cancelled, and records that it did.
+        struct Fails(Arc<std::sync::atomic::AtomicBool>);
+        impl crate::source::RecordSource for Fails {
+            fn schema(
+                &mut self,
+            ) -> Result<
+                clinker_record::owned_storage::SharedStorage<clinker_record::Schema>,
+                clinker_format::FormatError,
+            > {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(clinker_format::FormatError::Io(std::io::Error::other(
+                    UNREACHED_FAILURE,
+                )))
+            }
+            fn next_record(
+                &mut self,
+            ) -> Result<Option<clinker_record::Record>, clinker_format::FormatError> {
+                panic!("a failed schema cannot produce rows");
+            }
+        }
+        /// An input with no rows.
+        struct Empty;
+        impl crate::source::RecordSource for Empty {
+            fn schema(
+                &mut self,
+            ) -> Result<
+                clinker_record::owned_storage::SharedStorage<clinker_record::Schema>,
+                clinker_format::FormatError,
+            > {
+                Ok(schema())
+            }
+            fn next_record(
+                &mut self,
+            ) -> Result<Option<clinker_record::Record>, clinker_format::FormatError> {
+                Ok(None)
+            }
+        }
+        /// Cancels the run as it opens its Source.
+        struct CancellingOpener {
+            input: Option<SourceInput>,
+            shutdown: ShutdownToken,
+        }
+        impl CapabilityOpener for CancellingOpener {
+            fn open(
+                mut self: Box<Self>,
+            ) -> Result<Box<dyn CapabilitySession>, CapabilityOpenError> {
+                self.shutdown.request();
+                Ok(Box::new(InputSession {
+                    input: self.input.take(),
+                }))
+            }
+        }
+        let (workspace, plan) = fixture_with(TWO_SOURCE_BODY, TWO_SOURCE_PIPELINE);
+        let shutdown = ShutdownToken::detached();
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut inputs = vec![
+            SourceInput::Records(Box::new(Fails(failed.clone()))),
+            SourceInput::Records(Box::new(Empty)),
+        ]
+        .into_iter();
+        let activation = plan.dag().source_activation();
+        let groups = activation
+            .groups()
+            .iter()
+            .map(|group| {
+                let members = group
+                    .members()
+                    .iter()
+                    .copied()
+                    .map(|member| {
+                        if matches!(
+                            member.scope,
+                            clinker_plan::plan::execution::CompiledSourceScope::TopLevel
+                        ) {
+                            AdmittedSourceOpener::caller_supplied(member)
+                        } else {
+                            AdmittedSourceOpener::new(
+                                member,
+                                Box::new(CancellingOpener {
+                                    input: inputs.next(),
+                                    shutdown: shutdown.clone(),
+                                }),
+                            )
+                        }
+                    })
+                    .collect();
+                AdmittedActivationGroup::uncredentialed(group.id(), group.capacity(), members)
+            })
+            .collect();
+        let resources = AdmittedRunCapabilities::admit(activation, groups).unwrap();
+        let memory = memory();
+        let (result, warnings) = crate::executor::tests::capture_warnings(|| {
+            run(
+                workspace.path(),
+                &plan,
+                resources,
+                &PipelineRunParams {
+                    shutdown_token: Some(shutdown.clone()),
+                    ..Default::default()
+                },
+                memory.clone(),
+            )
+        });
+        let report = result.expect("a cancelled run stays cancelled");
+        assert!(report.interrupted, "the run reports the cancellation");
+        assert!(
+            failed.load(std::sync::atomic::Ordering::SeqCst),
+            "the unread body Source's reader failed"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|line| line.contains(UNREACHED_FAILURE) && line.contains("read")),
+            "the failure the run never reached is logged, naming its Source: {warnings:?}"
+        );
+        assert_eq!(memory.consumer_count(), 0);
+        assert_eq!(memory.sum_consumer_usage(), 0);
     }
 
     #[test]

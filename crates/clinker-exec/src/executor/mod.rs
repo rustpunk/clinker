@@ -64,7 +64,7 @@ pub use document_dlq::take_document_dlq_peak_charged_bytes_for_testing;
 #[doc(hidden)]
 pub use document_dlq::{DocumentDlqTeardown, take_document_dlq_teardown_for_testing};
 pub use ingest::build_source_format_reader;
-use ingest::{IngestTaskOutcome, ingest_source};
+use ingest::ingest_source;
 use params::sum_cpu_io_totals;
 pub use params::{
     ExecutionReport, MemoryTestOverrides, PipelineRunParams, PreviewPolicy, RunPolicy,
@@ -295,10 +295,10 @@ struct DagExecResources {
     /// Arbitrator registration for each declared Source's ingest-channel
     /// consumer, keyed by Source node name in lockstep with
     /// `source_records`. The dispatch arm that takes a source's receiver
-    /// out of `source_records` also owns this entry and releases it at
-    /// receiver disconnect, so a drained source's per-attempt queued charge
-    /// leaves the ledger total `sum_consumer_usage` reads instead of
-    /// freezing until arbitrator drop.
+    /// out of `source_records` also owns this entry and releases it once it
+    /// has taken the Source's `Ended`, so a drained source's per-attempt
+    /// queued charge leaves the ledger total `sum_consumer_usage` reads
+    /// instead of freezing until arbitrator drop.
     source_consumers: HashMap<
         String,
         (
@@ -1009,9 +1009,8 @@ impl PipelineExecutor {
             crossbeam_channel::Receiver<crate::executor::source_stream::SourceStreamEvent>,
         > = HashMap::new();
         let mut watermarks = crate::executor::watermark::PerSourceWatermarks::new();
-        let mut ingest_handles: Vec<
-            std::thread::JoinHandle<Result<IngestTaskOutcome, PipelineError>>,
-        > = Vec::with_capacity(source_configs.len());
+        let mut ingest_handles: Vec<ingest::SourceWorker> =
+            Vec::with_capacity(source_configs.len());
         let mut source_consumers: HashMap<
             String,
             (
@@ -1110,8 +1109,9 @@ impl PipelineExecutor {
                 // carry their unadmitted heap as a charge on it until they
                 // leave the channel. The registration travels with the
                 // receiver: whichever dispatch arm drains this source's
-                // channel releases the wrapper at receiver disconnect, so a
-                // drained source leaves the registry the policies poll.
+                // channel releases the wrapper once it takes the stream's
+                // `Ended`, so a drained source leaves the registry the
+                // policies poll.
                 let source_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
                 let source_body = validated_plan
                     .config()
@@ -1208,6 +1208,7 @@ impl PipelineExecutor {
                 let ingest_progress = params.progress.clone();
                 let ingest_source_runtime = source_runtime.clone();
                 let ingest_node = src_cfg.name.clone();
+                let stream_end = stream.end(&src_cfg.name);
                 // One OS thread per Source. Spawned before the DAG dispatch
                 // drains so the producers fill the bounded channels while the
                 // consumer dispatch loop runs concurrently. Joined after
@@ -1215,24 +1216,29 @@ impl PipelineExecutor {
                 let handle = std::thread::Builder::new()
                     .name(format!("clinker-ingest-{}", src_cfg.name))
                     .spawn(move || {
-                        source_activation::observe_source(lifecycle_telemetry.as_ref(), || {
-                            // A governed allocation this Source was refused
-                            // ends its ingest here, on the thread that
-                            // recorded the refusal's report.
-                            crate::pipeline::memory::ledger::convert_governed_refusal(
-                                ingest_source(
-                                    src_cfg_owned,
-                                    source_input,
-                                    config_clone,
-                                    stream,
-                                    ingest_shutdown,
-                                    ingest_progress,
-                                    ingest_source_runtime,
-                                ),
-                                &ingest_node,
-                                clinker_plan::runtime_error::MemorySurface::RowsRead,
-                            )
-                        })
+                        // The stream's last event reports how the read
+                        // ended, after the reader has released what it held.
+                        stream_end.finish(source_activation::observe_source(
+                            lifecycle_telemetry.as_ref(),
+                            || {
+                                // A governed allocation this Source was
+                                // refused ends its ingest here, on the thread
+                                // that recorded the refusal's report.
+                                crate::pipeline::memory::ledger::convert_governed_refusal(
+                                    ingest_source(
+                                        src_cfg_owned,
+                                        source_input,
+                                        config_clone,
+                                        stream,
+                                        ingest_shutdown,
+                                        ingest_progress,
+                                        ingest_source_runtime,
+                                    ),
+                                    &ingest_node,
+                                    clinker_plan::runtime_error::MemorySurface::RowsRead,
+                                )
+                            },
+                        ))
                     })
                     .map_err(|e| PipelineError::Internal {
                         op: "source-ingest-spawn",
@@ -1250,7 +1256,7 @@ impl PipelineExecutor {
                 handle.set_bytes(0);
                 memory_budget.unregister_consumer(id);
             }
-            let _ = ingest::join_source_workers(ingest_handles, "source-ingest-thread");
+            ingest::join_source_workers_after_failure(ingest_handles, "source-ingest-thread");
             return Err(error);
         }
 
@@ -1292,10 +1298,11 @@ impl PipelineExecutor {
                 // so each finite source worker can now finish. Join all of
                 // them before returning the original dispatcher failure: a
                 // detached ingest thread would keep reader and spill handles
-                // alive beyond the failed run's lifecycle boundary.
-                for handle in ingest_handles {
-                    let _ = handle.join();
-                }
+                // alive beyond the failed run's lifecycle boundary. The
+                // walk's error is the first failure in data order, a
+                // reader's it reached included; a reader failure it never
+                // reached is logged, not dropped.
+                ingest::join_source_workers_after_failure(ingest_handles, "source-ingest-thread");
                 return Err(dispatch_error);
             }
         };
@@ -1325,6 +1332,14 @@ impl PipelineExecutor {
         let mut counters = counters;
         // Join every worker before selecting the terminal result. An earlier
         // failure must never detach later workers holding readers or grants.
+        // A walk the run's cancellation stopped keeps the cancellation as the
+        // run's outcome: a reader failure it never reached is logged, while
+        // one it reached already failed the walk above.
+        let walk_end = if interrupted {
+            ingest::WalkEnd::Interrupted
+        } else {
+            ingest::WalkEnd::Completed
+        };
         let SourceCompletion {
             outcomes,
             cumulative_spill_bytes,
@@ -1334,7 +1349,7 @@ impl PipelineExecutor {
             per_node_peak_charged_bytes,
             memory_limit_bytes,
         } = SourceCompletion::join(&memory_budget, || {
-            ingest::join_source_workers(ingest_handles, "source-ingest-thread")
+            walk_end.join_source_workers(ingest_handles, "source-ingest-thread")
         })?;
         for outcome in outcomes {
             interrupted |= outcome.interrupted;
@@ -1479,7 +1494,7 @@ impl PipelineExecutor {
         // - seed `$record.<key>` defaults per record,
         // - seed `$source.<key>` defaults per `(source, file)` Arc on
         //   first observation,
-        // - on `recv` returning `Err` (channel disconnected), stamp the
+        // - on the reader's `Ended` (the whole input was read), stamp the
         //   finalized per-source count and call
         //   `finalize_node_rooted_windows` to populate every spec rooted
         //   at this source's NodeIndex.
@@ -2165,8 +2180,8 @@ impl PipelineExecutor {
         // before their dispatch turn — still hold their ingest-channel
         // registration. Release them here so the registry does not outlive
         // the walk with a frozen queued charge on the ledger. On a completed
-        // walk this map is empty: each drain arm released its entry at
-        // receiver disconnect. `resume` before unregister is load-bearing:
+        // walk this map is empty: each drain arm released its entry when it
+        // took the Source's `Ended`. `resume` before unregister is load-bearing:
         // an arbitration round may have paused an undrained source's ingest
         // thread, and once the wrapper leaves the registry nothing else can
         // unpark it — the thread would sit parked forever and the caller's

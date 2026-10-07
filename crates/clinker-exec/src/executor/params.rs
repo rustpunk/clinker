@@ -641,14 +641,13 @@ pub struct ExecutionReport {
     pub per_source_rollback_cursors: BTreeMap<String, u64>,
     /// Finalized per-source ingest record counts, keyed by
     /// Source-node name. Equals each source's `total_count`
-    /// contribution to the aggregate `counters.total_count`. Sources
-    /// whose ingest thread never finalized (e.g. fatal abort before
-    /// the crossbeam `Receiver` disconnected) are absent rather than
-    /// reported as zero — distinguishes "stream closed with zero records"
-    /// from
-    /// "never finished". The synthetic pipeline-wide rollup slot
-    /// stamped internally under `<merged>` is filtered out before
-    /// surfacing here.
+    /// contribution to the aggregate `counters.total_count`. A count is
+    /// finalized only when the walk reads the Source's stream to its
+    /// `Ended`: a Source whose read was interrupted, or that the walk never
+    /// read to the end, is absent rather than reported as zero, which
+    /// distinguishes "read to the end with zero records" from "never
+    /// finished". The synthetic pipeline-wide rollup slot stamped
+    /// internally under `<merged>` is filtered out before surfacing here.
     pub per_source_record_counts: BTreeMap<String, u64>,
     /// Per-source DLQ entry counts, keyed by Source-node name. A
     /// source with no DLQ entries is absent from the map, matching
