@@ -963,12 +963,42 @@ impl TransientNodeBufferReservation {
     /// this reservation's whole charge and charge `bytes` to `to` in one
     /// ledger step ([`ConsumerHandle::take_over`]), unchecked, then remove
     /// the registration. The rows are charged to exactly one owner at every
-    /// instant, so the caller must already have checked the hard limit for
-    /// `bytes` less this reservation's charge.
+    /// instant. Nothing here admits what `bytes` adds beyond this
+    /// reservation's charge: the caller must already have admitted that
+    /// growth, or call [`Self::hand_over_admitted`], which does.
     ///
     /// [`ConsumerHandle::take_over`]: crate::pipeline::memory::ConsumerHandle::take_over
     pub(crate) fn hand_over_to(self, to: &crate::pipeline::memory::ConsumerHandle, bytes: u64) {
         to.take_over(&self.handle, self.handle.bytes(), bytes);
+    }
+
+    /// Hand `reservation`'s rows to `to` charged at `bytes`, admitting first
+    /// what that adds. The growth, `bytes` less the reservation's charge (all
+    /// of `bytes` when the rows arrived uncharged), is a checked growth of
+    /// `to` ([`ConsumerHandle::try_grow`]): it reads only the ledger, and on
+    /// the walk it reclaims with `to`'s consumer as the requester before it
+    /// refuses. The hand-over that follows is then net zero, so the charged
+    /// total never passes the limit through it. A refusal is E310 built from
+    /// the shortfall, naming `to`'s consumer and the growth; `to` is
+    /// unchanged and the reservation drops with its charge.
+    ///
+    /// [`ConsumerHandle::try_grow`]: crate::pipeline::memory::ConsumerHandle::try_grow
+    pub(crate) fn hand_over_admitted(
+        reservation: Option<Self>,
+        to: &crate::pipeline::memory::ConsumerHandle,
+        bytes: u64,
+        budget: &crate::pipeline::memory::MemoryArbitrator,
+    ) -> Result<(), PipelineError> {
+        let held = reservation.as_ref().map_or(0, Self::bytes);
+        let growth = bytes.saturating_sub(held);
+        to.try_grow(growth)
+            .map_err(|shortfall| PipelineError::MemoryBudgetExceeded {
+                report: shortfall.into_report(budget),
+            })?;
+        if let Some(reservation) = reservation {
+            reservation.hand_over_to(to, bytes - growth);
+        }
+        Ok(())
     }
 
     /// Transfer ownership of the live registration to a node-buffer registry.

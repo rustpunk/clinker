@@ -1328,18 +1328,20 @@ type MissPileEntry = (Record, RecordOrder, u64);
 
 /// End a side input's charge where the kernel first charges its rows: the
 /// rows' `bytes` move onto `consumer` and the input's whole charge is
-/// released, in one ledger step. Unchecked, like the resident charge it
-/// replaces: the rows are already held. Rows that arrived uncharged are
-/// charged here.
+/// released, in one ledger step. `bytes` can exceed the input's charge (it
+/// covers the rows' heap and, for the driver, the null-key pile), so what it
+/// adds is admitted first as a checked growth of the join's consumer, which
+/// reads only the ledger and on the walk reclaims before it refuses. A
+/// refusal is E310 naming the join; the input's charge then drops with its
+/// reservation and `consumer` is unchanged. Rows that arrived uncharged are
+/// admitted whole.
 fn take_over_input(
     input_charge: Option<TransientNodeBufferReservation>,
     consumer: &crate::pipeline::memory::ConsumerHandle,
     bytes: u64,
-) {
-    match input_charge {
-        Some(charge) => charge.hand_over_to(consumer, bytes),
-        None => consumer.add_bytes(bytes),
-    }
+    budget: &MemoryArbitrator,
+) -> Result<(), PipelineError> {
+    TransientNodeBufferReservation::hand_over_admitted(input_charge, consumer, bytes, budget)
 }
 
 /// Resident byte charge of a `(record, key, payload)` entry once it lives in a
@@ -1430,8 +1432,10 @@ fn checked_presorted_charge<P>(
 /// it is the only charge on the rows waiting in `pairs`, and while the sort
 /// buffer fills, the vector `pairs` was is still allocated. Each successful
 /// return hands it to the kernel's consumer in one ledger step with the
-/// side's first resident charge plus `extra_bytes`; a spilled side hands over
-/// only `extra_bytes`, its rows being on disk.
+/// side's first resident charge plus `extra_bytes`, after admitting what that
+/// adds to the input's charge; a spilled side hands over only `extra_bytes`,
+/// its rows being on disk. A hand-over that does not fit is E310 naming the
+/// join.
 ///
 /// A pre-sorted simple-field side that fits budget is walked in place, with no
 /// redundant stable sort and Vec rebuild; only an over-budget pre-sorted side
@@ -1481,7 +1485,7 @@ where
         extra_bytes,
     } = args;
     if pairs.is_empty() {
-        take_over_input(input_charge, consumer_handle, extra_bytes);
+        take_over_input(input_charge, consumer_handle, extra_bytes, budget)?;
         return Ok((SideStream::InMemory(Vec::new().into_iter()), 0));
     }
     let spill_threshold = spill_threshold_bytes(budget);
@@ -1508,7 +1512,8 @@ where
             input_charge,
             consumer_handle,
             charged.saturating_add(extra_bytes),
-        );
+            budget,
+        )?;
         return Ok((SideStream::InMemory(pairs.into_iter()), charged));
     };
 
@@ -1520,7 +1525,8 @@ where
                 input_charge,
                 consumer_handle,
                 charged.saturating_add(extra_bytes),
-            );
+                budget,
+            )?;
             return Ok((SideStream::InMemory(pairs.into_iter()), charged));
         }
         // Over budget: fall through to the spillable sort (stable no-op on
@@ -1609,7 +1615,8 @@ where
                 input_charge,
                 consumer_handle,
                 charged.saturating_add(extra_bytes),
-            );
+                budget,
+            )?;
             Ok((SideStream::InMemory(v.into_iter()), charged))
         }
         SortedOutput::Spilled(files) => {
@@ -1637,7 +1644,7 @@ where
                 },
             )?;
             // The side's rows are on disk; only the extra share stays resident.
-            take_over_input(input_charge, consumer_handle, extra_bytes);
+            take_over_input(input_charge, consumer_handle, extra_bytes, budget)?;
             Ok((
                 SideStream::Spilled {
                     merger,
@@ -4371,75 +4378,102 @@ mod tests {
         // The peak is reached when the pile's share passes to the join, so it
         // cannot show the share stays. The walk emits one row short of the
         // memory check's interval, so the check first runs as the first miss
-        // is dispatched. The limit is the pile's text alone, which the walk's
-        // rows do not reach: the check refuses only if the pile is still
-        // charged when its misses are dispatched.
+        // is dispatched. The hand-over that gives the join the pile's share is
+        // admitted before the join holds it, so a limit of the pile's text
+        // alone is refused there, by the join, before the walk starts. The
+        // second run's limit is the floor that refusal suggests: it admits
+        // the hand-over, and the walk's rows do not reach it without the
+        // pile, so the check refuses only if the pile is still charged when
+        // its misses are dispatched.
         let big_pad = "y".repeat(256 * 1024);
         let pile_rows = 64usize;
         let keyed_rows = MEMORY_CHECK_INTERVAL - 1;
-        let mut big_pile_text = 0u64;
+        let big_pile_text = (pile_rows * big_pad.len()) as u64;
         // Collect mode emits a row per miss; its array lands in `builds`.
         let collect_schema = schema_with(&["k", "pad", "builds"]);
-        let driver_records: Vec<(Record, RecordOrder)> = (0..pile_rows + keyed_rows)
-            .map(|i| {
-                let record = if i < pile_rows {
-                    big_pile_text += big_pad.len() as u64;
-                    rec(
-                        &collect_schema,
-                        vec![
-                            Value::Null,
-                            Value::String(big_pad.as_str().into()),
-                            Value::Null,
-                        ],
-                    )
-                } else {
-                    rec(
-                        &collect_schema,
-                        vec![
-                            Value::Integer(i as i64),
-                            Value::String("".into()),
-                            Value::Null,
-                        ],
-                    )
-                };
-                (record, RecordOrder::from(i as u64))
-            })
-            .collect();
-        let (budget, handle, charges) =
-            ledger_with_input_charges(big_pile_text, 1024 * 1024, 64 * 1024);
-        let err = run_kernel_on(
-            RunKernel {
-                driver_records,
-                build_records: vec![rec(&builds_schema, vec![Value::Integer(1_000_000)])],
-                decomposed: drivers_below_builds(),
-                driver_qual: "drivers",
-                build_qual: "builds",
-                driver_schema: &collect_schema,
-                build_schema: &builds_schema,
-                match_mode: MatchMode::Collect,
-                on_miss: OnMiss::Skip,
-                presorted: true,
-                body_program: None,
-                budget_bytes: None,
-            },
-            None,
-            &test_allocation_resources(),
-            &budget,
-            charges,
-        )
-        .map(|(records, _)| records.len())
-        .expect_err("the check at the first miss counts the pile, which passes the limit");
+        let run_with_limit = |limit: u64| {
+            let driver_records: Vec<(Record, RecordOrder)> = (0..pile_rows + keyed_rows)
+                .map(|i| {
+                    let record = if i < pile_rows {
+                        rec(
+                            &collect_schema,
+                            vec![
+                                Value::Null,
+                                Value::String(big_pad.as_str().into()),
+                                Value::Null,
+                            ],
+                        )
+                    } else {
+                        rec(
+                            &collect_schema,
+                            vec![
+                                Value::Integer(i as i64),
+                                Value::String("".into()),
+                                Value::Null,
+                            ],
+                        )
+                    };
+                    (record, RecordOrder::from(i as u64))
+                })
+                .collect();
+            let (budget, handle, charges) =
+                ledger_with_input_charges(limit, 1024 * 1024, 64 * 1024);
+            let outcome = run_kernel_on(
+                RunKernel {
+                    driver_records,
+                    build_records: vec![rec(&builds_schema, vec![Value::Integer(1_000_000)])],
+                    decomposed: drivers_below_builds(),
+                    driver_qual: "drivers",
+                    build_qual: "builds",
+                    driver_schema: &collect_schema,
+                    build_schema: &builds_schema,
+                    match_mode: MatchMode::Collect,
+                    on_miss: OnMiss::Skip,
+                    presorted: true,
+                    body_program: None,
+                    budget_bytes: None,
+                },
+                None,
+                &test_allocation_resources(),
+                &budget,
+                charges,
+            )
+            .map(|(records, _)| records.len());
+            (outcome, budget, handle)
+        };
+        let join_label = Some(clinker_plan::runtime_error::ConsumerLabel {
+            node: "sm_test".to_string(),
+            surface: clinker_plan::runtime_error::MemorySurface::JoinState,
+        });
+
+        let (outcome, budget, handle) = run_with_limit(big_pile_text);
+        let hand_over_peak = budget.peak_charged_bytes();
+        let err = outcome.expect_err("a limit of the pile's text alone refuses the hand-over");
+        let hand_over_report = match err {
+            PipelineError::MemoryBudgetExceeded { report } => report,
+            other => panic!("expected E310 at the hand-over, got {other:?}"),
+        };
+        assert_eq!(hand_over_report.requester, join_label);
+        assert!(
+            hand_over_report.requested_bytes > 0,
+            "the hand-over is refused for the growth it asked for"
+        );
+        assert!(
+            hand_over_peak <= big_pile_text,
+            "the refused hand-over never takes the ledger ({hand_over_peak}) past the \
+             limit ({big_pile_text})"
+        );
+        assert_eq!(handle.bytes(), 0);
+        assert_eq!(budget.charged_bytes(), 0);
+
+        let (outcome, budget, handle) = run_with_limit(hand_over_report.suggested_limit_bytes);
+        let err = outcome
+            .expect_err("the check at the first miss counts the pile, which passes the limit");
         let report = match err {
             PipelineError::MemoryBudgetExceeded { report } => report,
             other => panic!("expected E310 at the miss dispatch's check, got {other:?}"),
         };
-        assert_eq!(
-            report.requester,
-            Some(clinker_plan::runtime_error::ConsumerLabel {
-                node: "sm_test".to_string(),
-                surface: clinker_plan::runtime_error::MemorySurface::JoinState,
-            })
-        );
+        assert_eq!(report.requester, join_label);
         assert_eq!(
             report.requested_bytes, 0,
             "the refusal is the emitted-row check, made after the fact"
@@ -4454,6 +4488,85 @@ mod tests {
             join_bytes > big_pile_text,
             "at the first miss's dispatch the join's charge ({join_bytes}) must still \
              cover the null-key pile ({big_pile_text} bytes of text)"
+        );
+        assert_eq!(
+            handle.bytes(),
+            0,
+            "the refused join returns to its baseline"
+        );
+        assert_eq!(budget.charged_bytes(), 0);
+    }
+
+    /// A side's hand-over to the join can raise the ledger, because the join
+    /// charges the rows' heap and the null-key pile that the input's charge
+    /// did not. The growth is admitted before the join holds it: a pile of
+    /// null-key drivers whose text alone fills the limit is refused at the
+    /// hand-over, naming the join with the growth it asked for, and the
+    /// ledger never passes the limit. No walk row is emitted, so no later
+    /// check would have seen the overshoot.
+    #[test]
+    fn a_hand_over_past_the_limit_is_refused_before_the_join_holds_it() {
+        let drivers_schema = schema_with(&["k", "pad"]);
+        let builds_schema = schema_with(&["k"]);
+        let pad = "y".repeat(256 * 1024);
+        let pile_rows = 64u64;
+        let pile_text = pile_rows * pad.len() as u64;
+        let driver_records: Vec<(Record, RecordOrder)> = (0..pile_rows)
+            .map(|i| {
+                (
+                    rec(
+                        &drivers_schema,
+                        vec![Value::Null, Value::String(pad.as_str().into())],
+                    ),
+                    RecordOrder::from(i),
+                )
+            })
+            .collect();
+        let limit = pile_text;
+        let (budget, handle, charges) = ledger_with_input_charges(limit, 1024 * 1024, 64 * 1024);
+        let outcome = run_kernel_on(
+            RunKernel {
+                driver_records,
+                build_records: vec![rec(&builds_schema, vec![Value::Integer(1_000)])],
+                decomposed: drivers_below_builds(),
+                driver_qual: "drivers",
+                build_qual: "builds",
+                driver_schema: &drivers_schema,
+                build_schema: &builds_schema,
+                match_mode: MatchMode::First,
+                on_miss: OnMiss::Skip,
+                presorted: true,
+                body_program: None,
+                budget_bytes: None,
+            },
+            None,
+            &test_allocation_resources(),
+            &budget,
+            charges,
+        )
+        .map(|(records, _)| records.len());
+        let peak = budget.peak_charged_bytes();
+        let err = outcome.expect_err(&format!(
+            "a hand-over past the limit must be refused (peak {peak}, limit {limit})"
+        ));
+        let report = match err {
+            PipelineError::MemoryBudgetExceeded { report } => report,
+            other => panic!("expected E310 at the hand-over's admission, got {other:?}"),
+        };
+        assert_eq!(
+            report.requester,
+            Some(clinker_plan::runtime_error::ConsumerLabel {
+                node: "sm_test".to_string(),
+                surface: clinker_plan::runtime_error::MemorySurface::JoinState,
+            })
+        );
+        assert!(
+            report.requested_bytes > 0,
+            "the refusal names the growth the hand-over asked for"
+        );
+        assert!(
+            peak <= limit,
+            "the ledger's peak ({peak}) must never pass the limit ({limit})"
         );
         assert_eq!(
             handle.bytes(),
