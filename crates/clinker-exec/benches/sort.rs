@@ -6,7 +6,10 @@
 //! on a dedicated eight-thread pool, over key shapes that stress the
 //! comparator differently (an integer, short and long strings, a string
 //! sharing a 16-byte prefix, a three-field mixed key, a leading date-time, and
-//! a low-cardinality integer with real ties).
+//! a low-cardinality integer with real ties). A cardinality sweep adds an
+//! integer key with 64, 1,000 and 16,000 distinct values at 100,000 rows, so
+//! the cost between a few repeated keys and all-distinct keys is measured
+//! rather than inferred from the two ends.
 //!
 //! `sort_buffer_spilled` times the external sort: the same buffer with a
 //! threshold that forms about sixteen runs, then the field-ordered k-way merge
@@ -287,7 +290,10 @@ fn buffer_shape(shape: &str, rows: usize) -> BufferShape {
                     Value::Integer((i % 1_000) as i64),
                 ],
                 "low_card" => vec![Value::Integer((p % 16) as i64)],
-                other => unreachable!("unknown sort-buffer shape {other}"),
+                other => match swept_cardinality(other) {
+                    Some(distinct) => vec![Value::Integer((p % distinct) as i64)],
+                    None => unreachable!("unknown sort-buffer shape {other}"),
+                },
             };
             let record = Record::new(schema.clone(), values);
             (record, SourceRowId::new(source, i as u64 + 1))
@@ -339,6 +345,19 @@ fn new_buffer(
     }
 }
 
+/// The cardinality sweep: one integer key with this many distinct values,
+/// scrambled like `low_card`, measured at [`CARDINALITY_SWEEP_ROWS`] rows only.
+/// Between `low_card`'s 16 values and `int`'s all-distinct key it shows where
+/// sorting on key prefixes starts to pay.
+const CARDINALITY_SWEEP: [&str; 3] = ["card_64", "card_1000", "card_16000"];
+
+const CARDINALITY_SWEEP_ROWS: usize = 100_000;
+
+/// The distinct-value count a `card_<k>` sweep shape names.
+fn swept_cardinality(shape: &str) -> Option<u64> {
+    shape.strip_prefix("card_")?.parse().ok()
+}
+
 const BUFFER_SHAPES: [&str; 6] = [
     "int",
     "short_string",
@@ -352,35 +371,40 @@ fn bench_sort_buffer_in_memory(c: &mut Criterion) {
     let mut group = c.benchmark_group("sort_buffer_in_memory");
     let pool = eight_thread_pool();
     let resources = buffer_resources();
-    for shape_name in BUFFER_SHAPES {
-        for rows in [10_000usize, 100_000] {
-            let shape = buffer_shape(shape_name, rows);
-            group.throughput(Throughput::Elements(rows as u64));
-            for (mode, pool) in [("seq", None), ("pool", Some(&pool))] {
-                group.bench_with_input(
-                    BenchmarkId::new(format!("{shape_name}/{mode}"), rows),
-                    &rows,
-                    |b, _| {
-                        b.iter_batched(
-                            || shape.rows.clone(),
-                            |input| {
-                                let mut buffer =
-                                    new_buffer(&shape, usize::MAX, None, pool, &resources);
-                                for (record, payload) in input {
-                                    buffer.push(record, payload);
+    let sized_shapes = BUFFER_SHAPES
+        .iter()
+        .flat_map(|shape| [10_000usize, 100_000].map(|rows| (*shape, rows)))
+        .chain(
+            CARDINALITY_SWEEP
+                .iter()
+                .map(|shape| (*shape, CARDINALITY_SWEEP_ROWS)),
+        );
+    for (shape_name, rows) in sized_shapes {
+        let shape = buffer_shape(shape_name, rows);
+        group.throughput(Throughput::Elements(rows as u64));
+        for (mode, pool) in [("seq", None), ("pool", Some(&pool))] {
+            group.bench_with_input(
+                BenchmarkId::new(format!("{shape_name}/{mode}"), rows),
+                &rows,
+                |b, _| {
+                    b.iter_batched(
+                        || shape.rows.clone(),
+                        |input| {
+                            let mut buffer = new_buffer(&shape, usize::MAX, None, pool, &resources);
+                            for (record, payload) in input {
+                                buffer.push(record, payload);
+                            }
+                            match buffer.finish().expect("resident sort") {
+                                (SortedOutput::InMemory(sorted), _) => black_box(sorted),
+                                (SortedOutput::Spilled(_), _) => {
+                                    unreachable!("an unbounded threshold spilled")
                                 }
-                                match buffer.finish().expect("resident sort") {
-                                    (SortedOutput::InMemory(sorted), _) => black_box(sorted),
-                                    (SortedOutput::Spilled(_), _) => {
-                                        unreachable!("an unbounded threshold spilled")
-                                    }
-                                };
-                            },
-                            BatchSize::LargeInput,
-                        );
-                    },
-                );
-            }
+                            };
+                        },
+                        BatchSize::LargeInput,
+                    );
+                },
+            );
         }
     }
     group.finish();
