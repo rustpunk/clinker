@@ -19,23 +19,53 @@
 //!     keying on evaluated inequality expressions that back no single column —
 //!     so the key need not be stamped onto the record as a synthetic field.
 //!
-//! A field-ordered buffer sorts a per-row index rather than the pairs: each
-//! entry holds the first eight bytes of the row's order-preserving key and the
-//! row's position, equal prefixes fall back to the full comparator and then to
-//! the position, and the pairs are moved into the index's order in place. The
-//! result is the stable sort by the comparator. When prefixes keep colliding
-//! while the full keys differ, the buffer measures it while encoding, stops
-//! abbreviating for that run and every later one, and sorts on the comparator
-//! alone. Each row's index entry is charged at push whichever way its run ends
-//! up sorted, and neither the index nor the abbreviations reach disk: the spill
-//! format is unchanged.
+//! A field-ordered buffer sorts through a per-row index. Each entry holds the
+//! first eight bytes of the row's order-preserving key (its abbreviation) and
+//! the row's position. The run is split into contiguous chunks: one per thread
+//! of the buffer's kernel pool, each at least 48 rows, or a single chunk
+//! without a pool or on a one-thread pool. Each chunk, in parallel with the
+//! others, sorts its entries on their two integers alone, moves its own pairs
+//! into that order, and checks each run of equal abbreviations once,
+//! stable-sorting the run with the full comparator only when it is out of
+//! order. Every chunk then holds the stable sort of its own rows, and a single
+//! chunk is the result. Otherwise the index is dropped and the pool's stable
+//! `par_sort_by` with the comparator merges the chunks. They are contiguous and
+//! in arrival order, so the stable merge keeps equal keys in arrival order and
+//! the output is the stable sort by the comparator.
 //!
-//! A sequential sort decides on a doubling schedule of checkpoints and can stop
-//! abbreviating part-way through a run; a pooled sort decides once over the
-//! whole run from its merged chunk sketches. On input whose early rows collide
-//! and whose later rows diversify the two can decide differently. The output is
-//! identical either way, and the two are claimed to agree only on the abort
-//! fixtures the tests pin.
+//! The merge leans on two things rayon documents for `par_sort_by`. It is
+//! stable, and the output's correctness rests on that alone. Under "Current
+//! implementation" it is also described as "very fast" on "two or more sorted
+//! sequences concatenated one after another": it sorts fixed-length pieces of
+//! the slice in parallel and joins neighbouring pieces already in order, so `C`
+//! presorted chunks reach its merge as about `2C - 1` pieces, each chunk's
+//! interior plus the pieces that straddle a chunk boundary, which are not in
+//! order and get sorted. That piece length is an implementation detail rayon
+//! may change; the `sort_buffer_sort_only` bench is what would show the cost
+//! moving, and the output cannot.
+//!
+//! Abbreviation is measured while the keys are encoded, from distinct-count
+//! sketches of the abbreviations and of the full keys. A sequential sort checks
+//! them at 100 rows and at each doubling, and can stop part-way through a run.
+//! A pooled sort runs the same checkpoints on its first 1,600 rows, then
+//! encodes the rest in its chunks and decides once over the whole run from the
+//! prefix's sketches merged with every chunk's: a chunk's distinct counts are
+//! not the run's, so the chunks contribute sketches, not verdicts. A run stops
+//! abbreviating when it has at most 96 distinct keys, which the comparator sort
+//! already orders more cheaply, or when the abbreviations keep colliding while
+//! the full keys differ. It is then sorted on the comparator alone, and so is
+//! every later run of the buffer. A measured run shorter than 48 rows is left
+//! to the comparator sort. A pooled and a sequential sort decide identically on every
+//! input decided within its first 1,600 rows; beyond that the pooled sort
+//! decides once on the whole run while the sequential one keeps checkpointing.
+//! The output is identical either way.
+//!
+//! Each row's index entry is charged at push, whichever way its run ends up
+//! sorted. The index is the only per-row allocation the abbreviated sort adds
+//! to the comparator sort, and it is dropped before the merge, whose scratch is
+//! the comparator sort's own, so a sort's peak memory is at most the comparator
+//! sort's peak plus the charged index. Neither the index nor the abbreviations
+//! reach disk: the spill format is unchanged.
 //!
 //! Generic over per-record payload `P`. Source/output sort uses `SortBuffer<()>`;
 //! the DAG enforcer-sort carries a `SourceRowId`, while the sort-merge join uses
