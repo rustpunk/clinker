@@ -562,8 +562,9 @@ A Source that declares record-level `sort_order` is the exception to the usual
 pause-only Source shape: it inserts a verification barrier around each physical
 file before the ingest channel releases that file downstream. The barrier reuses
 the Source consumer's live-byte counter. While a file is staged, that counter is
-the shared `SortBuffer`'s resident bytes plus one adjacent record retained for
-inversion detection, plus the charges of any verified records from the
+the shared `SortBuffer`'s resident bytes, which for this field-ordered sort
+include its per-row sort index, plus one adjacent record retained for inversion
+detection, plus the charges of any verified records from the
 preceding file still queued downstream. During resident release, ownership
 moves from the sorter to an explicitly charged release total and then to the
 queued record's own charge, the same exact per-attempt charge an unordered

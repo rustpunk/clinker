@@ -19,6 +19,24 @@
 //!     keying on evaluated inequality expressions that back no single column —
 //!     so the key need not be stamped onto the record as a synthetic field.
 //!
+//! A field-ordered buffer sorts a per-row index rather than the pairs: each
+//! entry holds the first eight bytes of the row's order-preserving key and the
+//! row's position, equal prefixes fall back to the full comparator and then to
+//! the position, and the pairs are moved into the index's order in place. The
+//! result is the stable sort by the comparator. When prefixes keep colliding
+//! while the full keys differ, the buffer measures it while encoding, stops
+//! abbreviating for that run and every later one, and sorts on the comparator
+//! alone. Each row's index entry is charged at push whichever way its run ends
+//! up sorted, and neither the index nor the abbreviations reach disk: the spill
+//! format is unchanged.
+//!
+//! A sequential sort decides on a doubling schedule of checkpoints and can stop
+//! abbreviating part-way through a run; a pooled sort decides once over the
+//! whole run from its merged chunk sketches. On input whose early rows collide
+//! and whose later rows diversify the two can decide differently. The output is
+//! identical either way, and the two are claimed to agree only on the abort
+//! fixtures the tests pin.
+//!
 //! Generic over per-record payload `P`. Source/output sort uses `SortBuffer<()>`;
 //! the DAG enforcer-sort carries a `SourceRowId`, while the sort-merge join uses
 //! its own typed ordering payload. Payload travels inside the spill envelope
