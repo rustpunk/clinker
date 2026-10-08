@@ -691,9 +691,10 @@ impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
             self.schema.columns(),
         );
         // A field-ordered sort builds one index entry per resident row when it
-        // sorts, and the stable sort it falls back to holds scratch of about
-        // the same size, so the entry is charged from the row's arrival
-        // whichever way the run ends up sorted.
+        // sorts, so the entry is charged from the row's arrival whichever way
+        // the run ends up sorted. The sort's own scratch, up to one pair per
+        // row, is not charged by any sort, abbreviated or not; that gap
+        // predates the index.
         let index_bytes = match self.ordering {
             SortOrdering::Fields(_) => SORT_INDEX_ENTRY_BYTES,
             SortOrdering::Payload => 0,
@@ -781,11 +782,23 @@ impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
     /// order, so of two rows with equal keys the earlier one is still first,
     /// and the stable merge keeps it there.
     ///
-    /// The index holds exactly the entries charged at push and is the only
-    /// per-row allocation this adds to the comparator sort; the integer sorts
-    /// allocate nothing; each chunk sorts one tie run at a time with scratch
-    /// for that run alone. The merge is the comparator sort's own parallel
-    /// sort, with its own scratch, and runs after the index is gone.
+    /// Peak memory is at most the comparator sort's peak plus the index, on
+    /// every path. With `n` rows, the comparator sort's scratch is the pool's
+    /// `par_sort_by` buffer of `n` pairs, or without a pool the standard stable
+    /// sort's, at most `max(n, 48)` pairs and never less for a longer slice
+    /// than for a shorter one. This sort
+    /// adds the index: exactly `n` entries, charged at push (its capacity is
+    /// asserted below). The integer sorts allocate nothing. A chunk sorts one
+    /// tie run at a time, and the standard stable sort's scratch for a run of
+    /// `r` rows is at most `max(r, 48)` pairs, none at all up to 20 rows. Every
+    /// chunk of a pooled sort holds at least [`MIN_CHUNK_ROWS`] rows, so a run's
+    /// scratch fits within its chunk and the chunks sorting at once hold at most
+    /// `n` pairs of scratch between them, beside the index. The index is
+    /// dropped before the merge, whose only scratch is the comparator sort's
+    /// own `n`-pair buffer. A single chunk without a pool sorts no run longer
+    /// than the whole buffer, so its scratch stays within the comparator sort
+    /// of the buffer; on a pool it has at least [`MIN_CHUNK_ROWS`] rows when
+    /// measured, so its scratch stays within the pool's `n`-pair buffer.
     ///
     /// Returns `false`, having latched abbreviation off for every later run,
     /// when the encode pass measured that the abbreviations no longer tell the
