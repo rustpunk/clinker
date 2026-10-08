@@ -1,7 +1,8 @@
-//! Phase 1.5: Pointer sorting within partitions.
+//! Window partition sort: orders a partition's arena positions.
 //!
-//! Sorts each partition's `Vec<u32>` by looking up `sort_by` fields in the Arena.
-//! Stable sort preserves insertion order for equal keys.
+//! Sorts each partition's `u64` arena positions by its `sort_by` fields, read
+//! from the arena by column position resolved once per partition. Stable, so
+//! equal keys keep insertion order.
 
 use std::cmp::Ordering;
 
@@ -51,10 +52,8 @@ fn compare_positions(arena: &Arena, keys: &ResolvedSortKeys, a: u64, b: u64) -> 
     )
 }
 
-/// Compare two records directly by sort_by fields.
-///
-/// Unlike `compare_records` which uses RecordStorage + position indices,
-/// this operates on Record references — used by SortBuffer for in-memory sorting.
+/// Compare two records by `sort_by` fields, reading each field by name: the
+/// authored comparator, [`compare_authored_keys`].
 pub fn compare_records_by_fields(a: &Record, b: &Record, sort_by: &[SortField]) -> Ordering {
     compare_authored_keys(a, b, sort_by)
 }

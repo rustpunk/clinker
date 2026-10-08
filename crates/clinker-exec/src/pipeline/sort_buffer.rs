@@ -8,8 +8,11 @@
 //!
 //! Two ordering modes, chosen at construction:
 //!   - Field-ordered ([`SortBuffer::new`]): the sort key is read from the
-//!     record via [`compare_authored_keys`] and the payload rides along
-//!     inert. Every source/output/DAG/join sort uses this.
+//!     record by the authored comparator
+//!     ([`compare_authored_keys`](crate::pipeline::sort_key::compare_authored_keys)),
+//!     its fields resolved to column positions once against the buffer's
+//!     schema, and the payload rides along inert. Every source/output/DAG/join
+//!     sort uses this.
 //!   - Payload-ordered ([`SortBuffer::new_payload_ordered`]): pairs order by the
 //!     payload `P: Ord` directly, with no record field consulted. This serves a
 //!     sort whose key is a value computed off the record — e.g. a range join
@@ -108,8 +111,9 @@ pub enum SortedOutput<P> {
 
 /// How a [`SortBuffer`] orders its accumulated pairs.
 enum SortOrdering {
-    /// Order by [`compare_authored_keys`] over these fields; the record
-    /// carries the sort key and the payload rides along inert.
+    /// Order by the authored fields, resolved once against the buffer's
+    /// schema; the record carries the sort key and the payload rides along
+    /// inert.
     Fields(ResolvedSortKeys),
     /// Order by the carried payload `P: Ord` directly, with no record field
     /// consulted. For a sort key computed off the record rather than stored in

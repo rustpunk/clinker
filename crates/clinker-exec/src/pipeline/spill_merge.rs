@@ -11,16 +11,16 @@
 //! Ordering mirrors the [`SortBuffer`](crate::pipeline::sort_buffer::SortBuffer)
 //! mode the runs were spilled under, so the merged order is byte-identical to
 //! the single in-memory sort the buffer would have produced without spilling:
-//!   - Field-ordered ([`SortedRunMerger::new`]): by [`compare_authored_keys`]
-//!     — the exact field comparator each run was formed with.
+//!   - Field-ordered ([`SortedRunMerger::new`]): by the authored field
+//!     comparator each run was formed with
+//!     ([`compare_authored_keys`](crate::pipeline::sort_key::compare_authored_keys)),
+//!     its fields resolved to column positions once from the runs' schema.
 //!   - Payload-ordered ([`SortedRunMerger::new_payload_ordered`]): by the
 //!     carried payload `P: Ord` directly, matching a payload-ordered buffer.
 //!
-//! The memcomparable byte key on
-//! [`crate::pipeline::loser_tree::MergeEntry`] is deliberately not used here:
-//! it is not provably equal to the field comparator across Integer/Decimal or
-//! mixed int/float ordering, so merging on it could silently mis-order
-//! cross-type keys.
+//! The memcomparable byte key orders runs the same way, but merging on it
+//! would cost one key encode per decoded record; comparing the decoded fields
+//! by position costs none.
 //!
 //! Memory model: streaming with a bounded fan-in. A single merge pass holds
 //! one resident record per open run and one open file descriptor per open run,
@@ -500,7 +500,8 @@ impl<P: Ord + crate::pipeline::sort_buffer::HeapBytes> SortedRunMerger<P> {
 }
 
 impl<P: Serialize + DeserializeOwned + Ord> SortedRunMerger<P> {
-    /// Field-ordered merge: runs are ordered by [`compare_authored_keys`]
+    /// Field-ordered merge: runs are ordered by the authored comparator
+    /// ([`compare_authored_keys`](crate::pipeline::sort_key::compare_authored_keys))
     /// over `sort_by`, matching a field-ordered
     /// [`SortBuffer`](crate::pipeline::sort_buffer::SortBuffer). `context` names
     /// the calling operator/phase so a spill open or decode failure localizes

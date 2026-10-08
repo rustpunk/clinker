@@ -2,12 +2,17 @@
 //!
 //! [`compare_authored_keys`] orders records by the fields, directions and null
 //! placement an author declared; [`encode_sort_key`] writes the same order as a
-//! byte sequence whose lexicographic comparison (`memcmp`) equals it. The loser
-//! tree of an external merge sort and the spilled and streaming aggregates
-//! compare the bytes; the in-memory sort, the declared-order check and the
-//! window partition sort call the comparator. Both order non-null values by
-//! the one value order, [`clinker_record::order`], so the in-memory and the
-//! spilled path of every sort agree.
+//! byte sequence whose lexicographic comparison (`memcmp`) equals it. The
+//! streaming aggregate's group boundary and the aggregate spill merge compare
+//! the bytes; the resident sort, the merge of spilled sort runs, the window
+//! partition sort and the Reshape and Cull group order call the comparator.
+//! Both order non-null values by the one value order, [`clinker_record::order`],
+//! so the in-memory and the spilled path of every sort agree.
+//!
+//! Those comparators read fields through `ResolvedSortKeys`, which resolves
+//! each field's column once against the schema the sort's records carry and
+//! reads it by position; a record of another schema is read by name, with the
+//! same result.
 //!
 //! Key layout, per sort field:
 //! - `[null_sentinel: 1 byte] [value key: N bytes]`
