@@ -530,9 +530,7 @@ pub struct SortBuffer<P> {
 // the shared `sort_and_spill` / `finish` path can compare payloads in the
 // payload-ordered mode without splitting the buffer across two impl blocks.
 // Every payload type in use is already `Ord`, so this constrains no caller.
-// `Sync` lets the pooled sort read the resident pairs from every worker; every
-// payload type in use is plain data.
-impl<P: Serialize + DeserializeOwned + Send + Sync + Ord + HeapBytes> SortBuffer<P> {
+impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
     /// Field-ordered buffer: pairs sort by `sort_by` over each record's fields
     /// and the payload rides along inert. The historical mode; used by every
     /// source/output/DAG/join sort.

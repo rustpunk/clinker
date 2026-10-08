@@ -1731,7 +1731,7 @@ fn charge_block_spill(ctx: &DrainCtx<'_>, written: u64) -> Result<(), PipelineEr
 /// Push one matched pair into the sort buffer, mirror the byte delta into the
 /// consumer handle, and spill (charging the run against the disk quota, E320)
 /// when the buffer crosses its threshold.
-fn push_charge_spill<P: Serialize + DeserializeOwned + Send + Sync + Ord + HeapBytes>(
+fn push_charge_spill<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes>(
     buf: &mut SortBuffer<P>,
     record: Record,
     payload: P,
@@ -1765,7 +1765,7 @@ fn push_charge_spill<P: Serialize + DeserializeOwned + Send + Sync + Ord + HeapB
 /// in-memory case that release is deferred until the sorted vec is actually
 /// consumed into blocks, so the still-resident vec is never charged out from
 /// under the consumer mid-slice.
-fn finish_and_slice<P: Serialize + DeserializeOwned + Send + Sync + Ord + HeapBytes>(
+fn finish_and_slice<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes>(
     buf: SortBuffer<P>,
     schema: &SharedStorage<Schema>,
     ctx: &DrainCtx<'_>,
@@ -1785,7 +1785,7 @@ fn finish_and_slice<P: Serialize + DeserializeOwned + Send + Sync + Ord + HeapBy
     result
 }
 
-fn finish_and_slice_inner<P: Serialize + DeserializeOwned + Send + Sync + Ord + HeapBytes>(
+fn finish_and_slice_inner<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes>(
     buf: SortBuffer<P>,
     schema: &SharedStorage<Schema>,
     ctx: &DrainCtx<'_>,
