@@ -47,7 +47,7 @@ use clinker_record::owned_storage::{AllocationResources, SharedStorage};
 use std::cmp::Ordering;
 use std::path::PathBuf;
 
-use rayon::iter::{IndexedParallelIterator, ParallelIterator};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rayon::slice::ParallelSliceMut;
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -197,12 +197,52 @@ impl KeySketches {
     }
 }
 
-/// Rows per chunk of the pooled encode pass: `min(rows, 4 × threads)` near-equal
-/// contiguous chunks, so the chunk sketches are bounded by the pool, not the
-/// input.
-fn encode_chunk_rows(rows: usize, threads: usize) -> usize {
-    let chunks = rows.min(4 * threads.max(1)).max(1);
-    rows.div_ceil(chunks).max(1)
+/// The fewest rows in a chunk of a pooled abbreviated sort, and the fewest rows
+/// a measured sort abbreviates at all. The standard library's stable sort takes
+/// a scratch of at least this many elements for any run longer than twenty
+/// rows, so a chunk of at least this length never needs a tie-run scratch
+/// larger than itself, and a shorter run has nothing to gain from an index.
+const MIN_CHUNK_ROWS: usize = 48;
+
+/// How many contiguous chunks a sort of `rows` rows on a pool of `threads`
+/// threads splits into: one per thread, as long as each holds at least
+/// [`MIN_CHUNK_ROWS`] rows. A single chunk is the sequential sort.
+fn chunk_count(rows: usize, threads: usize) -> usize {
+    (rows / MIN_CHUNK_ROWS).clamp(1, threads.max(1))
+}
+
+/// The first row of chunk `chunk` among `chunks` contiguous chunks over `rows`
+/// rows. Chunk lengths differ by at most one row, so none is shorter than
+/// `rows / chunks`, and [`chunk_count`] keeps that at least [`MIN_CHUNK_ROWS`].
+fn chunk_start(rows: usize, chunks: usize, chunk: usize) -> usize {
+    chunk * rows / chunks
+}
+
+/// One chunk of a pooled sort: its first row in the run, its pairs and their
+/// index entries.
+type Chunk<'a, P> = (usize, &'a mut [(Record, P)], &'a mut [SortIndexEntry]);
+
+/// Split a run's pairs and its index, which hold the same rows, into the
+/// `chunks` contiguous chunks [`chunk_start`] places. The list holds one entry
+/// per chunk, so its length is bounded by the pool, not the input.
+fn split_chunks<'a, P>(
+    mut pairs: &'a mut [(Record, P)],
+    mut index: &'a mut [SortIndexEntry],
+    chunks: usize,
+) -> Vec<Chunk<'a, P>> {
+    let rows = pairs.len();
+    debug_assert_eq!(rows, index.len());
+    let mut split = Vec::with_capacity(chunks);
+    for chunk in 0..chunks {
+        let first_row = chunk_start(rows, chunks, chunk);
+        let len = chunk_start(rows, chunks, chunk + 1) - first_row;
+        let (chunk_pairs, rest_pairs) = std::mem::take(&mut pairs).split_at_mut(len);
+        let (chunk_index, rest_index) = std::mem::take(&mut index).split_at_mut(len);
+        split.push((first_row, chunk_pairs, chunk_index));
+        pairs = rest_pairs;
+        index = rest_index;
+    }
+    split
 }
 
 /// Rows a pooled sort encodes on the calling thread, through the sequential
@@ -242,19 +282,24 @@ fn encode_sequential<P>(
     Ok(())
 }
 
-/// Encode a pooled sort's abbreviated keys into `index`. The first
-/// [`POOLED_PREFIX_ROWS`] rows are encoded on the calling thread through the
-/// sequential checkpoints, so a run that stops abbreviating early stops there.
-/// The rest are encoded in parallel chunks on `pool`, each chunk writing its
-/// own slice of the index with its own scratch key and sketches; the rows are
-/// only read, through disjoint chunks. When `measure`, the prefix's and every
-/// chunk's sketches are merged and the run is decided once over all its rows,
-/// returning `Err(rows)` to abort. Returns how many rows were encoded in
-/// parallel.
+/// Encode a pooled sort's abbreviated keys into `index`, over the `chunks`
+/// chunks the sort will order. The first [`POOLED_PREFIX_ROWS`] rows are
+/// encoded on the calling thread through the sequential checkpoints, so a run
+/// that stops abbreviating early stops there. Each chunk then encodes its own
+/// rows past the prefix in parallel on `pool`, with its own scratch key and
+/// sketches, writing its own slice of the index; the rows are only read.
+///
+/// When `measure`, the prefix's sketches are merged with every chunk's and the
+/// run is decided once over all its rows, returning `Err(rows)` to abort. A
+/// chunk's distinct counts are not the run's, so the chunks contribute sketches
+/// rather than verdicts. A run no longer than the prefix takes no such verdict:
+/// it was decided at the same checkpoints a sequential sort of it reaches.
+/// Returns how many rows were encoded in parallel.
 fn encode_pooled<P: Send>(
     pairs: &mut [(Record, P)],
     keys: &ResolvedSortKeys,
     pool: &rayon::ThreadPool,
+    chunks: usize,
     measure: bool,
     index: &mut Vec<SortIndexEntry>,
 ) -> Result<usize, usize> {
@@ -265,19 +310,19 @@ fn encode_pooled<P: Send>(
     if rows == prefix_rows {
         return Ok(0);
     }
-    let chunk_rows = encode_chunk_rows(rows - prefix_rows, pool.current_num_threads());
     index.resize(rows, (0, 0));
     let chunk_sketches: Vec<KeySketches> = pool.install(|| {
-        index[prefix_rows..]
-            .par_chunks_mut(chunk_rows)
-            .zip(pairs[prefix_rows..].par_chunks_mut(chunk_rows))
-            .enumerate()
-            .map(|(chunk, (entries, chunk_pairs))| {
+        split_chunks(pairs, index, chunks)
+            .into_par_iter()
+            .map(|(first_row, chunk_pairs, entries)| {
                 let mut key = Vec::new();
                 let mut sketches = KeySketches::new();
-                let first_row = prefix_rows + chunk * chunk_rows;
-                for (offset, (entry, (record, _))) in
-                    entries.iter_mut().zip(chunk_pairs.iter()).enumerate()
+                let encoded_by_prefix = prefix_rows.saturating_sub(first_row);
+                for (offset, (entry, (record, _))) in entries
+                    .iter_mut()
+                    .zip(chunk_pairs.iter())
+                    .enumerate()
+                    .skip(encoded_by_prefix)
                 {
                     keys.encode_into(record, &mut key);
                     let abbreviation = abbreviated_key(&key);
@@ -348,8 +393,8 @@ fn in_order<P>(run: &[(Record, P)], keys: &ResolvedSortKeys) -> bool {
 /// abbreviation of `pairs[k]`, so each run holds its rows in arrival order. A
 /// run already in order under the comparator is left as it is (an all-equal
 /// run always is); any other run is stable-sorted on its own, which keeps
-/// equal keys in arrival order. The sort allocates scratch for that run alone,
-/// never more than the stable sort of the whole buffer would.
+/// equal keys in arrival order. One run is sorted at a time, and its scratch
+/// is for that run alone.
 fn fix_tie_runs<P>(
     pairs: &mut [(Record, P)],
     index: &[SortIndexEntry],
@@ -377,50 +422,24 @@ fn fix_tie_runs<P>(
     runs
 }
 
-/// [`fix_tie_runs`] spread over the pool the caller has installed. A slice no
-/// longer than `leaf` is fixed sequentially. A longer one is split at the run
-/// boundary nearest its middle (the first at or after it, else the last before
-/// it) and both halves are fixed in parallel, so no run is ever split and each
-/// is examined exactly once. A longer slice with no interior boundary is a
-/// single run: it is checked once and, when out of order, sorted with the
-/// pool's stable sort. Every split shortens both halves, so the recursion ends;
-/// its searches read only the index, and it allocates nothing per run.
-fn fix_tie_runs_parallel<P: Send>(
+/// Sort one chunk's pairs into the stable order of the comparator through its
+/// index entries, which name rows of the whole run: rebase them to the chunk's
+/// `first_row`, sort them on their two integers (in place, no allocation), move
+/// the pairs into that order, and fix the chunk's tie runs.
+fn sort_chunk<P>(
     pairs: &mut [(Record, P)],
-    index: &[SortIndexEntry],
+    index: &mut [SortIndexEntry],
+    first_row: usize,
     keys: &ResolvedSortKeys,
-    leaf: usize,
 ) -> TieRuns {
-    let len = pairs.len();
-    if len <= leaf {
-        return fix_tie_runs(pairs, index, keys);
-    }
-    let boundary = |k: usize| index[k - 1].0 != index[k].0;
-    let middle = len / 2;
-    let split = (middle..len)
-        .find(|&k| boundary(k))
-        .or_else(|| (1..middle).rev().find(|&k| boundary(k)));
-    match split {
-        Some(k) => {
-            let (left_pairs, right_pairs) = pairs.split_at_mut(k);
-            let (left_index, right_index) = index.split_at(k);
-            let (left, right) = rayon::join(
-                || fix_tie_runs_parallel(left_pairs, left_index, keys, leaf),
-                || fix_tie_runs_parallel(right_pairs, right_index, keys, leaf),
-            );
-            left.plus(right)
-        }
-        None => {
-            let sorted = !in_order(pairs, keys);
-            if sorted {
-                pairs.par_sort_by(|(a, _), (b, _)| keys.compare(a, b));
-            }
-            TieRuns {
-                examined: 1,
-                sorted: usize::from(sorted),
-            }
+    if first_row != 0 {
+        for entry in index.iter_mut() {
+            entry.1 -= first_row;
         }
     }
+    index.sort_unstable();
+    permute_in_place(pairs, index);
+    fix_tie_runs(pairs, index, keys)
 }
 
 /// Result of finishing a sort buffer: either all (record, payload) pairs
@@ -681,10 +700,7 @@ impl<P: Serialize + DeserializeOwned + Send + Sync + Ord + HeapBytes> SortBuffer
     /// order. A field-ordered buffer first tries its abbreviated index sort,
     /// which produces that same order.
     fn sort_pairs(&mut self) {
-        if self.pairs.len() >= 2
-            && self.abbreviation != Abbreviation::Off
-            && self.sort_abbreviated()
-        {
+        if self.abbreviates(self.pairs.len()) && self.sort_abbreviated() {
             return;
         }
         // Split the borrow so the comparator can read `ordering` while the
@@ -709,19 +725,41 @@ impl<P: Serialize + DeserializeOwned + Send + Sync + Ord + HeapBytes> SortBuffer
         }
     }
 
+    /// Whether a run of `rows` rows is sorted through the abbreviated index. A
+    /// measured sort leaves a run shorter than [`MIN_CHUNK_ROWS`] to the
+    /// comparator sort without latching anything, so a later, longer run still
+    /// abbreviates.
+    fn abbreviates(&self, rows: usize) -> bool {
+        match self.abbreviation {
+            Abbreviation::Trying => rows >= MIN_CHUNK_ROWS,
+            Abbreviation::Off => false,
+            #[cfg(test)]
+            Abbreviation::Forced => rows >= 2,
+        }
+    }
+
     /// Sort a field-ordered buffer's pairs through a per-row index of
-    /// abbreviated keys. The index is sorted on its two integers alone, the
+    /// abbreviated keys, in [`chunk_count`] contiguous chunks: one without a
+    /// pool or on a one-thread pool, else one per pool thread.
+    ///
+    /// Each chunk sorts its index entries on their two integers alone, the
     /// abbreviation and then the row's position, so the in-place unstable sort
     /// yields each run of equal abbreviations in arrival order without reading
-    /// a row. The pairs are moved into index order, and then each run of equal
-    /// abbreviations is checked once and sorted on the comparator only when it
-    /// is out of order. Where two abbreviations differ they already decide the
-    /// order, so the result is exactly the stable sort by the comparator.
+    /// a row. The chunk's pairs are moved into index order, and each run of
+    /// equal abbreviations is checked once and sorted on the comparator only
+    /// when it is out of order. Where two abbreviations differ they already
+    /// decide the order, so each chunk ends as the stable sort of its own rows.
+    /// One chunk is then the whole result. Several chunks are sorted in
+    /// parallel, the index is dropped, and the pool's stable `par_sort_by`
+    /// with the comparator merges them: chunks are contiguous and in arrival
+    /// order, so of two rows with equal keys the earlier one is still first,
+    /// and the stable merge keeps it there.
     ///
-    /// The index is the only per-row allocation and holds exactly the entries
-    /// charged at push; the integer sort allocates nothing; a run's sort needs
-    /// scratch for that run alone, so the scratch alive at once stays within
-    /// what the stable sort of the whole buffer would hold.
+    /// The index holds exactly the entries charged at push and is the only
+    /// per-row allocation this adds to the comparator sort; the integer sorts
+    /// allocate nothing; each chunk sorts one tie run at a time with scratch
+    /// for that run alone. The merge is the comparator sort's own parallel
+    /// sort, with its own scratch, and runs after the index is gone.
     ///
     /// Returns `false`, having latched abbreviation off for every later run,
     /// when the encode pass measured that the abbreviations no longer tell the
@@ -731,11 +769,16 @@ impl<P: Serialize + DeserializeOwned + Send + Sync + Ord + HeapBytes> SortBuffer
             return false;
         };
         let measure = self.abbreviation == Abbreviation::Trying;
-        let pool = self.kernel_pool.as_deref();
         let rows = self.pairs.len();
+        let pooled = self.kernel_pool.as_deref().and_then(|pool| {
+            let chunks = chunk_count(rows, pool.current_num_threads());
+            (chunks >= 2).then_some((pool, chunks))
+        });
         let mut index = Vec::with_capacity(rows);
-        let encoded = match pool {
-            Some(pool) => encode_pooled(&mut self.pairs, keys, pool, measure, &mut index),
+        let encoded = match pooled {
+            Some((pool, chunks)) => {
+                encode_pooled(&mut self.pairs, keys, pool, chunks, measure, &mut index)
+            }
             None => encode_sequential(
                 &self.pairs,
                 keys,
@@ -749,7 +792,7 @@ impl<P: Serialize + DeserializeOwned + Send + Sync + Ord + HeapBytes> SortBuffer
             Ok(parallel_rows) => parallel_rows,
             Err(abort_rows) => {
                 debug_assert!(
-                    (FIRST_ABBREVIATION_CHECKPOINT..=self.pairs.len()).contains(&abort_rows),
+                    (FIRST_ABBREVIATION_CHECKPOINT..=rows).contains(&abort_rows),
                     "an abort is decided at a checkpoint the run reached"
                 );
                 self.abbreviation = Abbreviation::Off;
@@ -767,20 +810,24 @@ impl<P: Serialize + DeserializeOwned + Send + Sync + Ord + HeapBytes> SortBuffer
         }
         debug_assert_eq!(
             index.capacity(),
-            self.pairs.len(),
+            rows,
             "the sort index holds exactly the entries charged at push"
         );
-        match pool {
-            Some(pool) => pool.install(|| index.par_sort_unstable()),
-            None => index.sort_unstable(),
-        }
-        permute_in_place(&mut self.pairs, &mut index);
-        let runs = match pool {
-            Some(pool) => {
-                let leaf = encode_chunk_rows(self.pairs.len(), pool.current_num_threads()).max(2);
-                pool.install(|| fix_tie_runs_parallel(&mut self.pairs, &index, keys, leaf))
+        let runs = match pooled {
+            None => sort_chunk(&mut self.pairs, &mut index, 0, keys),
+            Some((pool, chunks)) => {
+                let runs = pool.install(|| {
+                    split_chunks(&mut self.pairs, &mut index, chunks)
+                        .into_par_iter()
+                        .map(|(first_row, pairs, index)| sort_chunk(pairs, index, first_row, keys))
+                        .reduce(TieRuns::default, TieRuns::plus)
+                });
+                drop(index);
+                pool.install(|| {
+                    self.pairs.par_sort_by(|(a, _), (b, _)| keys.compare(a, b));
+                });
+                runs
             }
-            None => fix_tie_runs(&mut self.pairs, &index, keys),
         };
         debug_assert!(runs.sorted <= runs.examined);
         #[cfg(test)]
@@ -1630,6 +1677,69 @@ mod tests {
                 .collect()
         }
 
+        /// A dedicated pool of exactly `threads` workers, so a test of the
+        /// chunked sort does not depend on the machine's thread count.
+        fn pool_of(threads: usize) -> Arc<rayon::ThreadPool> {
+            Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .expect("build a dedicated test pool"),
+            )
+        }
+
+        /// The chunks a sort of `rows` rows splits into on `pool`; one
+        /// without a pool.
+        fn chunks_on(rows: usize, pool: Option<&Arc<rayon::ThreadPool>>) -> usize {
+            pool.map_or(1, |pool| chunk_count(rows, pool.current_num_threads()))
+        }
+
+        /// The value these fixtures' abbreviations distinguish: an integer
+        /// key's value, or a string key's first six characters (the eight-byte
+        /// abbreviation spends two bytes on the field's null sentinel and the
+        /// value's type tag).
+        fn abbreviated_group(record: &Record) -> String {
+            match record.get("k") {
+                Some(Value::Integer(i)) => i.to_string(),
+                Some(Value::String(s)) => s.as_str().chars().take(6).collect(),
+                other => panic!("no abbreviation group for {other:?}"),
+            }
+        }
+
+        /// The tie runs (examined, sorted) a sort of `input` in `chunks`
+        /// chunks reaches: in each chunk, one run per abbreviation group of at
+        /// least two rows, sorted when its rows in arrival order are out of
+        /// order under the authored comparator.
+        fn expected_tie_runs(
+            input: &[(Record, u64)],
+            sort_by: &[SortField],
+            chunks: usize,
+        ) -> (usize, usize) {
+            let rows = input.len();
+            let (mut examined, mut sorted) = (0, 0);
+            for chunk in 0..chunks {
+                let mut groups: std::collections::BTreeMap<String, Vec<&Record>> =
+                    std::collections::BTreeMap::new();
+                for (record, _) in
+                    &input[chunk_start(rows, chunks, chunk)..chunk_start(rows, chunks, chunk + 1)]
+                {
+                    groups
+                        .entry(abbreviated_group(record))
+                        .or_default()
+                        .push(record);
+                }
+                for run in groups.values().filter(|run| run.len() >= 2) {
+                    examined += 1;
+                    if run.windows(2).any(|pair| {
+                        compare_authored_keys(pair[0], pair[1], sort_by) == Ordering::Greater
+                    }) {
+                        sorted += 1;
+                    }
+                }
+            }
+            (examined, sorted)
+        }
+
         #[test]
         fn abbreviated_sort_keeps_arrival_order_among_equal_keys() {
             let schema = schema();
@@ -1756,10 +1866,9 @@ mod tests {
                 .collect();
             let input = rows(&schema, skewed);
             let expected = oracle(&input, &sort_by);
-            let threads = crate::test_support::test_kernel_pool().current_num_threads();
-            let chunk_rows = encode_chunk_rows(input.len(), threads);
+            let two_threads = pool_of(2);
             assert!(
-                input.len().div_ceil(chunk_rows) >= 2,
+                chunks_on(input.len(), Some(&two_threads)) >= 2,
                 "the pool encodes the skewed fixture in several chunks"
             );
             let (sorted, abort) = resident(&input, &sort_by, Mode::Auto, false);
@@ -1769,9 +1878,9 @@ mod tests {
                 "the sequential path continued through 6,400 rows and aborted by 12,800, at {at}"
             );
             assert_eq!(sorted, expected);
-            let (sorted, abort) = resident(&input, &sort_by, Mode::Auto, true);
+            let (sorted, buf) = resident_on(&input, &sort_by, Mode::Auto, Some(&two_threads));
             assert!(
-                abort.is_some(),
+                buf.abbreviation_abort().is_some(),
                 "the pooled path sees the distinct half only through its merged sketches"
             );
             assert_eq!(sorted, expected);
@@ -1810,60 +1919,63 @@ mod tests {
 
         /// A run of equal abbreviations whose rows are already in order (here
         /// every run is one repeated key) costs one check and is not sorted; a
-        /// run the abbreviation cannot order is sorted once, also on a pool
-        /// small enough that the run is longer than one slice of the parallel
-        /// pass.
+        /// run the abbreviation cannot order is sorted once. A pooled sort fixes
+        /// the runs of each chunk on its own, so a run spread over two chunks
+        /// is examined, and sorted, once in each.
         #[test]
         fn tie_runs_already_in_order_are_not_sorted_again() {
             let schema = schema();
             let key_alone = vec![field("k", SortOrder::Asc, NullOrder::Last)];
-            let two_threads = Arc::new(
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(2)
-                    .build()
-                    .expect("build a two-thread pool"),
-            );
+            let two_threads = pool_of(2);
 
             let repeated = scrambled(5_000)
                 .map(|i| Value::Integer((i % 16) as i64))
                 .collect();
             let input = rows(&schema, repeated);
             let expected = oracle(&input, &key_alone);
-            for pool in [None, Some(crate::test_support::test_kernel_pool())] {
+            for pool in [None, Some(&two_threads)] {
                 let (sorted, buf) = resident_on(&input, &key_alone, Mode::Forced, pool);
                 assert_eq!(sorted, expected, "pooled: {}", pool.is_some());
+                let chunks = chunks_on(input.len(), pool);
                 assert_eq!(
                     (buf.tie_runs_examined(), buf.tie_runs_sorted()),
-                    (16, 0),
-                    "pooled: {}: sixteen runs of one key each, all already in order",
-                    pool.is_some()
+                    expected_tie_runs(&input, &key_alone, chunks),
+                    "{chunks} chunks: one run per key per chunk, all already in order"
                 );
+                assert_eq!(buf.tie_runs_sorted(), 0);
             }
+            assert_eq!(
+                expected_tie_runs(&input, &key_alone, 1),
+                (16, 0),
+                "sequentially, sixteen runs of one key each"
+            );
 
             let input = rows(&schema, prefixed_strings("a-twenty-byte-prefix", 3_000));
             let expected = oracle(&input, &key_alone);
-            assert!(
-                encode_chunk_rows(input.len(), two_threads.current_num_threads()) < input.len(),
-                "on two threads the single run is longer than one slice"
+            assert_eq!(
+                chunks_on(input.len(), Some(&two_threads)),
+                2,
+                "on two threads the single run spans both chunks"
             );
-            for pool in [
-                None,
-                Some(crate::test_support::test_kernel_pool()),
-                Some(&two_threads),
-            ] {
+            for (pool, runs) in [(None, (1, 1)), (Some(&two_threads), (2, 2))] {
                 let (sorted, buf) = resident_on(&input, &key_alone, Mode::Forced, pool);
                 assert_eq!(sorted, expected);
                 assert_eq!(
+                    expected_tie_runs(&input, &key_alone, chunks_on(input.len(), pool)),
+                    runs
+                );
+                assert_eq!(
                     (buf.tie_runs_examined(), buf.tie_runs_sorted()),
-                    (1, 1),
-                    "one run the abbreviation cannot order, sorted once"
+                    runs,
+                    "one run the abbreviation cannot order, sorted once per chunk"
                 );
             }
         }
 
         /// Runs end exactly where the abbreviation changes: four groups of
         /// strings whose abbreviations differ only between groups form four
-        /// runs, each sorted on its own.
+        /// runs, each sorted on its own; a pooled sort forms them in each
+        /// chunk.
         #[test]
         fn tie_runs_end_where_the_abbreviation_changes() {
             let schema = schema();
@@ -1876,14 +1988,16 @@ mod tests {
                 .collect();
             let input = rows(&schema, grouped);
             let expected = oracle(&input, &key_alone);
-            for pool in [None, Some(crate::test_support::test_kernel_pool())] {
+            let two_threads = pool_of(2);
+            assert_eq!(expected_tie_runs(&input, &key_alone, 1), (4, 4));
+            for pool in [None, Some(&two_threads)] {
                 let (sorted, buf) = resident_on(&input, &key_alone, Mode::Forced, pool);
                 assert_eq!(sorted, expected, "pooled: {}", pool.is_some());
+                let chunks = chunks_on(input.len(), pool);
                 assert_eq!(
                     (buf.tie_runs_examined(), buf.tie_runs_sorted()),
-                    (4, 4),
-                    "pooled: {}: one run per group",
-                    pool.is_some()
+                    expected_tie_runs(&input, &key_alone, chunks),
+                    "{chunks} chunks: one run per group per chunk"
                 );
             }
         }
@@ -1897,7 +2011,8 @@ mod tests {
         fn pooled_sort_decides_on_its_prefix_before_the_parallel_encode() {
             let schema = schema();
             let key_alone = vec![field("k", SortOrder::Asc, NullOrder::Last)];
-            let pool = Some(crate::test_support::test_kernel_pool());
+            let two_threads = pool_of(2);
+            let pool = Some(&two_threads);
 
             let input = rows(&schema, distinct_datetimes(20_000));
             let (sorted, buf) = resident_on(&input, &key_alone, Mode::Auto, pool);
