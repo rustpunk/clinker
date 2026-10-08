@@ -140,15 +140,45 @@ const FIRST_ABBREVIATION_CHECKPOINT: usize = 100;
 /// sort pays for abbreviating only while it still separates most rows.
 const ABBREVIATION_TIGHTENS_AFTER_ROWS: usize = 10_000;
 
-/// Whether a sort over `rows` rows should keep sorting on abbreviations, from
+/// At most this many distinct full keys and a run skips abbreviation: the
+/// comparator's stable sort already orders so few distinct values in a few
+/// cheap passes, and encoding, sketching and moving every row costs more than
+/// it saves. Measured against that sort on integer keys of increasing
+/// cardinality.
+const FEW_DISTINCT_KEYS: u64 = 96;
+
+/// The fewest rows at which a run's distinct-key estimate can rule that it has
+/// few keys: four rows per allowed key, so a key with somewhat more values than
+/// [`FEW_DISTINCT_KEYS`] has shown nearly all of them (about `e^-4`, under 2%,
+/// stay unseen) before it can be mistaken for one with that many or fewer.
+const FEW_KEYS_MIN_ROWS: usize = 4 * FEW_DISTINCT_KEYS as usize;
+
+/// Why a run stopped sorting on abbreviations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbbreviationStop {
+    /// The run has at most [`FEW_DISTINCT_KEYS`] distinct full keys.
+    FewKeys,
+    /// The abbreviations stopped telling apart enough of the distinct keys.
+    Collisions,
+}
+
+/// The checkpoint at which a run stopped abbreviating, and why.
+type AbbreviationAbort = (usize, AbbreviationStop);
+
+/// Whether a sort over `rows` rows should stop sorting on abbreviations, from
 /// the estimated distinct abbreviations and distinct full keys among them.
-/// Continue while the abbreviations keep apart more than a share of the
+/// Both estimates count as at least one. Stop when, from
+/// [`FEW_KEYS_MIN_ROWS`] rows on, there are at most [`FEW_DISTINCT_KEYS`]
+/// distinct full keys, so a run whose keys are all equal stops; otherwise
+/// continue while the abbreviations keep apart more than a share of the
 /// distinct keys: a fifth, shrinking by a factor of 0.65 at each checkpoint
-/// past [`ABBREVIATION_TIGHTENS_AFTER_ROWS`]. Both estimates count as at
-/// least one, so a run whose keys are all equal keeps abbreviating (equal full
-/// keys would tie under either comparator). The one rule both the sequential
+/// past [`ABBREVIATION_TIGHTENS_AFTER_ROWS`]. The one rule both the sequential
 /// and the pooled pass apply.
-fn abbreviation_continues(abbreviated: u64, full: u64, rows: usize) -> bool {
+fn abbreviation_stop(abbreviated: u64, full: u64, rows: usize) -> Option<AbbreviationStop> {
+    let full = full.max(1);
+    if rows >= FEW_KEYS_MIN_ROWS && full <= FEW_DISTINCT_KEYS {
+        return Some(AbbreviationStop::FewKeys);
+    }
     let mut share = 0.20;
     let mut checkpoint = FIRST_ABBREVIATION_CHECKPOINT;
     while checkpoint <= rows {
@@ -157,7 +187,7 @@ fn abbreviation_continues(abbreviated: u64, full: u64, rows: usize) -> bool {
         }
         checkpoint *= 2;
     }
-    abbreviated.max(1) as f64 > full.max(1) as f64 * share
+    (abbreviated.max(1) as f64 <= full as f64 * share).then_some(AbbreviationStop::Collisions)
 }
 
 /// Distinct-count sketches of one pass's abbreviations and full keys. Local to
@@ -192,8 +222,8 @@ impl KeySketches {
         self.full.merge(&other.full);
     }
 
-    fn continues(&self, rows: usize) -> bool {
-        abbreviation_continues(self.abbreviated.estimate(), self.full.estimate(), rows)
+    fn stop(&self, rows: usize) -> Option<AbbreviationStop> {
+        abbreviation_stop(self.abbreviated.estimate(), self.full.estimate(), rows)
     }
 }
 
@@ -254,15 +284,15 @@ const POOLED_PREFIX_ROWS: usize = 1_600;
 /// Encode the abbreviated key of each of `pairs`, rows `0..pairs.len()` of the
 /// run, in arrival order on the calling thread, appending one entry per row to
 /// `index` and feeding `sketches`. When `measure`, checks the sketches at 100
-/// rows and each doubling, and returns `Err(rows)` with the checkpoint that
-/// decided to abort.
+/// rows and each doubling, and returns the checkpoint that decided to abort
+/// and why.
 fn encode_sequential<P>(
     pairs: &[(Record, P)],
     keys: &ResolvedSortKeys,
     measure: bool,
     index: &mut Vec<SortIndexEntry>,
     sketches: &mut KeySketches,
-) -> Result<(), usize> {
+) -> Result<(), AbbreviationAbort> {
     let mut key = Vec::new();
     let mut checkpoint = FIRST_ABBREVIATION_CHECKPOINT;
     for (row, (record, _)) in pairs.iter().enumerate() {
@@ -272,8 +302,8 @@ fn encode_sequential<P>(
         if measure {
             sketches.add(abbreviation, &key);
             if row + 1 == checkpoint {
-                if !sketches.continues(checkpoint) {
-                    return Err(checkpoint);
+                if let Some(stop) = sketches.stop(checkpoint) {
+                    return Err((checkpoint, stop));
                 }
                 checkpoint *= 2;
             }
@@ -290,7 +320,7 @@ fn encode_sequential<P>(
 /// sketches, writing its own slice of the index; the rows are only read.
 ///
 /// When `measure`, the prefix's sketches are merged with every chunk's and the
-/// run is decided once over all its rows, returning `Err(rows)` to abort. A
+/// run is decided once over all its rows, aborting at `rows`. A
 /// chunk's distinct counts are not the run's, so the chunks contribute sketches
 /// rather than verdicts. A run no longer than the prefix takes no such verdict:
 /// it was decided at the same checkpoints a sequential sort of it reaches.
@@ -302,7 +332,7 @@ fn encode_pooled<P: Send>(
     chunks: usize,
     measure: bool,
     index: &mut Vec<SortIndexEntry>,
-) -> Result<usize, usize> {
+) -> Result<usize, AbbreviationAbort> {
     let rows = pairs.len();
     let prefix_rows = rows.min(POOLED_PREFIX_ROWS);
     let mut sketches = KeySketches::new();
@@ -339,8 +369,8 @@ fn encode_pooled<P: Send>(
         for chunk in &chunk_sketches {
             sketches.merge(chunk);
         }
-        if !sketches.continues(rows) {
-            return Err(rows);
+        if let Some(stop) = sketches.stop(rows) {
+            return Err((rows, stop));
         }
     }
     Ok(rows - prefix_rows)
@@ -508,9 +538,10 @@ pub struct SortBuffer<P> {
     /// global pool, whose workers the run neither sizes nor owns.
     kernel_pool: Option<std::sync::Arc<rayon::ThreadPool>>,
     abbreviation: Abbreviation,
-    /// The rows at which this buffer aborted abbreviation, once it has.
+    /// The rows at which this buffer aborted abbreviation, and why, once it
+    /// has.
     #[cfg(test)]
-    abbreviation_abort: Option<usize>,
+    abbreviation_abort: Option<AbbreviationAbort>,
     /// Tie runs examined and sorted over every run this buffer sorted.
     #[cfg(test)]
     tie_runs: TieRuns,
@@ -639,7 +670,13 @@ impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
     /// has not aborted.
     #[cfg(test)]
     pub(crate) fn abbreviation_abort(&self) -> Option<usize> {
-        self.abbreviation_abort
+        self.abbreviation_abort.map(|(rows, _)| rows)
+    }
+
+    /// Why the buffer aborted abbreviation; `None` while it has not.
+    #[cfg(test)]
+    fn abbreviation_stop(&self) -> Option<AbbreviationStop> {
+        self.abbreviation_abort.map(|(_, stop)| stop)
     }
 
     /// Runs of two or more equal abbreviations examined, over every run sorted.
@@ -829,15 +866,15 @@ impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
         };
         let parallel_rows = match encoded {
             Ok(parallel_rows) => parallel_rows,
-            Err(abort_rows) => {
+            Err(abort) => {
                 debug_assert!(
-                    (FIRST_ABBREVIATION_CHECKPOINT..=rows).contains(&abort_rows),
+                    (FIRST_ABBREVIATION_CHECKPOINT..=rows).contains(&abort.0),
                     "an abort is decided at a checkpoint the run reached"
                 );
                 self.abbreviation = Abbreviation::Off;
                 #[cfg(test)]
                 {
-                    self.abbreviation_abort = Some(abort_rows);
+                    self.abbreviation_abort = Some(abort);
                 }
                 return false;
             }
@@ -1884,40 +1921,49 @@ mod tests {
         #[test]
         fn pooled_and_sequential_abbreviation_reach_the_same_verdict() {
             let schema = schema();
-            let fixtures: Vec<(&str, Vec<Value>, bool)> = vec![
-                ("datetime lead", distinct_datetimes(2_000), true),
-                ("short integers", distinct_integers(2_000), false),
+            let fixtures: Vec<(&str, Vec<Value>, Option<AbbreviationStop>)> = vec![
+                (
+                    "datetime lead",
+                    distinct_datetimes(2_000),
+                    Some(AbbreviationStop::Collisions),
+                ),
+                ("short integers", distinct_integers(2_000), None),
                 (
                     "strings sharing a 12-byte prefix",
                     prefixed_strings("twelve-bytes", 2_000),
-                    true,
+                    Some(AbbreviationStop::Collisions),
                 ),
                 (
                     "16 distinct integers",
                     (0..2_000).map(|i| Value::Integer(i % 16)).collect(),
-                    false,
+                    Some(AbbreviationStop::FewKeys),
                 ),
             ];
             // Sorted on the key alone, so the full keys are exactly as
             // distinct as the fixture's values.
             let sort_by = vec![field("k", SortOrder::Asc, NullOrder::Last)];
-            for (name, keys, aborts) in fixtures {
+            for (name, keys, stop) in fixtures {
                 let input = rows(&schema, keys);
                 let expected = oracle(&input, &sort_by);
                 for pooled in [false, true] {
-                    let (sorted, abort) = resident(&input, &sort_by, Mode::Auto, pooled);
-                    assert_eq!(abort.is_some(), aborts, "{name}, pooled: {pooled}");
+                    let pool = pooled.then(crate::test_support::test_kernel_pool);
+                    let (sorted, buf) = resident_on(&input, &sort_by, Mode::Auto, pool);
+                    assert_eq!(
+                        buf.abbreviation_abort().is_some(),
+                        stop.is_some(),
+                        "{name}, pooled: {pooled}"
+                    );
+                    assert_eq!(buf.abbreviation_stop(), stop, "{name}, pooled: {pooled}");
                     assert_eq!(sorted, expected, "{name}, pooled: {pooled}");
                 }
             }
 
-            // A single datetime field whose first half repeats one instant and
-            // whose second half is 10,000 distinct instants: the full keys
-            // stay alike until the 12,800-row checkpoint.
-            let skewed: Vec<Value> = (0..20_000)
-                .map(|i| instant(1_600_000_000 + if i < 10_000 { 0 } else { i * 61 }))
-                .collect();
-            let input = rows(&schema, skewed);
+            // A single string field whose first half cycles 100 short keys
+            // and whose second half is 10,000 distinct keys sharing a 12-byte
+            // prefix: the abbreviations keep up with the full keys until the
+            // 12,800-row checkpoint, and the first half has more distinct keys
+            // than a run may have and still skip abbreviation for few keys.
+            let input = rows(&schema, skewed_strings());
             let expected = oracle(&input, &sort_by);
             let two_threads = pool_of(2);
             assert!(
@@ -2240,6 +2286,10 @@ mod tests {
                         pooled.abbreviation_abort(),
                         sequential.abbreviation_abort()
                     );
+                    proptest::prop_assert_eq!(
+                        pooled.abbreviation_stop(),
+                        sequential.abbreviation_stop()
+                    );
                 }
             }
         }
@@ -2356,6 +2406,58 @@ mod tests {
                         }
                         _ => {}
                     }
+                }
+            }
+        }
+
+        /// A run with at most `FEW_DISTINCT_KEYS` distinct keys stops
+        /// abbreviating for few keys at the first checkpoint of at least four
+        /// rows per allowed key, sequentially and on a pool; a key with four
+        /// times as many values keeps abbreviating. Output is the stable sort
+        /// either way.
+        #[test]
+        fn few_distinct_keys_skip_abbreviation() {
+            let schema = schema();
+            let key_alone = vec![field("k", SortOrder::Asc, NullOrder::Last)];
+            let two_threads = pool_of(2);
+            let first_checkpoint_from = |rows: usize| {
+                let mut checkpoint = FIRST_ABBREVIATION_CHECKPOINT;
+                while checkpoint < rows {
+                    checkpoint *= 2;
+                }
+                checkpoint
+            };
+            let fixtures = [
+                (FEW_DISTINCT_KEYS / 2, true),
+                (4 * FEW_DISTINCT_KEYS, false),
+            ];
+            for (distinct, stops) in fixtures {
+                let input = rows(
+                    &schema,
+                    scrambled(2_000)
+                        .map(|i| Value::Integer((i % distinct) as i64))
+                        .collect(),
+                );
+                let expected = oracle(&input, &key_alone);
+                for pool in [None, Some(&two_threads)] {
+                    let (sorted, buf) = resident_on(&input, &key_alone, Mode::Auto, pool);
+                    if stops {
+                        assert_eq!(
+                            buf.abbreviation_abort(),
+                            Some(first_checkpoint_from(FEW_KEYS_MIN_ROWS)),
+                            "{distinct} keys, pooled: {}",
+                            pool.is_some()
+                        );
+                        assert_eq!(buf.abbreviation_stop(), Some(AbbreviationStop::FewKeys));
+                    } else {
+                        assert_eq!(
+                            buf.abbreviation_abort(),
+                            None,
+                            "{distinct} keys, pooled: {}",
+                            pool.is_some()
+                        );
+                    }
+                    assert_eq!(sorted, expected);
                 }
             }
         }
