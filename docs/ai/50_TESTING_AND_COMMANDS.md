@@ -786,6 +786,7 @@ cargo bench -p clinker-record --bench record_ops
 cargo bench -p cxl --bench eval
 cargo bench -p cxl --bench parse
 cargo bench -p clinker-format --bench io_throughput
+cargo bench -p clinker-exec --bench aggregate_table
 cargo bench -p clinker-exec --bench arbitration_poll
 cargo bench -p clinker-exec --bench arena
 cargo bench -p clinker-exec --bench combine

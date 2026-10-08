@@ -817,6 +817,34 @@ pub(crate) fn merge_sorted_runs<P: Serialize + DeserializeOwned + Ord>(
     SortedRunMerger::new(files, sort_by, context, budget)?.collect()
 }
 
+/// Field-ordered k-way merge of `files` under an uncapped arbitrator, so the
+/// external sort bench can time the merge a spilled sort runs after its last
+/// run. Materializes the whole merged output, like [`merge_sorted_runs`]; any
+/// cascade charges a private uncapped ledger and never fails on the disk cap.
+///
+/// Compiled only with the `test-utils` feature: it exists for the bench, and
+/// in-crate tests call [`merge_sorted_runs`] directly so they build without
+/// the feature.
+#[cfg(feature = "test-utils")]
+pub fn merge_sorted_runs_for_testing<P: Serialize + DeserializeOwned + Ord>(
+    files: Vec<SpillFile<P>>,
+    sort_by: &[SortField],
+) -> Result<Vec<(Record, P)>, PipelineError> {
+    let arbitrator = MemoryArbitrator::with_policy(
+        u64::MAX,
+        0.80,
+        0.70,
+        Box::new(crate::pipeline::memory::NoOpPolicy),
+    );
+    let budget = MergeBudget {
+        budget: &arbitrator,
+        node: "sort bench",
+        compress: true,
+        charge_owner: None,
+    };
+    merge_sorted_runs(files, sort_by, "sort bench merge", budget)
+}
+
 /// Test-only constructors that pin the cascade fan-in explicitly, so a test can
 /// force the multi-pass path (`fan_in = 2`) or a single pass (`fan_in` above the
 /// run count) over the same input and prove the output does not depend on it.
