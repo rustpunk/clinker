@@ -474,33 +474,27 @@ mod tests {
 
         /// One to three sort fields over `v`, `s`, `t` and `missing`, a column
         /// the schema does not have, each with its own direction and null
-        /// placement.
+        /// placement: first, last, or left to the default.
         fn sort_fields() -> impl Strategy<Value = Vec<SortField>> {
             prop::collection::vec(
                 (
                     prop::sample::select(vec!["v", "s", "t", "missing"]),
                     any::<bool>(),
-                    any::<bool>(),
+                    prop::sample::select(vec![None, Some(NullOrder::First), Some(NullOrder::Last)]),
                 ),
                 1..=3,
             )
             .prop_map(|fields| {
                 fields
                     .into_iter()
-                    .map(|(name, descending, nulls_first)| {
-                        sf_nulls(
-                            name,
-                            if descending {
-                                SortOrder::Desc
-                            } else {
-                                SortOrder::Asc
-                            },
-                            if nulls_first {
-                                NullOrder::First
-                            } else {
-                                NullOrder::Last
-                            },
-                        )
+                    .map(|(name, descending, null_order)| SortField {
+                        field: name.into(),
+                        order: if descending {
+                            SortOrder::Desc
+                        } else {
+                            SortOrder::Asc
+                        },
+                        null_order,
                     })
                     .collect()
             })
