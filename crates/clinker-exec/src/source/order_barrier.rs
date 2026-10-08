@@ -1619,7 +1619,13 @@ mod tests {
         assert!(!previous.values_are_accounted_by(&resources));
         let previous_relative =
             (std::mem::size_of::<Record>() + previous.unaccounted_heap_size(&resources)) as u64;
-        assert_eq!(barrier.staged_bytes(), relative + previous_relative);
+        // The staged row also carries its sort-index entry.
+        assert_eq!(
+            barrier.staged_bytes(),
+            relative
+                + previous_relative
+                + crate::pipeline::sort_buffer::SORT_INDEX_ENTRY_BYTES as u64
+        );
         assert_eq!(barrier.consumer_handle.bytes(), barrier.staged_bytes());
         assert_eq!(barrier.reload_bytes_ewma, physical);
         assert!(barrier.physical_staged_bytes() > barrier.staged_bytes());

@@ -100,6 +100,15 @@ impl HeapBytes for (i64, i64, u64) {
     }
 }
 
+/// One entry of a field-ordered sort's per-row index: the row's abbreviated
+/// sort key and the row's position among the resident pairs.
+type SortIndexEntry = (u64, usize);
+
+/// Bytes a field-ordered buffer charges for each row's sort-index entry, taken
+/// from the entry's own layout so the charge cannot drift from what the index
+/// holds.
+pub(crate) const SORT_INDEX_ENTRY_BYTES: usize = std::mem::size_of::<SortIndexEntry>();
+
 /// Result of finishing a sort buffer: either all (record, payload) pairs
 /// fit in memory, or some were spilled to disk.
 pub enum SortedOutput<P> {
@@ -225,7 +234,8 @@ impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
 
     /// Push a `(record, payload)` pair into the buffer. The payload's own heap
     /// (its `HeapBytes`, e.g. a variable-length key) is charged alongside the
-    /// record so a wide-key payload is not undercounted.
+    /// record so a wide-key payload is not undercounted, and a field-ordered
+    /// buffer also charges the row's sort-index entry.
     pub fn push(&mut self, record: Record, payload: P) {
         // A spilled run stores each row's values by position and decodes them
         // under this buffer's schema, so a row of other columns would come back
@@ -238,14 +248,24 @@ impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
             record.schema().columns(),
             self.schema.columns(),
         );
+        // A field-ordered sort builds one index entry per resident row when it
+        // sorts, and the stable sort it falls back to holds scratch of about
+        // the same size, so the entry is charged from the row's arrival
+        // whichever way the run ends up sorted.
+        let index_bytes = match self.ordering {
+            SortOrdering::Fields(_) => SORT_INDEX_ENTRY_BYTES,
+            SortOrdering::Payload => 0,
+        };
         let size = std::mem::size_of::<Record>()
             + record.estimated_heap_size()
             + std::mem::size_of::<P>()
-            + payload.heap_bytes();
+            + payload.heap_bytes()
+            + index_bytes;
         self.unaccounted_bytes_used += std::mem::size_of::<Record>()
             + record.unaccounted_heap_size(&self.allocation_resources)
             + std::mem::size_of::<P>()
-            + payload.unaccounted_heap_bytes(&self.allocation_resources);
+            + payload.unaccounted_heap_bytes(&self.allocation_resources)
+            + index_bytes;
         self.bytes_used += size;
         self.total_rows += 1;
         self.pairs.push((record, payload));
@@ -708,6 +728,47 @@ mod tests {
             SortedOutput::Spilled(files) => assert_eq!(files.len(), 4, "3 flushes + 1 residue"),
             SortedOutput::InMemory(_) => panic!("expected Spilled"),
         }
+    }
+
+    /// A field-ordered buffer charges each row's sort-index entry at push,
+    /// both in its pressure figure and in what it reports as unaccounted; a
+    /// payload-ordered buffer has no index and charges nothing for one.
+    #[test]
+    fn field_ordered_push_charges_the_sort_index() {
+        let schema = test_schema();
+        let record = make_record(&schema, "Alice", 1);
+        let mut fields: SortBuffer<u64> = SortBuffer::new(
+            sort_by_value_asc(),
+            1_000_000,
+            None,
+            false,
+            schema.clone(),
+            test_allocation_resources(),
+        );
+        let mut payload: SortBuffer<u64> = SortBuffer::new_payload_ordered(
+            1_000_000,
+            None,
+            false,
+            schema.clone(),
+            test_allocation_resources(),
+        );
+        for pushed in 1..=3usize {
+            fields.push(record.clone(), pushed as u64);
+            payload.push(record.clone(), pushed as u64);
+            assert_eq!(
+                fields.bytes_used() - payload.bytes_used(),
+                pushed * SORT_INDEX_ENTRY_BYTES
+            );
+            assert_eq!(
+                fields.unaccounted_bytes_used() - payload.unaccounted_bytes_used(),
+                pushed * SORT_INDEX_ENTRY_BYTES
+            );
+        }
+        assert!(!fields.should_spill());
+        assert!(matches!(
+            fields.finish().unwrap(),
+            (SortedOutput::InMemory(_), 0)
+        ));
     }
 
     #[test]
