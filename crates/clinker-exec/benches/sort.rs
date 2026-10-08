@@ -266,7 +266,7 @@ fn buffer_shape(shape: &str, rows: usize) -> BufferShape {
                     vec![string_value(s)]
                 }
                 "mixed3" => vec![
-                    if q % 10 == 0 {
+                    if q.is_multiple_of(10) {
                         Value::Null
                     } else {
                         string_value(format!("name-{}", p % 1_000))
