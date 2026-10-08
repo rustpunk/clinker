@@ -517,6 +517,13 @@ pub struct SortBuffer<P> {
     /// Rows the pooled encode pass encoded in parallel, over every run.
     #[cfg(test)]
     rows_encoded_in_parallel: usize,
+    /// Merges of presorted chunks a pooled sort ran, over every run.
+    #[cfg(test)]
+    pooled_merges: usize,
+    /// Chunks found in order just before a pooled sort's merge, over every
+    /// run.
+    #[cfg(test)]
+    chunks_in_order_before_merge: usize,
 }
 
 // `P: Ord` spans the whole impl, not just the payload-ordered constructor, so
@@ -560,6 +567,10 @@ impl<P: Serialize + DeserializeOwned + Send + Sync + Ord + HeapBytes> SortBuffer
             tie_runs: TieRuns::default(),
             #[cfg(test)]
             rows_encoded_in_parallel: 0,
+            #[cfg(test)]
+            pooled_merges: 0,
+            #[cfg(test)]
+            chunks_in_order_before_merge: 0,
         }
     }
 
@@ -595,6 +606,10 @@ impl<P: Serialize + DeserializeOwned + Send + Sync + Ord + HeapBytes> SortBuffer
             tie_runs: TieRuns::default(),
             #[cfg(test)]
             rows_encoded_in_parallel: 0,
+            #[cfg(test)]
+            pooled_merges: 0,
+            #[cfg(test)]
+            chunks_in_order_before_merge: 0,
         }
     }
 
@@ -646,6 +661,19 @@ impl<P: Serialize + DeserializeOwned + Send + Sync + Ord + HeapBytes> SortBuffer
     #[cfg(test)]
     pub(crate) fn rows_encoded_in_parallel(&self) -> usize {
         self.rows_encoded_in_parallel
+    }
+
+    /// Merges of presorted chunks a pooled sort ran.
+    #[cfg(test)]
+    pub(crate) fn pooled_merges(&self) -> usize {
+        self.pooled_merges
+    }
+
+    /// Chunks that were in order under the comparator just before a pooled
+    /// sort's merge.
+    #[cfg(test)]
+    pub(crate) fn chunks_in_order_before_merge(&self) -> usize {
+        self.chunks_in_order_before_merge
     }
 
     /// Push a `(record, payload)` pair into the buffer. The payload's own heap
@@ -823,9 +851,23 @@ impl<P: Serialize + DeserializeOwned + Send + Sync + Ord + HeapBytes> SortBuffer
                         .reduce(TieRuns::default, TieRuns::plus)
                 });
                 drop(index);
+                #[cfg(test)]
+                {
+                    self.chunks_in_order_before_merge += (0..chunks)
+                        .filter(|&chunk| {
+                            let first = chunk_start(rows, chunks, chunk);
+                            let end = chunk_start(rows, chunks, chunk + 1);
+                            in_order(&self.pairs[first..end], keys)
+                        })
+                        .count();
+                }
                 pool.install(|| {
                     self.pairs.par_sort_by(|(a, _), (b, _)| keys.compare(a, b));
                 });
+                #[cfg(test)]
+                {
+                    self.pooled_merges += 1;
+                }
                 runs
             }
         };
@@ -1884,6 +1926,31 @@ mod tests {
                 "the pooled path sees the distinct half only through its merged sketches"
             );
             assert_eq!(sorted, expected);
+
+            // A run no longer than the pooled prefix is decided at the
+            // sequential checkpoints alone. Its first 800 rows cycle 100 short
+            // strings and its last 700 share a 12-byte prefix: every checkpoint
+            // up to 800 rows sees about as many distinct abbreviations as
+            // distinct keys, and no checkpoint falls after it. A verdict over
+            // all 1,500 rows would see 101 abbreviations for about 800 keys.
+            let prefix_decided: Vec<Value> = (0..800)
+                .map(|i| Value::String(format!("k{:03}", i % 100).into()))
+                .chain(prefixed_strings("twelve-bytes", 700))
+                .collect();
+            let input = rows(&schema, prefix_decided);
+            let expected = oracle(&input, &sort_by);
+            assert!(input.len() <= POOLED_PREFIX_ROWS);
+            assert!(chunks_on(input.len(), Some(&two_threads)) >= 2);
+            for pool in [None, Some(&two_threads)] {
+                let (sorted, buf) = resident_on(&input, &sort_by, Mode::Auto, pool);
+                assert_eq!(
+                    buf.abbreviation_abort(),
+                    None,
+                    "pooled: {}: the prefix's checkpoints continue",
+                    pool.is_some()
+                );
+                assert_eq!(sorted, expected);
+            }
         }
 
         #[test]
@@ -2025,6 +2092,261 @@ mod tests {
             assert_eq!(buf.abbreviation_abort(), None);
             assert_eq!(buf.rows_encoded_in_parallel(), 20_000 - POOLED_PREFIX_ROWS);
             assert_eq!(sorted, oracle(&input, &key_alone));
+        }
+
+        /// 20,000 rows on one string field: the first 10,000 cycle 100
+        /// distinct short strings, whose abbreviations tell them apart; the
+        /// last 10,000 are distinct strings sharing a 12-byte prefix, whose
+        /// abbreviations all collide. A sequential sort keeps abbreviating
+        /// through 6,400 rows and stops by 12,800; only a verdict that sees the
+        /// second half stops a pooled one.
+        fn skewed_strings() -> Vec<Value> {
+            (0..10_000)
+                .map(|i| Value::String(format!("k{:03}", i % 100).into()))
+                .chain(prefixed_strings("twelve-bytes", 10_000))
+                .collect()
+        }
+
+        /// Dedicated pools of two, three and four workers, built once for the
+        /// property below.
+        fn small_pool(threads: usize) -> &'static Arc<rayon::ThreadPool> {
+            static POOLS: std::sync::OnceLock<[Arc<rayon::ThreadPool>; 3]> =
+                std::sync::OnceLock::new();
+            &POOLS.get_or_init(|| [pool_of(2), pool_of(3), pool_of(4)])[threads - 2]
+        }
+
+        /// A string drawn from `prefix` plus up to `max_tail` characters of a
+        /// three-letter alphabet that includes NUL, so strings tie often and
+        /// differ past the eighth byte when the prefix is long.
+        fn small_string(
+            prefix: &'static str,
+            max_tail: usize,
+        ) -> impl proptest::strategy::Strategy<Value = Value> {
+            use proptest::prelude::*;
+            prop::collection::vec(prop::sample::select(vec!['a', 'b', '\0']), 0..=max_tail)
+                .prop_map(move |tail| {
+                    Value::String(
+                        format!("{prefix}{}", tail.into_iter().collect::<String>()).into(),
+                    )
+                })
+        }
+
+        /// Sort values from small pools, so rows tie on a field often and a
+        /// later field decides: integers, floats with NaN and signed zeros,
+        /// decimals, short strings, strings sharing a 14-byte prefix (up to 40
+        /// bytes, NULs included), dates and datetimes either side of 1970, and
+        /// nulls.
+        fn sort_value() -> impl proptest::strategy::Strategy<Value = Value> {
+            use proptest::prelude::*;
+            prop_oneof![
+                5 => prop_oneof![
+                    (-3i64..=3).prop_map(Value::Integer),
+                    prop::sample::select(vec![
+                        0.0,
+                        -0.0,
+                        1.5,
+                        -2.0,
+                        f64::NAN,
+                        -f64::NAN,
+                        f64::INFINITY
+                    ])
+                    .prop_map(Value::Float),
+                    (-30i64..=30, 0u32..=2)
+                        .prop_map(|(m, s)| Value::Decimal(rust_decimal::Decimal::new(m, s))),
+                    small_string("", 6),
+                    small_string("shared-prefix-", 26),
+                    (0u64..4).prop_map(|d| Value::Date(
+                        chrono::NaiveDate::from_ymd_opt(1969, 12, 30).unwrap()
+                            + chrono::Days::new(d)
+                    )),
+                    (-2i64..=2, 0u32..3).prop_map(|(years, nanos)| Value::DateTime(
+                        chrono::DateTime::from_timestamp(years * 31_536_000, nanos)
+                            .unwrap()
+                            .naive_utc()
+                    )),
+                ],
+                1 => Just(Value::Null),
+            ]
+        }
+
+        proptest::proptest! {
+            #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+
+            /// A sort split into per-thread chunks, each sorted on its own and
+            /// then merged, writes exactly the stable sort by the authored
+            /// comparator, whatever the keys, their directions and null
+            /// placements, the pool's size and whether abbreviation is measured
+            /// or forced. Where the whole run fits the sequential prefix, the
+            /// pooled sort also stops abbreviating exactly where, and why, a
+            /// sequential sort of the same rows does.
+            #[test]
+            fn chunked_pooled_sort_equals_the_stable_sort(
+                values in proptest::collection::vec(
+                    (sort_value(), sort_value(), sort_value()),
+                    96..=3_000,
+                ),
+                fields in proptest::collection::vec(
+                    (0usize..4, proptest::prelude::any::<bool>(), 0usize..3),
+                    1..=3,
+                ),
+                threads in 2usize..=4,
+                forced in proptest::prelude::any::<bool>(),
+            ) {
+                // Index 3 names a column the schema does not have.
+                let names = ["a", "b", "c", "missing"];
+                let sort_by: Vec<SortField> = fields
+                    .iter()
+                    .map(|(name, descending, nulls)| SortField {
+                        field: names[*name].to_string(),
+                        order: if *descending { SortOrder::Desc } else { SortOrder::Asc },
+                        null_order: [None, Some(NullOrder::First), Some(NullOrder::Last)][*nulls],
+                    })
+                    .collect();
+                let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec![
+                    "a".into(),
+                    "b".into(),
+                    "c".into(),
+                ])));
+                let input: Vec<(Record, u64)> = values
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (a, b, c))| (Record::new(schema.clone(), vec![a, b, c]), i as u64))
+                    .collect();
+                let mode = if forced { Mode::Forced } else { Mode::Auto };
+                let pool = small_pool(threads);
+                let chunks = chunks_on(input.len(), Some(pool));
+                proptest::prop_assert!((2..=threads).contains(&chunks));
+
+                let expected = oracle(&input, &sort_by);
+                let (sorted, pooled) = resident_on(&input, &sort_by, mode, Some(pool));
+                proptest::prop_assert_eq!(&sorted, &expected);
+                let merged = usize::from(pooled.abbreviation_abort().is_none());
+                proptest::prop_assert_eq!(pooled.pooled_merges(), merged);
+
+                if !forced && input.len() <= POOLED_PREFIX_ROWS {
+                    let (_, sequential) = resident_on(&input, &sort_by, mode, None);
+                    proptest::prop_assert_eq!(
+                        pooled.abbreviation_abort(),
+                        sequential.abbreviation_abort()
+                    );
+                }
+            }
+        }
+
+        /// Each chunk of a pooled sort is already in order under the
+        /// comparator when the merge starts, so the merge only joins sorted
+        /// pieces; it runs once per run.
+        #[test]
+        fn pooled_chunks_are_in_order_before_the_merge() {
+            let schema = schema();
+            let key_alone = vec![field("k", SortOrder::Asc, NullOrder::Last)];
+            let four_threads = pool_of(4);
+            let fixtures: [Vec<Value>; 2] = [
+                distinct_integers(20_000),
+                scrambled(20_000)
+                    .map(|i| Value::Integer((i % 16) as i64))
+                    .collect(),
+            ];
+            for keys in fixtures {
+                let input = rows(&schema, keys);
+                assert_eq!(chunks_on(input.len(), Some(&four_threads)), 4);
+                let (sorted, buf) =
+                    resident_on(&input, &key_alone, Mode::Forced, Some(&four_threads));
+                assert_eq!(sorted, oracle(&input, &key_alone));
+                assert_eq!(buf.chunks_in_order_before_merge(), 4);
+                assert_eq!(buf.pooled_merges(), 1);
+            }
+        }
+
+        /// Rows whose keys are equal but fall on both sides of a chunk boundary
+        /// leave the merge in arrival order: every abbreviation here is equal,
+        /// so the one tie run spans both chunks of a two-thread sort, and each
+        /// chunk sorts its share of it before the merge joins them.
+        #[test]
+        fn tie_runs_split_by_a_chunk_boundary_keep_arrival_order() {
+            let schema = schema();
+            let key_alone = vec![field("k", SortOrder::Asc, NullOrder::Last)];
+            let two_threads = pool_of(2);
+            let suffix = |i: u64| i % 50;
+            let input = rows(
+                &schema,
+                scrambled(4_000)
+                    .map(|i| Value::String(format!("tiekey{:02}", suffix(i)).into()))
+                    .collect(),
+            );
+            assert_eq!(chunks_on(input.len(), Some(&two_threads)), 2);
+            let boundary = chunk_start(input.len(), 2, 1);
+            let left: std::collections::BTreeSet<String> = input[..boundary]
+                .iter()
+                .map(|(record, _)| format!("{:?}", record.get("k")))
+                .collect();
+            assert!(
+                input[boundary..]
+                    .iter()
+                    .any(|(record, _)| left.contains(&format!("{:?}", record.get("k")))),
+                "equal keys sit on both sides of the chunk boundary"
+            );
+            let (sorted, buf) = resident_on(&input, &key_alone, Mode::Forced, Some(&two_threads));
+            assert_eq!(sorted, oracle(&input, &key_alone));
+            assert_eq!(
+                (buf.tie_runs_examined(), buf.tie_runs_sorted()),
+                expected_tie_runs(&input, &key_alone, 2)
+            );
+            assert_eq!(buf.pooled_merges(), 1);
+        }
+
+        /// A pool of one thread sorts as a sort without a pool does: the same
+        /// checkpoints and abort row, nothing encoded in parallel, no merge,
+        /// the same tie runs and the same output.
+        #[test]
+        fn a_one_thread_pool_sorts_exactly_as_the_sequential_path() {
+            let schema = schema();
+            let key_alone = vec![field("k", SortOrder::Asc, NullOrder::Last)];
+            let one_thread = pool_of(1);
+            let fixtures: [(&str, Vec<Value>); 3] = [
+                ("distinct instants", distinct_datetimes(2_000)),
+                ("skewed strings", skewed_strings()),
+                (
+                    "16 distinct integers",
+                    scrambled(5_000)
+                        .map(|i| Value::Integer((i % 16) as i64))
+                        .collect(),
+                ),
+            ];
+            for (name, keys) in fixtures {
+                let input = rows(&schema, keys);
+                let expected = oracle(&input, &key_alone);
+                for mode in [Mode::Forced, Mode::Auto] {
+                    let (sequential_out, sequential) = resident_on(&input, &key_alone, mode, None);
+                    let (pooled_out, pooled) =
+                        resident_on(&input, &key_alone, mode, Some(&one_thread));
+                    let report = |buf: &SortBuffer<u64>| {
+                        (
+                            buf.abbreviation_abort(),
+                            buf.rows_encoded_in_parallel(),
+                            buf.pooled_merges(),
+                            buf.tie_runs_examined(),
+                            buf.tie_runs_sorted(),
+                        )
+                    };
+                    assert_eq!(report(&pooled), report(&sequential), "{name}, {mode:?}");
+                    assert_eq!(pooled.rows_encoded_in_parallel(), 0, "{name}, {mode:?}");
+                    assert_eq!(pooled.pooled_merges(), 0, "{name}, {mode:?}");
+                    assert_eq!(sequential_out, expected, "{name}, {mode:?}");
+                    assert_eq!(pooled_out, expected, "{name}, {mode:?}");
+                    match (name, mode) {
+                        (_, Mode::Forced) => assert_eq!(pooled.abbreviation_abort(), None),
+                        ("distinct instants", _) => {
+                            assert_eq!(pooled.abbreviation_abort(), Some(100));
+                        }
+                        ("skewed strings", _) => {
+                            let at = pooled.abbreviation_abort().expect("the skewed run aborts");
+                            assert!(6_400 < at && at <= 12_800, "aborted at {at}");
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
     }
 }
