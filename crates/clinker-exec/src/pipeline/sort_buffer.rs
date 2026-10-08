@@ -220,6 +220,17 @@ impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
     /// (its `HeapBytes`, e.g. a variable-length key) is charged alongside the
     /// record so a wide-key payload is not undercounted.
     pub fn push(&mut self, record: Record, payload: P) {
+        // A spilled run stores each row's values by position and decodes them
+        // under this buffer's schema, so a row of other columns would come back
+        // with its values under the wrong names.
+        debug_assert!(
+            SharedStorage::ptr_eq(record.schema(), &self.schema)
+                || record.schema().columns() == self.schema.columns(),
+            "sort buffer received a row whose columns {:?} differ from the buffer's columns \
+             {:?}; a spilled run would reattach the buffer's schema to the row's positional values",
+            record.schema().columns(),
+            self.schema.columns(),
+        );
         let size = std::mem::size_of::<Record>()
             + record.estimated_heap_size()
             + std::mem::size_of::<P>()
@@ -690,6 +701,27 @@ mod tests {
             SortedOutput::Spilled(files) => assert_eq!(files.len(), 4, "3 flushes + 1 residue"),
             SortedOutput::InMemory(_) => panic!("expected Spilled"),
         }
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "differ from the buffer's columns")]
+    fn sort_buffer_rejects_a_record_whose_columns_differ_from_its_schema() {
+        let schema = test_schema();
+        let reordered =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["value".into(), "name".into()])));
+        let mut buf: SortBuffer<()> = SortBuffer::new(
+            sort_by_value_asc(),
+            1_000_000,
+            None,
+            true,
+            schema,
+            test_allocation_resources(),
+        );
+        buf.push(
+            Record::new(reordered, vec![Value::Integer(1), Value::String("a".into())]),
+            (),
+        );
     }
 
     #[test]
