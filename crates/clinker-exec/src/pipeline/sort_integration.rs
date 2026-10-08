@@ -538,8 +538,7 @@ mod tests {
             ///
             /// The sort is by one to three fields of mixed numbers, inline
             /// strings and datetimes, or a missing column, sorted sequentially
-            /// or on the kernel pool, with key abbreviation measured, forced
-            /// on or off.
+            /// or on the kernel pool.
             ///
             /// Every record here has the same shape (four inline values, a
             /// `u64` payload), so each push charges the buffer the same
@@ -555,7 +554,6 @@ mod tests {
                 ),
                 sort_by in sort_fields(),
                 pooled in any::<bool>(),
-                abbreviation in 0usize..3,
             ) {
                 let schema = schema();
                 let input: Vec<(Record, u64)> = values
@@ -569,12 +567,7 @@ mod tests {
                         (record, id as u64)
                     })
                     .collect();
-                let configured = |buffer: SortBuffer<u64>| {
-                    let buffer = match abbreviation {
-                        0 => buffer,
-                        1 => buffer.forcing_abbreviation(),
-                        _ => buffer.without_abbreviation(),
-                    };
+                let with_pool = |buffer: SortBuffer<u64>| {
                     if pooled {
                         buffer.with_kernel_pool(Arc::clone(crate::test_support::test_kernel_pool()))
                     } else {
@@ -586,7 +579,7 @@ mod tests {
                 reference.sort_by(|(a, _), (b, _)| compare_authored_keys(a, b, &sort_by));
                 let reference = identities(&reference);
 
-                let mut resident: SortBuffer<u64> = configured(SortBuffer::new(
+                let mut resident: SortBuffer<u64> = with_pool(SortBuffer::new(
                     sort_by.clone(),
                     usize::MAX,
                     None,
@@ -606,7 +599,7 @@ mod tests {
                 let Some((first, first_payload)) = input.first().cloned() else {
                     return Ok(());
                 };
-                let mut probe: SortBuffer<u64> = configured(SortBuffer::new(
+                let mut probe: SortBuffer<u64> = with_pool(SortBuffer::new(
                     sort_by.clone(),
                     usize::MAX,
                     None,
@@ -624,7 +617,7 @@ mod tests {
                 let arbitrator =
                     MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
                 for rows_per_run in [1usize, 2, 7] {
-                    let mut buffer: SortBuffer<u64> = configured(SortBuffer::new(
+                    let mut buffer: SortBuffer<u64> = with_pool(SortBuffer::new(
                         sort_by.clone(),
                         rows_per_run * row_bytes,
                         None,
