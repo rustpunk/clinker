@@ -11,6 +11,10 @@
 //! the cost between a few repeated keys and all-distinct keys is measured
 //! rather than inferred from the two ends.
 //!
+//! `sort_buffer_sort_only` repeats those shapes, sizes and the sequential and
+//! pooled split, but times the buffer's `finish()` alone: the push happens in
+//! untimed setup and the sorted output is dropped outside the timed region.
+//!
 //! `sort_buffer_spilled` times the external sort: the same buffer with a
 //! threshold that forms about sixteen runs, then the field-ordered k-way merge
 //! of those runs. The merge entry point is a `test-utils` wrapper, so this group
@@ -410,6 +414,54 @@ fn bench_sort_buffer_in_memory(c: &mut Criterion) {
     group.finish();
 }
 
+/// The shapes, sizes and sequential/pooled split of `sort_buffer_in_memory`,
+/// timing `finish()` alone. Each iteration's buffer is built and every row
+/// pushed in untimed setup, and the sorted output is returned so criterion
+/// drops it outside the timed region: a change in the sort itself is not
+/// diluted by the push and the drop around it.
+fn bench_sort_buffer_sort_only(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sort_buffer_sort_only");
+    let pool = eight_thread_pool();
+    let resources = buffer_resources();
+    let sized_shapes = BUFFER_SHAPES
+        .iter()
+        .flat_map(|shape| [10_000usize, 100_000].map(|rows| (*shape, rows)))
+        .chain(
+            CARDINALITY_SWEEP
+                .iter()
+                .map(|shape| (*shape, CARDINALITY_SWEEP_ROWS)),
+        );
+    for (shape_name, rows) in sized_shapes {
+        let shape = buffer_shape(shape_name, rows);
+        group.throughput(Throughput::Elements(rows as u64));
+        for (mode, pool) in [("seq", None), ("pool", Some(&pool))] {
+            group.bench_with_input(
+                BenchmarkId::new(format!("{shape_name}/{mode}"), rows),
+                &rows,
+                |b, _| {
+                    b.iter_batched(
+                        || {
+                            let mut buffer = new_buffer(&shape, usize::MAX, None, pool, &resources);
+                            for (record, payload) in shape.rows.iter().cloned() {
+                                buffer.push(record, payload);
+                            }
+                            buffer
+                        },
+                        |buffer| match buffer.finish().expect("resident sort") {
+                            (SortedOutput::InMemory(sorted), _) => sorted,
+                            (SortedOutput::Spilled(_), _) => {
+                                unreachable!("an unbounded threshold spilled")
+                            }
+                        },
+                        BatchSize::LargeInput,
+                    );
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
 #[cfg(feature = "test-utils")]
 fn bench_sort_buffer_spilled(c: &mut Criterion) {
     use clinker_exec::pipeline::spill_merge::merge_sorted_runs_for_testing;
@@ -473,6 +525,7 @@ criterion_group!(
     bench_sort_presorted,
     bench_sort_reverse,
     bench_sort_buffer_in_memory,
+    bench_sort_buffer_sort_only,
     bench_sort_buffer_spilled,
 );
 #[cfg(not(feature = "test-utils"))]
@@ -484,5 +537,6 @@ criterion_group!(
     bench_sort_presorted,
     bench_sort_reverse,
     bench_sort_buffer_in_memory,
+    bench_sort_buffer_sort_only,
 );
 criterion_main!(benches);
