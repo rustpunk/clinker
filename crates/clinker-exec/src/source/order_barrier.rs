@@ -314,7 +314,7 @@ pub(crate) struct OrderRepairOutcome {
 /// Attach the barrier's kernel pool, if it has one, to a buffer it built.
 fn pooled<P>(pool: Option<&Arc<rayon::ThreadPool>>, buffer: SortBuffer<P>) -> SortBuffer<P>
 where
-    P: serde::Serialize + serde::de::DeserializeOwned + Send + Ord + HeapBytes,
+    P: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + Ord + HeapBytes,
 {
     match pool {
         Some(pool) => buffer.with_kernel_pool(Arc::clone(pool)),

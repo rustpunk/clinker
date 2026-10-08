@@ -120,6 +120,21 @@ fn encode_fields_into<'r, F: FieldOrder>(
     }
 }
 
+/// The first eight bytes of a memcomparable key, zero-padded, read as a
+/// big-endian `u64`.
+///
+/// Wherever two abbreviations differ they order as the full keys do: the first
+/// differing byte is either a byte both keys hold, or the zero pad of a key
+/// that is a proper prefix of the other, and a prefix sorts first. Equal
+/// abbreviations say nothing, so a sort on them must break their ties with the
+/// full comparator.
+pub(crate) fn abbreviated_key(key: &[u8]) -> u64 {
+    let mut prefix = [0u8; 8];
+    let len = key.len().min(prefix.len());
+    prefix[..len].copy_from_slice(&key[..len]);
+    u64::from_be_bytes(prefix)
+}
+
 /// One sort field resolved against a schema: the column it reads there, or
 /// `None` when the schema has no column of that name (the field then reads as
 /// absent, as [`Record::get`] reports it).
@@ -252,6 +267,17 @@ impl ResolvedSortKeys {
             |field| self.value(a, a_by_position, field),
             |field| self.value(b, b_by_position, field),
         )
+    }
+
+    /// Write `record`'s memcomparable key into `key`, clearing it first; equal
+    /// to [`encode_sort_key`] over the same fields.
+    pub(crate) fn encode_into(&self, record: &Record, key: &mut Vec<u8>) {
+        let by_position = self.reads_by_position(record);
+        encode_fields_into(
+            &self.fields,
+            |field| self.value(record, by_position, field),
+            key,
+        );
     }
 
     /// Compare two rows whose values the caller reads by column index from
@@ -1223,7 +1249,8 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(1024))]
 
         /// The comparator resolved against a schema orders two records exactly
-        /// as the by-name comparator does, both reading by position (the records share the resolved schema,
+        /// as the by-name comparator does, and encodes them to the same key,
+        /// both reading by position (the records share the resolved schema,
         /// which may lack a sort field) and falling back to names (each record
         /// carries its own schema, so the resolved positions do not apply).
         #[test]
@@ -1269,7 +1296,66 @@ mod tests {
                     b.values(),
                     sort_by
                 );
+                for record in [a, b] {
+                    let mut key = vec![0xAB];
+                    keys.encode_into(record, &mut key);
+                    prop_assert_eq!(&key, &encode_sort_key(record, &sort_by));
+                }
             }
+        }
+
+        /// A key's first eight bytes, read as a big-endian `u64`, never order
+        /// two records against the authored comparator, and breaking their ties
+        /// with the comparator reproduces it exactly.
+        #[test]
+        fn abbreviated_key_order_agrees_with_the_authored_comparator(
+            fields in prop::collection::vec((0usize..4, any::<bool>(), 0usize..3), 1..=3),
+            shared_columns in prop::sample::subsequence(vec![0usize, 1, 2], 0..=3).prop_shuffle(),
+            shared_a in prop::collection::vec(present_or_null(), 3),
+            shared_b in prop::collection::vec(present_or_null(), 3),
+        ) {
+            let names = ["a", "b", "c", "missing"];
+            let sort_by: Vec<SortField> = fields
+                .iter()
+                .map(|(name, descending, nulls)| SortField {
+                    field: names[*name].to_string(),
+                    order: if *descending { SortOrder::Desc } else { SortOrder::Asc },
+                    null_order: [None, Some(NullOrder::First), Some(NullOrder::Last)][*nulls],
+                })
+                .collect();
+            let shared = clinker_record::owned_storage::SharedStorage::from_arc(Arc::new(
+                Schema::new(shared_columns.iter().map(|&c| COLUMNS[c].into()).collect()),
+            ));
+            let keys = ResolvedSortKeys::for_sort_fields(&sort_by, Some(&shared));
+            let on_shared = |values: &[Value]| {
+                Record::new(
+                    shared.clone(),
+                    shared_columns.iter().map(|&c| values[c].clone()).collect(),
+                )
+            };
+            let (a, b) = (on_shared(&shared_a), on_shared(&shared_b));
+            let (mut key_a, mut key_b) = (Vec::new(), Vec::new());
+            keys.encode_into(&a, &mut key_a);
+            keys.encode_into(&b, &mut key_b);
+            let (abbreviation_a, abbreviation_b) =
+                (abbreviated_key(&key_a), abbreviated_key(&key_b));
+            let authored = compare_authored_keys(&a, &b, &sort_by);
+            if abbreviation_a != abbreviation_b {
+                prop_assert_eq!(
+                    abbreviation_a.cmp(&abbreviation_b),
+                    authored,
+                    "{:?} vs {:?} under {:?}",
+                    a.values(),
+                    b.values(),
+                    sort_by
+                );
+            }
+            prop_assert_eq!(
+                abbreviation_a
+                    .cmp(&abbreviation_b)
+                    .then_with(|| keys.compare(&a, &b)),
+                authored
+            );
         }
     }
 

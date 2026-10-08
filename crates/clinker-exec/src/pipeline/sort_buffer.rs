@@ -28,15 +28,18 @@
 use clinker_record::owned_storage::{AllocationResources, SharedStorage};
 use std::path::PathBuf;
 
-use rayon::slice::ParallelSliceMut;
+use rayon::iter::{IndexedParallelIterator, ParallelIterator};
+use rayon::slice::{ParallelSlice, ParallelSliceMut};
 use serde::{Serialize, de::DeserializeOwned};
 
 use clinker_record::{Record, Schema};
 
-use crate::pipeline::sort_key::ResolvedSortKeys;
+use crate::pipeline::sort_key::{ResolvedSortKeys, abbreviated_key};
 use crate::pipeline::spill::{SpillFile, SpillWriter};
 use clinker_plan::SpillError;
 use clinker_plan::config::SortField;
+
+use crate::sketch::{Hll, splitmix64};
 
 /// The heap bytes a sort payload owns beyond its inline `size_of<P>`. Folded
 /// into the buffer's per-pair byte estimate so a payload carrying a
@@ -109,6 +112,175 @@ type SortIndexEntry = (u64, usize);
 /// holds.
 pub(crate) const SORT_INDEX_ENTRY_BYTES: usize = std::mem::size_of::<SortIndexEntry>();
 
+/// Rows at the first abbreviation checkpoint of a sequential sort; each later
+/// checkpoint doubles it.
+const FIRST_ABBREVIATION_CHECKPOINT: usize = 100;
+
+/// Past this many rows each checkpoint the schedule reaches tightens the
+/// share of distinct full keys the abbreviations must keep apart, so a large
+/// sort pays for abbreviating only while it still separates most rows.
+const ABBREVIATION_TIGHTENS_AFTER_ROWS: usize = 10_000;
+
+/// Whether a sort over `rows` rows should keep sorting on abbreviations, from
+/// the estimated distinct abbreviations and distinct full keys among them.
+/// Continue while the abbreviations keep apart more than a share of the
+/// distinct keys: a fifth, shrinking by a factor of 0.65 at each checkpoint
+/// past [`ABBREVIATION_TIGHTENS_AFTER_ROWS`]. Both estimates count as at
+/// least one, so a run whose keys are all equal keeps abbreviating (equal full
+/// keys would tie under either comparator). The one rule both the sequential
+/// and the pooled pass apply.
+fn abbreviation_continues(abbreviated: u64, full: u64, rows: usize) -> bool {
+    let mut share = 0.20;
+    let mut checkpoint = FIRST_ABBREVIATION_CHECKPOINT;
+    while checkpoint <= rows {
+        if checkpoint > ABBREVIATION_TIGHTENS_AFTER_ROWS {
+            share *= 0.65;
+        }
+        checkpoint *= 2;
+    }
+    abbreviated.max(1) as f64 > full.max(1) as f64 * share
+}
+
+/// Distinct-count sketches of one pass's abbreviations and full keys. Local to
+/// one sort: every run is measured on its own rows.
+struct KeySketches {
+    abbreviated: Hll<256>,
+    full: Hll<256>,
+}
+
+impl KeySketches {
+    fn new() -> Self {
+        Self {
+            abbreviated: Hll::new(),
+            full: Hll::new(),
+        }
+    }
+
+    fn add(&mut self, abbreviation: u64, key: &[u8]) {
+        // Fixed seeds, so the verdict on a given input is reproducible.
+        const FULL_KEY_HASHER: ahash::RandomState = ahash::RandomState::with_seeds(
+            0x243F_6A88_85A3_08D3,
+            0x1319_8A2E_0370_7344,
+            0xA409_3822_299F_31D0,
+            0x082E_FA98_EC4E_6C89,
+        );
+        self.abbreviated.add(splitmix64(abbreviation));
+        self.full.add(FULL_KEY_HASHER.hash_one(key));
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.abbreviated.merge(&other.abbreviated);
+        self.full.merge(&other.full);
+    }
+
+    fn continues(&self, rows: usize) -> bool {
+        abbreviation_continues(self.abbreviated.estimate(), self.full.estimate(), rows)
+    }
+}
+
+/// Rows per chunk of the pooled encode pass: `min(rows, 4 × threads)` near-equal
+/// contiguous chunks, so the chunk sketches are bounded by the pool, not the
+/// input.
+fn encode_chunk_rows(rows: usize, threads: usize) -> usize {
+    let chunks = rows.min(4 * threads.max(1)).max(1);
+    rows.div_ceil(chunks).max(1)
+}
+
+/// Encode every row's abbreviated key in arrival order on the calling thread.
+/// When `measure`, checks the sketches at 100 rows and each doubling, and
+/// returns `Err(rows)` with the checkpoint that decided to abort.
+fn encode_sequential<P>(
+    pairs: &[(Record, P)],
+    keys: &ResolvedSortKeys,
+    measure: bool,
+) -> Result<Vec<SortIndexEntry>, usize> {
+    let mut index = Vec::with_capacity(pairs.len());
+    let mut key = Vec::new();
+    let mut sketches = KeySketches::new();
+    let mut checkpoint = FIRST_ABBREVIATION_CHECKPOINT;
+    for (row, (record, _)) in pairs.iter().enumerate() {
+        keys.encode_into(record, &mut key);
+        let abbreviation = abbreviated_key(&key);
+        index.push((abbreviation, row));
+        if measure {
+            sketches.add(abbreviation, &key);
+            if row + 1 == checkpoint {
+                if !sketches.continues(checkpoint) {
+                    return Err(checkpoint);
+                }
+                checkpoint *= 2;
+            }
+        }
+    }
+    Ok(index)
+}
+
+/// Encode every row's abbreviated key in parallel chunks on `pool`, each chunk
+/// writing its own slice of the index with its own scratch key and sketches.
+/// When `measure`, merges the chunk sketches and decides once over all rows,
+/// returning `Err(rows)` to abort. A sort below the first checkpoint never
+/// aborts, as on the sequential path.
+fn encode_pooled<P: Sync>(
+    pairs: &[(Record, P)],
+    keys: &ResolvedSortKeys,
+    pool: &rayon::ThreadPool,
+    measure: bool,
+) -> Result<Vec<SortIndexEntry>, usize> {
+    let rows = pairs.len();
+    let chunk_rows = encode_chunk_rows(rows, pool.current_num_threads());
+    let mut index: Vec<SortIndexEntry> = vec![(0, 0); rows];
+    let chunk_sketches: Vec<KeySketches> = pool.install(|| {
+        index
+            .par_chunks_mut(chunk_rows)
+            .zip(pairs.par_chunks(chunk_rows))
+            .enumerate()
+            .map(|(chunk, (entries, chunk_pairs))| {
+                let mut key = Vec::new();
+                let mut sketches = KeySketches::new();
+                for (offset, (entry, (record, _))) in
+                    entries.iter_mut().zip(chunk_pairs).enumerate()
+                {
+                    keys.encode_into(record, &mut key);
+                    let abbreviation = abbreviated_key(&key);
+                    *entry = (abbreviation, chunk * chunk_rows + offset);
+                    if measure {
+                        sketches.add(abbreviation, &key);
+                    }
+                }
+                sketches
+            })
+            .collect()
+    });
+    if measure && rows >= FIRST_ABBREVIATION_CHECKPOINT {
+        let mut merged = KeySketches::new();
+        for sketches in &chunk_sketches {
+            merged.merge(sketches);
+        }
+        if !merged.continues(rows) {
+            return Err(rows);
+        }
+    }
+    Ok(index)
+}
+
+/// Reorder `pairs` so position `k` holds the pair `index[k]` names, following
+/// each cycle of the permutation with swaps. Each visited entry is marked by
+/// pointing it at its own position, so no scratch beyond the index is needed.
+fn permute_in_place<T>(pairs: &mut [T], index: &mut [SortIndexEntry]) {
+    for start in 0..pairs.len() {
+        let mut slot = start;
+        loop {
+            let source = index[slot].1;
+            index[slot].1 = slot;
+            if source == start {
+                break;
+            }
+            pairs.swap(slot, source);
+            slot = source;
+        }
+    }
+}
+
 /// Result of finishing a sort buffer: either all (record, payload) pairs
 /// fit in memory, or some were spilled to disk.
 pub enum SortedOutput<P> {
@@ -128,6 +300,21 @@ enum SortOrdering {
     /// consulted. For a sort key computed off the record rather than stored in
     /// a column.
     Payload,
+}
+
+/// Whether a field-ordered buffer sorts its rows on abbreviated keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Abbreviation {
+    /// Abbreviate, measuring each run's abbreviations against its full keys,
+    /// and latch off once they stop telling the rows apart.
+    Trying,
+    /// Sort on the full comparator only; latched by an abort, and the state of
+    /// a payload-ordered buffer, which has no keys to abbreviate.
+    Off,
+    /// Abbreviate without measuring, so a test can drive the abbreviated sort
+    /// on keys whose abbreviations collide.
+    #[cfg(test)]
+    Forced,
 }
 
 /// Accumulates `(record, payload)` pairs, sorts in-memory or spills to disk
@@ -159,13 +346,19 @@ pub struct SortBuffer<P> {
     /// sequentially on the calling thread; the sort never reaches rayon's
     /// global pool, whose workers the run neither sizes nor owns.
     kernel_pool: Option<std::sync::Arc<rayon::ThreadPool>>,
+    abbreviation: Abbreviation,
+    /// The rows at which this buffer aborted abbreviation, once it has.
+    #[cfg(test)]
+    abbreviation_abort: Option<usize>,
 }
 
 // `P: Ord` spans the whole impl, not just the payload-ordered constructor, so
 // the shared `sort_and_spill` / `finish` path can compare payloads in the
 // payload-ordered mode without splitting the buffer across two impl blocks.
 // Every payload type in use is already `Ord`, so this constrains no caller.
-impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
+// `Sync` lets the pooled sort read the resident pairs from every worker; every
+// payload type in use is plain data.
+impl<P: Serialize + DeserializeOwned + Send + Sync + Ord + HeapBytes> SortBuffer<P> {
     /// Field-ordered buffer: pairs sort by `sort_by` over each record's fields
     /// and the payload rides along inert. The historical mode; used by every
     /// source/output/DAG/join sort.
@@ -193,6 +386,9 @@ impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
             spill_files: Vec::new(),
             schema,
             kernel_pool: None,
+            abbreviation: Abbreviation::Trying,
+            #[cfg(test)]
+            abbreviation_abort: None,
         }
     }
 
@@ -221,6 +417,9 @@ impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
             spill_files: Vec::new(),
             schema,
             kernel_pool: None,
+            abbreviation: Abbreviation::Off,
+            #[cfg(test)]
+            abbreviation_abort: None,
         }
     }
 
@@ -230,6 +429,28 @@ impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
     pub fn with_kernel_pool(mut self, pool: std::sync::Arc<rayon::ThreadPool>) -> Self {
         self.kernel_pool = Some(pool);
         self
+    }
+
+    /// Abbreviate every run without measuring whether it pays.
+    #[cfg(test)]
+    pub(crate) fn forcing_abbreviation(mut self) -> Self {
+        self.abbreviation = Abbreviation::Forced;
+        self
+    }
+
+    /// Sort on the full comparator only.
+    #[cfg(test)]
+    pub(crate) fn without_abbreviation(mut self) -> Self {
+        self.abbreviation = Abbreviation::Off;
+        self
+    }
+
+    /// The rows at which the buffer aborted abbreviation: the deciding
+    /// checkpoint on the sequential path, the whole run on the pooled path.
+    /// `None` while it has not aborted.
+    #[cfg(test)]
+    pub(crate) fn abbreviation_abort(&self) -> Option<usize> {
+        self.abbreviation_abort
     }
 
     /// Push a `(record, payload)` pair into the buffer. The payload's own heap
@@ -281,8 +502,15 @@ impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
     /// the sequential stable sort on the calling thread. `par_sort_by`
     /// preserves the tie-break order of the sequential `slice::sort_by`, so a
     /// spilled run is byte-identical either way and equal keys keep input
-    /// order.
+    /// order. A field-ordered buffer first tries its abbreviated index sort,
+    /// which produces that same order.
     fn sort_pairs(&mut self) {
+        if self.pairs.len() >= 2
+            && self.abbreviation != Abbreviation::Off
+            && self.sort_abbreviated()
+        {
+            return;
+        }
         // Split the borrow so the comparator can read `ordering` while the
         // sort holds `pairs` mutably.
         let Self {
@@ -303,6 +531,57 @@ impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
             }),
             (SortOrdering::Payload, None) => pairs.sort_by(|(_, a), (_, b)| a.cmp(b)),
         }
+    }
+
+    /// Sort a field-ordered buffer's pairs through a per-row index of
+    /// abbreviated keys: order the index by abbreviation, break equal
+    /// abbreviations with the full comparator and then the row's position, and
+    /// move the pairs into that order. The trailing position makes the order
+    /// total and unique, so the unstable index sort yields exactly the stable
+    /// order of the pairs.
+    ///
+    /// Returns `false`, having latched abbreviation off for every later run,
+    /// when the encode pass measured that the abbreviations no longer tell the
+    /// rows apart; the caller then sorts on the full comparator.
+    fn sort_abbreviated(&mut self) -> bool {
+        let SortOrdering::Fields(keys) = &self.ordering else {
+            return false;
+        };
+        let measure = self.abbreviation == Abbreviation::Trying;
+        let pool = self.kernel_pool.as_deref();
+        let encoded = match pool {
+            Some(pool) => encode_pooled(&self.pairs, keys, pool, measure),
+            None => encode_sequential(&self.pairs, keys, measure),
+        };
+        let mut index = match encoded {
+            Ok(index) => index,
+            Err(abort_rows) => {
+                debug_assert!(
+                    (FIRST_ABBREVIATION_CHECKPOINT..=self.pairs.len()).contains(&abort_rows),
+                    "an abort is decided at a checkpoint the run reached"
+                );
+                self.abbreviation = Abbreviation::Off;
+                #[cfg(test)]
+                {
+                    self.abbreviation_abort = Some(abort_rows);
+                }
+                return false;
+            }
+        };
+        let pairs = &self.pairs;
+        let order = |&(abbreviation_a, row_a): &SortIndexEntry,
+                     &(abbreviation_b, row_b): &SortIndexEntry| {
+            abbreviation_a
+                .cmp(&abbreviation_b)
+                .then_with(|| keys.compare(&pairs[row_a].0, &pairs[row_b].0))
+                .then(row_a.cmp(&row_b))
+        };
+        match pool {
+            Some(pool) => pool.install(|| index.par_sort_unstable_by(order)),
+            None => index.sort_unstable_by(order),
+        }
+        permute_in_place(&mut self.pairs, &mut index);
+        true
     }
 
     /// Sort the current in-memory pairs and write them to a spill file. Clears
@@ -939,5 +1218,368 @@ mod tests {
         assert_eq!(failing.unaccounted_bytes_used(), 0);
         assert!(failing.pairs.is_empty());
         assert_eq!(failing.sort_and_spill().unwrap(), 0);
+    }
+
+    /// Field-ordered buffers abbreviate their sort keys; these tests drive the
+    /// abbreviated sort and its abort and compare every output with a stable
+    /// sort by the authored comparator.
+    mod abbreviated {
+        use super::*;
+        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
+        use crate::pipeline::sort_key::compare_authored_keys;
+        use crate::pipeline::spill_merge::{MergeBudget, merge_sorted_runs};
+        use clinker_plan::config::{NullOrder, SortOrder};
+
+        fn schema() -> SharedStorage<Schema> {
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["k".into(), "n".into()])))
+        }
+
+        fn field(name: &str, order: SortOrder, null_order: NullOrder) -> SortField {
+            SortField {
+                field: name.into(),
+                order,
+                null_order: Some(null_order),
+            }
+        }
+
+        /// `k` ascending, then `n` ascending.
+        fn by_key_then_n() -> Vec<SortField> {
+            vec![
+                field("k", SortOrder::Asc, NullOrder::Last),
+                field("n", SortOrder::Asc, NullOrder::Last),
+            ]
+        }
+
+        /// One row per key, each with an integer second field and its arrival
+        /// index as the payload.
+        fn rows(schema: &SharedStorage<Schema>, keys: Vec<Value>) -> Vec<(Record, u64)> {
+            keys.into_iter()
+                .enumerate()
+                .map(|(i, key)| {
+                    let record =
+                        Record::new(schema.clone(), vec![key, Value::Integer((i % 97) as i64)]);
+                    (record, i as u64)
+                })
+                .collect()
+        }
+
+        /// The payload order of a stable sort by the authored comparator.
+        fn oracle(input: &[(Record, u64)], sort_by: &[SortField]) -> Vec<u64> {
+            let mut sorted = input.to_vec();
+            sorted.sort_by(|(a, _), (b, _)| compare_authored_keys(a, b, sort_by));
+            sorted.into_iter().map(|(_, payload)| payload).collect()
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        enum Mode {
+            Auto,
+            Forced,
+            Off,
+        }
+
+        fn buffer(
+            sort_by: &[SortField],
+            schema: &SharedStorage<Schema>,
+            mode: Mode,
+            pooled: bool,
+        ) -> SortBuffer<u64> {
+            let buffer = SortBuffer::new(
+                sort_by.to_vec(),
+                usize::MAX,
+                None,
+                false,
+                schema.clone(),
+                test_allocation_resources(),
+            );
+            let buffer = match mode {
+                Mode::Auto => buffer,
+                Mode::Forced => buffer.forcing_abbreviation(),
+                Mode::Off => buffer.without_abbreviation(),
+            };
+            if pooled {
+                buffer.with_kernel_pool(Arc::clone(crate::test_support::test_kernel_pool()))
+            } else {
+                buffer
+            }
+        }
+
+        /// Sort `input` resident; returns the payload order and the
+        /// buffer's abort report.
+        fn resident(
+            input: &[(Record, u64)],
+            sort_by: &[SortField],
+            mode: Mode,
+            pooled: bool,
+        ) -> (Vec<u64>, Option<usize>) {
+            let mut buf = buffer(sort_by, &schema_of(input), mode, pooled);
+            for (record, payload) in input.iter().cloned() {
+                buf.push(record, payload);
+            }
+            // Sort the resident pairs as `finish` would, keeping the buffer to
+            // read its abort report.
+            buf.sort_pairs();
+            let sorted = std::mem::take(&mut buf.pairs);
+            (
+                sorted.into_iter().map(|(_, p)| p).collect(),
+                buf.abbreviation_abort(),
+            )
+        }
+
+        /// Sort `input` spilling a run every `run_rows` rows, then merge the
+        /// runs.
+        fn spilled(
+            input: &[(Record, u64)],
+            sort_by: &[SortField],
+            mode: Mode,
+            pooled: bool,
+            run_rows: usize,
+        ) -> Vec<u64> {
+            let mut buf = buffer(sort_by, &schema_of(input), mode, pooled);
+            for (i, (record, payload)) in input.iter().cloned().enumerate() {
+                buf.push(record, payload);
+                if (i + 1) % run_rows == 0 {
+                    buf.sort_and_spill().unwrap();
+                }
+            }
+            let SortedOutput::Spilled(files) = buf.finish().unwrap().0 else {
+                panic!("explicit spills produce runs");
+            };
+            merge(files, sort_by)
+        }
+
+        fn merge(files: Vec<SpillFile<u64>>, sort_by: &[SortField]) -> Vec<u64> {
+            let arbitrator =
+                MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
+            let budget = MergeBudget {
+                budget: &arbitrator,
+                node: "sort",
+                compress: false,
+                charge_owner: None,
+            };
+            merge_sorted_runs(files, sort_by, "abbreviated sort test", budget)
+                .unwrap()
+                .into_iter()
+                .map(|(_, p)| p)
+                .collect()
+        }
+
+        fn schema_of(input: &[(Record, u64)]) -> SharedStorage<Schema> {
+            input
+                .first()
+                .map_or_else(schema, |(record, _)| record.schema().clone())
+        }
+
+        fn instant(seconds: i64) -> Value {
+            Value::DateTime(
+                chrono::DateTime::from_timestamp(seconds, 0)
+                    .unwrap()
+                    .naive_utc(),
+            )
+        }
+
+        /// `n` scrambled indices `0..n`, a fixed odd-multiplier permutation.
+        fn scrambled(n: usize) -> impl Iterator<Item = u64> {
+            (0..n as u64).map(move |i| i.wrapping_mul(0x9E37_79B1) % n as u64)
+        }
+
+        fn distinct_datetimes(n: usize) -> Vec<Value> {
+            scrambled(n)
+                .map(|i| instant(1_600_000_000 + i as i64 * 61))
+                .collect()
+        }
+
+        fn distinct_integers(n: usize) -> Vec<Value> {
+            scrambled(n).map(|i| Value::Integer(i as i64)).collect()
+        }
+
+        fn prefixed_strings(prefix: &str, n: usize) -> Vec<Value> {
+            scrambled(n)
+                .map(|i| Value::String(format!("{prefix}{i:06}").into()))
+                .collect()
+        }
+
+        fn short_strings(n: usize) -> Vec<Value> {
+            scrambled(n)
+                .map(|i| Value::String(format!("s{i:05}").into()))
+                .collect()
+        }
+
+        #[test]
+        fn abbreviated_sort_keeps_arrival_order_among_equal_keys() {
+            let schema = schema();
+            let keys = (0..5_000)
+                .map(|i| Value::String(["pear", "apple", "fig"][i % 3].into()))
+                .collect();
+            let input = rows(&schema, keys);
+            let sort_by = vec![field("k", SortOrder::Asc, NullOrder::Last)];
+            let expected = oracle(&input, &sort_by);
+            for pooled in [false, true] {
+                let (sorted, abort) = resident(&input, &sort_by, Mode::Forced, pooled);
+                assert_eq!(abort, None, "a forced abbreviation never aborts");
+                assert_eq!(sorted, expected, "pooled: {pooled}");
+            }
+        }
+
+        #[test]
+        fn abbreviation_aborts_on_a_datetime_leading_key_and_output_is_unchanged() {
+            let schema = schema();
+            let input = rows(&schema, distinct_datetimes(2_000));
+            let sort_by = by_key_then_n();
+            let expected = oracle(&input, &sort_by);
+            for pooled in [false, true] {
+                let (sorted, abort) = resident(&input, &sort_by, Mode::Auto, pooled);
+                assert!(abort.is_some(), "pooled: {pooled}: a datetime lead aborts");
+                assert_eq!(sorted, expected, "pooled: {pooled}");
+                let (unabbreviated, _) = resident(&input, &sort_by, Mode::Off, pooled);
+                assert_eq!(unabbreviated, expected, "pooled: {pooled}");
+                assert_eq!(
+                    spilled(&input, &sort_by, Mode::Auto, pooled, 500),
+                    expected,
+                    "pooled: {pooled}"
+                );
+            }
+        }
+
+        #[test]
+        fn abbreviation_continues_on_distinct_short_keys() {
+            let schema = schema();
+            let input = rows(&schema, distinct_integers(2_000));
+            let sort_by = by_key_then_n();
+            let expected = oracle(&input, &sort_by);
+            for pooled in [false, true] {
+                let (sorted, abort) = resident(&input, &sort_by, Mode::Auto, pooled);
+                assert_eq!(
+                    abort, None,
+                    "pooled: {pooled}: distinct integers abbreviate"
+                );
+                assert_eq!(sorted, expected, "pooled: {pooled}");
+            }
+        }
+
+        #[test]
+        fn abbreviated_sort_orders_long_strings_sharing_a_prefix() {
+            let schema = schema();
+            let keys = (0..3_000u64)
+                .map(|i| {
+                    let r = i.wrapping_mul(0x9E37_79B1) % 3_000;
+                    if r % 11 == 0 {
+                        Value::Null
+                    } else {
+                        // Duplicates: 1,000 distinct tails over 3,000 rows,
+                        // padded so the strings run 24 to 64 bytes.
+                        let tail = format!("{:04}", r % 1_000);
+                        let pad = "x".repeat((r % 41) as usize);
+                        Value::String(format!("a-twenty-byte-prefix{tail}{pad}").into())
+                    }
+                })
+                .collect();
+            let input = rows(&schema, keys);
+            let sort_by = vec![
+                field("k", SortOrder::Desc, NullOrder::First),
+                field("n", SortOrder::Asc, NullOrder::Last),
+            ];
+            let expected = oracle(&input, &sort_by);
+            for pooled in [false, true] {
+                for mode in [Mode::Forced, Mode::Auto] {
+                    let (sorted, _) = resident(&input, &sort_by, mode, pooled);
+                    assert_eq!(sorted, expected, "{mode:?}, pooled: {pooled}");
+                    assert_eq!(
+                        spilled(&input, &sort_by, mode, pooled, 700),
+                        expected,
+                        "{mode:?} spilled, pooled: {pooled}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn pooled_and_sequential_abbreviation_reach_the_same_verdict() {
+            let schema = schema();
+            let fixtures: Vec<(&str, Vec<Value>, bool)> = vec![
+                ("datetime lead", distinct_datetimes(2_000), true),
+                ("short integers", distinct_integers(2_000), false),
+                (
+                    "strings sharing a 12-byte prefix",
+                    prefixed_strings("twelve-bytes", 2_000),
+                    true,
+                ),
+                (
+                    "16 distinct integers",
+                    (0..2_000).map(|i| Value::Integer(i % 16)).collect(),
+                    false,
+                ),
+            ];
+            // Sorted on the key alone, so the full keys are exactly as
+            // distinct as the fixture's values.
+            let sort_by = vec![field("k", SortOrder::Asc, NullOrder::Last)];
+            for (name, keys, aborts) in fixtures {
+                let input = rows(&schema, keys);
+                let expected = oracle(&input, &sort_by);
+                for pooled in [false, true] {
+                    let (sorted, abort) = resident(&input, &sort_by, Mode::Auto, pooled);
+                    assert_eq!(abort.is_some(), aborts, "{name}, pooled: {pooled}");
+                    assert_eq!(sorted, expected, "{name}, pooled: {pooled}");
+                }
+            }
+
+            // A single datetime field whose first half repeats one instant and
+            // whose second half is 10,000 distinct instants: the full keys
+            // stay alike until the 12,800-row checkpoint.
+            let skewed: Vec<Value> = (0..20_000)
+                .map(|i| instant(1_600_000_000 + if i < 10_000 { 0 } else { i * 61 }))
+                .collect();
+            let input = rows(&schema, skewed);
+            let expected = oracle(&input, &sort_by);
+            let threads = crate::test_support::test_kernel_pool().current_num_threads();
+            let chunk_rows = encode_chunk_rows(input.len(), threads);
+            assert!(
+                input.len().div_ceil(chunk_rows) >= 2,
+                "the pool encodes the skewed fixture in several chunks"
+            );
+            let (sorted, abort) = resident(&input, &sort_by, Mode::Auto, false);
+            let at = abort.expect("the sequential path aborts on the skewed fixture");
+            assert!(
+                6_400 < at && at <= 12_800,
+                "the sequential path continued through 6,400 rows and aborted by 12,800, at {at}"
+            );
+            assert_eq!(sorted, expected);
+            let (sorted, abort) = resident(&input, &sort_by, Mode::Auto, true);
+            assert!(
+                abort.is_some(),
+                "the pooled path sees the distinct half only through its merged sketches"
+            );
+            assert_eq!(sorted, expected);
+        }
+
+        #[test]
+        fn each_spilled_run_decides_abbreviation_on_its_own_rows() {
+            let schema = schema();
+            let distinct = rows(&schema, short_strings(2_000));
+            let colliding: Vec<(Record, u64)> =
+                rows(&schema, prefixed_strings("twelve-bytes", 2_000))
+                    .into_iter()
+                    .map(|(record, payload)| (record, payload + 2_000))
+                    .collect();
+            let input: Vec<(Record, u64)> = distinct.iter().chain(&colliding).cloned().collect();
+            let sort_by = by_key_then_n();
+            let expected = oracle(&input, &sort_by);
+            for pooled in [false, true] {
+                let mut buf = buffer(&sort_by, &schema, Mode::Auto, pooled);
+                for (record, payload) in distinct.iter().cloned() {
+                    buf.push(record, payload);
+                }
+                buf.sort_and_spill().unwrap();
+                assert_eq!(buf.abbreviation_abort(), None, "pooled: {pooled}");
+                for (record, payload) in colliding.iter().cloned() {
+                    buf.push(record, payload);
+                }
+                buf.sort_and_spill().unwrap();
+                assert!(buf.abbreviation_abort().is_some(), "pooled: {pooled}");
+                let SortedOutput::Spilled(files) = buf.finish().unwrap().0 else {
+                    panic!("explicit spills produce runs");
+                };
+                assert_eq!(merge(files, &sort_by), expected, "pooled: {pooled}");
+            }
+        }
     }
 }

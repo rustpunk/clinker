@@ -1460,7 +1460,7 @@ fn sort_side_stream<P>(
     pool: &Arc<rayon::ThreadPool>,
 ) -> Result<(SideStream<P>, u64), PipelineError>
 where
-    P: Serialize + DeserializeOwned + Send + Ord + crate::pipeline::sort_buffer::HeapBytes,
+    P: Serialize + DeserializeOwned + Send + Sync + Ord + crate::pipeline::sort_buffer::HeapBytes,
 {
     let consumer = args.consumer_handle.clone();
     let baseline = consumer.bytes();
@@ -1476,7 +1476,7 @@ fn sort_side_stream_inner<P>(
     pool: &Arc<rayon::ThreadPool>,
 ) -> Result<(SideStream<P>, u64), PipelineError>
 where
-    P: Serialize + DeserializeOwned + Send + Ord + crate::pipeline::sort_buffer::HeapBytes,
+    P: Serialize + DeserializeOwned + Send + Sync + Ord + crate::pipeline::sort_buffer::HeapBytes,
 {
     let SideStreamBuild {
         allocation_resources,
