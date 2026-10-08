@@ -44,6 +44,7 @@
 //! bugs.
 
 use clinker_record::owned_storage::{AllocationResources, SharedStorage};
+use std::cmp::Ordering;
 use std::path::PathBuf;
 
 use rayon::iter::{IndexedParallelIterator, ParallelIterator};
@@ -299,6 +300,110 @@ fn permute_in_place<T>(pairs: &mut [T], index: &mut [SortIndexEntry]) {
     }
 }
 
+/// How many runs of equal abbreviations a sort examined, and how many of
+/// those it had to sort because they were out of order.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TieRuns {
+    examined: usize,
+    sorted: usize,
+}
+
+impl TieRuns {
+    fn plus(self, other: Self) -> Self {
+        Self {
+            examined: self.examined + other.examined,
+            sorted: self.sorted + other.sorted,
+        }
+    }
+}
+
+/// Whether `run` is already in order under the comparator: one comparison per
+/// adjacent pair, no allocation.
+fn in_order<P>(run: &[(Record, P)], keys: &ResolvedSortKeys) -> bool {
+    run.windows(2)
+        .all(|pair| keys.compare(&pair[0].0, &pair[1].0) != Ordering::Greater)
+}
+
+/// Settle the order inside each run of equal abbreviations, on the calling
+/// thread. `pairs` is already in index order and `index[k].0` is the
+/// abbreviation of `pairs[k]`, so each run holds its rows in arrival order. A
+/// run already in order under the comparator is left as it is (an all-equal
+/// run always is); any other run is stable-sorted on its own, which keeps
+/// equal keys in arrival order. The sort allocates scratch for that run alone,
+/// never more than the stable sort of the whole buffer would.
+fn fix_tie_runs<P>(
+    pairs: &mut [(Record, P)],
+    index: &[SortIndexEntry],
+    keys: &ResolvedSortKeys,
+) -> TieRuns {
+    let mut runs = TieRuns::default();
+    let mut start = 0;
+    while start < pairs.len() {
+        let abbreviation = index[start].0;
+        let end = start
+            + index[start..]
+                .iter()
+                .take_while(|&&(other, _)| other == abbreviation)
+                .count();
+        if end - start >= 2 {
+            runs.examined += 1;
+            let run = &mut pairs[start..end];
+            if !in_order(run, keys) {
+                run.sort_by(|(a, _), (b, _)| keys.compare(a, b));
+                runs.sorted += 1;
+            }
+        }
+        start = end;
+    }
+    runs
+}
+
+/// [`fix_tie_runs`] spread over the pool the caller has installed. A slice no
+/// longer than `leaf` is fixed sequentially. A longer one is split at the run
+/// boundary nearest its middle (the first at or after it, else the last before
+/// it) and both halves are fixed in parallel, so no run is ever split and each
+/// is examined exactly once. A longer slice with no interior boundary is a
+/// single run: it is checked once and, when out of order, sorted with the
+/// pool's stable sort. Every split shortens both halves, so the recursion ends;
+/// its searches read only the index, and it allocates nothing per run.
+fn fix_tie_runs_parallel<P: Send>(
+    pairs: &mut [(Record, P)],
+    index: &[SortIndexEntry],
+    keys: &ResolvedSortKeys,
+    leaf: usize,
+) -> TieRuns {
+    let len = pairs.len();
+    if len <= leaf {
+        return fix_tie_runs(pairs, index, keys);
+    }
+    let boundary = |k: usize| index[k - 1].0 != index[k].0;
+    let middle = len / 2;
+    let split = (middle..len)
+        .find(|&k| boundary(k))
+        .or_else(|| (1..middle).rev().find(|&k| boundary(k)));
+    match split {
+        Some(k) => {
+            let (left_pairs, right_pairs) = pairs.split_at_mut(k);
+            let (left_index, right_index) = index.split_at(k);
+            let (left, right) = rayon::join(
+                || fix_tie_runs_parallel(left_pairs, left_index, keys, leaf),
+                || fix_tie_runs_parallel(right_pairs, right_index, keys, leaf),
+            );
+            left.plus(right)
+        }
+        None => {
+            let sorted = !in_order(pairs, keys);
+            if sorted {
+                pairs.par_sort_by(|(a, _), (b, _)| keys.compare(a, b));
+            }
+            TieRuns {
+                examined: 1,
+                sorted: usize::from(sorted),
+            }
+        }
+    }
+}
+
 /// Result of finishing a sort buffer: either all (record, payload) pairs
 /// fit in memory, or some were spilled to disk.
 pub enum SortedOutput<P> {
@@ -368,6 +473,9 @@ pub struct SortBuffer<P> {
     /// The rows at which this buffer aborted abbreviation, once it has.
     #[cfg(test)]
     abbreviation_abort: Option<usize>,
+    /// Tie runs examined and sorted over every run this buffer sorted.
+    #[cfg(test)]
+    tie_runs: TieRuns,
 }
 
 // `P: Ord` spans the whole impl, not just the payload-ordered constructor, so
@@ -407,6 +515,8 @@ impl<P: Serialize + DeserializeOwned + Send + Sync + Ord + HeapBytes> SortBuffer
             abbreviation: Abbreviation::Trying,
             #[cfg(test)]
             abbreviation_abort: None,
+            #[cfg(test)]
+            tie_runs: TieRuns::default(),
         }
     }
 
@@ -438,6 +548,8 @@ impl<P: Serialize + DeserializeOwned + Send + Sync + Ord + HeapBytes> SortBuffer
             abbreviation: Abbreviation::Off,
             #[cfg(test)]
             abbreviation_abort: None,
+            #[cfg(test)]
+            tie_runs: TieRuns::default(),
         }
     }
 
@@ -469,6 +581,18 @@ impl<P: Serialize + DeserializeOwned + Send + Sync + Ord + HeapBytes> SortBuffer
     #[cfg(test)]
     pub(crate) fn abbreviation_abort(&self) -> Option<usize> {
         self.abbreviation_abort
+    }
+
+    /// Runs of two or more equal abbreviations examined, over every run sorted.
+    #[cfg(test)]
+    pub(crate) fn tie_runs_examined(&self) -> usize {
+        self.tie_runs.examined
+    }
+
+    /// Runs of equal abbreviations that were out of order and had to be sorted.
+    #[cfg(test)]
+    pub(crate) fn tie_runs_sorted(&self) -> usize {
+        self.tie_runs.sorted
     }
 
     /// Push a `(record, payload)` pair into the buffer. The payload's own heap
@@ -552,11 +676,18 @@ impl<P: Serialize + DeserializeOwned + Send + Sync + Ord + HeapBytes> SortBuffer
     }
 
     /// Sort a field-ordered buffer's pairs through a per-row index of
-    /// abbreviated keys: order the index by abbreviation, break equal
-    /// abbreviations with the full comparator and then the row's position, and
-    /// move the pairs into that order. The trailing position makes the order
-    /// total and unique, so the unstable index sort yields exactly the stable
-    /// order of the pairs.
+    /// abbreviated keys. The index is sorted on its two integers alone, the
+    /// abbreviation and then the row's position, so the in-place unstable sort
+    /// yields each run of equal abbreviations in arrival order without reading
+    /// a row. The pairs are moved into index order, and then each run of equal
+    /// abbreviations is checked once and sorted on the comparator only when it
+    /// is out of order. Where two abbreviations differ they already decide the
+    /// order, so the result is exactly the stable sort by the comparator.
+    ///
+    /// The index is the only per-row allocation and holds exactly the entries
+    /// charged at push; the integer sort allocates nothing; a run's sort needs
+    /// scratch for that run alone, so the scratch alive at once stays within
+    /// what the stable sort of the whole buffer would hold.
     ///
     /// Returns `false`, having latched abbreviation off for every later run,
     /// when the encode pass measured that the abbreviations no longer tell the
@@ -586,19 +717,28 @@ impl<P: Serialize + DeserializeOwned + Send + Sync + Ord + HeapBytes> SortBuffer
                 return false;
             }
         };
-        let pairs = &self.pairs;
-        let order = |&(abbreviation_a, row_a): &SortIndexEntry,
-                     &(abbreviation_b, row_b): &SortIndexEntry| {
-            abbreviation_a
-                .cmp(&abbreviation_b)
-                .then_with(|| keys.compare(&pairs[row_a].0, &pairs[row_b].0))
-                .then(row_a.cmp(&row_b))
-        };
+        debug_assert_eq!(
+            index.capacity(),
+            self.pairs.len(),
+            "the sort index holds exactly the entries charged at push"
+        );
         match pool {
-            Some(pool) => pool.install(|| index.par_sort_unstable_by(order)),
-            None => index.sort_unstable_by(order),
+            Some(pool) => pool.install(|| index.par_sort_unstable()),
+            None => index.sort_unstable(),
         }
         permute_in_place(&mut self.pairs, &mut index);
+        let runs = match pool {
+            Some(pool) => {
+                let leaf = encode_chunk_rows(self.pairs.len(), pool.current_num_threads()).max(2);
+                pool.install(|| fix_tie_runs_parallel(&mut self.pairs, &index, keys, leaf))
+            }
+            None => fix_tie_runs(&mut self.pairs, &index, keys),
+        };
+        debug_assert!(runs.sorted <= runs.examined);
+        #[cfg(test)]
+        {
+            self.tie_runs = self.tie_runs.plus(runs);
+        }
         true
     }
 
@@ -1343,6 +1483,26 @@ mod tests {
             )
         }
 
+        /// Sort `input` resident, sequentially or on `pool`; returns the payload
+        /// order and the buffer, to read what the sort reports.
+        fn resident_on(
+            input: &[(Record, u64)],
+            sort_by: &[SortField],
+            mode: Mode,
+            pool: Option<&Arc<rayon::ThreadPool>>,
+        ) -> (Vec<u64>, SortBuffer<u64>) {
+            let mut buf = buffer(sort_by, &schema_of(input), mode, false);
+            if let Some(pool) = pool {
+                buf = buf.with_kernel_pool(Arc::clone(pool));
+            }
+            for (record, payload) in input.iter().cloned() {
+                buf.push(record, payload);
+            }
+            buf.sort_pairs();
+            let sorted = std::mem::take(&mut buf.pairs);
+            (sorted.into_iter().map(|(_, p)| p).collect(), buf)
+        }
+
         /// Sort `input` spilling a run every `run_rows` rows, then merge the
         /// runs.
         fn spilled(
@@ -1597,6 +1757,86 @@ mod tests {
                     panic!("explicit spills produce runs");
                 };
                 assert_eq!(merge(files, &sort_by), expected, "pooled: {pooled}");
+            }
+        }
+
+        /// A run of equal abbreviations whose rows are already in order (here
+        /// every run is one repeated key) costs one check and is not sorted; a
+        /// run the abbreviation cannot order is sorted once, also on a pool
+        /// small enough that the run is longer than one slice of the parallel
+        /// pass.
+        #[test]
+        fn tie_runs_already_in_order_are_not_sorted_again() {
+            let schema = schema();
+            let key_alone = vec![field("k", SortOrder::Asc, NullOrder::Last)];
+            let two_threads = Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(2)
+                    .build()
+                    .expect("build a two-thread pool"),
+            );
+
+            let repeated = scrambled(5_000)
+                .map(|i| Value::Integer((i % 16) as i64))
+                .collect();
+            let input = rows(&schema, repeated);
+            let expected = oracle(&input, &key_alone);
+            for pool in [None, Some(crate::test_support::test_kernel_pool())] {
+                let (sorted, buf) = resident_on(&input, &key_alone, Mode::Forced, pool);
+                assert_eq!(sorted, expected, "pooled: {}", pool.is_some());
+                assert_eq!(
+                    (buf.tie_runs_examined(), buf.tie_runs_sorted()),
+                    (16, 0),
+                    "pooled: {}: sixteen runs of one key each, all already in order",
+                    pool.is_some()
+                );
+            }
+
+            let input = rows(&schema, prefixed_strings("a-twenty-byte-prefix", 3_000));
+            let expected = oracle(&input, &key_alone);
+            assert!(
+                encode_chunk_rows(input.len(), two_threads.current_num_threads()) < input.len(),
+                "on two threads the single run is longer than one slice"
+            );
+            for pool in [
+                None,
+                Some(crate::test_support::test_kernel_pool()),
+                Some(&two_threads),
+            ] {
+                let (sorted, buf) = resident_on(&input, &key_alone, Mode::Forced, pool);
+                assert_eq!(sorted, expected);
+                assert_eq!(
+                    (buf.tie_runs_examined(), buf.tie_runs_sorted()),
+                    (1, 1),
+                    "one run the abbreviation cannot order, sorted once"
+                );
+            }
+        }
+
+        /// Runs end exactly where the abbreviation changes: four groups of
+        /// strings whose abbreviations differ only between groups form four
+        /// runs, each sorted on its own.
+        #[test]
+        fn tie_runs_end_where_the_abbreviation_changes() {
+            let schema = schema();
+            let key_alone = vec![field("k", SortOrder::Asc, NullOrder::Last)];
+            let grouped = scrambled(4_000)
+                .map(|i| {
+                    let group = ["groupA", "groupB", "groupC", "groupD"][(i % 4) as usize];
+                    Value::String(format!("{group}{i:05}").into())
+                })
+                .collect();
+            let input = rows(&schema, grouped);
+            let expected = oracle(&input, &key_alone);
+            for pool in [None, Some(crate::test_support::test_kernel_pool())] {
+                let (sorted, buf) = resident_on(&input, &key_alone, Mode::Forced, pool);
+                assert_eq!(sorted, expected, "pooled: {}", pool.is_some());
+                assert_eq!(
+                    (buf.tie_runs_examined(), buf.tie_runs_sorted()),
+                    (4, 4),
+                    "pooled: {}: one run per group",
+                    pool.is_some()
+                );
             }
         }
     }
