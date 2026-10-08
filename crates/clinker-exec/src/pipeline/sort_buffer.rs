@@ -48,7 +48,7 @@ use std::cmp::Ordering;
 use std::path::PathBuf;
 
 use rayon::iter::{IndexedParallelIterator, ParallelIterator};
-use rayon::slice::{ParallelSlice, ParallelSliceMut};
+use rayon::slice::ParallelSliceMut;
 use serde::{Serialize, de::DeserializeOwned};
 
 use clinker_record::{Record, Schema};
@@ -205,17 +205,25 @@ fn encode_chunk_rows(rows: usize, threads: usize) -> usize {
     rows.div_ceil(chunks).max(1)
 }
 
-/// Encode every row's abbreviated key in arrival order on the calling thread.
-/// When `measure`, checks the sketches at 100 rows and each doubling, and
-/// returns `Err(rows)` with the checkpoint that decided to abort.
+/// Rows a pooled sort encodes on the calling thread, through the sequential
+/// checkpoints, before it encodes the rest in parallel: the run up to its fifth
+/// checkpoint. A run that stops abbreviating within them never pays for the
+/// parallel encode, and decides exactly as a sequential sort would.
+const POOLED_PREFIX_ROWS: usize = 1_600;
+
+/// Encode the abbreviated key of each of `pairs`, rows `0..pairs.len()` of the
+/// run, in arrival order on the calling thread, appending one entry per row to
+/// `index` and feeding `sketches`. When `measure`, checks the sketches at 100
+/// rows and each doubling, and returns `Err(rows)` with the checkpoint that
+/// decided to abort.
 fn encode_sequential<P>(
     pairs: &[(Record, P)],
     keys: &ResolvedSortKeys,
     measure: bool,
-) -> Result<Vec<SortIndexEntry>, usize> {
-    let mut index = Vec::with_capacity(pairs.len());
+    index: &mut Vec<SortIndexEntry>,
+    sketches: &mut KeySketches,
+) -> Result<(), usize> {
     let mut key = Vec::new();
-    let mut sketches = KeySketches::new();
     let mut checkpoint = FIRST_ABBREVIATION_CHECKPOINT;
     for (row, (record, _)) in pairs.iter().enumerate() {
         keys.encode_into(record, &mut key);
@@ -231,37 +239,49 @@ fn encode_sequential<P>(
             }
         }
     }
-    Ok(index)
+    Ok(())
 }
 
-/// Encode every row's abbreviated key in parallel chunks on `pool`, each chunk
-/// writing its own slice of the index with its own scratch key and sketches.
-/// When `measure`, merges the chunk sketches and decides once over all rows,
-/// returning `Err(rows)` to abort. A sort below the first checkpoint never
-/// aborts, as on the sequential path.
-fn encode_pooled<P: Sync>(
-    pairs: &[(Record, P)],
+/// Encode a pooled sort's abbreviated keys into `index`. The first
+/// [`POOLED_PREFIX_ROWS`] rows are encoded on the calling thread through the
+/// sequential checkpoints, so a run that stops abbreviating early stops there.
+/// The rest are encoded in parallel chunks on `pool`, each chunk writing its
+/// own slice of the index with its own scratch key and sketches; the rows are
+/// only read, through disjoint chunks. When `measure`, the prefix's and every
+/// chunk's sketches are merged and the run is decided once over all its rows,
+/// returning `Err(rows)` to abort. Returns how many rows were encoded in
+/// parallel.
+fn encode_pooled<P: Send>(
+    pairs: &mut [(Record, P)],
     keys: &ResolvedSortKeys,
     pool: &rayon::ThreadPool,
     measure: bool,
-) -> Result<Vec<SortIndexEntry>, usize> {
+    index: &mut Vec<SortIndexEntry>,
+) -> Result<usize, usize> {
     let rows = pairs.len();
-    let chunk_rows = encode_chunk_rows(rows, pool.current_num_threads());
-    let mut index: Vec<SortIndexEntry> = vec![(0, 0); rows];
+    let prefix_rows = rows.min(POOLED_PREFIX_ROWS);
+    let mut sketches = KeySketches::new();
+    encode_sequential(&pairs[..prefix_rows], keys, measure, index, &mut sketches)?;
+    if rows == prefix_rows {
+        return Ok(0);
+    }
+    let chunk_rows = encode_chunk_rows(rows - prefix_rows, pool.current_num_threads());
+    index.resize(rows, (0, 0));
     let chunk_sketches: Vec<KeySketches> = pool.install(|| {
-        index
+        index[prefix_rows..]
             .par_chunks_mut(chunk_rows)
-            .zip(pairs.par_chunks(chunk_rows))
+            .zip(pairs[prefix_rows..].par_chunks_mut(chunk_rows))
             .enumerate()
             .map(|(chunk, (entries, chunk_pairs))| {
                 let mut key = Vec::new();
                 let mut sketches = KeySketches::new();
+                let first_row = prefix_rows + chunk * chunk_rows;
                 for (offset, (entry, (record, _))) in
-                    entries.iter_mut().zip(chunk_pairs).enumerate()
+                    entries.iter_mut().zip(chunk_pairs.iter()).enumerate()
                 {
                     keys.encode_into(record, &mut key);
                     let abbreviation = abbreviated_key(&key);
-                    *entry = (abbreviation, chunk * chunk_rows + offset);
+                    *entry = (abbreviation, first_row + offset);
                     if measure {
                         sketches.add(abbreviation, &key);
                     }
@@ -270,16 +290,15 @@ fn encode_pooled<P: Sync>(
             })
             .collect()
     });
-    if measure && rows >= FIRST_ABBREVIATION_CHECKPOINT {
-        let mut merged = KeySketches::new();
-        for sketches in &chunk_sketches {
-            merged.merge(sketches);
+    if measure {
+        for chunk in &chunk_sketches {
+            sketches.merge(chunk);
         }
-        if !merged.continues(rows) {
+        if !sketches.continues(rows) {
             return Err(rows);
         }
     }
-    Ok(index)
+    Ok(rows - prefix_rows)
 }
 
 /// Reorder `pairs` so position `k` holds the pair `index[k]` names, following
@@ -476,6 +495,9 @@ pub struct SortBuffer<P> {
     /// Tie runs examined and sorted over every run this buffer sorted.
     #[cfg(test)]
     tie_runs: TieRuns,
+    /// Rows the pooled encode pass encoded in parallel, over every run.
+    #[cfg(test)]
+    rows_encoded_in_parallel: usize,
 }
 
 // `P: Ord` spans the whole impl, not just the payload-ordered constructor, so
@@ -517,6 +539,8 @@ impl<P: Serialize + DeserializeOwned + Send + Sync + Ord + HeapBytes> SortBuffer
             abbreviation_abort: None,
             #[cfg(test)]
             tie_runs: TieRuns::default(),
+            #[cfg(test)]
+            rows_encoded_in_parallel: 0,
         }
     }
 
@@ -550,6 +574,8 @@ impl<P: Serialize + DeserializeOwned + Send + Sync + Ord + HeapBytes> SortBuffer
             abbreviation_abort: None,
             #[cfg(test)]
             tie_runs: TieRuns::default(),
+            #[cfg(test)]
+            rows_encoded_in_parallel: 0,
         }
     }
 
@@ -576,8 +602,9 @@ impl<P: Serialize + DeserializeOwned + Send + Sync + Ord + HeapBytes> SortBuffer
     }
 
     /// The rows at which the buffer aborted abbreviation: the deciding
-    /// checkpoint on the sequential path, the whole run on the pooled path.
-    /// `None` while it has not aborted.
+    /// checkpoint when one decided (on the sequential path, or within a pooled
+    /// sort's prefix), else the whole run on the pooled path. `None` while it
+    /// has not aborted.
     #[cfg(test)]
     pub(crate) fn abbreviation_abort(&self) -> Option<usize> {
         self.abbreviation_abort
@@ -593,6 +620,13 @@ impl<P: Serialize + DeserializeOwned + Send + Sync + Ord + HeapBytes> SortBuffer
     #[cfg(test)]
     pub(crate) fn tie_runs_sorted(&self) -> usize {
         self.tie_runs.sorted
+    }
+
+    /// Rows the pooled encode pass encoded in parallel, after the prefix
+    /// encoded on the calling thread.
+    #[cfg(test)]
+    pub(crate) fn rows_encoded_in_parallel(&self) -> usize {
+        self.rows_encoded_in_parallel
     }
 
     /// Push a `(record, payload)` pair into the buffer. The payload's own heap
@@ -698,12 +732,21 @@ impl<P: Serialize + DeserializeOwned + Send + Sync + Ord + HeapBytes> SortBuffer
         };
         let measure = self.abbreviation == Abbreviation::Trying;
         let pool = self.kernel_pool.as_deref();
+        let rows = self.pairs.len();
+        let mut index = Vec::with_capacity(rows);
         let encoded = match pool {
-            Some(pool) => encode_pooled(&self.pairs, keys, pool, measure),
-            None => encode_sequential(&self.pairs, keys, measure),
+            Some(pool) => encode_pooled(&mut self.pairs, keys, pool, measure, &mut index),
+            None => encode_sequential(
+                &self.pairs,
+                keys,
+                measure,
+                &mut index,
+                &mut KeySketches::new(),
+            )
+            .map(|()| 0),
         };
-        let mut index = match encoded {
-            Ok(index) => index,
+        let parallel_rows = match encoded {
+            Ok(parallel_rows) => parallel_rows,
             Err(abort_rows) => {
                 debug_assert!(
                     (FIRST_ABBREVIATION_CHECKPOINT..=self.pairs.len()).contains(&abort_rows),
@@ -717,6 +760,11 @@ impl<P: Serialize + DeserializeOwned + Send + Sync + Ord + HeapBytes> SortBuffer
                 return false;
             }
         };
+        debug_assert!(parallel_rows <= rows);
+        #[cfg(test)]
+        {
+            self.rows_encoded_in_parallel += parallel_rows;
+        }
         debug_assert_eq!(
             index.capacity(),
             self.pairs.len(),
@@ -1838,6 +1886,30 @@ mod tests {
                     pool.is_some()
                 );
             }
+        }
+
+        /// A pooled sort decides on its prefix on the calling thread before it
+        /// encodes the rest in parallel: a key whose abbreviations collide stops
+        /// at the first checkpoint with nothing encoded in parallel, and a key
+        /// that keeps abbreviating encodes every row after the prefix in
+        /// parallel.
+        #[test]
+        fn pooled_sort_decides_on_its_prefix_before_the_parallel_encode() {
+            let schema = schema();
+            let key_alone = vec![field("k", SortOrder::Asc, NullOrder::Last)];
+            let pool = Some(crate::test_support::test_kernel_pool());
+
+            let input = rows(&schema, distinct_datetimes(20_000));
+            let (sorted, buf) = resident_on(&input, &key_alone, Mode::Auto, pool);
+            assert_eq!(buf.abbreviation_abort(), Some(100));
+            assert_eq!(buf.rows_encoded_in_parallel(), 0);
+            assert_eq!(sorted, oracle(&input, &key_alone));
+
+            let input = rows(&schema, distinct_integers(20_000));
+            let (sorted, buf) = resident_on(&input, &key_alone, Mode::Auto, pool);
+            assert_eq!(buf.abbreviation_abort(), None);
+            assert_eq!(buf.rows_encoded_in_parallel(), 20_000 - POOLED_PREFIX_ROWS);
+            assert_eq!(sorted, oracle(&input, &key_alone));
         }
     }
 }
