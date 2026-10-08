@@ -53,7 +53,7 @@ use clinker_record::Record;
 
 use crate::pipeline::loser_tree::LoserTree;
 use crate::pipeline::memory::MemoryArbitrator;
-use crate::pipeline::sort_key::compare_authored_keys;
+use crate::pipeline::sort_key::ResolvedSortKeys;
 use crate::pipeline::spill::{SpillFile, SpillReader, SpillWriter};
 use clinker_plan::config::SortField;
 use clinker_plan::error::PipelineError;
@@ -301,11 +301,25 @@ impl OwnedMergeBudget {
 /// spilled under. Cheap to clone: the field variant shares one `Arc`.
 #[derive(Clone)]
 enum RunOrdering {
-    /// Order by [`compare_authored_keys`] over the shared fields — the
-    /// record carries the sort key.
-    Fields(Arc<[SortField]>),
+    /// Order by the authored fields, resolved once against the runs' schema —
+    /// the record carries the sort key.
+    Fields(Arc<ResolvedSortKeys>),
     /// Order by the carried payload `P: Ord` directly — no record field.
     Payload,
+}
+
+impl RunOrdering {
+    /// Field ordering over `sort_by`, resolved against the first run's schema.
+    /// Every run a sort buffer spills carries that buffer's schema handle, and
+    /// a cascade's intermediate runs carry their group's first run's, so the
+    /// decoded records read their fields by position. With no runs nothing is
+    /// compared, and the ordering reads by name.
+    fn fields<P>(sort_by: &[SortField], files: &[SpillFile<P>]) -> Self {
+        RunOrdering::Fields(Arc::new(ResolvedSortKeys::for_sort_fields(
+            sort_by,
+            files.first().map(SpillFile::schema),
+        )))
+    }
 }
 
 /// One entry in the k-way merge: a spilled record and the payload `P` carried
@@ -334,9 +348,7 @@ impl<P: Ord> PartialOrd for Run<P> {
 impl<P: Ord> Ord for Run<P> {
     fn cmp(&self, other: &Self) -> Ordering {
         match &self.ordering {
-            RunOrdering::Fields(sort_by) => {
-                compare_authored_keys(&self.record, &other.record, sort_by)
-            }
+            RunOrdering::Fields(keys) => keys.compare(&self.record, &other.record),
             RunOrdering::Payload => self.payload.cmp(&other.payload),
         }
     }
@@ -500,13 +512,8 @@ impl<P: Serialize + DeserializeOwned + Ord> SortedRunMerger<P> {
         context: &'static str,
         budget: MergeBudget<'_>,
     ) -> Result<Self, PipelineError> {
-        Self::open(
-            files,
-            RunOrdering::Fields(Arc::from(sort_by.to_vec())),
-            context,
-            budget,
-            MERGE_FAN_IN,
-        )
+        let ordering = RunOrdering::fields(sort_by, &files);
+        Self::open(files, ordering, context, budget, MERGE_FAN_IN)
     }
 
     /// Number of spill readers held concurrently by the final merge pass.
@@ -857,13 +864,8 @@ impl<P: Serialize + DeserializeOwned + Ord> SortedRunMerger<P> {
         budget: MergeBudget<'_>,
         fan_in: usize,
     ) -> Result<Self, PipelineError> {
-        Self::open(
-            files,
-            RunOrdering::Fields(Arc::from(sort_by.to_vec())),
-            context,
-            budget,
-            fan_in,
-        )
+        let ordering = RunOrdering::fields(sort_by, &files);
+        Self::open(files, ordering, context, budget, fan_in)
     }
 
     fn new_payload_ordered_with_fan_in(
@@ -1857,7 +1859,7 @@ mod tests {
         let (files, sort_by, oracle) = build_dup_key_runs(100, 2);
         assert_eq!(files.len(), 100);
 
-        let ordering = RunOrdering::Fields(Arc::from(sort_by.clone()));
+        let ordering = RunOrdering::fields(&sort_by, &files);
         let reduced = reduce_to_fan_in(files, &ordering, "test", &test_budget(&arb), 4).unwrap();
         assert!(
             (1..=4).contains(&reduced.len()),

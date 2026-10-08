@@ -3453,6 +3453,7 @@ nodes:
     mod resident_node_buffer_spill;
     mod scheduling;
     mod shared_slot_read_reservation;
+    mod sort_fast_path;
     mod source_completion;
     mod source_consumer_release;
     mod source_end_of_input;

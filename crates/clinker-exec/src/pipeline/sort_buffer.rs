@@ -30,7 +30,7 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use clinker_record::{Record, Schema};
 
-use crate::pipeline::sort_key::compare_authored_keys;
+use crate::pipeline::sort_key::ResolvedSortKeys;
 use crate::pipeline::spill::{SpillFile, SpillWriter};
 use clinker_plan::SpillError;
 use clinker_plan::config::SortField;
@@ -110,7 +110,7 @@ pub enum SortedOutput<P> {
 enum SortOrdering {
     /// Order by [`compare_authored_keys`] over these fields; the record
     /// carries the sort key and the payload rides along inert.
-    Fields(Vec<SortField>),
+    Fields(ResolvedSortKeys),
     /// Order by the carried payload `P: Ord` directly, with no record field
     /// consulted. For a sort key computed off the record rather than stored in
     /// a column.
@@ -166,7 +166,10 @@ impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
     ) -> Self {
         Self {
             pairs: Vec::new(),
-            ordering: SortOrdering::Fields(sort_by),
+            ordering: SortOrdering::Fields(ResolvedSortKeys::for_sort_fields(
+                &sort_by,
+                Some(&schema),
+            )),
             bytes_used: 0,
             unaccounted_bytes_used: 0,
             allocation_resources,
@@ -265,11 +268,11 @@ impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
             ..
         } = self;
         match (ordering, kernel_pool.as_deref()) {
-            (SortOrdering::Fields(sort_by), Some(pool)) => pool.install(|| {
-                pairs.par_sort_by(|(a, _), (b, _)| compare_authored_keys(a, b, sort_by));
+            (SortOrdering::Fields(keys), Some(pool)) => pool.install(|| {
+                pairs.par_sort_by(|(a, _), (b, _)| keys.compare(a, b));
             }),
-            (SortOrdering::Fields(sort_by), None) => {
-                pairs.sort_by(|(a, _), (b, _)| compare_authored_keys(a, b, sort_by));
+            (SortOrdering::Fields(keys), None) => {
+                pairs.sort_by(|(a, _), (b, _)| keys.compare(a, b));
             }
             (SortOrdering::Payload, Some(pool)) => pool.install(|| {
                 pairs.par_sort_by(|(_, a), (_, b)| a.cmp(b));
@@ -719,7 +722,10 @@ mod tests {
             test_allocation_resources(),
         );
         buf.push(
-            Record::new(reordered, vec![Value::Integer(1), Value::String("a".into())]),
+            Record::new(
+                reordered,
+                vec![Value::Integer(1), Value::String("a".into())],
+            ),
             (),
         );
     }

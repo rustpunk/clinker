@@ -25,9 +25,10 @@
 
 use std::cmp::Ordering;
 
-use clinker_record::{Record, Value};
+use clinker_record::owned_storage::SharedStorage;
+use clinker_record::{Record, Schema, Value};
 
-use clinker_plan::config::{NullOrder, SortField, SortOrder};
+use clinker_plan::config::{NullOrder, OrderField, SortField, SortOrder};
 
 /// Compare two records using only the fields, directions, and null placement
 /// the author declared.
@@ -37,18 +38,302 @@ use clinker_plan::config::{NullOrder, SortField, SortOrder};
 /// source identity, filenames, hashes, and other undeclared values never enter
 /// this comparison.
 pub fn compare_authored_keys(a: &Record, b: &Record, sort_by: &[SortField]) -> Ordering {
-    for field in sort_by {
+    compare_fields(
+        sort_by,
+        |field| a.get(&field.field),
+        |field| b.get(&field.field),
+    )
+}
+
+/// What the shared per-field loops need from one sort field: its direction
+/// and where its nulls go. The value comes from the caller's accessor, so the
+/// by-name and by-position forms run one loop and cannot drift apart.
+trait FieldOrder {
+    fn order(&self) -> SortOrder;
+    fn null_order(&self) -> NullOrder;
+}
+
+impl FieldOrder for SortField {
+    fn order(&self) -> SortOrder {
+        self.order
+    }
+
+    fn null_order(&self) -> NullOrder {
+        self.null_order.unwrap_or(NullOrder::Last)
+    }
+}
+
+/// The one field-by-field comparison every authored comparator runs: the
+/// first field whose two values differ decides.
+#[inline]
+fn compare_fields<'a, 'b, F: FieldOrder>(
+    fields: &[F],
+    mut value_a: impl FnMut(&F) -> Option<&'a Value>,
+    mut value_b: impl FnMut(&F) -> Option<&'b Value>,
+) -> Ordering {
+    for field in fields {
         let ordering = compare_authored_values_with_nulls(
-            a.get(&field.field),
-            b.get(&field.field),
-            field.order,
-            field.null_order.unwrap_or(NullOrder::Last),
+            value_a(field),
+            value_b(field),
+            field.order(),
+            field.null_order(),
         );
         if ordering != Ordering::Equal {
             return ordering;
         }
     }
     Ordering::Equal
+}
+
+/// The one key encoder loop: each field's null sentinel, then its value key,
+/// inverted for a descending field.
+fn encode_fields_into<'r, F: FieldOrder>(
+    fields: &[F],
+    mut value: impl FnMut(&F) -> Option<&'r Value>,
+    key: &mut Vec<u8>,
+) {
+    key.clear();
+    for field in fields {
+        match value(field) {
+            None | Some(Value::Null) => {
+                key.push(match field.null_order() {
+                    NullOrder::First => 0x00,
+                    NullOrder::Last | NullOrder::Drop => 0x02,
+                });
+            }
+            Some(value) => {
+                key.push(0x01); // non-null sentinel
+                let value_start = key.len();
+                clinker_record::order::encode(value, key);
+                if field.order() == SortOrder::Desc {
+                    for byte in &mut key[value_start..] {
+                        *byte ^= 0xFF;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One sort field resolved against a schema: the column it reads there, or
+/// `None` when the schema has no column of that name (the field then reads as
+/// absent, as [`Record::get`] reports it).
+#[derive(Debug, Clone)]
+struct ResolvedField {
+    name: Box<str>,
+    index: Option<usize>,
+    order: SortOrder,
+    null_order: NullOrder,
+}
+
+impl FieldOrder for ResolvedField {
+    fn order(&self) -> SortOrder {
+        self.order
+    }
+
+    fn null_order(&self) -> NullOrder {
+        self.null_order
+    }
+}
+
+/// Authored sort fields resolved once against the schema of the records a sort
+/// compares, so each comparison reads a field by its column position rather
+/// than looking its name up in the schema.
+///
+/// A record whose schema handle is not the resolved one (another schema, or
+/// equal columns behind another handle) is read by name, exactly as
+/// [`compare_authored_keys`] reads it, so the order never depends on which path
+/// a record takes, only its cost does. Holds the schema handle and one entry
+/// per field; built once per sort buffer, spilled-run merge, window partition
+/// or group, never per row.
+#[derive(Debug)]
+pub(crate) struct ResolvedSortKeys {
+    schema: Option<SharedStorage<Schema>>,
+    fields: Vec<ResolvedField>,
+    #[cfg(test)]
+    probe: Option<std::sync::Arc<fast_path_probe::FastPathProbe>>,
+}
+
+impl ResolvedSortKeys {
+    /// Resolve authored sort fields against `schema`. With no schema every
+    /// record is read by name.
+    pub(crate) fn for_sort_fields(
+        sort_by: &[SortField],
+        schema: Option<&SharedStorage<Schema>>,
+    ) -> Self {
+        Self::resolve(
+            sort_by.iter().map(|field| {
+                (
+                    field.field.as_str(),
+                    field.order,
+                    FieldOrder::null_order(field),
+                )
+            }),
+            schema,
+        )
+    }
+
+    /// Resolve placement-only ordering fields (a window's `order_by`) against
+    /// `schema`.
+    pub(crate) fn for_order_fields(
+        order_by: &[OrderField],
+        schema: &SharedStorage<Schema>,
+    ) -> Self {
+        Self::resolve(
+            order_by
+                .iter()
+                .map(|field| (field.field.as_str(), field.order, field.null_order.into())),
+            Some(schema),
+        )
+    }
+
+    fn resolve<'f>(
+        fields: impl Iterator<Item = (&'f str, SortOrder, NullOrder)>,
+        schema: Option<&SharedStorage<Schema>>,
+    ) -> Self {
+        let fields = fields
+            .map(|(name, order, null_order)| ResolvedField {
+                name: name.into(),
+                index: schema.and_then(|schema| schema.index(name)),
+                order,
+                null_order,
+            })
+            .collect();
+        Self {
+            schema: schema.cloned(),
+            fields,
+            #[cfg(test)]
+            probe: fast_path_probe::current(),
+        }
+    }
+
+    /// Whether `record` carries the resolved schema handle, so its fields can
+    /// be read at the resolved positions.
+    #[inline]
+    fn reads_by_position(&self, record: &Record) -> bool {
+        self.schema
+            .as_ref()
+            .is_some_and(|schema| SharedStorage::ptr_eq(record.schema(), schema))
+    }
+
+    /// One field of `record`: at its resolved position on the fast path, else
+    /// by name. The positional read is the expression [`Record::get`]
+    /// evaluates after its name lookup, so null and absent fields read the same
+    /// either way.
+    #[inline]
+    fn value<'r>(
+        &self,
+        record: &'r Record,
+        by_position: bool,
+        field: &ResolvedField,
+    ) -> Option<&'r Value> {
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            probe.record(by_position);
+        }
+        if by_position {
+            field.index.and_then(|index| record.values().get(index))
+        } else {
+            record.get(&field.name)
+        }
+    }
+
+    /// Compare two records under the authored fields; equal to
+    /// [`compare_authored_keys`] over the same fields.
+    pub(crate) fn compare(&self, a: &Record, b: &Record) -> Ordering {
+        let (a_by_position, b_by_position) = (self.reads_by_position(a), self.reads_by_position(b));
+        compare_fields(
+            &self.fields,
+            |field| self.value(a, a_by_position, field),
+            |field| self.value(b, b_by_position, field),
+        )
+    }
+
+    /// Compare two rows whose values the caller reads by column index from
+    /// storage holding the resolved schema's columns, such as a window's arena.
+    pub(crate) fn compare_columns<'a, 'b>(
+        &self,
+        a: impl Fn(usize) -> Option<&'a Value>,
+        b: impl Fn(usize) -> Option<&'b Value>,
+    ) -> Ordering {
+        compare_fields(
+            &self.fields,
+            |field| field.index.and_then(&a),
+            |field| field.index.and_then(&b),
+        )
+    }
+}
+
+/// Test-only instrumentation showing which path a resolved comparator's reads
+/// took, so a test can pin that a production sort reads by position.
+///
+/// A probe installed on a thread attaches to every [`ResolvedSortKeys`]
+/// resolved on that thread while it is installed. The counters are atomics
+/// because comparisons run on kernel-pool threads, and per probe so parallel
+/// tests never share a count.
+#[cfg(test)]
+pub(crate) mod fast_path_probe {
+    use std::cell::RefCell;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Field reads counted by path.
+    #[derive(Debug, Default)]
+    pub(crate) struct FastPathProbe {
+        by_position: AtomicU64,
+        by_name: AtomicU64,
+    }
+
+    impl FastPathProbe {
+        pub(crate) fn reads_by_position(&self) -> u64 {
+            self.by_position.load(Ordering::Relaxed)
+        }
+
+        pub(crate) fn reads_by_name(&self) -> u64 {
+            self.by_name.load(Ordering::Relaxed)
+        }
+
+        pub(super) fn record(&self, by_position: bool) {
+            let counter = if by_position {
+                &self.by_position
+            } else {
+                &self.by_name
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    thread_local! {
+        static INSTALLED: RefCell<Option<Arc<FastPathProbe>>> = const { RefCell::new(None) };
+    }
+
+    /// Keeps a probe installed on the current thread until dropped.
+    pub(crate) struct InstalledProbe {
+        probe: Arc<FastPathProbe>,
+    }
+
+    impl InstalledProbe {
+        pub(crate) fn probe(&self) -> &FastPathProbe {
+            &self.probe
+        }
+    }
+
+    impl Drop for InstalledProbe {
+        fn drop(&mut self) {
+            INSTALLED.with(|installed| installed.borrow_mut().take());
+        }
+    }
+
+    /// Install a fresh probe on the current thread.
+    pub(crate) fn install() -> InstalledProbe {
+        let probe = Arc::new(FastPathProbe::default());
+        INSTALLED.with(|installed| *installed.borrow_mut() = Some(Arc::clone(&probe)));
+        InstalledProbe { probe }
+    }
+
+    pub(super) fn current() -> Option<Arc<FastPathProbe>> {
+        INSTALLED.with(|installed| installed.borrow().clone())
+    }
 }
 
 /// Build the memcomparable form of exactly the authored key.
@@ -112,28 +397,7 @@ pub fn encode_sort_key(record: &Record, sort_by: &[SortField]) -> Vec<u8> {
 }
 
 fn encode_sort_key_into(record: &Record, sort_by: &[SortField], key: &mut Vec<u8>) {
-    key.clear();
-    for sf in sort_by {
-        let null_order = sf.null_order.unwrap_or(NullOrder::Last);
-        match record.get(&sf.field) {
-            None | Some(Value::Null) => {
-                key.push(match null_order {
-                    NullOrder::First => 0x00,
-                    NullOrder::Last | NullOrder::Drop => 0x02,
-                });
-            }
-            Some(value) => {
-                key.push(0x01); // non-null sentinel
-                let value_start = key.len();
-                clinker_record::order::encode(value, key);
-                if sf.order == SortOrder::Desc {
-                    for byte in &mut key[value_start..] {
-                        *byte ^= 0xFF;
-                    }
-                }
-            }
-        }
-    }
+    encode_fields_into(sort_by, |field| record.get(&field.field), key);
 }
 
 /// Order-preserving `f64` → `i64`: signed-`i64` comparison of the result
@@ -865,6 +1129,142 @@ mod tests {
                 datetime_to_orderable_i128(a).cmp(&datetime_to_orderable_i128(b)),
                 oracle
             );
+        }
+    }
+
+    /// One sort field's content in one record: a value (possibly null), or no
+    /// column of that name.
+    #[derive(Debug, Clone)]
+    enum Slot {
+        Present(Value),
+        Absent,
+    }
+
+    /// A string drawn from `prefix` plus up to `max_tail` characters of a
+    /// three-letter alphabet that includes NUL, so strings tie often and
+    /// differ past the eighth byte when the prefix is long.
+    fn small_string(prefix: &'static str, max_tail: usize) -> impl Strategy<Value = Value> {
+        prop::collection::vec(prop::sample::select(vec!['a', 'b', '\0']), 0..=max_tail).prop_map(
+            move |tail| {
+                Value::String(format!("{prefix}{}", tail.into_iter().collect::<String>()).into())
+            },
+        )
+    }
+
+    /// Non-null sort values from small pools, so two records often tie on a
+    /// field and a later field decides: integers, floats with NaN and signed
+    /// zeros, decimals, short strings, strings sharing a 14-byte prefix (up to
+    /// 40 bytes, embedded NULs included), dates, and datetimes either side of
+    /// 1970.
+    fn sort_value() -> impl Strategy<Value = Value> {
+        prop_oneof![
+            (-3i64..=3).prop_map(Value::Integer),
+            prop::sample::select(vec![
+                0.0,
+                -0.0,
+                1.5,
+                -2.0,
+                f64::NAN,
+                -f64::NAN,
+                f64::INFINITY
+            ])
+            .prop_map(Value::Float),
+            (-30i64..=30, 0u32..=2).prop_map(|(m, s)| Value::Decimal(Decimal::new(m, s))),
+            small_string("", 6),
+            small_string("shared-prefix-", 26),
+            (0u64..4).prop_map(|d| Value::Date(
+                NaiveDate::from_ymd_opt(1969, 12, 30).unwrap() + chrono::Days::new(d)
+            )),
+            (-2i64..=2, 0u32..3).prop_map(|(years, nanos)| Value::DateTime(
+                chrono::DateTime::from_timestamp(years * 31_536_000, nanos)
+                    .unwrap()
+                    .naive_utc()
+            )),
+        ]
+    }
+
+    fn present_or_null() -> impl Strategy<Value = Value> {
+        prop_oneof![5 => sort_value(), 1 => Just(Value::Null)]
+    }
+
+    fn slot() -> impl Strategy<Value = Slot> {
+        prop_oneof![
+            5 => sort_value().prop_map(Slot::Present),
+            1 => Just(Slot::Present(Value::Null)),
+            1 => Just(Slot::Absent),
+        ]
+    }
+
+    const COLUMNS: [&str; 3] = ["a", "b", "c"];
+
+    /// A record with its own schema: one column per present slot, named for
+    /// its position in `COLUMNS`; an absent slot has no column at all.
+    fn slot_record(slots: &[Slot]) -> Record {
+        let mut names = Vec::new();
+        let mut values = Vec::new();
+        for (name, slot) in COLUMNS.iter().zip(slots) {
+            if let Slot::Present(value) = slot {
+                names.push((*name).into());
+                values.push(value.clone());
+            }
+        }
+        Record::new(
+            clinker_record::owned_storage::SharedStorage::from_arc(Arc::new(Schema::new(names))),
+            values,
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1024))]
+
+        /// The comparator resolved against a schema orders two records exactly
+        /// as the by-name comparator does, both reading by position (the records share the resolved schema,
+        /// which may lack a sort field) and falling back to names (each record
+        /// carries its own schema, so the resolved positions do not apply).
+        #[test]
+        fn resolved_comparator_agrees_with_the_by_name_comparator(
+            fields in prop::collection::vec((0usize..4, any::<bool>(), 0usize..3), 1..=3),
+            shared_columns in prop::sample::subsequence(vec![0usize, 1, 2], 0..=3).prop_shuffle(),
+            shared_a in prop::collection::vec(present_or_null(), 3),
+            shared_b in prop::collection::vec(present_or_null(), 3),
+            own_a in prop::collection::vec(slot(), 3),
+            own_b in prop::collection::vec(slot(), 3),
+        ) {
+            // Index 3 names a column no schema here has.
+            let names = ["a", "b", "c", "missing"];
+            let sort_by: Vec<SortField> = fields
+                .iter()
+                .map(|(name, descending, nulls)| SortField {
+                    field: names[*name].to_string(),
+                    order: if *descending { SortOrder::Desc } else { SortOrder::Asc },
+                    null_order: [None, Some(NullOrder::First), Some(NullOrder::Last)][*nulls],
+                })
+                .collect();
+            let shared = clinker_record::owned_storage::SharedStorage::from_arc(Arc::new(
+                Schema::new(shared_columns.iter().map(|&c| COLUMNS[c].into()).collect()),
+            ));
+            let keys = ResolvedSortKeys::for_sort_fields(&sort_by, Some(&shared));
+
+            let on_shared = |values: &[Value]| {
+                Record::new(
+                    shared.clone(),
+                    shared_columns.iter().map(|&c| values[c].clone()).collect(),
+                )
+            };
+            let pairs = [
+                (on_shared(&shared_a), on_shared(&shared_b)),
+                (slot_record(&own_a), slot_record(&own_b)),
+            ];
+            for (a, b) in &pairs {
+                prop_assert_eq!(
+                    keys.compare(a, b),
+                    compare_authored_keys(a, b, &sort_by),
+                    "{:?} vs {:?} under {:?}",
+                    a.values(),
+                    b.values(),
+                    sort_by
+                );
+            }
         }
     }
 

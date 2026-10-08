@@ -88,7 +88,7 @@ use crate::pipeline::memory::walk::{
 use crate::pipeline::memory::{
     ConsumerHandle, ConsumerId, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
 };
-use crate::pipeline::sort_key::compare_authored_keys;
+use crate::pipeline::sort_key::ResolvedSortKeys;
 use crate::pipeline::spill::{SpillFile, SpillWriter};
 use clinker_plan::config::SortField;
 use clinker_plan::config::pipeline_node::CullBody;
@@ -419,11 +419,13 @@ fn run_cull_grouped(
     let group_order = groups.take_group_order();
     for key in group_order {
         let mut group = groups.take_group(&key, hard_limit, &budget)?;
-        if !order_fields.is_empty() {
+        if !order_fields.is_empty() && group.len() >= 2 {
             // The Sort node's order, so a group's rows arrive in the same
             // order a Sink `sort_order` would write them, with the authored
             // `null_order`. Stable, so arrival order breaks ties.
-            group.sort_by(|(a, _), (b, _)| compare_authored_keys(a, b, order_fields));
+            // Resolved once per group, against its first row's schema.
+            let keys = ResolvedSortKeys::for_sort_fields(order_fields, Some(group[0].0.schema()));
+            group.sort_by(|(a, _), (b, _)| keys.compare(a, b));
         }
         // Every buffered group must have a computed decision: the decision
         // aggregate is keyed by the same `partition_key`, over the same

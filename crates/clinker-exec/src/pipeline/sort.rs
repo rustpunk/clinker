@@ -5,12 +5,14 @@
 
 use std::cmp::Ordering;
 
-use clinker_record::{Record, RecordStorage, Value};
+use clinker_record::{Record, Value};
 
 use clinker_plan::config::{NullOrder, OrderField, SortField, SortOrder};
 
+use crate::pipeline::arena::Arena;
 use crate::pipeline::sort_key::{
-    compare_authored_keys, compare_authored_values, compare_authored_values_with_nulls,
+    ResolvedSortKeys, compare_authored_keys, compare_authored_values,
+    compare_authored_values_with_nulls,
 };
 
 /// Sort a window partition's position vector in place by its `sort_by`
@@ -18,41 +20,35 @@ use crate::pipeline::sort_key::{
 ///
 /// Every position stays: the fields are placement-only, so nulls go first
 /// or last and no row leaves the partition. The sort is stable, so equal
-/// keys keep arrival order.
-pub fn sort_partition<S: RecordStorage>(
-    storage: &S,
-    positions: &mut [u64],
-    sort_by: &[OrderField],
-) {
-    positions.sort_by(|&a, &b| compare_records(storage, a, b, sort_by));
+/// keys keep arrival order. The fields' columns are resolved once against
+/// the arena's schema, and only when there are two positions to compare.
+pub fn sort_partition(arena: &Arena, positions: &mut [u64], sort_by: &[OrderField]) {
+    if positions.len() < 2 {
+        return;
+    }
+    let keys = ResolvedSortKeys::for_order_fields(sort_by, arena.schema());
+    positions.sort_by(|&a, &b| compare_positions(arena, &keys, a, b));
 }
 
 /// Check if a partition is already sorted (linear scan).
 ///
 /// Returns true if all consecutive pairs are in the correct order.
-pub fn is_sorted<S: RecordStorage>(storage: &S, positions: &[u64], sort_by: &[OrderField]) -> bool {
+pub fn is_sorted(arena: &Arena, positions: &[u64], sort_by: &[OrderField]) -> bool {
+    if positions.len() < 2 {
+        return true;
+    }
+    let keys = ResolvedSortKeys::for_order_fields(sort_by, arena.schema());
     positions
         .windows(2)
-        .all(|pair| compare_records(storage, pair[0], pair[1], sort_by) != Ordering::Greater)
+        .all(|pair| compare_positions(arena, &keys, pair[0], pair[1]) != Ordering::Greater)
 }
 
-/// Compare two records by sort_by fields.
-fn compare_records<S: RecordStorage>(
-    storage: &S,
-    a: u64,
-    b: u64,
-    sort_by: &[OrderField],
-) -> Ordering {
-    for sf in sort_by {
-        let va = storage.resolve_field(a, &sf.field);
-        let vb = storage.resolve_field(b, &sf.field);
-
-        let ord = compare_values_with_nulls(va, vb, sf.order, sf.null_order.into());
-        if ord != Ordering::Equal {
-            return ord;
-        }
-    }
-    Ordering::Equal
+/// Compare the arena records at two positions by the resolved fields.
+fn compare_positions(arena: &Arena, keys: &ResolvedSortKeys, a: u64, b: u64) -> Ordering {
+    keys.compare_columns(
+        |column| arena.value_at(a, column),
+        |column| arena.value_at(b, column),
+    )
 }
 
 /// Compare two records directly by sort_by fields.
@@ -90,35 +86,12 @@ mod tests {
     use clinker_record::{MinimalRecord, Schema, Value};
     use std::sync::Arc;
 
-    struct TestStorage {
-        schema: SharedStorage<Schema>,
-        records: Vec<MinimalRecord>,
-    }
-
-    impl TestStorage {
-        fn new(columns: &[&str], rows: Vec<Vec<Value>>) -> Self {
-            let schema = SharedStorage::from_arc(Arc::new(Schema::new(
-                columns.iter().map(|c| (*c).into()).collect(),
-            )));
-            let records = rows.into_iter().map(MinimalRecord::new).collect();
-            TestStorage { schema, records }
-        }
-    }
-
-    impl RecordStorage for TestStorage {
-        fn resolve_field(&self, index: u64, name: &str) -> Option<&Value> {
-            let col = self.schema.index(name)?;
-            self.records.get(index as usize)?.get(col)
-        }
-        fn resolve_qualified(&self, _: u64, _: &str, _: &str) -> Option<&Value> {
-            None
-        }
-        fn available_fields(&self, _: u64) -> Vec<&str> {
-            self.schema.columns().iter().map(|s| &**s).collect()
-        }
-        fn record_count(&self) -> u64 {
-            self.records.len() as u64
-        }
+    /// An arena holding `rows` under `columns`.
+    fn arena(columns: &[&str], rows: Vec<Vec<Value>>) -> Arena {
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(
+            columns.iter().map(|c| (*c).into()).collect(),
+        )));
+        Arena::from_parts(schema, rows.into_iter().map(MinimalRecord::new).collect())
     }
 
     fn sf(field: &str, order: SortOrder, null_order: NullPlacement) -> OrderField {
@@ -131,7 +104,7 @@ mod tests {
 
     #[test]
     fn test_sort_partition_ascending() {
-        let storage = TestStorage::new(
+        let storage = arena(
             &["amount"],
             vec![
                 vec![Value::Integer(30)],
@@ -152,7 +125,7 @@ mod tests {
 
     #[test]
     fn test_sort_partition_descending() {
-        let storage = TestStorage::new(
+        let storage = arena(
             &["amount"],
             vec![
                 vec![Value::Integer(30)],
@@ -173,7 +146,7 @@ mod tests {
 
     #[test]
     fn test_sort_null_first() {
-        let storage = TestStorage::new(
+        let storage = arena(
             &["amount"],
             vec![
                 vec![Value::Integer(30)],
@@ -194,7 +167,7 @@ mod tests {
 
     #[test]
     fn test_sort_null_last() {
-        let storage = TestStorage::new(
+        let storage = arena(
             &["amount"],
             vec![
                 vec![Value::Integer(30)],
@@ -226,7 +199,7 @@ mod tests {
             Value::Null,
             Value::Integer(20),
         ];
-        let storage = TestStorage::new(&["amount"], values.into_iter().map(|v| vec![v]).collect());
+        let storage = arena(&["amount"], values.into_iter().map(|v| vec![v]).collect());
         let cases = [
             (SortOrder::Asc, NullPlacement::First, vec![1, 3, 2, 4, 0]),
             (SortOrder::Asc, NullPlacement::Last, vec![2, 4, 0, 1, 3]),
@@ -244,7 +217,7 @@ mod tests {
 
     #[test]
     fn test_sort_presorted_skip() {
-        let storage = TestStorage::new(
+        let storage = arena(
             &["amount"],
             vec![
                 vec![Value::Integer(10)],
@@ -262,7 +235,7 @@ mod tests {
 
     #[test]
     fn test_sort_partition_composite() {
-        let storage = TestStorage::new(
+        let storage = arena(
             &["dept", "amount"],
             vec![
                 vec![Value::String("B".into()), Value::Integer(200)],
@@ -308,7 +281,7 @@ mod tests {
             // 10
             Value::Float(9_007_199_254_740_992.0),
         ];
-        let storage = TestStorage::new(&["v"], values.into_iter().map(|v| vec![v]).collect());
+        let storage = arena(&["v"], values.into_iter().map(|v| vec![v]).collect());
         let all: Vec<u64> = (0..11).collect();
 
         let mut ascending = all.clone();
@@ -351,7 +324,7 @@ mod tests {
                 other => panic!("unexpected {other:?}"),
             }
         };
-        let storage = TestStorage::new(&["v"], long.iter().cloned().map(|v| vec![v]).collect());
+        let storage = arena(&["v"], long.iter().cloned().map(|v| vec![v]).collect());
         let mut positions: Vec<u64> = (0..400).collect();
         sort_partition(
             &storage,
@@ -368,6 +341,78 @@ mod tests {
                     "equal values lost arrival order at {pair:?}"
                 );
             }
+        }
+    }
+
+    /// One arena cell: a null or a value of one of several types, drawn from
+    /// small pools so rows tie often.
+    fn cell() -> impl proptest::strategy::Strategy<Value = Value> {
+        use proptest::prelude::*;
+        prop_oneof![
+            2 => Just(Value::Null),
+            3 => (-3i64..=3).prop_map(Value::Integer),
+            2 => prop::sample::select(vec![0.0, -0.0, 2.5, f64::NAN]).prop_map(Value::Float),
+            3 => prop::sample::select(vec!["", "a", "b", "shared-prefix-a", "shared-prefix-b"])
+                .prop_map(|s| Value::String(s.into())),
+        ]
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+
+        /// A window partition sort of any subset of an arena's positions, in
+        /// any arrival order, equals a stable sort of the same positions that
+        /// reads each field by name, and is reported sorted.
+        #[test]
+        fn window_partition_sort_matches_the_by_name_order(
+            rows in proptest::collection::vec(proptest::collection::vec(cell(), 3), 0..=40),
+            picks in proptest::collection::vec(0u64..40, 0..=40),
+            order_by in proptest::collection::vec(
+                (0usize..4, proptest::prelude::any::<bool>(), proptest::prelude::any::<bool>()),
+                1..=3,
+            ),
+        ) {
+            use clinker_record::RecordStorage;
+
+            let storage = arena(&["x", "y", "z"], rows.clone());
+            let mut positions: Vec<u64> = Vec::new();
+            for pick in picks {
+                if !rows.is_empty() && !positions.contains(&(pick % rows.len() as u64)) {
+                    positions.push(pick % rows.len() as u64);
+                }
+            }
+            // Index 3 names a column the arena does not have.
+            let names = ["x", "y", "z", "absent"];
+            let sort_by: Vec<OrderField> = order_by
+                .iter()
+                .map(|(name, descending, nulls_first)| {
+                    sf(
+                        names[*name],
+                        if *descending { SortOrder::Desc } else { SortOrder::Asc },
+                        if *nulls_first { NullPlacement::First } else { NullPlacement::Last },
+                    )
+                })
+                .collect();
+
+            let mut expected = positions.clone();
+            expected.sort_by(|&a, &b| {
+                sort_by
+                    .iter()
+                    .map(|field| {
+                        compare_authored_values_with_nulls(
+                            storage.resolve_field(a, &field.field),
+                            storage.resolve_field(b, &field.field),
+                            field.order,
+                            field.null_order.into(),
+                        )
+                    })
+                    .find(|ordering| *ordering != Ordering::Equal)
+                    .unwrap_or(Ordering::Equal)
+            });
+            let mut actual = positions;
+            sort_partition(&storage, &mut actual, &sort_by);
+            proptest::prop_assert_eq!(&actual, &expected);
+            proptest::prop_assert!(is_sorted(&storage, &actual, &sort_by));
         }
     }
 }
