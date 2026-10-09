@@ -150,12 +150,13 @@ impl FieldOrder for ResolvedField {
 /// than looking its name up in the schema.
 ///
 /// A record whose schema handle is not the resolved one (another schema, or
-/// equal columns behind another handle) is read by name, exactly as
+/// equal columns behind another handle) is compared by name, exactly as
 /// [`compare_authored_keys`] reads it, so the order never depends on which path
 /// a record takes, only its cost does. Holds the schema handle and one entry
 /// per field; built once per sort buffer, spilled-run merge, window, Cull or
 /// Reshape node or key encoder, never per partition, group or row. A holder
-/// whose records change handle re-binds it in place with [`Self::bind_to`].
+/// whose records change handle re-binds it in place with [`Self::bind_to`];
+/// [`Self::encode_into`] re-binds on its own.
 #[derive(Debug, Clone)]
 pub struct ResolvedSortKeys {
     schema: Option<SharedStorage<Schema>>,
@@ -223,6 +224,10 @@ impl ResolvedSortKeys {
     /// Resolve the same fields against `schema` instead, in place: the
     /// entries are reused and nothing is allocated. One schema lookup per
     /// field, the cost of reading one record by name.
+    ///
+    /// Cold because it runs once per change of handle, while the check that
+    /// guards it runs once per record or group.
+    #[cold]
     pub(crate) fn rebind(&mut self, schema: &SharedStorage<Schema>) {
         for field in &mut self.fields {
             field.index = schema.index(&field.name);
@@ -278,8 +283,16 @@ impl ResolvedSortKeys {
     /// Write `record`'s memcomparable key into `key`, cleared first; the same
     /// bytes [`encode_sort_key`] writes over the same fields, through the same
     /// per-field loop.
-    pub(crate) fn encode_into(&self, record: &Record, key: &mut Vec<u8>) {
-        let by_position = self.reads_by_position(record);
+    ///
+    /// Re-binds to `record`'s handle first if it is not the resolved one
+    /// ([`Self::bind_to`]), so the handle is checked once per record and every
+    /// field then reads at its resolved position. A position resolved by
+    /// [`Self::rebind`] is the one [`Record::get`] looks up by name, so the
+    /// bytes do not depend on whether this record re-bound.
+    pub(crate) fn encode_into(&mut self, record: &Record, key: &mut Vec<u8>) {
+        self.bind_to(record);
+        // `bind_to` leaves the resolution on `record`'s handle.
+        let by_position = true;
         encode_fields_into(
             &self.fields,
             |field| self.value(record, by_position, field),
@@ -593,7 +606,6 @@ impl SortKeyEncoder {
         let resolved = self.resolved.get_or_insert_with(|| {
             ResolvedSortKeys::for_sort_fields(&self.sort_by, Some(record.schema()))
         });
-        resolved.bind_to(record);
         resolved.encode_into(record, out);
     }
 
