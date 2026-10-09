@@ -13,22 +13,28 @@ Output is unchanged; only speed and an Aggregate's memory estimate change.
   covers a Sink `sort_order`, a Sort, a Source's declared `sort_order`, an
   analytic window's `order_by`, a sort-merge Combine, and Cull and Reshape
   `order_by`. Rows come out in the same order as before, and ties keep their
-  arrival order. A streaming Aggregate and an Aggregate's spill to disk now
-  find each group-by column the same way, so they build group keys faster,
-  with the same output.
+  arrival order. The group-key encoder of a streaming Aggregate and of an
+  Aggregate's spill to disk now reads each group-by column by position for
+  every record that shares the schema handle of the first record it encodes,
+  and by name for any other, with the same output. An Aggregate's spill
+  always reads by position. Timed alone, the encoder takes 0.57 to 0.69 of
+  its previous time on records that share that handle.
 - **Hash Aggregates.** An Aggregate that groups with a hash table keeps each
   group's hash, so it no longer recomputes the hash of every group it holds
   each time the table grows. Results are unchanged, and the order of its
   output rows was already unspecified.
 - **Memory.** A hash Aggregate now counts its group table's real size
   against `memory.limit`: the table's whole bucket array, the hash it keeps
-  for every group included, and the moment the table doubles, when it holds
-  its old and new arrays together. It spills when its next doubling would not
-  fit. Depending on its shape it therefore spills sooner or later than
-  before: sooner for the common shapes of one to three group-by fields and one
-  or two aggregates (at the default 512 MiB limit, after about 459,000 groups
-  instead of 672,000 for one field and two aggregates), and later for some
-  shapes with many aggregates per group. Cull's check of the state it keeps
+  for every group included. It spills at the largest group count for which
+  the table and its groups fit the Aggregate's share of the limit, both as
+  they stand and at the moment the table doubled into its current array,
+  when it held its old and new arrays together. Depending on its shape it
+  therefore spills sooner or later than before, usually sooner. At the
+  default 512 MiB limit, one group-by field and two aggregates spill after
+  about 459,000 groups instead of 672,000. The same shape in a relaxed
+  Aggregate that keeps each group's contributions to re-fold `min` or `max`
+  spills later, after about 727,000, and one field with four aggregates
+  after about 459,000 instead of 437,000. Cull's check of the state it keeps
   to decide its groups counts the same table size.
 
 ### Fixed — a bounded preview of a Transform that reads one Source and feeds one Sink prints its rows

@@ -248,15 +248,22 @@ or kept for the commit stays charged until it drops, and a refused
 request's E310 lists it as `cannot spill`.
 
 A hash Aggregate's table also spills on a group count of its own, fixed
-when the Aggregate starts: the largest count whose bucket array, together
-with the half-size array it grows from while it doubles, plus each group's
-key and accumulator heap, fits 60% of the limit. The bucket count is a
-power of two, at most seven eighths full, with one control byte per bucket,
-and a growth allocates the doubled array before it frees the old one, so
-the count is taken at the moment both arrays are live. A table that cannot
-afford its next doubling spills full and keeps its array instead of growing.
-Compared with a flat per-group allowance, that spills sooner for most
-shapes and later for some shapes with many aggregates per group. The array
+when the Aggregate starts: the largest count that passes two checks against
+60% of the limit. The resident check: the table's bucket array plus each
+group's key and accumulator heap fits. The doubling check: at the doubling
+into that array, both arrays plus the heap of the groups the table held
+then fit, because a growth allocates the doubled array before it frees the
+old one. The bucket count is a power of two, at most seven eighths full,
+with one control byte per bucket. The table spills with its array full
+when the next group would need a doubling that does not fit, and before its
+array is full when the resident check refuses a group the array still has
+room for.
+Compared with a flat per-group allowance, the count comes sooner or later
+depending on the shape, usually sooner. At 512 MiB, one group-by field and
+two aggregates spill at 458,752 groups instead of 672,489; the same shape in
+buffer mode (a relaxed Aggregate with `min` or `max`), which sizes from its
+own smaller slot, spills later, at 727,262 instead of 672,489; and one field
+with four aggregates spills at 458,752 instead of 437,072. The array
 is counted from the table's own sizing rule, which a test pins against the
 real allocation. Cull's decision check reads the arrays its decision
 Aggregate's tables hold now, plus the same per-group heap. Neither figure
