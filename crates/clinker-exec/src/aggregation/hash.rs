@@ -2465,7 +2465,7 @@ mod spill_trigger_tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn test_spill_fires_at_max_groups() {
+    fn test_spill_fires_when_unique_keys_outgrow_a_tiny_budget() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let input = make_schema(&["k"]);
         let mut agg = build_test_aggregator(
