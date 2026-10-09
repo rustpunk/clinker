@@ -2602,6 +2602,78 @@ mod spill_trigger_tests {
     }
 
     // ------------------------------------------------------------------
+    // Spilled group keys, read by position
+    // ------------------------------------------------------------------
+
+    /// Every group the spill drains is encoded from a record behind the
+    /// spill schema's one handle, so its key fields are read by position,
+    /// and the spilled run finalizes to the groups an ample budget holds.
+    #[test]
+    fn an_aggregate_spill_encodes_every_group_key_by_position() {
+        use crate::pipeline::sort_key::fast_path_probe;
+
+        let input = make_schema(&["a", "b", "v"]);
+        let fields = [("a", Type::String), ("b", Type::Int), ("v", Type::Int)];
+        let cxl_src = "emit a = a\nemit b = b\nemit n = count(*)\nemit total = sum(v)";
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        let feed = |agg: &mut HashAggregator| {
+            for i in 0..600u64 {
+                let record = make_record(
+                    &input,
+                    vec![
+                        Value::String(format!("key_{}", i % 150).into()),
+                        Value::Integer((i % 3) as i64),
+                        Value::Integer(i as i64),
+                    ],
+                );
+                agg.add_record(&record, i, &ctx_for(&stable, &file, i))
+                    .expect("add_record");
+            }
+        };
+        let finalized = |agg: HashAggregator| {
+            let mut out: Vec<SortRow> = Vec::new();
+            agg.finalize(&ctx_for(&stable, &file, 0), &mut out)
+                .expect("finalize");
+            let mut groups: Vec<String> = out
+                .iter()
+                .map(|(record, _)| format!("{:?}", record.values()))
+                .collect();
+            groups.sort();
+            groups
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let installed = fast_path_probe::install();
+        let mut spilled =
+            build_test_aggregator(&fields, &["a", "b"], cxl_src, 4096, Some(tmp.path().into()));
+        feed(&mut spilled);
+        assert!(
+            spilled.spill_files().len() >= 2,
+            "the tiny budget spills at least twice, got {}",
+            spilled.spill_files().len()
+        );
+        let probe = installed.probe();
+        assert_eq!(
+            probe.reads_by_name(),
+            0,
+            "no spilled key field is read by name"
+        );
+        assert!(
+            probe.reads_by_position() > 0,
+            "the spill reads its key fields by position"
+        );
+        drop(installed);
+        let spilled = finalized(spilled);
+
+        let mut ample = build_test_aggregator(&fields, &["a", "b"], cxl_src, 0, None);
+        feed(&mut ample);
+        let ample = finalized(ample);
+        assert_eq!(ample.len(), 150, "150 distinct keys");
+        assert_eq!(spilled, ample, "spilling changes no group");
+    }
+
+    // ------------------------------------------------------------------
     // RSS backstop fires exclusively — neither the group-count nor
     // value-heap thresholds are reachable under the configured budget
     // and workload, so the only path that can spill is the RSS check.

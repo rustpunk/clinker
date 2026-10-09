@@ -9,10 +9,11 @@
 //! Both order non-null values by the one value order, [`clinker_record::order`],
 //! so the in-memory and the spilled path of every sort agree.
 //!
-//! Those comparators read fields through `ResolvedSortKeys`, which resolves
-//! each field's column once against the schema the sort's records carry and
-//! reads it by position; a record of another schema is read by name, with the
-//! same result.
+//! Those comparators, and the group-key encoder of the streaming aggregate and
+//! the aggregate spill ([`SortKeyEncoder`]), read fields through
+//! `ResolvedSortKeys`, which resolves each field's column once against the
+//! schema the records carry and reads it by position; a record of another
+//! schema is read by name, with the same result.
 //!
 //! Key layout, per sort field:
 //! - `[null_sentinel: 1 byte] [value key: N bytes]`
@@ -149,9 +150,9 @@ impl FieldOrder for ResolvedField {
 /// equal columns behind another handle) is read by name, exactly as
 /// [`compare_authored_keys`] reads it, so the order never depends on which path
 /// a record takes, only its cost does. Holds the schema handle and one entry
-/// per field; built once per sort buffer, spilled-run merge, window partition
-/// or group, never per row.
-#[derive(Debug)]
+/// per field; built once per sort buffer, spilled-run merge, window partition,
+/// group or key encoder, never per row.
+#[derive(Debug, Clone)]
 pub(crate) struct ResolvedSortKeys {
     schema: Option<SharedStorage<Schema>>,
     fields: Vec<ResolvedField>,
@@ -252,6 +253,18 @@ impl ResolvedSortKeys {
             |field| self.value(a, a_by_position, field),
             |field| self.value(b, b_by_position, field),
         )
+    }
+
+    /// Write `record`'s memcomparable key into `key`, cleared first; the same
+    /// bytes [`encode_sort_key`] writes over the same fields, through the same
+    /// per-field loop.
+    pub(crate) fn encode_into(&self, record: &Record, key: &mut Vec<u8>) {
+        let by_position = self.reads_by_position(record);
+        encode_fields_into(
+            &self.fields,
+            |field| self.value(record, by_position, field),
+            key,
+        );
     }
 
     /// Compare two rows whose values the caller reads by column index from
@@ -517,9 +530,15 @@ pub(crate) use clinker_record::order::datetime_to_orderable_i128;
 ///   losslessly decodable (strings, for example, lose length framing
 ///   after the terminator XOR on DESC order), so the debug renderer
 ///   reports the field list together with both hex byte sequences.
+///
+/// It resolves its fields' columns against the first record it encodes and
+/// reads every later record behind that schema handle by position; a record
+/// behind another handle is read by name and encodes to the same bytes. It
+/// holds the field list and one resolved entry per field, set once.
 #[derive(Debug, Clone)]
 pub struct SortKeyEncoder {
     sort_by: Vec<SortField>,
+    resolved: std::sync::OnceLock<ResolvedSortKeys>,
 }
 
 impl SortKeyEncoder {
@@ -528,7 +547,10 @@ impl SortKeyEncoder {
     /// the supplied order, so this must match the declared sort order
     /// of the upstream.
     pub fn new(sort_by: Vec<SortField>) -> Self {
-        Self { sort_by }
+        Self {
+            sort_by,
+            resolved: std::sync::OnceLock::new(),
+        }
     }
 
     /// The sort fields this encoder was built with.
@@ -545,7 +567,9 @@ impl SortKeyEncoder {
     /// the `Vec`. This is the streaming-aggregator hot path's
     /// contract with the sort-key layer.
     pub fn encode_into(&self, record: &Record, out: &mut Vec<u8>) {
-        encode_sort_key_into(record, &self.sort_by, out);
+        self.resolved
+            .get_or_init(|| ResolvedSortKeys::for_sort_fields(&self.sort_by, Some(record.schema())))
+            .encode_into(record, out);
     }
 
     /// Compare two pre-encoded sort keys.
@@ -1267,6 +1291,66 @@ mod tests {
                     "{:?} vs {:?} under {:?}",
                     a.values(),
                     b.values(),
+                    sort_by
+                );
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1024))]
+
+        /// One group-key encoder over a sequence of records writes, for every
+        /// record, the bytes the by-name encoder writes. The records sit behind
+        /// three schema handles: the encoder's first record may come from any
+        /// of them, and later records come from the same handle (read by
+        /// position), from another handle with equal columns, or from a handle
+        /// whose columns are permuted (both read by name). One sort field may
+        /// name a column no schema has.
+        #[test]
+        fn sort_key_encoder_agrees_with_the_by_name_encoder(
+            fields in prop::collection::vec((0usize..4, any::<bool>(), 0usize..3), 1..=3),
+            rows in prop::collection::vec(
+                (0usize..3, prop::collection::vec(present_or_null(), 3)),
+                1..=12,
+            ),
+        ) {
+            // Index 3 names a column no schema here has.
+            let names = ["a", "b", "c", "missing"];
+            let sort_by: Vec<SortField> = fields
+                .iter()
+                .map(|(name, descending, nulls)| SortField {
+                    field: names[*name].to_string(),
+                    order: if *descending { SortOrder::Desc } else { SortOrder::Asc },
+                    null_order: [None, Some(NullOrder::First), Some(NullOrder::Last)][*nulls],
+                })
+                .collect();
+            let handle = |columns: [usize; 3]| {
+                (
+                    clinker_record::owned_storage::SharedStorage::from_arc(Arc::new(
+                        Schema::new(columns.iter().map(|&c| COLUMNS[c].into()).collect()),
+                    )),
+                    columns,
+                )
+            };
+            // The first two hold equal columns behind distinct handles; the
+            // third holds the same columns in another order.
+            let handles = [handle([0, 1, 2]), handle([0, 1, 2]), handle([2, 0, 1])];
+            let encoder = SortKeyEncoder::new(sort_by.clone());
+            let mut key = Vec::new();
+            for (which, values) in &rows {
+                let (schema, columns) = &handles[*which];
+                let record = Record::new(
+                    schema.clone(),
+                    columns.iter().map(|&c| values[c].clone()).collect(),
+                );
+                encoder.encode_into(&record, &mut key);
+                prop_assert_eq!(
+                    &key,
+                    &encode_sort_key(&record, &sort_by),
+                    "handle {} with {:?} under {:?}",
+                    which,
+                    record.values(),
                     sort_by
                 );
             }

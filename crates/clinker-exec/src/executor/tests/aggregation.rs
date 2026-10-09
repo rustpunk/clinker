@@ -349,6 +349,145 @@ nodes:
         let _ = ErrorStrategy::FailFast;
     }
 
+    // ----- The streaming Aggregate's group key, read by position -----
+
+    /// The constructor input `AggregateStream::for_node` takes for either
+    /// strategy: in memory, with an unlimited budget and no spill directory.
+    fn stream_config(
+        input_fields: &[(&str, Type)],
+        group_by: &[&str],
+        cxl_src: &str,
+        transform_name: &str,
+    ) -> AggregatorConfig {
+        let parsed = Parser::parse(cxl_src);
+        assert!(parsed.errors.is_empty(), "parse: {:?}", parsed.errors);
+        let field_names: Vec<&str> = input_fields.iter().map(|(n, _)| *n).collect();
+        let resolved =
+            resolve_program(parsed.ast, &field_names, parsed.node_count).expect("resolve");
+        let schema_map: IndexMap<cxl::typecheck::QualifiedField, Type> = input_fields
+            .iter()
+            .map(|(n, t)| (cxl::typecheck::QualifiedField::bare(*n), t.clone()))
+            .collect();
+        let row = Row::closed(schema_map, cxl::lexer::Span::new(0, 0));
+        let mode = AggregateMode::GroupBy {
+            group_by_fields: group_by.iter().map(|s| (*s).to_string()).collect(),
+        };
+        let typed = type_check_with_mode(resolved, &row, mode).expect("typecheck");
+        let schema_names: Vec<String> =
+            input_fields.iter().map(|(n, _)| (*n).to_string()).collect();
+        let group_by_owned: Vec<String> = group_by.iter().map(|s| (*s).to_string()).collect();
+        let compiled = extract_aggregates(&typed, &group_by_owned, &schema_names).expect("extract");
+        let output_schema = make_schema(
+            &compiled
+                .emits
+                .iter()
+                .map(|e| e.output_name.as_ref())
+                .collect::<Vec<_>>(),
+        );
+        let mut spill_columns: Vec<&str> = group_by.to_vec();
+        spill_columns.push("__acc_state");
+        AggregatorConfig {
+            compiled: Arc::new(compiled),
+            evaluator: ProgramEvaluator::new(Arc::new(typed), false),
+            output_schema,
+            spill_schema: make_schema(&spill_columns),
+            memory_budget: 0,
+            spill_dir: None,
+            spill_compress: false,
+            transform_name: transform_name.to_string(),
+            consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
+            arbitrator: std::sync::Arc::new(
+                crate::pipeline::memory::MemoryArbitrator::with_policy(
+                    0,
+                    0.8,
+                    0.70,
+                    crate::pipeline::memory::MemoryArbitrator::default_policy(),
+                ),
+            ),
+        }
+    }
+
+    /// A streaming Aggregate builds the group key of every record it takes by
+    /// column position, never by name, when its records share the one schema
+    /// handle a source batch carries, and it groups exactly as the hash
+    /// strategy does.
+    #[test]
+    fn a_streaming_aggregate_encodes_every_group_key_by_position() {
+        use crate::aggregation::AggregateStream;
+        use crate::pipeline::sort_key::fast_path_probe;
+        use clinker_plan::plan::types::AggregateStrategy;
+
+        const RECORDS: u64 = 1_000;
+        let fields = [
+            ("region", Type::String),
+            ("year", Type::Int),
+            ("v", Type::Int),
+        ];
+        let group_by = ["region", "year"];
+        let cxl_src =
+            "emit region = region\nemit year = year\nemit n = count(*)\nemit total = sum(v)";
+        let input = make_schema(&["region", "year", "v"]);
+        // Sorted on (region, year): ten regions of ten years of ten records.
+        let records: Vec<Record> = (0..RECORDS)
+            .map(|i| {
+                make_record(
+                    &input,
+                    vec![
+                        Value::String(format!("r{:02}", i / 100).into()),
+                        Value::Integer(((i / 10) % 10) as i64),
+                        Value::Integer(i as i64),
+                    ],
+                )
+            })
+            .collect();
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        let run = |strategy: AggregateStrategy| {
+            let mut stream = AggregateStream::for_node(
+                strategy,
+                stream_config(&fields, &group_by, cxl_src, "by_position"),
+            )
+            .expect("an aggregate stream");
+            let mut out = Vec::new();
+            for (row, record) in (0u64..).zip(&records) {
+                stream
+                    .add_record(record, row, &ctx_for(&stable, &file, row), &mut out)
+                    .expect("add_record");
+            }
+            stream
+                .finalize(&ctx_for(&stable, &file, 0), &mut out)
+                .expect("finalize");
+            let mut groups: Vec<String> = out
+                .iter()
+                .map(|(record, _)| format!("{:?}", record.values()))
+                .collect();
+            groups.sort();
+            groups
+        };
+
+        let installed = fast_path_probe::install();
+        let streamed = run(AggregateStrategy::Streaming);
+        let probe = installed.probe();
+        assert_eq!(
+            probe.reads_by_name(),
+            0,
+            "no group key field is read by name"
+        );
+        assert_eq!(
+            probe.reads_by_position(),
+            RECORDS * group_by.len() as u64,
+            "every record's two group key fields are read by position"
+        );
+        drop(installed);
+
+        let hashed = run(AggregateStrategy::Hash);
+        assert_eq!(streamed.len(), 100, "ten regions of ten years");
+        assert_eq!(
+            streamed, hashed,
+            "the streaming groups equal the hash groups"
+        );
+    }
+
     // ----- Smoke test: StreamingAggregator<AddRaw> -----
 
     /// Build a [`StreamingAggregator`](crate::aggregation::StreamingAggregator)
