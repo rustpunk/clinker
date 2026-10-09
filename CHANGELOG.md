@@ -27,17 +27,21 @@ Output is unchanged; only speed and an Aggregate's memory estimate change.
   output rows was already unspecified.
 - **Memory.** A hash Aggregate now counts its group table's real size
   against `memory.limit`: the table's whole bucket array, the hash it keeps
-  for every group included. It spills at the largest group count for which
-  the table and its groups fit the Aggregate's share of the limit, both as
-  they stand and at the moment the table doubled into its current array,
-  when it held its old and new arrays together. Depending on its shape it
-  therefore spills sooner or later than before, usually sooner. At the
-  default 512 MiB limit, one group-by field and two aggregates spill after
-  about 459,000 groups instead of 672,000. The same shape in a relaxed
+  for every group included, as the table reports it. After each record it
+  checks whether the next group would still fit the Aggregate's share of the
+  limit with the heap of every group it holds. When the table is full, the
+  next group makes it grow, and while it grows it holds its old array and a
+  new one up to twice that size together, so the check counts both; when the
+  table has room, it counts the array it holds. The Aggregate spills as soon
+  as the next group would not fit. Depending on its shape it therefore
+  spills sooner or later than before, usually sooner. At the default 512 MiB
+  limit, with hashbrown 0.15.5 on x86_64, one group-by field and two
+  aggregates spill after 458,752 groups instead of about 672,000, and
+  `count(*)` alone after 917,504. The same one-field shape in a relaxed
   Aggregate that keeps each group's contributions to re-fold `min` or `max`
-  spills later, after about 727,000, and one field with four aggregates
-  after about 459,000 instead of 437,000. Cull's check of the state it keeps
-  to decide its groups counts the same table size.
+  spills later, after 727,262, and one field with four aggregates after
+  458,752 instead of about 437,000. Cull's check of the state it keeps to
+  decide its groups counts the same table size.
 
 ### Fixed — a bounded preview of a Transform that reads one Source and feeds one Sink prints its rows
 

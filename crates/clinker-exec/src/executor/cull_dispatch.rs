@@ -505,8 +505,8 @@ fn compute_drop_decisions(
 
     // Output schema = partition-by columns ++ the boolean decision column.
     // Spill schema is unused (the predicate aggregate runs in-memory: budget
-    // 0 disables the group-count cap and `spill_dir: None` keeps every group
-    // resident), but `AggregatorConfig` still requires a value.
+    // 0 disables the group table's spill checks and `spill_dir: None` keeps
+    // every group resident), but `AggregatorConfig` still requires a value.
     let drop_output_schema: SharedStorage<Schema> = config
         .partition_by
         .iter()
