@@ -41,7 +41,6 @@ use clinker_record::{GroupByKey, Value, value_to_group_key};
 use criterion::{
     BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
-use hashbrown::hash_table::Entry;
 use hashbrown::{DefaultHashBuilder, HashMap, HashTable};
 use rust_decimal::Decimal;
 use std::hash::BuildHasher;
@@ -153,18 +152,24 @@ fn fill_map(keys: Vec<Key>, capacity: usize) -> HashMap<Key, StateFiller> {
 
 /// A table whose slots keep each key's hash: one hash per lookup, compare
 /// stored hashes before keys, and rehash on growth from the stored hash.
+/// It makes the operator's calls, a search that reserves nothing and then an
+/// insert of a key known to be absent, so it grows only when a new key
+/// arrives, as the operator's table does.
 fn fill_stored_hash(keys: Vec<Key>) -> HashTable<(u64, Key, StateFiller)> {
     let hasher = DefaultHashBuilder::default();
     let mut table: HashTable<(u64, Key, StateFiller)> = HashTable::new();
     for key in keys {
         let hash = hasher.hash_one(key.as_slice());
-        let slot = match table.entry(
-            hash,
-            |(stored, existing, _)| *stored == hash && *existing == key,
-            |(stored, _, _)| *stored,
-        ) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => entry.insert((hash, key, StateFiller::new())).into_mut(),
+        let slot = match table.find_entry(hash, |(stored, existing, _)| {
+            *stored == hash && *existing == key
+        }) {
+            Ok(held) => held.into_mut(),
+            Err(absent) => absent
+                .into_table()
+                .insert_unique(hash, (hash, key, StateFiller::new()), |(stored, _, _)| {
+                    *stored
+                })
+                .into_mut(),
         };
         slot.2.fold();
     }
