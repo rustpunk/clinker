@@ -351,8 +351,9 @@ fn new_buffer(
 
 /// The cardinality sweep: one integer key with this many distinct values,
 /// scrambled like `low_card`, measured at [`CARDINALITY_SWEEP_ROWS`] rows only.
-/// Between `low_card`'s 16 values and `int`'s all-distinct key it shows where
-/// sorting on key prefixes starts to pay.
+/// Between `low_card`'s 16 values and `int`'s all-distinct key it measures how
+/// a sort's cost varies with the number of distinct keys, the evidence any
+/// choice of sort strategy by key cardinality needs.
 const CARDINALITY_SWEEP: [&str; 3] = ["card_64", "card_1000", "card_16000"];
 
 const CARDINALITY_SWEEP_ROWS: usize = 100_000;
