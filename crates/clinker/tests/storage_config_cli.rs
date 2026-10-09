@@ -530,8 +530,9 @@ fn real_run_logs_per_stage_actual_spill() {
     );
     std::fs::write(&pipeline, &yaml).expect("write pipeline yaml");
     // Every row a distinct department: 50_000 groups dwarf the budget-derived
-    // group-count cap (max_groups = 60% of the finite budget / est-bytes-per-group
-    // ≈ a few thousand), so the group table crosses the cap and spills before
+    // group-count cap (max_groups: the most groups whose table, including the
+    // moment it doubles, fits 60% of the finite budget; a few thousand here),
+    // so the group table crosses the cap and spills before
     // EOF. That cap is derived from the configured budget, not process RSS, so
     // the spill fires deterministically on every host — unlike the prior
     // RSS-driven node-buffer spill this test used to rely on.
