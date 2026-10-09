@@ -13,7 +13,9 @@ Output is unchanged; only speed and an Aggregate's memory estimate change.
   covers a Sink `sort_order`, a Sort, a Source's declared `sort_order`, an
   analytic window's `order_by`, a sort-merge Combine, and Cull and Reshape
   `order_by`. Rows come out in the same order as before, and ties keep their
-  arrival order.
+  arrival order. A streaming Aggregate and an Aggregate's spill to disk now
+  find each group-by column the same way, so they build group keys faster,
+  with the same output.
 - **Hash Aggregates.** An Aggregate that groups with a hash table keeps each
   group's hash, so it no longer recomputes the hash of every group it holds
   each time the table grows. Results are unchanged, and the order of its
