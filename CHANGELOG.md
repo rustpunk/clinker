@@ -4,6 +4,25 @@ All notable changes to Clinker are tracked here.
 
 ## Unreleased
 
+### Changed — sorts compare faster, and a hash Aggregate stops recomputing its groups' hashes as it grows
+
+Output is unchanged; only speed and an Aggregate's memory estimate change.
+
+- **Sorts.** A sort now finds each sort field's column once, before it
+  compares, instead of looking the field up by name on every comparison. This
+  covers a Sink `sort_order`, a Sort, a Source's declared `sort_order`, an
+  analytic window's `order_by`, a sort-merge Combine, and Cull and Reshape
+  `order_by`. Rows come out in the same order as before, and ties keep their
+  arrival order.
+- **Hash Aggregates.** An Aggregate that groups with a hash table keeps each
+  group's hash, so it no longer recomputes the hash of every group it holds
+  each time the table grows. Results are unchanged, and the order of its
+  output rows was already unspecified.
+- **Memory.** A hash Aggregate now counts about 9 more bytes per group
+  against `memory.limit`, for the hash it keeps and its share of table slack.
+  An aggregation near its limit can therefore spill to disk slightly sooner
+  than before.
+
 ### Fixed — a bounded preview of a Transform that reads one Source and feeds one Sink prints its rows
 
 `clinker run pipeline.yaml --dry-run -n N` failed with an internal error
