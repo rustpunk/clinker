@@ -1587,18 +1587,30 @@ mod tests {
 
     /// A producer may build one schema handle per file or batch. The encoder
     /// re-binds to the new handle at its first record, so that record and
-    /// every later one behind it read by position, not by name.
+    /// every later one behind it read by position, not by name. The second
+    /// handle orders the columns the other way round, so a position resolved
+    /// against the first handle reads the wrong column and writes other bytes.
     #[test]
     fn sort_key_encoder_rebinds_to_a_new_schema_handle() {
-        let fields = [
+        let first = make_record(&[
             ("dept", Value::String("eng".into())),
             ("salary", Value::Integer(100)),
-        ];
-        let first = make_record(&fields);
-        let second = make_record(&fields);
+        ]);
+        let second = make_record(&[
+            ("salary", Value::Integer(200)),
+            ("dept", Value::String("ops".into())),
+        ]);
         assert!(
             !clinker_record::owned_storage::SharedStorage::ptr_eq(first.schema(), second.schema()),
-            "the two records sit behind distinct handles with equal columns"
+            "the two records sit behind distinct handles"
+        );
+        assert_eq!(
+            (
+                second.schema().index("dept"),
+                second.schema().index("salary")
+            ),
+            (Some(1), Some(0)),
+            "the second handle permutes the first one's columns"
         );
         let sort_by = vec![sf("dept", SortOrder::Asc), sf("salary", SortOrder::Desc)];
 
@@ -1622,7 +1634,11 @@ mod tests {
         drop(installed);
 
         assert_eq!(first_key, encode_sort_key(&first, &sort_by));
-        assert_eq!(second_key, encode_sort_key(&second, &sort_by));
+        assert_eq!(
+            second_key,
+            encode_sort_key(&second, &sort_by),
+            "the record behind the permuted handle encodes to its by-name key"
+        );
     }
 
     #[test]
