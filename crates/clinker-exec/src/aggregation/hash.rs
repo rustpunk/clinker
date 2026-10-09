@@ -99,15 +99,20 @@ fn heap_bytes_per_group(factory: &AccumulatorFactory, gb_count: usize) -> usize 
     key_heap + acc_heap
 }
 
-/// The group count at which a table of `S` slots spills: the largest whose
-/// table, at the peak of its last growth, plus `heap_per_group` bytes for
-/// every group it holds fits 60% of `memory_budget`. `usize::MAX` when the
-/// budget is 0 (unlimited), and 1 when not even one group fits, so a group
-/// always lands before the table spills.
+/// The group count at which a table of `S` slots spills: the largest count
+/// that passes two checks against 60% of `memory_budget`. Resident: the
+/// table's bucket array plus `heap_per_group` bytes for each group fits.
+/// Doubling: at the doubling into that array, both arrays plus the heap of
+/// the groups the table held then (the full half-size array's and the one
+/// arriving) fit. `usize::MAX` when the budget is 0 (unlimited), and 1 when
+/// not even one group fits, so a group always lands before the table spills.
 ///
-/// Counting the growth peak rather than the resident size is what makes the
-/// figure a bound: a table that cannot afford its next doubling spills full
-/// and keeps its array instead of growing past the share.
+/// Counting the doubling as well as the resident size is what makes the
+/// figure a bound: the table never doubles into an array it cannot hold
+/// beside the old one. The table spills with its array full when the next
+/// group would need a doubling that does not fit, and before its array is
+/// full when the resident check refuses a group the array still has room
+/// for.
 fn max_groups_within<S>(memory_budget: usize, heap_per_group: usize) -> usize {
     if memory_budget == 0 {
         return usize::MAX;
@@ -290,8 +295,10 @@ impl<S, H> GroupTable<S, H> {
     /// where it is 8 ([`CONTROL_GROUP_BYTES`]). The rule is hashbrown 0.15's
     /// (`capacity_to_buckets`, `bucket_mask_to_capacity` and
     /// `TableLayout::calculate_layout_for`); a release that changes any of
-    /// them, or the control group width, fails
+    /// them, or widens the control group past 16 bytes, fails
     /// `group_table_bytes_match_its_allocation_before_and_after_each_doubling`.
+    /// A control group narrowed to 8 bytes passes it: the test accepts the
+    /// model 8 bytes over the allocation, which overcounts rather than under.
     pub(crate) fn bytes_for(groups: usize) -> usize {
         Self::array_bytes(table_buckets(groups))
     }
@@ -477,8 +484,10 @@ pub struct HashAggregator {
     /// `finalize` (D12, D44).
     rows_seen: u64,
     /// The group count at which the group-count trigger spills: the largest
-    /// whose table, at the peak of its last growth, plus every group's heap
-    /// fits 60% of `memory_budget`, sized from the slot of the table this
+    /// that passes both checks of `max_groups_within` against 60% of
+    /// `memory_budget`. The table's array plus every group's heap fits, and,
+    /// at the doubling into that array, both arrays plus the heap of the
+    /// groups held then fit. Sized from the slot of the table this
     /// aggregator's mode fills. The 60% share leaves 40% for
     /// `value_heap_bytes` growth (Collect accumulators, meta tracker
     /// observations). `usize::MAX` when the budget is 0.
@@ -1056,8 +1065,8 @@ impl HashAggregator {
         self.add_value_heap_bytes(delta);
 
         // 7. Two spill triggers. Primary: the group count reaches
-        // `max_groups`, the most groups whose table, its growth peak
-        // included, and heap fit 60% of the budget. Secondary:
+        // `max_groups`, the most groups that pass both checks of
+        // `max_groups_within`, resident and doubling. Secondary:
         // value_heap_bytes exceeds 40% of budget (catches Collect
         // accumulators that grow unbounded per group).
         if (self.memory_budget > 0
@@ -2126,7 +2135,7 @@ mod spill_trigger_tests {
     }
 
     #[test]
-    fn estimated_bytes_per_group_counts_the_stored_hash() {
+    fn group_table_size_counts_the_stored_hash_and_each_groups_heap() {
         let slot = std::mem::size_of::<GroupSlot<AggregatorGroupState>>();
         assert_eq!(
             slot,

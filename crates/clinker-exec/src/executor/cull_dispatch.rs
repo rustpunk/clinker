@@ -524,10 +524,11 @@ fn compute_drop_decisions(
         spill_schema,
         // In-memory only: the raw-record buffer carries the spill burden,
         // and the aggregate state is O(groups) — never spilled. The ingest
-        // loop below reads the hash aggregate's fixed per-group estimate
-        // as well as its variable heap before every admission; it can neither
-        // spill (`spill_dir: None`) nor back-pressure, so an unbounded group
-        // cardinality must fail loud rather than grow the state uncounted.
+        // loop below reads the hash aggregate's allocated group table, each
+        // group's key and accumulator heap, and its variable value heap
+        // before every admission; it can neither spill (`spill_dir: None`)
+        // nor back-pressure, so an unbounded group cardinality must fail
+        // loud rather than grow the state uncounted.
         memory_budget: 0,
         spill_dir: None,
         spill_compress: false,
@@ -541,12 +542,12 @@ fn compute_drop_decisions(
 
     // The decision aggregate cannot spill (`budget: 0`, `spill_dir: None`) or
     // back-pressure, so its O(groups) accumulator state is arbitrator-invisible
-    // and grows with the group cardinality. Gate its fixed hash/key/accumulator
-    // footprint plus variable value heap against the run's hard limit on every
-    // admission and fail loud once it and the already charged input would carry
-    // the scope past the ceiling. A `hard_limit` of 0 means "no limit"
-    // (matching the finalize giant-group gate in `take_group`), so the read is
-    // skipped.
+    // and grows with the group cardinality. Gate its allocated table, its
+    // per-group key/accumulator heap and its variable value heap against the
+    // run's hard limit on every admission and fail loud once it and the
+    // already charged input would carry the scope past the ceiling. A
+    // `hard_limit` of 0 means "no limit" (matching the finalize giant-group
+    // gate in `take_group`), so the read is skipped.
     let hard_limit = ctx.memory_budget.hard_limit();
     let mut emitted: Vec<SortRow> = Vec::new();
     for (record, row_num) in input {
