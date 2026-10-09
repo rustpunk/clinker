@@ -509,11 +509,31 @@ fn run_with_fixture(
     SharedBuffer,
     SharedBuffer,
 ) {
+    run_with_driver(
+        plan,
+        workspace,
+        capabilities,
+        params,
+        b"seed\ngo\n".to_vec(),
+    )
+}
+
+fn run_with_driver(
+    plan: &clinker_plan::plan::CompiledPlan,
+    workspace: &Path,
+    capabilities: AdmittedRunCapabilities,
+    params: &PipelineRunParams,
+    driver: Vec<u8>,
+) -> (
+    Result<clinker_exec::executor::ExecutionReport, clinker_plan::error::PipelineError>,
+    SharedBuffer,
+    SharedBuffer,
+) {
     let readers = HashMap::from([(
         "driver".to_string(),
         SourceInput::Files(vec![FileSlot::new(
             "driver.csv",
-            Box::new(Cursor::new(b"seed\ngo\n".to_vec())),
+            Box::new(Cursor::new(driver)),
         )]),
     )]);
     let first = SharedBuffer::new();
@@ -674,14 +694,29 @@ fn read_failure_after_open_emits_one_failed_terminal_per_started_source() {
         ..Default::default()
     };
 
-    let (result, _, _) = run_with_fixture(&plan, workspace.path(), capabilities, &params);
+    // The driver has no edge into either composition, so the walk dispatches
+    // it last and fails before reading it. Its reader must still be pushing
+    // when the failed walk drops its receiver, or it may finish first and
+    // report Completed: more rows than a Source channel holds keep it pushing,
+    // so it is always the abandoned (Interrupted) Source.
+    let mut driver = String::from("seed\n");
+    for _ in 0..4096 {
+        driver.push_str("go\n");
+    }
+    let (result, _, _) = run_with_driver(
+        &plan,
+        workspace.path(),
+        capabilities,
+        &params,
+        driver.into_bytes(),
+    );
     result.expect_err("the admitted reader fails after its group opens");
 
     let signals = drain_source_signals(&receiver);
     assert_eq!(signals.started, 2);
     assert_eq!(signals.failed, 1);
-    assert_eq!(signals.completed, 1);
-    assert_eq!(signals.interrupted, 0);
+    assert_eq!(signals.completed, 0);
+    assert_eq!(signals.interrupted, 1);
     assert!(
         signals.spans.len() as u64 <= signals.started,
         "Source spans are admission-controlled and may be dropped"
@@ -692,12 +727,10 @@ fn read_failure_after_open_emits_one_failed_terminal_per_started_source() {
             .iter()
             .all(|span| span.logical_node == "source")
     );
-    assert!(
-        signals
-            .spans
-            .iter()
-            .all(|span| matches!(span.status, SpanStatus::Ok | SpanStatus::Error))
-    );
+    assert!(signals.spans.iter().all(|span| matches!(
+        span.status,
+        SpanStatus::Ok | SpanStatus::Unset | SpanStatus::Error
+    )));
 
     let events = events.snapshot();
     assert_eq!(
