@@ -18,10 +18,16 @@ Output is unchanged; only speed and an Aggregate's memory estimate change.
   group's hash, so it no longer recomputes the hash of every group it holds
   each time the table grows. Results are unchanged, and the order of its
   output rows was already unspecified.
-- **Memory.** A hash Aggregate now counts about 9 more bytes per group
-  against `memory.limit`, for the hash it keeps and its share of table slack.
-  An aggregation near its limit can therefore spill to disk slightly sooner
-  than before.
+- **Memory.** A hash Aggregate now counts its group table's real size
+  against `memory.limit`: the table's whole bucket array, the hash it keeps
+  for every group included, and the moment the table doubles, when it holds
+  its old and new arrays together. It spills when its next doubling would not
+  fit. Depending on its shape it therefore spills sooner or later than
+  before: sooner for the common shapes of one to three group-by fields and one
+  or two aggregates (at the default 512 MiB limit, after about 459,000 groups
+  instead of 672,000 for one field and two aggregates), and later for some
+  shapes with many aggregates per group. Cull's check of the state it keeps
+  to decide its groups counts the same table size.
 
 ### Fixed — a bounded preview of a Transform that reads one Source and feeds one Sink prints its rows
 

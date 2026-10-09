@@ -247,6 +247,23 @@ directory or is a relaxed-key Aggregate's table; a table being finalized
 or kept for the commit stays charged until it drops, and a refused
 request's E310 lists it as `cannot spill`.
 
+A hash Aggregate's table also spills on a group count of its own, fixed
+when the Aggregate starts: the largest count whose bucket array, together
+with the half-size array it grows from while it doubles, plus each group's
+key and accumulator heap, fits 60% of the limit. The bucket count is a
+power of two, at most seven eighths full, with one control byte per bucket,
+and a growth allocates the doubled array before it frees the old one, so
+the count is taken at the moment both arrays are live. A table that cannot
+afford its next doubling spills full and keeps its array instead of growing.
+Compared with a flat per-group allowance, that spills sooner for most
+shapes and later for some shapes with many aggregates per group. The array
+is counted from the table's own sizing rule, which a test pins against the
+real allocation. Cull's decision check reads the arrays its decision
+Aggregate's tables hold now, plus the same per-group heap. Neither figure
+reaches the run's ledger: the Aggregate's charge is its value heap, so the
+table's fixed bytes are bounded by the group count rather than charged, a
+gap tracked separately.
+
 The execution report samples the arbitrator's spill totals and the ledger's
 charged peak after dispatch has finished and every Source worker has joined. Ordered
 Sources can still release staged spill charges while unwinding cancellation;
