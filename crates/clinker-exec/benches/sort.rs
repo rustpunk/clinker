@@ -21,12 +21,21 @@
 //! builds only with `--features test-utils`; a default
 //! `cargo bench -p clinker-exec --bench sort` measures every other group.
 //! Spill files go to the OS temp directory (`TMPDIR`).
+//!
+//! `sort_key_encode` times the group-key encoder the streaming Aggregate runs
+//! once per record and the Aggregate spill runs once per drained group: one
+//! encoder over 100,000 records into one reused key buffer. The records are
+//! built once, outside the timed region, and each batch takes a fresh encoder.
+//! `mixed3_other_handle` carries the first record behind one schema handle and
+//! every later one behind another handle with the same columns, so it times
+//! the encoder's read for a record of another schema.
 
 use chrono::{NaiveDate, TimeDelta};
 use clinker_bench_support::{LARGE, MEDIUM, RecordFactory, SMALL};
 use clinker_exec::executor::SourceRowId;
 use clinker_exec::pipeline::arena::Arena;
 use clinker_exec::pipeline::sort_buffer::{SortBuffer, SortedOutput};
+use clinker_exec::pipeline::sort_key::SortKeyEncoder;
 use clinker_format::preparation::MemoryOnlyResources;
 use clinker_plan::config::{NullOrder, NullPlacement, OrderField, SortField, SortOrder};
 use clinker_plan::plan::{EntityRef, PlanNodeId};
@@ -35,6 +44,7 @@ use clinker_record::{MinimalRecord, Record, Schema, Value};
 use criterion::{
     BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
+use rust_decimal::Decimal;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -517,6 +527,81 @@ fn bench_sort_buffer_spilled(c: &mut Criterion) {
     group.finish();
 }
 
+/// Records per `sort_key_encode` batch.
+const KEY_ENCODE_ROWS: usize = 100_000;
+
+/// Group-key shapes: a 16-byte string, an integer, and a string, an integer
+/// and a decimal; `mixed3_other_handle` is `mixed3` with every record after
+/// the first behind a second handle of the same columns.
+const KEY_ENCODE_SHAPES: [&str; 4] = ["str16", "int", "mixed3", "mixed3_other_handle"];
+
+/// The sort fields and records of one `sort_key_encode` shape. Every field
+/// sorts ascending with nulls first, as an Aggregate's group key does.
+fn key_encode_input(shape: &str, rows: usize) -> (Vec<SortField>, Vec<Record>) {
+    let columns: &[&str] = match shape {
+        "str16" | "int" => &["k"],
+        _ => &["s", "n", "d"],
+    };
+    let schema = || {
+        SharedStorage::from_arc(Arc::new(Schema::new(
+            columns.iter().map(|name| (*name).into()).collect(),
+        )))
+    };
+    let (first, other) = (schema(), schema());
+    let sort_by = columns
+        .iter()
+        .map(|name| buffer_key(name, SortOrder::Asc, Some(NullOrder::First)))
+        .collect();
+    let records = (0..rows)
+        .map(|i| {
+            let p = permuted(i, rows);
+            let values = match shape {
+                "str16" => vec![string_value(format!("k{}", base36(p, 15)))],
+                "int" => vec![Value::Integer(p as i64)],
+                _ => vec![
+                    string_value(format!("name-{}", p % 1_000)),
+                    Value::Integer((p / 1_000) as i64),
+                    Value::Decimal(Decimal::new(p as i64, (p % 5) as u32)),
+                ],
+            };
+            let handle = if shape == "mixed3_other_handle" && i > 0 {
+                &other
+            } else {
+                &first
+            };
+            Record::new(handle.clone(), values)
+        })
+        .collect();
+    (sort_by, records)
+}
+
+fn bench_sort_key_encode(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sort_key_encode");
+    for shape in KEY_ENCODE_SHAPES {
+        let (sort_by, records) = key_encode_input(shape, KEY_ENCODE_ROWS);
+        group.throughput(Throughput::Elements(KEY_ENCODE_ROWS as u64));
+        group.bench_with_input(
+            BenchmarkId::new(shape, KEY_ENCODE_ROWS),
+            &KEY_ENCODE_ROWS,
+            |b, _| {
+                b.iter_batched(
+                    || SortKeyEncoder::new(sort_by.clone()),
+                    |encoder| {
+                        let mut key = Vec::new();
+                        for record in &records {
+                            encoder.encode_into(record, &mut key);
+                            black_box(&key);
+                        }
+                        encoder
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
 #[cfg(feature = "test-utils")]
 criterion_group!(
     benches,
@@ -528,6 +613,7 @@ criterion_group!(
     bench_sort_buffer_in_memory,
     bench_sort_buffer_sort_only,
     bench_sort_buffer_spilled,
+    bench_sort_key_encode,
 );
 #[cfg(not(feature = "test-utils"))]
 criterion_group!(
@@ -539,5 +625,6 @@ criterion_group!(
     bench_sort_reverse,
     bench_sort_buffer_in_memory,
     bench_sort_buffer_sort_only,
+    bench_sort_key_encode,
 );
 criterion_main!(benches);
