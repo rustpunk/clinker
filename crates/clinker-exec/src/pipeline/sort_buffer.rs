@@ -227,17 +227,6 @@ impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
     /// (its `HeapBytes`, e.g. a variable-length key) is charged alongside the
     /// record so a wide-key payload is not undercounted.
     pub fn push(&mut self, record: Record, payload: P) {
-        // A spilled run stores each row's values by position and decodes them
-        // under this buffer's schema, so a row of other columns would come back
-        // with its values under the wrong names.
-        debug_assert!(
-            SharedStorage::ptr_eq(record.schema(), &self.schema)
-                || record.schema().columns() == self.schema.columns(),
-            "sort buffer received a row whose columns {:?} differ from the buffer's columns \
-             {:?}; a spilled run would reattach the buffer's schema to the row's positional values",
-            record.schema().columns(),
-            self.schema.columns(),
-        );
         let size = std::mem::size_of::<Record>()
             + record.estimated_heap_size()
             + std::mem::size_of::<P>()
@@ -285,14 +274,50 @@ impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
         }
     }
 
+    /// Check that every resident row has this buffer's columns, which a spilled
+    /// run requires: it stores each row's values by position and decodes them
+    /// under the buffer's schema, so a row of other columns would come back
+    /// with its values under the wrong names. Refusing the spill, in every
+    /// build, is what keeps that outcome unrepresentable; a resident sort
+    /// keeps each row's own schema and never needs the check.
+    ///
+    /// A row behind the buffer's own handle passes by pointer; a run of rows
+    /// behind one other handle compares its columns once.
+    fn check_rows_have_buffer_columns(&self) -> Result<(), SpillError> {
+        let mut accepted: Option<&SharedStorage<Schema>> = None;
+        for (record, _) in &self.pairs {
+            let schema = record.schema();
+            if SharedStorage::ptr_eq(schema, &self.schema)
+                || accepted.is_some_and(|handle| SharedStorage::ptr_eq(handle, schema))
+            {
+                continue;
+            }
+            if schema.columns() != self.schema.columns() {
+                return Err(SpillError::InvalidSchema(format!(
+                    "a sort buffer over columns {:?} cannot spill a row whose columns are {:?}: \
+                     a spilled run stores each row's values by position under the buffer's \
+                     columns",
+                    self.schema.columns(),
+                    schema.columns(),
+                )));
+            }
+            accepted = Some(schema);
+        }
+        Ok(())
+    }
+
     /// Sort the current in-memory pairs and write them to a spill file. Clears
     /// the buffer and resets the byte counter. Returns the spilled file's exact
     /// on-disk byte length so the caller can charge it against the pipeline
     /// disk-spill quota; an empty buffer writes nothing and returns 0.
+    ///
+    /// Fails, leaving the buffer as it was, when a resident row's columns are
+    /// not the buffer's ([`SpillError::InvalidSchema`]).
     pub fn sort_and_spill(&mut self) -> Result<u64, SpillError> {
         if self.pairs.is_empty() {
             return Ok(0);
         }
+        self.check_rows_have_buffer_columns()?;
 
         self.sort_pairs();
 
@@ -710,10 +735,13 @@ mod tests {
         }
     }
 
+    /// A row of other columns may sit in the buffer, and sorts by name, but
+    /// the buffer refuses to spill it in every build: a spilled run would
+    /// reattach the buffer's schema to the row's positional values. A row of
+    /// the same columns behind another schema handle spills as the buffer's
+    /// own rows do.
     #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "differ from the buffer's columns")]
-    fn sort_buffer_rejects_a_record_whose_columns_differ_from_its_schema() {
+    fn sort_buffer_refuses_to_spill_a_record_whose_columns_differ_from_its_schema() {
         let schema = test_schema();
         let reordered =
             SharedStorage::from_arc(Arc::new(Schema::new(vec!["value".into(), "name".into()])));
@@ -722,16 +750,47 @@ mod tests {
             1_000_000,
             None,
             true,
-            schema,
+            schema.clone(),
             test_allocation_resources(),
         );
+        buf.push(make_record(&schema, "a", 2), ());
         buf.push(
             Record::new(
                 reordered,
-                vec![Value::Integer(1), Value::String("a".into())],
+                vec![Value::Integer(1), Value::String("b".into())],
             ),
             (),
         );
+        let error = buf.sort_and_spill().unwrap_err();
+        assert!(
+            matches!(&error, SpillError::InvalidSchema(message)
+                if message.contains("cannot spill a row whose columns are")),
+            "{error}"
+        );
+        assert_eq!(
+            buf.total_rows(),
+            2,
+            "the refused spill keeps the buffer's rows"
+        );
+
+        let same_columns = test_schema();
+        assert!(!SharedStorage::ptr_eq(&same_columns, &schema));
+        let mut buf: SortBuffer<()> = SortBuffer::new(
+            sort_by_value_asc(),
+            1_000_000,
+            None,
+            true,
+            schema.clone(),
+            test_allocation_resources(),
+        );
+        buf.push(make_record(&schema, "a", 2), ());
+        buf.push(make_record(&same_columns, "b", 1), ());
+        buf.sort_and_spill()
+            .expect("a row of the buffer's columns behind another handle spills");
+        match buf.finish().unwrap().0 {
+            SortedOutput::Spilled(files) => assert_eq!(files.len(), 1),
+            SortedOutput::InMemory(_) => panic!("expected Spilled"),
+        }
     }
 
     #[test]
