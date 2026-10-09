@@ -142,6 +142,27 @@ Primary source evidence used:
 6. **Confidence:** High.
 7. **Evidence:** `crates/clinker-exec/src/pipeline/memory.rs:17`, `:293`, `:358`, `:708`; `crates/clinker-exec/benches/arbitration_poll.rs:1`, `:12`; `crates/clinker-exec/src/executor/node_buffer.rs:1`, `:34`, `:173`, `:263`; `crates/clinker-exec/src/pipeline/spill.rs:1`, `:27`, `:82`, `:152`; `crates/clinker-exec/src/pipeline/loser_tree.rs`; `crates/clinker-exec/src/pipeline/spill_merge.rs`; `crates/clinker-exec/src/executor/util.rs` (resume threshold); `crates/clinker-exec/src/executor/tests/source_pause_liveness.rs`.
 
+### Sort Comparators
+
+1. **Area/module:** `clinker-exec::pipeline::{sort_key, sort_buffer, spill_merge, sort}` and the Reshape and Cull group order in `executor::{reshape_dispatch, cull_dispatch}`.
+2. **Why performance-sensitive:** Every field-ordered sort compares records O(n log n) times: a Sink `sort_order`, a Sort node, a Source's declared order, a sort-merge join's input sort, the spilled-run merge, an analytic window's partition sort, and Reshape and Cull `order_by`. A per-field cost inside the comparator is paid on every comparison.
+3. **Existing optimization choices:** Sort-field positions are resolved once per sort buffer, spilled-run merge, window partition or group (`ResolvedSortKeys`), and each comparison reads a field at its column position. A record whose schema handle is not the resolved one falls back to the by-name lookup, so mixed-schema input orders exactly as before and only its cost differs. In debug builds `SortBuffer::push` asserts that every row has the buffer's columns, because a spilled run reattaches the buffer's schema to each row's values by position.
+4. **Avoid:** Do not look a sort field up by name inside a comparator, and do not resolve positions per row. Do not let a sort buffer accept rows of other columns.
+5. **Benchmarks/tests available:** `cargo bench -p clinker-exec --features test-utils --bench sort`: `sort_buffer_in_memory`, `sort_buffer_sort_only` (the sort alone, without the push and the drop), `sort_buffer_spilled` (built only with `test-utils`), the cardinality sweep (`card_64`, `card_1000` and `card_16000` in the first two groups), and the window partition groups (`sort_single_field`, `sort_multi_field`, `sort_with_nulls`, `sort_presorted`, `sort_reverse`). Equivalence tests `resolved_comparator_agrees_with_the_by_name_comparator`, `window_partition_sort_matches_the_by_name_order`, the in-memory-against-spilled property `sort_output_is_identical_in_memory_and_spilled`, and `an_authored_sort_compares_every_row_by_position`.
+6. **Confidence:** High.
+7. **Evidence:** `crates/clinker-exec/src/pipeline/sort_key.rs:155`, `:248`, `:1230`; `crates/clinker-exec/src/pipeline/sort_buffer.rs:117`, `:229`, `:716`; `crates/clinker-exec/src/pipeline/spill_merge.rs:303`; `crates/clinker-exec/src/pipeline/sort.rs:30`, `:41`, `:366`; `crates/clinker-exec/src/executor/reshape_dispatch.rs:451`; `crates/clinker-exec/src/executor/cull_dispatch.rs:427`; `crates/clinker-exec/src/executor/tests/sort_fast_path.rs:75`; `crates/clinker-exec/benches/sort.rs:64`, `:357`, `:375`, `:423`, `:467`.
+
+Measured once, on 2026-10-08, on an AMD Ryzen 9 7950X3D: a dated observation on this machine, not a baseline. One interleaved session compared the column-position comparator with the by-name one it replaced, both binaries built beforehand, in three blocks of reference, change, change, reference, pinned with `taskset -c 8-15` (eight cores sharing one 32 MiB L3; governor `powersave`). Free memory was 9–11 GiB of 61 GiB, with 12–13 GiB of 19 GiB swap in use. The session's noise floor was 9.84%, the largest reference-against-reference difference in any block. All 78 IDs were faster, with all six ratios beyond the floor; none was slower. Median time ratios, new to old:
+
+| group | median ratio range |
+|---|---:|
+| `sort_buffer_in_memory`, sequential | 0.33–0.55 |
+| `sort_buffer_in_memory`, eight-thread pool | 0.53–0.77 |
+| `sort_buffer_sort_only` | 0.28–0.62 |
+| `sort_buffer_spilled` | 0.64–0.82 |
+| cardinality sweep (64, 1,000 and 16,000 distinct keys) | 0.36–0.65 |
+| window partition groups | 0.20–0.29 |
+
 ### Combine, Grace Hash, And IEJoin
 
 1. **Area/module:** `clinker-exec::pipeline::{combine,grace_hash,iejoin}` and `executor::combine_dispatch`.
@@ -156,11 +177,43 @@ Primary source evidence used:
 
 1. **Area/module:** `clinker-exec::aggregation`, `pipeline::arena`, `executor::window_runtime`, `pipeline::window_context`.
 2. **Why performance-sensitive:** Aggregation keeps per-group hash tables and spill state; windows use projected arenas and secondary indexes that are evaluated from transform loops.
-3. **Existing optimization choices:** Aggregation clones accumulator prototypes for new groups instead of dispatching factories per key. Group memory estimation precomputes spill thresholds. Pre-aggregation filters and binding args are compiled once. Window runtimes share `Arc<Arena>` and `Arc<SecondaryIndex>` across per-record eval and recompute paths instead of rebuilding.
-4. **Avoid:** Do not allocate accumulator factories per group, rebuild window indexes during per-record evaluation, or route strict pipelines through relaxed/buffer-mode overhead.
-5. **Benchmarks/tests available:** `cargo bench -p clinker-exec --bench window`; benchmark pipeline YAML under `benches/pipelines/execution_mode/*aggregate*` and `*window*`; aggregation/window integration tests under `crates/clinker-exec/tests/`; `cargo bench -p clinker-exec --bench aggregate_table` (`group_table_insert`, `group_table_probe`) times the hash Aggregate's group table alone, selecting the table variant with `CLINKER_GROUP_TABLE_VARIANT`.
+3. **Existing optimization choices:** Aggregation clones accumulator prototypes for new groups instead of dispatching factories per key. Group memory estimation precomputes spill thresholds. Pre-aggregation filters and binding args are compiled once. The group table (`GroupTable`) keeps each group's hash beside its key: a new key or a lookup costs one hash, growth moves the stored hashes without reading a key, and a lookup compares hashes before keys. The table grows only when a new key arrives, at the same points the previous map did, so its bucket count at every size is unchanged. The per-group estimate charges the stored hash through the slot size. Window runtimes share `Arc<Arena>` and `Arc<SecondaryIndex>` across per-record eval and recompute paths instead of rebuilding.
+4. **Avoid:** Do not allocate accumulator factories per group, rebuild window indexes during per-record evaluation, or route strict pipelines through relaxed/buffer-mode overhead. Do not re-hash keys on growth when the key sits behind a pointer, and do not look a group up through a call that reserves room before it searches, which grows a full table on a lookup of a key it already holds.
+5. **Benchmarks/tests available:** `cargo bench -p clinker-exec --bench window`; benchmark pipeline YAML under `benches/pipelines/execution_mode/*aggregate*` and `*window*`; aggregation/window integration tests under `crates/clinker-exec/tests/`; `cargo bench -p clinker-exec --bench aggregate_table` (`group_table_insert`, `group_table_probe`) times the hash Aggregate's group table alone, selecting the table variant with `CLINKER_GROUP_TABLE_VARIANT`; `cargo bench -p clinker-benchmarks --bench e2e_matrix -- hash_aggregate` times the whole pipelines. The counting test `group_table_hashes_each_key_once_per_lookup_across_growth` pins the hash count exactly; `group_table_grows_only_when_a_new_key_arrives` pins the growth points; `estimated_bytes_per_group_counts_the_stored_hash` pins the charge.
 6. **Confidence:** High for aggregation/window memory sensitivity; medium for exact CPU hotness without fresh profiles.
-7. **Evidence:** `crates/clinker-exec/src/aggregation/mod.rs:1`, `:20`; `crates/clinker-exec/src/aggregation/hash.rs:33`, `:78`, `:103`, `:120`, `:143`; `crates/clinker-exec/src/pipeline/arena.rs:44`, `:143`, `:191`; `crates/clinker-exec/src/executor/window_runtime.rs:4`, `:26`; `crates/clinker-exec/benches/window.rs:29`.
+7. **Evidence:** `crates/clinker-exec/src/aggregation/mod.rs:1`, `:20`; `crates/clinker-exec/src/aggregation/hash.rs:36`, `:90`, `:114`, `:137`, `:224`, `:309`, `:1983`, `:3793`, `:3868`; `crates/clinker-exec/src/pipeline/arena.rs:44`, `:143`, `:191`; `crates/clinker-exec/src/executor/window_runtime.rs:4`, `:26`; `crates/clinker-exec/benches/window.rs:29`; `crates/clinker-exec/benches/aggregate_table.rs:1`.
+
+The group table keeps each hash, measured 2026-10-09 on an AMD Ryzen 9 7950X3D. This paragraph is a dated observation on this machine, not a baseline, and its magnitudes are this machine's, not a portable number.
+
+- **Why.** Growing a hash table re-hashes every key it holds. A group key is a heap buffer, with a second allocation for text, so each re-hash is a dependent load. The table now moves the stored hash instead.
+- **Exact counts.** Under the table's growth rule (the bucket count is a power of two, filled to at most 7/8), building 10,000, 100,000 and 1,000,000 distinct groups from empty re-hashes 1.43, 1.15 and 1.83 keys per group. That is 2.43, 2.15 and 2.83 hash computations per group before, against 1 now: 58.9%, 53.4% and 64.7% of the build's hash computations removed. The counting test pins it: 20,000 distinct inserts across 14 growths cost exactly 20,000 hash computations, against the previous table's 48,668, and each later lookup costs one.
+- **Cost.** The stored hash adds 8 bytes per bucket: 10.5 B per group at 100,000 groups and 16.8 B at 1,000,000, because the bucket count rounds up to a power of two. The estimate charges 9.2 B per group (8 B under its flat 1.15 slack factor), taking it from 470 B to 479 B for one group-by field and two bindings. A slot is 136 B instead of 128 B, so about 6% more bytes move per resize. The flat slack factor undercounts a power-of-two bucket array; that gap predates the stored hash.
+- **Direction and size.** The direction is hardware-independent: strictly fewer hash computations and key reads. How much time that saves depends on the table's size relative to the cache and on memory latency.
+- **Why no gain gate.** Adoption rested on the design and the counting test. Timing guarded only against a regression: one interleaved session per cache domain on the same binary, the previous map against the stored-hash table, and one end-to-end session, each stopping the change if any ID were slower. None was.
+
+Median time ratios, stored-hash table to previous map, from one interleaved session per domain, each pinned to eight cores: `taskset -c 8-15` (32 MiB L3) and `taskset -c 0-7` (96 MiB L3). Each session's noise floor is the largest per-benchmark median of its reference-against-reference differences, at least 2%: 5.35% on 8-15 and 2.66% on 0-7. "Faster" means all six ratios beyond the floor; "within noise" means not classified either way.
+
+| shape | groups | 8-15 (32 MiB) | 0-7 (96 MiB) |
+|---|---:|---:|---:|
+| `decimal` | 10,000 | 0.49 | 0.48 |
+| `decimal` | 100,000 | 0.65 | 0.53 |
+| `decimal` | 1,000,000 | 0.65 | 0.70 |
+| `int` | 10,000 | 0.86 | 0.85 |
+| `int` | 100,000 | 0.95 (within noise) | 0.85 |
+| `int` | 1,000,000 | 0.85 | 0.92 |
+| `mixed3` | 10,000 | 0.70 | 0.69 |
+| `mixed3` | 100,000 | 0.81 | 0.74 |
+| `mixed3` | 1,000,000 | 0.78 | 0.81 |
+| `str16` | 10,000 | 0.82 | 0.81 |
+| `str16` | 100,000 | 0.98 (within noise) | 1.00 (within noise) |
+| `str16` | 1,000,000 | 0.84 | 0.89 |
+| `group_table_probe`, `mixed3` | 1,000 groups, 1,000,000 records | 1.00 (within noise) | 1.00 (within noise) |
+| `group_table_probe`, `str16` | 1,000 groups, 1,000,000 records | 1.01 (within noise) | 1.00 (within noise) |
+
+- The probe shape has no growth, so it shows only the 8 extra bytes per slot: within 1.1% on either domain.
+- At 100,000 groups the table's peak sits near the 32 MiB cache, and the saving is larger on the 96 MiB domain. At 1,000,000 groups the table exceeds both caches and the order reverses. The 100,000-group IDs on 8-15 also carried the session's largest reference noise.
+- End to end, the `hash_aggregate_*` pipelines (1,000, 10,000 and 100,000 rows, with nearly one group per row) ran on 0-7 with a 2% floor, comparing two binaries built from the previous and the new source. All six IDs were within noise. The two 100,000-row IDs leaned slower without reaching the floor, at median ratios of 1.016 and 1.014, with five or six of their six ratios above 1.0. The lean is reported as within noise, not as a result: the two arms are different binaries, so code layout is not held fixed as it is in the one-binary table bench, and the run's default 512 MiB budget held every group, so spill timing played no part. `hash_aggregate_low_cardinality` groups on `f0`, which has nearly a distinct value per row in the generated data, so the pipeline is not low-cardinality despite its name.
+- Machine state: governor `powersave`; free memory 15–16 GiB of 61 GiB, with 13 GiB of 19 GiB swap in use, throughout all three sessions.
 
 ## Likely Hot Or Resource-Sensitive Paths
 
