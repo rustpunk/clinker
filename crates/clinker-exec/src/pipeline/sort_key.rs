@@ -1585,10 +1585,7 @@ mod tests {
         let first = make_record(&fields);
         let second = make_record(&fields);
         assert!(
-            !clinker_record::owned_storage::SharedStorage::ptr_eq(
-                first.schema(),
-                second.schema()
-            ),
+            !clinker_record::owned_storage::SharedStorage::ptr_eq(first.schema(), second.schema()),
             "the two records sit behind distinct handles with equal columns"
         );
         let sort_by = vec![sf("dept", SortOrder::Asc), sf("salary", SortOrder::Desc)];
