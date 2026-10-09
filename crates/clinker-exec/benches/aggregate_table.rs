@@ -1,26 +1,34 @@
 //! Group-table benchmarks for the hash Aggregate.
 //!
 //! Models the hash Aggregate's group table on its own, to measure what growing
-//! the table costs and how much of that a table storing each key's hash would
-//! recover. A slot is the operator's key (`Vec<GroupByKey>`, built through
-//! `value_to_group_key`, so the key form and its hash are the operator's) plus a
-//! filler the size of `AggregatorGroupState`, so slots move on growth as the
-//! operator's do. Every variant uses the hasher today's map uses.
+//! the table costs and what storing each key's hash changes. A slot is the
+//! operator's key (`Vec<GroupByKey>`, built through `value_to_group_key`, so the
+//! key form and its hash are the operator's) plus a filler the size of
+//! `AggregatorGroupState`, so slots move on growth as the operator's do. Every
+//! variant uses the operator's hasher.
 //!
 //! The variant is read once from `CLINKER_GROUP_TABLE_VARIANT` (default `map`):
 //!
-//! - `map`: `hashbrown::HashMap::new()`, the table the operator holds today;
+//! - `map`: `hashbrown::HashMap::new()`, the layout the operator held before
+//!   its group table kept each key's hash, which re-hashes every held key on
+//!   each growth;
 //! - `presized_map`: the same map created with capacity for every group, so it
 //!   never grows;
-//! - `stored_hash`: a `hashbrown::HashTable` whose slots keep the key's hash,
-//!   finding by that hash first and then key equality, and rehashing on growth
-//!   from the stored hash.
+//! - `stored_hash`: a model of the operator's `GroupTable`, a
+//!   `hashbrown::HashTable` whose slots keep the key's hash, finding by that
+//!   hash first and then key equality, and rehashing on growth from the stored
+//!   hash.
 //!
-//! Benchmark IDs never name the variant, so criterion compares variants across
-//! saved baselines: `map` minus `presized_map` is the whole growth cost, and
-//! `map` minus `stored_hash` is what storing the hash recovers. For example
-//! `CLINKER_GROUP_TABLE_VARIANT=stored_hash cargo bench -p clinker-exec --bench
-//! aggregate_table -- --baseline map`.
+//! Benchmark IDs never name the variant, so one binary measures every variant
+//! and each run saves its own baseline name. Compare two variants by
+//! alternating them within one session on one pinned CPU set, as the testing
+//! guide describes, and reading the ratio of each run's mean to the adjacent
+//! run of the other variant: for example `CLINKER_GROUP_TABLE_VARIANT=map
+//! aggregate_table --bench --save-baseline map1`, then
+//! `CLINKER_GROUP_TABLE_VARIANT=stored_hash aggregate_table --bench
+//! --save-baseline stored_hash1`, and so on. `map` against `presized_map` is
+//! the whole growth cost; `map` against `stored_hash` is what storing the hash
+//! changes.
 //!
 //! `group_table_insert` inserts `groups` distinct keys into an empty table.
 //! `group_table_probe` is the few-groups, many-records shape: 1,000 groups and
@@ -130,7 +138,7 @@ fn distinct_keys(shape: &str, groups: usize) -> Vec<Key> {
         .collect()
 }
 
-/// Today's table, optionally presized. Entry-or-insert as the operator does.
+/// The map layout, optionally presized. Entry-or-insert as the operator did.
 fn fill_map(keys: Vec<Key>, capacity: usize) -> HashMap<Key, StateFiller> {
     let mut map = if capacity == 0 {
         HashMap::new()

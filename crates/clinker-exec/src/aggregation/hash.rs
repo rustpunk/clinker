@@ -79,16 +79,18 @@ impl AccumulatorFactory {
 // ---------------------------------------------------------------------------
 
 /// Conservative estimate of total memory consumed per distinct group in the
-/// hash table. Accounts for the hashbrown bucket entry, key heap, accumulator
-/// row heap, and IndexMap sidecar overhead.
+/// group table. Accounts for the table's bucket entry (the group's slot, its
+/// stored hash included, plus a control byte), key heap, accumulator row heap,
+/// and IndexMap sidecar overhead.
 ///
 /// Used to pre-compute `max_groups = (budget * 0.6) / estimated_bytes` so the
 /// spill trigger can fire on a simple group-count comparison (O(1)) instead of
 /// the broken `allocation_size() * 3 > headroom` heuristic that only saw the
 /// bucket array.
 fn estimated_bytes_per_group(factory: &AccumulatorFactory, gb_count: usize) -> usize {
-    // hashbrown stores (Key, Value) inline in the bucket array + 1 control byte.
-    let bucket_entry = std::mem::size_of::<(Vec<GroupByKey>, AggregatorGroupState)>() + 1;
+    // The table stores each group's slot (key, state and the key's 8-byte
+    // hash) inline in its bucket array, plus 1 control byte per bucket.
+    let bucket_entry = std::mem::size_of::<GroupSlot<AggregatorGroupState>>() + 1;
 
     // Vec<GroupByKey> heap: one GroupByKey enum per group-by column, plus an
     // average 32 bytes of string heap per field (typical 10-50 byte keys).
@@ -103,20 +105,209 @@ fn estimated_bytes_per_group(factory: &AccumulatorFactory, gb_count: usize) -> u
     (raw as f64 * 1.15) as usize
 }
 
-/// Hash aggregation engine — D1 default strategy.
+// ---------------------------------------------------------------------------
+// Group table
+// ---------------------------------------------------------------------------
+
+/// One group: its key, its state, and the key's hash, kept beside them so the
+/// table never hashes a key it already holds.
+struct GroupSlot<S> {
+    hash: u64,
+    key: Vec<GroupByKey>,
+    state: S,
+}
+
+/// The hash Aggregate's in-memory group table: one state per distinct group
+/// key, each slot keeping its key's hash.
 ///
-/// Holds the per-group hash table, the prototype clone factory from
-/// 16.3.7, the pre-aggregation row filter (D9), the residual evaluator
-/// (16.3.12), and the bookkeeping needed for the resize-aware spill
-/// trigger (D1) and the metadata common-only propagation (D11 revised).
+/// A key is hashed once per call that takes one: once when it arrives as a new
+/// group and once per later lookup. Growth moves the stored hashes and never
+/// reads a key, so a table that grows while it fills hashes each distinct key
+/// exactly once. A lookup compares the stored hash before the key, so keys
+/// whose hashes collide stay separate groups.
 ///
-/// The 16.3.8 commit lands `new` + `add_record` + memory accounting and
-/// the spill-trigger check. `spill`, `finalize`, and `merge_spilled`
-/// arrive in 16.3.10–16.3.12 as part of the same atomic 16.3 commit
-/// (interim sub-tasks compile because the executor dispatch arm in
-/// `PlanNode::Aggregation` is still an `unreachable!` stub until 16.3.13).
+/// The table grows only when a new key arrives at a full table. A lookup of a
+/// key it already holds never grows it, so its bucket count at every length is
+/// that of a map holding the same keys. Each slot holds 8 bytes more than the
+/// key and state alone; the per-group estimate charges them.
+///
+/// Iteration and drain order is unspecified and differs from run to run with
+/// the hasher's seed; the compiled plan declares the hash Aggregate's output
+/// unordered. An empty table allocates nothing.
+pub struct GroupTable<S, H = hashbrown::DefaultHashBuilder> {
+    slots: hashbrown::HashTable<GroupSlot<S>>,
+    hasher: H,
+}
+
+impl<S, H: Default> GroupTable<S, H> {
+    /// An empty table. Allocates nothing until the first group arrives.
+    pub(crate) fn new() -> Self {
+        Self::with_hasher(H::default())
+    }
+}
+
+impl<S, H> GroupTable<S, H> {
+    /// An empty table hashing keys with `hasher`. Allocates nothing until the
+    /// first group arrives.
+    pub(crate) fn with_hasher(hasher: H) -> Self {
+        Self {
+            slots: hashbrown::HashTable::new(),
+            hasher,
+        }
+    }
+
+    /// Number of groups held.
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Whether the table holds no group.
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// Every group's state, in unspecified order. Hashes nothing.
+    pub fn values(&self) -> impl Iterator<Item = &S> {
+        self.slots.iter().map(|slot| &slot.state)
+    }
+
+    /// Every group's key and state, in unspecified order. Hashes nothing.
+    pub fn iter(&self) -> GroupTableIter<'_, S> {
+        GroupTableIter {
+            inner: self.slots.iter(),
+        }
+    }
+
+    /// Every group's state, mutably, in unspecified order. Hashes nothing.
+    pub(crate) fn values_mut(&mut self) -> GroupTableValuesMut<'_, S> {
+        GroupTableValuesMut {
+            inner: self.slots.iter_mut(),
+        }
+    }
+
+    /// Remove every group, yielding each key and state once, in unspecified
+    /// order. Hashes nothing. The table keeps its allocation for the groups
+    /// that follow.
+    pub(crate) fn drain(&mut self) -> impl Iterator<Item = (Vec<GroupByKey>, S)> {
+        self.slots.drain().map(|slot| (slot.key, slot.state))
+    }
+
+    /// Groups the table holds before its next growth.
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.slots.capacity()
+    }
+}
+
+impl<S, H: std::hash::BuildHasher> GroupTable<S, H> {
+    /// The key's hash. A `Vec` hashes as its slice, so a lookup by slice and
+    /// the insert of the owned key agree.
+    fn hash_key(&self, key: &[GroupByKey]) -> u64 {
+        self.hasher.hash_one(key)
+    }
+
+    /// The state of the group `key`, if the table holds it. Hashes `key` once.
+    pub fn get(&self, key: &[GroupByKey]) -> Option<&S> {
+        let hash = self.hash_key(key);
+        self.slots
+            .find(hash, |slot| slot.hash == hash && slot.key[..] == *key)
+            .map(|slot| &slot.state)
+    }
+
+    /// Whether the table holds the group `key`. Hashes `key` once.
+    pub fn contains_key(&self, key: &[GroupByKey]) -> bool {
+        self.get(key).is_some()
+    }
+
+    /// The state of the group `key`, created by `make` when the table does not
+    /// hold it yet. Hashes `key` once; grows the table only for a new key.
+    pub(crate) fn entry_or_insert_with(
+        &mut self,
+        key: Vec<GroupByKey>,
+        make: impl FnOnce() -> S,
+    ) -> &mut S {
+        let hash = self.hash_key(&key);
+        // `find_entry` searches without reserving room; `HashTable::entry`
+        // reserves first, so a lookup of a held key in a full table would
+        // grow it where the map never did.
+        match self
+            .slots
+            .find_entry(hash, |slot| slot.hash == hash && slot.key == key)
+        {
+            Ok(held) => &mut held.into_mut().state,
+            Err(absent) => {
+                let slot = GroupSlot {
+                    hash,
+                    key,
+                    state: make(),
+                };
+                &mut absent
+                    .into_table()
+                    .insert_unique(hash, slot, |slot| slot.hash)
+                    .into_mut()
+                    .state
+            }
+        }
+    }
+}
+
+impl<'a, S, H> IntoIterator for &'a GroupTable<S, H> {
+    type Item = (&'a Vec<GroupByKey>, &'a S);
+    type IntoIter = GroupTableIter<'a, S>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// Iterator over a [`GroupTable`]'s keys and states, in unspecified order.
+pub struct GroupTableIter<'a, S> {
+    inner: hashbrown::hash_table::Iter<'a, GroupSlot<S>>,
+}
+
+impl<'a, S> Iterator for GroupTableIter<'a, S> {
+    type Item = (&'a Vec<GroupByKey>, &'a S);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|slot| (&slot.key, &slot.state))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+/// Mutable iterator over a [`GroupTable`]'s states, in unspecified order.
+/// Named rather than opaque so a loop over it can end early and still update
+/// the aggregator's other fields: the borrow checker can see it runs no
+/// destructor.
+pub(crate) struct GroupTableValuesMut<'a, S> {
+    inner: hashbrown::hash_table::IterMut<'a, GroupSlot<S>>,
+}
+
+impl<'a, S> Iterator for GroupTableValuesMut<'a, S> {
+    type Item = &'a mut S;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|slot| &mut slot.state)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+/// Hash aggregation engine, the default Aggregate strategy.
+///
+/// Holds its groups in a [`GroupTable`] that keeps each group's hash beside
+/// its key, so the table hashes every distinct key once however often it
+/// grows. Beside the table it holds the prototype accumulator factory, the
+/// pre-aggregation row filter, the lowered binding arguments, and the
+/// bookkeeping for the group-count spill trigger, the per-group memory
+/// estimate and spill, which writes resident groups to sorted runs and merges
+/// them at finalize.
 pub struct HashAggregator {
-    groups: hashbrown::HashMap<Vec<GroupByKey>, AggregatorGroupState>,
+    groups: GroupTable<AggregatorGroupState>,
     factory: AccumulatorFactory,
     group_by_indices: Vec<u32>,
     group_by_fields: Vec<String>,
@@ -166,10 +357,10 @@ pub struct HashAggregator {
     /// Buffer-mode per-group state, populated only when
     /// `compiled.requires_buffer_mode` is true. Mutually exclusive with
     /// `groups` at the dispatch level — `add_record` consults
-    /// `buffer_mode` once and routes to exactly one of the two maps.
-    /// Both maps land empty by default; `hashbrown::HashMap::new()`
-    /// does not allocate, so the strict path observes zero overhead.
-    buffered_groups: hashbrown::HashMap<Vec<GroupByKey>, BufferedGroupState>,
+    /// `buffer_mode` once and routes to exactly one of the two tables.
+    /// Both tables start empty, and an empty [`GroupTable`] allocates
+    /// nothing, so the strict path observes zero overhead.
+    buffered_groups: GroupTable<BufferedGroupState>,
     /// Mirror of `compiled.requires_buffer_mode`. Hoisted to a per-
     /// aggregator field so the hot loop dispatches without an
     /// `Arc<CompiledAggregate>` deref on every record.
@@ -308,7 +499,7 @@ impl HashAggregator {
         // never ranks as reclaimable.
         let reclaim_by_spill = spill_dir.is_some();
         Self {
-            groups: hashbrown::HashMap::new(),
+            groups: GroupTable::new(),
             factory,
             group_by_indices,
             group_by_fields,
@@ -327,7 +518,7 @@ impl HashAggregator {
             estimated_bytes_per_group: estimated,
             records_since_rss_check: 0,
             lineage,
-            buffered_groups: hashbrown::HashMap::new(),
+            buffered_groups: GroupTable::new(),
             buffer_mode,
             consumer_handle,
             reclaim_by_spill,
@@ -403,14 +594,14 @@ impl HashAggregator {
     }
 
     /// Borrow the in-memory group table. Public for finalize and tests.
-    pub fn groups(&self) -> &hashbrown::HashMap<Vec<GroupByKey>, AggregatorGroupState> {
+    pub fn groups(&self) -> &GroupTable<AggregatorGroupState> {
         &self.groups
     }
 
     /// Resolve a group's `input_rows` slice from its stable in-memory
-    /// `group_index`, walking whichever map (`groups` for the lineage
+    /// `group_index`, walking whichever table (`groups` for the lineage
     /// path, `buffered_groups` for the buffer path) is populated for
-    /// this aggregator. The two maps are mutually exclusive at runtime
+    /// this aggregator. The two tables are mutually exclusive at runtime
     /// because `buffer_mode` is fixed by `compiled.requires_buffer_mode`
     /// at construction.
     ///
@@ -581,7 +772,7 @@ impl HashAggregator {
         //    only fires for new groups, so existing keys keep their
         //    original index.
         let next_group_idx = self.groups.len() as u32;
-        let group_state = self.groups.entry(key).or_insert_with(|| {
+        let group_state = self.groups.entry_or_insert_with(key, || {
             let mut state = AggregatorGroupState::new(self.factory.create_accumulators());
             state.group_index = next_group_idx;
             state
@@ -817,7 +1008,7 @@ impl HashAggregator {
         //    rollback step can address groups by index without a parallel
         //    HashMap lookup.
         let next_group_idx = self.buffered_groups.len() as u32;
-        let group_state = self.buffered_groups.entry(key).or_insert_with(|| {
+        let group_state = self.buffered_groups.entry_or_insert_with(key, || {
             let mut state = BufferedGroupState::new();
             state.group_index = next_group_idx;
             state
@@ -890,7 +1081,7 @@ impl HashAggregator {
 
         // 7. Spill trigger — same dual-threshold check as fold-mode.
         //    `groups.len()` is always 0 in buffer-mode; the buffered
-        //    map's group count is the relevant signal.
+        //    table's group count is the relevant signal.
         if (self.memory_budget > 0
             && (self.buffered_groups.len() >= self.max_groups
                 || self.value_heap_bytes > self.memory_budget * 40 / 100))
@@ -1785,6 +1976,47 @@ mod spill_trigger_tests {
             agg.max_groups() > 0 && agg.max_groups() < usize::MAX,
             "max_groups should be a finite positive value, got {}",
             agg.max_groups(),
+        );
+    }
+
+    #[test]
+    fn estimated_bytes_per_group_counts_the_stored_hash() {
+        let slot = std::mem::size_of::<GroupSlot<AggregatorGroupState>>();
+        assert_eq!(
+            slot,
+            std::mem::size_of::<(Vec<GroupByKey>, AggregatorGroupState)>() + 8,
+            "a group's slot holds its key, its state and its 8-byte hash"
+        );
+        let check = |fields: &[(&str, Type)], group_by: &[&str], cxl_src: &str| {
+            let agg = build_test_aggregator(fields, group_by, cxl_src, 512 * 1024 * 1024, None);
+            let bindings = agg.factory.compiled().bindings.len();
+            let raw = (slot + 1)
+                + group_by.len() * (std::mem::size_of::<GroupByKey>() + 32)
+                + bindings * std::mem::size_of::<AccumulatorEnum>();
+            let expected = (raw as f64 * 1.15) as usize;
+            assert_eq!(
+                estimated_bytes_per_group(&agg.factory, group_by.len()),
+                expected,
+                "{} group-by fields: the bucket entry is the slot, stored hash included, plus \
+                 its control byte",
+                group_by.len()
+            );
+            assert_eq!(agg.estimated_bytes_per_group, expected);
+        };
+        check(
+            &[("k", Type::String), ("v", Type::Int)],
+            &["k"],
+            "emit k = k\nemit n = count(*)\nemit total = sum(v)",
+        );
+        check(
+            &[
+                ("a", Type::String),
+                ("b", Type::Int),
+                ("c", Type::String),
+                ("v", Type::Int),
+            ],
+            &["a", "b", "c"],
+            "emit a = a\nemit b = b\nemit c = c\nemit n = count(*)\nemit total = sum(v)",
         );
     }
 
@@ -3473,5 +3705,253 @@ mod spill_trigger_tests {
             }
         }
         assert_eq!(indices.len(), 4, "one row per distinct key");
+    }
+}
+
+#[cfg(test)]
+mod group_table_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::hash::{BuildHasher, Hasher};
+    use std::rc::Rc;
+
+    const SHAPES: [&str; 4] = ["str16", "int", "decimal", "mixed3"];
+
+    /// The `n`-th distinct key of `shape`, built through `value_to_group_key`
+    /// as the operator builds its keys: one string, one integer, one decimal
+    /// whose scale varies, or a string, an integer and a date.
+    fn shape_key(shape: &str, n: u64) -> Vec<GroupByKey> {
+        let values = match shape {
+            "str16" => vec![Value::String(format!("k{n:015}").into())],
+            "int" => vec![Value::Integer(n as i64)],
+            "decimal" => {
+                // The fractional digits encode the scale, so no two `n`
+                // normalize to the same value.
+                let scale = (n % 5) as u32;
+                let mantissa = (n as i64) * 10i64.pow(scale) + i64::from(scale);
+                vec![Value::Decimal(rust_decimal::Decimal::new(mantissa, scale))]
+            }
+            "mixed3" => {
+                let epoch = chrono::NaiveDate::from_ymd_opt(2020, 1, 1).expect("a valid date");
+                vec![
+                    Value::String(format!("name-{}", n % 1_000).into()),
+                    Value::Integer((n / 1_000) as i64),
+                    Value::Date(epoch + chrono::Days::new(n % 365)),
+                ]
+            }
+            other => panic!("unknown key shape {other}"),
+        };
+        values
+            .iter()
+            .map(|value| {
+                value_to_group_key(value, "k", 0)
+                    .expect("a groupable value")
+                    .unwrap_or(GroupByKey::Null)
+            })
+            .collect()
+    }
+
+    /// The table's default hasher, counting every hash it starts. Each key
+    /// hash goes through `BuildHasher::hash_one`, which builds one hasher.
+    struct CountingHasher {
+        inner: hashbrown::DefaultHashBuilder,
+        calls: Rc<Cell<u64>>,
+    }
+
+    impl BuildHasher for CountingHasher {
+        type Hasher = <hashbrown::DefaultHashBuilder as BuildHasher>::Hasher;
+
+        fn build_hasher(&self) -> Self::Hasher {
+            self.calls.set(self.calls.get() + 1);
+            self.inner.build_hasher()
+        }
+    }
+
+    /// Hashes every key to one value, so every lookup meets every group.
+    #[derive(Default)]
+    struct ConstantHasher;
+
+    struct ConstantState;
+
+    impl Hasher for ConstantState {
+        fn finish(&self) -> u64 {
+            0x5EED
+        }
+
+        fn write(&mut self, _bytes: &[u8]) {}
+    }
+
+    impl BuildHasher for ConstantHasher {
+        type Hasher = ConstantState;
+
+        fn build_hasher(&self) -> ConstantState {
+            ConstantState
+        }
+    }
+
+    #[test]
+    fn group_table_hashes_each_key_once_per_lookup_across_growth() {
+        const GROUPS: u64 = 20_000;
+        for shape in SHAPES {
+            let calls = Rc::new(Cell::new(0u64));
+            let mut table: GroupTable<u64, CountingHasher> =
+                GroupTable::with_hasher(CountingHasher {
+                    inner: hashbrown::DefaultHashBuilder::default(),
+                    calls: Rc::clone(&calls),
+                });
+            let keys: Vec<Vec<GroupByKey>> = (0..GROUPS).map(|n| shape_key(shape, n)).collect();
+
+            let mut growths = 0;
+            for (n, key) in keys.iter().enumerate() {
+                let before = table.capacity();
+                table.entry_or_insert_with(key.clone(), || n as u64);
+                if table.capacity() != before {
+                    growths += 1;
+                }
+            }
+            assert_eq!(table.len(), GROUPS as usize, "{shape}: one group per key");
+            assert!(
+                growths >= 10,
+                "{shape}: the inserts must cross many growths, saw {growths}"
+            );
+            assert_eq!(
+                calls.get(),
+                GROUPS,
+                "{shape}: {GROUPS} distinct inserts across {growths} growths must hash each key \
+                 exactly once"
+            );
+
+            for key in &keys {
+                table.entry_or_insert_with(key.clone(), || {
+                    panic!("{shape}: a key already held must not create a group")
+                });
+            }
+            assert_eq!(
+                calls.get(),
+                2 * GROUPS,
+                "{shape}: a lookup of a held key hashes it once"
+            );
+            assert_eq!(table.len(), GROUPS as usize);
+
+            for key in &keys {
+                assert!(table.get(key).is_some(), "{shape}: every key is found");
+            }
+            assert_eq!(calls.get(), 3 * GROUPS, "{shape}: `get` hashes once");
+            for key in &keys {
+                assert!(table.contains_key(key), "{shape}: every key is held");
+            }
+            assert_eq!(
+                calls.get(),
+                4 * GROUPS,
+                "{shape}: `contains_key` hashes once"
+            );
+
+            assert_eq!(table.len(), GROUPS as usize);
+            assert!(!table.is_empty());
+            assert_eq!(table.values().count(), GROUPS as usize);
+            assert_eq!(table.iter().count(), GROUPS as usize);
+            let mut by_reference = 0;
+            for _ in &table {
+                by_reference += 1;
+            }
+            assert_eq!(by_reference, GROUPS);
+            assert_eq!(table.drain().count(), GROUPS as usize);
+            assert_eq!(
+                calls.get(),
+                4 * GROUPS,
+                "{shape}: reading, iterating and draining hash nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn group_table_grows_only_when_a_new_key_arrives() {
+        for shape in SHAPES {
+            let mut table: GroupTable<u64> = GroupTable::new();
+            let mut keys = Vec::new();
+            let mut n = 0u64;
+            while table.len() < 1_000 || table.len() != table.capacity() {
+                assert!(n < 1_000_000, "{shape}: the table never filled");
+                let key = shape_key(shape, n);
+                table.entry_or_insert_with(key.clone(), || n);
+                keys.push(key);
+                n += 1;
+            }
+            let full = table.capacity();
+            for key in &keys {
+                table.entry_or_insert_with(key.clone(), || {
+                    panic!("{shape}: a key already held must not create a group")
+                });
+                assert!(table.get(key).is_some());
+                assert!(table.contains_key(key));
+                assert_eq!(
+                    table.capacity(),
+                    full,
+                    "{shape}: a lookup of a held key in a full table must not grow it"
+                );
+            }
+            table.entry_or_insert_with(shape_key(shape, n), || n);
+            assert!(
+                table.capacity() > full,
+                "{shape}: a new key arriving at a full table grows it"
+            );
+            assert_eq!(table.len(), keys.len() + 1);
+        }
+    }
+
+    #[test]
+    fn group_table_keeps_keys_apart_when_their_hashes_collide() {
+        const GROUPS: u64 = 50;
+        for shape in SHAPES {
+            let mut table: GroupTable<u64, ConstantHasher> = GroupTable::new();
+            let keys: Vec<Vec<GroupByKey>> = (0..GROUPS).map(|n| shape_key(shape, n)).collect();
+            for (n, key) in keys.iter().enumerate() {
+                table.entry_or_insert_with(key.clone(), || n as u64);
+            }
+            assert_eq!(
+                table.len(),
+                GROUPS as usize,
+                "{shape}: keys sharing one hash stay separate groups"
+            );
+            for (n, key) in keys.iter().enumerate() {
+                assert_eq!(table.get(key), Some(&(n as u64)), "{shape}: key {n}");
+                assert!(table.contains_key(key));
+                assert_eq!(
+                    *table.entry_or_insert_with(key.clone(), || u64::MAX),
+                    n as u64,
+                    "{shape}: key {n} finds its own group"
+                );
+            }
+            assert_eq!(table.len(), GROUPS as usize);
+            assert!(!table.contains_key(&shape_key(shape, GROUPS)));
+        }
+    }
+
+    #[test]
+    fn group_table_finds_every_key_after_growth_and_drains_each_once() {
+        const GROUPS: u64 = 20_000;
+        for shape in SHAPES {
+            let mut table: GroupTable<u64> = GroupTable::new();
+            let keys: Vec<Vec<GroupByKey>> = (0..GROUPS).map(|n| shape_key(shape, n)).collect();
+            for (n, key) in keys.iter().enumerate() {
+                table.entry_or_insert_with(key.clone(), || n as u64);
+            }
+            assert_eq!(table.len(), GROUPS as usize);
+            for (n, key) in keys.iter().enumerate() {
+                assert_eq!(table.get(key), Some(&(n as u64)), "{shape}: key {n}");
+            }
+
+            let mut drained: Vec<(Vec<GroupByKey>, u64)> = table.drain().collect();
+            assert!(table.is_empty(), "{shape}: drain empties the table");
+            assert_eq!(drained.len(), GROUPS as usize);
+            drained.sort_by_key(|(_, n)| *n);
+            for (n, (key, state)) in drained.iter().enumerate() {
+                assert_eq!(*state, n as u64, "{shape}: each group drains once");
+                assert!(
+                    *key == keys[n],
+                    "{shape}: group {n} drains with its own key"
+                );
+            }
+        }
     }
 }

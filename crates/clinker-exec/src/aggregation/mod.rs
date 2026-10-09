@@ -37,7 +37,9 @@ mod hash;
 mod spill;
 
 pub use error::{AggregateEvalError, HashAggError};
-pub use hash::{AccumulatorFactory, AggregateConsumer, AggregatorConfig, HashAggregator};
+pub use hash::{
+    AccumulatorFactory, AggregateConsumer, AggregatorConfig, GroupTable, HashAggregator,
+};
 pub use spill::{AggSpillFile, SpillState};
 
 pub(crate) use hash::{empty_global_fold_row, finalize_group_inner, group_by_sort_fields};
@@ -583,7 +585,7 @@ pub struct AggregatorGroupState {
     /// including its maximum value, remains a valid contributor identity.
     pub representative_row: Option<crate::executor::stream_event::SourceRowId>,
     /// Stable in-memory index of this group within the owning
-    /// `HashAggregator.groups` map at insertion time. Populated only on
+    /// `HashAggregator.groups` table at insertion time. Populated only on
     /// the lineage path (when `compiled.requires_lineage` is true) so a
     /// flat `(input_row, group_index)` map can be reconstructed without
     /// a parallel HashMap. Meaningless after spill+merge — index space
