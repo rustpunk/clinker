@@ -1,9 +1,10 @@
 //! Hash aggregation engine — the default `AggregateStrategy::Hash` path.
 //!
 //! Holds the per-group hash table ([`HashAggregator`]), the prototype
-//! clone factory ([`AccumulatorFactory`]), the per-group memory
-//! estimator, the arbitrator-facing [`AggregateConsumer`], and the
-//! shared group-finalize helpers ([`finalize_group_inner`],
+//! clone factory ([`AccumulatorFactory`]), the checks on the group table's
+//! real size behind the spill trigger, the arbitrator-facing
+//! [`AggregateConsumer`],
+//! and the shared group-finalize helpers ([`finalize_group_inner`],
 //! [`empty_global_fold_row`], [`group_by_sort_fields`]) that the
 //! streaming path reuses to guarantee byte-identical output.
 
@@ -75,48 +76,294 @@ impl AccumulatorFactory {
 }
 
 // ---------------------------------------------------------------------------
-// Per-group memory estimation (PostgreSQL hash_agg_entry_size pattern)
+// Per-group heap and the spill checks
 // ---------------------------------------------------------------------------
 
-/// Conservative estimate of total memory consumed per distinct group in the
-/// hash table. Accounts for the hashbrown bucket entry, key heap, accumulator
-/// row heap, and IndexMap sidecar overhead.
+/// The heap one group holds outside the group table: its key's field values
+/// and its accumulator row.
 ///
-/// Used to pre-compute `max_groups = (budget * 0.6) / estimated_bytes` so the
-/// spill trigger can fire on a simple group-count comparison (O(1)) instead of
-/// the broken `allocation_size() * 3 > headroom` heuristic that only saw the
-/// bucket array.
-fn estimated_bytes_per_group(factory: &AccumulatorFactory, gb_count: usize) -> usize {
-    // hashbrown stores (Key, Value) inline in the bucket array + 1 control byte.
-    let bucket_entry = std::mem::size_of::<(Vec<GroupByKey>, AggregatorGroupState)>() + 1;
-
+/// The table's own bytes, the bucket array its slots live in, are read from
+/// the table's real allocation rather than from a per-group figure, so this
+/// carries no allowance for table load. It assumes 32 bytes of string heap
+/// per group-by field (typical 10-50 byte keys). In buffer mode it still
+/// counts one accumulator row per binding, which a buffered group holds only
+/// from finalize: an overcount on the safe side.
+fn heap_bytes_per_group(factory: &AccumulatorFactory, gb_count: usize) -> usize {
     // Vec<GroupByKey> heap: one GroupByKey enum per group-by column, plus an
-    // average 32 bytes of string heap per field (typical 10-50 byte keys).
+    // average 32 bytes of string heap per field.
     let key_heap = gb_count * (std::mem::size_of::<GroupByKey>() + 32);
 
-    // AccumulatorRow heap: Vec header is inline in AggregatorGroupState,
-    // elements are on the heap.
+    // AccumulatorRow heap: the Vec header sits in the group's slot, its
+    // elements on the heap.
     let acc_heap = factory.compiled().bindings.len() * std::mem::size_of::<AccumulatorEnum>();
 
-    // hashbrown targets ~87.5% load factor → ~1.15x bucket overallocation.
-    let raw = bucket_entry + key_heap + acc_heap;
-    (raw as f64 * 1.15) as usize
+    key_heap + acc_heap
 }
 
-/// Hash aggregation engine — D1 default strategy.
+/// Whether a group table holding `len` groups in `allocation` bytes would
+/// pass `share` on admitting its next group, counting `heap_per_group` bytes
+/// outside the table for every group it would then hold. Saturates rather
+/// than overflows.
 ///
-/// Holds the per-group hash table, the prototype clone factory from
-/// 16.3.7, the pre-aggregation row filter (D9), the residual evaluator
-/// (16.3.12), and the bookkeeping needed for the resize-aware spill
-/// trigger (D1) and the metadata common-only propagation (D11 revised).
+/// `doubles` says the next group grows the table, which happens when the
+/// table is full. The library allocates the new array before it moves the
+/// groups and frees the old one, and the new array is at most twice the old
+/// one's size, so a growth is counted as the old array plus twice it. Without
+/// a growth the next group lands in the array the table already holds.
 ///
-/// The 16.3.8 commit lands `new` + `add_record` + memory accounting and
-/// the spill-trigger check. `spill`, `finalize`, and `merge_spilled`
-/// arrive in 16.3.10–16.3.12 as part of the same atomic 16.3 commit
-/// (interim sub-tasks compile because the executor dispatch arm in
-/// `PlanNode::Aggregation` is still an `unreachable!` stub until 16.3.13).
+/// The check looks one group ahead: a table that passes it can take its next
+/// group, growth included, within the share.
+fn next_group_exceeds_share(
+    allocation: usize,
+    doubles: bool,
+    len: usize,
+    heap_per_group: usize,
+    share: usize,
+) -> bool {
+    let arrays = if doubles {
+        allocation.saturating_mul(3)
+    } else {
+        allocation
+    };
+    arrays.saturating_add(len.saturating_add(1).saturating_mul(heap_per_group)) > share
+}
+
+// ---------------------------------------------------------------------------
+// Group table
+// ---------------------------------------------------------------------------
+
+/// One group: its key, its state, and the key's hash, kept beside them so the
+/// table never hashes a key it already holds.
+struct GroupSlot<S> {
+    hash: u64,
+    key: Vec<GroupByKey>,
+    state: S,
+}
+
+/// The hash Aggregate's in-memory group table: one state per distinct group
+/// key, each slot keeping its key's hash.
+///
+/// A key is hashed once per call that takes one: once when it arrives as a new
+/// group and once per later lookup. Growth moves the stored hashes and never
+/// reads a key, so a table that grows while it fills hashes each distinct key
+/// exactly once. A lookup compares the stored hash before the key, so keys
+/// whose hashes collide stay separate groups.
+///
+/// The table grows only when a new key arrives at a full table. A lookup of a
+/// key it already holds never grows it, so its bucket count at every length is
+/// that of a map holding the same keys. Each slot holds 8 bytes more than the
+/// key and state alone; the spill checks count them through the table's real
+/// allocation.
+///
+/// Iteration and drain order is unspecified and differs from run to run with
+/// the hasher's seed; the compiled plan declares the hash Aggregate's output
+/// unordered. An empty table allocates nothing.
+pub struct GroupTable<S, H = hashbrown::DefaultHashBuilder> {
+    slots: hashbrown::HashTable<GroupSlot<S>>,
+    hasher: H,
+}
+
+impl<S, H: Default> GroupTable<S, H> {
+    /// An empty table. Allocates nothing until the first group arrives.
+    pub(crate) fn new() -> Self {
+        Self::with_hasher(H::default())
+    }
+}
+
+impl<S, H> GroupTable<S, H> {
+    /// An empty table hashing keys with `hasher`. Allocates nothing until the
+    /// first group arrives.
+    pub(crate) fn with_hasher(hasher: H) -> Self {
+        Self {
+            slots: hashbrown::HashTable::new(),
+            hasher,
+        }
+    }
+
+    /// Number of groups held.
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Whether the table holds no group.
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// Every group's state, in unspecified order. Hashes nothing.
+    pub fn values(&self) -> impl Iterator<Item = &S> {
+        self.slots.iter().map(|slot| &slot.state)
+    }
+
+    /// Every group's key and state, in unspecified order. Hashes nothing.
+    pub fn iter(&self) -> GroupTableIter<'_, S> {
+        GroupTableIter {
+            inner: self.slots.iter(),
+        }
+    }
+
+    /// Every group's state, mutably, in unspecified order. Hashes nothing.
+    pub(crate) fn values_mut(&mut self) -> GroupTableValuesMut<'_, S> {
+        GroupTableValuesMut {
+            inner: self.slots.iter_mut(),
+        }
+    }
+
+    /// Remove every group, yielding each key and state once, in unspecified
+    /// order. Hashes nothing. The table keeps its allocation for the groups
+    /// that follow.
+    pub(crate) fn drain(&mut self) -> impl Iterator<Item = (Vec<GroupByKey>, S)> {
+        self.slots.drain().map(|slot| (slot.key, slot.state))
+    }
+
+    /// Groups the table holds before its next growth, as the library
+    /// reports it.
+    fn capacity(&self) -> usize {
+        self.slots.capacity()
+    }
+
+    /// Whether the next new group grows the table: it holds as many groups
+    /// as its array has room for. Read from the library's own figures.
+    pub(crate) fn next_group_doubles(&self) -> bool {
+        self.len() == self.capacity()
+    }
+
+    /// Whether this table's next new group would take it past `share`
+    /// ([`next_group_exceeds_share`] on its real allocation). An empty table
+    /// never refuses: one group always lands before the table spills.
+    fn next_group_exceeds(&self, heap_per_group: usize, share: usize) -> bool {
+        !self.is_empty()
+            && next_group_exceeds_share(
+                self.allocation_bytes(),
+                self.next_group_doubles(),
+                self.len(),
+                heap_per_group,
+                share,
+            )
+    }
+
+    /// Bytes the table has allocated now: its bucket array with the control
+    /// bytes, including the array a drained table keeps for the groups that
+    /// follow. 0 before the first group.
+    pub(crate) fn allocation_bytes(&self) -> usize {
+        self.slots.allocation_size()
+    }
+}
+
+impl<S, H: std::hash::BuildHasher> GroupTable<S, H> {
+    /// The key's hash. A `Vec` hashes as its slice, so a lookup by slice and
+    /// the insert of the owned key agree.
+    fn hash_key(&self, key: &[GroupByKey]) -> u64 {
+        self.hasher.hash_one(key)
+    }
+
+    /// The state of the group `key`, if the table holds it. Hashes `key` once.
+    pub fn get(&self, key: &[GroupByKey]) -> Option<&S> {
+        let hash = self.hash_key(key);
+        self.slots
+            .find(hash, |slot| slot.hash == hash && slot.key[..] == *key)
+            .map(|slot| &slot.state)
+    }
+
+    /// Whether the table holds the group `key`. Hashes `key` once.
+    pub fn contains_key(&self, key: &[GroupByKey]) -> bool {
+        self.get(key).is_some()
+    }
+
+    /// The state of the group `key`, created by `make` when the table does not
+    /// hold it yet. Hashes `key` once; grows the table only for a new key.
+    pub(crate) fn entry_or_insert_with(
+        &mut self,
+        key: Vec<GroupByKey>,
+        make: impl FnOnce() -> S,
+    ) -> &mut S {
+        let hash = self.hash_key(&key);
+        // `find_entry` searches without reserving room; `HashTable::entry`
+        // reserves first, so a lookup of a held key in a full table would
+        // grow it where the map never did.
+        match self
+            .slots
+            .find_entry(hash, |slot| slot.hash == hash && slot.key == key)
+        {
+            Ok(held) => &mut held.into_mut().state,
+            Err(absent) => {
+                let slot = GroupSlot {
+                    hash,
+                    key,
+                    state: make(),
+                };
+                &mut absent
+                    .into_table()
+                    .insert_unique(hash, slot, |slot| slot.hash)
+                    .into_mut()
+                    .state
+            }
+        }
+    }
+}
+
+impl<'a, S, H> IntoIterator for &'a GroupTable<S, H> {
+    type Item = (&'a Vec<GroupByKey>, &'a S);
+    type IntoIter = GroupTableIter<'a, S>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// Iterator over a [`GroupTable`]'s keys and states, in unspecified order.
+pub struct GroupTableIter<'a, S> {
+    inner: hashbrown::hash_table::Iter<'a, GroupSlot<S>>,
+}
+
+impl<'a, S> Iterator for GroupTableIter<'a, S> {
+    type Item = (&'a Vec<GroupByKey>, &'a S);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|slot| (&slot.key, &slot.state))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+/// Mutable iterator over a [`GroupTable`]'s states, in unspecified order.
+/// Named rather than opaque so a loop over it can end early and still update
+/// the aggregator's other fields: the borrow checker can see it runs no
+/// destructor.
+pub(crate) struct GroupTableValuesMut<'a, S> {
+    inner: hashbrown::hash_table::IterMut<'a, GroupSlot<S>>,
+}
+
+impl<'a, S> Iterator for GroupTableValuesMut<'a, S> {
+    type Item = &'a mut S;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|slot| &mut slot.state)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+/// Hash aggregation engine, the default Aggregate strategy.
+///
+/// Holds its groups in a [`GroupTable`] that keeps each group's hash beside
+/// its key, so the table hashes every distinct key once however often it
+/// grows. Beside the table it holds the prototype accumulator factory, the
+/// pre-aggregation row filter, the lowered binding arguments, and the
+/// bookkeeping for the spill trigger, the resident memory estimate and spill,
+/// which writes resident groups to sorted runs and merges them at finalize.
+///
+/// The group table spills when its next group would not fit its share of the
+/// memory budget, read after each record from the table's real figures: a
+/// full table's next group grows it, so its allocation, a new array at most
+/// twice that, and the heap of every group it would then hold must fit; a
+/// table with room must fit its allocation and that heap.
 pub struct HashAggregator {
-    groups: hashbrown::HashMap<Vec<GroupByKey>, AggregatorGroupState>,
+    groups: GroupTable<AggregatorGroupState>,
     factory: AccumulatorFactory,
     group_by_indices: Vec<u32>,
     group_by_fields: Vec<String>,
@@ -143,14 +390,17 @@ pub struct HashAggregator {
     /// a record. Used by the global-fold empty-input special case in
     /// `finalize` (D12, D44).
     rows_seen: u64,
-    /// Pre-computed maximum group count before spill fires. Derived from
-    /// `(memory_budget * 60%) / estimated_bytes_per_group`. The 60% share
-    /// leaves 40% for `value_heap_bytes` growth (Collect accumulators,
-    /// meta tracker observations). `usize::MAX` when budget is 0.
-    max_groups: usize,
-    /// Conservative fixed footprint of one live group, shared by the spill
-    /// threshold and callers that must budget an in-memory-only aggregate.
-    estimated_bytes_per_group: usize,
+    /// Heap one live group holds outside the group table, its key and
+    /// accumulator row. With the tables' allocations it makes up the resident
+    /// footprint that callers budgeting an in-memory-only aggregate read.
+    heap_bytes_per_group: usize,
+    /// The bytes the group table of this aggregator's mode may hold with its
+    /// groups' heap, its growth included: 60% of `memory_budget`, checked at
+    /// each record against the table's real allocation
+    /// ([`next_group_exceeds_share`]). The remaining 40% is left for
+    /// `value_heap_bytes` growth (Collect accumulators, meta tracker
+    /// observations). Unused when the budget is 0.
+    table_share: usize,
     /// Counter for periodic RSS backstop polling. Checked every 4096
     /// records to limit /proc/self/statm read overhead.
     records_since_rss_check: u32,
@@ -166,10 +416,10 @@ pub struct HashAggregator {
     /// Buffer-mode per-group state, populated only when
     /// `compiled.requires_buffer_mode` is true. Mutually exclusive with
     /// `groups` at the dispatch level — `add_record` consults
-    /// `buffer_mode` once and routes to exactly one of the two maps.
-    /// Both maps land empty by default; `hashbrown::HashMap::new()`
-    /// does not allocate, so the strict path observes zero overhead.
-    buffered_groups: hashbrown::HashMap<Vec<GroupByKey>, BufferedGroupState>,
+    /// `buffer_mode` once and routes to exactly one of the two tables.
+    /// Both tables start empty, and an empty [`GroupTable`] allocates
+    /// nothing, so the strict path observes zero overhead.
+    buffered_groups: GroupTable<BufferedGroupState>,
     /// Mirror of `compiled.requires_buffer_mode`. Hoisted to a per-
     /// aggregator field so the hot loop dispatches without an
     /// `Arc<CompiledAggregate>` deref on every record.
@@ -221,8 +471,9 @@ pub struct AggregatorConfig {
     /// Schema of spilled partition rows (group-by columns ++
     /// `__acc_state`).
     pub spill_schema: SharedStorage<Schema>,
-    /// RSS budget in bytes that gates the spill trigger. Zero disables
-    /// the group-count cap (`max_groups` becomes `usize::MAX`).
+    /// RSS budget in bytes that gates the spill triggers. Zero disables the
+    /// group table's insert-time checks, the value-heap check and the RSS
+    /// backstop; a spill the arbitrator requests still runs.
     pub memory_budget: usize,
     /// Directory for spill files; `None` keeps the aggregator
     /// in-memory-only.
@@ -281,19 +532,7 @@ impl HashAggregator {
             "lineage and buffer-mode are mutually exclusive retraction strategies"
         );
         let factory = AccumulatorFactory::new(compiled);
-        let estimated = estimated_bytes_per_group(&factory, group_by_indices.len());
-        // `.max(1)` clamp: integer division yields 0 when a single group's
-        // estimated footprint exceeds the 60% share of the budget. Without
-        // the clamp the downstream check `self.groups.len() >= self.max_groups`
-        // is `usize >= 0` — always true — and spill fires on every record
-        // insertion. Clamping to 1 lets at least one group land before
-        // spilling, the minimum sensible behavior at pathologically small
-        // budgets.
-        let max_groups = if memory_budget > 0 && estimated > 0 {
-            ((memory_budget * 60 / 100) / estimated).max(1)
-        } else {
-            usize::MAX
-        };
+        let heap_per_group = heap_bytes_per_group(&factory, group_by_indices.len());
         // The empty-vec form `Some(Vec::new())` does not allocate until
         // the first push, so the lineage-disabled path observes
         // `lineage = None` and pays exactly zero per-record overhead;
@@ -308,7 +547,7 @@ impl HashAggregator {
         // never ranks as reclaimable.
         let reclaim_by_spill = spill_dir.is_some();
         Self {
-            groups: hashbrown::HashMap::new(),
+            groups: GroupTable::new(),
             factory,
             group_by_indices,
             group_by_fields,
@@ -323,11 +562,11 @@ impl HashAggregator {
             output_schema,
             transform_name,
             rows_seen: 0,
-            max_groups,
-            estimated_bytes_per_group: estimated,
+            heap_bytes_per_group: heap_per_group,
+            table_share: memory_budget.saturating_mul(60) / 100,
             records_since_rss_check: 0,
             lineage,
-            buffered_groups: hashbrown::HashMap::new(),
+            buffered_groups: GroupTable::new(),
             buffer_mode,
             consumer_handle,
             reclaim_by_spill,
@@ -403,14 +642,14 @@ impl HashAggregator {
     }
 
     /// Borrow the in-memory group table. Public for finalize and tests.
-    pub fn groups(&self) -> &hashbrown::HashMap<Vec<GroupByKey>, AggregatorGroupState> {
+    pub fn groups(&self) -> &GroupTable<AggregatorGroupState> {
         &self.groups
     }
 
     /// Resolve a group's `input_rows` slice from its stable in-memory
-    /// `group_index`, walking whichever map (`groups` for the lineage
+    /// `group_index`, walking whichever table (`groups` for the lineage
     /// path, `buffered_groups` for the buffer path) is populated for
-    /// this aggregator. The two maps are mutually exclusive at runtime
+    /// this aggregator. The two tables are mutually exclusive at runtime
     /// because `buffer_mode` is fixed by `compiled.requires_buffer_mode`
     /// at construction.
     ///
@@ -459,23 +698,25 @@ impl HashAggregator {
         self.value_heap_bytes
     }
 
-    /// Conservative resident footprint of the live in-memory group state.
+    /// Resident footprint of the live in-memory group state: the arrays the
+    /// group tables hold now, including the array a drained table keeps, plus
+    /// each live group's key and accumulator heap and the value heap.
     ///
-    /// Unlike [`Self::value_heap_bytes`], this includes the fixed hash-table,
-    /// key, and accumulator-row cost for aggregates such as `count(*)` whose
-    /// accumulator contributes no variable heap bytes. Spill-backed groups are
-    /// excluded because they are no longer resident.
+    /// Unlike [`Self::value_heap_bytes`], this includes the fixed table, key
+    /// and accumulator-row cost of aggregates such as `count(*)` whose
+    /// accumulator holds no variable heap. Spilled groups are excluded because
+    /// they are no longer resident. It reports the state between inserts: an
+    /// insert that doubles a table holds the old and new arrays together
+    /// while it runs.
     pub(crate) fn estimated_memory_bytes(&self) -> u64 {
         let groups = self.groups.len().saturating_add(self.buffered_groups.len());
-        let bytes = groups
-            .saturating_mul(self.estimated_bytes_per_group)
+        let bytes = self
+            .groups
+            .allocation_bytes()
+            .saturating_add(self.buffered_groups.allocation_bytes())
+            .saturating_add(groups.saturating_mul(self.heap_bytes_per_group))
             .saturating_add(self.value_heap_bytes);
         u64::try_from(bytes).unwrap_or(u64::MAX)
-    }
-
-    /// Pre-computed maximum group count before spill fires.
-    pub fn max_groups(&self) -> usize {
-        self.max_groups
     }
 
     /// Number of input records that have passed the pre-aggregation
@@ -581,7 +822,7 @@ impl HashAggregator {
         //    only fires for new groups, so existing keys keep their
         //    original index.
         let next_group_idx = self.groups.len() as u32;
-        let group_state = self.groups.entry(key).or_insert_with(|| {
+        let group_state = self.groups.entry_or_insert_with(key, || {
             let mut state = AggregatorGroupState::new(self.factory.create_accumulators());
             state.group_index = next_group_idx;
             state
@@ -718,13 +959,16 @@ impl HashAggregator {
         }
         self.add_value_heap_bytes(delta);
 
-        // 7. Dual-threshold spill trigger (PostgreSQL hash_agg_check_limits
-        // pattern). Primary: group count exceeds pre-computed max_groups
-        // (60% of budget / estimated_bytes_per_group). Secondary:
-        // value_heap_bytes exceeds 40% of budget (catches Collect
-        // accumulators that grow unbounded per group).
+        // 7. Two spill triggers. Primary: the table's next group would not
+        // fit its share, read from the table's real allocation (its growth
+        // counted when the table is full). Decided from the table's state, so
+        // a record that ended early after creating its group is caught at the
+        // next record. Secondary: value_heap_bytes exceeds 40% of budget
+        // (catches Collect accumulators that grow unbounded per group).
         if (self.memory_budget > 0
-            && (self.groups.len() >= self.max_groups
+            && (self
+                .groups
+                .next_group_exceeds(self.heap_bytes_per_group, self.table_share)
                 || self.value_heap_bytes > self.memory_budget * 40 / 100))
             || self.consumer_handle.take_spill_request()
         {
@@ -732,7 +976,7 @@ impl HashAggregator {
         }
 
         // 8. RSS backstop — periodic process-wide memory check. Catches
-        //    cases where the per-group estimate underestimates or Collect
+        //    cases where the resident estimate underestimates or Collect
         //    accumulators grow beyond what value_heap_bytes tracks.
         self.records_since_rss_check += 1;
         if self.records_since_rss_check >= 4096 {
@@ -817,7 +1061,7 @@ impl HashAggregator {
         //    rollback step can address groups by index without a parallel
         //    HashMap lookup.
         let next_group_idx = self.buffered_groups.len() as u32;
-        let group_state = self.buffered_groups.entry(key).or_insert_with(|| {
+        let group_state = self.buffered_groups.entry_or_insert_with(key, || {
             let mut state = BufferedGroupState::new();
             state.group_index = next_group_idx;
             state
@@ -888,11 +1132,12 @@ impl HashAggregator {
         group_state.input_rows.push((source_row, source_name));
         self.add_value_heap_bytes(row_charge);
 
-        // 7. Spill trigger — same dual-threshold check as fold-mode.
-        //    `groups.len()` is always 0 in buffer-mode; the buffered
-        //    map's group count is the relevant signal.
+        // 7. Spill trigger — same dual-threshold check as fold-mode, on
+        //    the buffered table: `groups` stays empty in buffer mode.
         if (self.memory_budget > 0
-            && (self.buffered_groups.len() >= self.max_groups
+            && (self
+                .buffered_groups
+                .next_group_exceeds(self.heap_bytes_per_group, self.table_share)
                 || self.value_heap_bytes > self.memory_budget * 40 / 100))
             || self.consumer_handle.take_spill_request()
         {
@@ -1158,7 +1403,7 @@ impl HashAggregator {
         // 2. Encode sort keys via SortKeyEncoder (same encoding the
         //    streaming merge path uses).
         let sort_fields = group_by_sort_fields(&self.group_by_fields, &self.spill_schema);
-        let encoder = crate::pipeline::sort_key::SortKeyEncoder::new(sort_fields);
+        let mut encoder = crate::pipeline::sort_key::SortKeyEncoder::new(sort_fields);
 
         let gb_count = self.group_by_indices.len();
         let schema_cols = self.spill_schema.column_count();
@@ -1769,22 +2014,63 @@ mod spill_trigger_tests {
     }
 
     // ------------------------------------------------------------------
-    // estimated_bytes_per_group sanity
+    // Group-count trigger sanity
     // ------------------------------------------------------------------
 
     #[test]
-    fn test_estimated_bytes_positive() {
-        let agg = build_test_aggregator(
-            &[("k", Type::String)],
-            &["k"],
-            "emit k = k\nemit n = count(*)",
-            512 * 1024 * 1024,
-            None,
+    fn group_table_size_counts_the_stored_hash_and_each_groups_heap() {
+        let slot = std::mem::size_of::<GroupSlot<AggregatorGroupState>>();
+        assert_eq!(
+            slot,
+            std::mem::size_of::<(Vec<GroupByKey>, AggregatorGroupState)>() + 8,
+            "a group's slot holds its key, its state and its 8-byte hash"
         );
-        assert!(
-            agg.max_groups() > 0 && agg.max_groups() < usize::MAX,
-            "max_groups should be a finite positive value, got {}",
-            agg.max_groups(),
+        // Grown from empty, the table's real allocation holds a slot, stored
+        // hash included, for every group it has room for, whatever the
+        // library adds for its control bytes.
+        for groups in [1_000i64, 100_000] {
+            let mut table: GroupTable<AggregatorGroupState> = GroupTable::new();
+            for n in 0..groups {
+                let key = value_to_group_key(&Value::Integer(n), "k", 0)
+                    .expect("a groupable value")
+                    .expect("a non-null key");
+                table.entry_or_insert_with(vec![key], || {
+                    AggregatorGroupState::new(AccumulatorRow::new())
+                });
+            }
+            assert!(
+                table.allocation_bytes() >= table.capacity() * slot,
+                "{groups} groups: {} bytes allocated for room for {} slots of {slot} bytes",
+                table.allocation_bytes(),
+                table.capacity()
+            );
+        }
+        let check = |fields: &[(&str, Type)], group_by: &[&str], cxl_src: &str| {
+            let agg = build_test_aggregator(fields, group_by, cxl_src, 512 * 1024 * 1024, None);
+            let bindings = agg.factory.compiled().bindings.len();
+            let expected = group_by.len() * (std::mem::size_of::<GroupByKey>() + 32)
+                + bindings * std::mem::size_of::<AccumulatorEnum>();
+            assert_eq!(
+                agg.heap_bytes_per_group,
+                expected,
+                "{} group-by fields: each group's heap is its key fields and its accumulators",
+                group_by.len()
+            );
+        };
+        check(
+            &[("k", Type::String), ("v", Type::Int)],
+            &["k"],
+            "emit k = k\nemit n = count(*)\nemit total = sum(v)",
+        );
+        check(
+            &[
+                ("a", Type::String),
+                ("b", Type::Int),
+                ("c", Type::String),
+                ("v", Type::Int),
+            ],
+            &["a", "b", "c"],
+            "emit a = a\nemit b = b\nemit c = c\nemit n = count(*)\nemit total = sum(v)",
         );
     }
 
@@ -1815,7 +2101,7 @@ mod spill_trigger_tests {
         );
         assert_eq!(
             agg.estimated_memory_bytes(),
-            (agg.groups.len() * agg.estimated_bytes_per_group) as u64,
+            (agg.groups.allocation_bytes() + agg.groups.len() * agg.heap_bytes_per_group) as u64,
             "fixed hash, key, and accumulator state must remain budget-visible"
         );
 
@@ -1842,10 +2128,336 @@ mod spill_trigger_tests {
         assert!(collect.value_heap_bytes() > 0);
         assert_eq!(
             collect.estimated_memory_bytes(),
-            (collect.groups.len() * collect.estimated_bytes_per_group + collect.value_heap_bytes())
-                as u64,
+            (collect.groups.allocation_bytes()
+                + collect.groups.len() * collect.heap_bytes_per_group
+                + collect.value_heap_bytes()) as u64,
             "variable accumulator heap must be included exactly once"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // The group table's counted size
+    // ------------------------------------------------------------------
+
+    /// One group-by field with `count(*)` and `sum(v)`.
+    fn one_field_aggregator(budget: usize, spill_dir: Option<PathBuf>) -> HashAggregator {
+        build_test_aggregator(
+            &[("k", Type::String), ("v", Type::Int)],
+            &["k"],
+            "emit k = k\nemit n = count(*)\nemit total = sum(v)",
+            budget,
+            spill_dir,
+        )
+    }
+
+    /// Three group-by fields with the same two aggregates.
+    fn three_field_aggregator(budget: usize, spill_dir: Option<PathBuf>) -> HashAggregator {
+        build_test_aggregator(
+            &[
+                ("a", Type::String),
+                ("b", Type::Int),
+                ("c", Type::String),
+                ("v", Type::Int),
+            ],
+            &["a", "b", "c"],
+            "emit a = a\nemit b = b\nemit c = c\nemit n = count(*)\nemit total = sum(v)",
+            budget,
+            spill_dir,
+        )
+    }
+
+    /// One group-by field whose relaxed `min` keeps every contribution, so
+    /// its groups live in the buffer-mode table.
+    fn buffer_mode_aggregator(budget: usize, spill_dir: Option<PathBuf>) -> HashAggregator {
+        let agg = build_test_aggregator_relaxed(
+            &[("k", Type::String), ("v", Type::Int)],
+            &["k"],
+            "emit k = k\nemit total = sum(v)\nemit lo = min(v)",
+            budget,
+            spill_dir,
+            true,
+        );
+        assert!(agg.buffer_mode, "a relaxed min selects buffer mode");
+        agg
+    }
+
+    fn heap_of(agg: &HashAggregator) -> usize {
+        heap_bytes_per_group(&agg.factory, agg.group_by_indices.len())
+    }
+
+    /// One documented aggregate shape: its name, its aggregator, and the
+    /// record that carries its `i`-th distinct group.
+    type Shape = (&'static str, HashAggregator, fn(u64) -> Record);
+
+    /// A `k` key with `v` and `w` values, the input of the one-field shapes.
+    fn one_field_record(i: u64) -> Record {
+        make_record(
+            &make_schema(&["k", "v", "w"]),
+            vec![
+                Value::String(format!("key_{i}").into()),
+                Value::Integer(1),
+                Value::Integer(2),
+            ],
+        )
+    }
+
+    /// A `k` key with a `v` value, the input of the buffer-mode fixture.
+    fn key_value_record(i: u64) -> Record {
+        make_record(
+            &make_schema(&["k", "v"]),
+            vec![Value::String(format!("key_{i}").into()), Value::Integer(1)],
+        )
+    }
+
+    fn three_field_record(i: u64) -> Record {
+        make_record(
+            &make_schema(&["a", "b", "c", "v"]),
+            vec![
+                Value::String(format!("a_{i}").into()),
+                Value::Integer(i as i64),
+                Value::String("c".into()),
+                Value::Integer(1),
+            ],
+        )
+    }
+
+    /// The shapes the memory docs give spill points for: one group-by field
+    /// with `count(*)` and `sum`, three fields with the same two, buffer mode
+    /// with one field, `count(*)` alone, and one field with four and with eight
+    /// aggregates. Each spills into `spill_dir`.
+    fn documented_shapes(budget: usize, spill_dir: &std::path::Path) -> Vec<Shape> {
+        let one_field = |cxl_src: &str, bindings: usize| {
+            let agg = build_test_aggregator(
+                &[("k", Type::String), ("v", Type::Int), ("w", Type::Int)],
+                &["k"],
+                cxl_src,
+                budget,
+                Some(spill_dir.to_path_buf()),
+            );
+            assert_eq!(agg.factory.compiled().bindings.len(), bindings, "{cxl_src}");
+            agg
+        };
+        vec![
+            (
+                "one field, count+sum",
+                one_field_aggregator(budget, Some(spill_dir.to_path_buf())),
+                key_value_record,
+            ),
+            (
+                "three fields, count+sum",
+                three_field_aggregator(budget, Some(spill_dir.to_path_buf())),
+                three_field_record,
+            ),
+            (
+                "buffer mode, one field, sum+min",
+                buffer_mode_aggregator(budget, Some(spill_dir.to_path_buf())),
+                key_value_record,
+            ),
+            (
+                "one field, count(*)",
+                one_field("emit k = k\nemit n = count(*)", 1),
+                one_field_record,
+            ),
+            (
+                "one field, 4 bindings",
+                one_field(
+                    "emit k = k\nemit n = count(*)\nemit total = sum(v)\nemit lo = min(v)\n\
+                     emit hi = max(v)",
+                    4,
+                ),
+                one_field_record,
+            ),
+            (
+                "one field, 8 bindings",
+                one_field(
+                    "emit k = k\nemit n = count(*)\nemit sv = sum(v)\nemit sw = sum(w)\n\
+                     emit lv = min(v)\nemit lw = min(w)\nemit hv = max(v)\nemit hw = max(w)\n\
+                     emit av = avg(v)",
+                    8,
+                ),
+                one_field_record,
+            ),
+        ]
+    }
+
+    /// The allocation, capacity and group count of the table `agg`'s mode
+    /// fills.
+    fn table_figures(agg: &HashAggregator) -> (usize, usize, usize) {
+        if agg.buffer_mode {
+            let table = &agg.buffered_groups;
+            (table.allocation_bytes(), table.capacity(), table.len())
+        } else {
+            (
+                agg.groups.allocation_bytes(),
+                agg.groups.capacity(),
+                agg.groups.len(),
+            )
+        }
+    }
+
+    /// Add `record` to `agg` with the periodic RSS check held back. The test
+    /// process holds far more than 85% of these budgets, so that check would
+    /// spill every 4,096 records; holding it back leaves the group-count
+    /// checks as the only trigger these tests observe.
+    fn add_without_rss_check(agg: &mut HashAggregator, record: &Record, row: u64) {
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        agg.records_since_rss_check = 0;
+        agg.add_record(record, row, &ctx_for(&stable, &file, row))
+            .expect("add_record");
+    }
+
+    /// Filled as the operator fills it, every documented shape's table stays
+    /// within its share at every insert: each growth holds the array it grows
+    /// from beside the new one with the heap of every group then held, and
+    /// each resident table holds its groups' heap. At each spill, the next
+    /// group would not have fitted: a full table's growth, counted as the old
+    /// array plus a new one twice its size, or a table with room's next
+    /// resident size, exceeds the share.
+    #[test]
+    fn the_group_table_and_its_growth_peak_stay_within_the_share() {
+        for budget in [64 * 1024, 1024 * 1024, 16 * 1024 * 1024] {
+            let share = budget * 60 / 100;
+            let tmp = tempfile::tempdir().expect("tempdir");
+            for (shape, mut agg, record_of) in documented_shapes(budget, tmp.path()) {
+                let heap = heap_of(&agg);
+                let mut growths = 0;
+                let mut row = 0u64;
+                while agg.spill_files().len() < 2 {
+                    let (before, _, len) = table_figures(&agg);
+                    // Every key is new, so the insert holds one group more
+                    // until a spill it triggers drains them.
+                    let held = len + 1;
+                    let spills = agg.spill_files().len();
+                    add_without_rss_check(&mut agg, &record_of(row), row);
+                    row += 1;
+                    // A spill drains the table and keeps its array, so these
+                    // are the figures the insert left.
+                    let (after, capacity, _) = table_figures(&agg);
+                    if after != before {
+                        growths += 1;
+                        let peak = before + after + held * heap;
+                        assert!(
+                            peak <= share,
+                            "{shape} at {budget}: growing from {before} to {after} bytes at \
+                             {held} groups peaks at {peak} bytes, over the {share}-byte share"
+                        );
+                    }
+                    let resident = after + held * heap;
+                    assert!(
+                        resident <= share,
+                        "{shape} at {budget}: {held} groups in {after} bytes hold {resident} \
+                         bytes, over the {share}-byte share"
+                    );
+                    if agg.spill_files().len() > spills {
+                        let tables = if held == capacity { 3 * after } else { after };
+                        let next = tables + (held + 1) * heap;
+                        assert!(
+                            next > share,
+                            "{shape} at {budget}: spilled at {held} groups, but the next group's \
+                             {next} bytes fit the {share}-byte share"
+                        );
+                    }
+                }
+                assert!(
+                    growths > 0,
+                    "{shape} at {budget}: the table grew while it filled"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn estimated_memory_bytes_counts_the_allocated_table() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = make_schema(&["k"]);
+        let mut agg = build_test_aggregator(
+            &[("k", Type::String)],
+            &["k"],
+            "emit k = k\nemit n = count(*)",
+            0,
+            Some(tmp.path().to_path_buf()),
+        );
+        let heap = heap_of(&agg);
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        let mut sizes = Vec::new();
+        for i in 0..40u64 {
+            let record = make_record(&input, vec![Value::String(format!("key_{i}").into())]);
+            agg.add_record(&record, i, &ctx_for(&stable, &file, i))
+                .expect("count group admission");
+            let allocated = agg.groups.allocation_bytes();
+            if sizes.last() != Some(&allocated) {
+                sizes.push(allocated);
+            }
+            assert_eq!(
+                agg.estimated_memory_bytes(),
+                (allocated + agg.groups.len() * heap + agg.value_heap_bytes()) as u64,
+                "{} groups: the estimate is the allocated table plus the per-group heap",
+                agg.groups.len()
+            );
+        }
+        assert_eq!(
+            sizes.len(),
+            5,
+            "40 groups grow the table through 4, 8, 16, 32 and 64 buckets: {sizes:?}"
+        );
+
+        agg.spill().expect("spill");
+        assert!(agg.groups.is_empty());
+        let retained = agg.groups.allocation_bytes();
+        assert!(retained > 0, "a drained table keeps its array");
+        assert_eq!(
+            agg.estimated_memory_bytes(),
+            (retained + agg.value_heap_bytes()) as u64,
+            "a drained table still counts the array it keeps"
+        );
+    }
+
+    /// Buffer mode fills its own table, whose slot differs in size from the
+    /// fold table's, and the checks read that table: filled through
+    /// `add_record`, it stays within its share, and at its spill its next
+    /// group would not have fitted, while the fold table never allocates.
+    #[test]
+    fn buffer_mode_checks_its_own_table() {
+        for budget in [64 * 1024, 1024 * 1024, 16 * 1024 * 1024] {
+            let share = budget * 60 / 100;
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let mut agg = buffer_mode_aggregator(budget, Some(tmp.path().to_path_buf()));
+            let heap = heap_of(&agg);
+            let mut row = 0u64;
+            while agg.spill_files().is_empty() {
+                let held = agg.buffered_groups.len() + 1;
+                add_without_rss_check(&mut agg, &key_value_record(row), row);
+                row += 1;
+                let (allocation, capacity) = (
+                    agg.buffered_groups.allocation_bytes(),
+                    agg.buffered_groups.capacity(),
+                );
+                assert!(
+                    allocation + held * heap <= share,
+                    "at {budget}: {held} buffered groups in {allocation} bytes exceed the \
+                     {share}-byte share"
+                );
+                if !agg.spill_files().is_empty() {
+                    let arrays = if held == capacity {
+                        3 * allocation
+                    } else {
+                        allocation
+                    };
+                    assert!(
+                        arrays + (held + 1) * heap > share,
+                        "at {budget}: spilled at {held} buffered groups, but the next group \
+                         fits the {share}-byte share"
+                    );
+                }
+            }
+            assert_eq!(
+                agg.groups.allocation_bytes(),
+                0,
+                "at {budget}: the fold table stays unallocated in buffer mode"
+            );
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1853,7 +2465,7 @@ mod spill_trigger_tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn test_spill_fires_at_max_groups() {
+    fn test_spill_fires_when_unique_keys_outgrow_a_tiny_budget() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let input = make_schema(&["k"]);
         let mut agg = build_test_aggregator(
@@ -1988,6 +2600,78 @@ mod spill_trigger_tests {
     }
 
     // ------------------------------------------------------------------
+    // Spilled group keys, read by position
+    // ------------------------------------------------------------------
+
+    /// Every group the spill drains is encoded from a record behind the
+    /// spill schema's one handle, so its key fields are read by position,
+    /// and the spilled run finalizes to the groups an ample budget holds.
+    #[test]
+    fn an_aggregate_spill_encodes_every_group_key_by_position() {
+        use crate::pipeline::sort_key::fast_path_probe;
+
+        let input = make_schema(&["a", "b", "v"]);
+        let fields = [("a", Type::String), ("b", Type::Int), ("v", Type::Int)];
+        let cxl_src = "emit a = a\nemit b = b\nemit n = count(*)\nemit total = sum(v)";
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        let feed = |agg: &mut HashAggregator| {
+            for i in 0..600u64 {
+                let record = make_record(
+                    &input,
+                    vec![
+                        Value::String(format!("key_{}", i % 150).into()),
+                        Value::Integer((i % 3) as i64),
+                        Value::Integer(i as i64),
+                    ],
+                );
+                agg.add_record(&record, i, &ctx_for(&stable, &file, i))
+                    .expect("add_record");
+            }
+        };
+        let finalized = |agg: HashAggregator| {
+            let mut out: Vec<SortRow> = Vec::new();
+            agg.finalize(&ctx_for(&stable, &file, 0), &mut out)
+                .expect("finalize");
+            let mut groups: Vec<String> = out
+                .iter()
+                .map(|(record, _)| format!("{:?}", record.values()))
+                .collect();
+            groups.sort();
+            groups
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let installed = fast_path_probe::install();
+        let mut spilled =
+            build_test_aggregator(&fields, &["a", "b"], cxl_src, 4096, Some(tmp.path().into()));
+        feed(&mut spilled);
+        assert!(
+            spilled.spill_files().len() >= 2,
+            "the tiny budget spills at least twice, got {}",
+            spilled.spill_files().len()
+        );
+        let probe = installed.probe();
+        assert_eq!(
+            probe.reads_by_name(),
+            0,
+            "no spilled key field is read by name"
+        );
+        assert!(
+            probe.reads_by_position() > 0,
+            "the spill reads its key fields by position"
+        );
+        drop(installed);
+        let spilled = finalized(spilled);
+
+        let mut ample = build_test_aggregator(&fields, &["a", "b"], cxl_src, 0, None);
+        feed(&mut ample);
+        let ample = finalized(ample);
+        assert_eq!(ample.len(), 150, "150 distinct keys");
+        assert_eq!(spilled, ample, "spilling changes no group");
+    }
+
+    // ------------------------------------------------------------------
     // RSS backstop fires exclusively — neither the group-count nor
     // value-heap thresholds are reachable under the configured budget
     // and workload, so the only path that can spill is the RSS check.
@@ -2001,8 +2685,9 @@ mod spill_trigger_tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let input = make_schema(&["k"]);
         // 1 MB budget:
-        //   - max_groups resolves to hundreds (>> the 10 unique keys below),
-        //     so the primary group-count threshold cannot fire.
+        //   - the group table's checks do not fire for the 10 unique keys
+        //     below (checked on a twin aggregator first), so the primary
+        //     group-count threshold cannot fire.
         //   - value_heap_bytes stays ~0 (count(*) is i64-per-group),
         //     so the 40% value-heap threshold cannot fire.
         //   - RSS of any real test process is tens of MB >> 85% of 1 MB,
@@ -2017,12 +2702,23 @@ mod spill_trigger_tests {
         );
         // Precondition assertions make the test self-documenting about
         // which branch it claims to exercise.
+        let twin_dir = tempfile::tempdir().expect("tempdir");
+        let mut twin = build_test_aggregator(
+            &[("k", Type::String)],
+            &["k"],
+            "emit k = k\nemit n = count(*)",
+            BUDGET,
+            Some(twin_dir.path().to_path_buf()),
+        );
+        for i in 0..10u64 {
+            let r = make_record(&input, vec![Value::String(format!("k{i}").into())]);
+            add_without_rss_check(&mut twin, &r, i);
+        }
         assert!(
-            agg.max_groups() >= 100,
-            "precondition: max_groups={} must dwarf the 10-key workload \
-             (otherwise the primary group-count threshold fires and this \
-             test is not exercising the RSS backstop)",
-            agg.max_groups()
+            twin.spill_files().is_empty(),
+            "precondition: the group table's checks must not fire for the 10-key \
+             workload (otherwise the primary group-count threshold fires and this \
+             test is not exercising the RSS backstop)"
         );
 
         let stable = StableEvalContext::test_default();
@@ -3473,5 +4169,374 @@ mod spill_trigger_tests {
             }
         }
         assert_eq!(indices.len(), 4, "one row per distinct key");
+    }
+}
+
+#[cfg(test)]
+mod group_table_tests {
+    use super::*;
+    use clinker_bench_support::group_keys::{GROUP_KEY_SHAPES as SHAPES, group_key_values};
+    use std::cell::Cell;
+    use std::hash::{BuildHasher, Hasher};
+    use std::rc::Rc;
+
+    /// The `n`-th distinct key of `shape`, built through `value_to_group_key`
+    /// as the operator builds its keys, from the shape values the group-table
+    /// bench times.
+    fn shape_key(shape: &str, n: u64) -> Vec<GroupByKey> {
+        group_key_values(shape, n)
+            .iter()
+            .map(|value| {
+                value_to_group_key(value, "k", 0)
+                    .expect("a groupable value")
+                    .unwrap_or(GroupByKey::Null)
+            })
+            .collect()
+    }
+
+    /// The table's default hasher, counting every hash it starts. Each key
+    /// hash goes through `BuildHasher::hash_one`, which builds one hasher.
+    struct CountingHasher {
+        inner: hashbrown::DefaultHashBuilder,
+        calls: Rc<Cell<u64>>,
+    }
+
+    impl BuildHasher for CountingHasher {
+        type Hasher = <hashbrown::DefaultHashBuilder as BuildHasher>::Hasher;
+
+        fn build_hasher(&self) -> Self::Hasher {
+            self.calls.set(self.calls.get() + 1);
+            self.inner.build_hasher()
+        }
+    }
+
+    /// Hashes every key to one value, so every lookup meets every group.
+    #[derive(Default)]
+    struct ConstantHasher;
+
+    struct ConstantState;
+
+    impl Hasher for ConstantState {
+        fn finish(&self) -> u64 {
+            0x5EED
+        }
+
+        fn write(&mut self, _bytes: &[u8]) {}
+    }
+
+    impl BuildHasher for ConstantHasher {
+        type Hasher = ConstantState;
+
+        fn build_hasher(&self) -> ConstantState {
+            ConstantState
+        }
+    }
+
+    #[test]
+    fn group_table_hashes_each_key_once_per_lookup_across_growth() {
+        const GROUPS: u64 = 20_000;
+        for shape in SHAPES {
+            let calls = Rc::new(Cell::new(0u64));
+            let mut table: GroupTable<u64, CountingHasher> =
+                GroupTable::with_hasher(CountingHasher {
+                    inner: hashbrown::DefaultHashBuilder::default(),
+                    calls: Rc::clone(&calls),
+                });
+            let keys: Vec<Vec<GroupByKey>> = (0..GROUPS).map(|n| shape_key(shape, n)).collect();
+
+            let mut growths = 0;
+            for (n, key) in keys.iter().enumerate() {
+                let before = table.capacity();
+                table.entry_or_insert_with(key.clone(), || n as u64);
+                if table.capacity() != before {
+                    growths += 1;
+                }
+            }
+            assert_eq!(table.len(), GROUPS as usize, "{shape}: one group per key");
+            assert!(
+                growths >= 10,
+                "{shape}: the inserts must cross many growths, saw {growths}"
+            );
+            assert_eq!(
+                calls.get(),
+                GROUPS,
+                "{shape}: {GROUPS} distinct inserts across {growths} growths must hash each key \
+                 exactly once"
+            );
+
+            for key in &keys {
+                table.entry_or_insert_with(key.clone(), || {
+                    panic!("{shape}: a key already held must not create a group")
+                });
+            }
+            assert_eq!(
+                calls.get(),
+                2 * GROUPS,
+                "{shape}: a lookup of a held key hashes it once"
+            );
+            assert_eq!(table.len(), GROUPS as usize);
+
+            for key in &keys {
+                assert!(table.get(key).is_some(), "{shape}: every key is found");
+            }
+            assert_eq!(calls.get(), 3 * GROUPS, "{shape}: `get` hashes once");
+            for key in &keys {
+                assert!(table.contains_key(key), "{shape}: every key is held");
+            }
+            assert_eq!(
+                calls.get(),
+                4 * GROUPS,
+                "{shape}: `contains_key` hashes once"
+            );
+
+            assert_eq!(table.len(), GROUPS as usize);
+            assert!(!table.is_empty());
+            assert_eq!(table.values().count(), GROUPS as usize);
+            assert_eq!(table.iter().count(), GROUPS as usize);
+            let mut by_reference = 0;
+            for _ in &table {
+                by_reference += 1;
+            }
+            assert_eq!(by_reference, GROUPS);
+            assert_eq!(table.drain().count(), GROUPS as usize);
+            assert_eq!(
+                calls.get(),
+                4 * GROUPS,
+                "{shape}: reading, iterating and draining hash nothing"
+            );
+        }
+    }
+
+    /// The doubling check counts the array a full table grows into as at most
+    /// twice the array it grows from. Every growth of a real table, of either
+    /// slot type, allocates more than before and no more than twice it, on
+    /// whatever control-group width the build has. The first array, grown from
+    /// nothing, is not a doubling: the checks run after an insert, when the
+    /// table already holds a group.
+    #[test]
+    fn a_full_group_table_grows_into_at_most_twice_its_allocation() {
+        fn growths<S>(mut table: GroupTable<S>, state: impl Fn() -> S, slot: &str) -> usize {
+            let mut growths = 0;
+            for n in 0..100_000u64 {
+                let (capacity, before) = (table.capacity(), table.allocation_bytes());
+                let full = table.next_group_doubles();
+                table.entry_or_insert_with(shape_key("int", n), &state);
+                if table.capacity() == capacity {
+                    assert!(!full, "{slot}: a full table grows at its next group");
+                    continue;
+                }
+                assert!(full, "{slot}: a table with room does not grow");
+                if before == 0 {
+                    continue;
+                }
+                let after = table.allocation_bytes();
+                assert!(
+                    after > before && after <= 2 * before,
+                    "{slot}: growing at {} groups from {before} bytes allocated {after}, \
+                     more than twice the array it grew from",
+                    table.len()
+                );
+                growths += 1;
+            }
+            growths
+        }
+        let fold = growths(
+            GroupTable::<AggregatorGroupState>::new(),
+            || AggregatorGroupState::new(AccumulatorRow::new()),
+            "fold slot",
+        );
+        let buffered = growths(
+            GroupTable::<BufferedGroupState>::new(),
+            BufferedGroupState::new,
+            "buffer-mode slot",
+        );
+        assert!(
+            fold > 0 && buffered > 0,
+            "both tables grew while they filled"
+        );
+    }
+
+    /// Heap per group outside the table, as the one-field, two-aggregate
+    /// shape counts it on x86_64. Any figure serves: the checks take it as an
+    /// input.
+    const HEAP_PER_GROUP: usize = 280;
+
+    /// Fill a table of `S` slots from empty with `groups` distinct keys, and
+    /// after each insert hand `check` the table's real figures: its
+    /// allocation, its group count and whether its next group grows it.
+    fn sweep<S>(groups: u64, state: impl Fn() -> S, mut check: impl FnMut(usize, usize, bool)) {
+        let mut table: GroupTable<S> = GroupTable::new();
+        for n in 0..groups {
+            table.entry_or_insert_with(shape_key("int", n), &state);
+            assert_eq!(
+                table.next_group_doubles(),
+                table.len() == table.capacity(),
+                "{} groups: the next group grows the table exactly when it is full",
+                table.len()
+            );
+            check(
+                table.allocation_bytes(),
+                table.len(),
+                table.next_group_doubles(),
+            );
+        }
+    }
+
+    /// A full table's next group grows it. While the table grows the library
+    /// holds the array it grows from beside the new one, at most twice its
+    /// size, so the next group fits only if three times the real allocation,
+    /// plus the heap of every group the table would then hold, fits the share.
+    #[test]
+    fn the_doubling_check_counts_both_arrays_and_the_arriving_group() {
+        let mut full_tables = 0;
+        let mut check = |allocation: usize, len: usize, doubles: bool| {
+            if !doubles {
+                return;
+            }
+            full_tables += 1;
+            let peak = 3 * allocation + (len + 1) * HEAP_PER_GROUP;
+            assert!(
+                !next_group_exceeds_share(allocation, true, len, HEAP_PER_GROUP, peak),
+                "{len} groups in {allocation} bytes: a {peak}-byte share holds the growth"
+            );
+            assert!(
+                next_group_exceeds_share(allocation, true, len, HEAP_PER_GROUP, peak - 1),
+                "{len} groups in {allocation} bytes: a {}-byte share cannot hold the growth",
+                peak - 1
+            );
+        };
+        sweep(
+            20_000,
+            || AggregatorGroupState::new(AccumulatorRow::new()),
+            &mut check,
+        );
+        sweep(20_000, BufferedGroupState::new, &mut check);
+        assert!(
+            full_tables >= 2,
+            "{full_tables} full tables checked across both slot types"
+        );
+    }
+
+    /// A table with room takes its next group in its current array, so the
+    /// next group fits if the real allocation plus the heap of every group the
+    /// table would then hold fits the share.
+    #[test]
+    fn the_resident_check_counts_the_real_allocation_and_the_arriving_group() {
+        let mut tables_with_room = 0;
+        let mut check = |allocation: usize, len: usize, doubles: bool| {
+            if doubles {
+                return;
+            }
+            tables_with_room += 1;
+            let resident = allocation + (len + 1) * HEAP_PER_GROUP;
+            assert!(
+                !next_group_exceeds_share(allocation, false, len, HEAP_PER_GROUP, resident),
+                "{len} groups in {allocation} bytes: a {resident}-byte share holds the next \
+                 group"
+            );
+            assert!(
+                next_group_exceeds_share(allocation, false, len, HEAP_PER_GROUP, resident - 1),
+                "{len} groups in {allocation} bytes: a {}-byte share cannot hold the next group",
+                resident - 1
+            );
+        };
+        sweep(
+            20_000,
+            || AggregatorGroupState::new(AccumulatorRow::new()),
+            &mut check,
+        );
+        sweep(20_000, BufferedGroupState::new, &mut check);
+        assert!(tables_with_room > 0, "tables with room were checked");
+    }
+
+    #[test]
+    fn group_table_grows_only_when_a_new_key_arrives() {
+        for shape in SHAPES {
+            let mut table: GroupTable<u64> = GroupTable::new();
+            let mut keys = Vec::new();
+            let mut n = 0u64;
+            while table.len() < 1_000 || table.len() != table.capacity() {
+                assert!(n < 1_000_000, "{shape}: the table never filled");
+                let key = shape_key(shape, n);
+                table.entry_or_insert_with(key.clone(), || n);
+                keys.push(key);
+                n += 1;
+            }
+            let full = table.capacity();
+            for key in &keys {
+                table.entry_or_insert_with(key.clone(), || {
+                    panic!("{shape}: a key already held must not create a group")
+                });
+                assert!(table.get(key).is_some());
+                assert!(table.contains_key(key));
+                assert_eq!(
+                    table.capacity(),
+                    full,
+                    "{shape}: a lookup of a held key in a full table must not grow it"
+                );
+            }
+            table.entry_or_insert_with(shape_key(shape, n), || n);
+            assert!(
+                table.capacity() > full,
+                "{shape}: a new key arriving at a full table grows it"
+            );
+            assert_eq!(table.len(), keys.len() + 1);
+        }
+    }
+
+    #[test]
+    fn group_table_keeps_keys_apart_when_their_hashes_collide() {
+        const GROUPS: u64 = 50;
+        for shape in SHAPES {
+            let mut table: GroupTable<u64, ConstantHasher> = GroupTable::new();
+            let keys: Vec<Vec<GroupByKey>> = (0..GROUPS).map(|n| shape_key(shape, n)).collect();
+            for (n, key) in keys.iter().enumerate() {
+                table.entry_or_insert_with(key.clone(), || n as u64);
+            }
+            assert_eq!(
+                table.len(),
+                GROUPS as usize,
+                "{shape}: keys sharing one hash stay separate groups"
+            );
+            for (n, key) in keys.iter().enumerate() {
+                assert_eq!(table.get(key), Some(&(n as u64)), "{shape}: key {n}");
+                assert!(table.contains_key(key));
+                assert_eq!(
+                    *table.entry_or_insert_with(key.clone(), || u64::MAX),
+                    n as u64,
+                    "{shape}: key {n} finds its own group"
+                );
+            }
+            assert_eq!(table.len(), GROUPS as usize);
+            assert!(!table.contains_key(&shape_key(shape, GROUPS)));
+        }
+    }
+
+    #[test]
+    fn group_table_finds_every_key_after_growth_and_drains_each_once() {
+        const GROUPS: u64 = 20_000;
+        for shape in SHAPES {
+            let mut table: GroupTable<u64> = GroupTable::new();
+            let keys: Vec<Vec<GroupByKey>> = (0..GROUPS).map(|n| shape_key(shape, n)).collect();
+            for (n, key) in keys.iter().enumerate() {
+                table.entry_or_insert_with(key.clone(), || n as u64);
+            }
+            assert_eq!(table.len(), GROUPS as usize);
+            for (n, key) in keys.iter().enumerate() {
+                assert_eq!(table.get(key), Some(&(n as u64)), "{shape}: key {n}");
+            }
+
+            let mut drained: Vec<(Vec<GroupByKey>, u64)> = table.drain().collect();
+            assert!(table.is_empty(), "{shape}: drain empties the table");
+            assert_eq!(drained.len(), GROUPS as usize);
+            drained.sort_by_key(|(_, n)| *n);
+            for (n, (key, state)) in drained.iter().enumerate() {
+                assert_eq!(*state, n as u64, "{shape}: each group drains once");
+                assert!(
+                    *key == keys[n],
+                    "{shape}: group {n} drains with its own key"
+                );
+            }
+        }
     }
 }

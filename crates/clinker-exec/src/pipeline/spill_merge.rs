@@ -11,16 +11,16 @@
 //! Ordering mirrors the [`SortBuffer`](crate::pipeline::sort_buffer::SortBuffer)
 //! mode the runs were spilled under, so the merged order is byte-identical to
 //! the single in-memory sort the buffer would have produced without spilling:
-//!   - Field-ordered ([`SortedRunMerger::new`]): by [`compare_authored_keys`]
-//!     — the exact field comparator each run was formed with.
+//!   - Field-ordered ([`SortedRunMerger::new`]): by the authored field
+//!     comparator each run was formed with
+//!     ([`compare_authored_keys`](crate::pipeline::sort_key::compare_authored_keys)),
+//!     its fields resolved to column positions once from the runs' schema.
 //!   - Payload-ordered ([`SortedRunMerger::new_payload_ordered`]): by the
 //!     carried payload `P: Ord` directly, matching a payload-ordered buffer.
 //!
-//! The memcomparable byte key on
-//! [`crate::pipeline::loser_tree::MergeEntry`] is deliberately not used here:
-//! it is not provably equal to the field comparator across Integer/Decimal or
-//! mixed int/float ordering, so merging on it could silently mis-order
-//! cross-type keys.
+//! The memcomparable byte key orders runs the same way, but merging on it
+//! would cost one key encode per decoded record; comparing the decoded fields
+//! by position costs none.
 //!
 //! Memory model: streaming with a bounded fan-in. A single merge pass holds
 //! one resident record per open run and one open file descriptor per open run,
@@ -53,7 +53,7 @@ use clinker_record::Record;
 
 use crate::pipeline::loser_tree::LoserTree;
 use crate::pipeline::memory::MemoryArbitrator;
-use crate::pipeline::sort_key::compare_authored_keys;
+use crate::pipeline::sort_key::ResolvedSortKeys;
 use crate::pipeline::spill::{SpillFile, SpillReader, SpillWriter};
 use clinker_plan::config::SortField;
 use clinker_plan::error::PipelineError;
@@ -301,11 +301,25 @@ impl OwnedMergeBudget {
 /// spilled under. Cheap to clone: the field variant shares one `Arc`.
 #[derive(Clone)]
 enum RunOrdering {
-    /// Order by [`compare_authored_keys`] over the shared fields — the
-    /// record carries the sort key.
-    Fields(Arc<[SortField]>),
+    /// Order by the authored fields, resolved once against the runs' schema —
+    /// the record carries the sort key.
+    Fields(Arc<ResolvedSortKeys>),
     /// Order by the carried payload `P: Ord` directly — no record field.
     Payload,
+}
+
+impl RunOrdering {
+    /// Field ordering over `sort_by`, resolved against the first run's schema.
+    /// Every run a sort buffer spills carries that buffer's schema handle, and
+    /// a cascade's intermediate runs carry their group's first run's, so the
+    /// decoded records read their fields by position. With no runs nothing is
+    /// compared, and the ordering reads by name.
+    fn fields<P>(sort_by: &[SortField], files: &[SpillFile<P>]) -> Self {
+        RunOrdering::Fields(Arc::new(ResolvedSortKeys::for_sort_fields(
+            sort_by,
+            files.first().map(SpillFile::schema),
+        )))
+    }
 }
 
 /// One entry in the k-way merge: a spilled record and the payload `P` carried
@@ -334,9 +348,7 @@ impl<P: Ord> PartialOrd for Run<P> {
 impl<P: Ord> Ord for Run<P> {
     fn cmp(&self, other: &Self) -> Ordering {
         match &self.ordering {
-            RunOrdering::Fields(sort_by) => {
-                compare_authored_keys(&self.record, &other.record, sort_by)
-            }
+            RunOrdering::Fields(keys) => keys.compare(&self.record, &other.record),
             RunOrdering::Payload => self.payload.cmp(&other.payload),
         }
     }
@@ -488,7 +500,8 @@ impl<P: Ord + crate::pipeline::sort_buffer::HeapBytes> SortedRunMerger<P> {
 }
 
 impl<P: Serialize + DeserializeOwned + Ord> SortedRunMerger<P> {
-    /// Field-ordered merge: runs are ordered by [`compare_authored_keys`]
+    /// Field-ordered merge: runs are ordered by the authored comparator
+    /// ([`compare_authored_keys`](crate::pipeline::sort_key::compare_authored_keys))
     /// over `sort_by`, matching a field-ordered
     /// [`SortBuffer`](crate::pipeline::sort_buffer::SortBuffer). `context` names
     /// the calling operator/phase so a spill open or decode failure localizes
@@ -500,13 +513,8 @@ impl<P: Serialize + DeserializeOwned + Ord> SortedRunMerger<P> {
         context: &'static str,
         budget: MergeBudget<'_>,
     ) -> Result<Self, PipelineError> {
-        Self::open(
-            files,
-            RunOrdering::Fields(Arc::from(sort_by.to_vec())),
-            context,
-            budget,
-            MERGE_FAN_IN,
-        )
+        let ordering = RunOrdering::fields(sort_by, &files);
+        Self::open(files, ordering, context, budget, MERGE_FAN_IN)
     }
 
     /// Number of spill readers held concurrently by the final merge pass.
@@ -817,6 +825,34 @@ pub(crate) fn merge_sorted_runs<P: Serialize + DeserializeOwned + Ord>(
     SortedRunMerger::new(files, sort_by, context, budget)?.collect()
 }
 
+/// Field-ordered k-way merge of `files` under an uncapped arbitrator, so the
+/// external sort bench can time the merge a spilled sort runs after its last
+/// run. Materializes the whole merged output, like [`merge_sorted_runs`]; any
+/// cascade charges a private uncapped ledger and never fails on the disk cap.
+///
+/// Compiled only with the `test-utils` feature: it exists for the bench, and
+/// in-crate tests call [`merge_sorted_runs`] directly so they build without
+/// the feature.
+#[cfg(feature = "test-utils")]
+pub fn merge_sorted_runs_for_testing<P: Serialize + DeserializeOwned + Ord>(
+    files: Vec<SpillFile<P>>,
+    sort_by: &[SortField],
+) -> Result<Vec<(Record, P)>, PipelineError> {
+    let arbitrator = MemoryArbitrator::with_policy(
+        u64::MAX,
+        0.80,
+        0.70,
+        Box::new(crate::pipeline::memory::NoOpPolicy),
+    );
+    let budget = MergeBudget {
+        budget: &arbitrator,
+        node: "sort bench",
+        compress: true,
+        charge_owner: None,
+    };
+    merge_sorted_runs(files, sort_by, "sort bench merge", budget)
+}
+
 /// Test-only constructors that pin the cascade fan-in explicitly, so a test can
 /// force the multi-pass path (`fan_in = 2`) or a single pass (`fan_in` above the
 /// run count) over the same input and prove the output does not depend on it.
@@ -829,13 +865,8 @@ impl<P: Serialize + DeserializeOwned + Ord> SortedRunMerger<P> {
         budget: MergeBudget<'_>,
         fan_in: usize,
     ) -> Result<Self, PipelineError> {
-        Self::open(
-            files,
-            RunOrdering::Fields(Arc::from(sort_by.to_vec())),
-            context,
-            budget,
-            fan_in,
-        )
+        let ordering = RunOrdering::fields(sort_by, &files);
+        Self::open(files, ordering, context, budget, fan_in)
     }
 
     fn new_payload_ordered_with_fan_in(
@@ -1829,7 +1860,7 @@ mod tests {
         let (files, sort_by, oracle) = build_dup_key_runs(100, 2);
         assert_eq!(files.len(), 100);
 
-        let ordering = RunOrdering::Fields(Arc::from(sort_by.clone()));
+        let ordering = RunOrdering::fields(&sort_by, &files);
         let reduced = reduce_to_fan_in(files, &ordering, "test", &test_budget(&arb), 4).unwrap();
         assert!(
             (1..=4).contains(&reduced.len()),

@@ -1,0 +1,223 @@
+//! Group-table benchmarks for the hash Aggregate.
+//!
+//! Models the hash Aggregate's group table on its own, to measure what growing
+//! the table costs and what storing each key's hash changes. A slot is the
+//! operator's key (`Vec<GroupByKey>`, built through `value_to_group_key`, so the
+//! key form and its hash are the operator's) plus a filler the size of
+//! `AggregatorGroupState`, so slots move on growth as the operator's do. Every
+//! variant uses the operator's hasher.
+//!
+//! The variant is read once from `CLINKER_GROUP_TABLE_VARIANT` (default `map`):
+//!
+//! - `map`: `hashbrown::HashMap::new()`, the layout the operator held before
+//!   its group table kept each key's hash, which re-hashes every held key on
+//!   each growth;
+//! - `presized_map`: the same map created with capacity for every group, so it
+//!   never grows;
+//! - `stored_hash`: a model of the operator's `GroupTable`, a
+//!   `hashbrown::HashTable` whose slots keep the key's hash, finding by that
+//!   hash first and then key equality, and rehashing on growth from the stored
+//!   hash.
+//!
+//! Benchmark IDs never name the variant, so one binary measures every variant
+//! and each run saves its own baseline name. Compare two variants by
+//! alternating them within one session on one pinned CPU set, as the testing
+//! guide describes, and reading the ratio of each run's mean to the adjacent
+//! run of the other variant: for example `CLINKER_GROUP_TABLE_VARIANT=map
+//! aggregate_table --bench --save-baseline map1`, then
+//! `CLINKER_GROUP_TABLE_VARIANT=stored_hash aggregate_table --bench
+//! --save-baseline stored_hash1`, and so on. `map` against `presized_map` is
+//! the whole growth cost; `map` against `stored_hash` is what storing the hash
+//! changes.
+//!
+//! `group_table_insert` inserts `groups` distinct keys into an empty table.
+//! `group_table_probe` is the few-groups, many-records shape: 1,000 groups and
+//! 1,000,000 records, each record passing an owned key that is dropped when its
+//! group already exists, as the operator's per-record path does.
+
+use clinker_bench_support::group_keys::{group_key_values, permuted};
+use clinker_exec::aggregation::AggregatorGroupState;
+use clinker_record::{GroupByKey, value_to_group_key};
+use criterion::{
+    BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
+};
+use hashbrown::{DefaultHashBuilder, HashMap, HashTable};
+use std::hash::BuildHasher;
+use std::sync::OnceLock;
+
+/// Words in a filler the size of the operator's per-group state.
+const STATE_WORDS: usize = std::mem::size_of::<AggregatorGroupState>().div_ceil(8);
+
+/// Stands in for `AggregatorGroupState`: same size, 8-byte aligned.
+#[derive(Clone, Copy)]
+struct StateFiller([u64; STATE_WORDS]);
+
+impl StateFiller {
+    fn new() -> Self {
+        Self([0; STATE_WORDS])
+    }
+
+    /// Touch the state as folding a record into its group would.
+    fn fold(&mut self) {
+        self.0[0] = self.0[0].wrapping_add(1);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Variant {
+    Map,
+    PresizedMap,
+    StoredHash,
+}
+
+fn variant() -> Variant {
+    static VARIANT: OnceLock<Variant> = OnceLock::new();
+    *VARIANT.get_or_init(
+        || match std::env::var("CLINKER_GROUP_TABLE_VARIANT").as_deref() {
+            Err(_) | Ok("map") => Variant::Map,
+            Ok("presized_map") => Variant::PresizedMap,
+            Ok("stored_hash") => Variant::StoredHash,
+            Ok(other) => panic!(
+                "CLINKER_GROUP_TABLE_VARIANT={other}: expected map, presized_map or stored_hash"
+            ),
+        },
+    )
+}
+
+type Key = Vec<GroupByKey>;
+
+/// The `n`-th distinct key of `shape`, built through `value_to_group_key` as
+/// the operator builds its keys, from the shared shape values.
+fn shape_key(shape: &str, n: u64) -> Key {
+    group_key_values(shape, n)
+        .iter()
+        .map(|value| {
+            value_to_group_key(value, "k", 0)
+                .expect("a groupable value")
+                .unwrap_or(GroupByKey::Null)
+        })
+        .collect()
+}
+
+fn distinct_keys(shape: &str, groups: usize) -> Vec<Key> {
+    (0..groups)
+        .map(|i| shape_key(shape, permuted(i, groups)))
+        .collect()
+}
+
+/// The map layout, optionally presized. Entry-or-insert as the operator did.
+fn fill_map(keys: Vec<Key>, capacity: usize) -> HashMap<Key, StateFiller> {
+    let mut map = if capacity == 0 {
+        HashMap::new()
+    } else {
+        HashMap::with_capacity(capacity)
+    };
+    for key in keys {
+        map.entry(key).or_insert_with(StateFiller::new).fold();
+    }
+    map
+}
+
+/// A table whose slots keep each key's hash: one hash per lookup, compare
+/// stored hashes before keys, and rehash on growth from the stored hash.
+/// It makes the operator's calls, a search that reserves nothing and then an
+/// insert of a key known to be absent, so it grows only when a new key
+/// arrives, as the operator's table does.
+fn fill_stored_hash(keys: Vec<Key>) -> HashTable<(u64, Key, StateFiller)> {
+    let hasher = DefaultHashBuilder::default();
+    let mut table: HashTable<(u64, Key, StateFiller)> = HashTable::new();
+    for key in keys {
+        let hash = hasher.hash_one(key.as_slice());
+        let slot = match table.find_entry(hash, |(stored, existing, _)| {
+            *stored == hash && *existing == key
+        }) {
+            Ok(held) => held.into_mut(),
+            Err(absent) => absent
+                .into_table()
+                .insert_unique(hash, (hash, key, StateFiller::new()), |(stored, _, _)| {
+                    *stored
+                })
+                .into_mut(),
+        };
+        slot.2.fold();
+    }
+    table
+}
+
+/// Builds the selected variant's table from `keys` and returns it, so dropping
+/// it falls outside the timed region.
+enum Filled {
+    Map(HashMap<Key, StateFiller>),
+    StoredHash(HashTable<(u64, Key, StateFiller)>),
+}
+
+fn fill(keys: Vec<Key>, groups: usize) -> Filled {
+    match variant() {
+        Variant::Map => Filled::Map(fill_map(keys, 0)),
+        Variant::PresizedMap => Filled::Map(fill_map(keys, groups)),
+        Variant::StoredHash => Filled::StoredHash(fill_stored_hash(keys)),
+    }
+}
+
+fn filled_len(filled: &Filled) -> usize {
+    match filled {
+        Filled::Map(map) => map.len(),
+        Filled::StoredHash(table) => table.len(),
+    }
+}
+
+fn bench_group_table_insert(c: &mut Criterion) {
+    let mut group = c.benchmark_group("group_table_insert");
+    for shape in ["str16", "int", "decimal", "mixed3"] {
+        for groups in [10_000usize, 100_000, 1_000_000] {
+            let keys = distinct_keys(shape, groups);
+            group.sample_size(if groups >= 1_000_000 { 10 } else { 100 });
+            group.throughput(Throughput::Elements(groups as u64));
+            group.bench_with_input(BenchmarkId::new(shape, groups), &groups, |b, &groups| {
+                b.iter_batched(
+                    || keys.clone(),
+                    |keys| {
+                        let filled = fill(keys, groups);
+                        debug_assert_eq!(filled_len(&filled), groups);
+                        black_box(filled)
+                    },
+                    BatchSize::LargeInput,
+                );
+            });
+        }
+    }
+    group.finish();
+}
+
+fn bench_group_table_probe(c: &mut Criterion) {
+    const GROUPS: usize = 1_000;
+    const RECORDS: usize = 1_000_000;
+    let mut group = c.benchmark_group("group_table_probe");
+    group.sample_size(10);
+    for shape in ["str16", "mixed3"] {
+        let groups = distinct_keys(shape, GROUPS);
+        let records: Vec<Key> = (0..RECORDS)
+            .map(|r| groups[permuted(r, GROUPS) as usize].clone())
+            .collect();
+        group.throughput(Throughput::Elements(RECORDS as u64));
+        group.bench_with_input(
+            BenchmarkId::new(shape, format!("{GROUPS}x{RECORDS}")),
+            &GROUPS,
+            |b, &groups| {
+                b.iter_batched(
+                    || records.clone(),
+                    |records| {
+                        let filled = fill(records, groups);
+                        debug_assert_eq!(filled_len(&filled), groups);
+                        black_box(filled)
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_group_table_insert, bench_group_table_probe);
+criterion_main!(benches);

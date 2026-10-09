@@ -179,6 +179,13 @@ impl Arena {
         &self.schema
     }
 
+    /// The value in `column` of the record at `position`, or `None` when
+    /// either is out of range: [`RecordStorage::resolve_field`] for a caller
+    /// that resolved the column index once against [`Arena::schema`].
+    pub(crate) fn value_at(&self, position: u64, column: usize) -> Option<&Value> {
+        self.records.get(position as usize)?.get(column)
+    }
+
     /// Number of records in this Arena.
     pub fn len(&self) -> usize {
         self.records.len()

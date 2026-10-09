@@ -13,6 +13,7 @@ pub mod alloc;
 pub mod cache;
 pub mod combine;
 pub mod generators;
+pub mod group_keys;
 pub mod io;
 
 use clinker_record::owned_storage::SharedStorage;

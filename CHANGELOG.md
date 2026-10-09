@@ -4,6 +4,45 @@ All notable changes to Clinker are tracked here.
 
 ## Unreleased
 
+### Changed — sorts compare faster, and a hash Aggregate stops recomputing its groups' hashes as it grows
+
+Output is unchanged; only speed and an Aggregate's memory estimate change.
+
+- **Sorts.** A sort now finds each sort field's column once, before it
+  compares, instead of looking the field up by name on every comparison. This
+  covers a Sink `sort_order`, a Sort, a Source's declared `sort_order`, an
+  analytic window's `order_by`, a sort-merge Combine, and Cull and Reshape
+  `order_by`. Rows come out in the same order as before, and ties keep their
+  arrival order. The group-key encoder of a streaming Aggregate and of an
+  Aggregate's spill to disk now reads each group-by column by position. A
+  record that arrives behind another schema handle (a Source that builds one
+  per file, say) re-binds the encoder to that handle, so the records after it
+  read by position too, with the same output. Timed alone, the encoder took
+  0.57 to 0.69 of its previous time, and re-binding made it no slower. A
+  sort that must spill a row whose columns are not the sort's own now fails,
+  in every build, instead of writing that row's values under the wrong names.
+- **Hash Aggregates.** An Aggregate that groups with a hash table keeps each
+  group's hash, so it no longer recomputes the hash of every group it holds
+  each time the table grows. Results are unchanged, and the order of its
+  output rows was already unspecified.
+- **Memory.** A hash Aggregate now counts its group table's real size
+  against `memory.limit`: the table's whole bucket array, the hash it keeps
+  for every group included, as the table reports it. After each record it
+  checks whether the next group would still fit the Aggregate's share of the
+  limit with the heap of every group it holds. When the table is full, the
+  next group makes it grow, and while it grows it holds its old array and a
+  new one up to twice that size together, so the check counts both; when the
+  table has room, it counts the array it holds. The Aggregate spills as soon
+  as the next group would not fit. Depending on its shape it therefore
+  spills sooner or later than before, usually sooner. At the default 512 MiB
+  limit, with hashbrown 0.15.5 on x86_64, one group-by field and two
+  aggregates spill after 458,752 groups instead of about 672,000, and
+  `count(*)` alone after 917,504. The same one-field shape in a relaxed
+  Aggregate that keeps each group's contributions to re-fold `min` or `max`
+  spills later, after 727,262, and one field with four aggregates after
+  458,752 instead of about 437,000. Cull's check of the state it keeps to
+  decide its groups counts the same table size.
+
 ### Fixed — a bounded preview of a Transform that reads one Source and feeds one Sink prints its rows
 
 `clinker run pipeline.yaml --dry-run -n N` failed with an internal error

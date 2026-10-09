@@ -88,7 +88,7 @@ use crate::pipeline::memory::walk::{
 use crate::pipeline::memory::{
     ConsumerHandle, ConsumerId, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
 };
-use crate::pipeline::sort_key::compare_authored_keys;
+use crate::pipeline::sort_key::ResolvedSortKeys;
 use crate::pipeline::spill::{SpillFile, SpillWriter};
 use clinker_plan::config::SortField;
 use clinker_plan::config::pipeline_node::CullBody;
@@ -417,13 +417,21 @@ fn run_cull_grouped(
     let mut kept: Vec<(Record, crate::executor::stream_event::SourceRowId)> = Vec::new();
     let mut removed: Vec<(Record, crate::executor::stream_event::SourceRowId)> = Vec::new();
     let group_order = groups.take_group_order();
+    let mut order: Option<ResolvedSortKeys> = None;
     for key in group_order {
         let mut group = groups.take_group(&key, hard_limit, &budget)?;
-        if !order_fields.is_empty() {
+        if !order_fields.is_empty() && group.len() >= 2 {
             // The Sort node's order, so a group's rows arrive in the same
             // order a Sink `sort_order` would write them, with the authored
             // `null_order`. Stable, so arrival order breaks ties.
-            group.sort_by(|(a, _), (b, _)| compare_authored_keys(a, b, order_fields));
+            // Resolved once per node, against the first sorted group's first
+            // row, and re-bound in place for a group whose rows sit behind
+            // another schema handle (one reloaded from a spill file).
+            let keys = order.get_or_insert_with(|| {
+                ResolvedSortKeys::for_sort_fields(order_fields, Some(group[0].0.schema()))
+            });
+            keys.bind_to(&group[0].0);
+            group.sort_by(|(a, _), (b, _)| keys.compare(a, b));
         }
         // Every buffered group must have a computed decision: the decision
         // aggregate is keyed by the same `partition_key`, over the same
@@ -497,8 +505,8 @@ fn compute_drop_decisions(
 
     // Output schema = partition-by columns ++ the boolean decision column.
     // Spill schema is unused (the predicate aggregate runs in-memory: budget
-    // 0 disables the group-count cap and `spill_dir: None` keeps every group
-    // resident), but `AggregatorConfig` still requires a value.
+    // 0 disables the group table's spill checks and `spill_dir: None` keeps
+    // every group resident), but `AggregatorConfig` still requires a value.
     let drop_output_schema: SharedStorage<Schema> = config
         .partition_by
         .iter()
@@ -522,10 +530,11 @@ fn compute_drop_decisions(
         spill_schema,
         // In-memory only: the raw-record buffer carries the spill burden,
         // and the aggregate state is O(groups) — never spilled. The ingest
-        // loop below reads the hash aggregate's fixed per-group estimate
-        // as well as its variable heap before every admission; it can neither
-        // spill (`spill_dir: None`) nor back-pressure, so an unbounded group
-        // cardinality must fail loud rather than grow the state uncounted.
+        // loop below reads the hash aggregate's allocated group table, each
+        // group's key and accumulator heap, and its variable value heap
+        // before every admission; it can neither spill (`spill_dir: None`)
+        // nor back-pressure, so an unbounded group cardinality must fail
+        // loud rather than grow the state uncounted.
         memory_budget: 0,
         spill_dir: None,
         spill_compress: false,
@@ -539,12 +548,12 @@ fn compute_drop_decisions(
 
     // The decision aggregate cannot spill (`budget: 0`, `spill_dir: None`) or
     // back-pressure, so its O(groups) accumulator state is arbitrator-invisible
-    // and grows with the group cardinality. Gate its fixed hash/key/accumulator
-    // footprint plus variable value heap against the run's hard limit on every
-    // admission and fail loud once it and the already charged input would carry
-    // the scope past the ceiling. A `hard_limit` of 0 means "no limit"
-    // (matching the finalize giant-group gate in `take_group`), so the read is
-    // skipped.
+    // and grows with the group cardinality. Gate its allocated table, its
+    // per-group key/accumulator heap and its variable value heap against the
+    // run's hard limit on every admission and fail loud once it and the
+    // already charged input would carry the scope past the ceiling. A
+    // `hard_limit` of 0 means "no limit" (matching the finalize giant-group
+    // gate in `take_group`), so the read is skipped.
     let hard_limit = ctx.memory_budget.hard_limit();
     let mut emitted: Vec<SortRow> = Vec::new();
     for (record, row_num) in input {

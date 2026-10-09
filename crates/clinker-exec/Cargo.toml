@@ -135,3 +135,7 @@ harness = false
 [[bench]]
 name = "spill_compression"
 harness = false
+
+[[bench]]
+name = "aggregate_table"
+harness = false

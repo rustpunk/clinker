@@ -529,12 +529,13 @@ fn real_run_logs_per_stage_actual_spill() {
         &format!("pipeline:\n  name: storage_obs\n  memory: {{ limit: \"{memory_limit}\", backpressure: spill }}\n"),
     );
     std::fs::write(&pipeline, &yaml).expect("write pipeline yaml");
-    // Every row a distinct department: 50_000 groups dwarf the budget-derived
-    // group-count cap (max_groups = 60% of the finite budget / est-bytes-per-group
-    // ≈ a few thousand), so the group table crosses the cap and spills before
-    // EOF. That cap is derived from the configured budget, not process RSS, so
-    // the spill fires deterministically on every host — unlike the prior
-    // RSS-driven node-buffer spill this test used to rely on.
+    // Every row a distinct department: 50_000 groups dwarf what the group
+    // table can hold in 60% of the finite budget, its growth included (a few
+    // thousand here), so the table's insert-time check refuses the next group
+    // and spills before EOF. The check reads the table's real size against
+    // the configured budget, not process RSS, so the spill fires
+    // deterministically on every host — unlike the prior RSS-driven
+    // node-buffer spill this test used to rely on.
     let mut body = String::from("department,amount\n");
     for i in 0..50_000 {
         body.push_str(&format!("dept{},{}\n", i, i * 3));

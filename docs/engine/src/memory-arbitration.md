@@ -247,6 +247,33 @@ directory or is a relaxed-key Aggregate's table; a table being finalized
 or kept for the commit stays charged until it drops, and a refused
 request's E310 lists it as `cannot spill`.
 
+A hash Aggregate's table also spills on a check of its own against 60% of
+the limit, made after each record from the table's real figures: the bytes
+its hash table library reports allocated, whether the table is full, and
+each group's key and accumulator heap. The check looks one group ahead.
+When the table is full, its next group grows it, and a growth allocates the
+new array before it frees the old one, so the doubling check counts the old
+array, a new one at most twice its size, and the heap of every group the
+table would then hold. When the table has room, the resident check counts
+the array it holds plus that heap. The table spills as soon as its next
+group would fail the check: with its array full when the growth would not
+fit, and before its array is full when the resident check refuses a group
+the array still has room for. No sizing rule of the library is copied; a
+test pins the doubling check's one assumption, that a growth at most
+doubles the allocation, against the library.
+Compared with a flat per-group allowance, the spill comes sooner or later
+depending on the shape, usually sooner. With hashbrown 0.15.5 on x86_64, at
+512 MiB, one group-by field and two aggregates spill at 458,752 groups
+instead of 672,489; `count(*)` alone at 917,504; the same one-field shape in
+buffer mode (a relaxed Aggregate with `min` or `max`), whose table has a
+smaller slot, spills later, at 727,262 instead of 672,489, on the resident
+check; and one field with four aggregates spills at 458,752 instead of
+437,072. Cull's decision check reads the arrays its decision Aggregate's
+tables hold now, plus the same per-group heap. Neither figure
+reaches the run's ledger: the Aggregate's charge is its value heap, so the
+table's fixed bytes are bounded by the group count rather than charged, a
+gap tracked separately.
+
 The execution report samples the arbitrator's spill totals and the ledger's
 charged peak after dispatch has finished and every Source worker has joined. Ordered
 Sources can still release staged spill charges while unwinding cancellation;
