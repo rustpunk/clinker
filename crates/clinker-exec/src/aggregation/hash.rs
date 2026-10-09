@@ -4174,37 +4174,16 @@ mod spill_trigger_tests {
 #[cfg(test)]
 mod group_table_tests {
     use super::*;
+    use clinker_bench_support::group_keys::{GROUP_KEY_SHAPES as SHAPES, group_key_values};
     use std::cell::Cell;
     use std::hash::{BuildHasher, Hasher};
     use std::rc::Rc;
 
-    const SHAPES: [&str; 4] = ["str16", "int", "decimal", "mixed3"];
-
     /// The `n`-th distinct key of `shape`, built through `value_to_group_key`
-    /// as the operator builds its keys: one string, one integer, one decimal
-    /// whose scale varies, or a string, an integer and a date.
+    /// as the operator builds its keys, from the shape values the group-table
+    /// bench times.
     fn shape_key(shape: &str, n: u64) -> Vec<GroupByKey> {
-        let values = match shape {
-            "str16" => vec![Value::String(format!("k{n:015}").into())],
-            "int" => vec![Value::Integer(n as i64)],
-            "decimal" => {
-                // The fractional digits encode the scale, so no two `n`
-                // normalize to the same value.
-                let scale = (n % 5) as u32;
-                let mantissa = (n as i64) * 10i64.pow(scale) + i64::from(scale);
-                vec![Value::Decimal(rust_decimal::Decimal::new(mantissa, scale))]
-            }
-            "mixed3" => {
-                let epoch = chrono::NaiveDate::from_ymd_opt(2020, 1, 1).expect("a valid date");
-                vec![
-                    Value::String(format!("name-{}", n % 1_000).into()),
-                    Value::Integer((n / 1_000) as i64),
-                    Value::Date(epoch + chrono::Days::new(n % 365)),
-                ]
-            }
-            other => panic!("unknown key shape {other}"),
-        };
-        values
+        group_key_values(shape, n)
             .iter()
             .map(|value| {
                 value_to_group_key(value, "k", 0)

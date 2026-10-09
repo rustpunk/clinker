@@ -35,14 +35,13 @@
 //! 1,000,000 records, each record passing an owned key that is dropped when its
 //! group already exists, as the operator's per-record path does.
 
-use chrono::NaiveDate;
+use clinker_bench_support::group_keys::{group_key_values, permuted};
 use clinker_exec::aggregation::AggregatorGroupState;
-use clinker_record::{GroupByKey, Value, value_to_group_key};
+use clinker_record::{GroupByKey, value_to_group_key};
 use criterion::{
     BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
 use hashbrown::{DefaultHashBuilder, HashMap, HashTable};
-use rust_decimal::Decimal;
 use std::hash::BuildHasher;
 use std::sync::OnceLock;
 
@@ -87,16 +86,10 @@ fn variant() -> Variant {
 
 type Key = Vec<GroupByKey>;
 
-/// An odd multiplier coprime with every count below, so `i * PERMUTE % n`
-/// visits each of `0..n` once in a scrambled order.
-const PERMUTE: u64 = 0x9E37_79B1;
-
-fn permuted(i: usize, n: usize) -> u64 {
-    (i as u64).wrapping_mul(PERMUTE) % n as u64
-}
-
-fn group_key(values: &[Value]) -> Key {
-    values
+/// The `n`-th distinct key of `shape`, built through `value_to_group_key` as
+/// the operator builds its keys, from the shared shape values.
+fn shape_key(shape: &str, n: u64) -> Key {
+    group_key_values(shape, n)
         .iter()
         .map(|value| {
             value_to_group_key(value, "k", 0)
@@ -104,31 +97,6 @@ fn group_key(values: &[Value]) -> Key {
                 .unwrap_or(GroupByKey::Null)
         })
         .collect()
-}
-
-/// The `n`-th distinct key of `shape` (distinct for every `n` below the count).
-fn shape_key(shape: &str, n: u64) -> Key {
-    let values = match shape {
-        "str16" => vec![Value::String(format!("k{n:015}").into())],
-        "int" => vec![Value::Integer(n as i64)],
-        "decimal" => {
-            // Scale 0-4; the fractional digits encode the scale, so no two
-            // `n` normalize to the same value.
-            let scale = (n % 5) as u32;
-            let mantissa = (n as i64) * 10i64.pow(scale) + i64::from(scale);
-            vec![Value::Decimal(Decimal::new(mantissa, scale))]
-        }
-        "mixed3" => {
-            let epoch = NaiveDate::from_ymd_opt(2020, 1, 1).expect("a valid date");
-            vec![
-                Value::String(format!("name-{}", n % 1_000).into()),
-                Value::Integer((n / 1_000) as i64),
-                Value::Date(epoch + chrono::Days::new(n % 365)),
-            ]
-        }
-        other => unreachable!("unknown group-table shape {other}"),
-    };
-    group_key(&values)
 }
 
 fn distinct_keys(shape: &str, groups: usize) -> Vec<Key> {
