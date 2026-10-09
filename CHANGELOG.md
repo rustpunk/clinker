@@ -14,11 +14,13 @@ Output is unchanged; only speed and an Aggregate's memory estimate change.
   analytic window's `order_by`, a sort-merge Combine, and Cull and Reshape
   `order_by`. Rows come out in the same order as before, and ties keep their
   arrival order. The group-key encoder of a streaming Aggregate and of an
-  Aggregate's spill to disk now reads each group-by column by position for
-  every record that shares the schema handle of the first record it encodes,
-  and by name for any other, with the same output. An Aggregate's spill
-  always reads by position. Timed alone, the encoder takes 0.57 to 0.69 of
-  its previous time on records that share that handle.
+  Aggregate's spill to disk now reads each group-by column by position. A
+  record that arrives behind another schema handle (a Source that builds one
+  per file, say) re-binds the encoder to that handle, so the records after it
+  read by position too, with the same output. Timed alone, the encoder takes
+  0.57 to 0.69 of its previous time. A sort that must spill a row whose
+  columns are not the sort's own now fails, in every build, instead of
+  writing that row's values under the wrong names.
 - **Hash Aggregates.** An Aggregate that groups with a hash table keeps each
   group's hash, so it no longer recomputes the hash of every group it holds
   each time the table grows. Results are unchanged, and the order of its

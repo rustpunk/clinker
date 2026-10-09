@@ -1531,7 +1531,7 @@ mod two_phase_bytes_encoder {
     /// take/swap dance to dodge the double-borrow on `&mut b`.
     fn encode_key(b: &mut GroupBoundary, r: &Record) {
         let mut buf = std::mem::take(&mut b.current);
-        b.encoder().encode_into(r, &mut buf);
+        b.encoder_mut().encode_into(r, &mut buf);
         b.current = buf;
     }
 
@@ -1806,7 +1806,7 @@ mod two_phase_bytes_encoder {
             let s = SharedStorage::from_arc(Arc::new(Schema::new(col_names)));
             let group_by: Vec<String> = (0..schema_types.len()).map(col_name).collect();
             let fields = group_by_sort_fields(&group_by, &s);
-            let encoder = SortKeyEncoder::new(fields);
+            let mut encoder = SortKeyEncoder::new(fields);
 
             // Generate ~25 records per schema → ~600 pairs per schema,
             // ~5000 pairs across all schemas. Comfortably above the 200
@@ -2082,7 +2082,7 @@ mod two_phase_bytes_spill {
             if let Some((rec, _)) = rows.first() {
                 let sch = rec.schema().clone();
                 let fields = group_by_sort_fields(&group_by, &sch);
-                let encoder = SortKeyEncoder::new(fields);
+                let mut encoder = SortKeyEncoder::new(fields);
                 rows.sort_by_cached_key(|(r, _)| {
                     let mut b = Vec::new();
                     encoder.encode_into(r, &mut b);
@@ -2140,7 +2140,7 @@ mod group_boundary_sort_order {
 
     fn encode_key(b: &mut GroupBoundary, r: &Record) {
         let mut buf = std::mem::take(&mut b.current);
-        b.encoder().encode_into(r, &mut buf);
+        b.encoder_mut().encode_into(r, &mut buf);
         b.current = buf;
     }
 

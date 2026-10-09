@@ -28,14 +28,15 @@
 //! built once, outside the timed region, and each batch takes a fresh encoder.
 //! `mixed3_other_handle` carries the first record behind one schema handle and
 //! every later one behind another handle with the same columns, so it times
-//! the encoder's read for a record of another schema.
+//! one re-bind of the encoder to a second handle and the positional reads
+//! that follow it.
 
 use chrono::{NaiveDate, TimeDelta};
 use clinker_bench_support::{LARGE, MEDIUM, RecordFactory, SMALL};
 use clinker_exec::executor::SourceRowId;
 use clinker_exec::pipeline::arena::Arena;
 use clinker_exec::pipeline::sort_buffer::{SortBuffer, SortedOutput};
-use clinker_exec::pipeline::sort_key::SortKeyEncoder;
+use clinker_exec::pipeline::sort_key::{ResolvedSortKeys, SortKeyEncoder};
 use clinker_format::preparation::MemoryOnlyResources;
 use clinker_plan::config::{NullOrder, NullPlacement, OrderField, SortField, SortOrder};
 use clinker_plan::plan::{EntityRef, PlanNodeId};
@@ -78,12 +79,13 @@ fn bench_sort_single_field(c: &mut Criterion) {
     for count in [SMALL, MEDIUM, LARGE] {
         let arena = build_arena(count, 10, 0.0);
         let positions_template: Vec<u64> = (0..count as u64).collect();
+        let order = ResolvedSortKeys::for_order_fields(&sort_by, arena.schema());
 
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
             b.iter(|| {
                 let mut positions = positions_template.clone();
-                clinker_exec::pipeline::sort::sort_partition(&arena, &mut positions, &sort_by);
+                clinker_exec::pipeline::sort::sort_partition(&arena, &mut positions, &order);
                 black_box(&positions);
             });
         });
@@ -104,12 +106,13 @@ fn bench_sort_multi_field(c: &mut Criterion) {
     for count in [SMALL, MEDIUM, LARGE] {
         let arena = build_arena(count, 10, 0.0);
         let positions_template: Vec<u64> = (0..count as u64).collect();
+        let order = ResolvedSortKeys::for_order_fields(&sort_by, arena.schema());
 
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
             b.iter(|| {
                 let mut positions = positions_template.clone();
-                clinker_exec::pipeline::sort::sort_partition(&arena, &mut positions, &sort_by);
+                clinker_exec::pipeline::sort::sort_partition(&arena, &mut positions, &order);
                 black_box(&positions);
             });
         });
@@ -127,12 +130,13 @@ fn bench_sort_with_nulls(c: &mut Criterion) {
         let null_ratio = null_pct as f64 / 100.0;
         let arena = build_arena(MEDIUM, 10, null_ratio);
         let positions_template: Vec<u64> = (0..MEDIUM as u64).collect();
+        let order = ResolvedSortKeys::for_order_fields(&sort_by, arena.schema());
 
         group.throughput(Throughput::Elements(MEDIUM as u64));
         group.bench_with_input(BenchmarkId::new("null_pct", null_pct), &null_pct, |b, _| {
             b.iter(|| {
                 let mut positions = positions_template.clone();
-                clinker_exec::pipeline::sort::sort_partition(&arena, &mut positions, &sort_by);
+                clinker_exec::pipeline::sort::sort_partition(&arena, &mut positions, &order);
                 black_box(&positions);
             });
         });
@@ -154,12 +158,13 @@ fn bench_sort_presorted(c: &mut Criterion) {
             .collect();
         let arena = Arena::from_parts(schema, minimals);
         let positions_template: Vec<u64> = (0..count as u64).collect();
+        let order = ResolvedSortKeys::for_order_fields(&sort_by, arena.schema());
 
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
             b.iter(|| {
                 let mut positions = positions_template.clone();
-                clinker_exec::pipeline::sort::sort_partition(&arena, &mut positions, &sort_by);
+                clinker_exec::pipeline::sort::sort_partition(&arena, &mut positions, &order);
                 black_box(&positions);
             });
         });
@@ -181,12 +186,13 @@ fn bench_sort_reverse(c: &mut Criterion) {
             .collect();
         let arena = Arena::from_parts(schema, minimals);
         let positions_template: Vec<u64> = (0..count as u64).collect();
+        let order = ResolvedSortKeys::for_order_fields(&sort_by, arena.schema());
 
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
             b.iter(|| {
                 let mut positions = positions_template.clone();
-                clinker_exec::pipeline::sort::sort_partition(&arena, &mut positions, &sort_by);
+                clinker_exec::pipeline::sort::sort_partition(&arena, &mut positions, &order);
                 black_box(&positions);
             });
         });
@@ -586,7 +592,7 @@ fn bench_sort_key_encode(c: &mut Criterion) {
             |b, _| {
                 b.iter_batched(
                     || SortKeyEncoder::new(sort_by.clone()),
-                    |encoder| {
+                    |mut encoder| {
                         let mut key = Vec::new();
                         for record in &records {
                             encoder.encode_into(record, &mut key);

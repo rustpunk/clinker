@@ -1,14 +1,16 @@
 //! Window partition sort: orders a partition's arena positions.
 //!
 //! Sorts each partition's `u64` arena positions by its `sort_by` fields, read
-//! from the arena by column position resolved once per partition. Stable, so
-//! equal keys keep insertion order.
+//! from the arena by column position. The caller resolves the fields once per
+//! window ([`ResolvedSortKeys::for_order_fields`] against the arena's schema)
+//! and passes the resolution to every partition. Stable, so equal keys keep
+//! insertion order.
 
 use std::cmp::Ordering;
 
 use clinker_record::{Record, Value};
 
-use clinker_plan::config::{NullOrder, OrderField, SortField, SortOrder};
+use clinker_plan::config::{NullOrder, SortField, SortOrder};
 
 use crate::pipeline::arena::Arena;
 use crate::pipeline::sort_key::{
@@ -16,32 +18,30 @@ use crate::pipeline::sort_key::{
     compare_authored_values_with_nulls,
 };
 
-/// Sort a window partition's position vector in place by its `sort_by`
-/// fields.
+/// Sort a window partition's position vector in place by `order`, the
+/// window's `sort_by` fields resolved against the arena's schema.
 ///
 /// Every position stays: the fields are placement-only, so nulls go first
 /// or last and no row leaves the partition. The sort is stable, so equal
-/// keys keep arrival order. The fields' columns are resolved once against
-/// the arena's schema, and only when there are two positions to compare.
-pub fn sort_partition(arena: &Arena, positions: &mut [u64], sort_by: &[OrderField]) {
+/// keys keep arrival order. Allocates nothing per partition: the caller
+/// resolves `order` once per window and reuses it for every partition.
+pub fn sort_partition(arena: &Arena, positions: &mut [u64], order: &ResolvedSortKeys) {
     if positions.len() < 2 {
         return;
     }
-    let keys = ResolvedSortKeys::for_order_fields(sort_by, arena.schema());
-    positions.sort_by(|&a, &b| compare_positions(arena, &keys, a, b));
+    positions.sort_by(|&a, &b| compare_positions(arena, order, a, b));
 }
 
-/// Check if a partition is already sorted (linear scan).
+/// Check if a partition is already sorted under `order` (linear scan).
 ///
 /// Returns true if all consecutive pairs are in the correct order.
-pub fn is_sorted(arena: &Arena, positions: &[u64], sort_by: &[OrderField]) -> bool {
+pub fn is_sorted(arena: &Arena, positions: &[u64], order: &ResolvedSortKeys) -> bool {
     if positions.len() < 2 {
         return true;
     }
-    let keys = ResolvedSortKeys::for_order_fields(sort_by, arena.schema());
     positions
         .windows(2)
-        .all(|pair| compare_positions(arena, &keys, pair[0], pair[1]) != Ordering::Greater)
+        .all(|pair| compare_positions(arena, order, pair[0], pair[1]) != Ordering::Greater)
 }
 
 /// Compare the arena records at two positions by the resolved fields.
@@ -80,10 +80,23 @@ pub fn compare_values(a: &Value, b: &Value) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clinker_plan::config::NullPlacement;
+    use clinker_plan::config::{NullPlacement, OrderField};
     use clinker_record::owned_storage::SharedStorage;
     use clinker_record::{MinimalRecord, Schema, Value};
     use std::sync::Arc;
+
+    /// The production entry points take the fields resolved once per window;
+    /// these take the authored fields and resolve them against the arena, as
+    /// the window dispatch does, so each case reads as the author's order.
+    fn sort_partition(arena: &Arena, positions: &mut [u64], sort_by: &[OrderField]) {
+        let order = ResolvedSortKeys::for_order_fields(sort_by, arena.schema());
+        super::sort_partition(arena, positions, &order);
+    }
+
+    fn is_sorted(arena: &Arena, positions: &[u64], sort_by: &[OrderField]) -> bool {
+        let order = ResolvedSortKeys::for_order_fields(sort_by, arena.schema());
+        super::is_sorted(arena, positions, &order)
+    }
 
     /// An arena holding `rows` under `columns`.
     fn arena(columns: &[&str], rows: Vec<Vec<Value>>) -> Arena {

@@ -1504,7 +1504,7 @@ impl HashAggregator {
         // 2. Encode sort keys via SortKeyEncoder (same encoding the
         //    streaming merge path uses).
         let sort_fields = group_by_sort_fields(&self.group_by_fields, &self.spill_schema);
-        let encoder = crate::pipeline::sort_key::SortKeyEncoder::new(sort_fields);
+        let mut encoder = crate::pipeline::sort_key::SortKeyEncoder::new(sort_fields);
 
         let gb_count = self.group_by_indices.len();
         let schema_cols = self.spill_schema.column_count();

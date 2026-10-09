@@ -441,14 +441,20 @@ fn run_reshape_grouped(
     let hard_limit = budget.hard_limit();
     let mut out: Vec<(Record, crate::executor::stream_event::SourceRowId)> = Vec::new();
     let group_order = groups.take_group_order();
+    let mut order: Option<ResolvedSortKeys> = None;
     for key in group_order {
         let mut group = groups.take_group(&key, hard_limit, &budget)?;
         if !order_fields.is_empty() && group.len() >= 2 {
             // The Sort node's order, so each group's rows reach the rules in
             // the order a Sink `sort_order` would write them, with the
             // authored `null_order`. Stable, so arrival order breaks ties.
-            // Resolved once per group, against its first row's schema.
-            let keys = ResolvedSortKeys::for_sort_fields(order_fields, Some(group[0].0.schema()));
+            // Resolved once per node, against the first sorted group's first
+            // row, and re-bound in place for a group whose rows sit behind
+            // another schema handle (one reloaded from a spill file).
+            let keys = order.get_or_insert_with(|| {
+                ResolvedSortKeys::for_sort_fields(order_fields, Some(group[0].0.schema()))
+            });
+            keys.bind_to(&group[0].0);
             group.sort_by(|(a, _), (b, _)| keys.compare(a, b));
         }
         process_group(ctx, name, &mut rules, output_schema, group, &mut out)?;

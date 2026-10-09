@@ -1311,7 +1311,9 @@ impl StreamingAggregator<AddRaw> {
         // Encode the group-by columns into boundary.current via the
         // owned encoder. We feed it the input record directly.
         let mut scratch = std::mem::take(&mut self.boundary.current);
-        self.boundary.encoder().encode_into(record, &mut scratch);
+        self.boundary
+            .encoder_mut()
+            .encode_into(record, &mut scratch);
         self.boundary.current = scratch;
 
         // The finalize closure receives the previously-open input record
