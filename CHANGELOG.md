@@ -17,10 +17,10 @@ Output is unchanged; only speed and an Aggregate's memory estimate change.
   Aggregate's spill to disk now reads each group-by column by position. A
   record that arrives behind another schema handle (a Source that builds one
   per file, say) re-binds the encoder to that handle, so the records after it
-  read by position too, with the same output. Timed alone, the encoder takes
-  0.57 to 0.69 of its previous time. A sort that must spill a row whose
-  columns are not the sort's own now fails, in every build, instead of
-  writing that row's values under the wrong names.
+  read by position too, with the same output. Timed alone, the encoder took
+  0.57 to 0.69 of its previous time, and re-binding made it no slower. A
+  sort that must spill a row whose columns are not the sort's own now fails,
+  in every build, instead of writing that row's values under the wrong names.
 - **Hash Aggregates.** An Aggregate that groups with a hash table keeps each
   group's hash, so it no longer recomputes the hash of every group it holds
   each time the table grows. Results are unchanged, and the order of its
