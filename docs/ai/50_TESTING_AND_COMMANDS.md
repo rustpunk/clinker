@@ -808,6 +808,53 @@ cargo bench -p clinker-benchmarks --features bench-xlarge --bench e2e_xlarge
 
 Status: **Inferred.** This session did not run Criterion benchmark measurements.
 
+### When a change needs measured performance evidence
+
+Most changes need only the CI bench gates above. They make no speed claim, and
+the gates already prove every benchmark pipeline still plans and runs.
+
+Measure timings only when a change claims a speed-up, or when it touches a hot
+path where a slowdown is the risk: sort, spill, join, aggregation, record
+encoding, or the walk. Then size the measurement to the claim. Time only the
+bench IDs the change touches. Prefer a group that times the changed step alone
+over an end-to-end group, which dilutes a step-level change with setup work.
+
+Measure on the shared development host as it is. Production hosts are not
+quiet either, and a gain that appears only on an idle machine does not reach
+users. Noise does mean that results from different sessions cannot be
+compared:
+
+- Build the reference binary and the change binary once each. Give each
+  session its own `CRITERION_HOME` and a fixed CPU pin: on a
+  multi-cache-domain CPU, one L3 domain, and the same domain for every run of
+  a session.
+- Interleave the arms in one session, as three blocks of reference, change,
+  change, reference. Each block saves a unique baseline name.
+- Set the noise floor from the same session's reference-against-reference
+  pairs: take each benchmark's median across the three blocks, then the
+  largest of those medians, and never go below 2%. A single stray process run
+  then cannot inflate it. Call an ID faster or slower only when all six
+  change-against-reference ratios agree beyond that floor.
+- Never compare against a baseline saved in an earlier session. On the
+  development host the same code has drifted 24–92% within a day under memory
+  pressure. Criterion's own confidence interval is computed within a run and
+  cannot see that drift.
+- Record the CPU pin, its L3 size, the governor, and `free -g` in each log
+  header.
+
+When the direction of a change's effect follows from its design — it does
+strictly less of a countable kind of work, such as fewer hash computations,
+fewer comparisons or fewer bytes copied — decide it on the design and an exact
+counting test, not on a timing. The test counts that work through a seam the
+code already has, such as a counting hasher, asserts the exact figure, and is
+shown to fail on the previous code. Timing then serves only as a
+no-regression guard in more than one cache regime: on a CPU with several cache
+domains, one interleaved session pinned to each. The change stops if any
+benchmark is classified slower. Magnitudes measured on one machine are
+reported, never used as an adoption gate, because how much time removed work
+saves depends on cache size and memory latency relative to the working set,
+and differs between machines even when the direction does not.
+
 ## 12. Commands Codex Should Run Before Claiming Success
 
 For AI onboarding docs-only changes under `docs/ai/`, run the pinned
