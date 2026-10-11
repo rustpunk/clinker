@@ -45,8 +45,8 @@ use crate::executor::spill_purge;
 use crate::executor::{PipelineExecutor, PipelineRunParams};
 
 // A layout-derived ledger capacity forces the HashAggregator's dual-threshold
-// spill: with many distinct keys the group count crosses the budget-derived
-// `max_groups` well before EOF, so `add_record` calls `spill()` mid-run — the
+// spill: with many distinct keys the group table outgrows its share of the
+// budget well before EOF, so `add_record` calls `spill()` mid-run — the
 // open this test intercepts. The capacity also admits all output rows at their
 // compiled layout after the spilled aggregate completes, plus the existing
 // fixed allowance and measured writer workspace. `memory.limit` itself is

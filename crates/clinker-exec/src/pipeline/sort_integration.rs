@@ -440,8 +440,73 @@ mod tests {
             ]
         }
 
+        /// String sort values of at most 23 bytes, so every one is stored
+        /// inline and each push still charges the buffer the same bytes. Some
+        /// share a 12-byte prefix, so they differ only past the eighth byte.
+        fn string_value() -> impl Strategy<Value = Value> {
+            prop_oneof![
+                2 => Just(Value::Null),
+                2 => prop::sample::select(vec!["", "a", "ab", "b"])
+                    .prop_map(|s| Value::String(s.into())),
+                3 => prop::collection::vec(prop::sample::select(vec!['a', 'b', '\0']), 0..=11)
+                    .prop_map(|tail| {
+                        Value::String(
+                            format!("shared-text-{}", tail.into_iter().collect::<String>()).into(),
+                        )
+                    }),
+            ]
+        }
+
+        /// Datetime sort values either side of 1970, from a small pool so
+        /// they tie.
+        fn datetime_value() -> impl Strategy<Value = Value> {
+            prop_oneof![
+                1 => Just(Value::Null),
+                3 => (-2i64..=2, 0u32..3).prop_map(|(days, nanos)| {
+                    Value::DateTime(
+                        chrono::DateTime::from_timestamp(days * 86_400, nanos)
+                            .unwrap()
+                            .naive_utc(),
+                    )
+                }),
+            ]
+        }
+
+        /// One to three sort fields over `v`, `s`, `t` and `missing`, a column
+        /// the schema does not have, each with its own direction and null
+        /// placement: first, last, or left to the default.
+        fn sort_fields() -> impl Strategy<Value = Vec<SortField>> {
+            prop::collection::vec(
+                (
+                    prop::sample::select(vec!["v", "s", "t", "missing"]),
+                    any::<bool>(),
+                    prop::sample::select(vec![None, Some(NullOrder::First), Some(NullOrder::Last)]),
+                ),
+                1..=3,
+            )
+            .prop_map(|fields| {
+                fields
+                    .into_iter()
+                    .map(|(name, descending, null_order)| SortField {
+                        field: name.into(),
+                        order: if descending {
+                            SortOrder::Desc
+                        } else {
+                            SortOrder::Asc
+                        },
+                        null_order,
+                    })
+                    .collect()
+            })
+        }
+
         fn schema() -> SharedStorage<Schema> {
-            SharedStorage::from_arc(Arc::new(Schema::new(vec!["v".into(), "id".into()])))
+            SharedStorage::from_arc(Arc::new(Schema::new(vec![
+                "v".into(),
+                "s".into(),
+                "t".into(),
+                "id".into(),
+            ])))
         }
 
         /// A value's identity down to its bits, so a NaN's sign and payload
@@ -461,9 +526,9 @@ mod tests {
         }
 
         proptest! {
-            // 128 cases; each spills up to 40 single-row runs three times
-            // over, and the whole property runs in about a second.
-            #![proptest_config(ProptestConfig::with_cases(128))]
+            // 256 cases; each spills up to 40 single-row runs three times
+            // over.
+            #![proptest_config(ProptestConfig::with_cases(256))]
 
             /// A Sort's output is the same (record, payload) sequence whether
             /// it stays resident or spills runs of 1, 2 or 7 rows and merges
@@ -471,7 +536,11 @@ mod tests {
             /// comparator. A comparator that was not a total order (a NaN
             /// equal to everything) would let run boundaries change it.
             ///
-            /// Every record here has the same shape (two inline values, a
+            /// The sort is by one to three fields of mixed numbers, inline
+            /// strings and datetimes, or a missing column, sorted sequentially
+            /// or on the kernel pool.
+            ///
+            /// Every record here has the same shape (four inline values, a
             /// `u64` payload), so each push charges the buffer the same
             /// number of bytes, measured below as `row_bytes`. A threshold of
             /// `k × row_bytes` makes `should_spill` report exactly after the
@@ -479,40 +548,45 @@ mod tests {
             /// `k` rows.
             #[test]
             fn sort_output_is_identical_in_memory_and_spilled(
-                values in prop::collection::vec(sort_value(), 0..=40),
-                descending in any::<bool>(),
-                nulls_first in any::<bool>(),
+                values in prop::collection::vec(
+                    (sort_value(), string_value(), datetime_value()),
+                    0..=40,
+                ),
+                sort_by in sort_fields(),
+                pooled in any::<bool>(),
             ) {
                 let schema = schema();
-                let sort_by = vec![sf_nulls(
-                    "v",
-                    if descending { SortOrder::Desc } else { SortOrder::Asc },
-                    if nulls_first { NullOrder::First } else { NullOrder::Last },
-                )];
                 let input: Vec<(Record, u64)> = values
                     .iter()
                     .enumerate()
-                    .map(|(id, v)| {
+                    .map(|(id, (v, s, t))| {
                         let record = Record::new(
                             schema.clone(),
-                            vec![v.clone(), Value::Integer(id as i64)],
+                            vec![v.clone(), s.clone(), t.clone(), Value::Integer(id as i64)],
                         );
                         (record, id as u64)
                     })
                     .collect();
+                let with_pool = |buffer: SortBuffer<u64>| {
+                    if pooled {
+                        buffer.with_kernel_pool(Arc::clone(crate::test_support::test_kernel_pool()))
+                    } else {
+                        buffer
+                    }
+                };
 
                 let mut reference = input.clone();
                 reference.sort_by(|(a, _), (b, _)| compare_authored_keys(a, b, &sort_by));
                 let reference = identities(&reference);
 
-                let mut resident: SortBuffer<u64> = SortBuffer::new(
+                let mut resident: SortBuffer<u64> = with_pool(SortBuffer::new(
                     sort_by.clone(),
                     usize::MAX,
                     None,
                     true,
                     schema.clone(),
                     test_allocation_resources(),
-                );
+                ));
                 for (record, payload) in input.iter().cloned() {
                     resident.push(record, payload);
                 }
@@ -525,14 +599,14 @@ mod tests {
                 let Some((first, first_payload)) = input.first().cloned() else {
                     return Ok(());
                 };
-                let mut probe: SortBuffer<u64> = SortBuffer::new(
+                let mut probe: SortBuffer<u64> = with_pool(SortBuffer::new(
                     sort_by.clone(),
                     usize::MAX,
                     None,
                     true,
                     schema.clone(),
                     test_allocation_resources(),
-                );
+                ));
                 probe.push(first, first_payload);
                 let row_bytes = probe.bytes_used();
                 prop_assert!(row_bytes > 0);
@@ -543,14 +617,14 @@ mod tests {
                 let arbitrator =
                     MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
                 for rows_per_run in [1usize, 2, 7] {
-                    let mut buffer: SortBuffer<u64> = SortBuffer::new(
+                    let mut buffer: SortBuffer<u64> = with_pool(SortBuffer::new(
                         sort_by.clone(),
                         rows_per_run * row_bytes,
                         None,
                         true,
                         schema.clone(),
                         test_allocation_resources(),
-                    );
+                    ));
                     let mut pending = 0usize;
                     for (record, payload) in input.iter().cloned() {
                         let before = buffer.bytes_used();

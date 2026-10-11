@@ -75,10 +75,11 @@ impl GroupBoundary {
         }
     }
 
-    /// Borrow the owned encoder. Used by callers that need to encode a
+    /// Borrow the owned encoder, mutably: encoding a record may re-bind it to
+    /// the record's schema handle. Used by callers that need to encode a
     /// record into [`Self::current`] before calling [`Self::push`].
-    pub(crate) fn encoder(&self) -> &SortKeyEncoder {
-        &self.encoder
+    pub(crate) fn encoder_mut(&mut self) -> &mut SortKeyEncoder {
+        &mut self.encoder
     }
 
     /// Whether a per-group state is currently open (i.e. at least one

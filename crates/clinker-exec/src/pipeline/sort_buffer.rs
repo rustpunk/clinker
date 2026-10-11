@@ -8,8 +8,11 @@
 //!
 //! Two ordering modes, chosen at construction:
 //!   - Field-ordered ([`SortBuffer::new`]): the sort key is read from the
-//!     record via [`compare_authored_keys`] and the payload rides along
-//!     inert. Every source/output/DAG/join sort uses this.
+//!     record by the authored comparator
+//!     ([`compare_authored_keys`](crate::pipeline::sort_key::compare_authored_keys)),
+//!     its fields resolved to column positions once against the buffer's
+//!     schema, and the payload rides along inert. Every source/output/DAG/join
+//!     sort uses this.
 //!   - Payload-ordered ([`SortBuffer::new_payload_ordered`]): pairs order by the
 //!     payload `P: Ord` directly, with no record field consulted. This serves a
 //!     sort whose key is a value computed off the record — e.g. a range join
@@ -30,7 +33,7 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use clinker_record::{Record, Schema};
 
-use crate::pipeline::sort_key::compare_authored_keys;
+use crate::pipeline::sort_key::ResolvedSortKeys;
 use crate::pipeline::spill::{SpillFile, SpillWriter};
 use clinker_plan::SpillError;
 use clinker_plan::config::SortField;
@@ -108,9 +111,10 @@ pub enum SortedOutput<P> {
 
 /// How a [`SortBuffer`] orders its accumulated pairs.
 enum SortOrdering {
-    /// Order by [`compare_authored_keys`] over these fields; the record
-    /// carries the sort key and the payload rides along inert.
-    Fields(Vec<SortField>),
+    /// Order by the authored fields, resolved once against the buffer's
+    /// schema; the record carries the sort key and the payload rides along
+    /// inert.
+    Fields(ResolvedSortKeys),
     /// Order by the carried payload `P: Ord` directly, with no record field
     /// consulted. For a sort key computed off the record rather than stored in
     /// a column.
@@ -166,7 +170,10 @@ impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
     ) -> Self {
         Self {
             pairs: Vec::new(),
-            ordering: SortOrdering::Fields(sort_by),
+            ordering: SortOrdering::Fields(ResolvedSortKeys::for_sort_fields(
+                &sort_by,
+                Some(&schema),
+            )),
             bytes_used: 0,
             unaccounted_bytes_used: 0,
             allocation_resources,
@@ -254,11 +261,11 @@ impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
             ..
         } = self;
         match (ordering, kernel_pool.as_deref()) {
-            (SortOrdering::Fields(sort_by), Some(pool)) => pool.install(|| {
-                pairs.par_sort_by(|(a, _), (b, _)| compare_authored_keys(a, b, sort_by));
+            (SortOrdering::Fields(keys), Some(pool)) => pool.install(|| {
+                pairs.par_sort_by(|(a, _), (b, _)| keys.compare(a, b));
             }),
-            (SortOrdering::Fields(sort_by), None) => {
-                pairs.sort_by(|(a, _), (b, _)| compare_authored_keys(a, b, sort_by));
+            (SortOrdering::Fields(keys), None) => {
+                pairs.sort_by(|(a, _), (b, _)| keys.compare(a, b));
             }
             (SortOrdering::Payload, Some(pool)) => pool.install(|| {
                 pairs.par_sort_by(|(_, a), (_, b)| a.cmp(b));
@@ -267,14 +274,50 @@ impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
         }
     }
 
+    /// Check that every resident row has this buffer's columns, which a spilled
+    /// run requires: it stores each row's values by position and decodes them
+    /// under the buffer's schema, so a row of other columns would come back
+    /// with its values under the wrong names. Refusing the spill, in every
+    /// build, is what keeps that outcome unrepresentable; a resident sort
+    /// keeps each row's own schema and never needs the check.
+    ///
+    /// A row behind the buffer's own handle passes by pointer; a run of rows
+    /// behind one other handle compares its columns once.
+    fn check_rows_have_buffer_columns(&self) -> Result<(), SpillError> {
+        let mut accepted: Option<&SharedStorage<Schema>> = None;
+        for (record, _) in &self.pairs {
+            let schema = record.schema();
+            if SharedStorage::ptr_eq(schema, &self.schema)
+                || accepted.is_some_and(|handle| SharedStorage::ptr_eq(handle, schema))
+            {
+                continue;
+            }
+            if schema.columns() != self.schema.columns() {
+                return Err(SpillError::InvalidSchema(format!(
+                    "a sort buffer over columns {:?} cannot spill a row whose columns are {:?}: \
+                     a spilled run stores each row's values by position under the buffer's \
+                     columns",
+                    self.schema.columns(),
+                    schema.columns(),
+                )));
+            }
+            accepted = Some(schema);
+        }
+        Ok(())
+    }
+
     /// Sort the current in-memory pairs and write them to a spill file. Clears
     /// the buffer and resets the byte counter. Returns the spilled file's exact
     /// on-disk byte length so the caller can charge it against the pipeline
     /// disk-spill quota; an empty buffer writes nothing and returns 0.
+    ///
+    /// Fails, leaving the buffer as it was, when a resident row's columns are
+    /// not the buffer's ([`SpillError::InvalidSchema`]).
     pub fn sort_and_spill(&mut self) -> Result<u64, SpillError> {
         if self.pairs.is_empty() {
             return Ok(0);
         }
+        self.check_rows_have_buffer_columns()?;
 
         self.sort_pairs();
 
@@ -688,6 +731,64 @@ mod tests {
         buf.push(make_record(&schema, "r", 9), (9, 0, 9));
         match buf.finish().unwrap().0 {
             SortedOutput::Spilled(files) => assert_eq!(files.len(), 4, "3 flushes + 1 residue"),
+            SortedOutput::InMemory(_) => panic!("expected Spilled"),
+        }
+    }
+
+    /// A row of other columns may sit in the buffer, and sorts by name, but
+    /// the buffer refuses to spill it in every build: a spilled run would
+    /// reattach the buffer's schema to the row's positional values. A row of
+    /// the same columns behind another schema handle spills as the buffer's
+    /// own rows do.
+    #[test]
+    fn sort_buffer_refuses_to_spill_a_record_whose_columns_differ_from_its_schema() {
+        let schema = test_schema();
+        let reordered =
+            SharedStorage::from_arc(Arc::new(Schema::new(vec!["value".into(), "name".into()])));
+        let mut buf: SortBuffer<()> = SortBuffer::new(
+            sort_by_value_asc(),
+            1_000_000,
+            None,
+            true,
+            schema.clone(),
+            test_allocation_resources(),
+        );
+        buf.push(make_record(&schema, "a", 2), ());
+        buf.push(
+            Record::new(
+                reordered,
+                vec![Value::Integer(1), Value::String("b".into())],
+            ),
+            (),
+        );
+        let error = buf.sort_and_spill().unwrap_err();
+        assert!(
+            matches!(&error, SpillError::InvalidSchema(message)
+                if message.contains("cannot spill a row whose columns are")),
+            "{error}"
+        );
+        assert_eq!(
+            buf.total_rows(),
+            2,
+            "the refused spill keeps the buffer's rows"
+        );
+
+        let same_columns = test_schema();
+        assert!(!SharedStorage::ptr_eq(&same_columns, &schema));
+        let mut buf: SortBuffer<()> = SortBuffer::new(
+            sort_by_value_asc(),
+            1_000_000,
+            None,
+            true,
+            schema.clone(),
+            test_allocation_resources(),
+        );
+        buf.push(make_record(&schema, "a", 2), ());
+        buf.push(make_record(&same_columns, "b", 1), ());
+        buf.sort_and_spill()
+            .expect("a row of the buffer's columns behind another handle spills");
+        match buf.finish().unwrap().0 {
+            SortedOutput::Spilled(files) => assert_eq!(files.len(), 1),
             SortedOutput::InMemory(_) => panic!("expected Spilled"),
         }
     }

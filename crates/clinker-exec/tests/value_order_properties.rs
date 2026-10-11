@@ -704,8 +704,9 @@ proptest! {
 
     /// The Sort node's byte key orders two records exactly as its comparator
     /// does, over one to three fields with any direction and nulls first or
-    /// last: the spilled merge and the streaming aggregate compare the bytes,
-    /// the resident sort the comparator.
+    /// last: the streaming aggregate and the aggregate spill merge compare the
+    /// bytes, while the resident sort and the merge of spilled sort runs call
+    /// the comparator.
     #[test]
     fn authored_key_encoder_agrees_with_authored_comparator(
         fields in prop::collection::vec((slot_pair(), any::<bool>(), any::<bool>()), 1..=3),

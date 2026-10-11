@@ -834,7 +834,7 @@ impl RegisteredTables {
         &mut self,
         doc_id: DocumentId,
         factory: &DocAggregatorFactory,
-    ) -> Result<Option<GroupTable>, PipelineError> {
+    ) -> Result<Option<ChargedAggregateStream>, PipelineError> {
         if !self.flushed.insert(doc_id) {
             return Ok(None);
         }
@@ -933,9 +933,9 @@ impl Drop for RegisteredTables {
     }
 }
 
-/// One group table of an Aggregate arm: the table and the consumer it is
-/// charged to.
-pub(crate) type GroupTable = (
+/// One Aggregate arm's stream, which holds its group table, and the consumer
+/// that table is charged to.
+pub(crate) type ChargedAggregateStream = (
     crate::aggregation::AggregateStream,
     crate::pipeline::memory::ConsumerId,
 );
@@ -955,10 +955,10 @@ pub(crate) trait KeyedGroupTables {
     type Key: Eq + std::hash::Hash + Clone;
 
     /// The tables, by key.
-    fn tables(&self) -> &HashMap<Self::Key, GroupTable>;
+    fn tables(&self) -> &HashMap<Self::Key, ChargedAggregateStream>;
 
     /// The tables, by key, to add to or take from.
-    fn tables_mut(&mut self) -> &mut HashMap<Self::Key, GroupTable>;
+    fn tables_mut(&mut self) -> &mut HashMap<Self::Key, ChargedAggregateStream>;
 }
 
 /// Spill the table among `tables` that consumer `id` charges, for the pass
@@ -966,7 +966,7 @@ pub(crate) trait KeyedGroupTables {
 /// when it holds them all on disk, not held when no table here is `id`'s.
 /// The table records the run under its node; never reserves.
 fn spill_elected_table<K>(
-    tables: &mut HashMap<K, GroupTable>,
+    tables: &mut HashMap<K, ChargedAggregateStream>,
     id: crate::pipeline::memory::ConsumerId,
 ) -> Result<OwnedSpillResult, PipelineError> {
     let Some((stream, _)) = tables.values_mut().find(|(_, consumer)| *consumer == id) else {
@@ -994,11 +994,11 @@ impl WalkOwnedSpill for RegisteredTables {
 impl KeyedGroupTables for RegisteredTables {
     type Key = DocumentId;
 
-    fn tables(&self) -> &HashMap<DocumentId, GroupTable> {
+    fn tables(&self) -> &HashMap<DocumentId, ChargedAggregateStream> {
         &self.tables
     }
 
-    fn tables_mut(&mut self) -> &mut HashMap<DocumentId, GroupTable> {
+    fn tables_mut(&mut self) -> &mut HashMap<DocumentId, ChargedAggregateStream> {
         &mut self.tables
     }
 }
@@ -1012,7 +1012,7 @@ impl KeyedGroupTables for RegisteredTables {
 /// arbitrator's registry that every later pass would elect and find out of
 /// the walk's reach.
 pub(crate) struct WindowTables<K> {
-    tables: HashMap<K, GroupTable>,
+    tables: HashMap<K, ChargedAggregateStream>,
     arbitrator: Arc<crate::pipeline::memory::MemoryArbitrator>,
 }
 
@@ -1039,11 +1039,11 @@ impl<K: 'static> WalkOwnedSpill for WindowTables<K> {
 impl<K: Eq + std::hash::Hash + Clone> KeyedGroupTables for WindowTables<K> {
     type Key = K;
 
-    fn tables(&self) -> &HashMap<K, GroupTable> {
+    fn tables(&self) -> &HashMap<K, ChargedAggregateStream> {
         &self.tables
     }
 
-    fn tables_mut(&mut self) -> &mut HashMap<K, GroupTable> {
+    fn tables_mut(&mut self) -> &mut HashMap<K, ChargedAggregateStream> {
         &mut self.tables
     }
 }
@@ -1099,7 +1099,7 @@ impl<T: KeyedGroupTables> WalkGroupTables<T> {
     fn add_with(
         &self,
         key: T::Key,
-        make: impl FnOnce() -> Result<GroupTable, PipelineError>,
+        make: impl FnOnce() -> Result<ChargedAggregateStream, PipelineError>,
         record: &Record,
         row_num: crate::executor::stream_event::SourceRowId,
         eval_ctx: &EvalContext,
@@ -1127,7 +1127,7 @@ impl<T: KeyedGroupTables> WalkGroupTables<T> {
 
     /// Take the table under `key` out of the cell for its finalize, under
     /// one short borrow; `None` when there is none.
-    pub(crate) fn take(&mut self, key: &T::Key) -> Option<GroupTable> {
+    pub(crate) fn take(&mut self, key: &T::Key) -> Option<ChargedAggregateStream> {
         let table = self.cell.borrow_mut().tables_mut().remove(key)?;
         Some(self.withdraw(table))
     }
@@ -1140,7 +1140,7 @@ impl<T: KeyedGroupTables> WalkGroupTables<T> {
     /// A table leaving the cell leaves the walk reclaim set with it, and
     /// ranks by 0 from here on: it is being finalized, and no pass can reach
     /// it.
-    fn withdraw(&mut self, mut table: GroupTable) -> GroupTable {
+    fn withdraw(&mut self, mut table: ChargedAggregateStream) -> ChargedAggregateStream {
         self.registrations.remove(&table.1);
         table.0.begin_finalize();
         table
@@ -1222,7 +1222,7 @@ impl WalkGroupTables<RegisteredTables> {
         &mut self,
         doc_id: DocumentId,
         factory: &DocAggregatorFactory,
-    ) -> Result<Option<GroupTable>, PipelineError> {
+    ) -> Result<Option<ChargedAggregateStream>, PipelineError> {
         let table = self
             .cell
             .borrow_mut()
@@ -1271,7 +1271,7 @@ impl<K: Eq + std::hash::Hash + Clone + 'static> WalkGroupTables<WindowTables<K>>
     pub(crate) fn add_window_record(
         &mut self,
         key: K,
-        make: impl FnOnce() -> Result<GroupTable, PipelineError>,
+        make: impl FnOnce() -> Result<ChargedAggregateStream, PipelineError>,
         record: &Record,
         row_num: crate::executor::stream_event::SourceRowId,
         eval_ctx: &EvalContext,

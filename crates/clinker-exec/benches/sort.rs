@@ -1,9 +1,53 @@
+//! Sort benchmarks.
+//!
+//! The `sort_*` groups time the window partition sort (`sort_partition`) over
+//! arena positions. `sort_buffer_in_memory` times a field-ordered
+//! `SortBuffer` that holds every row: push, sort and finish, sequentially and
+//! on a dedicated eight-thread pool, over key shapes that stress the
+//! comparator differently (an integer, short and long strings, a string
+//! sharing a 16-byte prefix, a three-field mixed key, a leading date-time, and
+//! a low-cardinality integer with real ties). A cardinality sweep adds an
+//! integer key with 64, 1,000 and 16,000 distinct values at 100,000 rows, so
+//! the cost between a few repeated keys and all-distinct keys is measured
+//! rather than inferred from the two ends.
+//!
+//! `sort_buffer_sort_only` repeats those shapes, sizes and the sequential and
+//! pooled split, but times the buffer's `finish()` alone: the push happens in
+//! untimed setup and the sorted output is dropped outside the timed region.
+//!
+//! `sort_buffer_spilled` times the external sort: the same buffer with a
+//! threshold that forms about sixteen runs, then the field-ordered k-way merge
+//! of those runs. The merge entry point is a `test-utils` wrapper, so this group
+//! builds only with `--features test-utils`; a default
+//! `cargo bench -p clinker-exec --bench sort` measures every other group.
+//! Spill files go to the OS temp directory (`TMPDIR`).
+//!
+//! `sort_key_encode` times the group-key encoder the streaming Aggregate runs
+//! once per record and the Aggregate spill runs once per drained group: one
+//! encoder over 100,000 records into one reused key buffer. The records are
+//! built once, outside the timed region, and each batch takes a fresh encoder.
+//! `mixed3_other_handle` carries the first record behind one schema handle and
+//! every later one behind another handle with the same columns, so it times
+//! one re-bind of the encoder to a second handle and the positional reads
+//! that follow it.
+
+use chrono::{NaiveDate, TimeDelta};
+use clinker_bench_support::group_keys::permuted;
 use clinker_bench_support::{LARGE, MEDIUM, RecordFactory, SMALL};
+use clinker_exec::executor::SourceRowId;
 use clinker_exec::pipeline::arena::Arena;
-use clinker_plan::config::{NullPlacement, OrderField, SortOrder};
-use clinker_record::owned_storage::SharedStorage;
-use clinker_record::{MinimalRecord, Schema, Value};
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use clinker_exec::pipeline::sort_buffer::{SortBuffer, SortedOutput};
+use clinker_exec::pipeline::sort_key::{ResolvedSortKeys, SortKeyEncoder};
+use clinker_format::preparation::MemoryOnlyResources;
+use clinker_plan::config::{NullOrder, NullPlacement, OrderField, SortField, SortOrder};
+use clinker_plan::plan::{EntityRef, PlanNodeId};
+use clinker_record::owned_storage::{AllocationResources, SharedStorage};
+use clinker_record::{MinimalRecord, Record, Schema, Value};
+use criterion::{
+    BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
+};
+use rust_decimal::Decimal;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 /// Build an Arena from generated records for sort benchmarks.
@@ -35,13 +79,14 @@ fn bench_sort_single_field(c: &mut Criterion) {
 
     for count in [SMALL, MEDIUM, LARGE] {
         let arena = build_arena(count, 10, 0.0);
+        let order = ResolvedSortKeys::for_order_fields(&sort_by, arena.schema());
         let positions_template: Vec<u64> = (0..count as u64).collect();
 
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
             b.iter(|| {
                 let mut positions = positions_template.clone();
-                clinker_exec::pipeline::sort::sort_partition(&arena, &mut positions, &sort_by);
+                clinker_exec::pipeline::sort::sort_partition(&arena, &mut positions, &order);
                 black_box(&positions);
             });
         });
@@ -61,13 +106,14 @@ fn bench_sort_multi_field(c: &mut Criterion) {
 
     for count in [SMALL, MEDIUM, LARGE] {
         let arena = build_arena(count, 10, 0.0);
+        let order = ResolvedSortKeys::for_order_fields(&sort_by, arena.schema());
         let positions_template: Vec<u64> = (0..count as u64).collect();
 
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
             b.iter(|| {
                 let mut positions = positions_template.clone();
-                clinker_exec::pipeline::sort::sort_partition(&arena, &mut positions, &sort_by);
+                clinker_exec::pipeline::sort::sort_partition(&arena, &mut positions, &order);
                 black_box(&positions);
             });
         });
@@ -84,13 +130,14 @@ fn bench_sort_with_nulls(c: &mut Criterion) {
     for null_pct in [0, 10, 50] {
         let null_ratio = null_pct as f64 / 100.0;
         let arena = build_arena(MEDIUM, 10, null_ratio);
+        let order = ResolvedSortKeys::for_order_fields(&sort_by, arena.schema());
         let positions_template: Vec<u64> = (0..MEDIUM as u64).collect();
 
         group.throughput(Throughput::Elements(MEDIUM as u64));
         group.bench_with_input(BenchmarkId::new("null_pct", null_pct), &null_pct, |b, _| {
             b.iter(|| {
                 let mut positions = positions_template.clone();
-                clinker_exec::pipeline::sort::sort_partition(&arena, &mut positions, &sort_by);
+                clinker_exec::pipeline::sort::sort_partition(&arena, &mut positions, &order);
                 black_box(&positions);
             });
         });
@@ -111,13 +158,14 @@ fn bench_sort_presorted(c: &mut Criterion) {
             .map(|i| MinimalRecord::new(vec![Value::Integer(i as i64), Value::Null]))
             .collect();
         let arena = Arena::from_parts(schema, minimals);
+        let order = ResolvedSortKeys::for_order_fields(&sort_by, arena.schema());
         let positions_template: Vec<u64> = (0..count as u64).collect();
 
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
             b.iter(|| {
                 let mut positions = positions_template.clone();
-                clinker_exec::pipeline::sort::sort_partition(&arena, &mut positions, &sort_by);
+                clinker_exec::pipeline::sort::sort_partition(&arena, &mut positions, &order);
                 black_box(&positions);
             });
         });
@@ -138,13 +186,14 @@ fn bench_sort_reverse(c: &mut Criterion) {
             .map(|i| MinimalRecord::new(vec![Value::Integer(i as i64), Value::Null]))
             .collect();
         let arena = Arena::from_parts(schema, minimals);
+        let order = ResolvedSortKeys::for_order_fields(&sort_by, arena.schema());
         let positions_template: Vec<u64> = (0..count as u64).collect();
 
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
             b.iter(|| {
                 let mut positions = positions_template.clone();
-                clinker_exec::pipeline::sort::sort_partition(&arena, &mut positions, &sort_by);
+                clinker_exec::pipeline::sort::sort_partition(&arena, &mut positions, &order);
                 black_box(&positions);
             });
         });
@@ -152,6 +201,406 @@ fn bench_sort_reverse(c: &mut Criterion) {
     group.finish();
 }
 
+// ── SortBuffer: field-ordered, resident and spilled ────────────────
+
+/// One `(record, payload)` input row, as a Sort node pushes it.
+type BufferRow = (Record, SourceRowId);
+
+/// Fixed lowercase base-36 digits of `n`, left-padded with `0` to `width`.
+fn base36(mut n: u64, width: usize) -> String {
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut out = Vec::with_capacity(width);
+    while n > 0 {
+        out.push(DIGITS[(n % 36) as usize]);
+        n /= 36;
+    }
+    while out.len() < width {
+        out.push(b'0');
+    }
+    out.reverse();
+    String::from_utf8(out).expect("base-36 digits are ASCII")
+}
+
+fn string_value(s: String) -> Value {
+    Value::String(s.into())
+}
+
+fn buffer_key(name: &str, order: SortOrder, null_order: Option<NullOrder>) -> SortField {
+    SortField {
+        field: name.to_string(),
+        order,
+        null_order,
+    }
+}
+
+/// A sort-buffer input shape: its schema, sort fields and rows.
+struct BufferShape {
+    schema: SharedStorage<Schema>,
+    sort_by: Vec<SortField>,
+    rows: Vec<BufferRow>,
+}
+
+fn buffer_shape(shape: &str, rows: usize) -> BufferShape {
+    let column_names: &[&str] = match shape {
+        "mixed3" => &["s", "n", "f"],
+        "datetime_lead" => &["t", "n"],
+        _ => &["k"],
+    };
+    let schema = SharedStorage::from_arc(Arc::new(Schema::new(
+        column_names.iter().map(|name| (*name).into()).collect(),
+    )));
+    let sort_by = match shape {
+        "mixed3" => vec![
+            buffer_key("s", SortOrder::Asc, Some(NullOrder::Last)),
+            buffer_key("n", SortOrder::Desc, Some(NullOrder::First)),
+            buffer_key("f", SortOrder::Asc, None),
+        ],
+        "datetime_lead" => vec![
+            buffer_key("t", SortOrder::Asc, None),
+            buffer_key("n", SortOrder::Asc, None),
+        ],
+        _ => vec![buffer_key("k", SortOrder::Asc, None)],
+    };
+    let epoch = NaiveDate::from_ymd_opt(2020, 1, 1)
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .expect("a valid instant");
+    let source = <PlanNodeId as EntityRef>::new(1);
+    let rows = (0..rows)
+        .map(|i| {
+            let p = permuted(i, rows);
+            // A second scramble, independent of `p`, decides nulls so they do
+            // not line up with the key order.
+            let q = (i as u64).wrapping_mul(0x2545_F491) % 1_000;
+            let values = match shape {
+                "int" => vec![Value::Integer(p as i64)],
+                "short_string" => vec![string_value(base36(p, 4 + i % 3))],
+                "prefixed_string" => {
+                    let mut s = String::from("shared-prefix-16");
+                    s.push_str(&base36(p, 8));
+                    s.extend(std::iter::repeat_n('x', i % 17));
+                    vec![string_value(s)]
+                }
+                "mixed3" => vec![
+                    if q.is_multiple_of(10) {
+                        Value::Null
+                    } else {
+                        string_value(format!("name-{}", p % 1_000))
+                    },
+                    if q % 10 == 1 {
+                        Value::Null
+                    } else {
+                        Value::Integer((p % 100) as i64)
+                    },
+                    if q % 10 == 2 {
+                        Value::Null
+                    } else {
+                        Value::Float(p as f64 / 7.0)
+                    },
+                ],
+                "datetime_lead" => vec![
+                    Value::DateTime(epoch + TimeDelta::seconds(p as i64)),
+                    Value::Integer((i % 1_000) as i64),
+                ],
+                "low_card" => vec![Value::Integer((p % 16) as i64)],
+                other => match swept_cardinality(other) {
+                    Some(distinct) => vec![Value::Integer((p % distinct) as i64)],
+                    None => unreachable!("unknown sort-buffer shape {other}"),
+                },
+            };
+            let record = Record::new(schema.clone(), values);
+            (record, SourceRowId::new(source, i as u64 + 1))
+        })
+        .collect();
+    BufferShape {
+        schema,
+        sort_by,
+        rows,
+    }
+}
+
+fn buffer_resources() -> AllocationResources {
+    MemoryOnlyResources::new(NonZeroUsize::new(1 << 30).expect("non-zero"))
+        .resources()
+        .allocation()
+        .clone()
+}
+
+/// The sort's own kernel pool: eight workers, built once outside any timed
+/// region.
+fn eight_thread_pool() -> Arc<rayon::ThreadPool> {
+    Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .expect("build the bench kernel pool"),
+    )
+}
+
+fn new_buffer(
+    shape: &BufferShape,
+    threshold: usize,
+    spill_dir: Option<std::path::PathBuf>,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    resources: &AllocationResources,
+) -> SortBuffer<SourceRowId> {
+    let buffer = SortBuffer::new(
+        shape.sort_by.clone(),
+        threshold,
+        spill_dir,
+        true,
+        shape.schema.clone(),
+        resources.clone(),
+    );
+    match pool {
+        Some(pool) => buffer.with_kernel_pool(Arc::clone(pool)),
+        None => buffer,
+    }
+}
+
+/// The cardinality sweep: one integer key with this many distinct values,
+/// scrambled like `low_card`, measured at [`CARDINALITY_SWEEP_ROWS`] rows only.
+/// Between `low_card`'s 16 values and `int`'s all-distinct key it measures how
+/// a sort's cost varies with the number of distinct keys, the evidence any
+/// choice of sort strategy by key cardinality needs.
+const CARDINALITY_SWEEP: [&str; 3] = ["card_64", "card_1000", "card_16000"];
+
+const CARDINALITY_SWEEP_ROWS: usize = 100_000;
+
+/// The distinct-value count a `card_<k>` sweep shape names.
+fn swept_cardinality(shape: &str) -> Option<u64> {
+    shape.strip_prefix("card_")?.parse().ok()
+}
+
+const BUFFER_SHAPES: [&str; 6] = [
+    "int",
+    "short_string",
+    "prefixed_string",
+    "mixed3",
+    "datetime_lead",
+    "low_card",
+];
+
+fn bench_sort_buffer_in_memory(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sort_buffer_in_memory");
+    let pool = eight_thread_pool();
+    let resources = buffer_resources();
+    let sized_shapes = BUFFER_SHAPES
+        .iter()
+        .flat_map(|shape| [10_000usize, 100_000].map(|rows| (*shape, rows)))
+        .chain(
+            CARDINALITY_SWEEP
+                .iter()
+                .map(|shape| (*shape, CARDINALITY_SWEEP_ROWS)),
+        );
+    for (shape_name, rows) in sized_shapes {
+        let shape = buffer_shape(shape_name, rows);
+        group.throughput(Throughput::Elements(rows as u64));
+        for (mode, pool) in [("seq", None), ("pool", Some(&pool))] {
+            group.bench_with_input(
+                BenchmarkId::new(format!("{shape_name}/{mode}"), rows),
+                &rows,
+                |b, _| {
+                    b.iter_batched(
+                        || shape.rows.clone(),
+                        |input| {
+                            let mut buffer = new_buffer(&shape, usize::MAX, None, pool, &resources);
+                            for (record, payload) in input {
+                                buffer.push(record, payload);
+                            }
+                            match buffer.finish().expect("resident sort") {
+                                (SortedOutput::InMemory(sorted), _) => black_box(sorted),
+                                (SortedOutput::Spilled(_), _) => {
+                                    unreachable!("an unbounded threshold spilled")
+                                }
+                            };
+                        },
+                        BatchSize::LargeInput,
+                    );
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+/// The shapes, sizes and sequential/pooled split of `sort_buffer_in_memory`,
+/// timing `finish()` alone. Each iteration's buffer is built and every row
+/// pushed in untimed setup, and the sorted output is returned so criterion
+/// drops it outside the timed region: a change in the sort itself is not
+/// diluted by the push and the drop around it.
+fn bench_sort_buffer_sort_only(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sort_buffer_sort_only");
+    let pool = eight_thread_pool();
+    let resources = buffer_resources();
+    let sized_shapes = BUFFER_SHAPES
+        .iter()
+        .flat_map(|shape| [10_000usize, 100_000].map(|rows| (*shape, rows)))
+        .chain(
+            CARDINALITY_SWEEP
+                .iter()
+                .map(|shape| (*shape, CARDINALITY_SWEEP_ROWS)),
+        );
+    for (shape_name, rows) in sized_shapes {
+        let shape = buffer_shape(shape_name, rows);
+        group.throughput(Throughput::Elements(rows as u64));
+        for (mode, pool) in [("seq", None), ("pool", Some(&pool))] {
+            group.bench_with_input(
+                BenchmarkId::new(format!("{shape_name}/{mode}"), rows),
+                &rows,
+                |b, _| {
+                    b.iter_batched(
+                        || {
+                            let mut buffer = new_buffer(&shape, usize::MAX, None, pool, &resources);
+                            for (record, payload) in shape.rows.iter().cloned() {
+                                buffer.push(record, payload);
+                            }
+                            buffer
+                        },
+                        |buffer| match buffer.finish().expect("resident sort") {
+                            (SortedOutput::InMemory(sorted), _) => sorted,
+                            (SortedOutput::Spilled(_), _) => {
+                                unreachable!("an unbounded threshold spilled")
+                            }
+                        },
+                        BatchSize::LargeInput,
+                    );
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+#[cfg(feature = "test-utils")]
+fn bench_sort_buffer_spilled(c: &mut Criterion) {
+    use clinker_exec::pipeline::spill_merge::merge_sorted_runs_for_testing;
+
+    let mut group = c.benchmark_group("sort_buffer_spilled");
+    group.sample_size(20);
+    let pool = eight_thread_pool();
+    let resources = buffer_resources();
+    let rows = 100_000usize;
+    for shape_name in ["int", "prefixed_string", "mixed3"] {
+        let shape = buffer_shape(shape_name, rows);
+        // Size the threshold from one row's charge so about sixteen runs form,
+        // whatever a row costs the buffer.
+        let mut probe = new_buffer(&shape, usize::MAX, None, None, &resources);
+        let (record, payload) = shape.rows[0].clone();
+        probe.push(record, payload);
+        let threshold = probe.bytes_used() * rows / 16;
+        group.throughput(Throughput::Elements(rows as u64));
+        group.bench_with_input(
+            BenchmarkId::new(format!("{shape_name}/pool"), rows),
+            &rows,
+            |b, _| {
+                b.iter_batched(
+                    || shape.rows.clone(),
+                    |input| {
+                        let mut buffer = new_buffer(
+                            &shape,
+                            threshold,
+                            Some(std::env::temp_dir()),
+                            Some(&pool),
+                            &resources,
+                        );
+                        for (record, payload) in input {
+                            buffer.push(record, payload);
+                            if buffer.should_spill() {
+                                buffer.sort_and_spill().expect("spill a sorted run");
+                            }
+                        }
+                        match buffer.finish().expect("finish the external sort") {
+                            (SortedOutput::Spilled(files), _) => black_box(
+                                merge_sorted_runs_for_testing(files, &shape.sort_by)
+                                    .expect("merge the spilled runs"),
+                            ),
+                            (SortedOutput::InMemory(sorted), _) => black_box(sorted),
+                        };
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
+/// Records per `sort_key_encode` batch.
+const KEY_ENCODE_ROWS: usize = 100_000;
+
+/// Group-key shapes: a 16-byte string, an integer, and a string, an integer
+/// and a decimal; `mixed3_other_handle` is `mixed3` with every record after
+/// the first behind a second handle of the same columns.
+const KEY_ENCODE_SHAPES: [&str; 4] = ["str16", "int", "mixed3", "mixed3_other_handle"];
+
+/// The sort fields and records of one `sort_key_encode` shape. Every field
+/// sorts ascending with nulls first, as an Aggregate's group key does.
+fn key_encode_input(shape: &str, rows: usize) -> (Vec<SortField>, Vec<Record>) {
+    let columns: &[&str] = match shape {
+        "str16" | "int" => &["k"],
+        _ => &["s", "n", "d"],
+    };
+    let schema = || {
+        SharedStorage::from_arc(Arc::new(Schema::new(
+            columns.iter().map(|name| (*name).into()).collect(),
+        )))
+    };
+    let (first, other) = (schema(), schema());
+    let sort_by = columns
+        .iter()
+        .map(|name| buffer_key(name, SortOrder::Asc, Some(NullOrder::First)))
+        .collect();
+    let records = (0..rows)
+        .map(|i| {
+            let p = permuted(i, rows);
+            let values = match shape {
+                "str16" => vec![string_value(format!("k{}", base36(p, 15)))],
+                "int" => vec![Value::Integer(p as i64)],
+                _ => vec![
+                    string_value(format!("name-{}", p % 1_000)),
+                    Value::Integer((p / 1_000) as i64),
+                    Value::Decimal(Decimal::new(p as i64, (p % 5) as u32)),
+                ],
+            };
+            let handle = if shape == "mixed3_other_handle" && i > 0 {
+                &other
+            } else {
+                &first
+            };
+            Record::new(handle.clone(), values)
+        })
+        .collect();
+    (sort_by, records)
+}
+
+fn bench_sort_key_encode(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sort_key_encode");
+    for shape in KEY_ENCODE_SHAPES {
+        let (sort_by, records) = key_encode_input(shape, KEY_ENCODE_ROWS);
+        group.throughput(Throughput::Elements(KEY_ENCODE_ROWS as u64));
+        group.bench_with_input(
+            BenchmarkId::new(shape, KEY_ENCODE_ROWS),
+            &KEY_ENCODE_ROWS,
+            |b, _| {
+                b.iter_batched(
+                    || SortKeyEncoder::new(sort_by.clone()),
+                    |mut encoder| {
+                        let mut key = Vec::new();
+                        for record in &records {
+                            encoder.encode_into(record, &mut key);
+                            black_box(&key);
+                        }
+                        encoder
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
+#[cfg(feature = "test-utils")]
 criterion_group!(
     benches,
     bench_sort_single_field,
@@ -159,5 +608,21 @@ criterion_group!(
     bench_sort_with_nulls,
     bench_sort_presorted,
     bench_sort_reverse,
+    bench_sort_buffer_in_memory,
+    bench_sort_buffer_sort_only,
+    bench_sort_buffer_spilled,
+    bench_sort_key_encode,
+);
+#[cfg(not(feature = "test-utils"))]
+criterion_group!(
+    benches,
+    bench_sort_single_field,
+    bench_sort_multi_field,
+    bench_sort_with_nulls,
+    bench_sort_presorted,
+    bench_sort_reverse,
+    bench_sort_buffer_in_memory,
+    bench_sort_buffer_sort_only,
+    bench_sort_key_encode,
 );
 criterion_main!(benches);

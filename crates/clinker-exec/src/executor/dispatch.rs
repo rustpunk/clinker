@@ -4436,9 +4436,16 @@ pub(crate) fn finalize_node_rooted_windows(
         // sees normalized via this sort. lag/lead determinism over
         // hash-aggregate non-deterministic emit comes from this step.
         if !spec.already_sorted {
+            // The fields are resolved once per window against the arena's
+            // schema; every partition reads them by position and allocates
+            // nothing of its own.
+            let order = crate::pipeline::sort_key::ResolvedSortKeys::for_order_fields(
+                &spec.sort_by,
+                arena.schema(),
+            );
             for partition in secondary_index.groups.values_mut() {
-                if !crate::pipeline::sort::is_sorted(&arena, partition, &spec.sort_by) {
-                    crate::pipeline::sort::sort_partition(&arena, partition, &spec.sort_by);
+                if !crate::pipeline::sort::is_sorted(&arena, partition, &order) {
+                    crate::pipeline::sort::sort_partition(&arena, partition, &order);
                 }
             }
         }
