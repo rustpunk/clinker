@@ -25,7 +25,11 @@ each port. A call writes what the same nodes written in the pipeline at the
 call site would write. A Sink with `include_unmapped: false` reading a call
 now writes only the columns the node behind the composition's first output
 port emits, as it does after the same nodes written inline; before, it wrote
-every column the call passed on. One exception remains open: an Aggregate
+every column the call passed on. Some shapes are still not equivalent: a call
+carries only the rows of its composition's first output port, so a composition
+whose output reads a Route, one with several output ports, and a Cull's
+`removed_to` rows differ from the same nodes inline
+([#1315](https://github.com/rustpunk/clinker/issues/1315)); and an Aggregate
 inside a composition fed by a source that declares a `correlation_key` stops
 with `E314` where the inline Aggregate runs. Columns the port does not declare pass through the composition in the
 caller's position, so a call fed by a Transform that adds a column runs and
