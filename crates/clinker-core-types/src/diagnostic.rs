@@ -293,6 +293,7 @@ diagnostic_registry! {
     "E166", Error, "Composition-body window is rooted at a Merge node";
     "E167", Error, "Composition-body window resolves through an undeclared input port";
     "E168", Error, "Composition-body window root schema is missing or incompatible";
+    "E169", Error, "Composition body uses a column its input port does not declare";
     "E171", Error, "Scoped-var reader is not a DAG descendant of the Transform that writes it";
     "E172", Error, "`$source` scoped var read downstream of a Merge/Combine node (the per-source value is ambiguous there)";
     "E173", Error, "Composition body reads a parent-scope `$pipeline` / `$source` var its `_compose.scoped_vars` schema does not opt into";
