@@ -3672,6 +3672,7 @@ fn bind_schema_inner(
                         source_nodes: &source_nodes,
                         scope: nodes,
                         failed_nodes: &failed_nodes,
+                        signature: None,
                         span,
                     },
                     diags,
@@ -3811,6 +3812,11 @@ struct CompositionBindParams<'a> {
     scope: &'a [Spanned<PipelineNode>],
     /// The nodes of the calling scope whose bind failed with an error.
     failed_nodes: &'a HashSet<String>,
+    /// The signature to bind the call against in place of the one its
+    /// `use:` path names: a trial of a fix that edits the composition's
+    /// input ports (see [`offer_port_declarations`]). `None` for every
+    /// real bind.
+    signature: Option<&'a CompositionSignature>,
     span: Span,
 }
 
@@ -3818,8 +3824,295 @@ struct CompositionBindParams<'a> {
 ///
 /// This is the `PipelineNode::Composition` arm of `bind_schema_inner`.
 /// It recursively binds the body as a sub-problem within a nested scope
-/// (preserve-and-recurse, not flatten-and-splice).
+/// (preserve-and-recurse, not flatten-and-splice). The declarations an
+/// E169, W101 or E102 raised by the call says to add to the composition's
+/// input ports are then tried, and shown where the call compiles with them
+/// ([`offer_port_declarations`]).
 fn bind_composition(
+    params: &CompositionBindParams<'_>,
+    diags: &mut Vec<Diagnostic>,
+    bind_ctx: &mut BindContext<'_>,
+    artifacts: &mut CompileArtifacts,
+    parent_schema_by_name: &mut HashMap<String, Row>,
+    parent_declared_multiple_by_name: &mut HashMap<String, BTreeSet<String>>,
+) {
+    let from = diags.len();
+    bind_call(
+        params,
+        diags,
+        bind_ctx,
+        artifacts,
+        parent_schema_by_name,
+        parent_declared_multiple_by_name,
+    );
+    if !bind_ctx.verifying && diags[from..].iter().any(|d| d.help.is_some()) {
+        offer_port_declarations(
+            params,
+            from,
+            diags,
+            bind_ctx,
+            artifacts,
+            parent_schema_by_name,
+            parent_declared_multiple_by_name,
+        );
+    }
+}
+
+/// A declaration of one column on one input port of a composition, which
+/// a diagnostic of a call of it says to add: the diagnostic, by code, the
+/// opening of its message and its help as raised, and the fix to show in
+/// that help once the call compiles with the declaration.
+struct PortDeclaration {
+    code: &'static str,
+    opening: String,
+    /// The help as raised: `plain` then `after`.
+    plain: String,
+    after: String,
+    lead: String,
+    paste: String,
+    port: String,
+    column: String,
+    ty: Type,
+}
+
+impl PortDeclaration {
+    /// The `_compose:` block declaring the column, to paste into the
+    /// composition file.
+    fn block(port: &str, column: &str, ty: &Type) -> String {
+        format!(
+            "_compose:\n  inputs:\n    {port}:\n      schema:\n        - {{ name: {column}, \
+             type: {} }}",
+            port_column_type(ty)
+        )
+    }
+
+    /// `signature` with the column declared.
+    fn applied(&self, signature: &CompositionSignature) -> Option<CompositionSignature> {
+        let mut edited = signature.clone();
+        let decl = edited.inputs.get_mut(&self.port)?;
+        let columns = decl.schema.get_or_insert_with(Vec::new);
+        match columns.iter_mut().find(|column| column.name == self.column) {
+            Some(column) => column.ty = self.ty.clone(),
+            None => columns.push(Column::bare(&self.column, self.ty.clone())),
+        }
+        Some(edited)
+    }
+}
+
+/// The declarations the diagnostics of a call of `signature` (in `file`)
+/// can name: each caller column a bound port does not declare (E169, W101),
+/// each declared column the caller may leave empty that the port needs
+/// never empty (E102), and each column the port declares possibly empty
+/// that a call inside the composition needs never empty (E102).
+fn port_declarations(
+    params: &CompositionBindParams<'_>,
+    signature: &CompositionSignature,
+    file: &str,
+    rows: &HashMap<String, Row>,
+) -> Vec<PortDeclaration> {
+    let call = params.node_name;
+    let mut out = Vec::new();
+    for (port, decl) in &signature.inputs {
+        let Some(upstream) = params.call_inputs.get(port) else {
+            continue;
+        };
+        let declared = port_columns(decl);
+        if let Some(row) = rows.get(upstream.as_str()) {
+            for (field, ty) in row.fields() {
+                let column = field.name.as_ref();
+                if field.qualifier.is_some()
+                    || column.starts_with('$')
+                    || declared.contains_key(field)
+                {
+                    continue;
+                }
+                let block = PortDeclaration::block(port, column, ty);
+                out.push(PortDeclaration {
+                    code: "E169",
+                    opening: e169_opening(call, column),
+                    plain: e169_help(column, port, file),
+                    after: String::new(),
+                    lead: e169_help(column, port, file),
+                    paste: block.clone(),
+                    port: port.clone(),
+                    column: column.to_string(),
+                    ty: ty.clone(),
+                });
+                out.push(PortDeclaration {
+                    code: "W101",
+                    opening: w101_opening(call, column),
+                    plain: w101_help(column, port, file),
+                    after: String::new(),
+                    lead: w101_help(column, port, file),
+                    paste: block,
+                    port: port.clone(),
+                    column: column.to_string(),
+                    ty: ty.clone(),
+                });
+            }
+        }
+        for (field, declared_ty) in &declared {
+            let column = field.name.as_ref();
+            if let Some(ColumnLookup::Declared(Type::Nullable(inner))) =
+                rows.get(upstream.as_str()).map(|row| row.lookup(column))
+                && inner.as_ref() == declared_ty
+            {
+                let nullable = Type::Nullable(Box::new(declared_ty.clone()));
+                let help = nullable_port_help(upstream, column, port, file);
+                let plain = help
+                    .strip_suffix(PORT_ADMISSION_RULE)
+                    .unwrap_or(&help)
+                    .to_string();
+                out.push(PortDeclaration {
+                    code: "E102",
+                    opening: format!(
+                        "composition {call:?}: input port `{port}` declares `{column}`"
+                    ),
+                    lead: plain.clone(),
+                    plain,
+                    after: PORT_ADMISSION_RULE.to_string(),
+                    paste: format!(
+                        "- {{ name: {column}, type: {} }}",
+                        port_column_type(&nullable)
+                    ),
+                    port: port.clone(),
+                    column: column.to_string(),
+                    ty: nullable,
+                });
+            }
+            if let Type::Nullable(inner) = declared_ty
+                && !matches!(inner.as_ref(), Type::Any)
+            {
+                let plain = enclosing_port_help(call, port, column, file);
+                out.push(PortDeclaration {
+                    code: "E102",
+                    opening: enclosing_port_opening(call, column),
+                    lead: plain.clone(),
+                    plain,
+                    after: String::new(),
+                    paste: format!("- {{ name: {column}, type: {} }}", port_column_type(inner)),
+                    port: port.clone(),
+                    column: column.to_string(),
+                    ty: inner.as_ref().clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Show in each diagnostic the call raised (from `from` on) the
+/// declaration it says to add to one of the composition's input ports,
+/// once binding the call against the composition with that declaration
+/// clears the diagnostic without raising an error the compile did not
+/// already raise. A declaration that does not check out leaves the
+/// diagnostic's sentence.
+fn offer_port_declarations(
+    params: &CompositionBindParams<'_>,
+    from: usize,
+    diags: &mut [Diagnostic],
+    bind_ctx: &mut BindContext<'_>,
+    artifacts: &CompileArtifacts,
+    rows: &HashMap<String, Row>,
+    declared_multiple: &HashMap<String, BTreeSet<String>>,
+) {
+    let resolved_path = resolve_use_path(
+        params.use_path,
+        &bind_ctx.origin_dir,
+        bind_ctx.ctx.workspace_root(),
+        bind_ctx.symbol_table,
+    );
+    let symbol_table = bind_ctx.symbol_table;
+    let Some(signature) = params
+        .signature
+        .or_else(|| symbol_table.get(&resolved_path))
+    else {
+        return;
+    };
+    let file = resolved_path.display().to_string();
+    for declaration in port_declarations(params, signature, &file, rows) {
+        let raised = format!("{}{}", declaration.plain, declaration.after);
+        let matching: Vec<usize> = (from..diags.len())
+            .filter(|&i| {
+                let d = &diags[i];
+                d.code == declaration.code
+                    && d.help.as_deref() == Some(raised.as_str())
+                    && d.message.starts_with(&declaration.opening)
+            })
+            .collect();
+        let Some(&first) = matching.first() else {
+            continue;
+        };
+        let PortDeclaration {
+            plain,
+            after,
+            lead,
+            paste,
+            ..
+        } = &declaration;
+        let help = crate::plan::fix_offer::offer_fix(
+            plain.clone(),
+            [(
+                crate::plan::fix_offer::PasteFix::new(lead.clone(), paste.clone()),
+                &declaration,
+            )],
+            |declaration| {
+                let Some(edited) = declaration.applied(signature) else {
+                    return false;
+                };
+                let tried = trial_call(
+                    &CompositionBindParams {
+                        signature: Some(&edited),
+                        ..*params
+                    },
+                    bind_ctx,
+                    artifacts,
+                    rows,
+                    declared_multiple,
+                );
+                crate::plan::fix_offer::fix_resolves(&diags[first], diags, &tried)
+            },
+        );
+        for i in matching {
+            diags[i].help = Some(format!("{help}{after}"));
+        }
+    }
+}
+
+/// The diagnostics of binding the call `params` describes again, in
+/// scratch state, as a trial ([`BindContext::verifying`]): nothing it does
+/// reaches `artifacts`, `rows` or the record of passed contract checks.
+fn trial_call(
+    params: &CompositionBindParams<'_>,
+    bind_ctx: &mut BindContext<'_>,
+    artifacts: &CompileArtifacts,
+    rows: &HashMap<String, Row>,
+    declared_multiple: &HashMap<String, BTreeSet<String>>,
+) -> Vec<Diagnostic> {
+    let mut scratch = artifacts.scratch();
+    let mut rows = rows.clone();
+    let mut multiple = declared_multiple.clone();
+    rows.remove(params.node_name);
+    multiple.remove(params.node_name);
+    let was_verifying = std::mem::replace(&mut bind_ctx.verifying, true);
+    let checks = bind_ctx.passed_contract_checks.len();
+    let mut tried = Vec::new();
+    bind_call(
+        params,
+        &mut tried,
+        bind_ctx,
+        &mut scratch,
+        &mut rows,
+        &mut multiple,
+    );
+    bind_ctx.passed_contract_checks.truncate(checks);
+    bind_ctx.verifying = was_verifying;
+    tried
+}
+
+/// Bind one call of a composition: [`bind_composition`] without the check
+/// of the port declarations its diagnostics name.
+fn bind_call(
     params: &CompositionBindParams<'_>,
     diags: &mut Vec<Diagnostic>,
     bind_ctx: &mut BindContext<'_>,
@@ -3837,6 +4130,7 @@ fn bind_composition(
         source_nodes,
         scope,
         failed_nodes,
+        signature,
         span,
     } = params;
     // 1. Resolve use_path to workspace-relative key and look up in symbol_table.
@@ -3846,7 +4140,8 @@ fn bind_composition(
         bind_ctx.ctx.workspace_root(),
         bind_ctx.symbol_table,
     );
-    let signature = match bind_ctx.symbol_table.get(&resolved_path) {
+    let symbol_table = bind_ctx.symbol_table;
+    let signature = match signature.or_else(|| symbol_table.get(&resolved_path)) {
         Some(sig) => sig,
         None => {
             diags.push(Diagnostic::error(
@@ -3928,7 +4223,19 @@ fn bind_composition(
 
     // 6. Check each bound port against its upstream (E102) and record the
     //    port's declared columns, the vocabulary the body may name.
-    let input_port_rows = match build_input_port_rows(
+    let first_output_of = {
+        let symbol_table = bind_ctx.symbol_table;
+        let origin_dir = bind_ctx.origin_dir.clone();
+        let workspace_root = bind_ctx.ctx.workspace_root().to_path_buf();
+        move |use_path: &Path| {
+            let resolved = resolve_use_path(use_path, &origin_dir, &workspace_root, symbol_table);
+            symbol_table
+                .get(&resolved)
+                .and_then(|called| called.outputs.keys().next().cloned())
+        }
+    };
+    let mut scope_fixes: Vec<ScopeFix> = Vec::new();
+    let admitted = build_input_port_rows(
         &PortAdmission {
             call: node_name,
             call_inputs,
@@ -3938,13 +4245,36 @@ fn bind_composition(
             scope,
             failed_nodes,
             body_file: &resolved_path,
+            first_output_of: &first_output_of,
             span,
         },
         &mut artifacts.next_tail_var,
         diags,
-    ) {
+        &mut scope_fixes,
+    );
+    let input_port_rows = match admitted {
         Some(rows) => rows,
-        None => return, // E102 errors already pushed
+        None => {
+            // E102 errors already pushed; each fix one prints is checked
+            // by binding the calling scope with it.
+            if !bind_ctx.verifying {
+                for fix in scope_fixes {
+                    check_scope_fix(
+                        fix,
+                        &ScopeTrialAt {
+                            scope,
+                            call: node_name,
+                            rows: parent_schema_by_name,
+                            declared_multiple: parent_declared_multiple_by_name,
+                        },
+                        diags,
+                        bind_ctx,
+                        artifacts,
+                    );
+                }
+            }
+            return;
+        }
     };
 
     // 7. Re-read body from disk and verify it is the same snapshot module
@@ -4580,13 +4910,10 @@ fn bind_composition(
             if column.starts_with('$') || !matches!(row.mark_of(field), Some(ColumnMark::Own)) {
                 continue; // an engine column, or the caller's own value
             }
-            // The caller's type for the declaration in the fix: the type
-            // the port seed gives the column it carries undeclared, which is
-            // the type the caller passes.
-            let Some((input, caller_type)) = port_seeds.iter().find_map(|(input, seed)| {
-                seed.undeclared_carried(column)
-                    .map(|(ty, _)| (input, port_column_type(ty)))
-            }) else {
+            let Some(input) = port_seeds
+                .iter()
+                .find_map(|(input, seed)| seed.undeclared_carried(column).map(|_| input))
+            else {
                 continue;
             };
             let writer = body_writer_of(
@@ -4613,11 +4940,10 @@ fn bind_composition(
                     ),
                     LabeledSpan::primary(writer_span, writer_label),
                 )
-                .with_help(format!(
-                    "declare `{column}` on input port `{input}` in `{}` so replacing the \
-                     caller's value is part of the port's contract:\n_compose:\n  inputs:\n    \
-                     {input}:\n      schema:\n        - {{ name: {column}, type: {caller_type} }}",
-                    resolved_path.display()
+                .with_help(w101_help(
+                    column,
+                    input,
+                    &resolved_path.display().to_string(),
                 )),
             );
         }
@@ -5486,7 +5812,154 @@ struct PortAdmission<'a> {
     failed_nodes: &'a HashSet<String>,
     /// The composition file, as the author refers to it.
     body_file: &'a Path,
+    /// The first output port of the composition a `use:` path names.
+    first_output_of: &'a dyn Fn(&Path) -> Option<String>,
     span: Span,
+}
+
+impl PortAdmission<'_> {
+    /// The call node with each `(port, upstream)` of `bindings` bound under
+    /// its `inputs:`, and its `input:` line moved from `from` to the first
+    /// binding's upstream when it reads `from`.
+    fn call_rebound(
+        &self,
+        bindings: &[(&str, &str)],
+        from: Option<&str>,
+    ) -> Option<Spanned<PipelineNode>> {
+        let mut edited = call_with_inputs(self.scope, self.call, bindings)?;
+        if let (Some(from), Some((_, to))) = (from, bindings.first())
+            && let PipelineNode::Composition { header, .. } = &mut edited.value
+            && input_target(&header.input.value) == from
+        {
+            header.input.value = crate::config::node_header::NodeInput::Single(to.to_string());
+        }
+        Some(edited)
+    }
+}
+
+/// Composition node `call` of `scope` with each `(port, upstream)` of
+/// `bindings` bound under its `inputs:`.
+fn call_with_inputs(
+    scope: &[Spanned<PipelineNode>],
+    call: &str,
+    bindings: &[(&str, &str)],
+) -> Option<Spanned<PipelineNode>> {
+    let mut edited = scope
+        .iter()
+        .find(|spanned| spanned.value.name() == call)?
+        .clone();
+    let PipelineNode::Composition { inputs, .. } = &mut edited.value else {
+        return None;
+    };
+    for (port, upstream) in bindings {
+        inputs.insert(port.to_string(), upstream.to_string());
+    }
+    Some(edited)
+}
+
+/// Source `source` of `scope` with `column` declared `ty` in its `schema:`
+/// (the column's line retyped, or added after the last one), where the
+/// schema is a column list.
+fn source_declaring(
+    scope: &[Spanned<PipelineNode>],
+    source: &str,
+    column: &str,
+    ty: &Type,
+) -> Option<Spanned<PipelineNode>> {
+    let mut edited = scope
+        .iter()
+        .find(|spanned| spanned.value.name() == source)?
+        .clone();
+    let PipelineNode::Source { config, .. } = &mut edited.value else {
+        return None;
+    };
+    let SourceSchema::Columns(columns) = &mut config.schema else {
+        return None;
+    };
+    match columns.iter_mut().find(|declared| declared.name == column) {
+        Some(declared) => declared.ty = ty.clone(),
+        None => columns.push(Column::bare(column, ty.clone())),
+    }
+    Some(edited)
+}
+
+/// A fix an E102 prints that edits the calling scope: the nodes it adds or
+/// changes, shown once the calling scope binds the call with them (see
+/// [`check_scope_fix`]).
+struct ScopeFix {
+    /// The diagnostic's index in the diagnostics list.
+    diag: usize,
+    /// The help without a fix, and what follows the fix in the help.
+    plain: String,
+    after: String,
+    lead: String,
+    paste: String,
+    /// Nodes that replace the calling scope's node of the same name, or
+    /// join the scope.
+    edits: Vec<Spanned<PipelineNode>>,
+}
+
+/// The calling scope a [`ScopeFix`] is tried in.
+struct ScopeTrialAt<'a> {
+    scope: &'a [Spanned<PipelineNode>],
+    call: &'a str,
+    rows: &'a HashMap<String, Row>,
+    declared_multiple: &'a HashMap<String, BTreeSet<String>>,
+}
+
+/// Show `fix` in its diagnostic's help when the calling scope, edited as
+/// it says, binds the call without the error and without one the compile
+/// did not already raise; otherwise the help keeps its sentence.
+fn check_scope_fix(
+    fix: ScopeFix,
+    at: &ScopeTrialAt<'_>,
+    diags: &mut [Diagnostic],
+    bind_ctx: &mut BindContext<'_>,
+    artifacts: &CompileArtifacts,
+) {
+    let ScopeFix {
+        diag,
+        plain,
+        after,
+        lead,
+        paste,
+        edits,
+    } = fix;
+    let help = crate::plan::fix_offer::offer_fix(
+        plain,
+        [(crate::plan::fix_offer::PasteFix::new(lead, paste), edits)],
+        |edits| {
+            let tried = trial_scope(
+                &ScopeTrial {
+                    scope: at.scope,
+                    edits,
+                    targets: &[at.call],
+                },
+                bind_ctx,
+                artifacts,
+                at.rows,
+                at.declared_multiple,
+            );
+            crate::plan::fix_offer::fix_resolves(&diags[diag], diags, &tried)
+        },
+    );
+    diags[diag].help = Some(format!("{help}{after}"));
+}
+
+/// Push `diag` with the plain help of `fix`, and keep `fix` to check.
+fn push_with_scope_fix(
+    diag: Diagnostic,
+    fix: Option<ScopeFix>,
+    diags: &mut Vec<Diagnostic>,
+    fixes: &mut Vec<ScopeFix>,
+) {
+    if let Some(mut fix) = fix {
+        fix.diag = diags.len();
+        diags.push(diag.with_help(format!("{}{}", fix.plain, fix.after)));
+        fixes.push(fix);
+    } else {
+        diags.push(diag);
+    }
 }
 
 /// Check a call site's bound input ports and return each port's vocabulary.
@@ -5501,11 +5974,13 @@ struct PortAdmission<'a> {
 /// Each port's declared columns are recorded as `Row::open(declared,
 /// fresh_tail)`, the port's vocabulary. Nothing positional is compiled from
 /// it: the body binds against the caller's row (see `seed_port_row`).
-/// Returns `None` if any port was refused.
+/// Returns `None` if any port was refused. A fix an E102 prints that edits
+/// the calling scope is pushed to `fixes`, to check before it is shown.
 fn build_input_port_rows(
     admission: &PortAdmission<'_>,
     next_tail_var: &mut u32,
     diags: &mut Vec<Diagnostic>,
+    fixes: &mut Vec<ScopeFix>,
 ) -> Option<IndexMap<String, Row>> {
     let &PortAdmission {
         call,
@@ -5529,16 +6004,12 @@ fn build_input_port_rows(
         let Some(upstream_row) = parent_schemas.get(upstream_name.as_str()) else {
             // A node of this scope whose own bind failed said why where it
             // failed; a second error here would only say that the call
-            // cannot read it.
+            // cannot read it. A `node.port` upstream names the node.
             has_errors = true;
-            if !failed_nodes.contains(upstream_name.as_str()) {
-                diags.push(unbound_port_upstream(
-                    call,
-                    port_name,
-                    upstream_name,
-                    scope,
-                    span,
-                ));
+            let node = upstream_name.split('.').next().unwrap_or(upstream_name);
+            if !failed_nodes.contains(node) {
+                let (diag, fix) = unbound_port_upstream(admission, port_name, upstream_name);
+                push_with_scope_fix(diag, fix, diags, fixes);
             }
             continue;
         };
@@ -5554,48 +6025,71 @@ fn build_input_port_rows(
                 has_errors = true;
                 continue;
             }
-            let refusal = match upstream_row.lookup(col_str) {
-                ColumnLookup::Declared(provided) if admits(col_type, provided) => None,
-                ColumnLookup::Declared(provided) => Some(port_type_refusal(
-                    admission, port_name, col_str, col_type, provided,
-                )),
+            match upstream_row.lookup(col_str) {
+                ColumnLookup::Declared(provided) if admits(col_type, provided) => {}
+                ColumnLookup::Declared(provided) => {
+                    let (diag, fix) =
+                        port_type_refusal(admission, port_name, col_str, col_type, provided);
+                    push_with_scope_fix(diag, fix, diags, fixes);
+                    has_errors = true;
+                }
                 // Every bound row is closed: a column it does not declare is
                 // not there.
-                ColumnLookup::Unknown | ColumnLookup::PassThrough(_) => Some(
-                    Diagnostic::error(
+                ColumnLookup::Unknown | ColumnLookup::PassThrough(_) => {
+                    let diag = Diagnostic::error(
                         "E102",
                         format!(
                             "composition {call:?}: input port `{port_name}` needs column \
                              `{col_str}`, which {upstream_name:?} does not provide"
                         ),
                         LabeledSpan::primary(span, String::new()),
-                    )
-                    .with_help(if from_source {
-                        format!(
-                            "add the column to the `schema:` of source {upstream_name:?}: \
-                             `- {{ name: {col_str}, type: {} }}`",
-                            port_column_type(col_type)
-                        )
+                    );
+                    let ty = port_column_type(col_type);
+                    let fix = if from_source {
+                        source_declaring(scope, upstream_name, col_str, col_type).map(|source| {
+                            ScopeFix {
+                                diag: 0,
+                                plain: format!(
+                                    "add `{col_str}` to the `schema:` of source {upstream_name:?}"
+                                ),
+                                after: String::new(),
+                                lead: format!(
+                                    "add the column to the `schema:` of source {upstream_name:?}"
+                                ),
+                                paste: format!("- {{ name: {col_str}, type: {ty} }}"),
+                                edits: vec![source],
+                            }
+                        })
                     } else {
+                        None
+                    };
+                    let diag = if fix.is_some() {
+                        diag
+                    } else if from_source {
+                        diag.with_help(format!(
+                            "add `{col_str}` to the `schema:` of source {upstream_name:?}"
+                        ))
+                    } else {
+                        diag.with_help(format!(
+                            "make node {upstream_name:?} provide `{col_str}`, so the call \
+                             receives it"
+                        ))
+                    };
+                    push_with_scope_fix(diag, fix, diags, fixes);
+                    has_errors = true;
+                }
+                ColumnLookup::Ambiguous(_) => {
+                    diags.push(Diagnostic::error(
+                        "E102",
                         format!(
-                            "emit `{col_str}` in {upstream_name:?} or a node before it, so the \
-                             call receives it"
-                        )
-                    }),
-                ),
-                ColumnLookup::Ambiguous(_) => Some(Diagnostic::error(
-                    "E102",
-                    format!(
-                        "composition {call:?}: input port `{port_name}` needs column \
-                         `{col_str}`, and {upstream_name:?} provides more than one column of \
-                         that name"
-                    ),
-                    LabeledSpan::primary(span, String::new()),
-                )),
-            };
-            if let Some(refusal) = refusal {
-                diags.push(refusal);
-                has_errors = true;
+                            "composition {call:?}: input port `{port_name}` needs column \
+                             `{col_str}`, and {upstream_name:?} provides more than one column \
+                             of that name"
+                        ),
+                        LabeledSpan::primary(span, String::new()),
+                    ));
+                    has_errors = true;
+                }
             }
         }
 
@@ -5730,18 +6224,7 @@ impl CallFeeders<'_> {
     /// The call node, as the calling scope declares it, with `port` bound
     /// to `upstream`.
     fn binding(&self, port: &str, upstream: &str) -> Option<Spanned<PipelineNode>> {
-        let mut edited = self
-            .scope
-            .iter()
-            .find(|spanned| spanned.value.name() == self.call)?
-            .clone();
-        match &mut edited.value {
-            PipelineNode::Composition { inputs, .. } => {
-                inputs.insert(port.to_string(), upstream.to_string());
-            }
-            _ => return None,
-        }
-        Some(edited)
+        call_with_inputs(self.scope, self.call, &[(port, upstream)])
     }
 }
 
@@ -5819,32 +6302,68 @@ fn offer_port_bindings(
     }
 }
 
-/// E102 for a port whose upstream has no bound row. A `node.port`
-/// reference names an output port of a node of the scope: of a Route or a
-/// Cull, which a composition input port cannot read yet (#888), so the fix
-/// routes the rows through a Transform that passes them on; of a
-/// composition, whose call carries only the rows of its first output port
-/// (#1315); or of a node that has no output ports at all.
+/// A Transform an E102 prints to add before a call, `name` reading
+/// `upstream` and running the one CXL line `cxl`, as YAML to paste and as
+/// the node that YAML parses to.
+fn relay_transform(
+    name: &str,
+    upstream: &str,
+    cxl: &str,
+) -> (String, Option<Spanned<PipelineNode>>) {
+    let yaml = format!(
+        "- type: transform\n  name: {name}\n  input: {upstream}\n  config:\n    cxl: |\n      \
+         {cxl}"
+    );
+    let parsed = crate::yaml::from_str::<Vec<Spanned<PipelineNode>>>(&yaml)
+        .ok()
+        .and_then(|mut nodes| (nodes.len() == 1).then(|| nodes.remove(0)));
+    (yaml, parsed)
+}
+
+/// E102 for a port whose upstream has no bound row, and the fix that
+/// edits the calling scope where one exists. A `node.port` reference names
+/// an output port of a node of the scope: of a Route or a Cull, which a
+/// composition input port cannot read yet (#888), so the fix routes the
+/// rows through a Transform that passes them on; of a composition, whose
+/// call carries only the rows of its first output port (#1315), so a port
+/// reading that first output port reads the call by its name; or of a node
+/// that has no output ports at all.
 fn unbound_port_upstream(
-    call: &str,
+    admission: &PortAdmission<'_>,
     port: &str,
     upstream: &str,
-    scope: &[Spanned<PipelineNode>],
-    span: Span,
-) -> Diagnostic {
-    let kind_of = |name: &str| {
+) -> (Diagnostic, Option<ScopeFix>) {
+    let &PortAdmission {
+        call, scope, span, ..
+    } = admission;
+    let node_of = |name: &str| {
         scope
             .iter()
             .find(|spanned| spanned.value.name() == name)
-            .map(|spanned| spanned.value.type_tag())
+            .map(|spanned| &spanned.value)
     };
     let named = upstream
         .split_once('.')
-        .and_then(|(node, branch)| kind_of(node).map(|kind| (node, branch, kind)));
+        .and_then(|(node, branch)| node_of(node).map(|kind| (node, branch, kind)));
+    let fix =
+        |plain: String, lead: String, paste: String, edits: Vec<Spanned<PipelineNode>>| ScopeFix {
+            diag: 0,
+            plain,
+            after: String::new(),
+            lead,
+            paste,
+            edits,
+        };
+    let rebind_to = |node: &str, plain: String, lead: String| {
+        admission
+            .call_rebound(&[(port, node)], Some(upstream))
+            .map(|edited| fix(plain, lead, format!("{port}: {node}"), vec![edited]))
+    };
     match named {
-        Some((node, branch, "route" | "cull")) => {
+        Some((node, branch, PipelineNode::Route { .. } | PipelineNode::Cull { .. })) => {
             let relay = format!("{node}_{branch}");
-            Diagnostic::error(
+            let (yaml, parsed) = relay_transform(&relay, upstream, "filter true");
+            let diag = Diagnostic::error(
                 "E102",
                 format!(
                     "composition {call:?}: input port `{port}` cannot read {upstream:?}, an \
@@ -5852,47 +6371,98 @@ fn unbound_port_upstream(
                      port of a Route or a Cull yet"
                 ),
                 LabeledSpan::primary(span, String::new()),
+            );
+            let plain = format!(
+                "feed input port `{port}` from a Transform that reads {upstream:?} and passes its \
+                 rows on (issue #888 tracks reading the branch directly)"
+            );
+            let relayed = parsed.and_then(|relay_node| {
+                let call_node = admission.call_rebound(&[(port, &relay)], Some(upstream))?;
+                Some(fix(
+                    plain.clone(),
+                    format!(
+                        "pass the rows through a Transform and feed the port from it: write \
+                         `{relay}` for `{upstream}` in the call's `input:` and as \
+                         `{port}: {relay}` under `inputs:`, and add the Transform (issue #888 \
+                         tracks reading the branch directly)"
+                    ),
+                    yaml,
+                    vec![relay_node, call_node],
+                ))
+            });
+            match relayed {
+                Some(fix) => (diag, Some(fix)),
+                None => (diag.with_help(plain), None),
+            }
+        }
+        Some((node, branch, PipelineNode::Composition { r#use, .. }))
+            if (admission.first_output_of)(r#use).as_deref() == Some(branch) =>
+        {
+            let diag = Diagnostic::error(
+                "E102",
+                format!(
+                    "composition {call:?}: input port `{port}` reads {upstream:?}, output port \
+                     `{branch}` of composition {node:?}; that is the port a call's rows come \
+                     from, and they are read by the call's name, {node:?}"
+                ),
+                LabeledSpan::primary(span, String::new()),
+            );
+            let plain = format!("read {node:?} in place of {upstream:?} under `inputs:`");
+            match rebind_to(
+                node,
+                plain.clone(),
+                "read the call by its name: write under `inputs:`".to_string(),
+            ) {
+                Some(fix) => (diag, Some(fix)),
+                None => (diag.with_help(plain), None),
+            }
+        }
+        Some((node, branch, PipelineNode::Composition { .. })) => (
+            Diagnostic::error(
+                "E102",
+                format!(
+                    "composition {call:?}: input port `{port}` cannot read {upstream:?}, output \
+                     port `{branch}` of composition {node:?}; a call carries only the rows of \
+                     its first output port"
+                ),
+                LabeledSpan::primary(span, String::new()),
             )
             .with_help(format!(
-                "pass the rows through a Transform and feed the port from it: add\n  \
-                 - type: transform\n    name: {relay}\n    input: {upstream}\n    config:\n      \
-                 cxl: |\n        filter true\nthen write `{relay}` for `{upstream}` in the call's \
-                 `input:` and under `inputs:` as `{port}: {relay}` (issue #888 tracks reading the \
-                 branch directly)"
-            ))
+                "move the nodes that read output port `{branch}` into the composition {node:?} \
+                 calls (issue #1315 tracks reading another output port)"
+            )),
+            None,
+        ),
+        Some((node, branch, kind)) => {
+            let diag = Diagnostic::error(
+                "E102",
+                format!(
+                    "composition {call:?}: input port `{port}` reads {upstream:?}, but {node:?} \
+                     is a {} node, which has no output port `{branch}`",
+                    kind.type_tag()
+                ),
+                LabeledSpan::primary(span, String::new()),
+            );
+            let plain = format!("read {node:?} itself under `inputs:`");
+            match rebind_to(
+                node,
+                plain.clone(),
+                format!("feed the port from {node:?}: write under `inputs:`"),
+            ) {
+                Some(fix) => (diag, Some(fix)),
+                None => (diag.with_help(plain), None),
+            }
         }
-        Some((node, branch, "composition")) => Diagnostic::error(
-            "E102",
-            format!(
-                "composition {call:?}: input port `{port}` cannot read {upstream:?}, output port \
-                 `{branch}` of composition {node:?}; a call carries only the rows of its first \
-                 output port"
+        _ => (
+            Diagnostic::error(
+                "E102",
+                format!(
+                    "composition {call:?}: input port `{port}` reads {upstream:?}, which is not a \
+                     node this pipeline binds"
+                ),
+                LabeledSpan::primary(span, String::new()),
             ),
-            LabeledSpan::primary(span, String::new()),
-        )
-        .with_help(format!(
-            "write `{port}: {node}` under `inputs:` to feed the port from the first output \
-             port of {node:?}; to read `{branch}`, move the nodes that read it into \
-             `{node}`'s composition (issue #1315 tracks reading another output port)"
-        )),
-        Some((node, branch, kind)) => Diagnostic::error(
-            "E102",
-            format!(
-                "composition {call:?}: input port `{port}` reads {upstream:?}, but {node:?} is a \
-                 {kind} node, which has no output port `{branch}`"
-            ),
-            LabeledSpan::primary(span, String::new()),
-        )
-        .with_help(format!(
-            "write `{port}: {node}` under `inputs:` to feed the port from {node:?}"
-        )),
-        _ => Diagnostic::error(
-            "E102",
-            format!(
-                "composition {call:?}: input port `{port}` reads {upstream:?}, which is not a \
-                 node this pipeline binds"
-            ),
-            LabeledSpan::primary(span, String::new()),
+            None,
         ),
     }
 }
@@ -5924,26 +6494,44 @@ fn admits(declared: &Type, provided: &Type) -> bool {
     }
 }
 
+/// What follows every E102 help about a port's types: the admission rule.
+const PORT_ADMISSION_RULE: &str = ". A port admits the type it declares, that type's non-empty form \
+     into a `{ nullable: ... }` declaration, and anything into `any`; nothing is converted at \
+     the port";
+
+/// The help an E102 gives for a caller column `column` that `upstream` may
+/// leave empty while input port `port` of the composition in `file`
+/// declares it never empty: declare it nullable on the port.
+/// [`offer_port_declarations`] matches the E102 by this help.
+fn nullable_port_help(upstream: &str, column: &str, port: &str, file: &str) -> String {
+    format!(
+        "{upstream:?} can provide an empty `{column}`; declare `{column}` as nullable on input \
+         port `{port}` in `{file}`{PORT_ADMISSION_RULE}"
+    )
+}
+
 /// E102 for a caller column whose type the port's declaration does not
-/// admit, with the one change that makes the call compile.
+/// admit, with the one change that makes the call compile, and the fix
+/// that edits the calling scope where one exists.
 fn port_type_refusal(
     admission: &PortAdmission<'_>,
     port: &str,
     column: &str,
     declared: &Type,
     provided: &Type,
-) -> Diagnostic {
+) -> (Diagnostic, Option<ScopeFix>) {
     let &PortAdmission {
         call,
         call_inputs,
         source_nodes,
+        scope,
         body_file,
         span,
         ..
     } = admission;
     if let Some(refusal) = enclosing_port_may_be_empty(admission, port, column, declared, provided)
     {
-        return refusal;
+        return (refusal, None);
     }
     let upstream = call_inputs
         .get(port)
@@ -5951,10 +6539,7 @@ fn port_type_refusal(
         .unwrap_or_default();
     let from_source = source_nodes.contains(upstream);
     let declared_spelling = port_column_type(declared);
-    let provided_spelling = port_column_type(provided);
     let base = declared.unwrap_nullable();
-    let conversion =
-        conversion_method(base).map(|method| format!("`emit {column} = {column}.{method}()`"));
     let message = if matches!(provided, Type::Any) {
         format!(
             "composition {call:?}: input port `{port}` declares `{column}` as \
@@ -5968,33 +6553,92 @@ fn port_type_refusal(
             provided_type_words(provided)
         )
     };
-    let help = match (provided, &conversion) {
-        (Type::Any, _) if from_source => format!(
-            "declare the type where source {upstream:?} declares the column: \
-             `- {{ name: {column}, type: {} }}`",
-            port_column_type(base)
-        ),
-        (Type::Nullable(inner), _) if inner.as_ref() == declared => format!(
-            "{upstream:?} can provide an empty `{column}`; declare the port column as nullable \
-             in `{}`: `- {{ name: {column}, type: {{ nullable: {declared_spelling} }} }}`",
-            body_file.display()
-        ),
-        (_, Some(conversion)) => {
-            format!("convert the column in a transform before the call: {conversion}")
+    let diag = Diagnostic::error("E102", message, LabeledSpan::primary(span, String::new()));
+    let after = PORT_ADMISSION_RULE.to_string();
+    match (provided, conversion_method(base)) {
+        (Type::Any, _) if from_source => {
+            let plain = format!(
+                "declare the type of `{column}` where source {upstream:?} declares the column"
+            );
+            match source_declaring(scope, upstream, column, base) {
+                Some(source) => (
+                    diag,
+                    Some(ScopeFix {
+                        diag: 0,
+                        plain: plain.clone(),
+                        after,
+                        lead: format!(
+                            "declare the type where source {upstream:?} declares the column"
+                        ),
+                        paste: format!("- {{ name: {column}, type: {} }}", port_column_type(base)),
+                        edits: vec![source],
+                    }),
+                ),
+                None => (diag.with_help(format!("{plain}{after}")), None),
+            }
         }
-        (_, None) => format!(
-            "give `{column}` the type `{declared_spelling}` before the call, or declare it as \
-             `{provided_spelling}` on input port `{port}` in `{}`",
-            body_file.display()
+        (Type::Nullable(inner), _) if inner.as_ref() == declared => (
+            diag.with_help(nullable_port_help(
+                upstream,
+                column,
+                port,
+                &body_file.display().to_string(),
+            )),
+            None,
         ),
-    };
-    Diagnostic::error("E102", message, LabeledSpan::primary(span, String::new())).with_help(
-        format!(
-            "{help}. A port admits the type it declares, that type's non-empty form into a \
-         `{{ nullable: ... }}` declaration, and anything into `any`; nothing is converted at \
-         the port"
+        (_, Some(method)) => {
+            let plain = format!(
+                "convert `{column}` to `{declared_spelling}` in a node before the call, and feed \
+                 input port `{port}` from it"
+            );
+            let converter = format!("{upstream}_{column}");
+            let (yaml, parsed) = relay_transform(
+                &converter,
+                upstream,
+                &format!("emit {column} = {column}.{method}()"),
+            );
+            let fix = parsed.and_then(|converter_node| {
+                let call_node = admission.call_rebound(&[(port, &converter)], Some(upstream))?;
+                Some(ScopeFix {
+                    diag: 0,
+                    plain: plain.clone(),
+                    after: after.clone(),
+                    lead: format!(
+                        "convert the column in a Transform before the call: write `{converter}` \
+                         for `{upstream}` in the call's `input:` and as `{port}: {converter}` \
+                         under `inputs:`, and add the Transform"
+                    ),
+                    paste: yaml,
+                    edits: vec![converter_node, call_node],
+                })
+            });
+            match fix {
+                Some(fix) => (diag, Some(fix)),
+                None => (diag.with_help(format!("{plain}{after}")), None),
+            }
+        }
+        (_, None) => (
+            diag.with_help(format!(
+                "give `{column}` the type `{declared_spelling}` before the call{after}"
+            )),
+            None,
         ),
+    }
+}
+
+/// The help the E102 of [`enclosing_port_may_be_empty`] gives: declare
+/// `column` never empty (`never_empty`) on input port `port` of composition
+/// `outer` in `file`. [`offer_port_declarations`] matches the E102 by it.
+fn enclosing_port_help(outer: &str, port: &str, column: &str, file: &str) -> String {
+    format!(
+        "declare `{column}` as never empty on input port `{port}` in `{file}`, so {outer:?} \
+         accepts only a `{column}` that is never empty"
     )
+}
+
+/// The opening of the E102 of [`enclosing_port_may_be_empty`].
+fn enclosing_port_opening(outer: &str, column: &str) -> String {
+    format!("composition {outer:?} passes a `{column}` that may be empty to composition ")
 }
 
 /// E102 for a call inside a composition body whose port needs `column` never
@@ -6003,8 +6647,9 @@ fn port_type_refusal(
 ///
 /// The enclosing body is checked at every call as if the column could be
 /// empty, so the cause is that declaration, not the node feeding the call:
-/// the error names the enclosing port, and the fix to paste is that port's
-/// line with the never-empty type. `None` for every other refusal.
+/// the error names the enclosing port, and the fix is that port's line
+/// with the never-empty type, shown once the enclosing call compiles with
+/// it ([`offer_port_declarations`]). `None` for every other refusal.
 fn enclosing_port_may_be_empty(
     admission: &PortAdmission<'_>,
     port: &str,
@@ -6016,7 +6661,6 @@ fn enclosing_port_may_be_empty(
         call,
         call_inputs,
         parent_schemas,
-        body_file,
         span,
         ..
     } = admission;
@@ -6043,22 +6687,15 @@ fn enclosing_port_may_be_empty(
         Diagnostic::error(
             "E102",
             format!(
-                "composition {outer:?} passes a `{column}` that may be empty to composition \
-                 {call:?}, whose input port `{port}` needs `{column}` never empty (`{needed}`): \
-                 input port `{outer_port}` of {outer:?} declares `{column}` as \
+                "{}{call:?}, whose input port `{port}` needs `{column}` never empty \
+                 (`{needed}`): input port `{outer_port}` of {outer:?} declares `{column}` as \
                  `{possibly_empty}` in `{outer_file}`, so {outer:?} is checked at every call as \
-                 if `{column}` could be empty"
+                 if `{column}` could be empty",
+                enclosing_port_opening(outer, column)
             ),
             LabeledSpan::primary(span, String::new()),
         )
-        .with_help(format!(
-            "declare `{column}` as never empty on input port `{outer_port}` in `{outer_file}`: \
-             `- {{ name: {column}, type: {needed} }}`, so {outer:?} accepts only a `{column}` \
-             that is never empty, as {call:?} needs. If {outer:?} must accept an empty \
-             `{column}`, declare it nullable on input port `{port}` in `{}` instead: \
-             `- {{ name: {column}, type: {possibly_empty} }}`",
-            body_file.display()
-        )),
+        .with_help(enclosing_port_help(outer, outer_port, column, outer_file)),
     )
 }
 
@@ -7183,14 +7820,8 @@ fn carry_into_caller_scope(row: Row, scope: &CallerScope<'_>, diags: &mut Vec<Di
 /// a Sink `mapping:` source, ...) goes through this before its own presence
 /// check, so the author reads which port to edit rather than "not present".
 fn refuse_undeclared(row: &Row, node: &str, column: &str, span: Span) -> Option<Diagnostic> {
-    let (caller_type, carried) = row.undeclared_carried(column)?;
-    Some(undeclared_column_diagnostic(
-        node,
-        column,
-        carried,
-        caller_type,
-        span,
-    ))
+    let (_, carried) = row.undeclared_carried(column)?;
+    Some(undeclared_column_diagnostic(node, column, carried, span))
 }
 
 /// [`refuse_undeclared`] for each of `names`, once per column. Returns
@@ -7218,13 +7849,13 @@ fn refuse_undeclared_names<'a>(
 /// E169: a composition body names a caller column its input port does not
 /// declare.
 ///
-/// The help is the declaration to add to the port, in the composition file,
-/// with the type the caller's column has at this call site.
+/// The help says to declare the column on the port; the declaration to
+/// paste, with the type the caller's column has at the call, is shown once
+/// the call compiles with it ([`offer_port_declarations`]).
 fn undeclared_column_diagnostic(
     node: &str,
     column: &str,
     carried: &CarriedColumn,
-    caller_type: &Type,
     span: Span,
 ) -> Diagnostic {
     let PortOrigin {
@@ -7242,13 +7873,36 @@ fn undeclared_column_diagnostic(
         ),
         LabeledSpan::primary(span, format!("uses `{column}`")),
     )
-    .with_help(format!(
-        "declare `{column}` on input port `{port}` in `{body_file}`, so every call of the \
-         composition has to provide it:\n\
-         _compose:\n  inputs:\n    {port}:\n      schema:\n        \
-         - {{ name: {column}, type: {} }}",
-        port_column_type(caller_type),
-    ))
+    .with_help(e169_help(column, port, body_file))
+}
+
+/// The help E169 gives for `column` of input port `port` of the
+/// composition in `file`. [`offer_port_declarations`] matches the E169 by
+/// it, and shows the declaration to paste once the call compiles with it.
+fn e169_help(column: &str, port: &str, file: &str) -> String {
+    format!(
+        "declare `{column}` on input port `{port}` in `{file}`, so every call of the \
+         composition has to provide it"
+    )
+}
+
+/// The opening of an E169 for `column`, used by `call`.
+fn e169_opening(call: &str, column: &str) -> String {
+    format!("composition {call:?} uses column `{column}` in node ")
+}
+
+/// The help W101 gives for `column` of input port `port` of the
+/// composition in `file`; see [`e169_help`].
+fn w101_help(column: &str, port: &str, file: &str) -> String {
+    format!(
+        "declare `{column}` on input port `{port}` in `{file}` so replacing the caller's value \
+         is part of the port's contract"
+    )
+}
+
+/// The opening of a W101 for `column`, written by `call`.
+fn w101_opening(call: &str, column: &str) -> String {
+    format!("composition {call:?} writes column `{column}` to output port ")
 }
 
 /// The names a CXL program bound against `row` may resolve as columns:
@@ -7501,12 +8155,9 @@ impl BodyReads {
                     .any(|field| field.qualifier.as_deref() == Some(*qualifier))
             });
             let refused = match qualified_input {
-                Some(qualifier) => {
-                    row.undeclared_carried_qualified(qualifier, name)
-                        .map(|(ty, carried)| {
-                            undeclared_column_diagnostic(node, name, carried, ty, span)
-                        })
-                }
+                Some(qualifier) => row
+                    .undeclared_carried_qualified(qualifier, name)
+                    .map(|(_, carried)| undeclared_column_diagnostic(node, name, carried, span)),
                 None => refuse_undeclared(row, node, name, span),
             };
             if let Some(diag) = refused {
@@ -10552,7 +11203,7 @@ fn walk_for_unknown_refs(expr: &Expr, cx: CombineWalkContext<'_>, diags: &mut Ve
                     ),
                 );
             } else if parts.len() == 2
-                && let Some((caller_type, carried)) = cx
+                && let Some((_, carried)) = cx
                     .merged_row
                     .undeclared_carried_qualified(&parts[0], &parts[1])
             {
@@ -10561,7 +11212,6 @@ fn walk_for_unknown_refs(expr: &Expr, cx: CombineWalkContext<'_>, diags: &mut Ve
                     cx.combine_name,
                     &parts[1],
                     carried,
-                    caller_type,
                     cx.combine_span,
                 );
                 if !diags
@@ -11361,10 +12011,12 @@ nodes:
                     scope: &config.nodes,
                     failed_nodes,
                     body_file: Path::new("compositions/c.comp.yaml"),
+                    first_output_of: &|_| None,
                     span: Span::SYNTHETIC,
                 },
                 &mut next_tail_var,
                 diags,
+                &mut Vec::new(),
             )
         };
         assert!(admission(&HashSet::new(), &mut diags).is_none());
