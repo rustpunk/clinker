@@ -74,7 +74,11 @@ an empty value in a column its port declares `{ nullable: ... }` now fails
 with `E200` at every call, naming the node, the composition, the port and the
 column, and the help prints the node's line with the empty case handled, such
 as `filter (v ?? 0) > 6`. The `E102` that followed it, saying the next call
-reads a node the pipeline does not bind, is no longer reported.
+reads a node the pipeline does not bind, is no longer reported. A composition
+that passes such a column unchanged to an inner composition whose port needs it
+never empty fails with `E102` at every call; the error names the outer port's
+`{ nullable: ... }` declaration as the cause and prints that port's line with
+the never-empty type.
 
 **Breaking:** `E102` now admits a caller's column only when the port's
 declared type admits it: the same type, a type into its `{ nullable: ... }`
