@@ -639,3 +639,123 @@ nodes:
         "the help points at the port declaration: {help}"
     );
 }
+
+#[test]
+fn a_reshape_set_on_an_undeclared_column_is_refused() {
+    // A Reshape cannot add a column: `set: { wt: ... }` needs the caller's
+    // `wt`, and every row the rule does not touch keeps the caller's value.
+    // So the body depends on `wt` and the port has to declare it.
+    assert_refused(
+        compile(&comp(
+            r#"  - type: reshape
+    name: rsh
+    input: inp
+    config:
+      partition_by: [department]
+      rules:
+        - name: r1
+          when: "v > 6"
+          mutate:
+            set:
+              wt: "v"
+  - type: transform
+    name: last
+    input: rsh
+    config:
+      cxl: |
+        emit w2 = wt * 10
+"#,
+        )),
+        "rsh",
+        "wt",
+        "inp",
+        "- { name: wt, type: int }",
+    );
+}
+
+#[test]
+fn a_reshape_override_on_an_undeclared_column_is_refused() {
+    assert_refused(
+        compile(&comp(
+            r#"  - type: reshape
+    name: last
+    input: inp
+    config:
+      partition_by: [department]
+      rules:
+        - name: r1
+          when: "v > 6"
+          synthesize:
+            copy_from: trigger
+            overrides:
+              wt: "v"
+"#,
+        )),
+        "last",
+        "wt",
+        "inp",
+        "- { name: wt, type: int }",
+    );
+}
+
+#[test]
+fn a_distinct_by_an_undeclared_column_is_refused() {
+    assert_undeclared_column_refused(
+        r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        distinct by wt
+        emit r = v
+"#,
+        "wt",
+        "- { name: wt, type: int }",
+    );
+}
+
+#[test]
+fn a_window_naming_its_input_by_source_refuses_an_undeclared_key() {
+    // A body window's `source:` can only be its own input root, so its
+    // partition keys are names on the row the body receives.
+    assert_undeclared_column_refused(
+        r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      analytic_window:
+        source: inp
+        group_by: [wt]
+      cxl: |
+        emit t = $window.sum(v)
+"#,
+        "wt",
+        "- { name: wt, type: int }",
+    );
+}
+
+#[test]
+fn a_window_lookup_in_a_body_is_refused() {
+    // `on:` would read the window's input by a key expression; a body window
+    // reads only its own input, so `on:` is refused whatever it names.
+    let Err(diags) = compile(&comp(
+        r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      analytic_window:
+        source: inp
+        group_by: [department]
+        on: "wt"
+      cxl: |
+        emit t = $window.sum(v)
+"#,
+    )) else {
+        panic!("a body window with `on:` must not compile");
+    };
+    assert!(
+        diags.iter().any(|d| d.code == "E165" || d.code == "E169"),
+        "{:#?}",
+        describe(&diags)
+    );
+}
