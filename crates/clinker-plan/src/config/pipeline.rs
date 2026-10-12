@@ -4210,12 +4210,27 @@ pub(crate) fn lower_node_to_plan_node(
                         .build()
                 })
                 .unwrap_or_else(|| SchemaBuilder::new().build());
+            // What a Sink with `include_unmapped: false` reading the call
+            // writes: what the node behind the first output port emits.
+            let emits = artifacts
+                .composition_bodies
+                .get(&body_id)
+                .and_then(|body| {
+                    let output = *body.output_port_to_node_idx.values().next()?;
+                    Some(crate::plan::execution::call_emits(
+                        &body.graph,
+                        output,
+                        &body.port_name_to_node_idx,
+                    ))
+                })
+                .unwrap_or_default();
             Some(PlanNode::Composition {
                 name: name.to_string(),
                 id,
                 span,
                 body: body_id,
                 output_schema: comp_output_schema,
+                emits,
             })
         }
         PipelineNode::Aggregate {

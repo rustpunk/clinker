@@ -637,10 +637,11 @@ nodes:
 }
 
 #[test]
-fn e378_gives_the_next_step_when_the_sink_excludes_every_column_its_input_emits() {
+fn e378_moves_a_sink_that_excludes_every_column_its_input_emits_unchanged() {
     // `shape` emits only `value` and passes `id` through. The body Sink writes
-    // only emitted columns and excludes `value`, so no `mapping:` can say
-    // what it writes, and at pipeline level it would write `id`.
+    // only emitted columns and excludes `value`. The call emits what `shape`
+    // emits, so at pipeline level the same configuration writes the same
+    // columns: the help is the move, with the configuration unchanged.
     let comp = r#"_compose:
   name: audited
   inputs:
@@ -671,12 +672,21 @@ nodes:
 "#;
     let diags = e378_for(&[("compositions/audited.comp.yaml", comp)], ENRICH_CALL);
     assert_eq!(diags.len(), 1, "one E378 for the one body Sink");
-    assert_next_step(
-        help_for(&diags, "audit"),
-        "audit",
-        "Sink \"audit\" sets `include_unmapped: false` and its `exclude:` removes every \
-         column \"shape\" emits, so at pipeline level it would write the columns \
-         composition \"enrich\" passes through instead",
+    let help = help_for(&diags, "audit");
+    for fragment in [
+        "\n    audit: shape\n",
+        "input: enrich.audit",
+        "include_unmapped: false",
+        "exclude:\n      - value",
+    ] {
+        assert!(
+            help.contains(fragment),
+            "the help carries {fragment:?}: {help}"
+        );
+    }
+    assert!(
+        !help.contains("mapping:") && !help.contains("explain --code E378"),
+        "the help is the move with the Sink's configuration unchanged: {help}"
     );
 }
 
