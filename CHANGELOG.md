@@ -61,6 +61,21 @@ the message names the composition and the port. A column the port declares
 with a concrete type is still seen with that type, and the columns the port
 does not declare reach the composition's output with the caller's types.
 
+A composition's port types are now what its nodes are checked against, and
+what a call outputs follows what the caller passed. A column a composition
+does not write leaves the call with the type it arrived with, and a column it
+writes has the type its nodes give it from the caller's values, as the same
+nodes written in the pipeline would. Before, a column the port declared left
+the call with the port's declared type whatever the caller passed: an `int`
+column read through an `any` port came out untyped (`any`), and the columns
+the port did not declare did not reach the calling scope's schema, so a node
+after the call could not name them. A node that does not handle
+an empty value in a column its port declares `{ nullable: ... }` now fails
+with `E200` at every call, naming the node, the composition, the port and the
+column, and the help prints the node's line with the empty case handled, such
+as `filter (v ?? 0) > 6`. The `E102` that followed it, saying the next call
+reads a node the pipeline does not bind, is no longer reported.
+
 **Breaking:** `E102` now admits a caller's column only when the port's
 declared type admits it: the same type, a type into its `{ nullable: ... }`
 form, or anything into `any`. A caller column with no declared type (`any`)

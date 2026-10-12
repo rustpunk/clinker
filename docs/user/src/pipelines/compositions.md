@@ -106,14 +106,29 @@ Cull's `removed_to` rows do not reach the pipeline as they would inline
 inside a composition fed by a source that declares a `correlation_key` stops
 with `E314` where the inline Aggregate runs.
 
-The composition's nodes see each column the port declares with a concrete type
-with that type, at every call, so their use of those columns compiles
-wherever the composition is called. A column declared `any` (or
-`{ nullable: any }`) is seen with the type the call provides, so a node that
-uses it in a way only some types support compiles at some calls and not at
-others; the type error names the composition and the port, because it depends
-on the call. Columns the port does not declare keep the
-caller's types on the way through.
+A port's types are what the composition's nodes are checked against; what a
+call outputs follows what the caller passed. Each node is checked with every
+column the port declares at its declared type, at every call, so a composition
+that passes the check compiles wherever its ports accept the caller's rows.
+The rows a call then carries out are the composition's nodes run on the
+caller's values: a column the composition does not write leaves the call with
+the type it arrived with, and a column it writes has the type its nodes give
+it from the caller's values, as the same nodes written in the pipeline would.
+A column declared `any` (or `{ nullable: any }`) is checked with the type the
+call provides, so a node that uses it in a way only some types support
+compiles at some calls and not at others; the type error names the
+composition and the port, because it depends on the call. Columns the port
+does not declare keep the caller's types on the way through.
+
+A column declared `{ nullable: <type> }` says the composition copes with an
+empty value in that column. Its nodes are checked as if the value could be
+empty, so a node that cannot take an empty value, such as `filter qty > 6`,
+fails with `E200` at every call, and the fix is to handle the empty case in
+the composition: `filter (qty ?? 0) > 6`. A call whose column is never empty
+keeps that guarantee through the call, so a later composition that needs a
+never-empty `qty` still accepts it. A call whose column can be empty gets
+results that can be empty, and a later composition that needs a never-empty
+value says so with `E102`.
 
 Each call checks the caller's rows against the port: every declared column
 must be there, with the declared type, with the non-empty form of a
