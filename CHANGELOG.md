@@ -61,6 +61,12 @@ the pipeline's spelling, and the help gives the one change to make: the
 `schema:` line for a column read straight from a Source, or an
 `emit <column> = <column>.to_<type>()` before the call.
 
+A Sink inside a composition is now checked like the same Sink in the
+pipeline: a `mapping:` entry reading a column no row carries is `E365`, and one
+whose output name collides with a caller column `include_unmapped: true`
+writes beside it is `E364`. Before, both checks stood down inside a
+composition.
+
 A composition node listed before the node it reads is now bound after it.
 Before, such a node was left unbound: it escaped every check, and the call
 wrote no rows while the run exited 0.
