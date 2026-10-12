@@ -159,7 +159,8 @@ add before the call, that fixes it.
 
 A node inside the composition that uses a column its port does not declare
 fails compilation with `E169` at every call whose rows carry that column, and
-the help prints the line to add under `_compose.inputs.<port>.schema`. A call
+the help prints the line to add under `_compose.inputs.<port>.schema` once the
+call compiles with it. A call
 whose rows do not carry the column fails with the ordinary unknown-name error,
 such as `E203`. A Reshape `set` or `overrides` entry counts as using the column
 it rewrites. A column the composition creates itself, with an `emit` or as an

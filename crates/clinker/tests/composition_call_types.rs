@@ -1590,3 +1590,564 @@ fn one_composition_called_with_two_provided_types_runs_each_call_as_inline() {
         "the possibly empty call fills its holes: {called_out2:?}"
     );
 }
+
+/// The diagnostics a pipeline of `files` fails to compile with; it must
+/// also stop when run.
+fn refusals(files: &[(String, String)]) -> Vec<Diagnostic> {
+    let called = outcome(files);
+    assert_eq!(called.exit(), Some(1), "{}", describe(&called.run));
+    match called.compiled {
+        Err(diags) => diags,
+        Ok(_) => panic!("must not compile"),
+    }
+}
+
+/// `files` with the composition file's port `port` declared optional.
+fn with_optional_port(mut files: Vec<(String, String)>, port: &str) -> Vec<(String, String)> {
+    for (path, contents) in &mut files {
+        if path == "compositions/c.comp.yaml" {
+            *contents = contents.replacen(
+                &format!("    {port}:\n"),
+                &format!("    {port}:\n      required: false\n"),
+                1,
+            );
+        }
+    }
+    files
+}
+
+/// The `inputs:` entry an E104 help prints, split into port and node.
+fn e104_binding(help: &str) -> (&str, &str) {
+    help.split("under `inputs:` of composition \"first\": `")
+        .nth(1)
+        .and_then(|rest| rest.split('`').next())
+        .and_then(|entry| entry.split_once(": "))
+        .unwrap_or_else(|| panic!("the help prints the entry to add: {help}"))
+}
+
+#[test]
+fn the_e104_fix_names_the_node_whose_rows_the_port_admits_and_runs_as_inline() {
+    // `e104wrong`: `opt` needs `label`, which only `dep` has.
+    let body = r#"  - type: transform
+    name: flag
+    input: inp
+    config:
+      cxl: |
+        emit flag = 1
+  - type: transform
+    name: u
+    input: opt
+    config:
+      cxl: |
+        emit b = label
+"#;
+    let ports: &[(&str, &[&str])] = &[
+        ("inp", &["{ name: v, type: int }"]),
+        ("opt", &["{ name: label, type: string }"]),
+    ];
+    let shape = Shape {
+        ports,
+        bindings: FED_BY_SRC,
+        out: "flag",
+        body,
+        upstream: format!("{}{DEPARTMENTS_SOURCE}", source("int")),
+        input: ORDERS,
+    };
+    let diags = refusals(&with_optional_port(shape.call_files(), "opt"));
+    assert_eq!(diags.len(), 1, "{diags:#?}");
+    assert_eq!(diags[0].code, "E104", "{diags:#?}");
+    let (port, upstream) = e104_binding(diags[0].help.as_deref().unwrap_or_default());
+    assert_eq!((port, upstream), ("opt", "dep"));
+    let bindings = [("inp", "src"), (port, upstream)];
+    let bound = Shape {
+        bindings: &bindings,
+        ..shape
+    };
+    let called = outcome(&with_optional_port(bound.call_files(), "opt"));
+    let inline = outcome(&bound.inline_files());
+    assert_eq!(inline.exit(), Some(0), "{}", describe(&inline.run));
+    assert_eq!(called.exit(), Some(0), "{}", describe(&called.run));
+    assert_eq!(called.out, inline.out);
+    assert_eq!(called.typing("flag"), inline.typing("flag"));
+}
+
+#[test]
+fn a_call_binding_no_port_is_told_the_node_to_bind_and_binding_it_runs() {
+    // `e104none`: the call binds no port at all.
+    let composition = comp(
+        "c",
+        &[("inp", &["{ name: v, type: int }"])],
+        "flag",
+        r#"  - type: transform
+    name: flag
+    input: inp
+    config:
+      cxl: |
+        emit flag = v
+"#,
+    )
+    .replacen("    inp:\n", "    inp:\n      required: false\n", 1);
+    let files = |inputs: &str| {
+        let nodes = format!(
+            "{}  - type: composition\n    name: first\n    input: src\n    use: ../compositions/c.comp.yaml\n    inputs: {inputs}\n{}",
+            source("int"),
+            call("second", "second.comp.yaml", &[("inp", "first")]),
+        );
+        vec![
+            (PIPELINE.to_string(), pipeline(&nodes)),
+            ("compositions/c.comp.yaml".to_string(), composition.clone()),
+            ("compositions/second.comp.yaml".to_string(), second()),
+            ("pipelines/in.csv".to_string(), ORDERS.to_string()),
+        ]
+    };
+    let diags = refusals(&files("{}"));
+    assert_eq!(diags.len(), 1, "{diags:#?}");
+    let (port, upstream) = e104_binding(diags[0].help.as_deref().unwrap_or_default());
+    let pasted = outcome(&files(&format!("{{ {port}: {upstream} }}")));
+    assert_eq!(pasted.exit(), Some(0), "{}", describe(&pasted.run));
+    let inline = outcome(
+        &Shape {
+            ports: &[],
+            bindings: FED_BY_SRC,
+            out: "flag",
+            body: r#"  - type: transform
+    name: flag
+    input: inp
+    config:
+      cxl: |
+        emit flag = v
+"#,
+            upstream: source("int"),
+            input: ORDERS,
+        }
+        .inline_files(),
+    );
+    assert_eq!(pasted.out, inline.out);
+}
+
+#[test]
+fn an_unbound_optional_port_named_by_an_output_port_is_refused_and_binding_it_runs() {
+    // `optout`: the output port is the optional input port itself. Before,
+    // the call wrote no rows, not even a header, and exited 0.
+    let ports: &[(&str, &[&str])] = &[
+        ("inp", &["{ name: v, type: int }"]),
+        ("opt", &["{ name: v, type: int }"]),
+    ];
+    let shape = Shape {
+        ports,
+        bindings: FED_BY_SRC,
+        out: "opt",
+        body: r#"  - type: transform
+    name: flag
+    input: inp
+    config:
+      cxl: |
+        emit flag = 1
+"#,
+        upstream: source("int"),
+        input: ORDERS,
+    };
+    let diags = refusals(&with_optional_port(shape.call_files(), "opt"));
+    assert_eq!(diags.len(), 1, "{diags:#?}");
+    assert_eq!(diags[0].code, "E104", "{diags:#?}");
+    assert!(
+        diags[0]
+            .message
+            .contains("output port `out` in `compositions/c.comp.yaml` carries input port `opt`"),
+        "{}",
+        diags[0].message
+    );
+    let (port, upstream) = e104_binding(diags[0].help.as_deref().unwrap_or_default());
+    let bindings = [("inp", "src"), (port, upstream)];
+    let called = outcome(&with_optional_port(
+        Shape {
+            bindings: &bindings,
+            upstream: shape.upstream.clone(),
+            ..shape
+        }
+        .call_files(),
+        "opt",
+    ));
+    assert_eq!(called.exit(), Some(0), "{}", describe(&called.run));
+    // Inline, `second` reads what the port carried: the node bound to it.
+    let inline = outcome(
+        &Shape {
+            out: upstream,
+            body: "",
+            ..shape
+        }
+        .inline_files(),
+    );
+    assert_eq!(inline.exit(), Some(0), "{}", describe(&inline.run));
+    assert_eq!(called.out, inline.out);
+}
+
+/// The one E107 a call of `body` (output node `out`, ports `ports`) draws.
+fn the_e107(
+    ports: &[(&str, &[&str])],
+    bindings: &[(&str, &str)],
+    body: &str,
+    out: &str,
+) -> Diagnostic {
+    let diags = refusals(
+        &Shape {
+            ports,
+            bindings,
+            out,
+            body,
+            upstream: format!("{}{DEPARTMENTS_SOURCE}", source("int")),
+            input: ORDERS,
+        }
+        .call_files(),
+    );
+    assert_eq!(diags.len(), 1, "one E107 and no follower: {diags:#?}");
+    assert_eq!(diags[0].code, "E107", "{diags:#?}");
+    diags[0].clone()
+}
+
+#[test]
+fn a_cycle_through_a_merge_or_a_combine_gets_one_e107_and_a_sentence() {
+    // `e107merge`: following a line that made the Merge read `inp` again
+    // would write every row twice; the help is a sentence.
+    let merge = the_e107(
+        &[("inp", &["{ name: v, type: int }"])],
+        FED_BY_SRC,
+        r#"  - type: merge
+    name: m
+    inputs: [inp, b]
+  - type: transform
+    name: b
+    input: m
+    config:
+      cxl: |
+        emit v = v
+"#,
+        "m",
+    );
+    let help = merge.help.as_deref().unwrap_or_default();
+    assert!(
+        !help.contains("`input:") && !help.contains("inputs:"),
+        "{help}"
+    );
+    // `e107comb`: no E304 follower for the member that did not bind.
+    let combine = the_e107(
+        &[(
+            "pa",
+            &[
+                "{ name: department, type: string }",
+                "{ name: v, type: int }",
+            ],
+        )],
+        &[("pa", "src")],
+        r#"  - type: combine
+    name: j
+    input:
+      a: pa
+      b: k
+    config:
+      where: "a.department == b.department and a.v == b.v"
+      match: first
+      on_miss: skip
+      propagate_ck: driver
+      cxl: |
+        emit department = a.department
+        emit v = a.v
+  - type: transform
+    name: k
+    input: j
+    config:
+      cxl: |
+        emit v = v
+"#,
+        "j",
+    );
+    let help = combine.help.as_deref().unwrap_or_default();
+    assert!(!help.contains("`input:"), "{help}");
+}
+
+#[test]
+fn the_e107_fix_reads_the_port_that_declares_what_the_cycle_reads_and_runs_as_inline() {
+    // `e107port`: `aa` comes first but does not declare `v`.
+    let ports: &[(&str, &[&str])] = &[
+        ("aa", &["{ name: department, type: string }"]),
+        ("zz", &["{ name: v, type: int }"]),
+    ];
+    let body = r#"  - type: transform
+    name: a
+    input: b
+    config:
+      cxl: |
+        emit p = v
+  - type: transform
+    name: b
+    input: a
+    config:
+      cxl: |
+        emit v = v
+"#;
+    let bindings = [("aa", "src"), ("zz", "src")];
+    let refused = the_e107(ports, &bindings, body, "a");
+    let help = refused.help.as_deref().unwrap_or_default();
+    assert_eq!(
+        help,
+        "set `input:` of node \"b\" to an input port of the composition: `input: zz`"
+    );
+    let fixed = with_input_line(body, "b", "input: zz");
+    assert_inline_equivalent(
+        &Shape {
+            ports,
+            bindings: &bindings,
+            out: "a",
+            body: &fixed,
+            upstream: format!("{}{DEPARTMENTS_SOURCE}", source("int")),
+            input: ORDERS,
+        },
+        0,
+    );
+}
+
+#[test]
+fn a_combine_where_misusing_an_any_column_gets_an_entry_that_runs_as_inline() {
+    // `combany`: `pa` declares `v` as `any`, the call provides an `int`.
+    let ports: &[(&str, &[&str])] = &[
+        (
+            "pa",
+            &[
+                "{ name: department, type: string }",
+                "{ name: v, type: any }",
+            ],
+        ),
+        (
+            "pb",
+            &[
+                "{ name: department, type: string }",
+                "{ name: label, type: string }",
+            ],
+        ),
+    ];
+    let body = COMBINE_WHERE_BODY.replace(
+        "a.department == b.department and a.v > 5",
+        "a.department == b.department and a.v.upper() == b.label",
+    );
+    let shape = Shape {
+        ports,
+        bindings: &[("pa", "src"), ("pb", "dep")],
+        out: "j",
+        body: &body,
+        upstream: format!("{}{DEPARTMENTS_SOURCE}", source("int")),
+        input: ORDERS,
+    };
+    let diags = refusals(&shape.call_files());
+    assert_eq!(diags.len(), 1, "{diags:#?}");
+    assert_eq!(diags[0].code, "E200", "{diags:#?}");
+    assert!(
+        diags[0]
+            .message
+            .contains("input port `pa` declares `v` as `any`"),
+        "{}",
+        diags[0].message
+    );
+    let entry = pasted_line(diags[0].help.as_deref().unwrap_or_default()).to_string();
+    assert_eq!(
+        entry,
+        "where: 'a.department == b.department and a.v.to_string().upper() == b.label'"
+    );
+    let fixed = body.replace(
+        r#"where: "a.department == b.department and a.v.upper() == b.label""#,
+        &entry,
+    );
+    assert_ne!(fixed, body);
+    assert_inline_equivalent(
+        &Shape {
+            body: &fixed,
+            ..shape
+        },
+        0,
+    );
+}
+
+#[test]
+fn a_line_that_would_still_fail_is_not_offered() {
+    // `v > wt` needs both never empty: handling one is not a fix, so each
+    // E200 says what to change and prints no line.
+    let shape = Shape {
+        ports: &[(
+            "inp",
+            &[
+                "{ name: v, type: { nullable: int } }",
+                "{ name: wt, type: { nullable: int } }",
+            ],
+        )],
+        bindings: FED_BY_SRC,
+        out: "flag",
+        body: r#"  - type: transform
+    name: flag
+    input: inp
+    config:
+      cxl: |
+        filter v > wt
+"#,
+        upstream: source("int"),
+        input: ORDERS,
+    };
+    let diags = refusals(&shape.call_files());
+    assert_eq!(diags.len(), 2, "{diags:#?}");
+    for diag in &diags {
+        let help = diag.help.as_deref().unwrap_or_default();
+        let fix = help.split(". Technical detail: ").next().unwrap_or(help);
+        assert!(
+            fix.starts_with("give node \"flag\" in `compositions/c.comp.yaml` a value to use when"),
+            "{help}"
+        );
+        assert!(!fix.contains("??"), "{help}");
+    }
+}
+
+#[test]
+fn a_port_reading_a_call_s_first_output_port_by_name_gets_the_call_s_name_and_runs_as_inline() {
+    // `e102firstport`: `pre.out` is the only output port of `pre`.
+    let body = r#"  - type: transform
+    name: flag
+    input: inp
+    config:
+      cxl: |
+        emit flag = v
+"#;
+    let upstream = format!(
+        "{}{}",
+        source("int"),
+        call("pre", "second.comp.yaml", &[("inp", "src")])
+    );
+    let shape = Shape {
+        ports: &[("inp", &["{ name: v, type: int }"])],
+        bindings: &[("inp", "pre.out")],
+        out: "flag",
+        body,
+        upstream: upstream.clone(),
+        input: ORDERS,
+    };
+    let diags = refusals(&shape.call_files());
+    assert_eq!(diags.len(), 1, "{diags:#?}");
+    assert_eq!(diags[0].code, "E102", "{diags:#?}");
+    let help = diags[0].help.as_deref().unwrap_or_default();
+    assert_eq!(
+        help,
+        "read the call by its name: write under `inputs:`: `inp: pre`"
+    );
+    assert_inline_equivalent(
+        &Shape {
+            bindings: &[("inp", "pre")],
+            ..shape
+        },
+        0,
+    );
+}
+
+#[test]
+fn a_port_fed_by_a_route_branch_gets_a_transform_that_runs_as_inline() {
+    let route = r#"  - type: route
+    name: r
+    input: src
+    config:
+      mode: exclusive
+      conditions:
+        high: 'v > 6'
+      default: low
+"#;
+    let body = r#"  - type: transform
+    name: flag
+    input: inp
+    config:
+      cxl: |
+        emit flag = v
+"#;
+    let shape = Shape {
+        ports: &[("inp", &["{ name: v, type: int }"])],
+        bindings: &[("inp", "r.high")],
+        out: "flag",
+        body,
+        upstream: format!("{}{route}", source("int")),
+        input: ORDERS,
+    };
+    let diags = refusals(&shape.call_files());
+    assert_eq!(diags.len(), 1, "{diags:#?}");
+    let help = diags[0].help.as_deref().unwrap_or_default();
+    let yaml = help
+        .split_once(":\n")
+        .map(|(_, yaml)| yaml)
+        .unwrap_or_else(|| panic!("the help prints a Transform: {help}"));
+    let indented: String = yaml.lines().map(|line| format!("  {line}\n")).collect();
+    assert_inline_equivalent(
+        &Shape {
+            bindings: &[("inp", "r_high")],
+            upstream: format!("{}{route}{indented}", source("int")),
+            ..shape
+        },
+        0,
+    );
+}
+
+#[test]
+fn a_call_reading_a_node_whose_upstream_failed_reports_what_the_inline_nodes_report() {
+    let upstream = format!(
+        "{}  - type: transform\n    name: bad\n    input: src\n    config:\n      cxl: |\n        emit v = v + true\n  - type: transform\n    name: relay\n    input: bad\n    config:\n      cxl: |\n        emit v = v\n",
+        source("int")
+    );
+    let (called, _) = assert_inline_equivalent(
+        &Shape {
+            ports: &[("inp", &["{ name: v, type: int }"])],
+            bindings: &[("inp", "relay")],
+            out: "flag",
+            body: r#"  - type: transform
+    name: flag
+    input: inp
+    config:
+      cxl: |
+        emit flag = v
+"#,
+            upstream,
+            input: ORDERS,
+        },
+        1,
+    );
+    assert_eq!(called.codes(), ["E200"]);
+}
+
+#[test]
+fn a_column_of_another_type_gets_a_converting_transform_that_runs_as_inline() {
+    // `src` reads `v` as text; the port needs an `int`. The help prints a
+    // Transform converting it, to feed the port from.
+    let pre = "  - type: transform\n    name: pre\n    input: src\n    config:\n      cxl: |\n        emit v = v\n";
+    let shape = Shape {
+        ports: &[("inp", &["{ name: v, type: int }"])],
+        bindings: &[("inp", "pre")],
+        out: "flag",
+        body: r#"  - type: transform
+    name: flag
+    input: inp
+    config:
+      cxl: |
+        emit flag = v
+"#,
+        upstream: format!("{}{pre}", source("string")),
+        input: ORDERS,
+    };
+    let diags = refusals(&shape.call_files());
+    assert_eq!(diags.len(), 1, "{diags:#?}");
+    assert_eq!(diags[0].code, "E102", "{diags:#?}");
+    let help = diags[0].help.as_deref().unwrap_or_default();
+    let yaml = help
+        .split_once(":\n")
+        .and_then(|(_, rest)| rest.split(". A port admits").next())
+        .unwrap_or_else(|| panic!("the help prints a Transform: {help}"));
+    assert!(yaml.contains("emit v = v.to_int()"), "{help}");
+    let indented: String = yaml.lines().map(|line| format!("  {line}\n")).collect();
+    assert_inline_equivalent(
+        &Shape {
+            bindings: &[("inp", "pre_v")],
+            upstream: format!("{}{pre}{indented}", source("string")),
+            ..shape
+        },
+        0,
+    );
+}
