@@ -478,7 +478,11 @@ fn an_untyped_caller_column_from_a_transform_is_refused_with_a_conversion() {
 }
 
 #[test]
-fn a_port_declared_nullable_admits_the_non_empty_type_and_types_the_body_nullable() {
+fn a_port_declared_nullable_admits_the_non_empty_type_and_the_call_carries_it() {
+    // The body is checked as if `v` could be empty (see
+    // `a_body_that_does_not_handle_an_empty_value_is_refused_at_every_call`);
+    // what the call runs and carries out is the caller's `int`, so the
+    // column the body writes from it is an `int`, as it is inline.
     let composition = comp_declaring(
         &[
             "{ name: v, type: { nullable: int } }",
@@ -495,8 +499,233 @@ fn a_port_declared_nullable_admits_the_non_empty_type_and_types_the_body_nullabl
         });
     assert_eq!(
         body_column_type(&plan, "last", "y"),
-        cxl::typecheck::Type::nullable(cxl::typecheck::Type::Int),
-        "the body sees the port's type, not the caller's"
+        cxl::typecheck::Type::Int,
+        "the call carries the caller's type"
+    );
+    // A caller whose `v` can be empty gets a possibly empty `y`.
+    let plan = compile_in(
+        &pipeline_with_v("{ nullable: int }"),
+        &[("compositions/c.comp.yaml", &composition)],
+    )
+    .unwrap_or_else(|d| panic!("compiles: {:#?}", describe(&d)));
+    assert_eq!(
+        body_column_type(&plan, "last", "y"),
+        cxl::typecheck::Type::nullable(cxl::typecheck::Type::Int)
+    );
+}
+
+/// A body node that cannot take an empty value from a `{ nullable: int }`
+/// port, called by a caller whose `v` is `caller_v`.
+fn possibly_empty_refusal(caller_v: &str, body: &str) -> Vec<Diagnostic> {
+    let composition = comp_declaring(&["{ name: v, type: { nullable: int } }"], body);
+    let Err(diags) = compile_in(
+        &pipeline_with_v(caller_v),
+        &[("compositions/c.comp.yaml", &composition)],
+    ) else {
+        panic!("the body does not handle an empty `v`");
+    };
+    diags
+}
+
+#[test]
+fn a_body_that_does_not_handle_an_empty_value_is_refused_at_every_call() {
+    let body = r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        filter v > 6
+"#;
+    for caller in ["int", "{ nullable: int }"] {
+        let diags = possibly_empty_refusal(caller, body);
+        assert_eq!(diags.len(), 1, "{caller}: {:#?}", describe(&diags));
+        let diag = &diags[0];
+        assert_eq!(diag.code, "E200", "{:#?}", describe(&diags));
+        assert!(
+            diag.message.starts_with(
+                "node \"last\" in composition \"call\" cannot use `v` while it may be empty: \
+                 input port `inp` declares `v` as `{ nullable: int }`"
+            ),
+            "{}",
+            diag.message
+        );
+        let help = diag.help.as_deref().expect("a fix");
+        assert!(
+            help.contains("`filter (v ?? 0) > 6`")
+                && help.contains("`- { name: v, type: int }`")
+                && help.contains("c.comp.yaml"),
+            "{help}"
+        );
+    }
+}
+
+#[test]
+fn an_error_that_is_not_about_an_empty_value_is_not_blamed_on_one() {
+    // `v.upper()` fails whether or not `v` can be empty: the plain E200.
+    let diags = possibly_empty_refusal(
+        "int",
+        r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit u = v.upper()
+"#,
+    );
+    assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
+    assert_eq!(diags[0].code, "E200");
+    assert!(
+        !diags[0].message.contains("may be empty"),
+        "{}",
+        diags[0].message
+    );
+}
+
+#[test]
+fn a_nested_call_that_needs_a_never_empty_value_is_refused_behind_a_possibly_empty_port() {
+    // The outer body is checked as if `v` could be empty, so its call to a
+    // composition whose port needs a never-empty `v` fails at every call:
+    // the outer body has to handle the empty case first.
+    let outer = comp_declaring(
+        &["{ name: v, type: { nullable: int } }"],
+        r#"  - type: composition
+    name: last
+    input: inp
+    use: ./inner.comp.yaml
+    inputs:
+      inp: inp
+"#,
+    );
+    let inner = comp_declaring(&["{ name: v, type: int }"], IDENTITY_BODY);
+    let Err(diags) = compile_in(
+        PIPELINE,
+        &[
+            ("compositions/c.comp.yaml", &outer),
+            ("compositions/inner.comp.yaml", &inner),
+        ],
+    ) else {
+        panic!("the outer body hands a possibly empty `v` to a port that needs an `int`");
+    };
+    assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
+    assert_eq!(diags[0].code, "E102", "{:#?}", describe(&diags));
+    assert!(
+        diags[0].message.contains("composition \"last\"")
+            && diags[0]
+                .message
+                .contains("\"inp\" provides `v` as `{ nullable: int }`"),
+        "{}",
+        diags[0].message
+    );
+}
+
+#[test]
+fn a_body_that_compiles_against_its_declared_types_compiles_at_every_admitted_call() {
+    // Nullability monotonicity: every typing rule that accepts a possibly
+    // empty value accepts a never-empty one. A body that passes the check
+    // against `{ nullable: int }` must therefore bind for a caller whose `v`
+    // is a never-empty `int`; if it ever does not, the compile reports E000
+    // rather than trusting the check.
+    let transforms = [
+        "emit a = v + 1",
+        "emit a = v - 1",
+        "emit a = v * 2",
+        "emit a = v / 2",
+        "emit a = v % 2",
+        "emit a = -v",
+        "emit a = v * 2.5",
+        "emit a = v > 3",
+        "emit a = v >= 3 and v <= 9",
+        "emit a = v == 5",
+        "emit a = v != 5",
+        "emit a = v ?? 0",
+        "emit a = (v ?? 0) > 6",
+        "emit a = v.to_string()",
+        "emit a = v.to_float()",
+        "emit a = v.abs()",
+        "emit a = v.is_null()",
+        "emit a = v.type_of()",
+        "emit v = v",
+        "emit v = v + 1",
+        "let x = v + 1\nemit a = x",
+        "let x = v\nemit a = x ?? 0",
+        "filter (v ?? 0) > 6",
+        "filter v.is_null()",
+        "filter (v > 6) ?? false",
+        "emit a = v.to_string().upper()",
+        "emit a = v.to_string() + \"x\"",
+    ];
+    let mut bodies: Vec<String> = transforms
+        .iter()
+        .map(|cxl| {
+            let cxl = cxl.replace('\n', "\n        ");
+            format!(
+                "  - type: transform\n    name: last\n    input: inp\n    config:\n      cxl: |\n        {cxl}\n"
+            )
+        })
+        .collect();
+    bodies.push(
+        r#"  - type: aggregate
+    name: last
+    input: inp
+    config:
+      group_by: [v]
+      cxl: |
+        emit n = count(*)
+"#
+        .to_string(),
+    );
+    bodies.push(
+        r#"  - type: aggregate
+    name: last
+    input: inp
+    config:
+      group_by: []
+      cxl: |
+        emit s = sum(v)
+        emit m = max(v)
+"#
+        .to_string(),
+    );
+    bodies.push(
+        r#"  - type: reshape
+    name: last
+    input: inp
+    config:
+      partition_by: [v]
+      rules:
+        - name: r1
+          when: "v == 5"
+          mutate:
+            set:
+              v: "v"
+"#
+        .to_string(),
+    );
+    let mut checked = 0;
+    for body in &bodies {
+        let composition = comp_declaring(&["{ name: v, type: { nullable: int } }"], body);
+        let files = [("compositions/c.comp.yaml", composition.as_str())];
+        let declared = compile_in(&pipeline_with_v("{ nullable: int }"), &files);
+        let provided = compile_in(PIPELINE, &files);
+        if let Err(diags) = &provided {
+            assert!(
+                diags.iter().all(|d| d.code != "E000"),
+                "{body}\n{:#?}",
+                describe(diags)
+            );
+        }
+        if declared.is_ok() {
+            checked += 1;
+            assert!(
+                provided.is_ok(),
+                "passes against `{{ nullable: int }}` but not for an `int` caller:\n{body}\n{:#?}",
+                provided.err().map(|d| describe(&d))
+            );
+        }
+    }
+    assert!(
+        checked >= 20,
+        "the property ran on {checked} bodies that pass the check"
     );
 }
 

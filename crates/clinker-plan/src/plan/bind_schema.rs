@@ -50,6 +50,7 @@ use crate::plan::types::JoinSide;
 use crate::plan::{EntityRef, PlanNodeId};
 use crate::resources::WorkspaceCatalog;
 use crate::yaml::Spanned;
+use clinker_core_types::diagnostic::Severity;
 use clinker_core_types::span::{FileId, Span};
 use clinker_core_types::{Diagnostic, LabeledSpan, QuoteName};
 use clinker_format::{Column, SourceSchema};
@@ -2660,6 +2661,12 @@ fn bind_schema_inner(
         .filter(|spanned| matches!(spanned.value, PipelineNode::Source { .. }))
         .map(|spanned| spanned.value.name().to_string())
         .collect();
+    // Every node of this scope, so a call reading one that failed to bind
+    // is not reported a second time as reading a node that does not exist.
+    let scope_nodes: HashSet<String> = nodes
+        .iter()
+        .map(|spanned| spanned.value.name().to_string())
+        .collect();
 
     // Bind each node after the nodes of this scope it reads. An author may
     // list a node before its input; binding in list order left such a node
@@ -3510,6 +3517,7 @@ fn bind_schema_inner(
                         call_config: config,
                         call_resources: resources,
                         source_nodes: &source_nodes,
+                        scope_nodes: &scope_nodes,
                         span,
                     },
                     diags,
@@ -3568,6 +3576,8 @@ struct CompositionBindParams<'a> {
     /// The calling scope's Source nodes, so an E102 can point at the
     /// `schema:` line that declares a column's type.
     source_nodes: &'a HashSet<String>,
+    /// Every node of the calling scope.
+    scope_nodes: &'a HashSet<String>,
     span: Span,
 }
 
@@ -3592,6 +3602,7 @@ fn bind_composition(
         call_config,
         call_resources,
         source_nodes,
+        scope_nodes,
         span,
     } = params;
     // 1. Resolve use_path to workspace-relative key and look up in symbol_table.
@@ -3690,6 +3701,7 @@ fn bind_composition(
             signature,
             parent_schemas: parent_schema_by_name,
             source_nodes,
+            scope_nodes,
             body_file: &resolved_path,
             span,
         },
@@ -4088,11 +4100,14 @@ fn bind_composition(
     // body node compiles (an Aggregate's group key and field arguments, a
     // Cull's decision aggregate) then addresses the record's real layout.
     // The port's declaration decides what the body may name and the types
-    // it sees (see `seed_port_row`).
+    // it sees (see `seed_port_row`). The body binds against the types this
+    // call provides; when those differ from the declared types, it is also
+    // checked against the declared ones (see `bind_body`).
     let mut body_schema_by_name: HashMap<String, Row> = HashMap::new();
     let mut body_declared_multiple_by_name: HashMap<String, BTreeSet<String>> = HashMap::new();
     let body_file_label: Arc<str> = Arc::from(resolved_path.display().to_string().as_str());
     let mut port_seeds: IndexMap<String, Row> = IndexMap::new();
+    let mut contract_seeds: IndexMap<String, Row> = IndexMap::new();
     for port_name in input_port_rows.keys() {
         let Some(upstream_row) = call_inputs
             .get(port_name)
@@ -4110,7 +4125,14 @@ fn bind_composition(
             .get(port_name)
             .map(port_columns)
             .unwrap_or_default();
-        let seed = seed_port_row(upstream_row, &declared, origin);
+        let contract = seed_port_row(
+            upstream_row,
+            &declared,
+            Arc::clone(&origin),
+            PortTypes::Declared,
+        );
+        contract_seeds.insert(port_name.clone(), contract);
+        let seed = seed_port_row(upstream_row, &declared, origin, PortTypes::Provided);
         body_schema_by_name.insert(port_name.clone(), seed.clone());
         port_seeds.insert(port_name.clone(), seed);
         let declared_multiple = call_inputs
@@ -4211,9 +4233,15 @@ fn bind_composition(
         .collect();
 
     // Recursive bind_schema on body nodes.
-    bind_schema_inner(
-        &body_file.nodes,
-        &body_node_ids,
+    bind_body(
+        &BodyBind {
+            call: node_name,
+            nodes: &body_file.nodes,
+            node_ids: &body_node_ids,
+            port_seeds: &port_seeds,
+            contract_seeds: &contract_seeds,
+            span,
+        },
         diags,
         bind_ctx,
         artifacts,
@@ -4708,7 +4736,14 @@ fn bind_composition(
         artifacts
             .declared_multiple
             .insert(node_id, declared_multiple);
-        let row = carry_into_caller_scope(row, call_inputs, parent_schema_by_name);
+        let row = carry_into_caller_scope(
+            row,
+            node_name,
+            call_inputs,
+            parent_schema_by_name,
+            span,
+            diags,
+        );
         parent_schema_by_name.insert(node_name.to_string(), row);
     }
 }
@@ -5133,6 +5168,8 @@ struct PortAdmission<'a> {
     parent_schemas: &'a HashMap<String, Row>,
     /// The calling scope's Source nodes, whose `schema:` declares a type.
     source_nodes: &'a HashSet<String>,
+    /// Every node of the calling scope.
+    scope_nodes: &'a HashSet<String>,
     /// The composition file, as the author refers to it.
     body_file: &'a Path,
     span: Span,
@@ -5162,6 +5199,7 @@ fn build_input_port_rows(
         signature,
         parent_schemas,
         source_nodes,
+        scope_nodes,
         span,
         ..
     } = admission;
@@ -5174,6 +5212,15 @@ fn build_input_port_rows(
             continue;
         };
         let Some(upstream_row) = parent_schemas.get(upstream_name.as_str()) else {
+            // A node of this scope with no row failed to bind, and said why
+            // where it failed; a second error here would only say that the
+            // call cannot read it.
+            let failed_upstream = scope_nodes.contains(upstream_name.as_str())
+                && diags.iter().any(|d| d.severity == Severity::Error);
+            has_errors = true;
+            if failed_upstream {
+                continue;
+            }
             diags.push(unbound_port_upstream(
                 call,
                 port_name,
@@ -5702,21 +5749,158 @@ fn body_input_diagnostics(
     }
 }
 
+/// Which types a body's port rows give the columns the port declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortTypes {
+    /// The declared types: the composition's contract, which every call is
+    /// checked against. A `{ nullable: T }` column is seen as possibly empty
+    /// whatever the caller passes.
+    Declared,
+    /// The types this call provides, where the declaration admits them as
+    /// they are: a `{ nullable: T }` column fed a never-empty `T` is `T`.
+    /// The rows a call carries out, and so the types after the call, follow
+    /// from these, as they would for the same nodes written inline.
+    Provided,
+}
+
+/// One composition body to bind at one call site.
+struct BodyBind<'a> {
+    /// The composition node's name at the call site.
+    call: &'a str,
+    nodes: &'a [Spanned<PipelineNode>],
+    node_ids: &'a HashMap<String, PlanNodeId>,
+    /// Each port's row with the types this call provides
+    /// ([`PortTypes::Provided`]); already in the body's row map.
+    port_seeds: &'a IndexMap<String, Row>,
+    /// Each port's row with the declared types ([`PortTypes::Declared`]).
+    contract_seeds: &'a IndexMap<String, Row>,
+    span: Span,
+}
+
+/// Bind a composition body's nodes at one call site.
+///
+/// The body is bound against the types this call provides, and those rows,
+/// programs and output types are what the call carries out: a column the
+/// body does not write leaves with the type it arrived with, and a column it
+/// writes has the type the body computes from what the caller passed, as
+/// the same nodes written inline would.
+///
+/// The composition's contract is its ports' declared types. Where this call
+/// provides a narrower type (a never-empty `T` into `{ nullable: T }`), the
+/// body is first bound against the declared types as well, on a copy of the
+/// artifacts that is then dropped, and only that check's diagnostics are
+/// kept: a body that does not cope with an empty value its port admits fails
+/// at every call, whoever the caller is. Every CXL and planner rule is
+/// monotone in nullability, so a body that passes the declared-type check
+/// passes the provided-type bind too; a failure there is reported as an
+/// internal error (E000) rather than dropped.
+fn bind_body(
+    bind: &BodyBind<'_>,
+    diags: &mut Vec<Diagnostic>,
+    bind_ctx: &mut BindContext<'_>,
+    artifacts: &mut CompileArtifacts,
+    body_schema_by_name: &mut HashMap<String, Row>,
+    body_declared_multiple_by_name: &mut HashMap<String, BTreeSet<String>>,
+) {
+    if bind.contract_seeds == bind.port_seeds {
+        bind_schema_inner(
+            bind.nodes,
+            bind.node_ids,
+            diags,
+            bind_ctx,
+            artifacts,
+            body_schema_by_name,
+            body_declared_multiple_by_name,
+        );
+        return;
+    }
+    let mut contract_artifacts = artifacts.clone();
+    let mut contract_rows = body_schema_by_name.clone();
+    for (port, seed) in bind.contract_seeds {
+        contract_rows.insert(port.clone(), seed.clone());
+    }
+    let mut contract_multiple = body_declared_multiple_by_name.clone();
+    let checked_from = diags.len();
+    bind_schema_inner(
+        bind.nodes,
+        bind.node_ids,
+        diags,
+        bind_ctx,
+        &mut contract_artifacts,
+        &mut contract_rows,
+        &mut contract_multiple,
+    );
+    let contract_failed = diags[checked_from..]
+        .iter()
+        .any(|d| d.severity == Severity::Error);
+    let mut produced: Vec<Diagnostic> = Vec::new();
+    bind_schema_inner(
+        bind.nodes,
+        bind.node_ids,
+        &mut produced,
+        bind_ctx,
+        artifacts,
+        body_schema_by_name,
+        body_declared_multiple_by_name,
+    );
+    if let Some(internal) =
+        unchecked_instantiation_error(bind.call, contract_failed, &produced, bind.span)
+    {
+        diags.push(internal);
+    }
+}
+
+/// E000 when a composition body that passed the check against its ports'
+/// declared types fails to bind against the narrower types a call provides.
+/// That cannot happen while every typing rule is monotone in nullability;
+/// if it does, the call must not compile on the strength of a check whose
+/// result the compiled body no longer matches.
+fn unchecked_instantiation_error(
+    call: &str,
+    contract_failed: bool,
+    produced: &[Diagnostic],
+    span: Span,
+) -> Option<Diagnostic> {
+    if contract_failed {
+        return None;
+    }
+    let errors: Vec<String> = produced
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .map(|d| format!("{}: {}", d.code, d.message))
+        .collect();
+    if errors.is_empty() {
+        return None;
+    }
+    Some(Diagnostic::error(
+        "E000",
+        format!(
+            "internal error: composition {call:?} passed the check against its input ports' \
+             declared types but failed to bind against the types this call provides: {}",
+            errors.join("; ")
+        ),
+        LabeledSpan::primary(span, String::new()),
+    ))
+}
+
 /// The row a composition body binds input port `port` against: the row the
 /// call site feeds it, with the port's declaration applied.
 ///
 /// Positions, engine columns and every other column are the caller's, so
 /// each position a body node compiles addresses the records the body
 /// receives. A column the port declares with a concrete type is seen with
-/// that type at every call (E102 has admitted the caller's type into it);
-/// a column the port declares `any` keeps the type this call provides. Every
-/// author column is marked as carried in through the port, and one the port
-/// does not declare cannot be named by the body ([`Row::lookup`] refuses it),
-/// which every name check in the body reports as E169.
+/// that type (E102 has admitted the caller's type into it); under
+/// [`PortTypes::Provided`] a `{ nullable: T }` column the caller provides as
+/// `T` is seen as `T`. A column the port declares `any` keeps the type this
+/// call provides. Every author column is marked as carried in through the
+/// port, and one the port does not declare cannot be named by the body
+/// ([`Row::lookup`] refuses it), which every name check in the body reports
+/// as E169. The marks are the same under either [`PortTypes`].
 fn seed_port_row(
     upstream: &Row,
     declared: &IndexMap<QualifiedField, Type>,
     origin: Arc<PortOrigin>,
+    types: PortTypes,
 ) -> Row {
     // A declaration with a concrete type retypes the column; `any` and
     // `{ nullable: any }` keep the type this call provides.
@@ -5724,6 +5908,9 @@ fn seed_port_row(
     let columns: IndexMap<QualifiedField, Type> = upstream
         .fields()
         .map(|(field, ty)| match declared.get(field) {
+            Some(Type::Nullable(inner)) if types == PortTypes::Provided && inner.as_ref() == ty => {
+                (field.clone(), ty.clone())
+            }
             Some(port_ty) if !field.name.starts_with('$') && typed_by_port(port_ty) => {
                 (field.clone(), port_ty.clone())
             }
@@ -5763,10 +5950,20 @@ fn seed_port_row(
 /// body's own port). A column the body wrote is the calling scope's own, as
 /// any column a node there writes is. When the calling scope is the pipeline
 /// itself, the row leaves the body scope and every column may be named.
+///
+/// Inside an enclosing body every column must leave with a mark: a carried
+/// column takes the mark of the row that fed its port, which was seeded from
+/// that row. A carried column whose port has no fed row, or whose fed row
+/// does not mark it, or a column with no mark at all, is a state no bind
+/// produces; it is reported as an internal error (E000) naming the call, the
+/// port and the column, and the column is left unmarked, so not nameable.
 fn carry_into_caller_scope(
     row: Row,
+    call: &str,
     call_inputs: &IndexMap<String, String>,
     parent_schema_by_name: &HashMap<String, Row>,
+    span: Span,
+    diags: &mut Vec<Diagnostic>,
 ) -> Row {
     let fed = |port: &str| {
         call_inputs
@@ -5777,27 +5974,42 @@ fn carry_into_caller_scope(
         .keys()
         .filter_map(|port| fed(port))
         .any(Row::in_body_scope);
-    let marks: Vec<(QualifiedField, Option<ColumnMark>)> = row
-        .field_names()
-        .map(|field| {
-            let mark = match row.mark_of(field) {
-                Some(ColumnMark::Carried(column)) => fed(&column.port.port)
-                    .and_then(|fed| fed.mark_of(field))
-                    .cloned(),
-                Some(ColumnMark::Own) => Some(ColumnMark::Own),
-                None => None,
-            };
-            (field.clone(), mark)
-        })
-        .collect();
-    let mut out = row;
+    let mut out = row.clone();
     out.leave_body_scope();
-    if caller_in_body {
-        out.enter_body_scope();
-        for (field, mark) in marks {
-            if let Some(mark) = mark {
-                out.mark(field, mark);
-            }
+    if !caller_in_body {
+        return out;
+    }
+    out.enter_body_scope();
+    for field in row.field_names() {
+        let mark = match row.mark_of(field) {
+            Some(ColumnMark::Carried(column)) => match fed(&column.port.port) {
+                Some(fed) => fed.mark_of(field).cloned().ok_or_else(|| {
+                    format!(
+                        "the row that fed input port `{}` does not mark column `{}`",
+                        column.port.port, field.name
+                    )
+                }),
+                None => Err(format!(
+                    "column `{}` came in through input port `{}`, which no row fed",
+                    field.name, column.port.port
+                )),
+            },
+            Some(ColumnMark::Own) => Ok(ColumnMark::Own),
+            None => Err(format!(
+                "column `{}` left the body without a mark",
+                field.name
+            )),
+        };
+        match mark {
+            Ok(mark) => out.mark(field.clone(), mark),
+            Err(reason) => diags.push(Diagnostic::error(
+                "E000",
+                format!(
+                    "internal error: composition {call:?} returned a row to the composition \
+                     that called it, but {reason}"
+                ),
+                LabeledSpan::primary(span, String::new()),
+            )),
         }
     }
     out
@@ -6099,6 +6311,75 @@ impl BodyReads {
             }
         }
         out
+    }
+
+    /// The columns of `empty_by_port` a type error spanning one of `within`
+    /// reads, or every one the program reads when no error span holds one.
+    fn possibly_empty_in<'e>(
+        &self,
+        empty_by_port: &'e [(QualifiedField, CarriedColumn)],
+        within: &[cxl::lexer::Span],
+    ) -> Vec<(&'e QualifiedField, &'e CarriedColumn)> {
+        let read = |inside: &dyn Fn(cxl::lexer::Span) -> bool| {
+            empty_by_port
+                .iter()
+                .filter(|(field, _)| {
+                    self.fields
+                        .iter()
+                        .any(|(at, name)| inside(*at) && name.as_ref() == field.name.as_ref())
+                })
+                .map(|(field, column)| (field, column))
+                .collect::<Vec<_>>()
+        };
+        let in_errors = read(&|at| {
+            within
+                .iter()
+                .any(|span| span.start <= at.start && at.end <= span.end)
+        });
+        if in_errors.is_empty() {
+            read(&|_| true)
+        } else {
+            in_errors
+        }
+    }
+
+    /// The source line holding the first read of `name`, with every read of
+    /// `name` on it written `(name ?? stand_in)`; `None` when the reads'
+    /// spans do not address `source`.
+    fn line_with_stand_in(&self, source: &str, name: &str, stand_in: &str) -> Option<String> {
+        let first = self
+            .fields
+            .iter()
+            .filter(|(_, read)| read.as_ref() == name)
+            .map(|(at, _)| at.start as usize)
+            .min()?;
+        let start = source.get(..first)?.rfind('\n').map_or(0, |at| at + 1);
+        let end = source
+            .get(first..)?
+            .find('\n')
+            .map_or(source.len(), |at| first + at);
+        let mut reads: Vec<(usize, usize)> = self
+            .fields
+            .iter()
+            .filter(|(at, read)| {
+                read.as_ref() == name && start <= at.start as usize && at.end as usize <= end
+            })
+            .map(|(at, _)| (at.start as usize, at.end as usize))
+            .collect();
+        reads.sort_unstable();
+        reads.dedup();
+        let mut line = String::new();
+        let mut from = start;
+        for (read_start, read_end) in reads {
+            if source.get(read_start..read_end)? != name {
+                return None;
+            }
+            line.push_str(source.get(from..read_start)?);
+            line.push_str(&format!("({name} ?? {stand_in})"));
+            from = read_end;
+        }
+        line.push_str(source.get(from..end)?);
+        Some(line.trim().to_string())
     }
 
     /// The `any`-declared column the field reference inside `within` reads,
@@ -6757,6 +7038,12 @@ fn typecheck_parsed_program(
     // and combine bodies address qualified fields via
     // `Expr::QualifiedFieldRef` (handled in typecheck/pass.rs, not resolve).
     let context = format!("CXL name resolution failed in {node_name:?}");
+    // A body whose port declares a column `{ nullable: T }` is checked as if
+    // the column could be empty. Kept to tell, if the check fails, whether
+    // the column's possible emptiness is what failed it.
+    let empty_by_port = may_be_empty_by_port(schema);
+    let recheck = (!empty_by_port.is_empty()).then(|| program.clone());
+    let display_source = Arc::clone(&source);
     let resolved = resolve_against_row(
         ResolveSite {
             node,
@@ -6826,6 +7113,48 @@ fn typecheck_parsed_program(
                     span,
                 ));
             }
+            if !plain.is_empty()
+                && let Some(program) = recheck
+                && passes_when_never_empty(
+                    &ResolveSite {
+                        node,
+                        context: &context,
+                        span,
+                    },
+                    program,
+                    node_count,
+                    schema,
+                    &empty_by_port,
+                    mode,
+                    scoped_vars,
+                )
+            {
+                let detail = plain
+                    .iter()
+                    .map(|d| d.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let within: Vec<cxl::lexer::Span> = plain.iter().map(|d| d.span).collect();
+                for (field, column) in reads.possibly_empty_in(&empty_by_port, &within) {
+                    out.push(possibly_empty_type_error(
+                        &PossiblyEmpty {
+                            node,
+                            field,
+                            column,
+                            declared: schema
+                                .declared_map()
+                                .get(field)
+                                .cloned()
+                                .unwrap_or(Type::Any),
+                            span,
+                        },
+                        &reads,
+                        &display_source,
+                        &detail,
+                    ));
+                }
+                return out;
+            }
             if !plain.is_empty() {
                 let joined = plain
                     .iter()
@@ -6846,6 +7175,151 @@ fn typecheck_parsed_program(
             }
             out
         })
+}
+
+/// The columns of a body row that a port declares `{ nullable: T }` with a
+/// concrete `T`: a body is checked as if each could be empty.
+fn may_be_empty_by_port(row: &Row) -> Vec<(QualifiedField, CarriedColumn)> {
+    if !row.in_body_scope() {
+        return Vec::new();
+    }
+    row.carried_columns()
+        .filter(|(field, column)| {
+            column.access == PortAccess::Declared
+                && matches!(
+                    row.declared_map().get(*field),
+                    Some(Type::Nullable(inner)) if !matches!(inner.as_ref(), Type::Any)
+                )
+        })
+        .map(|(field, column)| (field.clone(), column.clone()))
+        .collect()
+}
+
+/// Whether `program`, which failed to typecheck against `row`, typechecks
+/// once every column in `empty_by_port` is known never to be empty: then
+/// the column's possible emptiness is what the node does not handle.
+fn passes_when_never_empty(
+    site: &ResolveSite<'_>,
+    program: cxl::ast::Program,
+    node_count: u32,
+    row: &Row,
+    empty_by_port: &[(QualifiedField, CarriedColumn)],
+    mode: &AggregateMode,
+    scoped_vars: &cxl::resolve::ScopedVarsRegistry,
+) -> bool {
+    let columns: IndexMap<QualifiedField, Type> = row
+        .fields()
+        .map(|(field, ty)| {
+            let never_empty = empty_by_port.iter().any(|(empty, _)| empty == field);
+            let ty = if never_empty {
+                ty.unwrap_nullable().clone()
+            } else {
+                ty.clone()
+            };
+            (field.clone(), ty)
+        })
+        .collect();
+    // Built outside a body scope: the program's names were already checked
+    // against `row`, and this check is about types only.
+    let never_empty = Row::from_parts(columns, row.declared_span, row.tail.clone());
+    let Ok(resolved) = resolve_against_row(
+        ResolveSite {
+            node: site.node,
+            context: site.context,
+            span: site.span,
+        },
+        program,
+        node_count,
+        &never_empty,
+        &scoped_vars.module_exports,
+        scoped_vars,
+    ) else {
+        return false;
+    };
+    cxl::typecheck::pass::type_check_with_mode_and_vars(
+        resolved,
+        &never_empty,
+        mode.clone(),
+        scoped_vars,
+    )
+    .is_ok()
+}
+
+/// A body node that cannot use a column while it may be empty.
+struct PossiblyEmpty<'a> {
+    node: &'a str,
+    field: &'a QualifiedField,
+    column: &'a CarriedColumn,
+    /// The port's declaration, `{ nullable: T }`.
+    declared: Type,
+    span: Span,
+}
+
+/// A value of `ty` a `??` can stand in for an empty one with, where CXL has
+/// a literal for it.
+fn empty_stand_in(ty: &Type) -> Option<&'static str> {
+    Some(match ty {
+        Type::Int => "0",
+        Type::Float => "0.0",
+        Type::String => "\"\"",
+        Type::Bool => "false",
+        _ => return None,
+    })
+}
+
+/// E200 for a body node that fails because a column its input port declares
+/// `{ nullable: T }` may be empty. Every call checks the body as if the
+/// column could be empty, so this fails at every call, whoever the caller
+/// is; the fix is in the composition.
+fn possibly_empty_type_error(
+    at: &PossiblyEmpty<'_>,
+    reads: &BodyReads,
+    source: &str,
+    detail: &str,
+) -> Diagnostic {
+    let PossiblyEmpty {
+        node,
+        field,
+        column,
+        span,
+        ..
+    } = at;
+    let PortOrigin {
+        call,
+        port,
+        body_file,
+    } = column.port.as_ref();
+    let name = field.name.as_ref();
+    let declared = port_column_type(&at.declared);
+    let inner = at.declared.unwrap_nullable();
+    let never_empty = port_column_type(inner);
+    let declare = format!(
+        "declare `{name}` as never empty on input port `{port}` in `{body_file}`: \
+         `- {{ name: {name}, type: {never_empty} }}`"
+    );
+    let help = match empty_stand_in(inner)
+        .and_then(|stand_in| reads.line_with_stand_in(source, name, stand_in))
+    {
+        Some(line) => format!(
+            "handle an empty `{name}` in node {node:?} in `{body_file}`: `{line}`, so the \
+             composition works for callers whose `{name}` can be empty. If it should not accept \
+             an empty `{name}`, {declare}"
+        ),
+        None => format!(
+            "give node {node:?} in `{body_file}` a value to use when `{name}` is empty \
+             (`{name} ?? <value>`), or {declare}"
+        ),
+    };
+    Diagnostic::error(
+        "E200",
+        format!(
+            "node {node:?} in composition {call:?} cannot use `{name}` while it may be empty: \
+             input port `{port}` declares `{name}` as `{declared}`, so the composition is \
+             checked at every call as if `{name}` could be empty ({detail})"
+        ),
+        LabeledSpan::primary(*span, String::new()),
+    )
+    .with_help(help)
 }
 
 /// E200 for a type error in a composition body node that reads a column
@@ -8932,5 +9406,202 @@ mod tests {
             schema.field_metadata_by_name("$ck.aggregate.daily_totals"),
             Some(FieldMetadata::AggregateGroupIndex { .. }),
         ));
+    }
+
+    /// A call whose body passed the check against its ports' declared types
+    /// must not compile when binding against the types the call provides
+    /// fails: that is an internal error, never a silent success.
+    #[test]
+    fn a_bind_that_fails_after_its_check_passed_is_an_internal_error() {
+        let failed = Diagnostic::error(
+            "E200",
+            "CXL type error in \"t\": something".to_string(),
+            LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+        );
+        let warned = Diagnostic::warning(
+            "W101",
+            "a warning".to_string(),
+            LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+        );
+        let internal = unchecked_instantiation_error(
+            "call",
+            false,
+            std::slice::from_ref(&failed),
+            Span::SYNTHETIC,
+        )
+        .expect("the check passed and the bind failed");
+        assert_eq!(internal.code, "E000");
+        assert!(
+            internal.message.contains("composition \"call\"")
+                && internal.message.contains("E200: CXL type error in \"t\""),
+            "{}",
+            internal.message
+        );
+        // The check already failed, and said why: nothing to add.
+        assert!(unchecked_instantiation_error("call", true, &[failed], Span::SYNTHETIC).is_none());
+        assert!(unchecked_instantiation_error("call", false, &[warned], Span::SYNTHETIC).is_none());
+    }
+
+    /// A body row's columns are nameable only where marked. Every row the
+    /// planner binds inside a composition body marks every column, so no
+    /// pipeline reaches an unmarked one; this takes a real body row from a
+    /// compiled call, drops its marks, and checks that the planner's own
+    /// typecheck refuses its columns rather than admitting them.
+    #[test]
+    fn a_body_row_without_its_marks_names_no_column() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let files = [
+            (
+                "pipelines/p.yaml",
+                r#"pipeline:
+  name: p
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - { name: v, type: int }
+        - { name: wt, type: int }
+  - type: composition
+    name: call
+    input: src
+    use: ../compositions/c.comp.yaml
+    inputs:
+      inp: src
+  - type: sink
+    name: out
+    input: call
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#,
+            ),
+            (
+                "compositions/c.comp.yaml",
+                r#"_compose:
+  name: c
+  inputs:
+    inp:
+      schema:
+        - { name: v, type: int }
+  outputs:
+    out: last
+  config_schema: {}
+
+nodes:
+  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit z = v
+"#,
+            ),
+        ];
+        for (relative, contents) in files {
+            let path = workspace.path().join(relative);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(path, contents).expect("write");
+        }
+        let config = crate::config::parse_config(files[0].1).expect("parse");
+        let ctx = CompileContext::with_pipeline_dir(workspace.path(), PathBuf::from("pipelines"));
+        let plan = config.compile(&ctx).expect("the call compiles");
+        let body = plan.composition_bodies().values().next().expect("one body");
+        let marked = &body.body_rows["last"];
+        let typecheck = |row: &Row| {
+            typecheck_cxl(
+                "last",
+                "last",
+                "emit q = v",
+                row,
+                AggregateMode::Row,
+                Span::SYNTHETIC,
+                &cxl::resolve::ScopedVarsRegistry::default(),
+            )
+        };
+        assert!(
+            typecheck(marked).is_ok(),
+            "the port declares `v`: the marked row names it"
+        );
+        let mut unmarked = Row::from_parts(
+            marked.declared_map().clone(),
+            marked.declared_span,
+            marked.tail.clone(),
+        );
+        unmarked.enter_body_scope();
+        assert!(
+            typecheck(&unmarked).is_err(),
+            "a body row that lost its marks must not name `v`"
+        );
+    }
+
+    /// A row a nested call returns into its enclosing body whose carried
+    /// column names a port no row fed is an internal error, not a column
+    /// silently left without its mark.
+    #[test]
+    fn a_carried_column_whose_port_was_not_fed_is_an_internal_error() {
+        let origin = Arc::new(PortOrigin {
+            call: Arc::from("inner"),
+            port: Arc::from("pb"),
+            body_file: Arc::from("inner.comp.yaml"),
+        });
+        let columns: IndexMap<QualifiedField, Type> = [
+            (QualifiedField::bare("v"), Type::Int),
+            (QualifiedField::bare("w"), Type::Int),
+        ]
+        .into_iter()
+        .collect();
+        let mut returned = Row::from_parts(
+            columns.clone(),
+            cxl::lexer::Span::new(0, 0),
+            cxl::typecheck::RowTail::Closed,
+        );
+        returned.enter_body_scope();
+        returned.mark(QualifiedField::bare("v"), ColumnMark::Own);
+        returned.mark(
+            QualifiedField::bare("w"),
+            ColumnMark::Carried(CarriedColumn {
+                port: origin,
+                access: PortAccess::Declared,
+            }),
+        );
+        // `pa` is fed by a body row; `pb` is bound to a node with no row.
+        let mut fed = Row::from_parts(
+            columns,
+            cxl::lexer::Span::new(0, 0),
+            cxl::typecheck::RowTail::Closed,
+        );
+        fed.enter_body_scope();
+        let parent: HashMap<String, Row> = [("up".to_string(), fed)].into_iter().collect();
+        let inputs: IndexMap<String, String> = [
+            ("pa".to_string(), "up".to_string()),
+            ("pb".to_string(), "gone".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let mut diags = Vec::new();
+        let out = carry_into_caller_scope(
+            returned,
+            "inner",
+            &inputs,
+            &parent,
+            Span::SYNTHETIC,
+            &mut diags,
+        );
+        assert_eq!(diags.len(), 1, "{diags:#?}");
+        assert_eq!(diags[0].code, "E000");
+        assert!(
+            diags[0].message.contains("composition \"inner\"")
+                && diags[0].message.contains("`w`")
+                && diags[0].message.contains("`pb`"),
+            "{}",
+            diags[0].message
+        );
+        assert!(out.is_nameable(&QualifiedField::bare("v")));
+        assert!(!out.is_nameable(&QualifiedField::bare("w")));
     }
 }
