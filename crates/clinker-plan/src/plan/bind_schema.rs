@@ -4283,18 +4283,7 @@ fn bind_composition(
             .to_path_buf(),
         scoped_vars: body_scoped_vars,
         enclosing_scope_names,
-        outputs: signature
-            .outputs
-            .values()
-            .map(|alias| {
-                let internal_ref = &alias.internal_ref.value;
-                internal_ref
-                    .split('.')
-                    .next()
-                    .unwrap_or(internal_ref)
-                    .to_string()
-            })
-            .collect(),
+        outputs: body_output_nodes(signature),
     };
 
     // Seed each port with the row its upstream carries: the records reach
@@ -5506,6 +5495,23 @@ fn build_input_port_rows(
     if has_errors { None } else { Some(rows) }
 }
 
+/// The body nodes a composition names as its outputs (`out: node.port`
+/// names `node`).
+fn body_output_nodes(signature: &CompositionSignature) -> HashSet<String> {
+    signature
+        .outputs
+        .values()
+        .map(|alias| {
+            let internal_ref = &alias.internal_ref.value;
+            internal_ref
+                .split('.')
+                .next()
+                .unwrap_or(internal_ref)
+                .to_string()
+        })
+        .collect()
+}
+
 /// A body node `reader` of the call `call` that reads input port `port`,
 /// which the call does not bind.
 struct UnboundPortRead<'a> {
@@ -5541,10 +5547,7 @@ fn unbound_port_read(
     let feeding = call_inputs
         .values()
         .find(|upstream| !upstream.contains('.'));
-    let is_output = signature.outputs.values().any(|alias| {
-        let internal_ref = &alias.internal_ref.value;
-        internal_ref.split('.').next().unwrap_or(internal_ref) == reader
-    });
+    let is_output = body_output_nodes(signature).contains(reader);
     let is_read = body.iter().any(|spanned| {
         spanned.value.name() != reader && node_input_names(&spanned.value).contains(&reader)
     });
