@@ -2221,10 +2221,34 @@ fn bind_reshape(
         Type::String,
     );
     let mut out = Row::from_parts(declared, upstream.declared_span, upstream.tail.clone());
-    // A `set` or override keeps the caller's value on every row its rule does
-    // not touch, so a carried column stays the caller's through Reshape. The
-    // audit columns are the engine's.
-    out.inherit_marks(upstream, |_| true);
+    // A column no rule writes stays the caller's through Reshape. A `set` or
+    // override target is the body's own from here: the rows a rule touches
+    // carry the body's value, so the column leaves the call with the body's
+    // type rather than the caller's. Its port declared it (an undeclared
+    // target is refused above), so the body may still name it. The audit
+    // columns are the engine's.
+    let written: HashSet<&str> = config
+        .rules
+        .iter()
+        .flat_map(|rule| {
+            let set = rule.mutate.iter().flat_map(|mutate| mutate.set.keys());
+            let overrides = rule
+                .synthesize
+                .iter()
+                .flat_map(|synth| synth.overrides.keys());
+            set.chain(overrides).map(String::as_str)
+        })
+        .collect();
+    let is_written = |field: &QualifiedField| written.contains(field.name.as_ref());
+    out.inherit_marks(upstream, |field| !is_written(field));
+    let written_fields: Vec<QualifiedField> = out
+        .field_names()
+        .filter(|f| is_written(f))
+        .cloned()
+        .collect();
+    for field in written_fields {
+        out.mark(field, ColumnMark::Own);
+    }
     for audit in [
         RESHAPE_SYNTHETIC_COLUMN,
         RESHAPE_SYNTHESIZED_BY_COLUMN,
@@ -5759,10 +5783,14 @@ fn seed_port_row(
 ///
 /// Inside the body, a carried mark means the column is the caller's,
 /// unchanged. Seen from the calling scope, such a column is whatever it was
-/// in the row that fed the port: the mark that row gave it (from an enclosing
-/// body's own port). A column the body wrote is the calling scope's own, as
-/// any column a node there writes is. When the calling scope is the pipeline
-/// itself, the row leaves the body scope and every column may be named.
+/// in the row that fed the port: the type and the mark that row gave it. A
+/// port's type is only how the body sees the column, so a column the body
+/// did not write leaves the call with the type it arrived with; for a nested
+/// call that is the enclosing body's view, restored again when the enclosing
+/// call returns. A column the body wrote is the calling scope's own, with
+/// the type the body gave it, as any column a node there writes is. When the
+/// calling scope is the pipeline itself, the row leaves the body scope and
+/// every column may be named.
 fn carry_into_caller_scope(
     row: Row,
     call_inputs: &IndexMap<String, String>,
@@ -5777,21 +5805,27 @@ fn carry_into_caller_scope(
         .keys()
         .filter_map(|port| fed(port))
         .any(Row::in_body_scope);
-    let marks: Vec<(QualifiedField, Option<ColumnMark>)> = row
-        .field_names()
-        .map(|field| {
-            let mark = match row.mark_of(field) {
-                Some(ColumnMark::Carried(column)) => fed(&column.port.port)
-                    .and_then(|fed| fed.mark_of(field))
-                    .cloned(),
-                Some(ColumnMark::Own) => Some(ColumnMark::Own),
-                None => None,
-            };
-            (field.clone(), mark)
-        })
-        .collect();
-    let mut out = row;
-    out.leave_body_scope();
+    let mut columns = IndexMap::with_capacity(row.field_count());
+    let mut marks: Vec<(QualifiedField, Option<ColumnMark>)> =
+        Vec::with_capacity(row.field_count());
+    for (field, ty) in row.fields() {
+        let (ty, mark) = match row.mark_of(field) {
+            Some(ColumnMark::Carried(column)) => {
+                let fed_row = fed(&column.port.port);
+                let fed_type = fed_row.and_then(|fed| fed.declared_map().get(field));
+                (
+                    fed_type.unwrap_or(ty).clone(),
+                    fed_row.and_then(|fed| fed.mark_of(field)).cloned(),
+                )
+            }
+            Some(ColumnMark::Own) => (ty.clone(), Some(ColumnMark::Own)),
+            None => (ty.clone(), None),
+        };
+        columns.insert(field.clone(), ty);
+        marks.push((field.clone(), mark));
+    }
+    // `from_parts` builds the row outside any body scope.
+    let mut out = Row::from_parts(columns, row.declared_span, row.tail.clone());
     if caller_in_body {
         out.enter_body_scope();
         for (field, mark) in marks {

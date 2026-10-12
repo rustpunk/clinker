@@ -1042,3 +1042,73 @@ fn a_pipeline_listing_a_node_before_its_input_writes_what_the_ordered_pipeline_w
     );
     assert_eq!(reversed_out, ordered_out);
 }
+
+#[test]
+fn a_column_a_call_does_not_write_reaches_the_next_call_with_the_caller_s_type() {
+    // `first` reads `v` as possibly empty and never writes it; `second`
+    // needs `v` as an `int`. The source's `v` is an `int`, so the chain
+    // compiles and writes what the same nodes written inline write.
+    let first = comp(
+        "first",
+        &[("v", "{ nullable: int }")],
+        "flag",
+        r#"  - type: transform
+    name: flag
+    input: inp
+    config:
+      cxl: |
+        emit flag = 1
+"#,
+    );
+    let second = comp(
+        "second",
+        &[("v", "int")],
+        "doubled",
+        r#"  - type: transform
+    name: doubled
+    input: inp
+    config:
+      cxl: |
+        emit doubled = v * 2
+"#,
+    );
+    let composed = pipeline(
+        "chain",
+        &format!(
+            "{ORDERS_SOURCE}{}{}{}",
+            call("first", "first.comp.yaml", "src"),
+            call("second", "second.comp.yaml", "first"),
+            sink("second", &["order_id", "department"])
+        ),
+    );
+    let inline = pipeline(
+        "chain_inline",
+        &format!(
+            r#"{ORDERS_SOURCE}  - type: transform
+    name: flag
+    input: src
+    config:
+      cxl: |
+        emit flag = 1
+  - type: transform
+    name: doubled
+    input: flag
+    config:
+      cxl: |
+        emit doubled = v * 2
+{}"#,
+            sink("doubled", &["order_id", "department"])
+        ),
+    );
+    assert_inline_equivalent(
+        &[
+            (PIPELINE, &composed),
+            ("compositions/first.comp.yaml", &first),
+            ("compositions/second.comp.yaml", &second),
+            ("pipelines/in.csv", ORDERS),
+        ],
+        &[(PIPELINE, &inline), ("pipelines/in.csv", ORDERS)],
+        0,
+        "order_id,department,v,wt,flag,doubled\nO1,a,5,0,1,10\nO1,b,6,1,1,12\nO2,a,7,1,1,14\n",
+    );
+}
