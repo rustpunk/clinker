@@ -1423,19 +1423,21 @@ fn a_call_leaving_unbound_a_port_a_node_reads_is_refused_and_binding_it_runs_as_
         "{}",
         diags[0].message
     );
-    assert!(
-        diags[0]
-            .help
-            .as_deref()
-            .unwrap_or_default()
-            .contains("add `opt: <node>` under `inputs:`"),
-        "{:?}",
-        diags[0].help
-    );
     // Bound as the help says, the call runs as the inline nodes do, with
     // `u` reading the same rows.
+    let help = diags[0].help.as_deref().unwrap_or_default();
+    let entry = help
+        .split("add `")
+        .nth(1)
+        .and_then(|rest| rest.split('`').next())
+        .unwrap_or_else(|| panic!("the help prints the entry to add: {help}"));
+    let (port, upstream) = entry
+        .split_once(": ")
+        .unwrap_or_else(|| panic!("the entry is `port: node`: {entry}"));
+    assert_eq!(port, "opt", "{help}");
+    let bindings = [("inp", "src"), ("opt", upstream)];
     let bound = Shape {
-        bindings: &[("inp", "src"), ("opt", "src")],
+        bindings: &bindings,
         ..shape
     };
     let mut bound_files = bound.call_files();

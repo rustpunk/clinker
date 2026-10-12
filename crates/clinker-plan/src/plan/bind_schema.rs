@@ -4215,11 +4215,16 @@ fn bind_composition(
                 }
                 refused = true;
                 diags.push(unbound_port_read(
-                    node_name,
-                    reader,
-                    port,
-                    &resolved_path,
-                    span,
+                    &UnboundPortRead {
+                        call: node_name,
+                        reader,
+                        port,
+                        body_file: &resolved_path,
+                        span,
+                    },
+                    call_inputs,
+                    signature,
+                    &body_file.nodes,
                 ));
             }
         }
@@ -5501,18 +5506,66 @@ fn build_input_port_rows(
     if has_errors { None } else { Some(rows) }
 }
 
-/// E104 for a composition node whose body node `reader` reads input port
-/// `port`, which the call does not bind. The port is optional, but a node
-/// that reads it needs it; the fix is the binding to add under the call's
-/// `inputs:`, or removing the node from the composition.
-fn unbound_port_read(
-    call: &str,
-    reader: &str,
-    port: &str,
-    body_file: &Path,
+/// A body node `reader` of the call `call` that reads input port `port`,
+/// which the call does not bind.
+struct UnboundPortRead<'a> {
+    call: &'a str,
+    reader: &'a str,
+    port: &'a str,
+    body_file: &'a Path,
     span: Span,
+}
+
+/// E104 for a composition node whose body node reads an input port the call
+/// does not bind. The port is optional, but a node that reads it needs it.
+/// The fix is the binding to add under the call's `inputs:`, naming the
+/// node that feeds the call's first bound port, so it can be pasted as it
+/// is; and, where taking the node out leaves the composition whole (no
+/// other node reads it and it is not an output), removing the node.
+fn unbound_port_read(
+    at: &UnboundPortRead<'_>,
+    call_inputs: &IndexMap<String, String>,
+    signature: &CompositionSignature,
+    body: &[Spanned<PipelineNode>],
 ) -> Diagnostic {
+    let &UnboundPortRead {
+        call,
+        reader,
+        port,
+        body_file,
+        span,
+    } = at;
     let file = body_file.display();
+    // The node the call already feeds a port from: a node of the calling
+    // scope whose rows reach the call, so binding the port to it compiles.
+    let feeding = call_inputs
+        .values()
+        .find(|upstream| !upstream.contains('.'));
+    let is_output = signature.outputs.values().any(|alias| {
+        let internal_ref = &alias.internal_ref.value;
+        internal_ref.split('.').next().unwrap_or(internal_ref) == reader
+    });
+    let is_read = body.iter().any(|spanned| {
+        spanned.value.name() != reader && node_input_names(&spanned.value).contains(&reader)
+    });
+    let removable = !is_output && !is_read;
+    let bind = feeding.map(|upstream| {
+        format!(
+            "bind the port at the call, so node {reader:?} receives rows: add `{port}: \
+             {upstream}` under `inputs:` of composition {call:?}"
+        )
+    });
+    let remove = removable.then(|| {
+        format!("remove node {reader:?} from `{file}` if the composition does not need it")
+    });
+    let help = match (bind, remove) {
+        (Some(bind), Some(remove)) => format!("{bind}; or {remove}"),
+        (Some(fix), None) | (None, Some(fix)) => fix,
+        (None, None) => format!(
+            "bind the port at the call, so node {reader:?} receives rows: add \
+             `{port}:` under `inputs:` of composition {call:?}, naming a node of this pipeline"
+        ),
+    };
     Diagnostic::error(
         "E104",
         format!(
@@ -5521,11 +5574,7 @@ fn unbound_port_read(
         ),
         LabeledSpan::primary(span, format!("does not bind `{port}`")),
     )
-    .with_help(format!(
-        "bind the port at the call: add `{port}: <node>` under `inputs:` of composition \
-         {call:?}, naming the node whose rows the port should receive; or remove node \
-         {reader:?} from `{file}` if the composition does not need it"
-    ))
+    .with_help(help)
 }
 
 /// E102 for a port whose upstream has no bound row. A `node.port`

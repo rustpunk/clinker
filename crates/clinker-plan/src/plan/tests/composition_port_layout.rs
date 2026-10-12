@@ -2748,11 +2748,39 @@ fn a_body_node_reading_an_input_port_the_call_does_not_bind_is_refused() {
     }
     let help = refused.help.as_deref().unwrap_or_default();
     for fragment in [
-        "add `opt: <node>` under `inputs:` of composition \"call\"",
+        "add `opt: src` under `inputs:` of composition \"call\"",
         "remove node \"u\" from `compositions/c.comp.yaml`",
     ] {
         assert!(help.contains(fragment), "{fragment}: {help}");
     }
+    assert!(!help.contains('<'), "no placeholder to fill in: {help}");
+    // The port is optional: the code's title does not call it required.
+    let title = clinker_core_types::diagnostic::registry_entry("E104")
+        .expect("E104 is registered")
+        .meaning;
+    assert!(!title.contains("required"), "{title}");
+}
+
+#[test]
+fn the_e104_help_offers_removing_a_node_only_when_the_composition_works_without_it() {
+    // `u` is the output node here, and `w` reads it: removing `u` would
+    // break the composition, so the help only binds the port.
+    let composition = OPTIONAL_PORT_COMPOSITION
+        .replace("    out: last\n", "    out: u\n")
+        .replace(
+            "        emit b = v\n",
+            "        emit b = v\n  - type: transform\n    name: w\n    input: u\n    config:\n      cxl: |\n        emit c = 1\n",
+        );
+    let Err(diags) = compile(&composition) else {
+        panic!("a body node reading an unbound port must not compile");
+    };
+    let refused = diags
+        .iter()
+        .find(|d| d.code == "E104")
+        .unwrap_or_else(|| panic!("{:#?}", describe(&diags)));
+    let help = refused.help.as_deref().unwrap_or_default();
+    assert!(help.contains("add `opt: src` under `inputs:`"), "{help}");
+    assert!(!help.contains("remove node"), "{help}");
 }
 
 #[test]
