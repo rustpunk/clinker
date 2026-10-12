@@ -7055,6 +7055,22 @@ impl BodyReads {
         field: &QualifiedField,
         stand_in: &str,
     ) -> Option<String> {
+        self.line_rewriting(line, field, &|written| format!("({written} ?? {stand_in})"))
+    }
+
+    /// The author's line that reads `field` inside one of the failing
+    /// expressions (`line.within`), or the first line reading it when none
+    /// does, with every read of `field` on it, written `written`, replaced
+    /// by `rewrite(written)`. For an expression the author wrote under a
+    /// YAML key, the rewritten entry (`key: '<expression>'`). `None` when the
+    /// program is the planner's own, the expression spans several lines, or
+    /// the reads' spans do not address the text.
+    fn line_rewriting(
+        &self,
+        line: &AuthoredLine<'_>,
+        field: &QualifiedField,
+        rewrite: &dyn Fn(&str) -> String,
+    ) -> Option<String> {
         let reads_of_name = || {
             self.fields
                 .iter()
@@ -7102,7 +7118,7 @@ impl BodyReads {
                 return None;
             }
             rewritten.push_str(text.get(from - base..read_start - base)?);
-            rewritten.push_str(&format!("({written} ?? {stand_in})"));
+            rewritten.push_str(&rewrite(&written));
             from = read_end;
         }
         rewritten.push_str(text.get(from - base..end - base)?);
@@ -7809,8 +7825,14 @@ fn typecheck_parsed_program(
     // A body whose port declares a column `{ nullable: T }` is checked as if
     // the column could be empty. Kept to tell, if the check fails, whether
     // the column's possible emptiness is what failed it.
+    // A body that reads a column its port declares `any` sees the type this
+    // call provides; kept too, to find the type a failing node needs.
     let empty_by_port = may_be_empty_by_port(schema);
-    let recheck = (!empty_by_port.is_empty()).then(|| program.clone());
+    let reads_caller_typed = schema.in_body_scope()
+        && schema
+            .carried_columns()
+            .any(|(_, _, column)| column.access == PortAccess::DeclaredAny);
+    let recheck = (!empty_by_port.is_empty() || reads_caller_typed).then(|| program.clone());
     let display_source = Arc::clone(&source);
     let resolved = resolve_against_row(
         ResolveSite {
@@ -7853,45 +7875,59 @@ fn typecheck_parsed_program(
             // provides, so the author has to learn that first. Every other
             // error is the node's own.
             let mut out: Vec<Diagnostic> = Vec::new();
-            let mut by_column: Vec<(&QualifiedField, &Type, &CarriedColumn, Vec<&str>)> =
-                Vec::new();
+            let mut by_column: Vec<CallerTypedErrors<'_>> = Vec::new();
             let mut plain: Vec<&cxl::typecheck::TypeDiagnostic> = Vec::new();
             for error in errors {
                 match reads.caller_typed_in(schema, error.span) {
-                    Some((field, ty, column)) => {
-                        match by_column.iter_mut().find(|(seen, ..)| *seen == field) {
-                            Some((.., details)) => details.push(&error.message),
-                            None => by_column.push((field, ty, column, vec![&error.message])),
+                    Some((field, provided, column)) => {
+                        match by_column.iter_mut().find(|seen| seen.field == field) {
+                            Some(seen) => {
+                                seen.details.push(&error.message);
+                                seen.within.push(error.span);
+                            }
+                            None => by_column.push(CallerTypedErrors {
+                                field,
+                                provided,
+                                column,
+                                details: vec![&error.message],
+                                within: vec![error.span],
+                            }),
                         }
                     }
                     None => plain.push(error),
                 }
             }
-            for (field, ty, column, details) in by_column {
-                out.push(caller_typed_type_error(
+            let recheck = recheck.as_ref().map(|program| Recheck {
+                site: ResolveSite {
                     node,
-                    field,
-                    column,
-                    ty,
-                    &details.join("; "),
+                    context: &context,
                     span,
-                ));
-            }
-            if let Some(program) = &recheck
-                && let Some(blamed) = possibly_empty_errors(
-                    &Recheck {
-                        site: ResolveSite {
-                            node,
-                            context: &context,
-                            span,
+                },
+                program,
+                node_count,
+                row: schema,
+                mode,
+                module_exports: &scoped_vars.module_exports,
+                scoped_vars,
+            });
+            for errors in &by_column {
+                let fix = recheck.as_ref().and_then(|recheck| {
+                    converted_line(
+                        recheck,
+                        &reads,
+                        errors,
+                        &AuthoredLine {
+                            authored,
+                            source: &display_source,
+                            within: &errors.within,
                         },
-                        program,
-                        node_count,
-                        row: schema,
-                        mode,
-                        module_exports: &scoped_vars.module_exports,
-                        scoped_vars,
-                    },
+                    )
+                });
+                out.push(caller_typed_type_error(node, errors, fix.as_ref(), span));
+            }
+            if let Some(recheck) = &recheck
+                && let Some(blamed) = possibly_empty_errors(
+                    recheck,
                     &empty_by_port,
                     &reads,
                     &plain,
@@ -8231,39 +8267,94 @@ fn possibly_empty_type_error(
     ))
 }
 
+/// The type errors of one body node inside expressions that read one
+/// column its input port declares `any`.
+struct CallerTypedErrors<'a> {
+    field: &'a QualifiedField,
+    /// The type this call provides for the column.
+    provided: &'a Type,
+    column: &'a CarriedColumn,
+    details: Vec<&'a str>,
+    /// The failing expressions' spans.
+    within: Vec<cxl::lexer::Span>,
+}
+
+/// The types a node can need a caller-typed column to have, in the order
+/// a fix tries them: each has a CXL conversion method.
+const CONVERTIBLE_TYPES: [Type; 7] = [
+    Type::String,
+    Type::Int,
+    Type::Float,
+    Type::Decimal,
+    Type::Bool,
+    Type::Date,
+    Type::DateTime,
+];
+
+/// The type a node needs a column its port declares `any` to have, and the
+/// node's failing line with every read of the column on it converted to
+/// that type (`v.to_string()`): the line compiles whatever type a call
+/// provides. `None` when no single conversion makes the node compile or no
+/// authored line can be rewritten.
+fn converted_line(
+    recheck: &Recheck<'_>,
+    reads: &BodyReads,
+    errors: &CallerTypedErrors<'_>,
+    line: &AuthoredLine<'_>,
+) -> Option<(Type, String)> {
+    let needed = CONVERTIBLE_TYPES
+        .iter()
+        .find(|ty| recheck.passes_with(&[(errors.field, (*ty).clone())]))?;
+    let method = conversion_method(needed)?;
+    let rewritten = reads.line_rewriting(line, errors.field, &|written| {
+        format!("{written}.{method}()")
+    })?;
+    Some((needed.clone(), rewritten))
+}
+
 /// E200 for a type error in a composition body node that reads a column
 /// its input port declares `any`. The body sees the type this call
 /// provides, so the composition and the port are what the author has to
-/// read first.
+/// read first. With `fix`, the type the node needs and its line converting
+/// the column to it, the help is that line; the composition then works for
+/// every call whose values convert.
 fn caller_typed_type_error(
     node: &str,
-    field: &QualifiedField,
-    column: &CarriedColumn,
-    provided: &Type,
-    detail: &str,
+    errors: &CallerTypedErrors<'_>,
+    fix: Option<&(Type, String)>,
     span: Span,
 ) -> Diagnostic {
     let PortOrigin {
         call,
         port,
         body_file,
-    } = column.port.as_ref();
-    let name = field.name.as_ref();
+    } = errors.column.port.as_ref();
+    let name = errors.field.name.as_ref();
+    let detail = errors.details.join("; ");
+    let help = match fix {
+        Some((needed, line)) => format!(
+            "convert `{name}` where node {node:?} in `{body_file}` uses it, so the node gets the \
+             `{}` it needs whatever type a call provides, as long as its values convert: `{line}`",
+            port_column_type(needed)
+        ),
+        None => format!(
+            "declare on input port `{port}` in `{body_file}` the type node {node:?} needs for \
+             `{name}`, so every call has to provide that type — replace `type: any` in \
+             `- {{ name: {name}, type: any }}` — or convert `{name}` in this pipeline before the \
+             call"
+        ),
+    };
     Diagnostic::error(
         "E200",
         format!(
             "composition {call:?} passes column `{name}` to node {node:?} as `{}`, the type \
              this call provides, because its input port `{port}` declares `{name}` as `any`; \
              node {node:?} cannot use it that way: {detail}",
-            port_column_type(provided)
+            port_column_type(errors.provided)
         ),
         LabeledSpan::primary(span, String::new()),
     )
-    .with_help(format!(
-        "declare on input port `{port}` in `{body_file}` the type node {node:?} needs for \
-         `{name}`, so every call has to provide that type — replace `type: any` in \
-         `- {{ name: {name}, type: any }}` — or convert `{name}` in this pipeline before the call"
-    ))
+    .with_help(help)
 }
 
 /// Wrapper a single Cull rule predicate is parsed inside. The rule source is
