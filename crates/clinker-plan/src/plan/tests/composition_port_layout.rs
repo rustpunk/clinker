@@ -68,12 +68,26 @@ nodes:
 }
 
 fn compile(comp_yaml: &str) -> Result<CompiledPlan, Vec<Diagnostic>> {
+    compile_in(PIPELINE, &[("compositions/c.comp.yaml", comp_yaml)])
+}
+
+/// A workspace holding `files` (paths relative to its root) and an empty
+/// `pipelines/` directory the pipeline compiles from.
+fn workspace(files: &[(&str, &str)]) -> tempfile::TempDir {
     let workspace = tempfile::tempdir().expect("tempdir");
-    let comp_dir = workspace.path().join("compositions");
-    std::fs::create_dir_all(&comp_dir).expect("mkdir compositions");
-    std::fs::write(comp_dir.join("c.comp.yaml"), comp_yaml).expect("write comp");
     std::fs::create_dir_all(workspace.path().join("pipelines")).expect("mkdir pipelines");
-    let config = parse_config(PIPELINE).expect("parse pipeline");
+    for (relative, contents) in files {
+        let path = workspace.path().join(relative);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(path, contents).expect("write file");
+    }
+    workspace
+}
+
+/// Compile `pipeline` in a workspace holding `files`.
+fn compile_in(pipeline: &str, files: &[(&str, &str)]) -> Result<CompiledPlan, Vec<Diagnostic>> {
+    let workspace = workspace(files);
+    let config = parse_config(pipeline).expect("parse pipeline");
     let ctx = CompileContext::with_pipeline_dir(workspace.path(), PathBuf::from("pipelines"));
     config.compile(&ctx)
 }
@@ -202,7 +216,20 @@ fn body_cull_positions_address_the_call_site_row() {
 /// house style requires: the composition, the port, the column, and the
 /// declaration to paste.
 fn assert_undeclared_column_refused(body: &str, column: &str, declaration: &str) {
-    let diags = match compile(&comp(body)) {
+    assert_refused(compile(&comp(body)), "last", column, "inp", declaration);
+}
+
+/// [`assert_undeclared_column_refused`] for any compile: exactly one
+/// diagnostic, E169, naming composition `call`, node `node`, `column` and
+/// port `port`, with the declaration to paste.
+fn assert_refused(
+    compiled: Result<CompiledPlan, Vec<Diagnostic>>,
+    node: &str,
+    column: &str,
+    port: &str,
+    declaration: &str,
+) {
+    let diags = match compiled {
         Ok(_) => panic!("a body naming the undeclared column {column:?} must not compile"),
         Err(diags) => diags,
     };
@@ -223,9 +250,9 @@ fn assert_undeclared_column_refused(body: &str, column: &str, declaration: &str)
     let first_sentence = diag.message.split(". ").next().unwrap_or_default();
     for fragment in [
         "composition \"call\"".to_string(),
-        "\"last\"".to_string(),
+        format!("node \"{node}\""),
         format!("`{column}`"),
-        "input port `inp`".to_string(),
+        format!("input port `{port}`"),
     ] {
         assert!(
             first_sentence.contains(&fragment),
@@ -234,11 +261,12 @@ fn assert_undeclared_column_refused(body: &str, column: &str, declaration: &str)
         );
     }
     let help = diag.help.as_deref().expect("E169 carries the fix");
+    let port_line = format!("{port}:");
     for fragment in [
         "c.comp.yaml",
         "_compose:",
         "inputs:",
-        "inp:",
+        port_line.as_str(),
         "schema:",
         declaration,
     ] {
@@ -305,4 +333,127 @@ fn a_body_reading_a_column_it_wrote_itself_compiles() {
 "#,
     ))
     .unwrap_or_else(|d| panic!("compiles: {:#?}", describe(&d)));
+}
+
+/// [`PIPELINE`] with the source's `v` typed `ty`.
+fn pipeline_with_v(ty: &str) -> String {
+    PIPELINE.replace(
+        "{ name: v, type: int }",
+        &format!("{{ name: v, type: {ty} }}"),
+    )
+}
+
+/// The type the body's node `node` gives `column`.
+fn body_column_type(plan: &CompiledPlan, node: &str, column: &str) -> cxl::typecheck::Type {
+    let body = plan.composition_bodies().values().next().expect("one body");
+    match body.body_rows[node].lookup(column) {
+        cxl::typecheck::ColumnLookup::Declared(ty) => ty.clone(),
+        other => panic!("{node:?} declares {column:?}: {other:?}"),
+    }
+}
+
+#[test]
+fn a_column_the_port_types_is_seen_with_the_port_type() {
+    // The port declares `v: int`; this caller's `v` is untyped. The body is
+    // typed by its port, as a function body is typed by its parameters, so
+    // the identity emit is an `int` at every call.
+    let composition = comp(
+        r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit y = v
+"#,
+    );
+    let plan = compile_in(
+        &pipeline_with_v("any"),
+        &[("compositions/c.comp.yaml", &composition)],
+    )
+    .unwrap_or_else(|d| panic!("compiles: {:#?}", describe(&d)));
+    assert_eq!(
+        body_column_type(&plan, "last", "y"),
+        cxl::typecheck::Type::Int
+    );
+}
+
+#[test]
+fn a_column_the_port_declares_any_is_seen_as_the_call_provides_it() {
+    let composition = r#"_compose:
+  name: c
+  inputs:
+    inp:
+      schema:
+        - { name: v, type: any }
+        - { name: department, type: any }
+  outputs:
+    out: last
+  config_schema: {}
+
+nodes:
+  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit y = v
+"#;
+    let plan = compile_in(PIPELINE, &[("compositions/c.comp.yaml", composition)])
+        .unwrap_or_else(|d| panic!("compiles: {:#?}", describe(&d)));
+    assert_eq!(
+        body_column_type(&plan, "last", "y"),
+        cxl::typecheck::Type::Int,
+        "this call provides `v` as an int"
+    );
+}
+
+#[test]
+fn a_type_error_on_a_column_declared_any_names_the_composition_and_the_port() {
+    // `department` is declared `any` and this call provides text, so
+    // `department + 1` fails only at this call: the error says so.
+    let composition = r#"_compose:
+  name: c
+  inputs:
+    inp:
+      schema:
+        - { name: v, type: int }
+        - { name: department, type: any }
+  outputs:
+    out: last
+  config_schema: {}
+
+nodes:
+  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit s = department + 1
+"#;
+    let Err(diags) = compile_in(PIPELINE, &[("compositions/c.comp.yaml", composition)]) else {
+        panic!("`department + 1` over text is a type error");
+    };
+    assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
+    let diag = &diags[0];
+    assert_eq!(diag.code, "E200", "{:#?}", describe(&diags));
+    let first_sentence = diag.message.split("; ").next().unwrap_or_default();
+    for fragment in [
+        "composition \"call\"",
+        "`department`",
+        "node \"last\"",
+        "`string`",
+        "input port `inp`",
+        "`any`",
+    ] {
+        assert!(
+            first_sentence.contains(fragment),
+            "the first sentence names {fragment:?}: {}",
+            diag.message
+        );
+    }
+    let help = diag.help.as_deref().expect("a fix");
+    assert!(
+        help.contains("c.comp.yaml") && help.contains("type: any"),
+        "the help points at the port declaration: {help}"
+    );
 }
