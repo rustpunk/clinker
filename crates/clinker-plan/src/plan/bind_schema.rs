@@ -2006,7 +2006,15 @@ fn bind_reshape(
         let when_prog = match typecheck_cxl(
             name,
             &format!("{name}:{}:when", rule.name),
-            &when_src,
+            CxlSource {
+                text: &when_src,
+
+                authored: Authored::Expression {
+                    key: "when",
+                    text: &rule.when.source,
+                    at: "filter ".len(),
+                },
+            },
             upstream,
             AggregateMode::Row,
             span,
@@ -2071,10 +2079,19 @@ fn bind_reshape(
                     );
                     ok = false;
                 }
+                let assignment = format!("emit {field} = ");
                 match typecheck_cxl(
                     name,
                     &format!("{name}:{}:set.{field}", rule.name),
-                    &format!("emit {field} = {}", value.source),
+                    CxlSource {
+                        text: &format!("{assignment}{}", value.source),
+
+                        authored: Authored::Expression {
+                            key: field,
+                            text: &value.source,
+                            at: assignment.len(),
+                        },
+                    },
                     upstream,
                     AggregateMode::Row,
                     span,
@@ -2134,10 +2151,19 @@ fn bind_reshape(
             }
             let mut overrides: Vec<(String, Arc<TypedProgram>)> = Vec::new();
             for (field, value) in &synth.overrides {
+                let assignment = format!("emit {field} = ");
                 match typecheck_cxl(
                     name,
                     &format!("{name}:{}:override.{field}", rule.name),
-                    &format!("emit {field} = {}", value.source),
+                    CxlSource {
+                        text: &format!("{assignment}{}", value.source),
+
+                        authored: Authored::Expression {
+                            key: field,
+                            text: &value.source,
+                            at: assignment.len(),
+                        },
+                    },
                     upstream,
                     AggregateMode::Row,
                     span,
@@ -2576,6 +2602,7 @@ fn bind_cull(
         mode: &agg_mode,
         span,
         scoped_vars,
+        authored: Authored::Synthesized,
     };
     match typecheck_parsed_program(
         &decision_ctx,
@@ -2597,6 +2624,11 @@ fn bind_cull(
                     mode: &agg_mode,
                     span,
                     scoped_vars,
+                    authored: Authored::Expression {
+                        key: "drop_group_when",
+                        text: &rule.drop_group_when.source,
+                        at: CULL_RULE_PARSE_PREFIX.len(),
+                    },
                 };
                 if let Err(rule_diags) =
                     typecheck_cull_rule(&rule_ctx, &rule.drop_group_when.source)
@@ -2990,7 +3022,11 @@ fn bind_schema_inner(
                 match typecheck_cxl(
                     &name,
                     &name,
-                    &config.cxl.source,
+                    CxlSource {
+                        text: &config.cxl.source,
+
+                        authored: Authored::Program,
+                    },
                     &upstream,
                     AggregateMode::Row,
                     span,
@@ -3040,7 +3076,15 @@ fn bind_schema_inner(
                         match typecheck_cxl(
                             &name,
                             &format!("{name}:log[{index}]:condition"),
-                            &format!("{}filter {}", use_prelude.source, condition.source),
+                            CxlSource {
+                                text: &format!("{}filter {}", use_prelude.source, condition.source),
+
+                                authored: Authored::Expression {
+                                    key: "condition",
+                                    text: &condition.source,
+                                    at: use_prelude.source.len() + "filter ".len(),
+                                },
+                            },
                             &upstream,
                             AggregateMode::Row,
                             span,
@@ -3174,7 +3218,11 @@ fn bind_schema_inner(
                 match typecheck_cxl(
                     &name,
                     &name,
-                    &config.cxl.source,
+                    CxlSource {
+                        text: &config.cxl.source,
+
+                        authored: Authored::Program,
+                    },
                     &upstream,
                     agg_mode,
                     span,
@@ -3209,7 +3257,11 @@ fn bind_schema_inner(
                     if let Ok(mut empty) = typecheck_cxl(
                         &name,
                         &name,
-                        "",
+                        CxlSource {
+                            text: "",
+
+                            authored: Authored::Synthesized,
+                        },
                         &cloned,
                         AggregateMode::Row,
                         span,
@@ -3242,7 +3294,15 @@ fn bind_schema_inner(
                         match typecheck_cxl(
                             &name,
                             &format!("{name} (branch {branch_name})"),
-                            &format!("filter {}", cond.source),
+                            CxlSource {
+                                text: &format!("filter {}", cond.source),
+
+                                authored: Authored::Expression {
+                                    key: branch_name,
+                                    text: &cond.source,
+                                    at: "filter ".len(),
+                                },
+                            },
                             &cloned,
                             AggregateMode::Row,
                             span,
@@ -6782,43 +6842,75 @@ impl BodyReads {
         }
     }
 
-    /// The source line holding the first read of `name`, with every read of
-    /// `name` on it written `(name ?? stand_in)`; `None` when the reads'
-    /// spans do not address `source`.
-    fn line_with_stand_in(&self, source: &str, name: &str, stand_in: &str) -> Option<String> {
-        let first = self
-            .fields
-            .iter()
-            .filter(|(_, read)| read.as_ref() == name)
-            .map(|(at, _)| at.start as usize)
-            .min()?;
-        let start = source.get(..first)?.rfind('\n').map_or(0, |at| at + 1);
-        let end = source
-            .get(first..)?
-            .find('\n')
-            .map_or(source.len(), |at| first + at);
-        let mut reads: Vec<(usize, usize)> = self
-            .fields
-            .iter()
-            .filter(|(at, read)| {
-                read.as_ref() == name && start <= at.start as usize && at.end as usize <= end
+    /// The author's line that reads `name` inside one of the failing
+    /// expressions (`line.within`), or the first line reading it when none
+    /// does, with every read of `name` on it written `(name ?? stand_in)`.
+    /// For an expression the author wrote under a YAML key, the rewritten
+    /// entry (`key: '<expression>'`). `None` when the program is the
+    /// planner's own, the expression spans several lines, or the reads'
+    /// spans do not address the text.
+    fn line_with_stand_in(
+        &self,
+        line: &AuthoredLine<'_>,
+        name: &str,
+        stand_in: &str,
+    ) -> Option<String> {
+        let reads_of_name = || {
+            self.fields
+                .iter()
+                .filter(|(_, read)| read.as_ref() == name)
+                .map(|(at, _)| (at.start as usize, at.end as usize))
+        };
+        let anchor = reads_of_name()
+            .filter(|(start, end)| {
+                line.within
+                    .iter()
+                    .any(|span| span.start as usize <= *start && *end <= span.end as usize)
             })
-            .map(|(at, _)| (at.start as usize, at.end as usize))
+            .map(|(start, _)| start)
+            .min()
+            .or_else(|| reads_of_name().map(|(start, _)| start).min())?;
+        // The text to rewrite, the offset of its first byte in the program
+        // source, and the bounds of the line within the source.
+        let (text, base, start, end) = match line.authored {
+            Authored::Program => {
+                let source = line.source;
+                let start = source.get(..anchor)?.rfind('\n').map_or(0, |at| at + 1);
+                let end = source
+                    .get(anchor..)?
+                    .find('\n')
+                    .map_or(source.len(), |at| anchor + at);
+                (source, 0, start, end)
+            }
+            Authored::Expression { text, at, .. } => {
+                if text.contains('\n') {
+                    return None;
+                }
+                (text, at, at, at + text.len())
+            }
+            Authored::Synthesized => return None,
+        };
+        let mut reads: Vec<(usize, usize)> = reads_of_name()
+            .filter(|(read_start, read_end)| start <= *read_start && *read_end <= end)
             .collect();
         reads.sort_unstable();
         reads.dedup();
-        let mut line = String::new();
+        let mut rewritten = String::new();
         let mut from = start;
         for (read_start, read_end) in reads {
-            if source.get(read_start..read_end)? != name {
+            if text.get(read_start - base..read_end - base)? != name {
                 return None;
             }
-            line.push_str(source.get(from..read_start)?);
-            line.push_str(&format!("({name} ?? {stand_in})"));
+            rewritten.push_str(text.get(from - base..read_start - base)?);
+            rewritten.push_str(&format!("({name} ?? {stand_in})"));
             from = read_end;
         }
-        line.push_str(source.get(from..end)?);
-        Some(line.trim().to_string())
+        rewritten.push_str(text.get(from - base..end - base)?);
+        let rewritten = rewritten.trim().to_string();
+        match line.authored {
+            Authored::Expression { key, .. } => yaml_entry(key, &rewritten),
+            _ => Some(rewritten),
+        }
     }
 
     /// The `any`-declared column the field reference inside `within` reads,
@@ -7182,6 +7274,37 @@ struct CxlTypecheckCtx<'a> {
     mode: &'a AggregateMode,
     span: Span,
     scoped_vars: &'a cxl::resolve::ScopedVarsRegistry,
+    /// How the author wrote the program, so a help that rewrites one of
+    /// its lines prints the author's YAML.
+    authored: Authored<'a>,
+}
+
+/// A CXL program to typecheck: its text, and how the author wrote it.
+#[derive(Clone, Copy)]
+struct CxlSource<'a> {
+    text: &'a str,
+    authored: Authored<'a>,
+}
+
+/// How the author wrote the program a [`CxlTypecheckCtx`] typechecks. A
+/// help that prints one of its lines rewritten (the E200 for a column that
+/// may be empty) prints what the author wrote, under the key they wrote it
+/// under, and never the program the planner synthesized around it.
+#[derive(Clone, Copy)]
+enum Authored<'a> {
+    /// The program is the author's `cxl:` block as written.
+    Program,
+    /// The program wraps one authored expression, `text`, written under the
+    /// YAML key `key` (a Route branch, a Reshape `when:`, a log
+    /// `condition:`, a Cull rule, a Reshape `set` or `overrides` entry);
+    /// `text` starts at byte `at` of the program's source.
+    Expression {
+        key: &'a str,
+        text: &'a str,
+        at: usize,
+    },
+    /// The program is the planner's own; no line of it is the author's.
+    Synthesized,
 }
 
 /// The engine-supplied opening of a gate's program: the transform's `use`
@@ -7341,12 +7464,16 @@ fn nearest_column(field: &str, upstream: &Row) -> Option<String> {
 fn typecheck_cxl(
     node: &str,
     node_name: &str,
-    source: &str,
+    source: CxlSource<'_>,
     schema: &Row,
     mode: AggregateMode,
     span: Span,
     scoped_vars: &cxl::resolve::ScopedVarsRegistry,
 ) -> Result<TypedProgram, Vec<Diagnostic>> {
+    let CxlSource {
+        text: source,
+        authored,
+    } = source;
     let parse_result = cxl::parser::Parser::parse(source);
     if !parse_result.errors.is_empty() {
         let messages: Vec<String> = parse_result
@@ -7367,6 +7494,7 @@ fn typecheck_cxl(
         mode: &mode,
         span,
         scoped_vars,
+        authored,
     };
     typecheck_parsed_program(
         &ctx,
@@ -7470,6 +7598,7 @@ fn typecheck_parsed_program(
         mode,
         span,
         scoped_vars,
+        authored,
     } = *ctx;
     // Field names for CXL resolve. In the non-combine case all fields are
     // bare; in the combine case qualified fields collapse to their `.name` —
@@ -7548,21 +7677,26 @@ fn typecheck_parsed_program(
                     span,
                 ));
             }
+            let site = ResolveSite {
+                node,
+                context: &context,
+                span,
+            };
+            let passes_with_never_empty =
+                |program: &cxl::ast::Program, never_empty: &[&MayBeEmpty]| {
+                    passes_when_never_empty(
+                        &site,
+                        program.clone(),
+                        node_count,
+                        schema,
+                        never_empty,
+                        mode,
+                        scoped_vars,
+                    )
+                };
             if !plain.is_empty()
                 && let Some(program) = recheck
-                && passes_when_never_empty(
-                    &ResolveSite {
-                        node,
-                        context: &context,
-                        span,
-                    },
-                    program,
-                    node_count,
-                    schema,
-                    &empty_by_port,
-                    mode,
-                    scoped_vars,
-                )
+                && passes_with_never_empty(&program, &empty_by_port.iter().collect::<Vec<_>>())
             {
                 let detail = plain
                     .iter()
@@ -7570,7 +7704,24 @@ fn typecheck_parsed_program(
                     .collect::<Vec<_>>()
                     .join("; ");
                 let within: Vec<cxl::lexer::Span> = plain.iter().map(|d| d.span).collect();
-                for empty in reads.possibly_empty_in(&empty_by_port, &within) {
+                // Blame a column only when its possible emptiness is what
+                // fails the node: one that, never empty on its own, lets the
+                // node compile. When no single column does, the columns the
+                // failing expressions read are needed together.
+                let candidates = reads.possibly_empty_in(&empty_by_port, &within);
+                let on_their_own: Vec<&MayBeEmpty> = candidates
+                    .iter()
+                    .copied()
+                    .filter(|empty| {
+                        candidates.len() == 1 || passes_with_never_empty(&program, &[empty])
+                    })
+                    .collect();
+                let blamed = if on_their_own.is_empty() {
+                    candidates
+                } else {
+                    on_their_own
+                };
+                for empty in blamed {
                     out.push(possibly_empty_type_error(
                         &PossiblyEmpty {
                             node,
@@ -7580,7 +7731,11 @@ fn typecheck_parsed_program(
                             span,
                         },
                         &reads,
-                        &display_source,
+                        &AuthoredLine {
+                            authored,
+                            source: &display_source,
+                            within: &within,
+                        },
                         &detail,
                     ));
                 }
@@ -7645,7 +7800,7 @@ fn passes_when_never_empty(
     program: cxl::ast::Program,
     node_count: u32,
     row: &Row,
-    empty_by_port: &[MayBeEmpty],
+    empty_by_port: &[&MayBeEmpty],
     mode: &AggregateMode,
     scoped_vars: &cxl::resolve::ScopedVarsRegistry,
 ) -> bool {
@@ -7687,6 +7842,71 @@ fn passes_when_never_empty(
     .is_ok()
 }
 
+/// Where a help finds the author's line to rewrite: how the program was
+/// written, its source, and the spans of the failing expressions.
+struct AuthoredLine<'a> {
+    authored: Authored<'a>,
+    source: &'a str,
+    within: &'a [cxl::lexer::Span],
+}
+
+/// `key: '<expr>'` as a YAML entry the author can paste: single-quoted
+/// unless the expression holds a single quote, then double-quoted unless
+/// that needs escaping too.
+fn yaml_entry(key: &str, expr: &str) -> Option<String> {
+    if !expr.contains('\'') {
+        Some(format!("{key}: '{expr}'"))
+    } else if !expr.contains('"') && !expr.contains('\\') {
+        Some(format!("{key}: \"{expr}\""))
+    } else {
+        None
+    }
+}
+
+/// `detail`, a CXL type checker message, with each type spelled as a port
+/// schema spells it: `Nullable(Int)` as `{ nullable: int }`, `Bool` as
+/// `bool`. Every other word is kept.
+fn author_spelling(detail: &str) -> String {
+    fn spelled(word: &str) -> Option<&'static str> {
+        Some(match word {
+            "Bool" => "bool",
+            "Int" => "int",
+            "Float" => "float",
+            "Decimal" => "decimal",
+            "String" => "string",
+            "Date" => "date",
+            "DateTime" => "date_time",
+            _ => return None,
+        })
+    }
+    let mut out = String::with_capacity(detail.len());
+    let mut rest = detail;
+    while !rest.is_empty() {
+        let word_end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        if word_end == 0 {
+            let mut chars = rest.chars();
+            out.push(chars.next().expect("non-empty"));
+            rest = chars.as_str();
+            continue;
+        }
+        let word = &rest[..word_end];
+        rest = &rest[word_end..];
+        if word == "Nullable"
+            && let Some(inner) = rest.strip_prefix('(')
+            && let Some(close) = inner.find(')')
+            && let Some(inner_spelling) = spelled(&inner[..close])
+        {
+            out.push_str(&format!("{{ nullable: {inner_spelling} }}"));
+            rest = &inner[close + 1..];
+            continue;
+        }
+        out.push_str(spelled(word).unwrap_or(word));
+    }
+    out
+}
+
 /// A body node that cannot use a column while it may be empty.
 struct PossiblyEmpty<'a> {
     node: &'a str,
@@ -7716,7 +7936,7 @@ fn empty_stand_in(ty: &Type) -> Option<&'static str> {
 fn possibly_empty_type_error(
     at: &PossiblyEmpty<'_>,
     reads: &BodyReads,
-    source: &str,
+    line: &AuthoredLine<'_>,
     detail: &str,
 ) -> Diagnostic {
     let PossiblyEmpty {
@@ -7739,8 +7959,8 @@ fn possibly_empty_type_error(
         "declare `{name}` as never empty on input port `{port}` in `{body_file}`: \
          `- {{ name: {name}, type: {never_empty} }}`"
     );
-    let help = match empty_stand_in(inner)
-        .and_then(|stand_in| reads.line_with_stand_in(source, name, stand_in))
+    let fix = match empty_stand_in(inner)
+        .and_then(|stand_in| reads.line_with_stand_in(line, name, stand_in))
     {
         Some(line) => format!(
             "handle an empty `{name}` in node {node:?} in `{body_file}`: `{line}`, so the \
@@ -7757,11 +7977,14 @@ fn possibly_empty_type_error(
         format!(
             "node {node:?} in composition {call:?} cannot use `{name}` while it may be empty: \
              input port `{port}` declares `{name}` as `{declared}`, so the composition is \
-             checked at every call as if `{name}` could be empty ({detail})"
+             checked at every call as if `{name}` could be empty"
         ),
         LabeledSpan::primary(*span, String::new()),
     )
-    .with_help(help)
+    .with_help(format!(
+        "{fix}. Technical detail: {}",
+        author_spelling(detail)
+    ))
 }
 
 /// E200 for a type error in a composition body node that reads a column
@@ -8011,7 +8234,11 @@ fn compile_header_section(
     let typed = match typecheck_cxl(
         name,
         &format!("{name}:header.{section}"),
-        &program,
+        CxlSource {
+            text: &program,
+
+            authored: Authored::Synthesized,
+        },
         body_row,
         AggregateMode::Row,
         span,
@@ -8169,7 +8396,11 @@ fn compile_footer_section(
     let typed = match typecheck_cxl(
         name,
         &format!("{name}:footer.{section}"),
-        &program,
+        CxlSource {
+            text: &program,
+
+            authored: Authored::Synthesized,
+        },
         body_row,
         AggregateMode::GroupBy {
             group_by_fields: HashSet::new(),
@@ -8909,7 +9140,11 @@ fn bind_combine(
     let body_typed = match typecheck_cxl(
         name,
         name,
-        &config.cxl.source,
+        CxlSource {
+            text: &config.cxl.source,
+
+            authored: Authored::Program,
+        },
         &merged_row,
         AggregateMode::Row,
         span,
@@ -9954,7 +10189,11 @@ nodes:
             typecheck_cxl(
                 "last",
                 "last",
-                "emit q = v",
+                CxlSource {
+                    text: "emit q = v",
+
+                    authored: Authored::Program,
+                },
                 row,
                 AggregateMode::Row,
                 Span::SYNTHETIC,
@@ -10105,5 +10344,42 @@ nodes:
         let mut diags_after_failure = vec![diags[0].clone()];
         assert!(admission(&failed, &mut diags_after_failure).is_none());
         assert_eq!(diags_after_failure.len(), 1, "{diags_after_failure:#?}");
+    }
+
+    #[test]
+    fn a_type_checker_detail_is_respelled_as_a_port_schema_spells_types() {
+        assert_eq!(
+            author_spelling("filter predicate must be type Bool, got Nullable(Bool). Use it."),
+            "filter predicate must be type bool, got { nullable: bool }. Use it."
+        );
+        assert_eq!(
+            author_spelling("method 'upper' expects a String receiver, but got Int"),
+            "method 'upper' expects a string receiver, but got int"
+        );
+        assert_eq!(
+            author_spelling("Nullable(DateTime) and Nullable(Map)"),
+            "{ nullable: date_time } and Nullable(Map)"
+        );
+        assert_eq!(
+            author_spelling("Integer_count Boolean"),
+            "Integer_count Boolean"
+        );
+    }
+
+    #[test]
+    fn a_yaml_entry_quotes_the_expression_so_it_pastes() {
+        assert_eq!(
+            yaml_entry("high", "(v ?? 0) > 6").as_deref(),
+            Some("high: '(v ?? 0) > 6'")
+        );
+        assert_eq!(
+            yaml_entry("when", "(s ?? \"\") == 'x'").as_deref(),
+            None,
+            "both quote styles would need escaping"
+        );
+        assert_eq!(
+            yaml_entry("when", "(s ?? 'a') == x").as_deref(),
+            Some("when: \"(s ?? 'a') == x\"")
+        );
     }
 }

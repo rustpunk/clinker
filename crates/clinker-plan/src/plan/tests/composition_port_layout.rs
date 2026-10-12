@@ -2941,3 +2941,187 @@ fn a_cycle_is_reported_once_naming_every_node_on_it() {
         three[0].message
     );
 }
+
+/// The one E200 a body behind a `{ nullable: int }` `v` draws when a node
+/// cannot use `v` while it may be empty.
+fn empty_value_refusal(body: &str) -> Diagnostic {
+    let composition = comp_declaring(
+        &[
+            "{ name: v, type: { nullable: int } }",
+            "{ name: department, type: string }",
+        ],
+        body,
+    );
+    let Err(diags) = compile_in(PIPELINE, &[("compositions/c.comp.yaml", &composition)]) else {
+        panic!("a body that does not handle an empty `v` must not compile");
+    };
+    assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
+    assert_eq!(diags[0].code, "E200", "{:#?}", describe(&diags));
+    assert!(
+        diags[0]
+            .message
+            .contains("cannot use `v` while it may be empty"),
+        "{}",
+        diags[0].message
+    );
+    diags[0].clone()
+}
+
+/// The help's paste-ready line: the text between the backticks that follow
+/// the body file's name.
+fn pasted_line(help: &str) -> &str {
+    help.split("`: `")
+        .nth(1)
+        .and_then(|rest| rest.split("`, so the composition").next())
+        .unwrap_or_else(|| panic!("the help prints a line to paste: {help}"))
+}
+
+#[test]
+fn the_empty_value_help_prints_the_line_that_fails_not_the_first_read() {
+    // `v + 1` compiles over a possibly empty `v`; `filter v > 6` does not.
+    // The help prints the filter line.
+    let refused = empty_value_refusal(
+        r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit a = v + 1
+        filter v > 6
+"#,
+    );
+    let help = refused.help.as_deref().unwrap_or_default();
+    assert_eq!(pasted_line(help), "filter (v ?? 0) > 6", "{help}");
+}
+
+#[test]
+fn the_empty_value_message_keeps_its_detail_after_the_fix_in_the_author_s_spelling() {
+    let refused = empty_value_refusal(
+        r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        filter v > 6
+"#,
+    );
+    assert!(
+        !refused.message.contains('(') && !refused.message.contains("Nullable"),
+        "the first sentence carries no type checker detail: {}",
+        refused.message
+    );
+    let help = refused.help.as_deref().unwrap_or_default();
+    let (fix, detail) = help
+        .split_once(". Technical detail: ")
+        .unwrap_or_else(|| panic!("the detail follows the fix: {help}"));
+    assert!(fix.contains("`filter (v ?? 0) > 6`"), "{fix}");
+    assert!(
+        detail.contains("{ nullable: bool }") && !detail.contains("Nullable("),
+        "{detail}"
+    );
+}
+
+#[test]
+fn the_empty_value_help_prints_each_authored_entry_as_the_author_wrote_it() {
+    // A condition the planner wraps in its own program is printed as the
+    // YAML entry the author wrote, never as the wrapper. (A Cull rule is
+    // wired the same way, but an aggregate over a possibly empty column
+    // compiles, so no Cull rule reaches this error.)
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "route branch",
+            "high: '(v ?? 0) > 6'",
+            r#"  - type: route
+    name: r
+    input: inp
+    config:
+      mode: exclusive
+      conditions:
+        high: 'v > 6'
+      default: low
+  - type: transform
+    name: last
+    input: r.high
+    config:
+      cxl: |
+        emit a = 1
+"#,
+        ),
+        (
+            "reshape when",
+            "when: '(v ?? 0) > 6'",
+            r#"  - type: reshape
+    name: last
+    input: inp
+    config:
+      partition_by: [department]
+      rules:
+        - name: r1
+          when: 'v > 6'
+          mutate:
+            set:
+              v: '0'
+"#,
+        ),
+        (
+            "log condition",
+            "condition: '(v ?? 0) > 6'",
+            r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit a = 1
+      log:
+        - name: l
+          level: info
+          when: per_record
+          every: 1
+          condition: 'v > 6'
+          message: "m"
+"#,
+        ),
+    ];
+    for (label, expected, body) in cases {
+        let refused = empty_value_refusal(body);
+        let help = refused.help.as_deref().unwrap_or_default();
+        assert_eq!(pasted_line(help), *expected, "{label}: {help}");
+        let fix = help.split(". Technical detail: ").next().unwrap_or(help);
+        assert!(!fix.contains("filter"), "{label} prints no wrapper: {fix}");
+    }
+}
+
+#[test]
+fn only_the_column_whose_emptiness_fails_the_node_is_blamed() {
+    // The failing filter reads neither column directly; `v` never empty
+    // on its own makes it compile, `w` never empty on its own does not.
+    let composition = comp_declaring(
+        &[
+            "{ name: v, type: { nullable: int } }",
+            "{ name: wt, type: { nullable: int } }",
+        ],
+        r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        let x = v
+        let y = wt
+        filter x > 6
+        emit b = y ?? 0
+"#,
+    );
+    let Err(diags) = compile_in(PIPELINE, &[("compositions/c.comp.yaml", &composition)]) else {
+        panic!("the filter does not handle an empty `v`");
+    };
+    assert_eq!(diags.len(), 1, "one column blamed: {:#?}", describe(&diags));
+    assert!(
+        diags[0]
+            .message
+            .contains("cannot use `v` while it may be empty"),
+        "{}",
+        diags[0].message
+    );
+    let help = diags[0].help.as_deref().unwrap_or_default();
+    assert_eq!(pasted_line(help), "let x = (v ?? 0)", "{help}");
+}
