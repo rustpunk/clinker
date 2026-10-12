@@ -117,7 +117,10 @@ it from the caller's values, as the same nodes written in the pipeline would.
 A column declared `any` (or `{ nullable: any }`) is checked with the type the
 call provides, so a node that uses it in a way only some types support
 compiles at some calls and not at others; the type error names the
-composition and the port, because it depends on the call. Columns the port
+composition and the port, because it depends on the call. Its help prints the
+node's line with the column converted to the type the node needs, such as
+`emit u = v.to_string().upper()`, which compiles whatever type a call provides
+as long as the values convert. Columns the port
 does not declare keep the caller's types on the way through.
 
 A column declared `{ nullable: <type> }` says the composition copes with an

@@ -1181,6 +1181,49 @@ fn the_fix_e107_prints_for_a_body_node_reading_itself_runs_as_inline() {
 }
 
 #[test]
+fn the_fix_for_a_type_error_on_an_any_column_is_one_line_that_runs_as_inline() {
+    // `v` is declared `any` and this call provides an `int`, which has no
+    // `upper()`. The help prints the node's line with `v` converted; pasted,
+    // the call runs as the same line written inline.
+    let body = r#"  - type: transform
+    name: flag
+    input: inp
+    config:
+      cxl: |
+        emit u = v.upper()
+"#;
+    let shape = Shape {
+        ports: &[("inp", &["{ name: v, type: any }"])],
+        bindings: FED_BY_SRC,
+        out: "flag",
+        body,
+        upstream: source("int"),
+        input: ORDERS,
+    };
+    let called = outcome(&shape.call_files());
+    assert_eq!(called.exit(), Some(1), "{}", describe(&called.run));
+    let Err(diags) = &called.compiled else {
+        panic!("`upper()` on an int is a type error");
+    };
+    assert_eq!(diags.len(), 1, "{diags:#?}");
+    assert_eq!(diags[0].code, "E200", "{diags:#?}");
+    let help = diags[0].help.as_deref().unwrap_or_default();
+    let line = help
+        .rsplit(": `")
+        .next()
+        .and_then(|rest| rest.strip_suffix('`'))
+        .unwrap_or_else(|| panic!("the help ends with the line to paste: {help}"));
+    assert_eq!(line, "emit u = v.to_string().upper()");
+    assert_inline_equivalent(
+        &Shape {
+            body: &body.replace("emit u = v.upper()", line),
+            ..shape
+        },
+        0,
+    );
+}
+
+#[test]
 fn an_aggregate_over_a_possibly_empty_port_feeds_a_strict_call_as_inline() {
     // `aggint`: the body sums `v` per department; the sum of a never-empty
     // `v` is never empty, so `second` accepts it as it does inline. A hash

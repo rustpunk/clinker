@@ -57,7 +57,9 @@ not declare, not for every column a composition adds.
 nodes with the type the call provides. Before, it was untyped inside the
 composition, so a node that used it in a way that type does not support
 compiled and wrote empty values; now it fails with `E200` at that call, and
-the message names the composition and the port. A column the port declares
+the message names the composition and the port. The help prints the node's
+line with the column converted to the type the node needs, such as
+`emit u = v.to_string().upper()`. A column the port declares
 with a concrete type is still checked with that type, and the columns the port
 does not declare reach the composition's output with the caller's types.
 

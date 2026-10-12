@@ -944,8 +944,10 @@ nodes:
     }
     let help = diag.help.as_deref().expect("a fix");
     assert!(
-        help.contains("c.comp.yaml") && help.contains("type: any"),
-        "the help points at the port declaration: {help}"
+        help.contains("c.comp.yaml")
+            && help.ends_with(": `emit s = department.to_int() + 1`")
+            && help.contains("`int` it needs"),
+        "the help prints the node's line converting the column to the type it needs: {help}"
     );
 }
 
