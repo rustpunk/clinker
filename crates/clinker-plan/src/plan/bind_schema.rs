@@ -1689,12 +1689,14 @@ fn validate_output_mapping_columns(
     let sidecar_expands = upstream.has_field(crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN)
         && output.include_unmapped;
 
-    // Suggest only author-facing columns: the engine-stamped namespaces
-    // (`$widened`, `$source.*`, `$ck.*`) are not names a pipeline author types.
-    let candidates: Vec<String> = upstream
-        .fields()
-        .map(|(qf, _)| qf.name.to_string())
+    // Suggest only author-facing columns the Sink may name: the engine-stamped
+    // namespaces (`$widened`, `$source.*`, `$ck.*`) are not names a pipeline
+    // author types, and a caller column a composition port carries undeclared
+    // would lead to E169.
+    let candidates: Vec<String> = nameable_columns(upstream)
+        .into_iter()
         .filter(|n| !n.starts_with('$'))
+        .map(str::to_string)
         .collect();
     let candidate_refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
     let available = if candidate_refs.is_empty() {
@@ -6185,8 +6187,10 @@ fn log_field_diagnostics(
             if !matches!(upstream.lookup(field), ColumnLookup::Unknown) {
                 continue;
             }
-            let mut names = upstream
-                .field_names()
+            // Only columns this node may name: a caller column a composition
+            // port carries undeclared would lead to E169 if requested.
+            let mut names = nameable_columns(upstream)
+                .into_iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>();
             let elided = names.len().saturating_sub(LOG_FIELD_ROW_LISTING_LIMIT);
@@ -6218,7 +6222,8 @@ fn log_field_diagnostics(
     diags
 }
 
-/// The declared column an unmatched selector most likely meant, if any.
+/// The declared column an unmatched selector most likely meant, if any,
+/// among the columns the node may name.
 ///
 /// Folding case and separators out before measuring is what lets `orderId`
 /// reach `order_id`: the two differ by an underscore and a capital, which is
@@ -6233,8 +6238,8 @@ fn nearest_column(field: &str, upstream: &Row) -> Option<String> {
     }
     let folded = fold(field);
     let threshold = 1 + folded.len() / 8;
-    upstream
-        .field_names()
+    nameable_columns(upstream)
+        .into_iter()
         .filter_map(|column| {
             let name = column.to_string();
             let distance =
