@@ -15,16 +15,21 @@ port's order. An Aggregate, Cull or Combine inside the composition then read
 its columns by the wrong position whenever the port declared fewer columns
 than the caller had, or the same columns in another order. A sum came out
 empty or summed the wrong column, and a Combine wrote the wrong input's
-values, with no error. A Transform-only composition read
-the right values, but a call fed by a node that adds or reorders columns,
-such as a Transform in front of the call, stopped with `E314` at the next
-Sink.
+values, with no error. A Transform-only composition read the right values,
+but any call whose port declared fewer columns than the caller had, or the
+same columns in another order, stopped with `E314` at the next Sink, whether
+a Source or another node fed it.
 
 The composition's nodes now compile against the rows the call actually feeds
 each port. A call writes what the same nodes written in the pipeline at the
-call site would write. Columns the port does not declare pass through the
-composition in the caller's position, so a call fed by a Transform that adds a
-column runs and writes that column.
+call site would write, with two exceptions that remain open: a Sink with
+`include_unmapped: false` reading a call writes every column the call passes
+on, where the same Sink after the inline nodes writes only the columns their
+last Transform emits; and an Aggregate inside a composition fed by a source
+that declares a `correlation_key` stops with `E314` where the inline Aggregate
+runs. Columns the port does not declare pass through the composition in the
+caller's position, so a call fed by a Transform that adds a column runs and
+writes that column.
 
 The emitted OpenLineage column lineage changes with it: a composition's
 column now names the input column it really reads (an Aggregate's `sum(v)`
@@ -34,10 +39,13 @@ the pipeline.
 
 The port's `schema:` is now the list of columns the composition may use. A
 node that uses any other column of the caller's rows fails with `E169` at
-every call, naming the call, the node, the port and the column, and the help
-prints the line to add under `_compose.inputs.<port>.schema`. Before, such a
-node failed with `E203` (`E200` for a `group_by`), an unknown-name error that
-did not say the port was the reason. `W101` now fires only where a
+every call whose rows carry that column, naming the call, the node, the port
+and the column, and the help prints the line to add under
+`_compose.inputs.<port>.schema`. A Reshape `set` or `overrides` entry on such a
+column counts as using it. Before, such a node failed with an error that did
+not say the port was the reason: `E203` for an expression, `E200` for a
+`group_by`, `partition_by` or Reshape target, `E308` for a Combine, or, for log
+`fields`, `E314` only once the run started. `W101` now fires only where a
 composition writes a column with the name of a caller column its port does
 not declare, not for every column a composition adds.
 
