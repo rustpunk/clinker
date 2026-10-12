@@ -92,6 +92,27 @@ fn compile_in(pipeline: &str, files: &[(&str, &str)]) -> Result<CompiledPlan, Ve
     config.compile(&ctx)
 }
 
+/// Bind `pipeline` in a workspace holding `files` and return every
+/// diagnostic the bind raised, warnings included (a compile that succeeds
+/// does not return its warnings).
+fn bind_in(pipeline: &str, files: &[(&str, &str)]) -> Vec<Diagnostic> {
+    let workspace = workspace(files);
+    let config = parse_config(pipeline).expect("parse pipeline");
+    let ctx = CompileContext::with_pipeline_dir(workspace.path(), PathBuf::from("pipelines"));
+    let symbol_table = crate::config::composition::scan_workspace_signatures(workspace.path())
+        .expect("compositions load");
+    let mut diags = Vec::new();
+    crate::plan::bind_schema::bind_schema(
+        &config.nodes,
+        &mut diags,
+        &ctx,
+        &symbol_table,
+        &ctx.pipeline_dir,
+        Default::default(),
+    );
+    diags
+}
+
 fn describe(diags: &[Diagnostic]) -> Vec<String> {
     diags
         .iter()
@@ -781,5 +802,698 @@ fn a_body_node_listed_before_its_input_is_still_checked() {
 "#,
         "wt",
         "- { name: wt, type: int }",
+    );
+}
+
+/// A composition `c` like [`comp`] whose first output port reads `out`.
+fn comp_out(out: &str, body: &str) -> String {
+    comp(body).replace("    out: last\n", &format!("    out: {out}\n"))
+}
+
+/// Every surface outside a CXL expression where a body names a column: each
+/// is refused with E169 when the column is a caller column its port does
+/// not declare.
+#[test]
+fn each_column_list_naming_an_undeclared_column_is_refused() {
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "route condition",
+            "last.high",
+            r#"  - type: route
+    name: last
+    input: inp
+    config:
+      conditions:
+        high: "wt > 0"
+      default: low
+"#,
+        ),
+        (
+            "cull partition_by",
+            "last",
+            r#"  - type: cull
+    name: last
+    input: inp
+    config:
+      partition_by: [wt]
+      removed_to: gone
+      rules:
+        - name: r
+          drop_group_when: "count(*) > 1"
+"#,
+        ),
+        (
+            "cull order_by",
+            "last",
+            r#"  - type: cull
+    name: last
+    input: inp
+    config:
+      partition_by: [department]
+      order_by:
+        - field: wt
+      removed_to: gone
+      rules:
+        - name: r
+          drop_group_when: "count(*) > 1"
+"#,
+        ),
+        (
+            "cull rule",
+            "last",
+            r#"  - type: cull
+    name: last
+    input: inp
+    config:
+      partition_by: [department]
+      removed_to: gone
+      rules:
+        - name: r
+          drop_group_when: "sum(wt) > 0"
+"#,
+        ),
+        (
+            "reshape partition_by",
+            "last",
+            r#"  - type: reshape
+    name: last
+    input: inp
+    config:
+      partition_by: [wt]
+      rules:
+        - name: r1
+          when: "v > 5"
+          mutate:
+            set:
+              department: "'z'"
+"#,
+        ),
+        (
+            "reshape order_by",
+            "last",
+            r#"  - type: reshape
+    name: last
+    input: inp
+    config:
+      partition_by: [department]
+      order_by:
+        - field: wt
+      rules:
+        - name: r1
+          when: "v > 5"
+          mutate:
+            set:
+              v: "v + 1"
+"#,
+        ),
+        (
+            "reshape when",
+            "last",
+            r#"  - type: reshape
+    name: last
+    input: inp
+    config:
+      partition_by: [department]
+      rules:
+        - name: r1
+          when: "wt > 0"
+          mutate:
+            set:
+              v: "v + 1"
+"#,
+        ),
+        (
+            "aggregate argument",
+            "last",
+            r#"  - type: aggregate
+    name: last
+    input: inp
+    config:
+      group_by: [department]
+      cxl: |
+        emit s = sum(wt)
+"#,
+        ),
+        (
+            "window argument",
+            "last",
+            r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      analytic_window:
+        group_by: [department]
+      cxl: |
+        emit t = $window.sum(wt)
+"#,
+        ),
+        (
+            "window sort_by",
+            "last",
+            r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      analytic_window:
+        group_by: [department]
+        sort_by:
+          - field: wt
+      cxl: |
+        emit t = $window.sum(v)
+"#,
+        ),
+        (
+            "log fields",
+            "last",
+            r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit r = v
+      log:
+        - name: l
+          level: info
+          when: per_record
+          every: 1
+          fields: [wt]
+          message: "m"
+"#,
+        ),
+        (
+            "log condition",
+            "last",
+            r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit r = v
+      log:
+        - name: l
+          level: info
+          when: per_record
+          every: 1
+          condition: "wt > 0"
+          message: "m"
+"#,
+        ),
+        (
+            "validation field",
+            "last",
+            r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit r = v
+      validations:
+        - field: wt
+          check: "not_empty"
+"#,
+        ),
+    ];
+    for (surface, out, body) in cases {
+        let node = out.split('.').next().unwrap_or(out);
+        let compiled = compile(&comp_out(out, body));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_refused(compiled, node, "wt", "inp", "- { name: wt, type: int }")
+        }));
+        assert!(outcome.is_ok(), "{surface}: see the panic above");
+    }
+}
+
+/// A body Sink names columns in its `mapping:`, `exclude:`, split key and
+/// sort order: each is refused on an undeclared column.
+#[test]
+fn a_body_sink_naming_an_undeclared_column_is_refused() {
+    let sinks: &[(&str, &str)] = &[
+        ("mapping", "      mapping:\n        - w: wt\n"),
+        ("exclude", "      exclude: [wt]\n"),
+        ("sort_order", "      sort_order:\n        - field: wt\n"),
+        (
+            "split",
+            "      split:\n        max_records: 10\n        group_key: wt\n",
+        ),
+    ];
+    for (surface, config) in sinks {
+        let body = format!(
+            r#"  - type: transform
+    name: t
+    input: inp
+    config:
+      cxl: |
+        emit r = v
+  - type: sink
+    name: keep
+    input: t
+    config:
+      name: keep
+      type: csv
+      path: keep.csv
+{config}"#
+        );
+        let compiled = compile(&comp_out("t", &body));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_refused(compiled, "keep", "wt", "inp", "- { name: wt, type: int }")
+        }));
+        assert!(outcome.is_ok(), "{surface}: see the panic above");
+    }
+}
+
+/// [`PIPELINE`] with a second Source `dep` (`department, label, extra`)
+/// feeding the call's port `pb`.
+const COMBINE_PIPELINE: &str = r#"
+pipeline:
+  name: port_layout
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: department, type: string }
+        - { name: v, type: int }
+        - { name: wt, type: int }
+  - type: source
+    name: dep
+    config:
+      name: dep
+      type: csv
+      path: in2.csv
+      schema:
+        - { name: department, type: string }
+        - { name: label, type: string }
+        - { name: extra, type: string }
+  - type: composition
+    name: call
+    input: src
+    use: ../compositions/c.comp.yaml
+    inputs:
+      pa: src
+      pb: dep
+  - type: sink
+    name: out
+    input: call
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+
+/// A two-port composition: `pa` declares `department, v`, `pb` declares
+/// `department, label`; a Combine `j` with `where_clause` and `cxl`.
+fn combine_comp(where_clause: &str, cxl: &str) -> String {
+    format!(
+        r#"_compose:
+  name: c
+  inputs:
+    pa:
+      schema:
+        - {{ name: department, type: string }}
+        - {{ name: v, type: int }}
+    pb:
+      schema:
+        - {{ name: department, type: string }}
+        - {{ name: label, type: string }}
+  outputs:
+    out: j
+  config_schema: {{}}
+
+nodes:
+  - type: combine
+    name: j
+    input:
+      a: pa
+      b: pb
+    config:
+      where: "{where_clause}"
+      match: first
+      on_miss: null_fields
+      propagate_ck: driver
+      cxl: |
+        {cxl}
+"#
+    )
+}
+
+#[test]
+fn a_combine_naming_an_undeclared_column_of_one_input_is_refused() {
+    for (surface, where_clause, cxl, port, column, declaration) in [
+        (
+            "body",
+            "a.department == b.department",
+            "emit label = b.extra",
+            "pb",
+            "extra",
+            "- { name: extra, type: string }",
+        ),
+        (
+            "where",
+            "a.department == b.department and a.wt > 0",
+            "emit label = b.label",
+            "pa",
+            "wt",
+            "- { name: wt, type: int }",
+        ),
+    ] {
+        let compiled = compile_in(
+            COMBINE_PIPELINE,
+            &[("compositions/c.comp.yaml", &combine_comp(where_clause, cxl))],
+        );
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_refused(compiled, "j", column, port, declaration)
+        }));
+        assert!(outcome.is_ok(), "{surface}: see the panic above");
+    }
+}
+
+#[test]
+fn a_combine_reading_declared_columns_of_both_inputs_compiles() {
+    compile_in(
+        COMBINE_PIPELINE,
+        &[(
+            "compositions/c.comp.yaml",
+            &combine_comp(
+                "a.department == b.department",
+                "emit department = a.department\n        emit v = a.v\n        emit label = b.label",
+            ),
+        )],
+    )
+    .unwrap_or_else(|d| panic!("compiles: {:#?}", describe(&d)));
+}
+
+/// The inner composition of a nested call: its port `ip` declares `ip_columns`.
+fn inner_comp(ip_columns: &str) -> String {
+    format!(
+        r#"_compose:
+  name: inner
+  inputs:
+    ip:
+      schema:
+{ip_columns}  outputs:
+    out: it
+  config_schema: {{}}
+
+nodes:
+  - type: transform
+    name: it
+    input: ip
+    config:
+      cxl: |
+        emit r = v * 2
+"#
+    )
+}
+
+#[test]
+fn a_nested_port_declaring_a_column_the_outer_port_does_not_is_refused() {
+    let outer = comp_out(
+        "ic",
+        r#"  - type: composition
+    name: ic
+    input: inp
+    use: ./inner.comp.yaml
+    inputs:
+      ip: inp
+"#,
+    );
+    assert_refused(
+        compile_in(
+            PIPELINE,
+            &[
+                ("compositions/c.comp.yaml", &outer),
+                (
+                    "compositions/inner.comp.yaml",
+                    &inner_comp(
+                        "        - { name: v, type: int }\n        - { name: wt, type: int }\n",
+                    ),
+                ),
+            ],
+        ),
+        "ic",
+        "wt",
+        "inp",
+        "- { name: wt, type: int }",
+    );
+}
+
+#[test]
+fn a_caller_column_passed_through_a_nested_call_stays_unnamed() {
+    // The inner call passes `order_id` through unchanged; it is still the
+    // outer caller's column, which the outer port does not declare.
+    let outer = comp_out(
+        "after",
+        r#"  - type: composition
+    name: ic
+    input: inp
+    use: ./inner.comp.yaml
+    inputs:
+      ip: inp
+  - type: transform
+    name: after
+    input: ic
+    config:
+      cxl: |
+        emit z = order_id
+"#,
+    );
+    assert_refused(
+        compile_in(
+            PIPELINE,
+            &[
+                ("compositions/c.comp.yaml", &outer),
+                (
+                    "compositions/inner.comp.yaml",
+                    &inner_comp("        - { name: v, type: int }\n"),
+                ),
+            ],
+        ),
+        "after",
+        "order_id",
+        "inp",
+        "- { name: order_id, type: string }",
+    );
+}
+
+#[test]
+fn a_column_a_nested_call_writes_is_the_outer_body_s_own() {
+    // The inner call writes `r`; the outer body may read it.
+    let outer = comp_out(
+        "after",
+        r#"  - type: composition
+    name: ic
+    input: inp
+    use: ./inner.comp.yaml
+    inputs:
+      ip: inp
+  - type: transform
+    name: after
+    input: ic
+    config:
+      cxl: |
+        emit z = r + v
+"#,
+    );
+    compile_in(
+        PIPELINE,
+        &[
+            ("compositions/c.comp.yaml", &outer),
+            (
+                "compositions/inner.comp.yaml",
+                &inner_comp("        - { name: v, type: int }\n"),
+            ),
+        ],
+    )
+    .unwrap_or_else(|d| panic!("compiles: {:#?}", describe(&d)));
+}
+
+/// The W101 warnings a bind of `pipeline` with composition `comp_yaml` raises.
+fn w101(pipeline: &str, comp_yaml: &str) -> Vec<Diagnostic> {
+    bind_in(pipeline, &[("compositions/c.comp.yaml", comp_yaml)])
+        .into_iter()
+        .filter(|d| d.code == "W101")
+        .collect()
+}
+
+#[test]
+fn w101_warns_where_the_body_writes_a_column_the_port_passes_through() {
+    let warned = w101(
+        PIPELINE,
+        &comp(
+            r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit wt = 2
+"#,
+        ),
+    );
+    assert_eq!(warned.len(), 1, "{:#?}", describe(&warned));
+    assert!(
+        warned[0].message.contains("\"wt\"") && warned[0].message.contains("\"inp\""),
+        "{}",
+        warned[0].message
+    );
+}
+
+#[test]
+fn w101_stays_silent_for_a_new_column() {
+    let warned = w101(
+        PIPELINE,
+        &comp(
+            r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit r = v * 2
+"#,
+        ),
+    );
+    assert!(warned.is_empty(), "{:#?}", describe(&warned));
+}
+
+#[test]
+fn w101_stays_silent_for_a_column_one_port_declares_and_another_passes_through() {
+    // `department` reaches the body through both ports; `pa` declares it.
+    // The output carries `pa`'s `department` unchanged, which shadows
+    // nothing, although `pb` would pass its own through undeclared.
+    let composition = r#"_compose:
+  name: c
+  inputs:
+    pa:
+      schema:
+        - { name: department, type: string }
+        - { name: v, type: int }
+    pb:
+      schema:
+        - { name: label, type: string }
+  outputs:
+    out: t
+  config_schema: {}
+
+nodes:
+  - type: transform
+    name: t
+    input: pa
+    config:
+      cxl: |
+        emit r = v
+"#;
+    let warned = w101(COMBINE_PIPELINE, composition);
+    assert!(warned.is_empty(), "{:#?}", describe(&warned));
+}
+
+#[test]
+fn a_typo_is_never_answered_with_an_undeclared_column() {
+    // `wtt` is one edit from the caller's `wt`, which the port does not
+    // declare: suggesting it would lead straight to E169.
+    let Err(diags) = compile(&comp(
+        r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit r = wtt
+"#,
+    )) else {
+        panic!("`wtt` names nothing");
+    };
+    assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
+    assert_eq!(diags[0].code, "E203", "{:#?}", describe(&diags));
+    let help = diags[0].help.as_deref().unwrap_or_default();
+    assert!(
+        !help.contains("'wt'"),
+        "the suggestion is a column the body may use: {help}"
+    );
+}
+
+#[test]
+fn a_synthesized_row_need_not_override_an_undeclared_column() {
+    // `copy_from: none` makes every column of a synthesized row empty unless
+    // an override sets it. The body may not name `order_id` or `wt`, so it
+    // cannot override them: they stay empty on the synthesized row, and the
+    // body compiles at every call whatever extra columns the caller has.
+    compile(&comp(
+        r#"  - type: reshape
+    name: last
+    input: inp
+    config:
+      partition_by: [department]
+      rules:
+        - name: r1
+          when: "v > 6"
+          synthesize:
+            copy_from: none
+            overrides:
+              v: "v + 1"
+              department: "department"
+"#,
+    ))
+    .unwrap_or_else(|d| panic!("compiles: {:#?}", describe(&d)));
+}
+
+/// A body Sink `keep` reading Transform `t`, with `config` appended to its
+/// `config:` block.
+fn body_sink(config: &str) -> String {
+    comp_out(
+        "t",
+        &format!(
+            r#"  - type: transform
+    name: t
+    input: inp
+    config:
+      cxl: |
+        emit r = v
+  - type: sink
+    name: keep
+    input: t
+    config:
+      name: keep
+      type: csv
+      path: keep.csv
+{config}"#
+        ),
+    )
+}
+
+#[test]
+fn a_body_sink_mapping_is_checked_against_the_row_its_call_feeds_it() {
+    // The body Sink's row is the caller's row plus `r`: a mapping reading a
+    // column no row carries is E365, as it is inline.
+    let Err(diags) = compile(&body_sink(
+        "      include_unmapped: false\n      mapping:\n        - total: nope\n",
+    )) else {
+        panic!("`nope` is in no row");
+    };
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.code == "E365" && d.message.contains("'nope'")),
+        "{:#?}",
+        describe(&diags)
+    );
+}
+
+#[test]
+fn a_body_sink_mapping_colliding_with_a_passed_through_column_is_refused() {
+    // `include_unmapped: true` writes the caller's `wt`, which passes
+    // through the body, beside the mapped `wt`: E364, as it is inline.
+    let Err(diags) = compile(&body_sink(
+        "      include_unmapped: true\n      mapping:\n        - wt: r\n",
+    )) else {
+        panic!("two `wt` columns");
+    };
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.code == "E364" && d.message.contains("'wt'")),
+        "{:#?}",
+        describe(&diags)
     );
 }

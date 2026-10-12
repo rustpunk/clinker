@@ -4164,7 +4164,6 @@ fn bind_composition(
         .collect();
 
     // Recursive bind_schema on body nodes.
-    let body_diags_start = diags.len();
     bind_schema_inner(
         &body_file.nodes,
         &body_node_ids,
@@ -4186,11 +4185,10 @@ fn bind_composition(
     let output_port_rows = compute_output_rows(&signature.outputs, &body_schema_by_name);
 
     // 10. A body node that named a caller column its port does not declare
-    // was refused where it named it (E169). Abandon the body then, as any
-    // other refused body is abandoned.
-    if diags[body_diags_start..].iter().any(|d| d.code == "E169") {
-        return;
-    }
+    // was refused where it named it (E169). The body is still recorded, as
+    // a body with any other refused node is, so a nested call it holds is
+    // not left without an owner.
+    //
     // W101: a body column written under the name of a caller column one of
     // the input ports passes through undeclared.
     for (port_name, row) in &output_port_rows {
