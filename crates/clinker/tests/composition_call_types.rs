@@ -958,6 +958,127 @@ fn a_reshape_condition_that_does_not_handle_an_empty_value_is_refused_and_its_pa
     );
 }
 
+/// `combnull`: a Combine whose `where:` compares `a.v`, which its port
+/// `pa` declares possibly empty, without handling the empty case.
+const COMBINE_WHERE_BODY: &str = r#"  - type: combine
+    name: j
+    input:
+      a: pa
+      b: pb
+    config:
+      where: "a.department == b.department and a.v > 5"
+      match: first
+      on_miss: skip
+      propagate_ck: driver
+      cxl: |
+        emit department = a.department
+        emit v = a.v
+        emit label = b.label
+"#;
+
+/// The ports of a Combine body: `pa` declares `v` possibly empty beside
+/// `department`, `pb` declares `department` and `label`.
+const COMBINE_PORTS: &[(&str, &[&str])] = &[
+    (
+        "pa",
+        &[
+            "{ name: department, type: string }",
+            "{ name: v, type: { nullable: int } }",
+        ],
+    ),
+    (
+        "pb",
+        &[
+            "{ name: department, type: string }",
+            "{ name: label, type: string }",
+        ],
+    ),
+];
+
+/// A Combine body `j` over [`COMBINE_PORTS`], fed `src` (with `v` typed
+/// `v_type`) and `dep`.
+fn combine_shape<'a>(body: &'a str, v_type: &str, input: &'a str) -> Shape<'a> {
+    Shape {
+        ports: COMBINE_PORTS,
+        bindings: &[("pa", "src"), ("pb", "dep")],
+        out: "j",
+        body,
+        upstream: format!("{}{DEPARTMENTS_SOURCE}", source(v_type)),
+        input,
+    }
+}
+
+/// The one E200 the call of a Combine `body` that does not handle an empty
+/// `a.v` draws, whatever its caller passes.
+fn combine_empty_value_refusal(body: &str) -> Diagnostic {
+    let mut first = None;
+    for (caller, input) in [("int", ORDERS), ("{ nullable: int }", ORDERS_WITH_EMPTY)] {
+        let called = outcome(&combine_shape(body, caller, input).call_files());
+        assert_eq!(
+            called.exit(),
+            Some(1),
+            "{caller}: {}",
+            describe(&called.run)
+        );
+        let Err(diags) = &called.compiled else {
+            panic!("{caller}: the Combine does not handle an empty `a.v`");
+        };
+        assert_eq!(
+            diags.len(),
+            1,
+            "{caller}: one error, no follower: {diags:#?}"
+        );
+        let refused = &diags[0];
+        assert_eq!(refused.code, "E200", "{caller}: {refused:#?}");
+        assert!(
+            refused.message.starts_with(
+                "node \"j\" in composition \"first\" cannot use `v` while it may be empty: \
+                 input port `pa` declares `v` as `{ nullable: int }`"
+            ),
+            "{caller}: {}",
+            refused.message
+        );
+        first.get_or_insert_with(|| refused.clone());
+    }
+    first.expect("two calls")
+}
+
+#[test]
+fn a_combine_condition_that_does_not_handle_an_empty_value_is_refused_and_its_pasted_entry_runs_as_inline()
+ {
+    let refused = combine_empty_value_refusal(COMBINE_WHERE_BODY);
+    let entry = pasted_line(refused.help.as_deref().unwrap_or_default()).to_string();
+    assert_eq!(
+        entry,
+        "where: 'a.department == b.department and (a.v ?? 0) > 5'"
+    );
+    // `combnullfix`: the entry pasted over the failing one.
+    let fixed = COMBINE_WHERE_BODY.replace(
+        r#"where: "a.department == b.department and a.v > 5""#,
+        &entry,
+    );
+    assert_ne!(
+        fixed, COMBINE_WHERE_BODY,
+        "the entry replaces the `where:` line"
+    );
+    assert_inline_equivalent(&combine_shape(&fixed, "int", ORDERS), 0);
+}
+
+#[test]
+fn a_combine_body_that_does_not_handle_an_empty_value_is_refused_and_its_pasted_line_runs_as_inline()
+ {
+    // `combcxl`: the `where:` handles the empty case, the body's own
+    // `filter` does not.
+    let body = COMBINE_WHERE_BODY
+        .replace("and a.v > 5", "and (a.v ?? 0) > 5")
+        .replace("      cxl: |\n", "      cxl: |\n        filter a.v > 5\n");
+    let refused = combine_empty_value_refusal(&body);
+    let line = pasted_line(refused.help.as_deref().unwrap_or_default()).to_string();
+    assert_eq!(line, "filter (a.v ?? 0) > 5");
+    let fixed = body.replace("filter a.v > 5", &line);
+    assert_inline_equivalent(&combine_shape(&fixed, "int", ORDERS), 0);
+}
+
 #[test]
 fn an_aggregate_over_a_possibly_empty_port_feeds_a_strict_call_as_inline() {
     // `aggint`: the body sums `v` per department; the sum of a never-empty
