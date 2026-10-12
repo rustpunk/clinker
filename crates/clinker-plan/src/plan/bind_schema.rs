@@ -23,9 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cxl::ast::{Expr, LiteralValue, Statement};
-use cxl::typecheck::{
-    AggregateMode, ColumnLookup, QualifiedField, Row, RowTail, Type, TypedProgram,
-};
+use cxl::typecheck::{AggregateMode, ColumnLookup, QualifiedField, Row, Type, TypedProgram};
 use indexmap::IndexMap;
 
 use crate::config::compile_context::{CompileContext, ConfigOverrides};
@@ -227,6 +225,11 @@ pub struct CompileArtifacts {
     /// from colliding — bare-name keying let the last writer silently win.
     pub envelope_synthesis:
         HashMap<PlanNodeId, Arc<crate::plan::envelope_synthesis::EnvelopeSynthesis>>,
+    /// Per composition call site: the caller columns its first output port
+    /// carries through the body with the caller's value. An enclosing body's
+    /// port-vocabulary walk reads it to follow an undeclared caller column
+    /// through a nested call (see [`crate::plan::port_vocabulary`]).
+    pub(crate) composition_passthrough: HashMap<PlanNodeId, BTreeSet<String>>,
     /// Monotonic counter for fresh tail-variable IDs allocated during
     /// row-polymorphic propagation (composition input-port binding).
     /// Threaded as `&mut u32` into `build_input_port_rows`; IDs are
@@ -3494,8 +3497,8 @@ fn bind_composition(
         &mut artifacts.provenance,
     );
 
-    // 6. Build input port rows: validate upstream satisfies port schema,
-    //    build Row::open(declared, fresh_tail) for each port.
+    // 6. Check each bound port against its upstream (E102) and record the
+    //    port's declared columns, the vocabulary the body may name.
     let input_port_rows = match build_input_port_rows(
         call_inputs,
         signature,
@@ -3890,11 +3893,22 @@ fn bind_composition(
     bind_ctx.use_path_stack.push(resolved_path.clone());
     bind_ctx.depth += 1;
 
-    // Seed body_schema_by_name with input port rows.
+    // Seed each port with the row its upstream carries: the records reach
+    // the body untouched, in the upstream's column order with the
+    // upstream's engine columns, so the body binds against exactly what it
+    // will read, as the same nodes written inline would. Every position a
+    // body node compiles (an Aggregate's group key and field arguments, a
+    // Cull's decision aggregate) then addresses the record's real layout.
     let mut body_schema_by_name: HashMap<String, Row> = HashMap::new();
     let mut body_declared_multiple_by_name: HashMap<String, BTreeSet<String>> = HashMap::new();
-    for (port_name, row) in &input_port_rows {
-        body_schema_by_name.insert(port_name.clone(), row.clone());
+    for port_name in input_port_rows.keys() {
+        let Some(upstream_row) = call_inputs
+            .get(port_name)
+            .and_then(|upstream| parent_schema_by_name.get(upstream))
+        else {
+            continue; // build_input_port_rows already diagnosed it
+        };
+        body_schema_by_name.insert(port_name.clone(), upstream_row.clone());
         let declared_multiple = call_inputs
             .get(port_name)
             .and_then(|upstream| parent_declared_multiple_by_name.get(upstream))
@@ -4013,16 +4027,77 @@ fn bind_composition(
     // 9. Compute output rows from signature.outputs → body schemas.
     let output_port_rows = compute_output_rows(&signature.outputs, &body_schema_by_name);
 
-    // 10. W101 check: body-declared columns shadowing input port pass-throughs.
-    check_w101_shadows(
-        &input_port_rows,
-        &output_port_rows,
+    // 10. The port is the body's vocabulary: refuse a body node that names
+    // a caller column its port does not declare (E169), and warn where the
+    // body writes a column under the name of one (W101).
+    let port_entries: Vec<crate::plan::port_vocabulary::PortEntry<'_>> = input_port_rows
+        .iter()
+        .filter_map(|(port_name, vocabulary)| {
+            let upstream = call_inputs
+                .get(port_name)
+                .and_then(|upstream| parent_schema_by_name.get(upstream))?;
+            Some(crate::plan::port_vocabulary::PortEntry {
+                port: port_name.as_str(),
+                upstream,
+                declared: vocabulary
+                    .field_names()
+                    .map(|qf| qf.name.to_string())
+                    .collect(),
+            })
+        })
+        .collect();
+    let output_nodes: Vec<(String, String)> = signature
+        .outputs
+        .iter()
+        .map(|(port_name, alias)| {
+            let internal = &alias.internal_ref.value;
+            (
+                port_name.clone(),
+                internal.split('.').next().unwrap_or(internal).to_string(),
+            )
+        })
+        .collect();
+    let walk = crate::plan::port_vocabulary::walk_body(
+        &body_file.nodes,
+        &body_node_ids,
+        artifacts,
         &body_schema_by_name,
-        signature,
-        node_name,
-        span,
-        diags,
+        &port_entries,
+        &output_nodes,
     );
+    if !walk.reads.is_empty() {
+        for read in &walk.reads {
+            let upstream_type = port_entries
+                .iter()
+                .find(|entry| entry.port == read.port)
+                .and_then(|entry| match entry.upstream.lookup(&read.column) {
+                    cxl::typecheck::ColumnLookup::Declared(ty) => Some(ty.clone()),
+                    _ => None,
+                })
+                .unwrap_or(Type::Any);
+            diags.push(undeclared_port_column_diagnostic(
+                node_name,
+                &resolved_path,
+                read,
+                &upstream_type,
+            ));
+        }
+        return;
+    }
+    for (port_name, column) in &walk.shadows {
+        diags.push(Diagnostic::warning(
+            "W101",
+            format!(
+                "composition node {node_name:?}, output port {port_name:?}: \
+                 body-declared column {column:?} shadows a pass-through \
+                 column from the input port"
+            ),
+            LabeledSpan::primary(span, "body creates this column".to_string()),
+        ));
+    }
+    artifacts
+        .composition_passthrough
+        .insert(node_id, walk.first_output_unchanged);
 
     // 11. Collect nested body ids from artifacts (bodies added during recursive call).
     let nested_body_ids: Vec<CompositionBodyId> = artifacts
@@ -4078,11 +4153,10 @@ fn bind_composition(
     // names) would have no incoming edges in the body DAG and fail
     // their predecessor-by-name lookup at dispatch time.
     //
-    // The synthetic node's `output_schema` adopts the parent source's
-    // declared columns (the schema records actually carry at runtime),
-    // not the port's declared columns — port rows declare a subset
-    // and rely on Open-tail pass-through, but records flowing in
-    // already carry every parent column.
+    // The synthetic node's `output_schema` is the upstream's columns: the
+    // records flowing in carry every upstream column, and the body bound
+    // against that same row (step 8), so the port Source and every body
+    // node agree on the layout by construction.
     for (port_name, _port_row) in &input_port_rows {
         let parent_node_name = match call_inputs.get(port_name) {
             Some(n) => n.as_str(),
@@ -4849,10 +4923,14 @@ fn populate_config_provenance(
 
 // ─── Input port row building ────────────────────────────────────────
 
-/// Build input port rows for a composition call site.
+/// Check a call site's bound input ports and return each port's vocabulary.
 ///
-/// For each declared input port, validates that the upstream row satisfies
-/// the declared minimum schema, then builds `Row::open(declared, fresh_tail)`.
+/// For each bound port, validates that the upstream row carries every
+/// declared column with a compatible type (E102), then records the port's
+/// declared columns as `Row::open(declared, fresh_tail)`: the columns the
+/// body may name, with every other column passing through. This row is the
+/// port's contract only. The body binds against the upstream row itself (see
+/// `bind_composition`), so nothing positional is compiled from it.
 /// Returns `None` if any E102 errors were emitted.
 fn build_input_port_rows(
     call_inputs: &IndexMap<String, String>,
@@ -4953,38 +5031,8 @@ fn build_input_port_rows(
             }
         }
 
-        // Append the parent's engine-stamped tail columns to the
-        // body's port declared set. Three engine-stamp shapes
-        // propagate from parent to body:
-        //
-        // - `$ck.<field>` source-CK shadow columns from each parent
-        //   source's `correlation_key:` widening.
-        // - `$widened` sidecar absorber column from
-        //   `on_unmapped: auto_widen`.
-        // - `$source.file` per-record source-file lineage stamp
-        //   every Source carries.
-        //
-        // The runtime port-synthetic Source built at body entry adopts
-        // every parent column, so the body sees these at runtime;
-        // declaring them here keeps the compile-time Row aligned with
-        // that runtime shape — without this step the open-tail
-        // mechanism would silently drop engine-stamped columns from
-        // the body's compile-time view and surface as a schema
-        // mismatch when records flow back to the parent (the
-        // composition's `output_schema` is derived from the body's
-        // terminal Row).
-        let mut declared_columns = declared_columns;
-        for (qf, ty) in upstream_row.fields() {
-            let is_engine_stamped = qf.name.starts_with("$ck.")
-                || qf.name.as_ref() == crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN
-                || qf.name.as_ref() == crate::config::pipeline_node::SOURCE_FILE_COLUMN
-                || qf.name.as_ref() == crate::config::pipeline_node::SOURCE_NAME_COLUMN
-                || qf.name.as_ref() == crate::config::pipeline_node::SOURCE_EVENT_TIME_COLUMN;
-            if is_engine_stamped && !declared_columns.contains_key(qf) {
-                declared_columns.insert(qf.clone(), ty.clone());
-            }
-        }
-        // Build Row::open(declared, fresh_tail) for the port.
+        // Record the port's vocabulary: its declared columns, open to the
+        // columns that pass through.
         let tail_var = cxl::typecheck::row::TailVarId(*next_tail_var);
         *next_tail_var += 1;
         let cxl_span = cxl::lexer::Span::new(span.start as usize, span.start as usize);
@@ -5098,61 +5146,56 @@ fn compute_output_rows(
     rows
 }
 
-// ─── W101 shadow detection ──────────────────────────────────────────
+// ─── Port vocabulary ────────────────────────────────────────────────
 
-/// Check for W101: body-declared columns that shadow input port
-/// pass-through columns at the output boundary.
-fn check_w101_shadows(
-    input_port_rows: &IndexMap<String, Row>,
-    output_port_rows: &IndexMap<String, Row>,
-    _body_schemas: &HashMap<String, Row>,
-    _signature: &CompositionSignature,
-    node_name: &str,
-    span: Span,
-    diags: &mut Vec<Diagnostic>,
-) {
-    // Collect all columns declared in input ports (the minimum-required set).
-    // Columns NOT in this set but flowing through via Open tail are pass-throughs.
-    // Composition ports are never qualified, so `.name.as_ref()` is the
-    // full identifier.
-    let mut input_declared: HashSet<String> = HashSet::new();
-    for row in input_port_rows.values() {
-        for qf in row.field_names() {
-            input_declared.insert(qf.name.to_string());
-        }
-    }
+/// E169: a composition body names a caller column its input port does not
+/// declare.
+///
+/// The help is the declaration to add to the port, in the composition file,
+/// with the type the caller's column has at this call site.
+fn undeclared_port_column_diagnostic(
+    call: &str,
+    body_path: &Path,
+    read: &crate::plan::port_vocabulary::UndeclaredRead,
+    upstream_type: &Type,
+) -> Diagnostic {
+    let column = &read.column;
+    let port = &read.port;
+    let node = &read.node;
+    Diagnostic::error(
+        "E169",
+        format!(
+            "composition {call:?} uses column `{column}` in node {node:?}, but its input \
+             port `{port}` does not declare `{column}`. A composition may use only the \
+             columns its input ports declare; every other column passes through the call \
+             unchanged."
+        ),
+        LabeledSpan::primary(read.span, format!("uses `{column}`")),
+    )
+    .with_help(format!(
+        "declare `{column}` on input port `{port}` in `{}`, so every call of the \
+         composition has to provide it:\n\
+         _compose:\n  inputs:\n    {port}:\n      schema:\n        \
+         - {{ name: {column}, type: {} }}",
+        body_path.display(),
+        port_column_type(upstream_type),
+    ))
+}
 
-    // For each output row, check if any body-added column has the same name
-    // as a column that would pass through from the input tail.
-    for (port_name, output_row) in output_port_rows {
-        for col_qf in output_row.field_names() {
-            let col_name = col_qf.name.as_ref();
-            // If this column is NOT in the input declared set but COULD
-            // pass through via an Open tail, and the body also declares it,
-            // that's a shadow. However, in practice the shadow case is:
-            // the body declares a column with the same name as a pass-through.
-            // A pass-through column is one that exists in the upstream row
-            // but is NOT in the port's declared minimum.
-            if !input_declared.contains(col_name) {
-                // This column was added by the body (not declared in input ports).
-                // Check if any input port has an Open tail — if so, this column
-                // name could shadow a pass-through from the upstream.
-                let has_open_input = input_port_rows
-                    .values()
-                    .any(|r| matches!(r.tail, RowTail::Open(_)));
-                if has_open_input {
-                    diags.push(Diagnostic::warning(
-                        "W101",
-                        format!(
-                            "composition node {node_name:?}, output port {port_name:?}: \
-                             body-declared column {col_name:?} may shadow a pass-through \
-                             column from the input port"
-                        ),
-                        LabeledSpan::primary(span, "body creates this column".to_string()),
-                    ));
-                }
-            }
-        }
+/// How a port schema spells `ty`. A type a port column cannot declare
+/// directly (an array, a map, or a type the caller's row leaves open) is
+/// written `any`, which accepts whatever the caller provides.
+fn port_column_type(ty: &Type) -> &'static str {
+    match ty {
+        Type::Nullable(inner) => port_column_type(inner),
+        Type::Bool => "bool",
+        Type::Int => "int",
+        Type::Float => "float",
+        Type::Decimal => "decimal",
+        Type::String => "string",
+        Type::Date => "date",
+        Type::DateTime => "date_time",
+        Type::Null | Type::Array | Type::Map | Type::Numeric | Type::Any => "any",
     }
 }
 
