@@ -1497,3 +1497,68 @@ fn a_body_sink_mapping_colliding_with_a_passed_through_column_is_refused() {
         describe(&diags)
     );
 }
+
+#[test]
+fn a_log_field_typo_is_never_answered_with_an_undeclared_column() {
+    // `wtt` is one edit from the caller's `wt`, which the port does not
+    // declare: neither the suggestion nor the listed columns may offer it.
+    let Err(diags) = compile(&comp(
+        r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit r = v
+      log:
+        - name: l
+          level: info
+          when: per_record
+          every: 1
+          fields: [wtt]
+          message: "m"
+"#,
+    )) else {
+        panic!("`wtt` names nothing");
+    };
+    assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
+    assert_eq!(diags[0].code, "E374", "{:#?}", describe(&diags));
+    assert!(
+        !diags[0].message.contains("`wt`") && !diags[0].message.contains("[wt]"),
+        "only columns the body may use are offered: {}",
+        diags[0].message
+    );
+}
+
+#[test]
+fn a_body_sink_mapping_typo_is_never_answered_with_an_undeclared_column() {
+    let Err(diags) = compile(&body_sink(
+        "      include_unmapped: false\n      mapping:\n        - total: wtt\n",
+    )) else {
+        panic!("`wtt` is in no row");
+    };
+    let refused: Vec<&Diagnostic> = diags.iter().filter(|d| d.code == "E365").collect();
+    assert_eq!(refused.len(), 1, "{:#?}", describe(&diags));
+    let help = refused[0].help.as_deref().unwrap_or_default();
+    assert!(
+        !help.contains("'wt'") && !help.contains("total: wt`"),
+        "only columns the body may use are offered: {help}"
+    );
+}
+
+#[test]
+fn an_int_caller_column_is_refused_by_a_float_port() {
+    // Nothing converts a value at the port, so an `int` column does not fit a
+    // `float` declaration.
+    let composition = comp_declaring(
+        &[
+            "{ name: v, type: float }",
+            "{ name: department, type: string }",
+        ],
+        IDENTITY_BODY,
+    );
+    assert_port_refuses(
+        compile_in(PIPELINE, &[("compositions/c.comp.yaml", &composition)]),
+        &["input port `inp`", "`v`", "`float`", "`int`", "\"src\""],
+        &["emit v = v.to_float()"],
+    );
+}
