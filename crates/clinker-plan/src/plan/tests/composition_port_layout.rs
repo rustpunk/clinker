@@ -2415,3 +2415,95 @@ fn a_dotted_node_name_in_a_nested_body_is_reported_alone() {
     let codes: Vec<&str> = diags.iter().map(|d| d.code.as_str()).collect();
     assert_eq!(codes, ["E010"], "{:#?}", describe(&diags));
 }
+
+/// `PIPELINE` with a second call of the same composition, `again`, fed by
+/// `feed` (a node the caller adds with `extra_nodes`).
+fn pipeline_calling_twice(extra_nodes: &str, feed: &str) -> String {
+    format!(
+        "{}{extra_nodes}  - type: composition
+    name: again
+    input: {feed}
+    use: ../compositions/c.comp.yaml
+    inputs:
+      inp: {feed}
+",
+        PIPELINE
+    )
+}
+
+#[test]
+fn a_body_that_does_not_handle_an_empty_value_is_refused_at_each_call_of_one_pipeline() {
+    // The check fails the same way at both calls; each call reports it,
+    // naming itself.
+    let composition = comp_declaring(
+        &["{ name: v, type: { nullable: int } }"],
+        r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        filter v > 6
+"#,
+    );
+    let Err(diags) = compile_in(
+        &pipeline_calling_twice("", "src"),
+        &[("compositions/c.comp.yaml", &composition)],
+    ) else {
+        panic!("the body does not handle an empty `v`");
+    };
+    let named: Vec<&str> = diags
+        .iter()
+        .map(|d| {
+            assert_eq!(d.code, "E200", "{:#?}", describe(&diags));
+            if d.message.contains("in composition \"call\"") {
+                "call"
+            } else if d.message.contains("in composition \"again\"") {
+                "again"
+            } else {
+                panic!("names a call: {}", d.message)
+            }
+        })
+        .collect();
+    assert_eq!(named, ["call", "again"], "{:#?}", describe(&diags));
+}
+
+#[test]
+fn a_check_that_passed_for_one_call_does_not_pass_a_call_with_other_types() {
+    // `w` is declared `any`, so the check sees the type each call provides:
+    // it passes for the `int` caller and must still fail for the `string`
+    // one, although both calls also narrow `v`.
+    let composition = comp_declaring(
+        &[
+            "{ name: v, type: { nullable: int } }",
+            "{ name: w, type: any }",
+        ],
+        r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit a = w + 1
+"#,
+    );
+    let pipeline = pipeline_calling_twice(
+        r#"  - type: transform
+    name: as_text
+    input: src
+    config:
+      cxl: |
+        emit w = w.to_string()
+"#,
+        "as_text",
+    )
+    .replace("{ name: wt, type: int }", "{ name: w, type: int }");
+    let Err(diags) = compile_in(&pipeline, &[("compositions/c.comp.yaml", &composition)]) else {
+        panic!("`w + 1` does not compile for a string `w`");
+    };
+    assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
+    assert_eq!(diags[0].code, "E200", "{:#?}", describe(&diags));
+    assert!(
+        diags[0].message.contains("composition \"again\""),
+        "{}",
+        diags[0].message
+    );
+}

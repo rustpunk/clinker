@@ -374,6 +374,10 @@ pub(crate) struct BindContext<'a> {
     pub scoped_vars: cxl::resolve::ScopedVarsRegistry,
     /// Bounded typed workspace resources admitted before the bind walk.
     pub resource_catalog: &'a WorkspaceCatalog,
+    /// Every composition body check against its ports' declared types that
+    /// has already passed in this bind, so a later call with the same
+    /// inputs does not run it again (see [`ContractCheck`]).
+    pub passed_contract_checks: Vec<ContractCheck>,
 }
 
 // ─── Public entry point ─────────────────────────────────────────────
@@ -448,6 +452,7 @@ pub fn bind_schema(
         origin_dir: pipeline_dir.to_path_buf(),
         scoped_vars,
         resource_catalog: &resource_catalog,
+        passed_contract_checks: Vec::new(),
     };
     bind_schema_inner(
         nodes,
@@ -4145,6 +4150,7 @@ fn bind_composition(
     let body_file_label: Arc<str> = Arc::from(resolved_path.display().to_string().as_str());
     let mut port_seeds: IndexMap<String, Row> = IndexMap::new();
     let mut contract_seeds: IndexMap<String, Row> = IndexMap::new();
+    let mut check_seeds: IndexMap<String, Row> = IndexMap::new();
     for port_name in input_port_rows.keys() {
         let Some(upstream_row) = call_inputs
             .get(port_name)
@@ -4169,6 +4175,17 @@ fn bind_composition(
             PortTypes::Declared,
         );
         contract_seeds.insert(port_name.clone(), contract);
+        // The same row with the call's name left out of its marks: the
+        // name only words diagnostics, so two calls whose contract rows
+        // differ only in it pass or fail the check together.
+        let unnamed = Arc::new(PortOrigin {
+            call: Arc::from(""),
+            ..origin.as_ref().clone()
+        });
+        check_seeds.insert(
+            port_name.clone(),
+            seed_port_row(upstream_row, &declared, unnamed, PortTypes::Declared),
+        );
         let seed = seed_port_row(upstream_row, &declared, origin, PortTypes::Provided);
         body_schema_by_name.insert(port_name.clone(), seed.clone());
         port_seeds.insert(port_name.clone(), seed);
@@ -4269,15 +4286,23 @@ fn bind_composition(
         })
         .collect();
 
+    // A channel `sources:` patch rewrites this call's body (step 7a), so
+    // its check stands for no other call.
+    let shared_body =
+        !(bind_ctx.depth == 0 && bind_ctx.ctx.body_source_patches.contains_key(node_name));
+
     // Recursive bind_schema on body nodes, inside the body's scope.
     in_body_scope(bind_ctx, body_scope, |bind_ctx| {
         bind_body(
             &BodyBind {
                 call: node_name,
+                body_file: &resolved_path,
+                shared_body,
                 nodes: &body_file.nodes,
                 node_ids: &body_node_ids,
                 port_seeds: &port_seeds,
                 contract_seeds: &contract_seeds,
+                check_seeds: &check_seeds,
                 span,
             },
             diags,
@@ -5866,6 +5891,12 @@ enum PortTypes {
 struct BodyBind<'a> {
     /// The composition node's name at the call site.
     call: &'a str,
+    /// The composition file, workspace-relative: which body this is.
+    body_file: &'a Path,
+    /// Whether `nodes` is the composition file as every call reads it, so a
+    /// check of it can stand for another call's (no channel patch rewrote
+    /// it for this call).
+    shared_body: bool,
     nodes: &'a [Spanned<PipelineNode>],
     node_ids: &'a HashMap<String, PlanNodeId>,
     /// Each port's row with the types this call provides
@@ -5873,7 +5904,100 @@ struct BodyBind<'a> {
     port_seeds: &'a IndexMap<String, Row>,
     /// Each port's row with the declared types ([`PortTypes::Declared`]).
     contract_seeds: &'a IndexMap<String, Row>,
+    /// `contract_seeds` with the call's name left out of the marks: what a
+    /// [`ContractCheck`] compares.
+    check_seeds: &'a IndexMap<String, Row>,
     span: Span,
+}
+
+/// Everything a composition body's check against its ports' declared types
+/// depends on, except the call's name.
+///
+/// The check is a pure function of these: the body (its file; a channel
+/// patch makes a call's body its own, see [`BodyBind::shared_body`]), the
+/// rows its ports are seeded with at their declared types, which columns
+/// hold several values, the scoped variables and `$config` values the body
+/// sees, where the body sits in the `use:` chain, and which of the names
+/// its nodes read from outside the body belong to an enclosing scope. The
+/// call's name only words the check's diagnostics, so a check that raised
+/// none stands for every call with the same inputs; one that raised any is
+/// run again at each call, so each call's diagnostics name that call.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ContractCheck {
+    body_file: PathBuf,
+    seeds: IndexMap<String, Row>,
+    declared_multiple: HashMap<String, BTreeSet<String>>,
+    scoped_vars: ScopedVarsSeen,
+    use_path_stack: Vec<PathBuf>,
+    depth: u32,
+    /// Each name a body node reads that is neither a body node nor an input
+    /// port, and whether an enclosing scope has a node of that name.
+    outside_inputs: Vec<(String, bool)>,
+}
+
+/// The parts of a body's [`cxl::resolve::ScopedVarsRegistry`] a check can
+/// see differ between calls. The module exports and runtime modules are
+/// the compile's own, the same in every body.
+#[derive(Debug, Clone, PartialEq)]
+struct ScopedVarsSeen {
+    pipeline: IndexMap<String, cxl::resolve::ScopedVarType>,
+    source: IndexMap<String, cxl::resolve::ScopedVarType>,
+    record: IndexMap<String, cxl::resolve::ScopedVarType>,
+    hidden_pipeline: IndexMap<String, cxl::resolve::ScopedVarType>,
+    hidden_source: IndexMap<String, cxl::resolve::ScopedVarType>,
+    hidden_record: IndexMap<String, cxl::resolve::ScopedVarType>,
+    static_vars: IndexMap<String, cxl::resolve::ScopedVarType>,
+    config: IndexMap<String, cxl::resolve::ScopedVarType>,
+    config_fold: IndexMap<String, LiteralValue>,
+}
+
+impl ContractCheck {
+    /// The check `bind` runs inside the body scope `bind_ctx` is in, or
+    /// `None` when its body is this call's own.
+    fn of(
+        bind: &BodyBind<'_>,
+        bind_ctx: &BindContext<'_>,
+        body_declared_multiple_by_name: &HashMap<String, BTreeSet<String>>,
+    ) -> Option<Self> {
+        if !bind.shared_body {
+            return None;
+        }
+        let names: HashSet<&str> = bind.nodes.iter().map(|n| n.value.name()).collect();
+        let mut outside_inputs: Vec<(String, bool)> = bind
+            .nodes
+            .iter()
+            .flat_map(|n| node_input_names(&n.value))
+            .filter(|input| !names.contains(input) && !bind.port_seeds.contains_key(*input))
+            .map(|input| {
+                (
+                    input.to_string(),
+                    bind_ctx.enclosing_scope_names.contains(input),
+                )
+            })
+            .collect();
+        outside_inputs.sort();
+        outside_inputs.dedup();
+        let vars = &bind_ctx.scoped_vars;
+        Some(Self {
+            body_file: bind.body_file.to_path_buf(),
+            seeds: bind.check_seeds.clone(),
+            declared_multiple: body_declared_multiple_by_name.clone(),
+            scoped_vars: ScopedVarsSeen {
+                pipeline: vars.pipeline.clone(),
+                source: vars.source.clone(),
+                record: vars.record.clone(),
+                hidden_pipeline: vars.hidden_pipeline.clone(),
+                hidden_source: vars.hidden_source.clone(),
+                hidden_record: vars.hidden_record.clone(),
+                static_vars: vars.static_vars.clone(),
+                config: vars.config.clone(),
+                config_fold: vars.config_fold.clone(),
+            },
+            use_path_stack: bind_ctx.use_path_stack.clone(),
+            depth: bind_ctx.depth,
+            outside_inputs,
+        })
+    }
 }
 
 /// Bind a composition body's nodes at one call site.
@@ -5893,6 +6017,11 @@ struct BodyBind<'a> {
 /// monotone in nullability, so a body that passes the declared-type check
 /// passes the provided-type bind too; a failure there is reported as an
 /// internal error (E000) rather than dropped.
+///
+/// A check that passed with no diagnostics is not run again for a later
+/// call with the same [`ContractCheck`] inputs: its outcome is the same, and
+/// a passing check has nothing to report. A check that raised anything runs
+/// at every call, so every call reports its own diagnostics.
 fn bind_body(
     bind: &BodyBind<'_>,
     diags: &mut Vec<Diagnostic>,
@@ -5901,7 +6030,16 @@ fn bind_body(
     body_schema_by_name: &mut HashMap<String, Row>,
     body_declared_multiple_by_name: &mut HashMap<String, BTreeSet<String>>,
 ) {
+    let check = ContractCheck::of(bind, bind_ctx, body_declared_multiple_by_name);
+    let record_passed = |bind_ctx: &mut BindContext<'_>, check: Option<ContractCheck>| {
+        if let Some(check) = check
+            && !bind_ctx.passed_contract_checks.contains(&check)
+        {
+            bind_ctx.passed_contract_checks.push(check);
+        }
+    };
     if bind.contract_seeds == bind.port_seeds {
+        let checked_from = diags.len();
         bind_schema_inner(
             bind.nodes,
             bind.node_ids,
@@ -5911,27 +6049,38 @@ fn bind_body(
             body_schema_by_name,
             body_declared_multiple_by_name,
         );
+        if diags.len() == checked_from {
+            record_passed(bind_ctx, check);
+        }
         return;
     }
-    let mut contract_artifacts = artifacts.clone();
-    let mut contract_rows = body_schema_by_name.clone();
-    for (port, seed) in bind.contract_seeds {
-        contract_rows.insert(port.clone(), seed.clone());
-    }
-    let mut contract_multiple = body_declared_multiple_by_name.clone();
-    let checked_from = diags.len();
-    bind_schema_inner(
-        bind.nodes,
-        bind.node_ids,
-        diags,
-        bind_ctx,
-        &mut contract_artifacts,
-        &mut contract_rows,
-        &mut contract_multiple,
-    );
-    let contract_failed = diags[checked_from..]
-        .iter()
-        .any(|d| d.severity == Severity::Error);
+    let passed_before = check
+        .as_ref()
+        .is_some_and(|check| bind_ctx.passed_contract_checks.contains(check));
+    let contract_failed = !passed_before && {
+        let mut contract_artifacts = artifacts.clone();
+        let mut contract_rows = body_schema_by_name.clone();
+        for (port, seed) in bind.contract_seeds {
+            contract_rows.insert(port.clone(), seed.clone());
+        }
+        let mut contract_multiple = body_declared_multiple_by_name.clone();
+        let checked_from = diags.len();
+        bind_schema_inner(
+            bind.nodes,
+            bind.node_ids,
+            diags,
+            bind_ctx,
+            &mut contract_artifacts,
+            &mut contract_rows,
+            &mut contract_multiple,
+        );
+        if diags.len() == checked_from {
+            record_passed(bind_ctx, check);
+        }
+        diags[checked_from..]
+            .iter()
+            .any(|d| d.severity == Severity::Error)
+    };
     let mut produced: Vec<Diagnostic> = Vec::new();
     bind_schema_inner(
         bind.nodes,
