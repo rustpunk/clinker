@@ -403,6 +403,9 @@ pub(crate) struct BindContext<'a> {
     /// has already passed in this bind, so a later call with the same
     /// inputs does not run it again (see [`ContractCheck`]).
     pub passed_contract_checks: Vec<ContractCheck>,
+    /// The body nodes the composition being bound names as its outputs;
+    /// empty at the top level.
+    pub body_outputs: HashSet<String>,
 }
 
 // ─── Public entry point ─────────────────────────────────────────────
@@ -478,6 +481,7 @@ pub fn bind_schema(
         scoped_vars,
         resource_catalog: &resource_catalog,
         passed_contract_checks: Vec::new(),
+        body_outputs: HashSet::new(),
     };
     bind_schema_inner(
         nodes,
@@ -2754,6 +2758,7 @@ fn bind_schema_inner(
             &unplaced,
             &ports,
             &bind_ctx.enclosing_scope_names,
+            &bind_ctx.body_outputs,
             diags,
         );
     }
@@ -3671,6 +3676,8 @@ struct BodyScope {
     origin_dir: PathBuf,
     scoped_vars: cxl::resolve::ScopedVarsRegistry,
     enclosing_scope_names: HashSet<String>,
+    /// The body nodes the composition names as its outputs.
+    outputs: HashSet<String>,
 }
 
 /// Run `bind` with `bind_ctx` one composition level deeper, in `scope`, and
@@ -3689,9 +3696,11 @@ fn in_body_scope<'a, R>(
         origin_dir,
         scoped_vars,
         enclosing_scope_names,
+        outputs,
     } = scope;
     let saved_enclosing =
         std::mem::replace(&mut bind_ctx.enclosing_scope_names, enclosing_scope_names);
+    let saved_outputs = std::mem::replace(&mut bind_ctx.body_outputs, outputs);
     let saved_origin_dir = std::mem::replace(&mut bind_ctx.origin_dir, origin_dir);
     let saved_scoped_vars = std::mem::replace(&mut bind_ctx.scoped_vars, scoped_vars);
     bind_ctx.use_path_stack.push(use_path);
@@ -3700,6 +3709,7 @@ fn in_body_scope<'a, R>(
     bind_ctx.depth -= 1;
     bind_ctx.use_path_stack.pop();
     bind_ctx.enclosing_scope_names = saved_enclosing;
+    bind_ctx.body_outputs = saved_outputs;
     bind_ctx.scoped_vars = saved_scoped_vars;
     bind_ctx.origin_dir = saved_origin_dir;
     out
@@ -4268,6 +4278,18 @@ fn bind_composition(
             .to_path_buf(),
         scoped_vars: body_scoped_vars,
         enclosing_scope_names,
+        outputs: signature
+            .outputs
+            .values()
+            .map(|alias| {
+                let internal_ref = &alias.internal_ref.value;
+                internal_ref
+                    .split('.')
+                    .next()
+                    .unwrap_or(internal_ref)
+                    .to_string()
+            })
+            .collect(),
     };
 
     // Seed each port with the row its upstream carries: the records reach
@@ -5949,21 +5971,60 @@ fn bind_order(nodes: &[Spanned<PipelineNode>]) -> (Vec<usize>, Vec<usize>) {
     (order, pending)
 }
 
+/// The change that makes body node `node`, which reads `from` (itself, or
+/// the node before it on a cycle), read an input port of the composition
+/// instead, written so the author can paste it. Reading a port never puts
+/// the node back on a cycle; reading another body node could.
+fn read_a_port_instead(node: &PipelineNode, from: &str, ports: &[&str]) -> String {
+    let name = node.name();
+    let Some((first, rest)) = ports.split_first() else {
+        return format!(
+            "make node {name:?} read a node that does not read it, instead of {from:?}"
+        );
+    };
+    let others = if rest.is_empty() {
+        String::new()
+    } else {
+        let listed: Vec<String> = rest.iter().map(|port| format!("`{port}`")).collect();
+        format!(" (or another input port: {})", listed.join(", "))
+    };
+    match node {
+        PipelineNode::Transform { .. }
+        | PipelineNode::Aggregate { .. }
+        | PipelineNode::Route { .. }
+        | PipelineNode::Sink { .. }
+        | PipelineNode::Reshape { .. }
+        | PipelineNode::Cull { .. } => format!(
+            "set `input:` of node {name:?} to an input port of the composition: \
+             `input: {first}`{others}"
+        ),
+        _ => {
+            format!("in node {name:?}, read input port `{first}`{others} instead of node {from:?}")
+        }
+    }
+}
+
 /// E004 and E107 for a composition body's nodes whose input the bind walk
 /// cannot bind: an input that names no node and no input port of the body,
 /// a node that reads itself, and a cycle. At pipeline level the same shapes
 /// are refused before binding (E004, E002, E003); a body is first read here.
+///
+/// `outputs` are the body nodes the composition names as its outputs: the
+/// fix for a cycle never leaves a node of the cycle reading one of them,
+/// since a body node that reads an output node fails when the call runs
+/// (#1315).
 fn body_input_diagnostics(
     nodes: &[Spanned<PipelineNode>],
     unplaced: &[usize],
     ports: &HashSet<&str>,
     enclosing: &HashSet<String>,
+    outputs: &HashSet<String>,
     diags: &mut Vec<Diagnostic>,
 ) {
     let names: HashSet<&str> = nodes.iter().map(|spanned| spanned.value.name()).collect();
-    let mut port_list: Vec<&str> = ports.iter().copied().collect();
-    port_list.sort_unstable();
-    let port_list = port_list
+    let mut sorted_ports: Vec<&str> = ports.iter().copied().collect();
+    sorted_ports.sort_unstable();
+    let port_list = sorted_ports
         .iter()
         .map(|port| format!("`{port}`"))
         .collect::<Vec<_>>()
@@ -5982,9 +6043,10 @@ fn body_input_diagnostics(
                         ),
                         LabeledSpan::primary(span, "reads itself".to_string()),
                     )
-                    .with_help(format!(
-                        "set `input:` of node {node:?} to an input port of the composition \
-                         ({port_list}) or to another node"
+                    .with_help(read_a_port_instead(
+                        &spanned.value,
+                        node,
+                        &sorted_ports,
                     )),
                 );
             } else if !names.contains(input) && !ports.contains(input) && !enclosing.contains(input)
@@ -6058,6 +6120,38 @@ fn body_input_diagnostics(
             [rest @ .., last] => (format!("{} and {last}", rest.join(", ")), "none of them"),
             [] => unreachable!("a node on a cycle is one of its members"),
         };
+        // Changing one member to read a port leaves every other member
+        // reading the member before it. A member reading an output node
+        // would then be a node that reads the node the call's rows leave
+        // by, which fails when the call runs; so the members to change are
+        // the ones that read an output node on the cycle, or, when none
+        // does, the first.
+        let reading_an_output: Vec<&str> = members
+            .iter()
+            .copied()
+            .filter(|member| {
+                reads_of(member)
+                    .iter()
+                    .any(|input| members.contains(input) && outputs.contains(*input))
+            })
+            .collect();
+        let to_change = if reading_an_output.is_empty() {
+            vec![members[0]]
+        } else {
+            reading_an_output
+        };
+        let fixes: Vec<String> = to_change
+            .iter()
+            .filter_map(|member| {
+                let spanned = nodes
+                    .iter()
+                    .find(|spanned| spanned.value.name() == *member)?;
+                let from = reads_of(member)
+                    .into_iter()
+                    .find(|input| members.contains(input))?;
+                Some(read_a_port_instead(&spanned.value, from, &sorted_ports))
+            })
+            .collect();
         diags.push(
             Diagnostic::error(
                 "E107",
@@ -6067,10 +6161,7 @@ fn body_input_diagnostics(
                 ),
                 LabeledSpan::primary(span_for_node(&nodes[i]), "on a cycle".to_string()),
             )
-            .with_help(format!(
-                "make one node on the cycle read an input port of the composition \
-                 ({port_list}) or a node outside the cycle"
-            )),
+            .with_help(fixes.join("; and ")),
         );
     }
 }

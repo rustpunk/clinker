@@ -1079,6 +1079,107 @@ fn a_combine_body_that_does_not_handle_an_empty_value_is_refused_and_its_pasted_
     assert_inline_equivalent(&combine_shape(&fixed, "int", ORDERS), 0);
 }
 
+/// `body` with the `input:` line of node `node` replaced by `line`, as the
+/// author pastes an E107 fix.
+fn with_input_line(body: &str, node: &str, line: &str) -> String {
+    let mut out = String::new();
+    let mut in_node = false;
+    for current in body.lines() {
+        if let Some(name) = current.trim_start().strip_prefix("name: ") {
+            in_node = name == node;
+        }
+        if in_node && current.trim_start().starts_with("input: ") {
+            let indent = &current[..current.len() - current.trim_start().len()];
+            out.push_str(&format!("{indent}{line}\n"));
+        } else {
+            out.push_str(current);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// The one E107 the call of a body `body` with output node `out` draws;
+/// its fix, pasted, runs as the fixed body written inline.
+fn assert_e107_fix_runs_as_inline(body: &str, out: &str) {
+    let shape = Shape {
+        ports: &[("inp", &["{ name: v, type: int }"])],
+        bindings: FED_BY_SRC,
+        out,
+        body,
+        upstream: source("int"),
+        input: ORDERS,
+    };
+    let called = outcome(&shape.call_files());
+    assert_eq!(called.exit(), Some(1), "{}", describe(&called.run));
+    let Err(diags) = &called.compiled else {
+        panic!("the body cannot receive a row");
+    };
+    assert_eq!(diags.len(), 1, "{diags:#?}");
+    assert_eq!(diags[0].code, "E107", "{diags:#?}");
+    let help = diags[0].help.as_deref().unwrap_or_default();
+    assert!(
+        help.contains("`input: "),
+        "the help prints the `input:` line to paste: {help}"
+    );
+    let node = help
+        .split("node \"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .unwrap_or_else(|| panic!("the help names a node: {help}"));
+    let line = help
+        .rsplit("`input: ")
+        .next()
+        .and_then(|rest| rest.split('`').next())
+        .map(|port| format!("input: {port}"))
+        .unwrap_or_else(|| panic!("the help prints an `input:` line: {help}"));
+    let fixed = with_input_line(body, node, &line);
+    assert_ne!(fixed, body, "the fix changes node {node:?}");
+    assert_inline_equivalent(
+        &Shape {
+            body: &fixed,
+            ..shape
+        },
+        0,
+    );
+}
+
+#[test]
+fn the_fix_e107_prints_for_a_body_cycle_runs_as_inline() {
+    // The output node `a` and `b` read each other: the fix changes `b`, so
+    // no node is left reading `a`.
+    assert_e107_fix_runs_as_inline(
+        r#"  - type: transform
+    name: a
+    input: b
+    config:
+      cxl: |
+        emit p = v
+  - type: transform
+    name: b
+    input: a
+    config:
+      cxl: |
+        emit q = v
+"#,
+        "a",
+    );
+}
+
+#[test]
+fn the_fix_e107_prints_for_a_body_node_reading_itself_runs_as_inline() {
+    assert_e107_fix_runs_as_inline(
+        r#"  - type: transform
+    name: a
+    input: a
+    config:
+      cxl: |
+        emit p = v
+"#,
+        "a",
+    );
+}
+
 #[test]
 fn an_aggregate_over_a_possibly_empty_port_feeds_a_strict_call_as_inline() {
     // `aggint`: the body sums `v` per department; the sum of a never-empty
