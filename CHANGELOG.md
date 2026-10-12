@@ -4,6 +4,40 @@ All notable changes to Clinker are tracked here.
 
 ## Unreleased
 
+### Fixed — a composition call writes what its nodes written in the pipeline would write
+
+**Breaking:** a composition node that uses a column its input port does not
+declare now fails compilation with the new code `E169`.
+
+A composition's input port receives the caller's rows as they are, but the
+compiler used to describe them with only the port's declared columns, in the
+port's order. An Aggregate or Cull inside the composition then read its
+columns by the wrong position whenever the port declared fewer columns than
+the caller had, or the same columns in another order. A sum came out empty,
+or summed the wrong column, with no error. A Transform-only composition read
+the right values, but a call fed by a node that adds or reorders columns,
+such as a Transform in front of the call, stopped with `E314` at the next
+Sink.
+
+The composition's nodes now compile against the rows the call actually feeds
+each port. A call writes what the same nodes written in the pipeline at the
+call site would write. Columns the port does not declare pass through the
+composition in the caller's position, so a call fed by a Transform that adds a
+column runs and writes that column.
+
+The port's `schema:` is now the list of columns the composition may use. A
+node that uses any other column of the caller's rows fails with `E169` at
+every call, naming the call, the node, the port and the column, and the help
+prints the line to add under `_compose.inputs.<port>.schema`. Before, such a
+node failed with `E203` (`E200` for a `group_by`), an unknown-name error that
+did not say the port was the reason. `W101` now fires only where a
+composition writes a column with the name of a caller column its port does
+not declare, not for every column a composition adds.
+
+To migrate, add each column `E169` names to the port's `schema:`.
+
+Closes [#1221](https://github.com/rustpunk/clinker/issues/1221).
+
 ### Changed — sorts compare faster, and a hash Aggregate stops recomputing its groups' hashes as it grows
 
 Output is unchanged; only speed and an Aggregate's memory estimate change.
