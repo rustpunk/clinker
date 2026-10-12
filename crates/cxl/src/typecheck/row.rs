@@ -174,7 +174,9 @@ pub enum RowTail {
     /// `SchemaDecl`.
     Closed,
     /// Unknown columns bind to the row variable `ρ` identified by
-    /// `TailVarId` and pass through. Used at composition port boundaries.
+    /// `TailVarId` and pass through. A composition port's declared
+    /// vocabulary is recorded as an open row; the body itself binds against
+    /// its caller's closed row, with [`CarriedColumn`] marks.
     Open(TailVarId),
 }
 

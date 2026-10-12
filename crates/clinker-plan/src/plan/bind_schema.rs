@@ -1654,13 +1654,12 @@ pub(crate) fn validate_log_event_shapes(
 /// serve the passthrough column's value under the renamed column's header —
 /// the renamed value silently dropped.
 ///
-/// Both run only against a **closed** row. An open row is the composition-port
-/// case: the caller's extra columns bind to the row variable and flow through,
-/// so a name missing from `declared` there is not evidence the column is absent
-/// at run time, and an unlisted column set that cannot be enumerated cannot be
-/// checked for collisions either. Reporting either would reject a body that is
-/// correct for every caller. The runtime carries its own guard for both, which
-/// is what covers the open-row and sidecar cases.
+/// Both judge the row bound to the Sink's input. Every bound row is closed:
+/// a Source declares a typed schema, each node's row derives from it, and a
+/// composition body binds against the row its call feeds it, so a body Sink
+/// is judged against the caller's columns as the same Sink written inline
+/// would be. The runtime carries its own guard for the `auto_widen` sidecar
+/// case, which the planner cannot enumerate.
 fn validate_output_mapping_columns(
     node_name: &str,
     output: &crate::config::SinkConfig,
@@ -1671,9 +1670,6 @@ fn validate_output_mapping_columns(
     let Some(mapping) = output.mapping.as_ref() else {
         return;
     };
-    if !matches!(upstream.tail, cxl::typecheck::RowTail::Closed) {
-        return;
-    }
     // A Sink's upstream row carries only bare names: a Combine publishes its
     // merged row as `QualifiedField::bare`, so the qualified spelling never
     // reaches here and matching it would accept a name the record cannot carry.
@@ -6166,10 +6162,10 @@ const LOG_FIELD_ROW_LISTING_LIMIT: usize = 12;
 /// program runs, for `per_record` and `on_error` alike, so the row a selector
 /// must name is the input row, not the projected output.
 ///
-/// Only a closed row decides this. A row left open at a composition port
-/// carries columns the planner never sees, and a selector naming one of those
-/// is not decidable here — those stay with the runtime miss counter this check
-/// backs up.
+/// Only a closed row decides this. Every row the bind walk produces is closed
+/// (a composition body binds against its caller's row), so an open row reaches
+/// here only from a caller that builds one; a selector against it is not
+/// decidable and stays with the runtime miss counter this check backs up.
 fn log_field_diagnostics(
     node_name: &str,
     directives: &[LogDirective],
@@ -8416,9 +8412,9 @@ mod tests {
     /// The field check decides what a declared schema can decide, and stops
     /// there.
     ///
-    /// A row left open at a composition port carries columns declared outside
-    /// this walk's view, so an undeclared selector against one is not a
-    /// mistake the planner has grounds to refuse. Refusing it anyway would
+    /// An open row carries columns declared outside this walk's view, so an
+    /// undeclared selector against one is not a mistake the planner has
+    /// grounds to refuse. Refusing it anyway would
     /// reject working pipelines; this is also the case that keeps the runtime
     /// miss counter a backstop rather than dead surface.
     #[test]
