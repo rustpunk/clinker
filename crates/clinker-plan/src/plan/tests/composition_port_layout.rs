@@ -2724,17 +2724,34 @@ nodes:
         emit b = v
 "#;
 
+/// The one E104 a call of `composition` from `pipeline` draws.
+fn unbound_port_refusal(pipeline: &str, composition: &str) -> Diagnostic {
+    let Err(diags) = compile_in(pipeline, &[("compositions/c.comp.yaml", composition)]) else {
+        panic!("a call leaving unbound a port its composition reads must not compile");
+    };
+    assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
+    assert_eq!(diags[0].code, "E104", "{:#?}", describe(&diags));
+    diags[0].clone()
+}
+
+/// The `inputs:` entry an E104 help prints to paste, if it prints one.
+fn pasted_binding(help: &str) -> Option<&str> {
+    help.split("under `inputs:` of composition \"call\": `")
+        .nth(1)
+        .and_then(|rest| rest.split('`').next())
+}
+
+/// `pipeline` with `entry` added under the call's `inputs:`.
+fn with_binding(pipeline: &str, entry: &str) -> String {
+    pipeline.replace("    inputs:\n", &format!("    inputs:\n      {entry}\n"))
+}
+
 #[test]
 fn a_body_node_reading_an_input_port_the_call_does_not_bind_is_refused() {
     // `opt` is optional, so the call may leave it unbound; but `u` reads
     // it and would receive no row. The call is refused, naming the call,
-    // the node and the port, with the binding to add at the call site.
-    let Err(diags) = compile(OPTIONAL_PORT_COMPOSITION) else {
-        panic!("a body node reading an unbound port must not compile");
-    };
-    assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
-    let refused = &diags[0];
-    assert_eq!(refused.code, "E104", "{:#?}", describe(&diags));
+    // the node and the port, with the one binding to add at the call site.
+    let refused = unbound_port_refusal(PIPELINE, OPTIONAL_PORT_COMPOSITION);
     for fragment in [
         "composition \"call\"",
         "node \"u\"",
@@ -2749,13 +2766,11 @@ fn a_body_node_reading_an_input_port_the_call_does_not_bind_is_refused() {
         );
     }
     let help = refused.help.as_deref().unwrap_or_default();
-    for fragment in [
-        "add `opt: src` under `inputs:` of composition \"call\"",
-        "remove node \"u\" from `compositions/c.comp.yaml`",
-    ] {
-        assert!(help.contains(fragment), "{fragment}: {help}");
-    }
-    assert!(!help.contains('<'), "no placeholder to fill in: {help}");
+    assert_eq!(
+        help,
+        "bind input port `opt` at the call, so node \"u\" receives rows: add under `inputs:` \
+         of composition \"call\": `opt: src`"
+    );
     // The port is optional: the code's title does not call it required.
     let title = clinker_core_types::diagnostic::registry_entry("E104")
         .expect("E104 is registered")
@@ -2764,35 +2779,135 @@ fn a_body_node_reading_an_input_port_the_call_does_not_bind_is_refused() {
 }
 
 #[test]
-fn the_e104_help_offers_removing_a_node_only_when_the_composition_works_without_it() {
-    // `u` is the output node here, and `w` reads it: removing `u` would
-    // break the composition, so the help only binds the port.
-    let composition = OPTIONAL_PORT_COMPOSITION
-        .replace("    out: last\n", "    out: u\n")
+fn binding_the_port_the_help_names_compiles_the_call() {
+    let refused = unbound_port_refusal(PIPELINE, OPTIONAL_PORT_COMPOSITION);
+    let entry = pasted_binding(refused.help.as_deref().unwrap_or_default()).expect("a binding");
+    compile_in(
+        &with_binding(PIPELINE, entry),
+        &[("compositions/c.comp.yaml", OPTIONAL_PORT_COMPOSITION)],
+    )
+    .unwrap_or_else(|d| panic!("compiles once `{entry}` is pasted: {:#?}", describe(&d)));
+}
+
+/// [`OPTIONAL_PORT_COMPOSITION`] with `opt` declaring `columns` and `u`
+/// running `cxl`.
+fn optional_port_composition(columns: &str, cxl: &str) -> String {
+    OPTIONAL_PORT_COMPOSITION
         .replace(
-            "        emit b = v\n",
-            "        emit b = v\n  - type: transform\n    name: w\n    input: u\n    config:\n      cxl: |\n        emit c = 1\n",
-        );
-    let Err(diags) = compile(&composition) else {
-        panic!("a body node reading an unbound port must not compile");
-    };
-    let refused = diags
-        .iter()
-        .find(|d| d.code == "E104")
-        .unwrap_or_else(|| panic!("{:#?}", describe(&diags)));
-    let help = refused.help.as_deref().unwrap_or_default();
-    assert!(help.contains("add `opt: src` under `inputs:`"), "{help}");
-    assert!(!help.contains("remove node"), "{help}");
+            "    opt:\n      required: false\n      schema:\n        - { name: v, type: int }\n",
+            &format!("    opt:\n      required: false\n      schema:\n{columns}"),
+        )
+        .replace("        emit b = v\n", &format!("        {cxl}\n"))
 }
 
 #[test]
-fn binding_the_port_the_help_names_compiles_the_call() {
-    let bound = PIPELINE.replace("      inp: src\n", "      inp: src\n      opt: src\n");
+fn the_e104_fix_names_the_first_node_whose_rows_the_port_admits() {
+    // `opt` needs `label`; `src`, which feeds `inp`, has none, so binding
+    // `opt` to it would only trade the E104 for an E102. `dep` has it.
+    let composition = optional_port_composition(
+        "        - { name: label, type: string }\n",
+        "emit b = label",
+    );
+    let pipeline = COMBINE_PIPELINE.replace("      pa: src\n      pb: dep\n", "      inp: src\n");
+    let refused = unbound_port_refusal(&pipeline, &composition);
+    let help = refused.help.as_deref().unwrap_or_default();
+    assert_eq!(pasted_binding(help), Some("opt: dep"), "{help}");
     compile_in(
-        &bound,
-        &[("compositions/c.comp.yaml", OPTIONAL_PORT_COMPOSITION)],
+        &with_binding(&pipeline, "opt: dep"),
+        &[("compositions/c.comp.yaml", &composition)],
     )
-    .unwrap_or_else(|d| panic!("compiles once `opt` is bound: {:#?}", describe(&d)));
+    .unwrap_or_else(|d| panic!("the pasted binding compiles: {:#?}", describe(&d)));
+}
+
+#[test]
+fn the_e104_fix_skips_a_node_whose_column_the_port_does_not_admit() {
+    // `opt` declares `v` never empty. `src` provides it possibly empty,
+    // which the port does not admit; `filled`, after it, never empty.
+    let pipeline = PIPELINE
+        .replace(
+            "        - { name: v, type: int }\n",
+            "        - { name: v, type: { nullable: int } }\n",
+        )
+        .replace(
+            "  - type: composition\n",
+            "  - type: transform\n    name: filled\n    input: src\n    config:\n      cxl: |\n        emit v = v ?? 0\n  - type: composition\n",
+        );
+    let composition = OPTIONAL_PORT_COMPOSITION.replace(
+        "    inp:\n      schema:\n        - { name: v, type: int }\n",
+        "    inp:\n      schema:\n        - { name: v, type: { nullable: int } }\n",
+    );
+    let refused = unbound_port_refusal(&pipeline, &composition);
+    let help = refused.help.as_deref().unwrap_or_default();
+    assert_eq!(pasted_binding(help), Some("opt: filled"), "{help}");
+}
+
+#[test]
+fn the_e104_help_is_a_sentence_when_no_node_can_feed_the_port() {
+    // No node of the pipeline has `label`: every binding the help could
+    // print fails, so it prints none and says what the port needs.
+    let composition = optional_port_composition(
+        "        - { name: label, type: string }\n",
+        "emit b = label",
+    );
+    let refused = unbound_port_refusal(PIPELINE, &composition);
+    let help = refused.help.as_deref().unwrap_or_default();
+    assert_eq!(pasted_binding(help), None, "{help}");
+    assert_eq!(
+        help,
+        "bind input port `opt` under `inputs:` of composition \"call\" to a node whose rows \
+         have the columns `opt` declares"
+    );
+}
+
+#[test]
+fn an_output_port_carrying_an_input_port_the_call_does_not_bind_is_refused() {
+    // The composition's output port is the optional input port itself:
+    // left unbound, the call would write no row at all.
+    let composition = OPTIONAL_PORT_COMPOSITION
+        .replace("    out: last\n", "    out: opt\n")
+        .replace("    input: opt\n", "    input: inp\n");
+    let refused = unbound_port_refusal(PIPELINE, &composition);
+    assert!(
+        refused.message.contains(
+            "output port `out` in `compositions/c.comp.yaml` carries input port `opt`, which \
+             this call does not bind, so the call could write no row"
+        ),
+        "{}",
+        refused.message
+    );
+    let help = refused.help.as_deref().unwrap_or_default();
+    assert_eq!(pasted_binding(help), Some("opt: src"), "{help}");
+    compile_in(
+        &with_binding(PIPELINE, "opt: src"),
+        &[("compositions/c.comp.yaml", &composition)],
+    )
+    .unwrap_or_else(|d| panic!("the pasted binding compiles: {:#?}", describe(&d)));
+}
+
+#[test]
+fn a_call_binding_no_port_is_told_the_node_to_bind() {
+    // Every port optional and none bound: the help still names a node of
+    // the pipeline, not a fill-in.
+    let composition = OPTIONAL_PORT_COMPOSITION
+        .replace(
+            "    inp:\n      schema:",
+            "    inp:\n      required: false\n      schema:",
+        )
+        .replace("    input: inp\n", "    input: opt\n");
+    let pipeline = PIPELINE.replace("    inputs:\n      inp: src\n", "    inputs: {}\n");
+    let Err(diags) = compile_in(&pipeline, &[("compositions/c.comp.yaml", &composition)]) else {
+        panic!("must not compile");
+    };
+    assert!(
+        diags.iter().all(|d| d.code == "E104"),
+        "{:#?}",
+        describe(&diags)
+    );
+    for diag in &diags {
+        let help = diag.help.as_deref().unwrap_or_default();
+        assert!(!help.contains('<'), "{help}");
+        assert_eq!(pasted_binding(help), Some("opt: src"), "{help}");
+    }
 }
 
 #[test]
@@ -3309,4 +3424,269 @@ fn the_e107_fix_for_a_node_reading_itself_reads_a_port() {
         help,
         "set `input:` of node \"a\" to an input port of the composition: `input: inp`"
     );
+}
+
+#[test]
+fn a_cycle_through_a_merge_is_reported_once_with_a_sentence() {
+    // `m` merges the port and `b`, and `b` reads `m`. The cycle is
+    // reported once, with a sentence and no line: what a Merge should read
+    // instead is the author's choice (it already reads `inp`, so reading
+    // the port in place of `b` would write every row twice). The node to
+    // change is `b`, which reads the output node: left reading it, `b`
+    // would fail when the call runs.
+    let help = cycle_help(&comp_out(
+        "m",
+        r#"  - type: merge
+    name: m
+    inputs: [inp, b]
+  - type: transform
+    name: b
+    input: m
+    config:
+      cxl: |
+        emit v = v
+        emit department = department
+"#,
+    ));
+    assert_eq!(
+        help,
+        "change what node \"b\" reads so that it no longer reads node \"m\", which ends the \
+         cycle"
+    );
+}
+
+#[test]
+fn a_cycle_through_a_combine_is_reported_once_with_a_sentence() {
+    let composition = r#"_compose:
+  name: c
+  inputs:
+    pa:
+      schema:
+        - { name: department, type: string }
+        - { name: v, type: int }
+  outputs:
+    out: j
+  config_schema: {}
+
+nodes:
+  - type: combine
+    name: j
+    input:
+      a: pa
+      b: k
+    config:
+      where: "a.department == b.department and a.v == b.v"
+      match: first
+      on_miss: null_fields
+      propagate_ck: driver
+      cxl: |
+        emit department = a.department
+        emit v = a.v
+  - type: transform
+    name: k
+    input: j
+    config:
+      cxl: |
+        emit department = department
+        emit v = v
+"#;
+    let pipeline = PIPELINE.replace("      inp: src\n", "      pa: src\n");
+    let Err(diags) = compile_in(&pipeline, &[("compositions/c.comp.yaml", composition)]) else {
+        panic!("a body with a cycle must not compile");
+    };
+    assert_eq!(diags.len(), 1, "no follower: {:#?}", describe(&diags));
+    assert_eq!(diags[0].code, "E107", "{:#?}", describe(&diags));
+    assert_eq!(
+        diags[0].help.as_deref(),
+        Some(
+            "change what node \"k\" reads so that it no longer reads node \"j\", which ends the \
+             cycle"
+        )
+    );
+}
+
+/// [`comp`] with two ports: `aa` declaring `department`, `zz` declaring
+/// `v`.
+fn two_port_comp(body: &str) -> String {
+    format!(
+        r#"_compose:
+  name: c
+  inputs:
+    aa:
+      schema:
+        - {{ name: department, type: string }}
+    zz:
+      schema:
+        - {{ name: v, type: int }}
+  outputs:
+    out: last
+  config_schema: {{}}
+
+nodes:
+{body}"#
+    )
+}
+
+const TWO_PORT_PIPELINE_BINDINGS: &str = "      aa: src\n      zz: src\n";
+
+#[test]
+fn the_e107_fix_reads_the_port_whose_columns_the_cycle_reads() {
+    // The cycle's nodes read `v`, which only `zz` declares; `aa` comes
+    // first, but reading it would only trade the E107 for an E169.
+    let body = r#"  - type: transform
+    name: a
+    input: b
+    config:
+      cxl: |
+        emit v = v + 1
+  - type: transform
+    name: b
+    input: a
+    config:
+      cxl: |
+        emit v = v
+  - type: transform
+    name: last
+    input: zz
+    config:
+      cxl: |
+        emit r = v
+"#;
+    let pipeline = PIPELINE.replace("      inp: src\n", TWO_PORT_PIPELINE_BINDINGS);
+    let Err(diags) = compile_in(
+        &pipeline,
+        &[("compositions/c.comp.yaml", &two_port_comp(body))],
+    ) else {
+        panic!("a body with a cycle must not compile");
+    };
+    assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
+    assert_eq!(
+        diags[0].help.as_deref(),
+        Some("set `input:` of node \"a\" to an input port of the composition: `input: zz`")
+    );
+    let fixed = body.replace(
+        "    name: a\n    input: b\n",
+        "    name: a\n    input: zz\n",
+    );
+    compile_in(
+        &pipeline,
+        &[("compositions/c.comp.yaml", &two_port_comp(&fixed))],
+    )
+    .unwrap_or_else(|d| panic!("the pasted line compiles: {:#?}", describe(&d)));
+}
+
+#[test]
+fn the_e107_help_is_a_sentence_when_no_port_ends_the_cycle_cleanly() {
+    // The cycle's nodes read `wt`, which no port declares: whichever port
+    // a node read instead, it would name a column the composition may not
+    // use, so no line is printed.
+    let help = cycle_help(&comp(
+        r#"  - type: transform
+    name: a
+    input: b
+    config:
+      cxl: |
+        emit p = wt
+  - type: transform
+    name: b
+    input: a
+    config:
+      cxl: |
+        emit wt = p
+  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit r = v
+"#,
+    ));
+    assert_eq!(
+        help,
+        "change what node \"a\" reads so that it no longer reads node \"b\", which ends the \
+         cycle"
+    );
+}
+
+#[test]
+fn the_e004_fix_reads_the_name_the_body_has() {
+    let Err(diags) = compile(&comp(
+        r#"  - type: transform
+    name: a
+    input: inpp
+    config:
+      cxl: |
+        emit p = v
+  - type: transform
+    name: last
+    input: a
+    config:
+      cxl: |
+        emit r = p
+"#,
+    )) else {
+        panic!("a misspelt input must not compile");
+    };
+    assert_eq!(diags.len(), 1, "no follower: {:#?}", describe(&diags));
+    assert_eq!(diags[0].code, "E004", "{:#?}", describe(&diags));
+    assert_eq!(
+        diags[0].help.as_deref(),
+        Some("set `input:` of node \"a\" to a name the composition has: `input: inp`")
+    );
+}
+
+#[test]
+fn a_call_reading_a_node_whose_upstream_failed_is_not_told_it_reads_nothing() {
+    // `bad` fails to typecheck; `relay` reads it and so has no row either.
+    // The call reading `relay` adds nothing to `bad`'s own error.
+    let pipeline = PIPELINE.replace(
+        "  - type: composition\n",
+        "  - type: transform\n    name: bad\n    input: src\n    config:\n      cxl: |\n        emit v = v + true\n  - type: transform\n    name: relay\n    input: bad\n    config:\n      cxl: |\n        emit v = v\n  - type: composition\n",
+    )
+    .replace("      inp: src\n", "      inp: relay\n");
+    let Err(diags) = compile_in(
+        &pipeline,
+        &[("compositions/c.comp.yaml", &comp(IDENTITY_BODY))],
+    ) else {
+        panic!("`bad` does not compile");
+    };
+    assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
+    assert_eq!(diags[0].code, "E200", "{:#?}", describe(&diags));
+}
+
+#[test]
+fn a_nested_call_reading_a_body_node_after_a_misspelt_input_is_not_told_it_reads_nothing() {
+    let inner = comp_declaring(&["{ name: v, type: int }"], IDENTITY_BODY);
+    let outer = comp(
+        r#"  - type: transform
+    name: a
+    input: inpp
+    config:
+      cxl: |
+        emit v = v
+  - type: transform
+    name: b
+    input: a
+    config:
+      cxl: |
+        emit v = v
+  - type: composition
+    name: last
+    input: b
+    use: ./inner.comp.yaml
+    inputs:
+      inp: b
+"#,
+    );
+    let Err(diags) = compile_in(
+        PIPELINE,
+        &[
+            ("compositions/c.comp.yaml", &outer),
+            ("compositions/inner.comp.yaml", &inner),
+        ],
+    ) else {
+        panic!("`a` reads nothing");
+    };
+    assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
+    assert_eq!(diags[0].code, "E004", "{:#?}", describe(&diags));
 }

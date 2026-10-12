@@ -1470,7 +1470,7 @@ fn a_call_leaving_unbound_a_port_a_node_reads_is_refused_and_binding_it_runs_as_
     // `u` reading the same rows.
     let help = diags[0].help.as_deref().unwrap_or_default();
     let entry = help
-        .split("add `")
+        .split("under `inputs:` of composition \"first\": `")
         .nth(1)
         .and_then(|rest| rest.split('`').next())
         .unwrap_or_else(|| panic!("the help prints the entry to add: {help}"));

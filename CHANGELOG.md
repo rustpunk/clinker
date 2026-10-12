@@ -119,19 +119,36 @@ composition it escaped every check and the call wrote no rows while the run
 exited 0. A composition node that reads itself or sits on a cycle now fails
 with `E107`, and one whose `input:` names nothing in the composition with
 `E004`, as the same mistakes do in a pipeline; before, each wrote no rows
-with exit 0. The `E107` help names the node to change and prints its
-`input:` line, choosing the node so that no node is left reading the
-composition's output node.
+with exit 0. A cycle is reported once; the nodes on it are not bound, so no
+second `E107` or follower error such as `E304` is reported. The `E107` help
+names the node to change, choosing it so that no node is left reading the
+composition's output node, and prints its `input:` line naming the first
+input port with which every node on the cycle compiles. A cycle through a
+Merge, a Combine or a composition call, or one no port can end, gets a
+sentence naming the node to change instead.
 
 **Breaking:** a composition node that reads an input port declared
 `required: false` now needs every call to bind that port. A call that leaves
-it unbound fails with `E104`, naming the call, the node and the port, and the
-help prints the `inputs:` entry to add at the call, naming the node that
-already feeds the call's first bound port, or, when nothing else in the
-composition needs the node, says to remove it. The `E104` title no longer
-says the input is required, since the port is declared optional. Before, the node was left unbound: it escaped every check and the call
-ran with the node writing nothing. A port no node reads may still be left
-unbound.
+it unbound fails with `E104`, naming the call, the node and the port. The
+`E104` title no longer says the input is required, since the port is declared
+optional. Before, the node was left unbound: it escaped every check and the
+call ran with the node writing nothing. A port nothing in the composition
+reads may still be left unbound.
+
+**Breaking:** a composition whose output port is an input port declared
+`required: false` (`outputs: { out: opt }`) now needs every call to bind that
+port, and a call that leaves it unbound fails with `E104`. Before, such a call
+compiled and wrote no rows, not even a header, with exit 0. To migrate, bind
+the port under the call's `inputs:`.
+
+A help that prints YAML or a line of CXL for the author to paste now prints
+it only after the compiler has tried it: the edit is compiled in scratch and
+must clear the error without raising a new one. Otherwise the help is one
+sentence saying what to change, with no code, and no help offers two fixes.
+The `E104` help prints the `inputs:` entry naming the first node of the
+calling pipeline whose rows the port accepts; before, it named the node
+feeding the call's first bound port even when the port refused that node's
+rows, and with no bound port it asked the author to fill a name in.
 
 `E102` for a port fed by a Route branch now says a composition input port
 cannot read a Route or Cull output port yet and prints the Transform that
