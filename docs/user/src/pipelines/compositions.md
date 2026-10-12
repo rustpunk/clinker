@@ -130,6 +130,18 @@ never-empty `qty` still accepts it. A call whose column can be empty gets
 results that can be empty, and a later composition that needs a never-empty
 value says so with `E102`.
 
+The same check applies to a composition called inside another composition.
+If the outer composition declares `qty` as `{ nullable: int }` and passes it
+unchanged to an inner composition whose port declares `qty` as `int`, the
+outer composition fails with `E102` at every call, even when every caller's
+`qty` is never empty: the outer composition is checked as if `qty` could be
+empty, and the inner one does not accept an empty `qty`. The error names the
+outer composition's port as the cause. Declare `qty` as never empty on that
+port, `- { name: qty, type: int }`, when the outer composition should only be
+called with a value; to keep accepting empty values, handle them before the
+inner call, or declare the inner port `{ nullable: int }` if the inner
+composition copes with an empty `qty`.
+
 Each call checks the caller's rows against the port: every declared column
 must be there, with the declared type, with the non-empty form of a
 `{ nullable: <type> }` declaration, or with any type for `any`. Otherwise the

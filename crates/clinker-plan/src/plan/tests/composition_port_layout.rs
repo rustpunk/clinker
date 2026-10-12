@@ -584,8 +584,10 @@ fn an_error_that_is_not_about_an_empty_value_is_not_blamed_on_one() {
 #[test]
 fn a_nested_call_that_needs_a_never_empty_value_is_refused_behind_a_possibly_empty_port() {
     // The outer body is checked as if `v` could be empty, so its call to a
-    // composition whose port needs a never-empty `v` fails at every call:
-    // the outer body has to handle the empty case first.
+    // composition whose port needs a never-empty `v` fails at every call.
+    // The empty value comes from the outer composition's own declaration,
+    // so the error names that port, and its first fix is the outer port
+    // line to paste.
     let outer = comp_declaring(
         &["{ name: v, type: { nullable: int } }"],
         r#"  - type: composition
@@ -607,15 +609,43 @@ fn a_nested_call_that_needs_a_never_empty_value_is_refused_behind_a_possibly_emp
         panic!("the outer body hands a possibly empty `v` to a port that needs an `int`");
     };
     assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
-    assert_eq!(diags[0].code, "E102", "{:#?}", describe(&diags));
+    let diag = &diags[0];
+    assert_eq!(diag.code, "E102", "{:#?}", describe(&diags));
     assert!(
-        diags[0].message.contains("composition \"last\"")
-            && diags[0]
-                .message
-                .contains("\"inp\" provides `v` as `{ nullable: int }`"),
+        diag.message.starts_with(
+            "composition \"call\" passes a `v` that may be empty to composition \"last\", \
+             whose input port `inp` needs `v` never empty (`int`)"
+        ) && diag.message.contains(
+            "input port `inp` of \"call\" declares `v` as `{ nullable: int }` in \
+             `compositions/c.comp.yaml`"
+        ),
         "{}",
-        diags[0].message
+        diag.message
     );
+    let help = diag.help.as_deref().expect("a fix");
+    assert!(
+        help.starts_with(
+            "declare `v` as never empty on input port `inp` in `compositions/c.comp.yaml`: \
+             `- { name: v, type: int }`"
+        ) && help.contains(
+            "`compositions/inner.comp.yaml` instead: `- { name: v, type: { nullable: int } }`"
+        ),
+        "{help}"
+    );
+
+    // The first fix, pasted, compiles.
+    let fixed = outer.replace(
+        "- { name: v, type: { nullable: int } }",
+        "- { name: v, type: int }",
+    );
+    compile_in(
+        PIPELINE,
+        &[
+            ("compositions/c.comp.yaml", &fixed),
+            ("compositions/inner.comp.yaml", &inner),
+        ],
+    )
+    .unwrap_or_else(|d| panic!("the pasted fix compiles: {:#?}", describe(&d)));
 }
 
 #[test]
