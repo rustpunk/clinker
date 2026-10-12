@@ -124,8 +124,10 @@ composition's output node.
 **Breaking:** a composition node that reads an input port declared
 `required: false` now needs every call to bind that port. A call that leaves
 it unbound fails with `E104`, naming the call, the node and the port, and the
-help prints the `inputs:` entry to add at the call, or says to remove the
-node. Before, the node was left unbound: it escaped every check and the call
+help prints the `inputs:` entry to add at the call, naming the node that
+already feeds the call's first bound port, or, when nothing else in the
+composition needs the node, says to remove it. The `E104` title no longer
+says the input is required, since the port is declared optional. Before, the node was left unbound: it escaped every check and the call
 ran with the node writing nothing. A port no node reads may still be left
 unbound.
 

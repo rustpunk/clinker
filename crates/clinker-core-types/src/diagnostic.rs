@@ -240,7 +240,7 @@ diagnostic_registry! {
     "E101", Error, "Composition signature parse error (malformed `.comp.yaml`)";
     "E102", Error, "Composition input port does not accept the column the call gives it";
     "E103", Error, "Call site or channel binds undeclared input/config/resource";
-    "E104", Error, "Call site or channel missing required input/config";
+    "E104", Error, "Call site or channel leaves unbound an input or config the composition needs";
     "E106", Error, "Name collision after composition expansion";
     "E107", Error, "Cycle detected in flat post-expansion graph";
     "E108", Error, "Composition body references enclosing scope (IsolatedFromAbove)";
