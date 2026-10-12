@@ -255,9 +255,34 @@ pub struct CompileArtifacts {
     /// entry. Moved onto `CompiledPlan` and read by tooling; the executor
     /// never consults it.
     pub top_level_rows: IndexMap<String, Row>,
+    /// How many times a composition body was bound during this compile,
+    /// counting the check of a body against its ports' declared types and
+    /// the bind that produces the call's rows separately. Read by tests
+    /// that pin the cost of nesting; nothing else consults it.
+    pub(crate) body_binds: u32,
 }
 
 impl CompileArtifacts {
+    /// Empty artifacts whose id counters continue this one's, for a bind
+    /// whose outcome is read from its diagnostics alone (a composition
+    /// body's check against its ports' declared types).
+    ///
+    /// A body bind reads nothing from the artifacts it binds into: the
+    /// module closure comes from the compile context, and a node reads only
+    /// the entries the same bind wrote for the nodes before it. So the check
+    /// needs none of this one's contents. Its counters continue from here
+    /// so an id minted during the check never names an entry this one
+    /// already holds.
+    pub(crate) fn scratch(&self) -> Self {
+        Self {
+            next_body_id: self.next_body_id,
+            next_file_id: self.next_file_id,
+            next_tail_var: self.next_tail_var,
+            next_node_id: self.next_node_id,
+            ..Self::default()
+        }
+    }
+
     /// Look up a node's typed CXL program by its stable [`PlanNodeId`].
     /// The table is per-node and only read at compile time and executor
     /// startup, so this is not hot.
@@ -4150,7 +4175,6 @@ fn bind_composition(
     let body_file_label: Arc<str> = Arc::from(resolved_path.display().to_string().as_str());
     let mut port_seeds: IndexMap<String, Row> = IndexMap::new();
     let mut contract_seeds: IndexMap<String, Row> = IndexMap::new();
-    let mut check_seeds: IndexMap<String, Row> = IndexMap::new();
     for port_name in input_port_rows.keys() {
         let Some(upstream_row) = call_inputs
             .get(port_name)
@@ -4175,17 +4199,6 @@ fn bind_composition(
             PortTypes::Declared,
         );
         contract_seeds.insert(port_name.clone(), contract);
-        // The same row with the call's name left out of its marks: the
-        // name only words diagnostics, so two calls whose contract rows
-        // differ only in it pass or fail the check together.
-        let unnamed = Arc::new(PortOrigin {
-            call: Arc::from(""),
-            ..origin.as_ref().clone()
-        });
-        check_seeds.insert(
-            port_name.clone(),
-            seed_port_row(upstream_row, &declared, unnamed, PortTypes::Declared),
-        );
         let seed = seed_port_row(upstream_row, &declared, origin, PortTypes::Provided);
         body_schema_by_name.insert(port_name.clone(), seed.clone());
         port_seeds.insert(port_name.clone(), seed);
@@ -4302,7 +4315,6 @@ fn bind_composition(
                 node_ids: &body_node_ids,
                 port_seeds: &port_seeds,
                 contract_seeds: &contract_seeds,
-                check_seeds: &check_seeds,
                 span,
             },
             diags,
@@ -5905,9 +5917,6 @@ struct BodyBind<'a> {
     port_seeds: &'a IndexMap<String, Row>,
     /// Each port's row with the declared types ([`PortTypes::Declared`]).
     contract_seeds: &'a IndexMap<String, Row>,
-    /// `contract_seeds` with the call's name left out of the marks: what a
-    /// [`ContractCheck`] compares.
-    check_seeds: &'a IndexMap<String, Row>,
     span: Span,
 }
 
@@ -5926,7 +5935,10 @@ struct BodyBind<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ContractCheck {
     body_file: PathBuf,
-    seeds: IndexMap<String, Row>,
+    /// Each port's seed row, in port order: its columns in order, with
+    /// their types and what the body may do with each (see
+    /// [`SeedColumn`]).
+    seeds: Vec<(String, Vec<SeedColumn>)>,
     declared_multiple: HashMap<String, BTreeSet<String>>,
     scoped_vars: ScopedVarsSeen,
     use_path_stack: Vec<PathBuf>,
@@ -5934,6 +5946,42 @@ pub(crate) struct ContractCheck {
     /// Each name a body node reads that is neither a body node nor an input
     /// port, and whether an enclosing scope has a node of that name.
     outside_inputs: Vec<(String, bool)>,
+}
+
+/// What a body's check reads of one column of a port's seed row: its
+/// position (the column's place in the row), its name, its type and what
+/// the port's declaration lets the body do with it. A row's declaration
+/// span and tail word diagnostics and never decide a check, and the call's
+/// name in a mark only words them too, so none of those is in the key.
+#[derive(Debug, Clone, PartialEq)]
+struct SeedColumn {
+    field: QualifiedField,
+    ty: Type,
+    access: Option<SeedAccess>,
+}
+
+/// A seed column's mark, as a check reads it: the body's own column, or one
+/// carried in through the port being seeded with the port's access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeedAccess {
+    Own,
+    Carried(PortAccess),
+}
+
+impl SeedColumn {
+    /// The columns of a seed row, in order.
+    fn of_row(row: &Row) -> Vec<Self> {
+        row.fields()
+            .map(|(field, ty)| Self {
+                field: field.clone(),
+                ty: ty.clone(),
+                access: row.mark_of(field).map(|mark| match mark {
+                    ColumnMark::Own => SeedAccess::Own,
+                    ColumnMark::Carried(column) => SeedAccess::Carried(column.access),
+                }),
+            })
+            .collect()
+    }
 }
 
 /// The parts of a body's [`cxl::resolve::ScopedVarsRegistry`] a check can
@@ -5981,7 +6029,11 @@ impl ContractCheck {
         let vars = &bind_ctx.scoped_vars;
         Some(Self {
             body_file: bind.body_file.to_path_buf(),
-            seeds: bind.check_seeds.clone(),
+            seeds: bind
+                .contract_seeds
+                .iter()
+                .map(|(port, row)| (port.clone(), SeedColumn::of_row(row)))
+                .collect(),
             declared_multiple: body_declared_multiple_by_name.clone(),
             scoped_vars: ScopedVarsSeen {
                 pipeline: vars.pipeline.clone(),
@@ -6011,9 +6063,9 @@ impl ContractCheck {
 ///
 /// The composition's contract is its ports' declared types. Where this call
 /// provides a narrower type (a never-empty `T` into `{ nullable: T }`), the
-/// body is first bound against the declared types as well, on a copy of the
-/// artifacts that is then dropped, and only that check's diagnostics are
-/// kept: a body that does not cope with an empty value its port admits fails
+/// body is first bound against the declared types as well, into scratch
+/// artifacts that are then dropped ([`CompileArtifacts::scratch`]), and only
+/// that check's diagnostics are kept: a body that does not cope with an empty value its port admits fails
 /// at every call, whoever the caller is. Every CXL and planner rule is
 /// monotone in nullability, so a body that passes the declared-type check
 /// passes the provided-type bind too; a failure there is reported as an
@@ -6041,6 +6093,7 @@ fn bind_body(
     };
     if bind.contract_seeds == bind.port_seeds {
         let checked_from = diags.len();
+        artifacts.body_binds += 1;
         bind_schema_inner(
             bind.nodes,
             bind.node_ids,
@@ -6059,22 +6112,24 @@ fn bind_body(
         .as_ref()
         .is_some_and(|check| bind_ctx.passed_contract_checks.contains(check));
     let contract_failed = !passed_before && {
-        let mut contract_artifacts = artifacts.clone();
+        let mut scratch = artifacts.scratch();
         let mut contract_rows = body_schema_by_name.clone();
         for (port, seed) in bind.contract_seeds {
             contract_rows.insert(port.clone(), seed.clone());
         }
         let mut contract_multiple = body_declared_multiple_by_name.clone();
         let checked_from = diags.len();
+        scratch.body_binds += 1;
         bind_schema_inner(
             bind.nodes,
             bind.node_ids,
             diags,
             bind_ctx,
-            &mut contract_artifacts,
+            &mut scratch,
             &mut contract_rows,
             &mut contract_multiple,
         );
+        artifacts.body_binds += scratch.body_binds;
         if diags.len() == checked_from {
             record_passed(bind_ctx, check);
         }
@@ -6083,6 +6138,7 @@ fn bind_body(
             .any(|d| d.severity == Severity::Error)
     };
     let mut produced: Vec<Diagnostic> = Vec::new();
+    artifacts.body_binds += 1;
     bind_schema_inner(
         bind.nodes,
         bind.node_ids,

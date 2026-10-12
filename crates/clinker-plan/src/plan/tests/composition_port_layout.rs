@@ -113,6 +113,35 @@ fn bind_in(pipeline: &str, files: &[(&str, &str)]) -> Vec<Diagnostic> {
     diags
 }
 
+/// Bind `pipeline` as [`bind_in`] does and return how many times a
+/// composition body was bound, counting a body's check against its ports'
+/// declared types and the bind that produces its call's rows separately.
+/// The bind must raise no error.
+fn body_binds_in(pipeline: &str, files: &[(&str, &str)]) -> u32 {
+    let workspace = workspace(files);
+    let config = parse_config(pipeline).expect("parse pipeline");
+    let ctx = CompileContext::with_pipeline_dir(workspace.path(), PathBuf::from("pipelines"));
+    let symbol_table = crate::config::composition::scan_workspace_signatures(workspace.path())
+        .expect("compositions load");
+    let mut diags = Vec::new();
+    let artifacts = crate::plan::bind_schema::bind_schema(
+        &config.nodes,
+        &mut diags,
+        &ctx,
+        &symbol_table,
+        &ctx.pipeline_dir,
+        Default::default(),
+    );
+    assert!(
+        diags
+            .iter()
+            .all(|d| d.severity != clinker_core_types::Severity::Error),
+        "binds cleanly: {:#?}",
+        describe(&diags)
+    );
+    artifacts.body_binds
+}
+
 fn describe(diags: &[Diagnostic]) -> Vec<String> {
     diags
         .iter()
@@ -2560,5 +2589,99 @@ fn a_check_that_passed_for_one_call_does_not_pass_a_call_with_other_types() {
         diags[0].message.contains("composition \"again\""),
         "{}",
         diags[0].message
+    );
+}
+
+/// A chain of `depth` compositions: `c.comp.yaml` calls `l2.comp.yaml`,
+/// which calls `l3.comp.yaml`, and so on; the innermost adds `flag`. Every
+/// port declares `v` as `{ nullable: int }`, so a pipeline feeding an `int`
+/// has each level checked against its declared types and then bound
+/// against the type it is fed.
+fn nullable_chain(depth: usize) -> Vec<(String, String)> {
+    (1..=depth)
+        .map(|level| {
+            let file = if level == 1 {
+                "compositions/c.comp.yaml".to_string()
+            } else {
+                format!("compositions/l{level}.comp.yaml")
+            };
+            let body = if level == depth {
+                r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit flag = 1
+"#
+                .to_string()
+            } else {
+                format!(
+                    r#"  - type: composition
+    name: last
+    input: inp
+    use: ./l{}.comp.yaml
+    inputs:
+      inp: inp
+"#,
+                    level + 1
+                )
+            };
+            (
+                file,
+                comp_declaring(&["{ name: v, type: { nullable: int } }"], &body),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn body_binds_grow_linearly_with_nesting_depth() {
+    // Each level adds the same number of binds: a check of its body against
+    // the declared types, and the bind that produces its call's rows. A
+    // check that passed once is not run again for the nested call the
+    // producing bind reaches, so the count does not grow with the square
+    // of the depth.
+    let binds = |depth: usize| {
+        let files = nullable_chain(depth);
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, contents)| (path.as_str(), contents.as_str()))
+            .collect();
+        body_binds_in(PIPELINE, &refs)
+    };
+    let (at_4, at_6, at_8) = (binds(4), binds(6), binds(8));
+    assert!(at_4 > 0);
+    assert_eq!(
+        at_8 - at_6,
+        at_6 - at_4,
+        "two more levels add the same number of binds: {at_4} at depth 4, {at_6} at 6, {at_8} at 8"
+    );
+}
+
+#[test]
+fn a_check_that_passed_for_one_call_stands_for_a_call_fed_the_same_columns_from_another_source() {
+    // Both Sources declare the same columns with the same types; the check
+    // of the body against its declared types reads nothing else of the
+    // rows, so the second call only binds against what it is fed.
+    let composition = comp_declaring(&["{ name: v, type: { nullable: int } }"], IDENTITY_BODY);
+    let pipeline = pipeline_calling_twice(
+        r#"  - type: source
+    name: src2
+    config:
+      name: src2
+      type: csv
+      path: in2.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: department, type: string }
+        - { name: v, type: int }
+        - { name: wt, type: int }
+"#,
+        "src2",
+    );
+    assert_eq!(
+        body_binds_in(&pipeline, &[("compositions/c.comp.yaml", &composition)]),
+        3,
+        "a check and a produce for the first call, a produce for the second"
     );
 }
