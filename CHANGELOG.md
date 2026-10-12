@@ -11,10 +11,11 @@ declare now fails compilation with the new code `E169`.
 
 A composition's input port receives the caller's rows as they are, but the
 compiler used to describe them with only the port's declared columns, in the
-port's order. An Aggregate or Cull inside the composition then read its
-columns by the wrong position whenever the port declared fewer columns than
-the caller had, or the same columns in another order. A sum came out empty,
-or summed the wrong column, with no error. A Transform-only composition read
+port's order. An Aggregate, Cull or Combine inside the composition then read
+its columns by the wrong position whenever the port declared fewer columns
+than the caller had, or the same columns in another order. A sum came out
+empty or summed the wrong column, and a Combine wrote the wrong input's
+values, with no error. A Transform-only composition read
 the right values, but a call fed by a node that adds or reorders columns,
 such as a Transform in front of the call, stopped with `E314` at the next
 Sink.
@@ -24,6 +25,12 @@ each port. A call writes what the same nodes written in the pipeline at the
 call site would write. Columns the port does not declare pass through the
 composition in the caller's position, so a call fed by a Transform that adds a
 column runs and writes that column.
+
+The emitted OpenLineage column lineage changes with it: a composition's
+column now names the input column it really reads (an Aggregate's `sum(v)`
+named `order_id` before), and the columns a composition passes through now
+appear with identity lineage, as they do when the same nodes are written in
+the pipeline.
 
 The port's `schema:` is now the list of columns the composition may use. A
 node that uses any other column of the caller's rows fails with `E169` at

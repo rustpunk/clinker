@@ -589,3 +589,333 @@ fn a_body_node_listed_before_its_input_writes_what_the_inline_nodes_write() {
         "order_id,department,v,wt,r,z\nO1,a,5,0,5,5\nO1,b,6,1,6,6\nO2,a,7,1,7,7\n",
     );
 }
+
+/// Departments the orders join to, with a column no port declares.
+const DEPARTMENTS: &str = "department,label,extra\na,alpha,X\nb,beta,Y\n";
+
+const DEPARTMENTS_SOURCE: &str = r#"  - type: source
+    name: dep
+    config:
+      name: dep
+      type: csv
+      path: dep.csv
+      schema:
+        - { name: department, type: string }
+        - { name: label, type: string }
+        - { name: extra, type: string }
+"#;
+
+/// A Combine `j` of inputs `a` and `b` on `department`.
+fn combine_node(a: &str, b: &str) -> String {
+    format!(
+        r#"  - type: combine
+    name: j
+    input:
+      a: {a}
+      b: {b}
+    config:
+      where: "a.department == b.department"
+      match: first
+      on_miss: null_fields
+      propagate_ck: driver
+      cxl: |
+        emit department = a.department
+        emit v = a.v
+        emit label = b.label
+"#
+    )
+}
+
+#[test]
+fn a_body_combine_reads_each_input_by_the_column_it_names() {
+    // Each port declares fewer columns than its caller has, in another
+    // order. Before the body bound against the caller's rows, the Combine
+    // read `label` and `department` by the wrong position and wrote
+    // `O1,a,` and the like, exit 0.
+    let composition = format!(
+        r#"_compose:
+  name: c
+  inputs:
+    pa:
+      schema:
+        - {{ name: department, type: string }}
+        - {{ name: v, type: int }}
+    pb:
+      schema:
+        - {{ name: department, type: string }}
+        - {{ name: label, type: string }}
+  outputs:
+    out: j
+  config_schema: {{}}
+
+nodes:
+{}"#,
+        combine_node("pa", "pb")
+    );
+    let composed = pipeline(
+        "comb",
+        &format!(
+            r#"{ORDERS_SOURCE}{DEPARTMENTS_SOURCE}  - type: composition
+    name: call
+    input: src
+    use: ../compositions/c.comp.yaml
+    inputs:
+      pa: src
+      pb: dep
+{}"#,
+            sink("call", &["v"])
+        ),
+    );
+    let inline = pipeline(
+        "comb_inline",
+        &format!(
+            "{ORDERS_SOURCE}{DEPARTMENTS_SOURCE}{}{}",
+            combine_node("src", "dep"),
+            sink("j", &["v"])
+        ),
+    );
+    assert_inline_equivalent(
+        &[
+            (PIPELINE, &composed),
+            ("compositions/c.comp.yaml", &composition),
+            ("pipelines/in.csv", ORDERS),
+            ("pipelines/dep.csv", DEPARTMENTS),
+        ],
+        &[
+            (PIPELINE, &inline),
+            ("pipelines/in.csv", ORDERS),
+            ("pipelines/dep.csv", DEPARTMENTS),
+        ],
+        0,
+        "department,v,label\na,5,alpha\nb,6,beta\na,7,alpha\n",
+    );
+}
+
+#[test]
+fn engine_columns_pass_through_a_body_as_they_pass_through_inline_nodes() {
+    // The source's correlation key column and `$source.file` reach the body
+    // undeclared and come out where the inline Transform puts them.
+    let source = ORDERS_SOURCE.replace(
+        "      path: in.csv\n",
+        "      path: in.csv\n      correlation_key: [order_id]\n",
+    );
+    let body = r#"  - type: transform
+    name: t1
+    input: inp
+    config:
+      cxl: |
+        emit v = v + 100
+        emit r = v * 2
+        emit f = $source.file
+"#;
+    let composition = comp("c", &[("v", "int"), ("department", "string")], "t1", body);
+    let keyed_sink = |input: &str| {
+        sink(input, &["v"]).replace(
+            "      path: out.csv\n",
+            "      path: out.csv\n      include_correlation_keys: true\n",
+        )
+    };
+    let composed = pipeline(
+        "keyed",
+        &format!(
+            "{source}{}{}",
+            call("call", "c.comp.yaml", "src"),
+            keyed_sink("call")
+        ),
+    );
+    let inline = pipeline(
+        "keyed_inline",
+        &format!(
+            "{source}{}{}",
+            body.replace("input: inp", "input: src"),
+            keyed_sink("t1")
+        ),
+    );
+    let (inline_run, inline_out) =
+        run_workspace(&[(PIPELINE, &inline), ("pipelines/in.csv", ORDERS)]);
+    assert_eq!(
+        inline_run.status.code(),
+        Some(0),
+        "{}",
+        describe(&inline_run)
+    );
+    let header = inline_out.lines().next().unwrap_or_default();
+    assert_eq!(
+        header, "order_id,department,v,wt,$ck.order_id,r,f",
+        "the inline reference writes the key column: {inline_out}"
+    );
+    assert_eq!(inline_out.lines().count(), 4, "{inline_out}");
+    let (composed_run, composed_out) = run_workspace(&[
+        (PIPELINE, &composed),
+        ("compositions/c.comp.yaml", &composition),
+        ("pipelines/in.csv", ORDERS),
+    ]);
+    assert_eq!(
+        composed_run.status.code(),
+        Some(0),
+        "{}",
+        describe(&composed_run)
+    );
+    assert_eq!(
+        composed_out, inline_out,
+        "the composition call writes what its body inline writes"
+    );
+}
+
+/// Run `files` with `--lineage` under a local lineage policy; return each
+/// output column's sources as `(input column, transformation subtypes)`.
+fn column_lineage(files: &[(&str, &str)]) -> Vec<(String, Vec<(String, String)>)> {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_files(dir.path(), files);
+    write_files(
+        dir.path(),
+        &[(
+            "clinker.toml",
+            "[observability.lineage]\nidentity_mode = \"local_diagnostic_paths\"\n",
+        )],
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_clinker"))
+        .current_dir(dir.path())
+        .arg("run")
+        .arg(PIPELINE)
+        .arg("--base-dir")
+        .arg(dir.path())
+        .arg("--force")
+        .arg("--lineage")
+        .arg("lin.ndjson")
+        .output()
+        .expect("spawn clinker");
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    let events = std::fs::read_to_string(dir.path().join("lin.ndjson")).expect("read lineage");
+    let complete: serde_json::Value = events
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("lineage line is JSON"))
+        .find(|event| event["eventType"] == "COMPLETE")
+        .expect("a COMPLETE event");
+    let fields = complete["outputs"][0]["facets"]["columnLineage"]["fields"]
+        .as_object()
+        .unwrap_or_else(|| panic!("an output with column lineage: {complete}"));
+    let mut lineage: Vec<(String, Vec<(String, String)>)> = fields
+        .iter()
+        .map(|(column, entry)| {
+            let mut sources: Vec<(String, String)> = entry["inputFields"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|input| {
+                    let kinds: Vec<String> = input["transformations"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|t| t["subtype"].as_str().unwrap_or_default().to_string())
+                        .collect();
+                    (
+                        input["field"].as_str().unwrap_or_default().to_string(),
+                        kinds.join("+"),
+                    )
+                })
+                .collect();
+            sources.sort();
+            (column.clone(), sources)
+        })
+        .collect();
+    lineage.sort();
+    lineage
+}
+
+#[test]
+fn a_call_s_column_lineage_is_the_lineage_of_its_body_written_inline() {
+    // A body Aggregate behind a reordered subset port: `s` comes from `v`.
+    let composition = comp(
+        "c",
+        &[("v", "int"), ("department", "string")],
+        "totals",
+        COMP3_BODY,
+    );
+    let composed = column_lineage(&[
+        (
+            PIPELINE,
+            &pipeline(
+                "comp3",
+                &format!(
+                    "{ORDERS_SOURCE}{}{}",
+                    call("call", "c.comp.yaml", "src"),
+                    sink("call", &["department"])
+                ),
+            ),
+        ),
+        ("compositions/c.comp.yaml", &composition),
+        ("pipelines/in.csv", ORDERS),
+    ]);
+    let inline = column_lineage(&[
+        (
+            PIPELINE,
+            &pipeline(
+                "comp3_inline",
+                &format!(
+                    "{ORDERS_SOURCE}{}{}",
+                    comp3_inline("src"),
+                    sink("totals", &["department"])
+                ),
+            ),
+        ),
+        ("pipelines/in.csv", ORDERS),
+    ]);
+    assert_eq!(composed, inline);
+    assert!(
+        composed.contains(&(
+            "s".to_string(),
+            vec![("v".to_string(), "AGGREGATION".to_string())]
+        )),
+        "`s` sums `v`: {composed:?}"
+    );
+
+    // A Transform body: the columns the port does not declare pass through
+    // with identity lineage, as they do inline.
+    let body = r#"  - type: transform
+    name: t
+    input: inp
+    config:
+      cxl: |
+        emit r = v * 2
+"#;
+    let composition = comp("c", &[("v", "int"), ("department", "string")], "t", body);
+    let composed = column_lineage(&[
+        (
+            PIPELINE,
+            &pipeline(
+                "pass",
+                &format!(
+                    "{ORDERS_SOURCE}{}{}",
+                    call("call", "c.comp.yaml", "src"),
+                    sink("call", &["v"])
+                ),
+            ),
+        ),
+        ("compositions/c.comp.yaml", &composition),
+        ("pipelines/in.csv", ORDERS),
+    ]);
+    let inline = column_lineage(&[
+        (
+            PIPELINE,
+            &pipeline(
+                "pass_inline",
+                &format!(
+                    "{ORDERS_SOURCE}{}{}",
+                    body.replace("input: inp", "input: src"),
+                    sink("t", &["v"])
+                ),
+            ),
+        ),
+        ("pipelines/in.csv", ORDERS),
+    ]);
+    assert_eq!(composed, inline);
+    for column in ["order_id", "wt"] {
+        assert!(
+            composed.iter().any(|(name, sources)| name == column
+                && sources == &[(column.to_string(), "IDENTITY".to_string())]),
+            "`{column}` passes through with identity lineage: {composed:?}"
+        );
+    }
+}
