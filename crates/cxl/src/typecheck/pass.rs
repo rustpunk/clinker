@@ -769,18 +769,34 @@ impl<'a> TypeChecker<'a> {
                                 // "qualify with X or Y" suggestion rather
                                 // than silently typing as Any. Reachable only
                                 // from combine body typechecks (C.1.3).
+                                // Where the row lets only one of the
+                                // matches be named (the others came through
+                                // a composition port that does not declare
+                                // them), nothing is ambiguous: the bare name
+                                // still reads no column at run time, so the
+                                // author writes the one qualified name.
                                 let suggestions: Vec<String> =
                                     matches.iter().map(|qf| qf.to_string()).collect();
-                                self.error(
-                                    *span,
-                                    format!(
-                                        "field '{name}' is ambiguous — matches multiple inputs"
+                                let (message, help) = match suggestions.as_slice() {
+                                    [only] => (
+                                        format!(
+                                            "field '{name}' is on more than one input, and \
+                                             only `{only}` may be named here"
+                                        ),
+                                        format!("write the qualified name: `{only}`"),
                                     ),
-                                    Some(format!(
-                                        "qualify the reference: `{}`",
-                                        suggestions.join("` or `")
-                                    )),
-                                );
+                                    _ => (
+                                        format!(
+                                            "field '{name}' is ambiguous — matches multiple \
+                                             inputs"
+                                        ),
+                                        format!(
+                                            "qualify the reference: `{}`",
+                                            suggestions.join("` or `")
+                                        ),
+                                    ),
+                                };
+                                self.error(*span, message, Some(help));
                                 Type::Any
                             }
                         }
@@ -3621,6 +3637,59 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A bare name matching two inputs of which only one may be named (the
+    /// other came through a composition port that does not declare it) is
+    /// not ambiguous: the error names the one qualified spelling to write.
+    #[test]
+    fn a_bare_name_with_one_nameable_match_is_told_the_name_to_write() {
+        use super::super::row::{
+            CarriedColumn, ColumnMark, PortAccess, PortOrigin, QualifiedField,
+        };
+        use std::sync::Arc;
+
+        let mut cols = IndexMap::new();
+        cols.insert(QualifiedField::qualified("a", "wt"), Type::Int);
+        cols.insert(QualifiedField::qualified("b", "wt"), Type::Int);
+        let mut schema = Row::closed(cols, Span::new(0, 0));
+        schema.enter_body_scope();
+        let origin = Arc::new(PortOrigin {
+            call: Arc::from("call"),
+            port: Arc::from("pa"),
+            body_file: Arc::from("c.comp.yaml"),
+        });
+        schema.mark(
+            QualifiedField::qualified("a", "wt"),
+            ColumnMark::Carried(CarriedColumn {
+                port: origin,
+                access: PortAccess::Undeclared,
+            }),
+        );
+        schema.mark(QualifiedField::qualified("b", "wt"), ColumnMark::Own);
+
+        let parsed = Parser::parse("emit z = wt");
+        assert!(parsed.errors.is_empty(), "parse: {:?}", parsed.errors);
+        let resolved = resolve_program(parsed.ast, &["wt"], parsed.node_count).unwrap();
+        let diags = type_check(resolved, &schema).expect_err("the bare name reads no column");
+        let messages: Vec<&String> = diags.iter().map(|d| &d.message).collect();
+        assert!(
+            diags.iter().any(|d| d.message.contains(
+                "field 'wt' is on more than one input, and only `b.wt` may be named here"
+            )),
+            "{messages:?}"
+        );
+        assert!(
+            !diags.iter().any(|d| d.message.contains("ambiguous")),
+            "{messages:?}"
+        );
+        let helps: Vec<&String> = diags.iter().filter_map(|d| d.help.as_ref()).collect();
+        assert!(
+            helps
+                .iter()
+                .any(|h| h.contains("write the qualified name: `b.wt`")),
+            "{helps:?}"
+        );
     }
 
     // --- Phase Combine C.1.0 gate: qualified field ref resolution --------
