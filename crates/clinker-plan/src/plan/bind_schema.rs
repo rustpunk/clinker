@@ -24,8 +24,8 @@ use std::sync::Arc;
 
 use cxl::ast::{Expr, LiteralValue, Statement};
 use cxl::typecheck::{
-    AggregateMode, CarriedColumn, ColumnLookup, PortAccess, PortOrigin, QualifiedField, Row, Type,
-    TypedProgram,
+    AggregateMode, CarriedColumn, ColumnLookup, ColumnMark, PortAccess, PortOrigin, QualifiedField,
+    Row, Type, TypedProgram,
 };
 use indexmap::IndexMap;
 
@@ -2222,8 +2222,16 @@ fn bind_reshape(
     );
     let mut out = Row::from_parts(declared, upstream.declared_span, upstream.tail.clone());
     // A `set` or override keeps the caller's value on every row its rule does
-    // not touch, so a carried column stays the caller's through Reshape.
-    out.inherit_carried(upstream, |_| true);
+    // not touch, so a carried column stays the caller's through Reshape. The
+    // audit columns are the engine's.
+    out.inherit_marks(upstream, |_| true);
+    for audit in [
+        RESHAPE_SYNTHETIC_COLUMN,
+        RESHAPE_SYNTHESIZED_BY_COLUMN,
+        RESHAPE_MUTATED_BY_COLUMN,
+    ] {
+        out.mark(QualifiedField::bare(audit), ColumnMark::Own);
+    }
     schema_by_name.insert(name.to_string(), out.clone());
     // Bind→lowering handoff: lowering stamps these onto
     // `PlanNode::Reshape.compiled_rules`. Every rule is present here (each
@@ -2653,7 +2661,22 @@ fn bind_schema_inner(
         .map(|spanned| spanned.value.name().to_string())
         .collect();
 
-    for spanned in nodes {
+    // Bind each node after the nodes of this scope it reads. An author may
+    // list a node before its input; binding in list order left such a node
+    // unbound, so it escaped every check and wrote no rows.
+    let (order, unplaced) = bind_order(nodes);
+    if bind_ctx.depth > 0 {
+        let ports: HashSet<&str> = schema_by_name.keys().map(String::as_str).collect();
+        body_input_diagnostics(
+            nodes,
+            &unplaced,
+            &ports,
+            &bind_ctx.enclosing_scope_names,
+            diags,
+        );
+    }
+
+    for spanned in order.iter().map(|&i| &nodes[i]) {
         let node = &spanned.value;
         let name = node.name().to_string();
         let span = span_for(spanned);
@@ -2842,7 +2865,16 @@ fn bind_schema_inner(
                     }
                 }
                 let cxl_span = cxl::lexer::Span::new(span.start as usize, span.start as usize);
-                let row = Row::closed(columns, cxl_span);
+                let mut row = Row::closed(columns, cxl_span);
+                if bind_ctx.depth > 0 {
+                    // A Source inside a composition body reads the body's own
+                    // data: every column is the body's.
+                    row.enter_body_scope();
+                    let own: Vec<QualifiedField> = row.field_names().cloned().collect();
+                    for field in own {
+                        row.mark(field, ColumnMark::Own);
+                    }
+                }
                 schema_by_name.insert(name.clone(), row.clone());
                 artifacts.typed_insert(node_id, Arc::new(synthetic_typed_program(row)));
             }
@@ -3274,7 +3306,7 @@ fn bind_schema_inner(
                                 .map(|(field, column)| (field.clone(), column.clone()))
                                 .collect();
                             for (field, column) in undeclared {
-                                row.carry(field, column);
+                                row.mark(field, ColumnMark::Carried(column));
                             }
                         }
                     }
@@ -3486,6 +3518,29 @@ fn bind_schema_inner(
                     schema_by_name,
                     declared_multiple_by_name,
                 );
+            }
+        }
+    }
+
+    // Inside a composition body every bound row must carry its marks: a
+    // row built without them would let a node name every column. A node
+    // kind that forgets to pass the marks on is caught here, loudly, instead
+    // of silently widening what the body may name.
+    if bind_ctx.depth > 0 {
+        for spanned in nodes {
+            let name = spanned.value.name();
+            if schema_by_name
+                .get(name)
+                .is_some_and(|row| !row.in_body_scope())
+            {
+                diags.push(Diagnostic::error(
+                    "E000",
+                    format!(
+                        "internal error: composition node {name:?} was bound without the \
+                         marks that say which columns the composition may use"
+                    ),
+                    LabeledSpan::primary(span_for(spanned), String::new()),
+                ));
             }
         }
     }
@@ -4117,12 +4172,6 @@ fn bind_composition(
         }
     }
 
-    // Bind the body's nodes after the nodes they read. The bind walk binds
-    // in list order and needs each node's input row bound first; an author
-    // may list a node before its input, which used to leave the node
-    // unbound: it escaped every check and its call wrote no rows.
-    order_body_nodes_by_input(&mut body_file.nodes);
-
     // Pre-mint a stable id per body node and per synthetic input-port
     // source BEFORE binding, so the bind walk can key this body's typed /
     // combine side-table entries by id — body node ids are not available
@@ -4190,26 +4239,61 @@ fn bind_composition(
     // W101: a body column written under the name of a caller column one of
     // the input ports passes through undeclared.
     for (port_name, row) in &output_port_rows {
+        let output_node = signature
+            .outputs
+            .get(port_name)
+            .map(|alias| {
+                let internal = alias.internal_ref.value.as_str();
+                internal.split('.').next().unwrap_or(internal)
+            })
+            .unwrap_or_default();
         for (field, _) in row.fields() {
             let column = field.name.as_ref();
-            if column.starts_with('$') || row.carried(field).is_some() {
+            if column.starts_with('$') || !matches!(row.mark_of(field), Some(ColumnMark::Own)) {
                 continue; // an engine column, or the caller's own value
             }
-            let shadowed = port_seeds
+            let Some((input, seed)) = port_seeds
                 .iter()
                 .find(|(_, seed)| seed.undeclared_carried(column).is_some())
-                .map(|(input, _)| input);
-            if let Some(input) = shadowed {
-                diags.push(Diagnostic::warning(
+            else {
+                continue;
+            };
+            let writer = body_writer_of(
+                &body_file.nodes,
+                &body_node_ids,
+                artifacts,
+                output_node,
+                column,
+            );
+            let caller_type = seed
+                .fields()
+                .find(|(seeded, _)| seeded.name.as_ref() == column)
+                .map(|(_, ty)| port_column_type(ty))
+                .unwrap_or_else(|| "any".to_string());
+            let (writer_span, writer_label) = match writer {
+                Some(spanned) => (
+                    span_for_node(spanned),
+                    format!("node {:?} writes `{column}`", spanned.value.name()),
+                ),
+                None => (span, "body creates this column".to_string()),
+            };
+            diags.push(
+                Diagnostic::warning(
                     "W101",
                     format!(
-                        "composition node {node_name:?}, output port {port_name:?}: \
-                         body-declared column {column:?} shadows the column of that \
-                         name input port {input:?} passes through undeclared"
+                        "composition {node_name:?} writes column `{column}` to output port \
+                         {port_name:?}, replacing the caller's `{column}`, which input port \
+                         {input:?} passes through undeclared"
                     ),
-                    LabeledSpan::primary(span, "body creates this column".to_string()),
-                ));
-            }
+                    LabeledSpan::primary(writer_span, writer_label),
+                )
+                .with_help(format!(
+                    "declare `{column}` on input port `{input}` in `{}` so replacing the \
+                     caller's value is part of the port's contract:\n_compose:\n  inputs:\n    \
+                     {input}:\n      schema:\n        - {{ name: {column}, type: {caller_type} }}",
+                    resolved_path.display()
+                )),
+            );
         }
     }
 
@@ -5090,13 +5174,12 @@ fn build_input_port_rows(
             continue;
         };
         let Some(upstream_row) = parent_schemas.get(upstream_name.as_str()) else {
-            diags.push(Diagnostic::error(
-                "E102",
-                format!(
-                    "composition {call:?}: input port `{port_name}` reads {upstream_name:?}, \
-                     which produces no rows Clinker could bind the port to"
-                ),
-                LabeledSpan::primary(span, String::new()),
+            diags.push(unbound_port_upstream(
+                call,
+                port_name,
+                upstream_name,
+                parent_schemas,
+                span,
             ));
             has_errors = true;
             continue;
@@ -5170,12 +5253,70 @@ fn build_input_port_rows(
     if has_errors { None } else { Some(rows) }
 }
 
+/// E102 for a port whose upstream has no bound row. A `node.port`
+/// reference to a node that exists is an output port of a Route or a Cull,
+/// which a composition input port cannot read yet (#888); the fix routes the
+/// rows through a Transform that passes them on.
+fn unbound_port_upstream(
+    call: &str,
+    port: &str,
+    upstream: &str,
+    parent_schemas: &HashMap<String, Row>,
+    span: Span,
+) -> Diagnostic {
+    match upstream.split_once('.') {
+        Some((node, branch)) if parent_schemas.contains_key(node) => {
+            let relay = format!("{node}_{branch}");
+            Diagnostic::error(
+                "E102",
+                format!(
+                    "composition {call:?}: input port `{port}` cannot read {upstream:?}, an \
+                     output port of {node:?}; a composition input port cannot read the output \
+                     port of a Route or a Cull yet"
+                ),
+                LabeledSpan::primary(span, String::new()),
+            )
+            .with_help(format!(
+                "pass the rows through a Transform and feed the port from it: add\n  \
+                 - type: transform\n    name: {relay}\n    input: {upstream}\n    config:\n      \
+                 cxl: |\n        filter true\nthen write `{relay}` for `{upstream}` in the call's \
+                 `input:` and under `inputs:` as `{port}: {relay}` (issue #888 tracks reading the \
+                 branch directly)"
+            ))
+        }
+        _ => Diagnostic::error(
+            "E102",
+            format!(
+                "composition {call:?}: input port `{port}` reads {upstream:?}, which is not a \
+                 node this pipeline binds"
+            ),
+            LabeledSpan::primary(span, String::new()),
+        ),
+    }
+}
+
+/// How E102 says what type a caller provides a column with, in the author's
+/// words: the port spelling where there is one, and a description for a
+/// value a port cannot declare.
+fn provided_type_words(ty: &Type) -> String {
+    match ty {
+        Type::Null => "always empty (every value is null)".to_string(),
+        Type::Array => "as a list".to_string(),
+        Type::Map => "as a map".to_string(),
+        Type::Numeric => "as a number".to_string(),
+        Type::Any => "with no declared type (`any`)".to_string(),
+        other => format!("as `{}`", port_column_type(other)),
+    }
+}
+
 /// Whether a port column declared `declared` admits a caller column of type
 /// `provided`: the same type, `T` into `{ nullable: T }`, or anything into
 /// `any`. A caller column typed `any` is admitted only by `any`.
 fn admits(declared: &Type, provided: &Type) -> bool {
     match declared {
         Type::Any => true,
+        // `{ nullable: any }` is `any`: an empty value is already one.
+        Type::Nullable(inner) if matches!(inner.as_ref(), Type::Any) => true,
         Type::Nullable(inner) => provided == declared || provided == inner.as_ref(),
         _ => provided == declared,
     }
@@ -5217,8 +5358,8 @@ fn port_type_refusal(
     } else {
         format!(
             "composition {call:?}: input port `{port}` declares `{column}` as \
-             `{declared_spelling}`, but {upstream:?} provides `{column}` as \
-             `{provided_spelling}`"
+             `{declared_spelling}`, but {upstream:?} provides `{column}` {}",
+            provided_type_words(provided)
         )
     };
     let help = match (provided, &conversion) {
@@ -5369,51 +5510,195 @@ fn compute_output_rows(
 
 // ─── Port vocabulary ────────────────────────────────────────────────
 
-/// Reorder a composition body's nodes so each comes after every body node it
-/// reads, keeping the authored order wherever it already satisfies that.
-///
-/// Inputs that are not body nodes (the body's input ports) impose no order.
-/// Nodes on a cycle keep their authored order after everything else; the
-/// body graph reports the cycle.
-fn order_body_nodes_by_input(nodes: &mut Vec<Spanned<PipelineNode>>) {
-    let names: HashSet<String> = nodes
+/// The body node nearest `output` (walking its inputs back) whose emits
+/// write `column`: the line W101 points at.
+fn body_writer_of<'a>(
+    nodes: &'a [Spanned<PipelineNode>],
+    node_ids: &HashMap<String, PlanNodeId>,
+    artifacts: &CompileArtifacts,
+    output: &str,
+    column: &str,
+) -> Option<&'a Spanned<PipelineNode>> {
+    let mut queue: std::collections::VecDeque<&str> = std::collections::VecDeque::from([output]);
+    let mut seen: HashSet<&str> = HashSet::new();
+    while let Some(name) = queue.pop_front() {
+        if !seen.insert(name) {
+            continue;
+        }
+        let Some(spanned) = nodes.iter().find(|spanned| spanned.value.name() == name) else {
+            continue;
+        };
+        let mut writes = false;
+        if let Some(typed) = node_ids.get(name).and_then(|id| artifacts.typed_get(*id)) {
+            cxl::ast::for_each_field_emit(&typed.program.statements, &mut |emitted, _| {
+                writes |= emitted == column;
+            });
+        }
+        if writes {
+            return Some(spanned);
+        }
+        queue.extend(node_input_names(&spanned.value));
+    }
+    None
+}
+
+/// The names of the nodes `node` reads, with a port suffix stripped: its
+/// `input:` (or inputs), and for a composition call each `inputs:` port's
+/// upstream.
+fn node_input_names(node: &PipelineNode) -> Vec<&str> {
+    let mut inputs: Vec<&str> = node.direct_input_names();
+    if let PipelineNode::Composition { inputs: ports, .. } = node {
+        inputs.extend(
+            ports
+                .values()
+                .map(|upstream| upstream.split('.').next().unwrap_or(upstream)),
+        );
+    }
+    inputs
+}
+
+/// The order the bind walk binds `nodes` in: each node after every node of
+/// the same scope it reads, keeping the authored order wherever it already
+/// holds. Returns the order and the nodes that could not be placed because
+/// they are on, or read from, a cycle; those come last in the order.
+fn bind_order(nodes: &[Spanned<PipelineNode>]) -> (Vec<usize>, Vec<usize>) {
+    let names: HashSet<&str> = nodes.iter().map(|spanned| spanned.value.name()).collect();
+    let reads: Vec<Vec<&str>> = nodes
         .iter()
-        .map(|spanned| spanned.value.name().to_string())
+        .map(|spanned| {
+            let own = spanned.value.name();
+            node_input_names(&spanned.value)
+                .into_iter()
+                .filter(|input| names.contains(input) && *input != own)
+                .collect()
+        })
         .collect();
-    let inputs_of = |node: &PipelineNode| -> Vec<String> {
-        let mut inputs: Vec<String> = node
-            .direct_input_names()
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-        if let PipelineNode::Composition { inputs: ports, .. } = node {
-            inputs.extend(
-                ports
-                    .values()
-                    .map(|upstream| upstream.split('.').next().unwrap_or(upstream).to_string()),
-            );
+    let mut placed: HashSet<&str> = HashSet::new();
+    let mut order: Vec<usize> = Vec::with_capacity(nodes.len());
+    let mut pending: Vec<usize> = (0..nodes.len()).collect();
+    loop {
+        let Some(at) = pending
+            .iter()
+            .position(|&i| reads[i].iter().all(|input| placed.contains(input)))
+        else {
+            break;
+        };
+        let i = pending.remove(at);
+        placed.insert(nodes[i].value.name());
+        order.push(i);
+    }
+    order.extend(pending.iter().copied());
+    (order, pending)
+}
+
+/// E004 and E107 for a composition body's nodes whose input the bind walk
+/// cannot bind: an input that names no node and no input port of the body,
+/// a node that reads itself, and a cycle. At pipeline level the same shapes
+/// are refused before binding (E004, E002, E003); a body is first read here.
+fn body_input_diagnostics(
+    nodes: &[Spanned<PipelineNode>],
+    unplaced: &[usize],
+    ports: &HashSet<&str>,
+    enclosing: &HashSet<String>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let names: HashSet<&str> = nodes.iter().map(|spanned| spanned.value.name()).collect();
+    let mut port_list: Vec<&str> = ports.iter().copied().collect();
+    port_list.sort_unstable();
+    let port_list = port_list
+        .iter()
+        .map(|port| format!("`{port}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    for spanned in nodes {
+        let node = spanned.value.name();
+        let span = span_for_node(spanned);
+        for input in node_input_names(&spanned.value) {
+            if input == node {
+                diags.push(
+                    Diagnostic::error(
+                        "E107",
+                        format!(
+                            "composition node {node:?} reads itself, so it can never \
+                             receive a row"
+                        ),
+                        LabeledSpan::primary(span, "reads itself".to_string()),
+                    )
+                    .with_help(format!(
+                        "set `input:` of node {node:?} to an input port of the composition \
+                         ({port_list}) or to another node"
+                    )),
+                );
+            } else if !names.contains(input) && !ports.contains(input) && !enclosing.contains(input)
+            {
+                diags.push(
+                    Diagnostic::error(
+                        "E004",
+                        format!(
+                            "composition node {node:?} input {input:?} references no node and \
+                             no input port of the composition"
+                        ),
+                        LabeledSpan::primary(span, format!("reads {input:?}")),
+                    )
+                    .with_help(format!(
+                        "set `input:` of node {node:?} to an input port of the composition \
+                         ({port_list}) or to a node of the composition"
+                    )),
+                );
+            }
         }
-        inputs.retain(|input| names.contains(input) && input != node.name());
-        inputs
+    }
+    // Of the unplaced nodes, report those on a cycle: each reaches itself
+    // through the unplaced nodes it reads.
+    let unplaced_names: HashSet<&str> = unplaced.iter().map(|&i| nodes[i].value.name()).collect();
+    let reads_of = |name: &str| -> Vec<&str> {
+        nodes
+            .iter()
+            .find(|spanned| spanned.value.name() == name)
+            .map(|spanned| {
+                node_input_names(&spanned.value)
+                    .into_iter()
+                    .filter(|input| unplaced_names.contains(input) && *input != name)
+                    .collect()
+            })
+            .unwrap_or_default()
     };
-    let mut pending: Vec<Spanned<PipelineNode>> = std::mem::take(nodes);
-    let mut placed: HashSet<String> = HashSet::new();
-    while !pending.is_empty() {
-        let ready = pending.iter().position(|spanned| {
-            inputs_of(&spanned.value)
-                .iter()
-                .all(|input| placed.contains(input))
-        });
-        match ready {
-            Some(index) => {
-                let node = pending.remove(index);
-                placed.insert(node.value.name().to_string());
-                nodes.push(node);
+    for &i in unplaced {
+        let node = nodes[i].value.name();
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut stack: Vec<&str> = reads_of(node);
+        let mut on_cycle = false;
+        while let Some(next) = stack.pop() {
+            if next == node {
+                on_cycle = true;
+                break;
             }
-            None => {
-                nodes.append(&mut pending);
+            if seen.insert(next) {
+                stack.extend(reads_of(next));
             }
         }
+        if !on_cycle {
+            continue;
+        }
+        let read = reads_of(node);
+        diags.push(
+            Diagnostic::error(
+                "E107",
+                format!(
+                    "composition node {node:?} is on a cycle: it reads {}, which reads it \
+                     back, so none of them can receive a row",
+                    read.iter()
+                        .map(|name| format!("{name:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                LabeledSpan::primary(span_for_node(&nodes[i]), "on a cycle".to_string()),
+            )
+            .with_help(format!(
+                "make one node on the cycle read an input port of the composition \
+                 ({port_list}) or a node outside the cycle"
+            )),
+        );
     }
 }
 
@@ -5433,26 +5718,38 @@ fn seed_port_row(
     declared: &IndexMap<QualifiedField, Type>,
     origin: Arc<PortOrigin>,
 ) -> Row {
-    let mut seed = upstream.clone();
+    // A declaration with a concrete type retypes the column; `any` and
+    // `{ nullable: any }` keep the type this call provides.
+    let typed_by_port = |ty: &Type| !matches!(ty.unwrap_nullable(), Type::Any);
+    let columns: IndexMap<QualifiedField, Type> = upstream
+        .fields()
+        .map(|(field, ty)| match declared.get(field) {
+            Some(port_ty) if !field.name.starts_with('$') && typed_by_port(port_ty) => {
+                (field.clone(), port_ty.clone())
+            }
+            _ => (field.clone(), ty.clone()),
+        })
+        .collect();
+    let mut seed = Row::from_parts(columns, upstream.declared_span, upstream.tail.clone());
+    seed.enter_body_scope();
     let fields: Vec<QualifiedField> = seed.field_names().cloned().collect();
     for field in fields {
         if field.name.starts_with('$') {
-            continue; // engine columns stay nameable where authors may name them
+            // Engine columns stay nameable where authors may name them.
+            seed.mark(field, ColumnMark::Own);
+            continue;
         }
         let access = match declared.get(&field) {
             None => PortAccess::Undeclared,
-            Some(Type::Any) => PortAccess::DeclaredAny,
-            Some(ty) => {
-                seed.retype(&field, ty.clone());
-                PortAccess::Declared
-            }
+            Some(ty) if typed_by_port(ty) => PortAccess::Declared,
+            Some(_) => PortAccess::DeclaredAny,
         };
-        seed.carry(
+        seed.mark(
             field,
-            CarriedColumn {
+            ColumnMark::Carried(CarriedColumn {
                 port: Arc::clone(&origin),
                 access,
-            },
+            }),
         );
     }
     seed
@@ -5463,29 +5760,44 @@ fn seed_port_row(
 /// Inside the body, a carried mark means the column is the caller's,
 /// unchanged. Seen from the calling scope, such a column is whatever it was
 /// in the row that fed the port: the mark that row gave it (from an enclosing
-/// body's own port), or none. A column the body wrote is the calling scope's
-/// own, as any column a node there writes is.
+/// body's own port). A column the body wrote is the calling scope's own, as
+/// any column a node there writes is. When the calling scope is the pipeline
+/// itself, the row leaves the body scope and every column may be named.
 fn carry_into_caller_scope(
     row: Row,
     call_inputs: &IndexMap<String, String>,
     parent_schema_by_name: &HashMap<String, Row>,
 ) -> Row {
-    let marks: Vec<(QualifiedField, Arc<str>)> = row
-        .carried_columns()
-        .map(|(field, column)| (field.clone(), Arc::clone(&column.port.port)))
+    let fed = |port: &str| {
+        call_inputs
+            .get(port)
+            .and_then(|upstream| parent_schema_by_name.get(upstream))
+    };
+    let caller_in_body = call_inputs
+        .keys()
+        .filter_map(|port| fed(port))
+        .any(Row::in_body_scope);
+    let marks: Vec<(QualifiedField, Option<ColumnMark>)> = row
+        .field_names()
+        .map(|field| {
+            let mark = match row.mark_of(field) {
+                Some(ColumnMark::Carried(column)) => fed(&column.port.port)
+                    .and_then(|fed| fed.mark_of(field))
+                    .cloned(),
+                Some(ColumnMark::Own) => Some(ColumnMark::Own),
+                None => None,
+            };
+            (field.clone(), mark)
+        })
         .collect();
     let mut out = row;
-    for (field, _) in &marks {
-        out.release(field);
-    }
-    for (field, port) in marks {
-        let caller_mark = call_inputs
-            .get(port.as_ref())
-            .and_then(|upstream| parent_schema_by_name.get(upstream))
-            .and_then(|fed| fed.carried(&field))
-            .cloned();
-        if let Some(mark) = caller_mark {
-            out.carry(field, mark);
+    out.leave_body_scope();
+    if caller_in_body {
+        out.enter_body_scope();
+        for (field, mark) in marks {
+            if let Some(mark) = mark {
+                out.mark(field, mark);
+            }
         }
     }
     out
@@ -5574,10 +5886,7 @@ fn undeclared_column_diagnostic(
 /// every column except one a composition port carries undeclared.
 fn nameable_columns(row: &Row) -> Vec<&str> {
     row.field_names()
-        .filter(|field| {
-            row.carried(field)
-                .is_none_or(|column| column.access != PortAccess::Undeclared)
-        })
+        .filter(|field| row.is_nameable(field))
         .map(|field| field.name.as_ref())
         .collect()
 }
@@ -5621,9 +5930,13 @@ fn resolve_against_row(
             cxl::analyzer::visitor::walk_expr(self, expr);
         }
     }
+    // Field references are collected only where a refusal can need them:
+    // in a composition body, whose rows mark the columns the body may use.
     let mut refs = FieldRefs(Vec::new());
-    for statement in &program.statements {
-        cxl::analyzer::visitor::Visitor::visit_statement(&mut refs, statement);
+    if row.in_body_scope() {
+        for statement in &program.statements {
+            cxl::analyzer::visitor::Visitor::visit_statement(&mut refs, statement);
+        }
     }
     let names = nameable_columns(row);
     cxl::resolve::resolve_program_with_modules_and_vars(
@@ -5660,99 +5973,150 @@ fn resolve_against_row(
     })
 }
 
-/// E169 for each column a resolved program names outside the resolver's
-/// reach: a `distinct by` field, and the field a positional window call
-/// (`$window.first().amount`) reads.
-fn undeclared_names_outside_resolver(
-    program: &cxl::ast::Program,
-    row: &Row,
-    node: &str,
-    span: Span,
-) -> Vec<Diagnostic> {
-    struct Names(Vec<Box<str>>);
-    impl cxl::analyzer::visitor::Visitor for Names {
-        fn visit_statement(&mut self, statement: &Statement) {
-            if let Statement::Distinct {
-                field: Some(field), ..
-            } = statement
-            {
-                self.0.push(field.clone());
-            }
-            cxl::analyzer::visitor::walk_statement(self, statement);
-        }
-        fn visit_expr(&mut self, expr: &Expr) {
-            if let Expr::MethodCall {
-                receiver,
-                method,
-                args,
-                ..
-            } = expr
-                && args.is_empty()
-                && let Expr::WindowCall { function, .. } = receiver.as_ref()
-                && matches!(function.as_ref(), "first" | "last" | "lag" | "lead")
-            {
-                self.0.push(method.clone());
-            }
-            cxl::analyzer::visitor::walk_expr(self, expr);
-        }
-    }
-    let mut names = Names(Vec::new());
-    for statement in &program.statements {
-        cxl::analyzer::visitor::Visitor::visit_statement(&mut names, statement);
-    }
-    let mut seen: Vec<&str> = Vec::new();
-    let mut out = Vec::new();
-    for name in &names.0 {
-        if seen.contains(&name.as_ref()) {
-            continue;
-        }
-        seen.push(name);
-        out.extend(refuse_undeclared(row, node, name, span));
-    }
-    out
+/// The column names a resolved program reads, gathered in one walk for the
+/// checks a composition body adds: the names the resolver does not check
+/// (`distinct by` fields, positional window fields, qualified references),
+/// and each field reference with its span.
+#[derive(Default)]
+struct BodyReads {
+    /// `(qualifier, name)` for a name outside the resolver's reach; the
+    /// qualifier is set for a qualified reference.
+    unresolved: Vec<(Option<String>, Box<str>)>,
+    /// Each column field reference, with its span.
+    fields: Vec<(cxl::lexer::Span, Box<str>)>,
 }
 
-/// The columns a resolved program reads that its composition port declares
-/// `any`: the body sees them with the type this call provides, so a type
-/// error over one is specific to this call.
-fn caller_typed_reads<'a>(
-    resolved: &cxl::resolve::ResolvedProgram,
-    row: &'a Row,
-) -> Vec<(&'a QualifiedField, &'a CarriedColumn)> {
-    struct Reads<'b> {
-        bindings: &'b [Option<cxl::resolve::ResolvedBinding>],
-        names: Vec<Box<str>>,
-    }
-    impl cxl::analyzer::visitor::Visitor for Reads<'_> {
-        fn visit_expr(&mut self, expr: &Expr) {
-            if let Expr::FieldRef { node_id, name, .. } = expr
-                && matches!(
-                    self.bindings.get(node_id.0 as usize),
-                    Some(Some(cxl::resolve::ResolvedBinding::Field(_)))
-                )
-                && !self.names.contains(name)
-            {
-                self.names.push(name.clone());
-            }
-            cxl::analyzer::visitor::walk_expr(self, expr);
+impl BodyReads {
+    fn collect(resolved: &cxl::resolve::ResolvedProgram) -> Self {
+        struct Walk<'a> {
+            bindings: &'a [Option<cxl::resolve::ResolvedBinding>],
+            reads: BodyReads,
         }
+        impl cxl::analyzer::visitor::Visitor for Walk<'_> {
+            fn visit_statement(&mut self, statement: &Statement) {
+                if let Statement::Distinct {
+                    field: Some(field), ..
+                } = statement
+                {
+                    self.reads.unresolved.push((None, field.clone()));
+                }
+                cxl::analyzer::visitor::walk_statement(self, statement);
+            }
+            fn visit_expr(&mut self, expr: &Expr) {
+                let binding = |node_id: &cxl::ast::NodeId| {
+                    self.bindings
+                        .get(node_id.0 as usize)
+                        .and_then(|binding| binding.as_ref())
+                };
+                match expr {
+                    Expr::FieldRef {
+                        node_id,
+                        name,
+                        span,
+                    } if matches!(
+                        binding(node_id),
+                        Some(cxl::resolve::ResolvedBinding::Field(_))
+                    ) =>
+                    {
+                        self.reads.fields.push((*span, name.clone()));
+                    }
+                    // A qualified reference reads its last part; outside a
+                    // Combine the qualifier names no input.
+                    Expr::QualifiedFieldRef { node_id, parts, .. }
+                        if !matches!(
+                            binding(node_id),
+                            Some(cxl::resolve::ResolvedBinding::ModuleConstant(..))
+                        ) =>
+                    {
+                        if let Some((name, qualifier)) = parts.split_last() {
+                            let qualifier = qualifier
+                                .iter()
+                                .map(|part| part.as_ref())
+                                .collect::<Vec<&str>>()
+                                .join(".");
+                            self.reads.unresolved.push((Some(qualifier), name.clone()));
+                        }
+                    }
+                    Expr::MethodCall {
+                        receiver,
+                        method,
+                        args,
+                        ..
+                    } if args.is_empty()
+                        && matches!(
+                            receiver.as_ref(),
+                            Expr::WindowCall { function, .. }
+                                if matches!(function.as_ref(), "first" | "last" | "lag" | "lead")
+                        ) =>
+                    {
+                        self.reads.unresolved.push((None, method.clone()));
+                    }
+                    _ => {}
+                }
+                cxl::analyzer::visitor::walk_expr(self, expr);
+            }
+        }
+        let mut walk = Walk {
+            bindings: &resolved.bindings,
+            reads: BodyReads::default(),
+        };
+        for statement in &resolved.program.statements {
+            cxl::analyzer::visitor::Visitor::visit_statement(&mut walk, statement);
+        }
+        walk.reads
     }
-    let mut reads = Reads {
-        bindings: &resolved.bindings,
-        names: Vec::new(),
-    };
-    for statement in &resolved.program.statements {
-        cxl::analyzer::visitor::Visitor::visit_statement(&mut reads, statement);
+
+    /// E169 for each name outside the resolver's reach that `row` carries
+    /// undeclared. A qualified reference is checked against the input its
+    /// qualifier names when the row has one, and by its bare name otherwise,
+    /// which is the column the runtime reads.
+    fn refused(&self, row: &Row, node: &str, span: Span) -> Vec<Diagnostic> {
+        let mut seen: Vec<&str> = Vec::new();
+        let mut out = Vec::new();
+        for (qualifier, name) in &self.unresolved {
+            if seen.contains(&name.as_ref()) {
+                continue;
+            }
+            let qualified_input = qualifier.as_deref().filter(|qualifier| {
+                row.field_names()
+                    .any(|field| field.qualifier.as_deref() == Some(*qualifier))
+            });
+            let refused = match qualified_input {
+                Some(qualifier) => {
+                    row.undeclared_carried_qualified(qualifier, name)
+                        .map(|carried| {
+                            let ty = row
+                                .declared_map()
+                                .get(&QualifiedField::qualified(qualifier, name.as_ref()));
+                            undeclared_column_diagnostic(node, name, carried, ty, span)
+                        })
+                }
+                None => refuse_undeclared(row, node, name, span),
+            };
+            if let Some(diag) = refused {
+                seen.push(name);
+                out.push(diag);
+            }
+        }
+        out
     }
-    row.carried_columns()
-        .filter(|(field, column)| {
-            column.access == PortAccess::DeclaredAny
-                && reads
-                    .names
-                    .iter()
-                    .any(|name| name.as_ref() == field.name.as_ref())
-        })
-        .collect()
+
+    /// The `any`-declared column the field reference inside `within` reads,
+    /// if one does: the column a type error spanning `within` is about.
+    fn caller_typed_in<'r>(
+        &self,
+        row: &'r Row,
+        within: cxl::lexer::Span,
+    ) -> Option<(&'r QualifiedField, &'r CarriedColumn)> {
+        self.fields
+            .iter()
+            .filter(|(at, _)| within.start <= at.start && at.end <= within.end)
+            .find_map(|(_, name)| {
+                row.carried_columns().find(|(field, column)| {
+                    column.access == PortAccess::DeclaredAny && field.name.as_ref() == name.as_ref()
+                })
+            })
+    }
 }
 
 /// How a port schema spells `ty`: the spelling a `- { name: ..., type: ... }`
@@ -6405,55 +6769,82 @@ fn typecheck_parsed_program(
         &scoped_vars.module_exports,
         scoped_vars,
     )?;
-    let refused = undeclared_names_outside_resolver(&resolved.program, schema, node, span);
+    // The composition-body checks walk the program once, and only inside a
+    // body: outside one no column carries a mark.
+    let reads = if schema.in_body_scope() {
+        BodyReads::collect(&resolved)
+    } else {
+        BodyReads::default()
+    };
+    let refused = reads.refused(schema, node, span);
     if !refused.is_empty() {
         return Err(refused);
     }
-    let caller_typed: Vec<(QualifiedField, CarriedColumn, Type)> =
-        caller_typed_reads(&resolved, schema)
-            .into_iter()
-            .map(|(field, column)| {
-                let ty = schema
-                    .declared_map()
-                    .get(field)
-                    .cloned()
-                    .unwrap_or(Type::Any);
-                (field.clone(), column.clone(), ty)
-            })
-            .collect();
     cxl::typecheck::pass::type_check_with_mode_and_vars(resolved, schema, mode.clone(), scoped_vars)
         .map(|mut typed| {
             fold_body_config(&mut typed, scoped_vars);
             typed.with_source(source)
         })
         .map_err(|diags| {
-            let errors: Vec<String> = diags
-                .iter()
-                .filter(|d| !d.is_warning)
-                .map(|d| d.message.clone())
-                .collect();
-            let joined = if errors.is_empty() {
-                diags
-                    .into_iter()
-                    .map(|d| d.message)
-                    .collect::<Vec<_>>()
-                    .join("; ")
+            let errors: Vec<&cxl::typecheck::TypeDiagnostic> =
+                diags.iter().filter(|d| !d.is_warning).collect();
+            let errors = if errors.is_empty() {
+                diags.iter().collect()
             } else {
-                errors.join("; ")
+                errors
             };
-            vec![match caller_typed.first() {
-                // The program reads a column its port declares `any`: the
-                // node sees the type this call provides, so the error is
-                // this call's, and the author has to learn that first.
-                Some((field, column, ty)) => {
-                    caller_typed_type_error(node, field, column, ty, &joined, span)
+            // An error inside an expression that reads a column the port
+            // declares `any` is this call's: the node sees the type the call
+            // provides, so the author has to learn that first. Every other
+            // error is the node's own.
+            let mut out: Vec<Diagnostic> = Vec::new();
+            let mut by_column: Vec<(&QualifiedField, &CarriedColumn, Vec<&str>)> = Vec::new();
+            let mut plain: Vec<&cxl::typecheck::TypeDiagnostic> = Vec::new();
+            for error in errors {
+                match reads.caller_typed_in(schema, error.span) {
+                    Some((field, column)) => {
+                        match by_column.iter_mut().find(|(seen, _, _)| *seen == field) {
+                            Some((_, _, details)) => details.push(&error.message),
+                            None => by_column.push((field, column, vec![&error.message])),
+                        }
+                    }
+                    None => plain.push(error),
                 }
-                None => Diagnostic::error(
+            }
+            for (field, column, details) in by_column {
+                let ty = schema
+                    .declared_map()
+                    .get(field)
+                    .cloned()
+                    .unwrap_or(Type::Any);
+                out.push(caller_typed_type_error(
+                    node,
+                    field,
+                    column,
+                    &ty,
+                    &details.join("; "),
+                    span,
+                ));
+            }
+            if !plain.is_empty() {
+                let joined = plain
+                    .iter()
+                    .map(|d| d.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let helps: Vec<&str> = plain.iter().filter_map(|d| d.help.as_deref()).collect();
+                let diag = Diagnostic::error(
                     "E200",
                     format!("CXL type error in {node_name:?}: {joined}"),
                     LabeledSpan::primary(span, String::new()),
-                ),
-            }]
+                );
+                out.push(if helps.is_empty() {
+                    diag
+                } else {
+                    diag.with_help(helps.join("; "))
+                });
+            }
+            out
         })
 }
 
@@ -6972,7 +7363,7 @@ fn compile_footer_section(
 /// mark unless the Transform writes it, which makes it the body's own.
 fn propagate_row(upstream: &Row, typed: &TypedProgram) -> Row {
     let mut out = upstream.declared_map().clone();
-    let mut written: HashSet<QualifiedField> = HashSet::new();
+    let mut written: Vec<QualifiedField> = Vec::new();
     cxl::ast::for_each_field_emit(&typed.program.statements, &mut |name, expr| {
         let emit_type = typed
             .types
@@ -6980,10 +7371,13 @@ fn propagate_row(upstream: &Row, typed: &TypedProgram) -> Row {
             .and_then(|t| t.clone())
             .unwrap_or(Type::Any);
         out.insert(QualifiedField::bare(name), emit_type);
-        written.insert(QualifiedField::bare(name));
+        written.push(QualifiedField::bare(name));
     });
     let mut row = Row::from_parts(out, upstream.declared_span, upstream.tail.clone());
-    row.inherit_carried(upstream, |field| !written.contains(field));
+    row.inherit_marks(upstream, |field| !written.contains(field));
+    for field in written {
+        row.mark(field, ColumnMark::Own);
+    }
     row
 }
 
@@ -7161,6 +7555,7 @@ fn propagate_aggregate(
     // here still recurses so the typed `output_row` stays coherent with
     // every other emit-name collector — the rejection diagnostic
     // supersedes whatever schema this produces.
+    let mut written: Vec<QualifiedField> = Vec::new();
     cxl::ast::for_each_field_emit(&typed.program.statements, &mut |name, expr| {
         let emit_type = typed
             .types
@@ -7168,6 +7563,7 @@ fn propagate_aggregate(
             .and_then(|t| t.clone())
             .unwrap_or(Type::Any);
         out.insert(QualifiedField::bare(name), emit_type);
+        written.push(QualifiedField::bare(name));
     });
     // Detect relaxed mode by walking the upstream row for `$ck.<field>`
     // shadow columns whose source field is missing from `group_by`.
@@ -7211,15 +7607,20 @@ fn propagate_aggregate(
             Type::Any,
         );
     }
-    let mut written: HashSet<QualifiedField> = HashSet::new();
-    cxl::ast::for_each_field_emit(&typed.program.statements, &mut |name, _| {
-        written.insert(QualifiedField::bare(name));
-    });
     let mut row = Row::from_parts(out, upstream.declared_span, upstream.tail.clone());
-    // A group key holds the caller's value; an emitted column is the body's.
-    row.inherit_carried(upstream, |field| {
+    // A group key holds the caller's value; an emitted column and the
+    // engine's own columns are the body's.
+    row.inherit_marks(upstream, |field| {
         group_by.iter().any(|gb| gb == field.name.as_ref()) && !written.contains(field)
     });
+    let own: Vec<QualifiedField> = row
+        .field_names()
+        .filter(|field| written.contains(field) || field.name.starts_with('$'))
+        .cloned()
+        .collect();
+    for field in own {
+        row.mark(field, ColumnMark::Own);
+    }
     row
 }
 
@@ -7365,19 +7766,28 @@ fn bind_combine(
 
     let cxl_span = cxl::lexer::Span::new(span.start as usize, span.start as usize);
     let mut merged_row = Row::closed(merged_declared, cxl_span);
-    // Each input's carried columns stay carried under their qualifier, so
+    // Each input's marks stay on its columns under their qualifier, so
     // `b.extra` is refused where `b`'s port does not declare `extra`.
+    let inputs_in_body = artifacts
+        .combine_inputs
+        .get(&id)
+        .is_some_and(|inputs| inputs.values().any(|input| input.row.in_body_scope()));
+    if inputs_in_body {
+        merged_row.enter_body_scope();
+    }
     for (qualifier, input) in artifacts
         .combine_inputs
         .get(&id)
         .into_iter()
         .flat_map(|inputs| inputs.iter())
     {
-        for (field, column) in input.row.carried_columns() {
-            merged_row.carry(
-                QualifiedField::qualified(qualifier.as_str(), field.name.clone()),
-                column.clone(),
-            );
+        for field in input.row.field_names() {
+            if let Some(mark) = input.row.mark_of(field) {
+                merged_row.mark(
+                    QualifiedField::qualified(qualifier.as_str(), field.name.clone()),
+                    mark.clone(),
+                );
+            }
         }
     }
 
@@ -7560,8 +7970,20 @@ fn bind_combine(
             }
         }
         let mut output_row = Row::closed(output_decl, cxl_span);
-        // The driver's columns pass through collect mode unchanged.
-        output_row.inherit_carried(&driver_input.row, |_| true);
+        // The driver's columns pass through collect mode unchanged; the
+        // matched-array column and the propagated keys are the engine's.
+        output_row.inherit_marks(&driver_input.row, |_| true);
+        let own: Vec<QualifiedField> = output_row
+            .field_names()
+            .filter(|field| {
+                field.name.as_ref() == build_qualifier.as_str()
+                    || (field.name.starts_with('$') && driver_input.row.mark_of(field).is_none())
+            })
+            .cloned()
+            .collect();
+        for field in own {
+            output_row.mark(field, ColumnMark::Own);
+        }
         schema_by_name.insert(name.to_string(), output_row.clone());
         artifacts.typed_insert(id, Arc::new(synthetic_typed_program(output_row)));
         return;
@@ -7615,7 +8037,7 @@ fn bind_combine(
         .map(|input| input.row.clone());
     let driver_qualifier_for_row = artifacts.combine_driving.get(&id).cloned();
     let inputs_for_row = artifacts.combine_inputs.get(&id);
-    let output_row = combine_output_row(
+    let mut output_row = combine_output_row(
         &body_typed,
         driver_row.as_ref(),
         inputs_for_row,
@@ -7623,6 +8045,15 @@ fn bind_combine(
         &config.propagate_ck,
         cxl_span,
     );
+    // The output holds only the body's emits and the engine's columns: in a
+    // composition body every one of them is the body's own.
+    if inputs_in_body {
+        output_row.enter_body_scope();
+        let own: Vec<QualifiedField> = output_row.field_names().cloned().collect();
+        for field in own {
+            output_row.mark(field, ColumnMark::Own);
+        }
+    }
     schema_by_name.insert(name.to_string(), output_row.clone());
     let mut body_typed = body_typed;
     body_typed.output_row = output_row;
