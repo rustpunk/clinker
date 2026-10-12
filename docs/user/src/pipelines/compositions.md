@@ -98,9 +98,13 @@ For the `risk_score` composition above, a call fed rows of `order_id`,
 
 A Sink with `include_unmapped: false` reading the call writes only the columns
 the node behind the composition's first output port emits, as it would after
-the same nodes written inline. One case does not yet match the inline nodes:
-an Aggregate inside a composition fed by a source that declares a
-`correlation_key` stops with `E314` where the inline Aggregate runs.
+the same nodes written inline. Some shapes do not yet match the inline nodes:
+a call carries only the rows of its composition's first output port, so a
+composition whose output reads a Route, one with several output ports, and a
+Cull's `removed_to` rows do not reach the pipeline as they would inline
+([#1315](https://github.com/rustpunk/clinker/issues/1315)); and an Aggregate
+inside a composition fed by a source that declares a `correlation_key` stops
+with `E314` where the inline Aggregate runs.
 
 The composition's nodes see each declared column with the type the port
 declares, at every call, so a composition that compiles against its ports
