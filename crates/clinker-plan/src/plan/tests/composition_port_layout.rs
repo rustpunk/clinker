@@ -352,29 +352,211 @@ fn body_column_type(plan: &CompiledPlan, node: &str, column: &str) -> cxl::typec
     }
 }
 
-#[test]
-fn a_column_the_port_types_is_seen_with_the_port_type() {
-    // The port declares `v: int`; this caller's `v` is untyped. The body is
-    // typed by its port, as a function body is typed by its parameters, so
-    // the identity emit is an `int` at every call.
-    let composition = comp(
-        r#"  - type: transform
+/// A composition `c` whose port `inp` declares `columns` (YAML flow
+/// entries, one per line) and whose body is `body`, read out of node `last`.
+fn comp_declaring(columns: &[&str], body: &str) -> String {
+    let schema: String = columns
+        .iter()
+        .map(|column| format!("        - {column}\n"))
+        .collect();
+    format!(
+        r#"_compose:
+  name: c
+  inputs:
+    inp:
+      schema:
+{schema}  outputs:
+    out: last
+  config_schema: {{}}
+
+nodes:
+{body}"#
+    )
+}
+
+const IDENTITY_BODY: &str = r#"  - type: transform
     name: last
     input: inp
     config:
       cxl: |
         emit y = v
-"#,
+"#;
+
+/// The one E102 a compile draws, with every fragment the house style
+/// requires in its first sentence and its fix.
+fn assert_port_refuses(
+    compiled: Result<CompiledPlan, Vec<Diagnostic>>,
+    sentence: &[&str],
+    fix: &[&str],
+) {
+    let Err(diags) = compiled else {
+        panic!("the port must refuse the caller's column");
+    };
+    assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
+    let diag = &diags[0];
+    assert_eq!(diag.code, "E102", "{:#?}", describe(&diags));
+    for fragment in sentence {
+        assert!(
+            diag.message.contains(fragment),
+            "the message names {fragment:?}: {}",
+            diag.message
+        );
+    }
+    assert!(
+        !diag.message.contains("Nullable(") && !diag.message.contains("Int"),
+        "no internal type names: {}",
+        diag.message
     );
-    let plan = compile_in(
-        &pipeline_with_v("any"),
-        &[("compositions/c.comp.yaml", &composition)],
-    )
-    .unwrap_or_else(|d| panic!("compiles: {:#?}", describe(&d)));
+    let help = diag.help.as_deref().expect("E102 carries the fix");
+    for fragment in fix {
+        assert!(
+            help.contains(fragment),
+            "the fix carries {fragment:?}: {help}"
+        );
+    }
+}
+
+#[test]
+fn an_untyped_caller_column_is_refused_by_a_typed_port() {
+    // The port declares `v: int`; this caller's `v` has no declared type.
+    // The body is typed by its port, so the call has to guarantee the type.
+    assert_port_refuses(
+        compile_in(
+            &pipeline_with_v("any"),
+            &[("compositions/c.comp.yaml", &comp(IDENTITY_BODY))],
+        ),
+        &[
+            "composition \"call\"",
+            "input port `inp`",
+            "`v`",
+            "`int`",
+            "\"src\"",
+            "`any`",
+        ],
+        &["- { name: v, type: int }", "source \"src\""],
+    );
+}
+
+#[test]
+fn an_untyped_caller_column_from_a_transform_is_refused_with_a_conversion() {
+    let pipeline = PIPELINE
+        .replace("{ name: v, type: int }", "{ name: v, type: any }")
+        .replace(
+            "  - type: composition\n    name: call\n    input: src\n",
+            "  - type: transform\n    name: pre\n    input: src\n    config:\n      cxl: |\n        emit tag = 1\n  - type: composition\n    name: call\n    input: pre\n",
+        )
+        .replace("      inp: src\n", "      inp: pre\n");
+    assert_port_refuses(
+        compile_in(
+            &pipeline,
+            &[("compositions/c.comp.yaml", &comp(IDENTITY_BODY))],
+        ),
+        &["input port `inp`", "`v`", "\"pre\""],
+        &["emit v = v.to_int()"],
+    );
+}
+
+#[test]
+fn a_port_declared_nullable_admits_the_non_empty_type_and_types_the_body_nullable() {
+    let composition = comp_declaring(
+        &[
+            "{ name: v, type: { nullable: int } }",
+            "{ name: department, type: string }",
+        ],
+        IDENTITY_BODY,
+    );
+    let plan =
+        compile_in(PIPELINE, &[("compositions/c.comp.yaml", &composition)]).unwrap_or_else(|d| {
+            panic!(
+                "`int` is admitted into `{{ nullable: int }}`: {:#?}",
+                describe(&d)
+            )
+        });
     assert_eq!(
         body_column_type(&plan, "last", "y"),
-        cxl::typecheck::Type::Int
+        cxl::typecheck::Type::nullable(cxl::typecheck::Type::Int),
+        "the body sees the port's type, not the caller's"
     );
+}
+
+/// [`PIPELINE`] with a Transform `pre` before the call that writes `w2`,
+/// empty on the first row: the call's caller column `w2` is nullable.
+fn pipeline_with_nullable_w2() -> String {
+    PIPELINE
+        .replace(
+            "  - type: composition\n    name: call\n    input: src\n",
+            "  - type: transform\n    name: pre\n    input: src\n    config:\n      cxl: |\n        emit w2 = if v > 5 then 1 else null\n  - type: composition\n    name: call\n    input: pre\n",
+        )
+        .replace("      inp: src\n", "      inp: pre\n")
+}
+
+#[test]
+fn a_typed_port_refuses_a_nullable_caller_column() {
+    let composition = comp_declaring(
+        &[
+            "{ name: v, type: int }",
+            "{ name: department, type: string }",
+            "{ name: w2, type: int }",
+        ],
+        IDENTITY_BODY,
+    );
+    assert_port_refuses(
+        compile_in(
+            &pipeline_with_nullable_w2(),
+            &[("compositions/c.comp.yaml", &composition)],
+        ),
+        &["`w2`", "`int`", "`{ nullable: int }`", "\"pre\""],
+        &["- { name: w2, type: { nullable: int } }", "c.comp.yaml"],
+    );
+}
+
+#[test]
+fn a_port_declared_any_admits_every_caller_type() {
+    let composition = comp_declaring(
+        &[
+            "{ name: v, type: any }",
+            "{ name: department, type: string }",
+            "{ name: w2, type: any }",
+        ],
+        IDENTITY_BODY,
+    );
+    let pipeline =
+        pipeline_with_nullable_w2().replace("{ name: v, type: int }", "{ name: v, type: any }");
+    compile_in(&pipeline, &[("compositions/c.comp.yaml", &composition)])
+        .unwrap_or_else(|d| panic!("`any` admits anything: {:#?}", describe(&d)));
+}
+
+#[test]
+fn the_e169_fix_for_a_nullable_caller_column_compiles_when_pasted() {
+    let body = r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit r = w2
+"#;
+    let pipeline = pipeline_with_nullable_w2();
+    let Err(diags) = compile_in(&pipeline, &[("compositions/c.comp.yaml", &comp(body))]) else {
+        panic!("`w2` is not declared on the port");
+    };
+    assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
+    let help = diags[0].help.as_deref().expect("E169 carries the fix");
+    let declaration = help
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("- { name: w2"))
+        .unwrap_or_else(|| panic!("the fix declares `w2`: {help}"));
+    assert_eq!(declaration, "- { name: w2, type: { nullable: int } }");
+    let pasted = comp_declaring(
+        &[
+            "{ name: v, type: int }",
+            "{ name: department, type: string }",
+            declaration.trim_start_matches("- "),
+        ],
+        body,
+    );
+    compile_in(&pipeline, &[("compositions/c.comp.yaml", &pasted)])
+        .unwrap_or_else(|d| panic!("the pasted fix compiles: {:#?}", describe(&d)));
 }
 
 #[test]
