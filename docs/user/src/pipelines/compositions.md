@@ -166,10 +166,13 @@ declare, the composition's value replaces the caller's and the compiler warns
 with `W101`. Nodes may be listed in any order; each is bound after the nodes it
 reads. A node that reads itself or sits on a cycle fails with `E107`, and one
 whose `input:` names neither a node nor an input port of the composition fails
-with `E004`. A node that reads an input port declared `required: false` needs
-every call to bind that port: a call that leaves it unbound fails with `E104`,
-and the help prints the `inputs:` entry to add. Only a port no node reads may
-be left unbound. Run `clinker explain --code E169` for details.
+with `E004`. A node that reads an input port declared `required: false`, or
+an output port that is such an input port, needs every call to bind that port:
+a call that leaves it unbound fails with `E104`, and the help prints the
+`inputs:` entry to add. Only a port nothing in the composition reads may be
+left unbound. A help that prints YAML or a line of CXL to paste prints it only
+after the compiler has tried it and the composition compiled with it; when no
+such fix works, the help says in one sentence what to change. Run `clinker explain --code E169` for details.
 
 ### Reading config parameters in the body
 
@@ -284,7 +287,8 @@ For compositions with multiple input ports, bind every declared port by name:
 The primary `input:` must be present for the current YAML node shape. The
 planner builds composition edges from the named `inputs:` map, so that map must
 contain every required port declared by `_compose.inputs`, and every port
-declared `required: false` that a node of the composition reads (`E104`).
+declared `required: false` that a node of the composition reads or an output
+port carries (`E104`).
 
 Downstream nodes consume a composition's declared output ports using the usual
 `node.port` syntax. If there is only one output port, the bare composition node

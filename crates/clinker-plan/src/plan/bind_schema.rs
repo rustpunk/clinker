@@ -406,6 +406,13 @@ pub(crate) struct BindContext<'a> {
     /// The body nodes the composition being bound names as its outputs;
     /// empty at the top level.
     pub body_outputs: HashSet<String>,
+    /// The input ports the call being bound binds, in the order the
+    /// composition declares them; empty at the top level.
+    pub body_ports: Vec<String>,
+    /// Whether this bind is a trial of an edit a help would print (see
+    /// [`crate::plan::fix_offer`]). A trial only has to say whether the edit
+    /// compiles, so the helps raised inside it are not checked in turn.
+    pub verifying: bool,
 }
 
 // ─── Public entry point ─────────────────────────────────────────────
@@ -482,6 +489,8 @@ pub fn bind_schema(
         resource_catalog: &resource_catalog,
         passed_contract_checks: Vec::new(),
         body_outputs: HashSet::new(),
+        body_ports: Vec::new(),
+        verifying: false,
     };
     bind_schema_inner(
         nodes,
@@ -2695,7 +2704,7 @@ fn bind_schema_inner(
     artifacts: &mut CompileArtifacts,
     schema_by_name: &mut HashMap<String, Row>,
     declared_multiple_by_name: &mut HashMap<String, BTreeSet<String>>,
-) {
+) -> HashSet<String> {
     let span_for = |spanned: &Spanned<PipelineNode>| -> Span {
         let line = spanned.referenced.line() as u32;
         if line > 0 {
@@ -2731,44 +2740,76 @@ fn bind_schema_inner(
     // list a node before its input; binding in list order left such a node
     // unbound, so it escaped every check and wrote no rows.
     let (order, unplaced) = bind_order(nodes);
-    // The nodes of this scope that failed to bind: those on a cycle, and
-    // each whose own bind raised an error. A call reading one of them is
-    // not told a second time that it reads a node with no row.
+    // The nodes of this scope that failed to bind: those on a cycle, each
+    // whose own bind raised an error, and each left without a row because a
+    // node it reads failed. A call reading one of them is not told a second
+    // time that it reads a node with no row.
     let mut failed_nodes: HashSet<String> = unplaced
         .iter()
         .map(|&i| nodes[i].value.name().to_string())
         .collect();
-    // The node being bound and where its diagnostics start.
-    let mut binding: Option<(String, usize)> = None;
+    // The node being bound (its index) and where its diagnostics start.
+    let mut binding: Option<(usize, usize)> = None;
     fn settle(
-        binding: &mut Option<(String, usize)>,
+        binding: &mut Option<(usize, usize)>,
+        nodes: &[Spanned<PipelineNode>],
         diags: &[Diagnostic],
+        schema_by_name: &HashMap<String, Row>,
         failed_nodes: &mut HashSet<String>,
     ) {
-        if let Some((name, from)) = binding.take()
-            && diags[from..].iter().any(|d| d.severity == Severity::Error)
-        {
-            failed_nodes.insert(name);
+        let Some((i, from)) = binding.take() else {
+            return;
+        };
+        let node = &nodes[i].value;
+        let name = node.name();
+        let own_error = diags[from..].iter().any(|d| d.severity == Severity::Error);
+        let upstream_failed = !schema_by_name.contains_key(name)
+            && node_input_names(node)
+                .iter()
+                .any(|input| failed_nodes.contains(*input));
+        if own_error || upstream_failed {
+            failed_nodes.insert(name.to_string());
         }
     }
+    // In a body, the inputs no node or port names, the nodes that read
+    // themselves and the cycles; each such node has failed before it binds.
+    let mut body_fixes: Vec<BodyInputFix> = Vec::new();
     if bind_ctx.depth > 0 {
         let ports: HashSet<&str> = schema_by_name.keys().map(String::as_str).collect();
-        body_input_diagnostics(
-            nodes,
-            &unplaced,
-            &ports,
-            &bind_ctx.enclosing_scope_names,
-            &bind_ctx.body_outputs,
+        let faults = body_input_diagnostics(
+            &BodyInputs {
+                nodes,
+                unplaced: &unplaced,
+                ports: &ports,
+                declared_ports: &bind_ctx.body_ports,
+                enclosing: &bind_ctx.enclosing_scope_names,
+                outputs: &bind_ctx.body_outputs,
+            },
             diags,
         );
+        failed_nodes.extend(faults.failed);
+        body_fixes = faults.fixes;
     }
 
-    for spanned in order.iter().map(|&i| &nodes[i]) {
-        settle(&mut binding, diags, &mut failed_nodes);
+    for &index in &order {
+        settle(
+            &mut binding,
+            nodes,
+            diags,
+            schema_by_name,
+            &mut failed_nodes,
+        );
+        let spanned = &nodes[index];
         let node = &spanned.value;
         let name = node.name().to_string();
         let span = span_for(spanned);
-        binding = Some((name.clone(), diags.len()));
+        // A body node that cannot receive a row (it reads itself, a name
+        // that is nothing in the body, or sits on or after a cycle) was
+        // reported above; binding it would only raise followers.
+        if bind_ctx.depth > 0 && failed_nodes.contains(&name) {
+            continue;
+        }
+        binding = Some((index, diags.len()));
         // The node's stable id for this scope. Pre-minted before the walk
         // (top-level vector zip, or body pre-mint), so every visited node
         // is present. A missing entry can only mean an internal pre-mint /
@@ -3640,7 +3681,29 @@ fn bind_schema_inner(
             }
         }
     }
-    settle(&mut binding, diags, &mut failed_nodes);
+    settle(
+        &mut binding,
+        nodes,
+        diags,
+        schema_by_name,
+        &mut failed_nodes,
+    );
+
+    // Each fix a body input diagnostic would print is shown only once the
+    // body, edited as it says, binds without the error.
+    if !bind_ctx.verifying {
+        for fix in body_fixes {
+            check_body_input_fix(
+                fix,
+                nodes,
+                diags,
+                bind_ctx,
+                artifacts,
+                schema_by_name,
+                declared_multiple_by_name,
+            );
+        }
+    }
 
     // Inside a composition body every bound row must carry its marks: a
     // row built without them would let a node name every column. A node
@@ -3664,6 +3727,7 @@ fn bind_schema_inner(
             }
         }
     }
+    failed_nodes
 }
 
 // ─── Composition binding ────────────────────────────────────────────
@@ -3678,6 +3742,8 @@ struct BodyScope {
     enclosing_scope_names: HashSet<String>,
     /// The body nodes the composition names as its outputs.
     outputs: HashSet<String>,
+    /// The input ports the call binds, in declaration order.
+    ports: Vec<String>,
 }
 
 /// Run `bind` with `bind_ctx` one composition level deeper, in `scope`, and
@@ -3697,10 +3763,12 @@ fn in_body_scope<'a, R>(
         scoped_vars,
         enclosing_scope_names,
         outputs,
+        ports,
     } = scope;
     let saved_enclosing =
         std::mem::replace(&mut bind_ctx.enclosing_scope_names, enclosing_scope_names);
     let saved_outputs = std::mem::replace(&mut bind_ctx.body_outputs, outputs);
+    let saved_ports = std::mem::replace(&mut bind_ctx.body_ports, ports);
     let saved_origin_dir = std::mem::replace(&mut bind_ctx.origin_dir, origin_dir);
     let saved_scoped_vars = std::mem::replace(&mut bind_ctx.scoped_vars, scoped_vars);
     bind_ctx.use_path_stack.push(use_path);
@@ -3710,6 +3778,7 @@ fn in_body_scope<'a, R>(
     bind_ctx.use_path_stack.pop();
     bind_ctx.enclosing_scope_names = saved_enclosing;
     bind_ctx.body_outputs = saved_outputs;
+    bind_ctx.body_ports = saved_ports;
     bind_ctx.scoped_vars = saved_scoped_vars;
     bind_ctx.origin_dir = saved_origin_dir;
     out
@@ -4201,34 +4270,67 @@ fn bind_composition(
     }
 
     // 7g. A body node that reads an input port this call leaves unbound (a
-    // port declared `required: false`) could receive no row. Left alone it
-    // would bind against nothing and escape every check, and the call would
-    // run with that node writing nothing; the call is refused instead, with
-    // the binding to add at the call site.
+    // port declared `required: false`), or an output port that is such a
+    // port, could receive no row. Left alone it would bind against nothing
+    // and escape every check, and the call would run writing nothing; the
+    // call is refused instead, with the binding to add at the call site.
     {
-        let mut refused = false;
+        let unbound =
+            |port: &str| signature.inputs.contains_key(port) && !call_inputs.contains_key(port);
+        let mut refused: Vec<(usize, String, UnboundPortReader<'_>)> = Vec::new();
         for spanned in &body_file.nodes {
-            let reader = spanned.value.name();
             for port in node_input_names(&spanned.value) {
-                if !signature.inputs.contains_key(port) || call_inputs.contains_key(port) {
-                    continue;
-                }
-                refused = true;
-                diags.push(unbound_port_read(
-                    &UnboundPortRead {
+                if unbound(port) {
+                    refused.push((
+                        diags.len(),
+                        port.to_string(),
+                        UnboundPortReader::Node(spanned.value.name()),
+                    ));
+                    diags.push(unbound_port_read(&UnboundPortRead {
                         call: node_name,
-                        reader,
+                        reader: UnboundPortReader::Node(spanned.value.name()),
                         port,
                         body_file: &resolved_path,
                         span,
-                    },
-                    call_inputs,
-                    signature,
-                    &body_file.nodes,
-                ));
+                    }));
+                }
             }
         }
-        if refused {
+        for (output, alias) in &signature.outputs {
+            let internal = alias.internal_ref.value.as_str();
+            let port = internal.split('.').next().unwrap_or(internal);
+            if unbound(port) {
+                refused.push((
+                    diags.len(),
+                    port.to_string(),
+                    UnboundPortReader::Output(output),
+                ));
+                diags.push(unbound_port_read(&UnboundPortRead {
+                    call: node_name,
+                    reader: UnboundPortReader::Output(output),
+                    port,
+                    body_file: &resolved_path,
+                    span,
+                }));
+            }
+        }
+        if !refused.is_empty() {
+            if !bind_ctx.verifying {
+                offer_port_bindings(
+                    &refused,
+                    &CallFeeders {
+                        call: node_name,
+                        call_inputs,
+                        scope,
+                        failed_nodes,
+                    },
+                    diags,
+                    bind_ctx,
+                    artifacts,
+                    parent_schema_by_name,
+                    parent_declared_multiple_by_name,
+                );
+            }
             return;
         }
     }
@@ -4284,6 +4386,7 @@ fn bind_composition(
         scoped_vars: body_scoped_vars,
         enclosing_scope_names,
         outputs: body_output_nodes(signature),
+        ports: input_port_rows.keys().cloned().collect(),
     };
 
     // Seed each port with the row its upstream carries: the records reach
@@ -4546,6 +4649,17 @@ fn bind_composition(
             ),
             LabeledSpan::primary(span, String::new()),
         ));
+        return;
+    }
+
+    // A body with a node on a cycle or reading itself was refused when it
+    // bound (E107, see `body_input_diagnostics`); its graph has no order to
+    // lower in, and the same cycle is not reported twice.
+    let reads_itself = body_file
+        .nodes
+        .iter()
+        .any(|spanned| node_input_names(&spanned.value).contains(&spanned.value.name()));
+    if reads_itself || !bind_order(&body_file.nodes).1.is_empty() {
         return;
     }
 
@@ -5512,28 +5626,30 @@ fn body_output_nodes(signature: &CompositionSignature) -> HashSet<String> {
         .collect()
 }
 
-/// A body node `reader` of the call `call` that reads input port `port`,
-/// which the call does not bind.
+/// What reads an input port a call leaves unbound: a body node, or one of
+/// the composition's output ports.
+#[derive(Clone, Copy)]
+enum UnboundPortReader<'a> {
+    Node(&'a str),
+    Output(&'a str),
+}
+
+/// A reader `reader` in the composition of the call `call` of input port
+/// `port`, which the call does not bind.
 struct UnboundPortRead<'a> {
     call: &'a str,
-    reader: &'a str,
+    reader: UnboundPortReader<'a>,
     port: &'a str,
     body_file: &'a Path,
     span: Span,
 }
 
-/// E104 for a composition node whose body node reads an input port the call
-/// does not bind. The port is optional, but a node that reads it needs it.
-/// The fix is the binding to add under the call's `inputs:`, naming the
-/// node that feeds the call's first bound port, so it can be pasted as it
-/// is; and, where taking the node out leaves the composition whole (no
-/// other node reads it and it is not an output), removing the node.
-fn unbound_port_read(
-    at: &UnboundPortRead<'_>,
-    call_inputs: &IndexMap<String, String>,
-    signature: &CompositionSignature,
-    body: &[Spanned<PipelineNode>],
-) -> Diagnostic {
+/// E104 for a composition call whose composition reads an input port the
+/// call does not bind: a body node reads it, or an output port is it. The
+/// port is optional, but what reads it needs it. The help is the sentence
+/// to bind the port at the call; [`offer_port_bindings`] puts the line to
+/// paste in its place once one checks out.
+fn unbound_port_read(at: &UnboundPortRead<'_>) -> Diagnostic {
     let &UnboundPortRead {
         call,
         reader,
@@ -5542,42 +5658,163 @@ fn unbound_port_read(
         span,
     } = at;
     let file = body_file.display();
-    // The node the call already feeds a port from: a node of the calling
-    // scope whose rows reach the call, so binding the port to it compiles.
-    let feeding = call_inputs
-        .values()
-        .find(|upstream| !upstream.contains('.'));
-    let is_output = body_output_nodes(signature).contains(reader);
-    let is_read = body.iter().any(|spanned| {
-        spanned.value.name() != reader && node_input_names(&spanned.value).contains(&reader)
-    });
-    let removable = !is_output && !is_read;
-    let bind = feeding.map(|upstream| {
-        format!(
-            "bind the port at the call, so node {reader:?} receives rows: add `{port}: \
-             {upstream}` under `inputs:` of composition {call:?}"
-        )
-    });
-    let remove = removable.then(|| {
-        format!("remove node {reader:?} from `{file}` if the composition does not need it")
-    });
-    let help = match (bind, remove) {
-        (Some(bind), Some(remove)) => format!("{bind}; or {remove}"),
-        (Some(fix), None) | (None, Some(fix)) => fix,
-        (None, None) => format!(
-            "bind the port at the call, so node {reader:?} receives rows: add \
-             `{port}:` under `inputs:` of composition {call:?}, naming a node of this pipeline"
+    let message = match reader {
+        UnboundPortReader::Node(node) => format!(
+            "composition {call:?}: node {node:?} in `{file}` reads input port `{port}`, which \
+             this call does not bind, so the node could receive no row"
+        ),
+        UnboundPortReader::Output(output) => format!(
+            "composition {call:?}: output port `{output}` in `{file}` carries input port \
+             `{port}`, which this call does not bind, so the call could write no row"
         ),
     };
     Diagnostic::error(
         "E104",
-        format!(
-            "composition {call:?}: node {reader:?} in `{file}` reads input port `{port}`, which \
-             this call does not bind, so the node could receive no row"
-        ),
+        message,
         LabeledSpan::primary(span, format!("does not bind `{port}`")),
     )
-    .with_help(help)
+    .with_help(format!(
+        "bind input port `{port}` under `inputs:` of composition {call:?} to a node whose rows \
+         have the columns `{port}` declares"
+    ))
+}
+
+/// The calling scope of a composition call, as a fix that binds one of
+/// its ports chooses the node to bind it to.
+struct CallFeeders<'a> {
+    call: &'a str,
+    call_inputs: &'a IndexMap<String, String>,
+    scope: &'a [Spanned<PipelineNode>],
+    failed_nodes: &'a HashSet<String>,
+}
+
+impl CallFeeders<'_> {
+    /// The names a port of the call could be bound to, in the order a fix
+    /// tries them: the nodes feeding the call's other ports, the calling
+    /// body's own input ports, then every other node of the calling scope
+    /// in declaration order. A node is left out when it has no row to
+    /// give, failed, is the call, writes rows out (a Sink), or is a Route
+    /// or a Cull, whose rows a call reads through one of its output ports.
+    fn candidates(&self, bind_ctx: &BindContext<'_>, rows: &HashMap<String, Row>) -> Vec<String> {
+        let feeds = |name: &str| {
+            name != self.call
+                && rows.contains_key(name)
+                && !self.failed_nodes.contains(name)
+                && !self.scope.iter().any(|spanned| {
+                    spanned.value.name() == name
+                        && matches!(
+                            spanned.value,
+                            PipelineNode::Sink { .. }
+                                | PipelineNode::Route { .. }
+                                | PipelineNode::Cull { .. }
+                        )
+                })
+        };
+        let mut out: Vec<String> = Vec::new();
+        let named = self
+            .call_inputs
+            .values()
+            .map(String::as_str)
+            .chain(bind_ctx.body_ports.iter().map(String::as_str))
+            .chain(self.scope.iter().map(|spanned| spanned.value.name()));
+        for name in named {
+            if feeds(name) && !out.iter().any(|seen| seen == name) {
+                out.push(name.to_string());
+            }
+        }
+        out
+    }
+
+    /// The call node, as the calling scope declares it, with `port` bound
+    /// to `upstream`.
+    fn binding(&self, port: &str, upstream: &str) -> Option<Spanned<PipelineNode>> {
+        let mut edited = self
+            .scope
+            .iter()
+            .find(|spanned| spanned.value.name() == self.call)?
+            .clone();
+        match &mut edited.value {
+            PipelineNode::Composition { inputs, .. } => {
+                inputs.insert(port.to_string(), upstream.to_string());
+            }
+            _ => return None,
+        }
+        Some(edited)
+    }
+}
+
+/// Put in each E104 of `refused` (diagnostic index, port, reader) the line
+/// that binds its port, naming the first node of the calling scope that,
+/// bound to the port, lets the call compile without the E104 and without
+/// an error the compile did not already raise (see
+/// [`crate::plan::fix_offer`]). With none, the E104 keeps its sentence.
+fn offer_port_bindings(
+    refused: &[(usize, String, UnboundPortReader<'_>)],
+    feeders: &CallFeeders<'_>,
+    diags: &mut [Diagnostic],
+    bind_ctx: &mut BindContext<'_>,
+    artifacts: &CompileArtifacts,
+    rows: &HashMap<String, Row>,
+    declared_multiple: &HashMap<String, BTreeSet<String>>,
+) {
+    let call = feeders.call;
+    let candidates = feeders.candidates(bind_ctx, rows);
+    // The node each port binds to, decided by the port's first E104.
+    let mut chosen: HashMap<&str, Option<String>> = HashMap::new();
+    for (diag, port, reader) in refused {
+        let lead = match reader {
+            UnboundPortReader::Node(node) => format!(
+                "bind input port `{port}` at the call, so node {node:?} receives rows: add under \
+                 `inputs:` of composition {call:?}"
+            ),
+            UnboundPortReader::Output(output) => format!(
+                "bind input port `{port}` at the call, so output port `{output}` has rows to \
+                 carry: add under `inputs:` of composition {call:?}"
+            ),
+        };
+        let offered = candidates.iter().take(MAX_FIX_TRIALS).map(|upstream| {
+            (
+                crate::plan::fix_offer::PasteFix::new(lead.clone(), format!("{port}: {upstream}")),
+                upstream.clone(),
+            )
+        });
+        let Some(plain) = diags[*diag].help.clone() else {
+            continue;
+        };
+        let help = match chosen.get(port.as_str()) {
+            Some(decided) => crate::plan::fix_offer::offer_fix(plain, offered, |upstream| {
+                decided.as_ref() == Some(upstream)
+            }),
+            None => {
+                let mut passed = None;
+                let help = crate::plan::fix_offer::offer_fix(plain, offered, |upstream| {
+                    let Some(edited) = feeders.binding(port, upstream) else {
+                        return false;
+                    };
+                    let tried = trial_scope(
+                        &ScopeTrial {
+                            scope: feeders.scope,
+                            edits: std::slice::from_ref(&edited),
+                            targets: &[call],
+                        },
+                        bind_ctx,
+                        artifacts,
+                        rows,
+                        declared_multiple,
+                    );
+                    let resolves =
+                        crate::plan::fix_offer::fix_resolves(&diags[*diag], diags, &tried);
+                    if resolves {
+                        passed = Some(upstream.clone());
+                    }
+                    resolves
+                });
+                chosen.insert(port, passed);
+                help
+            }
+        };
+        diags[*diag].help = Some(help);
+    }
 }
 
 /// E102 for a port whose upstream has no bound row. A `node.port`
@@ -6023,37 +6260,74 @@ fn bind_order(nodes: &[Spanned<PipelineNode>]) -> (Vec<usize>, Vec<usize>) {
     (order, pending)
 }
 
-/// The change that makes body node `node`, which reads `from` (itself, or
-/// the node before it on a cycle), read an input port of the composition
-/// instead, written so the author can paste it. Reading a port never puts
-/// the node back on a cycle; reading another body node could.
-fn read_a_port_instead(node: &PipelineNode, from: &str, ports: &[&str]) -> String {
-    let name = node.name();
-    let Some((first, rest)) = ports.split_first() else {
-        return format!(
-            "make node {name:?} read a node that does not read it, instead of {from:?}"
-        );
-    };
-    let others = if rest.is_empty() {
-        String::new()
-    } else {
-        let listed: Vec<String> = rest.iter().map(|port| format!("`{port}`")).collect();
-        format!(" (or another input port: {})", listed.join(", "))
-    };
-    match node {
+/// Whether `node` reads one node through a single `input:` line, so a fix
+/// can rewrite that line.
+fn reads_through_one_input_line(node: &PipelineNode) -> bool {
+    matches!(
+        node,
         PipelineNode::Transform { .. }
-        | PipelineNode::Aggregate { .. }
-        | PipelineNode::Route { .. }
-        | PipelineNode::Sink { .. }
-        | PipelineNode::Reshape { .. }
-        | PipelineNode::Cull { .. } => format!(
-            "set `input:` of node {name:?} to an input port of the composition: \
-             `input: {first}`{others}"
-        ),
-        _ => {
-            format!("in node {name:?}, read input port `{first}`{others} instead of node {from:?}")
+            | PipelineNode::Aggregate { .. }
+            | PipelineNode::Route { .. }
+            | PipelineNode::Sink { .. }
+            | PipelineNode::Reshape { .. }
+            | PipelineNode::Cull { .. }
+    )
+}
+
+/// `node` reading `to` through its single `input:` line, for a node that
+/// has one ([`reads_through_one_input_line`]).
+fn with_single_input(node: &Spanned<PipelineNode>, to: &str) -> Option<Spanned<PipelineNode>> {
+    let mut edited = node.clone();
+    match &mut edited.value {
+        PipelineNode::Transform { header, .. }
+        | PipelineNode::Aggregate { header, .. }
+        | PipelineNode::Route { header, .. }
+        | PipelineNode::Sink { header, .. }
+        | PipelineNode::Reshape { header, .. }
+        | PipelineNode::Cull { header, .. } => {
+            header.input.value = crate::config::node_header::NodeInput::Single(to.to_string());
         }
+        _ => return None,
     }
+    Some(edited)
+}
+
+/// What [`body_input_diagnostics`] reads of a composition body.
+struct BodyInputs<'a> {
+    nodes: &'a [Spanned<PipelineNode>],
+    /// The nodes [`bind_order`] could not place.
+    unplaced: &'a [usize],
+    /// Every name a body node may read besides the body's own nodes.
+    ports: &'a HashSet<&'a str>,
+    /// The input ports the call binds, in declaration order.
+    declared_ports: &'a [String],
+    enclosing: &'a HashSet<String>,
+    /// The body nodes the composition names as its outputs.
+    outputs: &'a HashSet<String>,
+}
+
+/// The nodes [`body_input_diagnostics`] reported, which cannot receive a
+/// row, and the fixes its diagnostics would print once checked.
+struct BodyInputFaults {
+    failed: Vec<String>,
+    fixes: Vec<BodyInputFix>,
+}
+
+/// A fix one of [`body_input_diagnostics`]' errors would print: node
+/// `node` reading one of `candidates` through its `input:` line. It is
+/// printed only when the body, edited so, binds `targets` without the error
+/// (see [`check_body_input_fix`]).
+struct BodyInputFix {
+    /// The diagnostic's index in the diagnostics list.
+    diag: usize,
+    node: usize,
+    /// The names the node could read instead, in the order to try them.
+    candidates: Vec<String>,
+    /// The nodes the edit is for: the node, and every other node of its
+    /// cycle.
+    targets: Vec<String>,
+    /// The sentence leading to the `input:` line.
+    lead: String,
 }
 
 /// E004 and E107 for a composition body's nodes whose input the bind walk
@@ -6061,32 +6335,33 @@ fn read_a_port_instead(node: &PipelineNode, from: &str, ports: &[&str]) -> Strin
 /// a node that reads itself, and a cycle. At pipeline level the same shapes
 /// are refused before binding (E004, E002, E003); a body is first read here.
 ///
-/// `outputs` are the body nodes the composition names as its outputs: the
-/// fix for a cycle never leaves a node of the cycle reading one of them,
-/// since a body node that reads an output node fails when the call runs
-/// (#1315).
-fn body_input_diagnostics(
-    nodes: &[Spanned<PipelineNode>],
-    unplaced: &[usize],
-    ports: &HashSet<&str>,
-    enclosing: &HashSet<String>,
-    outputs: &HashSet<String>,
-    diags: &mut Vec<Diagnostic>,
-) {
+/// Each diagnostic's help is one plain sentence. Where the fix is one
+/// node's `input:` line, the line is offered as well (see
+/// [`BodyInputFix`]), and replaces the sentence once checked. A cycle
+/// through a Merge, a Combine or a composition call keeps the sentence:
+/// such a node reads several inputs, and the line to change is the
+/// author's choice. A fix never makes a node read an output node, since a
+/// body node that reads an output node fails when the call runs (#1315).
+fn body_input_diagnostics(body: &BodyInputs<'_>, diags: &mut Vec<Diagnostic>) -> BodyInputFaults {
+    let &BodyInputs {
+        nodes,
+        unplaced,
+        ports,
+        declared_ports,
+        enclosing,
+        outputs,
+    } = body;
     let names: HashSet<&str> = nodes.iter().map(|spanned| spanned.value.name()).collect();
-    let mut sorted_ports: Vec<&str> = ports.iter().copied().collect();
-    sorted_ports.sort_unstable();
-    let port_list = sorted_ports
-        .iter()
-        .map(|port| format!("`{port}`"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    for spanned in nodes {
+    let mut faults = BodyInputFaults {
+        failed: Vec::new(),
+        fixes: Vec::new(),
+    };
+    for (index, spanned) in nodes.iter().enumerate() {
         let node = spanned.value.name();
         let span = span_for_node(spanned);
         for input in node_input_names(&spanned.value) {
-            if input == node {
-                diags.push(
+            let (diag, candidates, lead) = if input == node {
+                (
                     Diagnostic::error(
                         "E107",
                         format!(
@@ -6095,15 +6370,29 @@ fn body_input_diagnostics(
                         ),
                         LabeledSpan::primary(span, "reads itself".to_string()),
                     )
-                    .with_help(read_a_port_instead(
-                        &spanned.value,
-                        node,
-                        &sorted_ports,
+                    .with_help(format!(
+                        "make node {node:?} read an input port of the composition instead of \
+                         itself"
                     )),
-                );
+                    declared_ports.to_vec(),
+                    format!("set `input:` of node {node:?} to an input port of the composition"),
+                )
             } else if !names.contains(input) && !ports.contains(input) && !enclosing.contains(input)
             {
-                diags.push(
+                // A misspelt name may have meant a port or a node; any node
+                // but an output node, which a body node cannot read.
+                let candidates = declared_ports
+                    .iter()
+                    .cloned()
+                    .chain(
+                        nodes
+                            .iter()
+                            .map(|other| other.value.name())
+                            .filter(|other| *other != node && !outputs.contains(*other))
+                            .map(str::to_string),
+                    )
+                    .collect();
+                (
                     Diagnostic::error(
                         "E004",
                         format!(
@@ -6113,17 +6402,35 @@ fn body_input_diagnostics(
                         LabeledSpan::primary(span, format!("reads {input:?}")),
                     )
                     .with_help(format!(
-                        "set `input:` of node {node:?} to an input port of the composition \
-                         ({port_list}) or to a node of the composition"
+                        "change `input:` of node {node:?}, which names nothing in the \
+                         composition, to a node of the composition or one of its input ports"
                     )),
-                );
+                    candidates,
+                    format!("set `input:` of node {node:?} to a name the composition has"),
+                )
+            } else {
+                continue;
+            };
+            faults.failed.push(node.to_string());
+            if reads_through_one_input_line(&spanned.value) {
+                faults.fixes.push(BodyInputFix {
+                    diag: diags.len(),
+                    node: index,
+                    candidates,
+                    targets: vec![node.to_string()],
+                    lead,
+                });
             }
+            diags.push(diag);
         }
     }
     // Of the unplaced nodes, those on a cycle: each reaches itself through
     // the unplaced nodes it reads. The nodes that reach each other are one
     // cycle, reported once, naming every node on it in declaration order.
     let unplaced_names: HashSet<&str> = unplaced.iter().map(|&i| nodes[i].value.name()).collect();
+    faults
+        .failed
+        .extend(unplaced_names.iter().map(|name| name.to_string()));
     let reads_of = |name: &str| -> Vec<&str> {
         nodes
             .iter()
@@ -6175,9 +6482,9 @@ fn body_input_diagnostics(
         // Changing one member to read a port leaves every other member
         // reading the member before it. A member reading an output node
         // would then be a node that reads the node the call's rows leave
-        // by, which fails when the call runs; so the members to change are
-        // the ones that read an output node on the cycle, or, when none
-        // does, the first.
+        // by, which fails when the call runs; so the member to change is the
+        // one that reads an output node on the cycle, or, when none does,
+        // the first.
         let reading_an_output: Vec<&str> = members
             .iter()
             .copied()
@@ -6187,23 +6494,51 @@ fn body_input_diagnostics(
                     .any(|input| members.contains(input) && outputs.contains(*input))
             })
             .collect();
-        let to_change = if reading_an_output.is_empty() {
-            vec![members[0]]
-        } else {
-            reading_an_output
+        let to_change = match reading_an_output.as_slice() {
+            [] => Some(members[0]),
+            [only] => Some(*only),
+            _ => None,
         };
-        let fixes: Vec<String> = to_change
-            .iter()
-            .filter_map(|member| {
-                let spanned = nodes
+        let change = to_change.and_then(|member| {
+            let index = nodes
+                .iter()
+                .position(|spanned| spanned.value.name() == member)?;
+            let from = reads_of(member)
+                .into_iter()
+                .find(|input| members.contains(input))?;
+            Some((index, member, from))
+        });
+        let plain = match (change, reading_an_output.as_slice()) {
+            (Some((_, member, from)), _) => format!(
+                "change what node {member:?} reads so that it no longer reads node {from:?}, \
+                 which ends the cycle"
+            ),
+            (None, several) => format!(
+                "change what nodes {} read so that none of them reads a node the composition \
+                 names as an output, which ends the cycle",
+                several
                     .iter()
-                    .find(|spanned| spanned.value.name() == *member)?;
-                let from = reads_of(member)
-                    .into_iter()
-                    .find(|input| members.contains(input))?;
-                Some(read_a_port_instead(&spanned.value, from, &sorted_ports))
-            })
-            .collect();
+                    .map(|name| format!("{name:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        if let Some((index, member, _)) = change
+            && reads_through_one_input_line(&nodes[index].value)
+            && members
+                .iter()
+                .all(|other| reads_through_one_input_line_or_is(nodes, other, member))
+        {
+            faults.fixes.push(BodyInputFix {
+                diag: diags.len(),
+                node: index,
+                candidates: declared_ports.to_vec(),
+                targets: members.iter().map(|name| name.to_string()).collect(),
+                lead: format!(
+                    "set `input:` of node {member:?} to an input port of the composition"
+                ),
+            });
+        }
         diags.push(
             Diagnostic::error(
                 "E107",
@@ -6213,9 +6548,164 @@ fn body_input_diagnostics(
                 ),
                 LabeledSpan::primary(span_for_node(&nodes[i]), "on a cycle".to_string()),
             )
-            .with_help(fixes.join("; and ")),
+            .with_help(plain),
         );
     }
+    faults
+}
+
+/// Whether body node `name` reads through a single `input:` line, or is
+/// `member`. A cycle through a node that reads several inputs (a Merge, a
+/// Combine, a composition call) gets no generated fix.
+fn reads_through_one_input_line_or_is(
+    nodes: &[Spanned<PipelineNode>],
+    name: &str,
+    member: &str,
+) -> bool {
+    name == member
+        || nodes
+            .iter()
+            .find(|spanned| spanned.value.name() == name)
+            .is_some_and(|spanned| reads_through_one_input_line(&spanned.value))
+}
+
+/// Show the `input:` line of `fix` in place of its diagnostic's sentence
+/// when the body, edited so, binds the nodes the fix is for without the
+/// error and without an error the bind did not already raise.
+fn check_body_input_fix(
+    fix: BodyInputFix,
+    nodes: &[Spanned<PipelineNode>],
+    diags: &mut [Diagnostic],
+    bind_ctx: &mut BindContext<'_>,
+    artifacts: &CompileArtifacts,
+    schema_by_name: &HashMap<String, Row>,
+    declared_multiple_by_name: &HashMap<String, BTreeSet<String>>,
+) {
+    let BodyInputFix {
+        diag,
+        node,
+        candidates,
+        targets,
+        lead,
+    } = fix;
+    let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
+    let Some(plain) = diags[diag].help.clone() else {
+        return;
+    };
+    let offered = candidates
+        .into_iter()
+        .take(MAX_FIX_TRIALS)
+        .filter_map(|candidate| {
+            let edited = with_single_input(&nodes[node], &candidate)?;
+            Some((
+                crate::plan::fix_offer::PasteFix::new(lead.clone(), format!("input: {candidate}")),
+                edited,
+            ))
+        });
+    let help = crate::plan::fix_offer::offer_fix(plain, offered, |edited| {
+        let tried = trial_scope(
+            &ScopeTrial {
+                scope: nodes,
+                edits: std::slice::from_ref(edited),
+                targets: &targets,
+            },
+            bind_ctx,
+            artifacts,
+            schema_by_name,
+            declared_multiple_by_name,
+        );
+        crate::plan::fix_offer::fix_resolves(&diags[diag], diags, &tried)
+    });
+    diags[diag].help = Some(help);
+}
+
+/// The most edits one help tries before it settles for its sentence.
+const MAX_FIX_TRIALS: usize = 16;
+
+/// An edit to a scope's nodes, to try in scratch state (see
+/// [`trial_scope`]).
+struct ScopeTrial<'a> {
+    scope: &'a [Spanned<PipelineNode>],
+    /// Nodes that replace the scope's node of the same name, or join the
+    /// scope when it has none.
+    edits: &'a [Spanned<PipelineNode>],
+    /// The nodes the edit is for. The trial binds them and every node of
+    /// the edited scope they read, directly or not.
+    targets: &'a [&'a str],
+}
+
+/// The diagnostics of binding `trial`'s edited scope, in scratch state.
+///
+/// Only the nodes the targets read, and the targets, bind; every other
+/// node keeps the row it has in `rows`. The bind runs as a trial
+/// ([`BindContext::verifying`]): nothing it does reaches `artifacts`,
+/// `rows` or the record of passed contract checks.
+fn trial_scope(
+    trial: &ScopeTrial<'_>,
+    bind_ctx: &mut BindContext<'_>,
+    artifacts: &CompileArtifacts,
+    rows: &HashMap<String, Row>,
+    declared_multiple: &HashMap<String, BTreeSet<String>>,
+) -> Vec<Diagnostic> {
+    let edit_of = |name: &str| trial.edits.iter().find(|edit| edit.value.name() == name);
+    let mut edited: Vec<Spanned<PipelineNode>> = trial
+        .scope
+        .iter()
+        .map(|spanned| edit_of(spanned.value.name()).unwrap_or(spanned).clone())
+        .collect();
+    edited.extend(
+        trial
+            .edits
+            .iter()
+            .filter(|edit| {
+                !trial
+                    .scope
+                    .iter()
+                    .any(|spanned| spanned.value.name() == edit.value.name())
+            })
+            .cloned(),
+    );
+    let mut needed: HashSet<String> = HashSet::new();
+    let mut stack: Vec<String> = trial.targets.iter().map(|name| name.to_string()).collect();
+    while let Some(name) = stack.pop() {
+        if !needed.insert(name.clone()) {
+            continue;
+        }
+        if let Some(spanned) = edited.iter().find(|spanned| spanned.value.name() == name) {
+            stack.extend(
+                node_input_names(&spanned.value)
+                    .into_iter()
+                    .map(str::to_string),
+            );
+        }
+    }
+    edited.retain(|spanned| needed.contains(spanned.value.name()));
+    let mut scratch = artifacts.scratch();
+    let ids: HashMap<String, PlanNodeId> = edited
+        .iter()
+        .map(|spanned| (spanned.value.name().to_string(), scratch.fresh_node_id()))
+        .collect();
+    let mut rows = rows.clone();
+    let mut multiple = declared_multiple.clone();
+    for name in ids.keys() {
+        rows.remove(name);
+        multiple.remove(name);
+    }
+    let was_verifying = std::mem::replace(&mut bind_ctx.verifying, true);
+    let checks = bind_ctx.passed_contract_checks.len();
+    let mut tried = Vec::new();
+    bind_schema_inner(
+        &edited,
+        &ids,
+        &mut tried,
+        bind_ctx,
+        &mut scratch,
+        &mut rows,
+        &mut multiple,
+    );
+    bind_ctx.passed_contract_checks.truncate(checks);
+    bind_ctx.verifying = was_verifying;
+    tried
 }
 
 /// Which types a body's port rows give the columns the port declares.
