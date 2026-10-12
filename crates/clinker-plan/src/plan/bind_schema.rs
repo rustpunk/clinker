@@ -4108,6 +4108,34 @@ fn bind_composition(
         }
     }
 
+    // 7g. A body node that reads an input port this call leaves unbound (a
+    // port declared `required: false`) could receive no row. Left alone it
+    // would bind against nothing and escape every check, and the call would
+    // run with that node writing nothing; the call is refused instead, with
+    // the binding to add at the call site.
+    {
+        let mut refused = false;
+        for spanned in &body_file.nodes {
+            let reader = spanned.value.name();
+            for port in node_input_names(&spanned.value) {
+                if !signature.inputs.contains_key(port) || call_inputs.contains_key(port) {
+                    continue;
+                }
+                refused = true;
+                diags.push(unbound_port_read(
+                    node_name,
+                    reader,
+                    port,
+                    &resolved_path,
+                    span,
+                ));
+            }
+        }
+        if refused {
+            return;
+        }
+    }
+
     // 8. Prepare the nested scope. Nothing in `bind_ctx` changes until the
     //    body binds inside it (`in_body_scope`), so every early return below
     //    leaves the calling scope as it found it.
@@ -5366,6 +5394,33 @@ fn build_input_port_rows(
     }
 
     if has_errors { None } else { Some(rows) }
+}
+
+/// E104 for a composition node whose body node `reader` reads input port
+/// `port`, which the call does not bind. The port is optional, but a node
+/// that reads it needs it; the fix is the binding to add under the call's
+/// `inputs:`, or removing the node from the composition.
+fn unbound_port_read(
+    call: &str,
+    reader: &str,
+    port: &str,
+    body_file: &Path,
+    span: Span,
+) -> Diagnostic {
+    let file = body_file.display();
+    Diagnostic::error(
+        "E104",
+        format!(
+            "composition {call:?}: node {reader:?} in `{file}` reads input port `{port}`, which \
+             this call does not bind, so the node could receive no row"
+        ),
+        LabeledSpan::primary(span, format!("does not bind `{port}`")),
+    )
+    .with_help(format!(
+        "bind the port at the call: add `{port}: <node>` under `inputs:` of composition \
+         {call:?}, naming the node whose rows the port should receive; or remove node \
+         {reader:?} from `{file}` if the composition does not need it"
+    ))
 }
 
 /// E102 for a port whose upstream has no bound row. A `node.port`
