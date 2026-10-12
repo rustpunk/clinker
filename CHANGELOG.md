@@ -99,8 +99,8 @@ accepted and arithmetic over its values could silently come out empty.
 before. Nothing is converted at the port, so `int` is still refused for
 `float`. The message names the call, the port, the column and both types in
 the pipeline's spelling, and the help gives the one change to make: the
-`schema:` line for a column read straight from a Source, or an
-`emit <column> = <column>.to_<type>()` before the call.
+`schema:` line for a column read straight from a Source, or a Transform to add
+before the call that converts the column (`emit <column> = <column>.to_<type>()`).
 
 A Sink inside a composition is now checked like the same Sink in the
 pipeline: a `mapping:` entry reading a column no row carries is `E365`, and one
@@ -152,7 +152,12 @@ rows, and with no bound port it asked the author to fill a name in.
 
 `E102` for a port fed by a Route branch now says a composition input port
 cannot read a Route or Cull output port yet and prints the Transform that
-passes the rows on (#888). A port declared `{ nullable: any }` accepts every
+passes the rows on (#888). A port that names a composition's first output
+port (`call.out`) is told that a call's rows are read by the call's name and
+gets the `inputs:` entry naming the call; another output port gets no line
+to paste (#1315). An `E102` is no longer reported for a port reading a node
+whose own upstream failed, or a composition that failed: the earlier error
+says why. A port declared `{ nullable: any }` accepts every
 caller type, as `any` does, and an always-empty caller column is described as
 such rather than as `any`.
 

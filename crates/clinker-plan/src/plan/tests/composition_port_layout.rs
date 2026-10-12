@@ -654,18 +654,17 @@ fn a_nested_call_that_needs_a_never_empty_value_is_refused_behind_a_possibly_emp
         "{}",
         diag.message
     );
-    let help = diag.help.as_deref().expect("a fix");
-    assert!(
-        help.starts_with(
-            "declare `v` as never empty on input port `inp` in `compositions/c.comp.yaml`: \
-             `- { name: v, type: int }`"
-        ) && help.contains(
-            "`compositions/inner.comp.yaml` instead: `- { name: v, type: { nullable: int } }`"
-        ),
-        "{help}"
+    // One fix: the outer port's line, shown because the outer call
+    // compiles with it.
+    assert_eq!(
+        diag.help.as_deref(),
+        Some(
+            "declare `v` as never empty on input port `inp` in `compositions/c.comp.yaml`, so \
+             \"call\" accepts only a `v` that is never empty: `- { name: v, type: int }`"
+        )
     );
 
-    // The first fix, pasted, compiles.
+    // The fix, pasted, compiles.
     let fixed = outer.replace(
         "- { name: v, type: { nullable: int } }",
         "- { name: v, type: int }",
@@ -3009,8 +3008,79 @@ fn a_port_reading_another_output_port_of_a_composition_is_told_what_a_call_carri
         "{}",
         refused.message
     );
-    let help = refused.help.as_deref().unwrap_or_default();
-    assert!(help.contains("`inp: enrich`"), "{help}");
+    // The first output port is not `audit`: reading the call by its name
+    // would read other rows, so the help offers no line.
+    assert_eq!(
+        refused.help.as_deref(),
+        Some(
+            "move the nodes that read output port `audit` into the composition \"enrich\" \
+             calls (issue #1315 tracks reading another output port)"
+        )
+    );
+}
+
+#[test]
+fn a_port_reading_the_first_output_port_of_a_composition_by_name_is_told_to_read_the_call() {
+    let refused = port_upstream_refusal(
+        "enrich.out",
+        r#"  - type: composition
+    name: enrich
+    input: src
+    use: ../compositions/enrich.comp.yaml
+    inputs:
+      inp: src
+"#,
+    );
+    assert!(
+        refused.message.contains(
+            "reads \"enrich.out\", output port `out` of composition \"enrich\"; that is the port \
+             a call's rows come from, and they are read by the call's name, \"enrich\""
+        ),
+        "{}",
+        refused.message
+    );
+    assert!(
+        !refused
+            .message
+            .contains("only the rows of its first output port"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(
+        refused.help.as_deref(),
+        Some("read the call by its name: write under `inputs:`: `inp: enrich`")
+    );
+}
+
+#[test]
+fn a_port_reading_a_composition_that_failed_is_not_told_it_reads_nothing() {
+    // `enrich` itself fails (its port needs `nope`); the call reading
+    // `enrich.out` adds nothing to that error.
+    let pipeline = PIPELINE
+        .replace("      inp: src\n", "      inp: enrich.out\n")
+        .replace(
+            "  - type: composition\n    name: call\n    input: src\n",
+            "  - type: composition\n    name: enrich\n    input: src\n    use: ../compositions/enrich.comp.yaml\n    inputs:\n      inp: src\n  - type: composition\n    name: call\n    input: src\n",
+        );
+    let enrich = TWO_OUTPUT_COMPOSITION.replace(
+        "        - { name: v, type: int }\n",
+        "        - { name: nope, type: int }\n",
+    );
+    let Err(diags) = compile_in(
+        &pipeline,
+        &[
+            ("compositions/c.comp.yaml", &comp(IDENTITY_BODY)),
+            ("compositions/enrich.comp.yaml", &enrich),
+        ],
+    ) else {
+        panic!("`enrich` does not compile");
+    };
+    assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
+    assert!(
+        diags[0].message.contains("needs column `nope`"),
+        "{:#?}",
+        describe(&diags)
+    );
 }
 
 #[test]
@@ -3817,4 +3887,97 @@ fn a_rewritten_line_that_does_not_compile_is_not_offered() {
             "{help}"
         );
     }
+}
+
+/// The one diagnostic `pipeline` calling `composition` draws.
+fn the_refusal(pipeline: &str, composition: &str) -> Diagnostic {
+    let Err(diags) = compile_in(pipeline, &[("compositions/c.comp.yaml", composition)]) else {
+        panic!("must not compile");
+    };
+    assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
+    diags[0].clone()
+}
+
+#[test]
+fn the_e102_fix_adding_a_column_to_a_source_compiles() {
+    let composition = comp_declaring(
+        &["{ name: label, type: string }"],
+        IDENTITY_BODY
+            .replace("emit y = v", "emit y = label")
+            .as_str(),
+    );
+    let refused = the_refusal(PIPELINE, &composition);
+    assert_eq!(refused.code, "E102");
+    assert_eq!(
+        refused.help.as_deref(),
+        Some(
+            "add the column to the `schema:` of source \"src\": \
+             `- { name: label, type: string }`"
+        )
+    );
+    let pasted = PIPELINE.replace(
+        "        - { name: wt, type: int }\n",
+        "        - { name: wt, type: int }\n        - { name: label, type: string }\n",
+    );
+    compile_in(&pasted, &[("compositions/c.comp.yaml", &composition)])
+        .unwrap_or_else(|d| panic!("the pasted line compiles: {:#?}", describe(&d)));
+}
+
+#[test]
+fn the_e102_nullable_declaration_is_not_offered_when_the_composition_would_then_fail() {
+    // Declaring `w2` nullable would admit the caller, but the body's
+    // `filter w2 > 6` cannot take an empty `w2`: pasting it would only
+    // trade the E102 for an E200, so the help says what to change and
+    // prints no line.
+    let composition = comp_declaring(
+        &[
+            "{ name: v, type: int }",
+            "{ name: department, type: string }",
+            "{ name: w2, type: int }",
+        ],
+        r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        filter w2 > 6
+"#,
+    );
+    let refused = the_refusal(&pipeline_with_nullable_w2(), &composition);
+    assert_eq!(refused.code, "E102");
+    let help = refused.help.as_deref().unwrap_or_default();
+    assert!(
+        help.starts_with(
+            "\"pre\" can provide an empty `w2`; declare `w2` as nullable on input port `inp` \
+             in `compositions/c.comp.yaml`. A port admits"
+        ),
+        "{help}"
+    );
+    assert!(!help.contains("name: w2"), "no line: {help}");
+}
+
+#[test]
+fn the_e169_declaration_is_not_offered_when_the_composition_would_then_fail() {
+    // `wt` is an `int`; declaring it would let the body name it, and
+    // `wt.upper()` would then fail as a type error.
+    let refused = the_refusal(
+        PIPELINE,
+        &comp(
+            r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit x = wt.upper()
+"#,
+        ),
+    );
+    assert_eq!(refused.code, "E169");
+    assert_eq!(
+        refused.help.as_deref(),
+        Some(
+            "declare `wt` on input port `inp` in `compositions/c.comp.yaml`, so every call of \
+             the composition has to provide it"
+        )
+    );
 }
