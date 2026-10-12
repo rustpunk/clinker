@@ -106,11 +106,13 @@ Cull's `removed_to` rows do not reach the pipeline as they would inline
 inside a composition fed by a source that declares a `correlation_key` stops
 with `E314` where the inline Aggregate runs.
 
-The composition's nodes see each declared column with the type the port
-declares, at every call, so a composition that compiles against its ports
-compiles wherever it is called. A column declared `any` is seen with the type
-the call provides; a type error over one names the composition and the port,
-because it depends on the call. Columns the port does not declare keep the
+The composition's nodes see each column the port declares with a concrete type
+with that type, at every call, so their use of those columns compiles
+wherever the composition is called. A column declared `any` (or
+`{ nullable: any }`) is seen with the type the call provides, so a node that
+uses it in a way only some types support compiles at some calls and not at
+others; the type error names the composition and the port, because it depends
+on the call. Columns the port does not declare keep the
 caller's types on the way through.
 
 Each call checks the caller's rows against the port: every declared column
@@ -131,7 +133,9 @@ aggregate result, is its own, and later nodes may use it. When the composition
 writes a column with the same name as a caller column its port does not
 declare, the composition's value replaces the caller's and the compiler warns
 with `W101`. Nodes may be listed in any order; each is bound after the nodes it
-reads. Run `clinker explain --code E169` for details.
+reads. A node that reads itself or sits on a cycle fails with `E107`, and one
+whose `input:` names neither a node nor an input port of the composition fails
+with `E004`. Run `clinker explain --code E169` for details.
 
 ### Reading config parameters in the body
 

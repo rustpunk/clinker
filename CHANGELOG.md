@@ -53,13 +53,13 @@ not say the port was the reason: `E203` for an expression, `E200` for a
 composition writes a column with the name of a caller column its port does
 not declare, not for every column a composition adds.
 
-**Breaking:** a composition's nodes now see each column its port declares
-with the port's type, at every call. A column the port declares `any` is seen
-with the type the call provides; columns the port does not declare keep the
-caller's types. Before, the nodes saw whatever type the caller's column had,
-so a composition could compile in one pipeline and fail in another although
-both met its ports. A type error on a column declared `any` now names the
-composition and the port.
+**Breaking:** a column a port declares `any` is now seen by the composition's
+nodes with the type the call provides. Before, it was untyped inside the
+composition, so a node that used it in a way that type does not support
+compiled and wrote empty values; now it fails with `E200` at that call, and
+the message names the composition and the port. A column the port declares
+with a concrete type is still seen with that type, and the columns the port
+does not declare reach the composition's output with the caller's types.
 
 **Breaking:** `E102` now admits a caller's column only when the port's
 declared type admits it: the same type, a type into its `{ nullable: ... }`
@@ -84,9 +84,19 @@ moves it with its configuration unchanged, with no `mapping:`, and moves
 such a Sink even when its `exclude:` removes every column it reads: the
 moved Sink writes the same columns at pipeline level.
 
-A composition node listed before the node it reads is now bound after it.
-Before, such a node was left unbound: it escaped every check, and the call
-wrote no rows while the run exited 0.
+A node listed before the node it reads is now bound after it, in a pipeline
+and in a composition alike. Before, such a node was left unbound: in a
+composition it escaped every check and the call wrote no rows while the run
+exited 0. A composition node that reads itself or sits on a cycle now fails
+with `E107`, and one whose `input:` names nothing in the composition with
+`E004`, as the same mistakes do in a pipeline; before, each wrote no rows
+with exit 0.
+
+`E102` for a port fed by a Route branch now says a composition input port
+cannot read a Route or Cull output port yet and prints the Transform that
+passes the rows on (#888). A port declared `{ nullable: any }` accepts every
+caller type, as `any` does, and an always-empty caller column is described as
+such rather than as `any`.
 
 To migrate, add each column `E169` names to the port's `schema:`. For an
 `E102` on an untyped column, declare its type where the Source declares it,
