@@ -4629,8 +4629,7 @@ fn bind_call(
             }
         }
         for (output, alias) in &signature.outputs {
-            let internal = alias.internal_ref.value.as_str();
-            let port = internal.split('.').next().unwrap_or(internal);
+            let port = output_node(alias);
             if unbound(port) {
                 refused.push((
                     diags.len(),
@@ -4900,10 +4899,7 @@ fn bind_call(
         let output_node = signature
             .outputs
             .get(port_name)
-            .map(|alias| {
-                let internal = alias.internal_ref.value.as_str();
-                internal.split('.').next().unwrap_or(internal)
-            })
+            .map(output_node)
             .unwrap_or_default();
         for (field, _) in row.fields() {
             let column = field.name.as_ref();
@@ -5235,9 +5231,7 @@ fn bind_call(
     // end of the body walk.
     let mut output_port_to_node_idx: IndexMap<String, petgraph::graph::NodeIndex> = IndexMap::new();
     for (port_name, alias) in &signature.outputs {
-        let internal_ref = &alias.internal_ref.value;
-        let bare = internal_ref.split('.').next().unwrap_or(internal_ref);
-        if let Some(&idx) = body_name_to_idx.get(bare) {
+        if let Some(&idx) = body_name_to_idx.get(output_node(alias)) {
             output_port_to_node_idx.insert(port_name.clone(), idx);
         }
     }
@@ -5356,15 +5350,7 @@ fn bind_call(
         let declared_multiple = signature
             .outputs
             .get(&port_name)
-            .and_then(|output| {
-                let internal_name = output
-                    .internal_ref
-                    .value
-                    .split('.')
-                    .next()
-                    .unwrap_or(output.internal_ref.value.as_str());
-                body_declared_multiple_by_name.get(internal_name)
-            })
+            .and_then(|output| body_declared_multiple_by_name.get(output_node(output)))
             .cloned()
             .unwrap_or_default();
         parent_declared_multiple_by_name.insert(node_name.to_string(), declared_multiple.clone());
@@ -6111,15 +6097,15 @@ fn body_output_nodes(signature: &CompositionSignature) -> HashSet<String> {
     signature
         .outputs
         .values()
-        .map(|alias| {
-            let internal_ref = &alias.internal_ref.value;
-            internal_ref
-                .split('.')
-                .next()
-                .unwrap_or(internal_ref)
-                .to_string()
-        })
+        .map(|alias| output_node(alias).to_string())
         .collect()
+}
+
+/// The body node (or input port) an output port names: `node` for both
+/// `out: node` and `out: node.port`.
+fn output_node(alias: &OutputAlias) -> &str {
+    let internal_ref = alias.internal_ref.value.as_str();
+    internal_ref.split('.').next().unwrap_or(internal_ref)
 }
 
 /// What reads an input port a call leaves unbound: a body node, or one of
@@ -6806,10 +6792,7 @@ fn compute_output_rows(
 ) -> IndexMap<String, Row> {
     let mut rows = IndexMap::new();
     for (port_name, alias) in signature_outputs {
-        // Parse "node_name.channel" or just "node_name".
-        let internal_ref = &alias.internal_ref.value;
-        let node_name = internal_ref.split('.').next().unwrap_or(internal_ref);
-        if let Some(row) = body_schemas.get(node_name) {
+        if let Some(row) = body_schemas.get(output_node(alias)) {
             rows.insert(port_name.clone(), row.clone());
         }
     }
