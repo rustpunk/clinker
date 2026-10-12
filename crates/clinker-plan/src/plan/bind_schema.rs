@@ -5946,8 +5946,9 @@ fn body_input_diagnostics(
             }
         }
     }
-    // Of the unplaced nodes, report those on a cycle: each reaches itself
-    // through the unplaced nodes it reads.
+    // Of the unplaced nodes, those on a cycle: each reaches itself through
+    // the unplaced nodes it reads. The nodes that reach each other are one
+    // cycle, reported once, naming every node on it in declaration order.
     let unplaced_names: HashSet<&str> = unplaced.iter().map(|&i| nodes[i].value.name()).collect();
     let reads_of = |name: &str| -> Vec<&str> {
         nodes
@@ -5961,34 +5962,48 @@ fn body_input_diagnostics(
             })
             .unwrap_or_default()
     };
-    for &i in unplaced {
-        let node = nodes[i].value.name();
+    // Every unplaced node `from` reaches by reading, `from` itself included
+    // exactly when it is on a cycle.
+    let reaches = |from: &str| -> HashSet<&str> {
         let mut seen: HashSet<&str> = HashSet::new();
-        let mut stack: Vec<&str> = reads_of(node);
-        let mut on_cycle = false;
+        let mut stack: Vec<&str> = reads_of(from);
         while let Some(next) = stack.pop() {
-            if next == node {
-                on_cycle = true;
-                break;
-            }
             if seen.insert(next) {
                 stack.extend(reads_of(next));
             }
         }
-        if !on_cycle {
+        seen
+    };
+    let mut reported: HashSet<&str> = HashSet::new();
+    for &i in unplaced {
+        let node = nodes[i].value.name();
+        if reported.contains(node) {
             continue;
         }
-        let read = reads_of(node);
+        let reach = reaches(node);
+        if !reach.contains(node) {
+            continue;
+        }
+        let members: Vec<&str> = unplaced
+            .iter()
+            .map(|&j| nodes[j].value.name())
+            .filter(|member| {
+                *member == node || (reach.contains(member) && reaches(member).contains(node))
+            })
+            .collect();
+        reported.extend(members.iter().copied());
+        let named: Vec<String> = members.iter().map(|name| format!("{name:?}")).collect();
+        let (listed, none) = match named.as_slice() {
+            [first, second] => (format!("{first} and {second}"), "neither"),
+            [rest @ .., last] => (format!("{} and {last}", rest.join(", ")), "none of them"),
+            [] => unreachable!("a node on a cycle is one of its members"),
+        };
         diags.push(
             Diagnostic::error(
                 "E107",
                 format!(
-                    "composition node {node:?} is on a cycle: it reads {}, which reads it \
-                     back, so none of them can receive a row",
-                    read.iter()
-                        .map(|name| format!("{name:?}"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    "composition nodes {listed} read each other in a cycle, so {none} can receive \
+                     a row"
                 ),
                 LabeledSpan::primary(span_for_node(&nodes[i]), "on a cycle".to_string()),
             )

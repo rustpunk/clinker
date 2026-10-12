@@ -2860,3 +2860,84 @@ fn a_port_reading_a_port_of_a_node_without_ports_is_told_so() {
     let help = refused.help.as_deref().unwrap_or_default();
     assert!(help.contains("`inp: src`"), "{help}");
 }
+
+/// The E107s a body with `nodes` raises; nothing else may be raised.
+fn cycle_reports(nodes: &str) -> Vec<Diagnostic> {
+    let Err(diags) = compile(&comp(nodes)) else {
+        panic!("a body with a cycle must not compile");
+    };
+    assert!(
+        diags.iter().all(|d| d.code == "E107"),
+        "only E107: {:#?}",
+        describe(&diags)
+    );
+    diags
+}
+
+#[test]
+fn a_cycle_is_reported_once_naming_every_node_on_it() {
+    let two = cycle_reports(
+        r#"  - type: transform
+    name: a
+    input: b
+    config:
+      cxl: |
+        emit p = 1
+  - type: transform
+    name: b
+    input: a
+    config:
+      cxl: |
+        emit q = 1
+  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit r = v
+"#,
+    );
+    assert_eq!(two.len(), 1, "{:#?}", describe(&two));
+    assert!(
+        two[0]
+            .message
+            .contains("composition nodes \"a\" and \"b\" read each other in a cycle"),
+        "{}",
+        two[0].message
+    );
+    let three = cycle_reports(
+        r#"  - type: transform
+    name: a
+    input: c
+    config:
+      cxl: |
+        emit p = 1
+  - type: transform
+    name: b
+    input: a
+    config:
+      cxl: |
+        emit q = 1
+  - type: transform
+    name: c
+    input: b
+    config:
+      cxl: |
+        emit s = 1
+  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit r = v
+"#,
+    );
+    assert_eq!(three.len(), 1, "{:#?}", describe(&three));
+    assert!(
+        three[0]
+            .message
+            .contains("composition nodes \"a\", \"b\" and \"c\" read each other in a cycle"),
+        "{}",
+        three[0].message
+    );
+}
