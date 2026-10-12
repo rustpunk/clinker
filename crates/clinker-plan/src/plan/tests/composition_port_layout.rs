@@ -2279,3 +2279,109 @@ fn an_aggregate_group_key_stays_nameable_after_the_aggregate() {
     ))
     .unwrap_or_else(|d| panic!("compiles: {:#?}", describe(&d)));
 }
+
+/// A composition `inner` whose body declares node `t` twice.
+const DUPLICATE_NODE_COMP: &str = r#"_compose:
+  name: inner
+  inputs:
+    inp:
+      schema:
+        - { name: v, type: { nullable: int } }
+  outputs:
+    out: t
+  config_schema: {}
+
+nodes:
+  - type: transform
+    name: t
+    input: inp
+    config:
+      cxl: |
+        emit w = 1
+  - type: transform
+    name: t
+    input: inp
+    config:
+      cxl: |
+        emit w = 2
+"#;
+
+/// A composition `outer` whose body calls `inner.comp.yaml`.
+const OUTER_OF_INNER_COMP: &str = r#"_compose:
+  name: outer
+  inputs:
+    inp:
+      schema:
+        - { name: v, type: { nullable: int } }
+  outputs:
+    out: nn
+  config_schema: {}
+
+nodes:
+  - type: composition
+    name: nn
+    input: inp
+    use: ./inner.comp.yaml
+    inputs:
+      inp: inp
+"#;
+
+#[test]
+fn a_duplicate_node_name_in_a_nested_body_is_reported_once_and_alone() {
+    // A body that is refused before it binds must leave the calling scope
+    // as it found it: the pipeline's own nodes are not reported as bound
+    // without composition marks.
+    let pipeline = PIPELINE.replace("c.comp.yaml", "outer.comp.yaml");
+    let diags = bind_in(
+        &pipeline,
+        &[
+            ("compositions/outer.comp.yaml", OUTER_OF_INNER_COMP),
+            ("compositions/inner.comp.yaml", DUPLICATE_NODE_COMP),
+        ],
+    );
+    let codes: Vec<&str> = diags.iter().map(|d| d.code.as_str()).collect();
+    assert_eq!(codes, ["E001"], "{:#?}", describe(&diags));
+    assert!(
+        diags[0].message.contains("duplicate node name: \"t\""),
+        "{}",
+        diags[0].message
+    );
+}
+
+#[test]
+fn duplicate_node_names_at_two_calls_are_reported_at_each_and_alone() {
+    let pipeline = format!(
+        "{}  - type: composition
+    name: second
+    input: src
+    use: ../compositions/inner.comp.yaml
+    inputs:
+      inp: src
+",
+        pipeline_with_v("{ nullable: int }").replace("c.comp.yaml", "outer.comp.yaml")
+    );
+    let diags = bind_in(
+        &pipeline,
+        &[
+            ("compositions/outer.comp.yaml", OUTER_OF_INNER_COMP),
+            ("compositions/inner.comp.yaml", DUPLICATE_NODE_COMP),
+        ],
+    );
+    let codes: Vec<&str> = diags.iter().map(|d| d.code.as_str()).collect();
+    assert_eq!(codes, ["E001", "E001"], "{:#?}", describe(&diags));
+}
+
+#[test]
+fn a_dotted_node_name_in_a_nested_body_is_reported_alone() {
+    let dotted = DUPLICATE_NODE_COMP.replacen("    name: t\n", "    name: a.b\n", 1);
+    let pipeline = PIPELINE.replace("c.comp.yaml", "outer.comp.yaml");
+    let diags = bind_in(
+        &pipeline,
+        &[
+            ("compositions/outer.comp.yaml", OUTER_OF_INNER_COMP),
+            ("compositions/inner.comp.yaml", &dotted),
+        ],
+    );
+    let codes: Vec<&str> = diags.iter().map(|d| d.code.as_str()).collect();
+    assert_eq!(codes, ["E010"], "{:#?}", describe(&diags));
+}

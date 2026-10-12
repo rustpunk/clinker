@@ -3556,6 +3556,48 @@ fn bind_schema_inner(
 
 // ─── Composition binding ────────────────────────────────────────────
 
+/// The binding state a composition body binds in: its `use:` path (for
+/// cycle detection), the directory its own `use:` paths resolve from, its
+/// sealed scoped variables, and the node names of every enclosing scope.
+struct BodyScope {
+    use_path: PathBuf,
+    origin_dir: PathBuf,
+    scoped_vars: cxl::resolve::ScopedVarsRegistry,
+    enclosing_scope_names: HashSet<String>,
+}
+
+/// Run `bind` with `bind_ctx` one composition level deeper, in `scope`, and
+/// put the calling scope's state back when it returns.
+///
+/// Entering and leaving happen here and nowhere else, so no exit from
+/// `bind` (or before it) can leave the calling scope bound as if it were
+/// inside a body.
+fn in_body_scope<'a, R>(
+    bind_ctx: &mut BindContext<'a>,
+    scope: BodyScope,
+    bind: impl FnOnce(&mut BindContext<'a>) -> R,
+) -> R {
+    let BodyScope {
+        use_path,
+        origin_dir,
+        scoped_vars,
+        enclosing_scope_names,
+    } = scope;
+    let saved_enclosing =
+        std::mem::replace(&mut bind_ctx.enclosing_scope_names, enclosing_scope_names);
+    let saved_origin_dir = std::mem::replace(&mut bind_ctx.origin_dir, origin_dir);
+    let saved_scoped_vars = std::mem::replace(&mut bind_ctx.scoped_vars, scoped_vars);
+    bind_ctx.use_path_stack.push(use_path);
+    bind_ctx.depth += 1;
+    let out = bind(bind_ctx);
+    bind_ctx.depth -= 1;
+    bind_ctx.use_path_stack.pop();
+    bind_ctx.enclosing_scope_names = saved_enclosing;
+    bind_ctx.scoped_vars = saved_scoped_vars;
+    bind_ctx.origin_dir = saved_origin_dir;
+    out
+}
+
 /// Immutable call-site inputs to [`bind_composition`]: the node's name and
 /// `use:` path, plus the three call-site maps (`inputs:`, `config:`,
 /// `resources:`) read off the
@@ -3742,8 +3784,8 @@ fn bind_composition(
     // The patch map is keyed by bare node name, so without this gate a patch
     // keyed for a top-level composition would also match a same-named
     // composition node nested inside another body and mutate the wrong body.
-    // `depth` is 0 here only for top-level call sites — it is incremented at
-    // step 8 before recursing into a body — so this restricts application to
+    // `depth` is 0 here only for top-level call sites — it is incremented by
+    // `in_body_scope` while the body binds — so this restricts application to
     // the top-level composition the qualified key actually addresses.
     if bind_ctx.depth == 0
         && let Some(inner_patches) = bind_ctx.ctx.body_source_patches.get(node_name)
@@ -4036,20 +4078,10 @@ fn bind_composition(
         }
     }
 
-    // 8. Enter nested scope.
+    // 8. Prepare the nested scope. Nothing in `bind_ctx` changes until the
+    //    body binds inside it (`in_body_scope`), so every early return below
+    //    leaves the calling scope as it found it.
     let body_id = artifacts.fresh_body_id();
-
-    // Save parent state and set up nested scope.
-    let saved_enclosing = std::mem::take(&mut bind_ctx.enclosing_scope_names);
-    let saved_origin_dir = std::mem::replace(
-        &mut bind_ctx.origin_dir,
-        // Set origin_dir to the composition file's directory (workspace-relative)
-        // so nested `use:` paths resolve correctly.
-        resolved_path
-            .parent()
-            .unwrap_or(Path::new(""))
-            .to_path_buf(),
-    );
     // Composition bodies are sealed from parent scoped vars by default
     // — the body sees an empty `ScopedVarsRegistry` and the
     // resolver rejects every `$pipeline.<custom>` / `$source.<custom>` /
@@ -4062,10 +4094,9 @@ fn bind_composition(
     // declaration with the same type, the body's registry includes it.
     // Mismatches (parent missing the var, or type doesn't match) emit
     // E174.
-    let saved_scoped_vars = std::mem::take(&mut bind_ctx.scoped_vars);
     let mut body_scoped_vars = build_body_scoped_vars(
         &signature.scoped_vars_schema,
-        &saved_scoped_vars,
+        &bind_ctx.scoped_vars,
         &signature.name,
         span,
         diags,
@@ -4081,17 +4112,23 @@ fn bind_composition(
         call_config,
         &bind_ctx.ctx.config_overrides,
     );
-    bind_ctx.scoped_vars = body_scoped_vars;
-    // The new enclosing_scope is the parent's node names (for E108).
-    bind_ctx.enclosing_scope_names = parent_schema_by_name.keys().cloned().collect();
-    // Also include the enclosing scope's names so nested compositions
-    // can detect references to any ancestor scope.
-    bind_ctx
-        .enclosing_scope_names
-        .extend(saved_enclosing.iter().cloned());
-
-    bind_ctx.use_path_stack.push(resolved_path.clone());
-    bind_ctx.depth += 1;
+    // The body's enclosing scope is the parent's node names (for E108),
+    // plus the names of every scope enclosing the parent, so nested
+    // compositions can detect references to any ancestor scope.
+    let mut enclosing_scope_names: HashSet<String> =
+        parent_schema_by_name.keys().cloned().collect();
+    enclosing_scope_names.extend(bind_ctx.enclosing_scope_names.iter().cloned());
+    let body_scope = BodyScope {
+        use_path: resolved_path.clone(),
+        // The composition file's directory (workspace-relative), so nested
+        // `use:` paths resolve correctly.
+        origin_dir: resolved_path
+            .parent()
+            .unwrap_or(Path::new(""))
+            .to_path_buf(),
+        scoped_vars: body_scoped_vars,
+        enclosing_scope_names,
+    };
 
     // Seed each port with the row its upstream carries: the records reach
     // the body untouched, in the upstream's column order with the
@@ -4232,29 +4269,24 @@ fn bind_composition(
         })
         .collect();
 
-    // Recursive bind_schema on body nodes.
-    bind_body(
-        &BodyBind {
-            call: node_name,
-            nodes: &body_file.nodes,
-            node_ids: &body_node_ids,
-            port_seeds: &port_seeds,
-            contract_seeds: &contract_seeds,
-            span,
-        },
-        diags,
-        bind_ctx,
-        artifacts,
-        &mut body_schema_by_name,
-        &mut body_declared_multiple_by_name,
-    );
-
-    // Restore parent state.
-    bind_ctx.depth -= 1;
-    bind_ctx.use_path_stack.pop();
-    bind_ctx.enclosing_scope_names = saved_enclosing;
-    bind_ctx.scoped_vars = saved_scoped_vars;
-    bind_ctx.origin_dir = saved_origin_dir;
+    // Recursive bind_schema on body nodes, inside the body's scope.
+    in_body_scope(bind_ctx, body_scope, |bind_ctx| {
+        bind_body(
+            &BodyBind {
+                call: node_name,
+                nodes: &body_file.nodes,
+                node_ids: &body_node_ids,
+                port_seeds: &port_seeds,
+                contract_seeds: &contract_seeds,
+                span,
+            },
+            diags,
+            bind_ctx,
+            artifacts,
+            &mut body_schema_by_name,
+            &mut body_declared_multiple_by_name,
+        )
+    });
 
     // 9. Compute output rows from signature.outputs → body schemas.
     let output_port_rows = compute_output_rows(&signature.outputs, &body_schema_by_name);
