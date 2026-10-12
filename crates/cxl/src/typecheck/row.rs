@@ -119,6 +119,51 @@ pub struct Row {
     pub declared_span: Span,
     /// Whether unknown columns are errors or pass-through.
     pub tail: RowTail,
+    /// Columns that entered this row through a composition input port, each
+    /// with the port it came through and whether the body may name it. Every
+    /// other column belongs to the scope that binds the row. Private: a
+    /// carried column is read through [`Row::carried`] and refused by
+    /// [`Row::lookup`] when the port did not declare it.
+    carried: IndexMap<QualifiedField, CarriedColumn>,
+}
+
+/// A column a composition body received from its caller, unchanged.
+///
+/// The body binds against the caller's row, so the column sits in the
+/// caller's position with the caller's value. Whether the body may name it
+/// is the port's declaration: a column the port does not declare passes
+/// through unnamed. A column the body writes is the body's own and is no
+/// longer carried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CarriedColumn {
+    /// The composition call and input port the column entered through.
+    pub port: Arc<PortOrigin>,
+    /// What the port's declaration lets the body do with the column.
+    pub access: PortAccess,
+}
+
+/// The composition call site and input port a carried column entered
+/// through. Opaque to CXL; the planner reads it to word its diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortOrigin {
+    /// The composition node's name at the call site.
+    pub call: Arc<str>,
+    /// The input port the column came through.
+    pub port: Arc<str>,
+    /// The composition file, as the author refers to it.
+    pub body_file: Arc<str>,
+}
+
+/// How a port's declaration exposes one caller column to the body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortAccess {
+    /// The port does not declare the column: it passes through, unnamed.
+    Undeclared,
+    /// The port declares the column with a concrete type.
+    Declared,
+    /// The port declares the column as `any`: the body sees the type this
+    /// call provides.
+    DeclaredAny,
 }
 
 /// Row tail: closed rows reject unknown columns; open rows bind them to
@@ -167,6 +212,7 @@ impl Row {
             declared,
             declared_span,
             tail: RowTail::Closed,
+            carried: IndexMap::new(),
         }
     }
 
@@ -181,6 +227,7 @@ impl Row {
             declared,
             declared_span,
             tail: RowTail::Open(tail),
+            carried: IndexMap::new(),
         }
     }
 
@@ -195,6 +242,7 @@ impl Row {
             declared,
             declared_span,
             tail,
+            carried: IndexMap::new(),
         }
     }
 
@@ -209,6 +257,10 @@ impl Row {
     ///   (qualified or bare) so the caller can render a precise
     ///   "ambiguous — try `orders.id` or `products.id`" diagnostic.
     ///   This only arises for combine merged rows.
+    ///
+    /// A column carried through a composition port that does not declare it
+    /// is never found: it is [`ColumnLookup::Unknown`], whatever the tail.
+    /// The planner tells that case apart with [`Row::undeclared_carried`].
     pub fn lookup(&self, name: &str) -> ColumnLookup<'_> {
         let matches: Vec<(&QualifiedField, &Type)> = self
             .declared
@@ -220,6 +272,7 @@ impl Row {
                 RowTail::Closed => ColumnLookup::Unknown,
                 RowTail::Open(id) => ColumnLookup::PassThrough(*id),
             },
+            1 if self.is_undeclared_carried(matches[0].0) => ColumnLookup::Unknown,
             1 => ColumnLookup::Declared(matches[0].1),
             _ => ColumnLookup::Ambiguous(matches.iter().map(|(qf, _)| (*qf).clone()).collect()),
         }
@@ -228,9 +281,14 @@ impl Row {
     /// Look up a column by qualifier + name. Exact match on both sides.
     /// Used by the CXL typechecker for 2-part `Expr::QualifiedFieldRef`
     /// resolution inside a combine body / where-clause.
+    ///
+    /// A carried column its port does not declare is [`ColumnLookup::Unknown`].
     pub fn lookup_qualified(&self, qualifier: &str, name: &str) -> ColumnLookup<'_> {
         for (qf, ty) in &self.declared {
             if qf.qualifier.as_deref() == Some(qualifier) && qf.name.as_ref() == name {
+                if self.is_undeclared_carried(qf) {
+                    return ColumnLookup::Unknown;
+                }
                 return ColumnLookup::Declared(ty);
             }
         }
@@ -274,6 +332,88 @@ impl Row {
     /// iterator / lookup methods when possible.
     pub fn declared_map(&self) -> &IndexMap<QualifiedField, Type> {
         &self.declared
+    }
+
+    /// Replace the type of the declared field `field`, keeping its position.
+    /// Returns `false` (and changes nothing) when the row has no such field.
+    pub fn retype(&mut self, field: &QualifiedField, ty: Type) -> bool {
+        match self.declared.get_mut(field) {
+            Some(slot) => {
+                *slot = ty;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Mark the declared field `field` as carried through a composition
+    /// port. A field the row does not declare is ignored.
+    pub fn carry(&mut self, field: QualifiedField, column: CarriedColumn) {
+        if self.declared.contains_key(&field) {
+            self.carried.insert(field, column);
+        }
+    }
+
+    /// Forget that `field` was carried: a node wrote its own column under
+    /// that name, so the column is the body's from here on.
+    pub fn release(&mut self, field: &QualifiedField) {
+        self.carried.shift_remove(field);
+    }
+
+    /// Copy every carried mark of `upstream` onto the field of the same key
+    /// in this row, for each field `keep` admits. A node whose output
+    /// passes some of its input's columns through unchanged calls this so
+    /// the marks travel with the columns.
+    pub fn inherit_carried(&mut self, upstream: &Row, keep: impl Fn(&QualifiedField) -> bool) {
+        for (field, column) in &upstream.carried {
+            if keep(field) {
+                self.carry(field.clone(), column.clone());
+            }
+        }
+    }
+
+    /// The carried mark on `field`, if it entered through a composition port.
+    pub fn carried(&self, field: &QualifiedField) -> Option<&CarriedColumn> {
+        self.carried.get(field)
+    }
+
+    /// Every carried column, in the order they were marked.
+    pub fn carried_columns(&self) -> indexmap::map::Iter<'_, QualifiedField, CarriedColumn> {
+        self.carried.iter()
+    }
+
+    /// The carried mark of the column a bare `name` resolves to, when that
+    /// column entered through a port that does not declare it: the case
+    /// [`Row::lookup`] reports as `Unknown` although the row carries it.
+    pub fn undeclared_carried(&self, name: &str) -> Option<&CarriedColumn> {
+        let mut matches = self.declared.keys().filter(|qf| qf.name.as_ref() == name);
+        let field = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        self.carried
+            .get(field)
+            .filter(|column| column.access == PortAccess::Undeclared)
+    }
+
+    /// [`Row::undeclared_carried`] for an exact `(qualifier, name)` pair.
+    pub fn undeclared_carried_qualified(
+        &self,
+        qualifier: &str,
+        name: &str,
+    ) -> Option<&CarriedColumn> {
+        self.carried.iter().find_map(|(qf, column)| {
+            (qf.qualifier.as_deref() == Some(qualifier)
+                && qf.name.as_ref() == name
+                && column.access == PortAccess::Undeclared)
+                .then_some(column)
+        })
+    }
+
+    fn is_undeclared_carried(&self, field: &QualifiedField) -> bool {
+        self.carried
+            .get(field)
+            .is_some_and(|column| column.access == PortAccess::Undeclared)
     }
 }
 
@@ -423,6 +563,63 @@ mod tests {
         assert_eq!(format!("{qf}"), "orders.id");
         let bare = QualifiedField::bare("id");
         assert_eq!(format!("{bare}"), "id");
+    }
+
+    fn carried(access: PortAccess) -> CarriedColumn {
+        CarriedColumn {
+            port: Arc::new(PortOrigin {
+                call: "call".into(),
+                port: "inp".into(),
+                body_file: "c.comp.yaml".into(),
+            }),
+            access,
+        }
+    }
+
+    /// A column a port carries undeclared is in the row, in its position,
+    /// and cannot be looked up; a declared one can.
+    #[test]
+    fn an_undeclared_carried_column_is_not_found_by_name() {
+        let mut cols = IndexMap::new();
+        cols.insert(QualifiedField::bare("a"), Type::Int);
+        cols.insert(QualifiedField::bare("b"), Type::String);
+        let mut row = Row::closed(cols, span());
+        row.carry(QualifiedField::bare("a"), carried(PortAccess::Undeclared));
+        row.carry(QualifiedField::bare("b"), carried(PortAccess::Declared));
+        assert!(matches!(row.lookup("a"), ColumnLookup::Unknown));
+        assert!(!row.has_field("a"));
+        assert!(row.undeclared_carried("a").is_some());
+        assert!(matches!(
+            row.lookup("b"),
+            ColumnLookup::Declared(Type::String)
+        ));
+        assert!(row.undeclared_carried("b").is_none());
+        assert_eq!(row.field_count(), 2, "the column stays in the row");
+        row.release(&QualifiedField::bare("a"));
+        assert!(matches!(row.lookup("a"), ColumnLookup::Declared(Type::Int)));
+    }
+
+    /// Qualified lookup refuses an undeclared carried column of one input
+    /// and finds the same name on another.
+    #[test]
+    fn an_undeclared_carried_column_is_not_found_by_qualified_name() {
+        let mut cols = IndexMap::new();
+        cols.insert(QualifiedField::qualified("a", "x"), Type::Int);
+        cols.insert(QualifiedField::qualified("b", "x"), Type::Int);
+        let mut row = Row::closed(cols, span());
+        row.carry(
+            QualifiedField::qualified("a", "x"),
+            carried(PortAccess::Undeclared),
+        );
+        assert!(matches!(
+            row.lookup_qualified("a", "x"),
+            ColumnLookup::Unknown
+        ));
+        assert!(row.undeclared_carried_qualified("a", "x").is_some());
+        assert!(matches!(
+            row.lookup_qualified("b", "x"),
+            ColumnLookup::Declared(Type::Int)
+        ));
     }
 
     /// `has_field` and `field_count` on a row with two bare fields.

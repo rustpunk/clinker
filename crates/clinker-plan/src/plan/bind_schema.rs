@@ -23,7 +23,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cxl::ast::{Expr, LiteralValue, Statement};
-use cxl::typecheck::{AggregateMode, ColumnLookup, QualifiedField, Row, Type, TypedProgram};
+use cxl::typecheck::{
+    AggregateMode, CarriedColumn, ColumnLookup, PortAccess, PortOrigin, QualifiedField, Row, Type,
+    TypedProgram,
+};
 use indexmap::IndexMap;
 
 use crate::config::compile_context::{CompileContext, ConfigOverrides};
@@ -225,11 +228,6 @@ pub struct CompileArtifacts {
     /// from colliding — bare-name keying let the last writer silently win.
     pub envelope_synthesis:
         HashMap<PlanNodeId, Arc<crate::plan::envelope_synthesis::EnvelopeSynthesis>>,
-    /// Per composition call site: the caller columns its first output port
-    /// carries through the body with the caller's value. An enclosing body's
-    /// port-vocabulary walk reads it to follow an undeclared caller column
-    /// through a nested call (see [`crate::plan::port_vocabulary`]).
-    pub(crate) composition_passthrough: HashMap<PlanNodeId, BTreeSet<String>>,
     /// Monotonic counter for fresh tail-variable IDs allocated during
     /// row-polymorphic propagation (composition input-port binding).
     /// Threaded as `&mut u32` into `build_input_port_rows`; IDs are
@@ -1893,6 +1891,25 @@ fn bind_reshape(
     } = node;
     let mut ok = true;
 
+    // Every column a Reshape names outside CXL must be one the body may name.
+    // A `set` target and an override name count: both require the column to
+    // exist, and every row the rule does not touch keeps the caller's value,
+    // so a body writing one still depends on the caller having it.
+    let mut named: Vec<&str> = Vec::new();
+    named.extend(config.partition_by.iter().map(String::as_str));
+    named.extend(config.order_by.iter().map(|sf| sf.field.as_str()));
+    for rule in &config.rules {
+        if let Some(mutate) = &rule.mutate {
+            named.extend(mutate.set.keys().map(String::as_str));
+        }
+        if let Some(synth) = &rule.synthesize {
+            named.extend(synth.overrides.keys().map(String::as_str));
+        }
+    }
+    if refuse_undeclared_names(upstream, name, named, span, diags) {
+        return;
+    }
+
     // `partition_by` fields must exist upstream.
     for pk in &config.partition_by {
         if !upstream.has_field(pk) {
@@ -1958,6 +1975,7 @@ fn bind_reshape(
         // `when` predicate compiles as a row filter.
         let when_src = format!("filter {}", rule.when.source);
         let when_prog = match typecheck_cxl(
+            name,
             &format!("{name}:{}:when", rule.name),
             &when_src,
             upstream,
@@ -1971,7 +1989,7 @@ fn bind_reshape(
                 Some(prog)
             }
             Err(d) => {
-                diags.push(d);
+                diags.extend(d);
                 ok = false;
                 None
             }
@@ -2025,6 +2043,7 @@ fn bind_reshape(
                     ok = false;
                 }
                 match typecheck_cxl(
+                    name,
                     &format!("{name}:{}:set.{field}", rule.name),
                     &format!("emit {field} = {}", value.source),
                     upstream,
@@ -2041,7 +2060,7 @@ fn bind_reshape(
                         set.push((field.clone(), prog));
                     }
                     Err(d) => {
-                        diags.push(d);
+                        diags.extend(d);
                         ok = false;
                     }
                 }
@@ -2055,7 +2074,12 @@ fn bind_reshape(
             if synth.copy_from == CopyFrom::None {
                 for (qf, _) in upstream.fields() {
                     let col = qf.name.as_ref();
-                    if col.starts_with('$') {
+                    // Engine columns are the engine's to fill. A column a
+                    // composition port carries undeclared is not the body's
+                    // to name, so it cannot be overridden; a synthesized row
+                    // leaves it empty, as it did before a body bound against
+                    // the caller's row.
+                    if col.starts_with('$') || upstream.undeclared_carried(col).is_some() {
                         continue;
                     }
                     if !synth.overrides.keys().any(|k| k == col) {
@@ -2082,6 +2106,7 @@ fn bind_reshape(
             let mut overrides: Vec<(String, Arc<TypedProgram>)> = Vec::new();
             for (field, value) in &synth.overrides {
                 match typecheck_cxl(
+                    name,
                     &format!("{name}:{}:override.{field}", rule.name),
                     &format!("emit {field} = {}", value.source),
                     upstream,
@@ -2098,7 +2123,7 @@ fn bind_reshape(
                         overrides.push((field.clone(), prog));
                     }
                     Err(d) => {
-                        diags.push(d);
+                        diags.extend(d);
                         ok = false;
                     }
                 }
@@ -2197,7 +2222,10 @@ fn bind_reshape(
         QualifiedField::bare(RESHAPE_MUTATED_BY_COLUMN),
         Type::String,
     );
-    let out = Row::from_parts(declared, upstream.declared_span, upstream.tail.clone());
+    let mut out = Row::from_parts(declared, upstream.declared_span, upstream.tail.clone());
+    // A `set` or override keeps the caller's value on every row its rule does
+    // not touch, so a carried column stays the caller's through Reshape.
+    out.inherit_carried(upstream, |_| true);
     schema_by_name.insert(name.to_string(), out.clone());
     // Bind→lowering handoff: lowering stamps these onto
     // `PlanNode::Reshape.compiled_rules`. Every rule is present here (each
@@ -2264,6 +2292,15 @@ fn bind_cull(
         id,
     } = node;
     let mut ok = true;
+
+    let named = config
+        .partition_by
+        .iter()
+        .map(String::as_str)
+        .chain(config.order_by.iter().map(|sf| sf.field.as_str()));
+    if refuse_undeclared_names(upstream, name, named, span, diags) {
+        return;
+    }
 
     // `partition_by` fields must exist upstream.
     for pk in &config.partition_by {
@@ -2496,6 +2533,7 @@ fn bind_cull(
     // absent from `cull_decision_typed`).
     let decision_label = format!("{name}:drop_group_when");
     let decision_ctx = CxlTypecheckCtx {
+        node: name,
         node_name: &decision_label,
         schema: upstream,
         mode: &agg_mode,
@@ -2516,19 +2554,30 @@ fn bind_cull(
             for rule in &config.rules {
                 let rule_label = format!("{name}:{}:drop_group_when", rule.name);
                 let rule_ctx = CxlTypecheckCtx {
+                    node: name,
                     node_name: &rule_label,
                     schema: upstream,
                     mode: &agg_mode,
                     span,
                     scoped_vars,
                 };
-                if let Err(d) = typecheck_cull_rule(&rule_ctx, &rule.drop_group_when.source) {
-                    diags.push(d);
+                if let Err(rule_diags) =
+                    typecheck_cull_rule(&rule_ctx, &rule.drop_group_when.source)
+                {
+                    // Two rules naming one undeclared column are one fault.
+                    for d in rule_diags {
+                        if !diags
+                            .iter()
+                            .any(|seen| seen.code == d.code && seen.message == d.message)
+                        {
+                            diags.push(d);
+                        }
+                    }
                     attributed = true;
                 }
             }
             if !attributed {
-                diags.push(combined);
+                diags.extend(combined);
             }
             return;
         }
@@ -2837,7 +2886,21 @@ fn bind_schema_inner(
                     Some(s) => s.clone(),
                     None => continue,
                 };
+                // Column names the Transform uses outside CXL: a window's
+                // partition and order keys, and a validation's field.
+                let mut named: Vec<&str> = Vec::new();
+                if let Some(window) = &config.analytic_window {
+                    named.extend(window.group_by.iter().map(String::as_str));
+                    named.extend(window.sort_by.iter().map(|sf| sf.field.as_str()));
+                }
+                for validation in config.validations.iter().flatten() {
+                    named.extend(validation.field.iter().map(String::as_str));
+                }
+                if refuse_undeclared_names(&upstream, &name, named, span, diags) {
+                    continue;
+                }
                 match typecheck_cxl(
+                    &name,
                     &name,
                     &config.cxl.source,
                     &upstream,
@@ -2861,7 +2924,7 @@ fn bind_schema_inner(
                         typed.output_row = out;
                         artifacts.typed_insert(node_id, Arc::new(typed));
                     }
-                    Err(d) => diags.push(d),
+                    Err(d) => diags.extend(d),
                 }
                 // Log-directive gates typecheck against the INPUT row, not the
                 // projected output: dispatch fires before the transform's own
@@ -2887,6 +2950,7 @@ fn bind_schema_inner(
                             continue;
                         };
                         match typecheck_cxl(
+                            &name,
                             &format!("{name}:log[{index}]:condition"),
                             &format!("{}filter {}", use_prelude.source, condition.source),
                             &upstream,
@@ -2923,7 +2987,7 @@ fn bind_schema_inner(
                                 every_condition_bound = false;
                             }
                             Err(d) => {
-                                diags.push(d);
+                                diags.extend(d);
                                 every_condition_bound = false;
                             }
                         }
@@ -2981,6 +3045,17 @@ fn bind_schema_inner(
                         continue;
                     }
                 }
+                // A group_by naming a column a composition port carries
+                // undeclared is E169; any other absent field is E200.
+                let refused: Vec<Diagnostic> = config
+                    .group_by
+                    .iter()
+                    .filter_map(|gb| refuse_undeclared(&upstream, &name, gb, span))
+                    .collect();
+                if !refused.is_empty() {
+                    diags.extend(refused);
+                    continue;
+                }
                 // Validate group_by fields exist in the upstream schema.
                 let mut missing = Vec::new();
                 for gb in &config.group_by {
@@ -3010,6 +3085,7 @@ fn bind_schema_inner(
                 };
                 match typecheck_cxl(
                     &name,
+                    &name,
                     &config.cxl.source,
                     &upstream,
                     agg_mode,
@@ -3036,13 +3112,14 @@ fn bind_schema_inner(
                         typed.output_row = out;
                         artifacts.typed_insert(node_id, Arc::new(typed));
                     }
-                    Err(d) => diags.push(d),
+                    Err(d) => diags.extend(d),
                 }
             }
             PipelineNode::Route { header, config } => {
                 if let Some(upstream) = upstream_schema(&header.input.value, schema_by_name) {
                     let cloned = upstream.clone();
                     if let Ok(mut empty) = typecheck_cxl(
+                        &name,
                         &name,
                         "",
                         &cloned,
@@ -3075,6 +3152,7 @@ fn bind_schema_inner(
                         // type error in a multi-branch route points at the
                         // offending branch, not just the route node.
                         match typecheck_cxl(
+                            &name,
                             &format!("{name} (branch {branch_name})"),
                             &format!("filter {}", cond.source),
                             &cloned,
@@ -3083,7 +3161,7 @@ fn bind_schema_inner(
                             &bind_ctx.scoped_vars,
                         ) {
                             Ok(typed) => branch_programs.push(Arc::new(typed)),
-                            Err(d) => diags.push(d),
+                            Err(d) => diags.extend(d),
                         }
                     }
                     // Record the programs only when every branch typechecked: a
@@ -3181,7 +3259,21 @@ fn bind_schema_inner(
                     artifacts
                         .declared_multiple
                         .insert(node_id, declared_multiple);
-                    let row = upstream.clone();
+                    let mut row = upstream.clone();
+                    // A column any input carries in undeclared stays unnamed
+                    // after the Merge: its records may come from that input.
+                    for input in header.inputs.iter().skip(1) {
+                        if let Some(other) = schema_by_name.get(input_target(&input.value)) {
+                            let undeclared: Vec<(QualifiedField, CarriedColumn)> = other
+                                .carried_columns()
+                                .filter(|(_, column)| column.access == PortAccess::Undeclared)
+                                .map(|(field, column)| (field.clone(), column.clone()))
+                                .collect();
+                            for (field, column) in undeclared {
+                                row.carry(field, column);
+                            }
+                        }
+                    }
                     schema_by_name.insert(name.clone(), row.clone());
                     artifacts.typed_insert(node_id, Arc::new(synthetic_typed_program(row)));
                 }
@@ -3202,6 +3294,34 @@ fn bind_schema_inner(
                         .declared_multiple
                         .insert(node_id, declared_multiple);
                     let row = upstream.clone();
+                    // Every column the Sink names: mapping sources, exclusions,
+                    // the split group key and the sort keys.
+                    let sink = &config.sink;
+                    let mut named: Vec<String> = Vec::new();
+                    if let Some(mapping) = &sink.mapping {
+                        named.extend(mapping.entries().iter().map(|e| e.source.clone()));
+                    }
+                    named.extend(sink.exclude.iter().flatten().cloned());
+                    named.extend(
+                        sink.split
+                            .iter()
+                            .filter_map(|split| split.group_key.clone()),
+                    );
+                    named.extend(
+                        sink.sort_order
+                            .iter()
+                            .flatten()
+                            .map(|spec| spec.clone().into_sort_field().field),
+                    );
+                    if refuse_undeclared_names(
+                        &row,
+                        &name,
+                        named.iter().map(String::as_str),
+                        span,
+                        diags,
+                    ) {
+                        continue;
+                    }
                     validate_output_mapping_columns(&name, &config.sink, &row, span, diags);
                     schema_by_name.insert(name.clone(), row.clone());
                     artifacts.typed_insert(node_id, Arc::new(synthetic_typed_program(row)));
@@ -3899,8 +4019,12 @@ fn bind_composition(
     // will read, as the same nodes written inline would. Every position a
     // body node compiles (an Aggregate's group key and field arguments, a
     // Cull's decision aggregate) then addresses the record's real layout.
+    // The port's declaration decides what the body may name and the types
+    // it sees (see `seed_port_row`).
     let mut body_schema_by_name: HashMap<String, Row> = HashMap::new();
     let mut body_declared_multiple_by_name: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let body_file_label: Arc<str> = Arc::from(resolved_path.display().to_string().as_str());
+    let mut port_seeds: IndexMap<String, Row> = IndexMap::new();
     for port_name in input_port_rows.keys() {
         let Some(upstream_row) = call_inputs
             .get(port_name)
@@ -3908,7 +4032,19 @@ fn bind_composition(
         else {
             continue; // build_input_port_rows already diagnosed it
         };
-        body_schema_by_name.insert(port_name.clone(), upstream_row.clone());
+        let origin = Arc::new(PortOrigin {
+            call: Arc::from(node_name),
+            port: Arc::from(port_name.as_str()),
+            body_file: Arc::clone(&body_file_label),
+        });
+        let declared = signature
+            .inputs
+            .get(port_name)
+            .map(port_columns)
+            .unwrap_or_default();
+        let seed = seed_port_row(upstream_row, &declared, origin);
+        body_schema_by_name.insert(port_name.clone(), seed.clone());
+        port_seeds.insert(port_name.clone(), seed);
         let declared_multiple = call_inputs
             .get(port_name)
             .and_then(|upstream| parent_declared_multiple_by_name.get(upstream))
@@ -4007,6 +4143,7 @@ fn bind_composition(
         .collect();
 
     // Recursive bind_schema on body nodes.
+    let body_diags_start = diags.len();
     bind_schema_inner(
         &body_file.nodes,
         &body_node_ids,
@@ -4027,77 +4164,37 @@ fn bind_composition(
     // 9. Compute output rows from signature.outputs → body schemas.
     let output_port_rows = compute_output_rows(&signature.outputs, &body_schema_by_name);
 
-    // 10. The port is the body's vocabulary: refuse a body node that names
-    // a caller column its port does not declare (E169), and warn where the
-    // body writes a column under the name of one (W101).
-    let port_entries: Vec<crate::plan::port_vocabulary::PortEntry<'_>> = input_port_rows
-        .iter()
-        .filter_map(|(port_name, vocabulary)| {
-            let upstream = call_inputs
-                .get(port_name)
-                .and_then(|upstream| parent_schema_by_name.get(upstream))?;
-            Some(crate::plan::port_vocabulary::PortEntry {
-                port: port_name.as_str(),
-                upstream,
-                declared: vocabulary
-                    .field_names()
-                    .map(|qf| qf.name.to_string())
-                    .collect(),
-            })
-        })
-        .collect();
-    let output_nodes: Vec<(String, String)> = signature
-        .outputs
-        .iter()
-        .map(|(port_name, alias)| {
-            let internal = &alias.internal_ref.value;
-            (
-                port_name.clone(),
-                internal.split('.').next().unwrap_or(internal).to_string(),
-            )
-        })
-        .collect();
-    let walk = crate::plan::port_vocabulary::walk_body(
-        &body_file.nodes,
-        &body_node_ids,
-        artifacts,
-        &body_schema_by_name,
-        &port_entries,
-        &output_nodes,
-    );
-    if !walk.reads.is_empty() {
-        for read in &walk.reads {
-            let upstream_type = port_entries
-                .iter()
-                .find(|entry| entry.port == read.port)
-                .and_then(|entry| match entry.upstream.lookup(&read.column) {
-                    cxl::typecheck::ColumnLookup::Declared(ty) => Some(ty.clone()),
-                    _ => None,
-                })
-                .unwrap_or(Type::Any);
-            diags.push(undeclared_port_column_diagnostic(
-                node_name,
-                &resolved_path,
-                read,
-                &upstream_type,
-            ));
-        }
+    // 10. A body node that named a caller column its port does not declare
+    // was refused where it named it (E169). Abandon the body then, as any
+    // other refused body is abandoned.
+    if diags[body_diags_start..].iter().any(|d| d.code == "E169") {
         return;
     }
-    for (port_name, column) in &walk.shadows {
-        diags.push(Diagnostic::warning(
-            "W101",
-            format!(
-                "composition node {node_name:?}, output port {port_name:?}: \
-                 body-declared column {column:?} shadows a pass-through \
-                 column from the input port"
-            ),
-            LabeledSpan::primary(span, "body creates this column".to_string()),
-        ));
+    // W101: a body column written under the name of a caller column one of
+    // the input ports passes through undeclared.
+    for (port_name, row) in &output_port_rows {
+        for (field, _) in row.fields() {
+            let column = field.name.as_ref();
+            if column.starts_with('$') || row.carried(field).is_some() {
+                continue; // an engine column, or the caller's own value
+            }
+            let shadowed = port_seeds
+                .iter()
+                .find(|(_, seed)| seed.undeclared_carried(column).is_some())
+                .map(|(input, _)| input);
+            if let Some(input) = shadowed {
+                diags.push(Diagnostic::warning(
+                    "W101",
+                    format!(
+                        "composition node {node_name:?}, output port {port_name:?}: \
+                         body-declared column {column:?} shadows the column of that \
+                         name input port {input:?} passes through undeclared"
+                    ),
+                    LabeledSpan::primary(span, "body creates this column".to_string()),
+                ));
+            }
+        }
     }
-    artifacts
-        .composition_passthrough
-        .insert(node_id, walk.first_output_unchanged);
 
     // 11. Collect nested body ids from artifacts (bodies added during recursive call).
     let nested_body_ids: Vec<CompositionBodyId> = artifacts
@@ -4510,6 +4607,7 @@ fn bind_composition(
         artifacts
             .declared_multiple
             .insert(node_id, declared_multiple);
+        let row = carry_into_caller_scope(row, call_inputs, parent_schema_by_name);
         parent_schema_by_name.insert(node_name.to_string(), row);
     }
 }
@@ -4979,6 +5077,13 @@ fn build_input_port_rows(
         let declared_columns = port_columns(port_decl);
         for (col_name, col_type) in &declared_columns {
             let col_str = col_name.name.as_ref();
+            // A nested call inside a body names each column its port
+            // declares: one the enclosing port carries undeclared is E169.
+            if let Some(refused) = refuse_undeclared(upstream_row, node_name, col_str, span) {
+                diags.push(refused);
+                has_errors = true;
+                continue;
+            }
             match upstream_row.lookup(col_str) {
                 cxl::typecheck::ColumnLookup::Unknown => {
                     // Closed upstream, no match — required column missing.
@@ -5148,20 +5253,140 @@ fn compute_output_rows(
 
 // ─── Port vocabulary ────────────────────────────────────────────────
 
+/// The row a composition body binds input port `port` against: the row the
+/// call site feeds it, with the port's declaration applied.
+///
+/// Positions, engine columns and every other column are the caller's, so
+/// each position a body node compiles addresses the records the body
+/// receives. A column the port declares with a concrete type is seen with
+/// that type at every call (E102 has admitted the caller's type into it);
+/// a column the port declares `any` keeps the type this call provides. Every
+/// author column is marked as carried in through the port, and one the port
+/// does not declare cannot be named by the body ([`Row::lookup`] refuses it),
+/// which every name check in the body reports as E169.
+fn seed_port_row(
+    upstream: &Row,
+    declared: &IndexMap<QualifiedField, Type>,
+    origin: Arc<PortOrigin>,
+) -> Row {
+    let mut seed = upstream.clone();
+    let fields: Vec<QualifiedField> = seed.field_names().cloned().collect();
+    for field in fields {
+        if field.name.starts_with('$') {
+            continue; // engine columns stay nameable where authors may name them
+        }
+        let access = match declared.get(&field) {
+            None => PortAccess::Undeclared,
+            Some(Type::Any) => PortAccess::DeclaredAny,
+            Some(ty) => {
+                seed.retype(&field, ty.clone());
+                PortAccess::Declared
+            }
+        };
+        seed.carry(
+            field,
+            CarriedColumn {
+                port: Arc::clone(&origin),
+                access,
+            },
+        );
+    }
+    seed
+}
+
+/// A composition call's output row as the scope that called it sees it.
+///
+/// Inside the body, a carried mark means the column is the caller's,
+/// unchanged. Seen from the calling scope, such a column is whatever it was
+/// in the row that fed the port: the mark that row gave it (from an enclosing
+/// body's own port), or none. A column the body wrote is the calling scope's
+/// own, as any column a node there writes is.
+fn carry_into_caller_scope(
+    row: Row,
+    call_inputs: &IndexMap<String, String>,
+    parent_schema_by_name: &HashMap<String, Row>,
+) -> Row {
+    let marks: Vec<(QualifiedField, Arc<str>)> = row
+        .carried_columns()
+        .map(|(field, column)| (field.clone(), Arc::clone(&column.port.port)))
+        .collect();
+    let mut out = row;
+    for (field, _) in &marks {
+        out.release(field);
+    }
+    for (field, port) in marks {
+        let caller_mark = call_inputs
+            .get(port.as_ref())
+            .and_then(|upstream| parent_schema_by_name.get(upstream))
+            .and_then(|fed| fed.carried(&field))
+            .cloned();
+        if let Some(mark) = caller_mark {
+            out.carry(field, mark);
+        }
+    }
+    out
+}
+
+/// E169 for `column` when `row` carries it through a composition port that
+/// does not declare it; `None` for any other name.
+///
+/// Every name a body node uses outside CXL (a `group_by`, a `partition_by`,
+/// a Sink `mapping:` source, ...) goes through this before its own presence
+/// check, so the author reads which port to edit rather than "not present".
+fn refuse_undeclared(row: &Row, node: &str, column: &str, span: Span) -> Option<Diagnostic> {
+    let carried = row.undeclared_carried(column)?;
+    let caller_type = row
+        .fields()
+        .find(|(field, _)| field.name.as_ref() == column)
+        .map(|(_, ty)| ty);
+    Some(undeclared_column_diagnostic(
+        node,
+        column,
+        carried,
+        caller_type,
+        span,
+    ))
+}
+
+/// [`refuse_undeclared`] for each of `names`, once per column. Returns
+/// whether any was refused.
+fn refuse_undeclared_names<'a>(
+    row: &Row,
+    node: &str,
+    names: impl IntoIterator<Item = &'a str>,
+    span: Span,
+    diags: &mut Vec<Diagnostic>,
+) -> bool {
+    let mut refused: Vec<&str> = Vec::new();
+    for column in names {
+        if refused.contains(&column) {
+            continue;
+        }
+        if let Some(d) = refuse_undeclared(row, node, column, span) {
+            refused.push(column);
+            diags.push(d);
+        }
+    }
+    !refused.is_empty()
+}
+
 /// E169: a composition body names a caller column its input port does not
 /// declare.
 ///
 /// The help is the declaration to add to the port, in the composition file,
 /// with the type the caller's column has at this call site.
-fn undeclared_port_column_diagnostic(
-    call: &str,
-    body_path: &Path,
-    read: &crate::plan::port_vocabulary::UndeclaredRead,
-    upstream_type: &Type,
+fn undeclared_column_diagnostic(
+    node: &str,
+    column: &str,
+    carried: &CarriedColumn,
+    caller_type: Option<&Type>,
+    span: Span,
 ) -> Diagnostic {
-    let column = &read.column;
-    let port = &read.port;
-    let node = &read.node;
+    let PortOrigin {
+        call,
+        port,
+        body_file,
+    } = carried.port.as_ref();
     Diagnostic::error(
         "E169",
         format!(
@@ -5170,16 +5395,200 @@ fn undeclared_port_column_diagnostic(
              columns its input ports declare; every other column passes through the call \
              unchanged."
         ),
-        LabeledSpan::primary(read.span, format!("uses `{column}`")),
+        LabeledSpan::primary(span, format!("uses `{column}`")),
     )
     .with_help(format!(
-        "declare `{column}` on input port `{port}` in `{}`, so every call of the \
+        "declare `{column}` on input port `{port}` in `{body_file}`, so every call of the \
          composition has to provide it:\n\
          _compose:\n  inputs:\n    {port}:\n      schema:\n        \
          - {{ name: {column}, type: {} }}",
-        body_path.display(),
-        port_column_type(upstream_type),
+        port_column_type(caller_type.unwrap_or(&Type::Any)),
     ))
+}
+
+/// The names a CXL program bound against `row` may resolve as columns:
+/// every column except one a composition port carries undeclared.
+fn nameable_columns(row: &Row) -> Vec<&str> {
+    row.field_names()
+        .filter(|field| {
+            row.carried(field)
+                .is_none_or(|column| column.access != PortAccess::Undeclared)
+        })
+        .map(|field| field.name.as_ref())
+        .collect()
+}
+
+/// Where a program [`resolve_against_row`] resolves sits: its node, the
+/// context its resolver failures are reported under, and the node's span.
+#[derive(Clone, Copy)]
+struct ResolveSite<'a> {
+    node: &'a str,
+    context: &'a str,
+    span: Span,
+}
+
+/// Resolve `program`'s names against `row`, as [`cxl::resolve`] does, with
+/// the columns a composition port carries undeclared left out of the names
+/// it may resolve.
+///
+/// A field reference that fails only because it names such a column is
+/// E169, one per column; every other failure is the resolver's own, worded
+/// by [`resolve_failure_diagnostic`] under `context`. Leaving those columns
+/// out is also what keeps them out of a "did you mean" suggestion.
+fn resolve_against_row(
+    site: ResolveSite<'_>,
+    program: cxl::ast::Program,
+    node_count: u32,
+    row: &Row,
+    module_exports: &HashMap<String, cxl::resolve::ModuleExports>,
+    scoped_vars: &cxl::resolve::ScopedVarsRegistry,
+) -> Result<cxl::resolve::ResolvedProgram, Vec<Diagnostic>> {
+    let ResolveSite {
+        node,
+        context,
+        span,
+    } = site;
+    struct FieldRefs(Vec<(cxl::lexer::Span, Box<str>)>);
+    impl cxl::analyzer::visitor::Visitor for FieldRefs {
+        fn visit_expr(&mut self, expr: &Expr) {
+            if let Expr::FieldRef { name, span, .. } = expr {
+                self.0.push((*span, name.clone()));
+            }
+            cxl::analyzer::visitor::walk_expr(self, expr);
+        }
+    }
+    let mut refs = FieldRefs(Vec::new());
+    for statement in &program.statements {
+        cxl::analyzer::visitor::Visitor::visit_statement(&mut refs, statement);
+    }
+    let names = nameable_columns(row);
+    cxl::resolve::resolve_program_with_modules_and_vars(
+        program,
+        &names,
+        node_count,
+        module_exports,
+        scoped_vars,
+    )
+    .map_err(|failures| {
+        let mut out: Vec<Diagnostic> = Vec::new();
+        let mut refused: Vec<&str> = Vec::new();
+        let mut other = Vec::new();
+        for failure in failures {
+            let undeclared = refs
+                .0
+                .iter()
+                .find(|(at, name)| *at == failure.span && row.undeclared_carried(name).is_some())
+                .map(|(_, name)| name);
+            match undeclared {
+                Some(name) => {
+                    if !refused.contains(&name.as_ref()) {
+                        refused.push(name);
+                        out.extend(refuse_undeclared(row, node, name, span));
+                    }
+                }
+                None => other.push(failure),
+            }
+        }
+        if !other.is_empty() {
+            out.push(resolve_failure_diagnostic(context, other, span));
+        }
+        out
+    })
+}
+
+/// E169 for each column a resolved program names outside the resolver's
+/// reach: a `distinct by` field, and the field a positional window call
+/// (`$window.first().amount`) reads.
+fn undeclared_names_outside_resolver(
+    program: &cxl::ast::Program,
+    row: &Row,
+    node: &str,
+    span: Span,
+) -> Vec<Diagnostic> {
+    struct Names(Vec<Box<str>>);
+    impl cxl::analyzer::visitor::Visitor for Names {
+        fn visit_statement(&mut self, statement: &Statement) {
+            if let Statement::Distinct {
+                field: Some(field), ..
+            } = statement
+            {
+                self.0.push(field.clone());
+            }
+            cxl::analyzer::visitor::walk_statement(self, statement);
+        }
+        fn visit_expr(&mut self, expr: &Expr) {
+            if let Expr::MethodCall {
+                receiver,
+                method,
+                args,
+                ..
+            } = expr
+                && args.is_empty()
+                && let Expr::WindowCall { function, .. } = receiver.as_ref()
+                && matches!(function.as_ref(), "first" | "last" | "lag" | "lead")
+            {
+                self.0.push(method.clone());
+            }
+            cxl::analyzer::visitor::walk_expr(self, expr);
+        }
+    }
+    let mut names = Names(Vec::new());
+    for statement in &program.statements {
+        cxl::analyzer::visitor::Visitor::visit_statement(&mut names, statement);
+    }
+    let mut seen: Vec<&str> = Vec::new();
+    let mut out = Vec::new();
+    for name in &names.0 {
+        if seen.contains(&name.as_ref()) {
+            continue;
+        }
+        seen.push(name);
+        out.extend(refuse_undeclared(row, node, name, span));
+    }
+    out
+}
+
+/// The columns a resolved program reads that its composition port declares
+/// `any`: the body sees them with the type this call provides, so a type
+/// error over one is specific to this call.
+fn caller_typed_reads<'a>(
+    resolved: &cxl::resolve::ResolvedProgram,
+    row: &'a Row,
+) -> Vec<(&'a QualifiedField, &'a CarriedColumn)> {
+    struct Reads<'b> {
+        bindings: &'b [Option<cxl::resolve::ResolvedBinding>],
+        names: Vec<Box<str>>,
+    }
+    impl cxl::analyzer::visitor::Visitor for Reads<'_> {
+        fn visit_expr(&mut self, expr: &Expr) {
+            if let Expr::FieldRef { node_id, name, .. } = expr
+                && matches!(
+                    self.bindings.get(node_id.0 as usize),
+                    Some(Some(cxl::resolve::ResolvedBinding::Field(_)))
+                )
+                && !self.names.contains(name)
+            {
+                self.names.push(name.clone());
+            }
+            cxl::analyzer::visitor::walk_expr(self, expr);
+        }
+    }
+    let mut reads = Reads {
+        bindings: &resolved.bindings,
+        names: Vec::new(),
+    };
+    for statement in &resolved.program.statements {
+        cxl::analyzer::visitor::Visitor::visit_statement(&mut reads, statement);
+    }
+    row.carried_columns()
+        .filter(|(field, column)| {
+            column.access == PortAccess::DeclaredAny
+                && reads
+                    .names
+                    .iter()
+                    .any(|name| name.as_ref() == field.name.as_ref())
+        })
+        .collect()
 }
 
 /// How a port schema spells `ty`. A type a port column cannot declare
@@ -5511,6 +5920,10 @@ fn upstream_target_name(input: &crate::config::node_header::NodeInput) -> Option
 /// several rule-level checks; the program-specific inputs (AST, node count,
 /// display source) stay direct arguments.
 struct CxlTypecheckCtx<'a> {
+    /// The node the program belongs to, as the author named it.
+    node: &'a str,
+    /// The node and the part of it the program compiles, for diagnostics
+    /// (`"t1"`, `"r (branch high)"`, `"t1:log[0]:condition"`).
     node_name: &'a str,
     schema: &'a Row,
     mode: &'a AggregateMode,
@@ -5598,6 +6011,10 @@ fn log_field_diagnostics(
             continue;
         };
         for field in fields {
+            if let Some(refused) = refuse_undeclared(upstream, node_name, field, span) {
+                diags.push(refused);
+                continue;
+            }
             if !matches!(upstream.lookup(field), ColumnLookup::Unknown) {
                 continue;
             }
@@ -5661,15 +6078,19 @@ fn nearest_column(field: &str, upstream: &Row) -> Option<String> {
         .map(|(_, name)| name)
 }
 
-#[allow(clippy::result_large_err)]
+/// Parse, resolve and typecheck one CXL program of node `node` against
+/// `schema`. `node_name` labels the program in diagnostics. A failure is one
+/// or more diagnostics: E169 once per column a composition port carries
+/// undeclared, otherwise the one parse, resolve or type error.
 fn typecheck_cxl(
+    node: &str,
     node_name: &str,
     source: &str,
     schema: &Row,
     mode: AggregateMode,
     span: Span,
     scoped_vars: &cxl::resolve::ScopedVarsRegistry,
-) -> Result<TypedProgram, Diagnostic> {
+) -> Result<TypedProgram, Vec<Diagnostic>> {
     let parse_result = cxl::parser::Parser::parse(source);
     if !parse_result.errors.is_empty() {
         let messages: Vec<String> = parse_result
@@ -5677,13 +6098,14 @@ fn typecheck_cxl(
             .iter()
             .map(|e| e.message.clone())
             .collect();
-        return Err(Diagnostic::error(
+        return Err(vec![Diagnostic::error(
             "E202",
             format!("CXL parse error in {node_name:?}: {}", messages.join("; ")),
             LabeledSpan::primary(span, String::new()),
-        ));
+        )]);
     }
     let ctx = CxlTypecheckCtx {
+        node,
         node_name,
         schema,
         mode: &mode,
@@ -5779,41 +6201,54 @@ fn resolve_failure_diagnostic(
 /// `program` (the resolver/typechecker size their per-node side-tables by
 /// it); a synthesizing caller is responsible for keeping ids dense and
 /// below it.
-#[allow(clippy::result_large_err)]
 fn typecheck_parsed_program(
     ctx: &CxlTypecheckCtx<'_>,
     program: cxl::ast::Program,
     node_count: u32,
     source: Arc<str>,
-) -> Result<TypedProgram, Diagnostic> {
+) -> Result<TypedProgram, Vec<Diagnostic>> {
     let CxlTypecheckCtx {
+        node,
         node_name,
         schema,
         mode,
         span,
         scoped_vars,
     } = *ctx;
-    // Collect unqualified field names for CXL resolve. In the non-combine
-    // case all fields are bare; in the combine case (C.1.1+) qualified
-    // fields collapse to their `.name` — the resolver only needs to know
-    // which identifiers are "field-like," and combine bodies address
-    // qualified fields via `Expr::QualifiedFieldRef` (handled in
-    // typecheck/pass.rs, not resolve).
-    let field_refs: Vec<&str> = schema.field_names().map(|qf| qf.name.as_ref()).collect();
-    let resolved = cxl::resolve::resolve_program_with_modules_and_vars(
+    // Field names for CXL resolve. In the non-combine case all fields are
+    // bare; in the combine case qualified fields collapse to their `.name` —
+    // the resolver only needs to know which identifiers are "field-like",
+    // and combine bodies address qualified fields via
+    // `Expr::QualifiedFieldRef` (handled in typecheck/pass.rs, not resolve).
+    let context = format!("CXL name resolution failed in {node_name:?}");
+    let resolved = resolve_against_row(
+        ResolveSite {
+            node,
+            context: &context,
+            span,
+        },
         program,
-        &field_refs,
         node_count,
+        schema,
         &scoped_vars.module_exports,
         scoped_vars,
-    )
-    .map_err(|diags| {
-        resolve_failure_diagnostic(
-            &format!("CXL name resolution failed in {node_name:?}"),
-            diags,
-            span,
-        )
-    })?;
+    )?;
+    let refused = undeclared_names_outside_resolver(&resolved.program, schema, node, span);
+    if !refused.is_empty() {
+        return Err(refused);
+    }
+    let caller_typed: Vec<(QualifiedField, CarriedColumn, Type)> =
+        caller_typed_reads(&resolved, schema)
+            .into_iter()
+            .map(|(field, column)| {
+                let ty = schema
+                    .declared_map()
+                    .get(field)
+                    .cloned()
+                    .unwrap_or(Type::Any);
+                (field.clone(), column.clone(), ty)
+            })
+            .collect();
     cxl::typecheck::pass::type_check_with_mode_and_vars(resolved, schema, mode.clone(), scoped_vars)
         .map(|mut typed| {
             fold_body_config(&mut typed, scoped_vars);
@@ -5834,12 +6269,55 @@ fn typecheck_parsed_program(
             } else {
                 errors.join("; ")
             };
-            Diagnostic::error(
-                "E200",
-                format!("CXL type error in {node_name:?}: {joined}"),
-                LabeledSpan::primary(span, String::new()),
-            )
+            vec![match caller_typed.first() {
+                // The program reads a column its port declares `any`: the
+                // node sees the type this call provides, so the error is
+                // this call's, and the author has to learn that first.
+                Some((field, column, ty)) => {
+                    caller_typed_type_error(node, field, column, ty, &joined, span)
+                }
+                None => Diagnostic::error(
+                    "E200",
+                    format!("CXL type error in {node_name:?}: {joined}"),
+                    LabeledSpan::primary(span, String::new()),
+                ),
+            }]
         })
+}
+
+/// E200 for a type error in a composition body node that reads a column
+/// its input port declares `any`. The body sees the type this call
+/// provides, so the composition and the port are what the author has to
+/// read first.
+fn caller_typed_type_error(
+    node: &str,
+    field: &QualifiedField,
+    column: &CarriedColumn,
+    provided: &Type,
+    detail: &str,
+    span: Span,
+) -> Diagnostic {
+    let PortOrigin {
+        call,
+        port,
+        body_file,
+    } = column.port.as_ref();
+    let name = field.name.as_ref();
+    Diagnostic::error(
+        "E200",
+        format!(
+            "composition {call:?} passes column `{name}` to node {node:?} as `{}`, the type \
+             this call provides, because its input port `{port}` declares `{name}` as `any`; \
+             node {node:?} cannot use it that way: {detail}",
+            port_column_type(provided)
+        ),
+        LabeledSpan::primary(span, String::new()),
+    )
+    .with_help(format!(
+        "declare on input port `{port}` in `{body_file}` the type node {node:?} needs for \
+         `{name}`, so every call has to provide that type — replace `type: any` in \
+         `- {{ name: {name}, type: any }}` — or convert `{name}` in this pipeline before the call"
+    ))
 }
 
 /// Wrapper a single Cull rule predicate is parsed inside. The rule source is
@@ -5913,12 +6391,12 @@ fn parse_cull_rule_predicate(
 /// surfacing a non-boolean predicate as the same type error the combined
 /// program raises. Returns `Ok` if this rule alone typechecks cleanly,
 /// `Err` with the attributed diagnostic otherwise.
-#[allow(clippy::result_large_err)]
 fn typecheck_cull_rule(
     ctx: &CxlTypecheckCtx<'_>,
     source: &str,
-) -> Result<TypedProgram, Diagnostic> {
-    let (predicate, mut next_id) = parse_cull_rule_predicate(ctx.node_name, source, 0, ctx.span)?;
+) -> Result<TypedProgram, Vec<Diagnostic>> {
+    let (predicate, mut next_id) =
+        parse_cull_rule_predicate(ctx.node_name, source, 0, ctx.span).map_err(|d| vec![d])?;
     let body_span = predicate.span();
     let false_id = cxl::ast::NodeId(next_id);
     next_id += 1;
@@ -6052,6 +6530,7 @@ fn compile_header_section(
     }
 
     let typed = match typecheck_cxl(
+        name,
         &format!("{name}:header.{section}"),
         &program,
         body_row,
@@ -6061,7 +6540,7 @@ fn compile_header_section(
     ) {
         Ok(t) => t,
         Err(d) => {
-            diags.push(d);
+            diags.extend(d);
             return None;
         }
     };
@@ -6209,6 +6688,7 @@ fn compile_footer_section(
     }
 
     let typed = match typecheck_cxl(
+        name,
         &format!("{name}:footer.{section}"),
         &program,
         body_row,
@@ -6220,7 +6700,7 @@ fn compile_footer_section(
     ) {
         Ok(t) => t,
         Err(d) => {
-            diags.push(d);
+            diags.extend(d);
             return None;
         }
     };
@@ -6316,9 +6796,11 @@ fn compile_footer_section(
 /// statement. Output field names come from the `emit name = expr` LHS
 /// and are always bare (`QualifiedField::bare`). Preserves the upstream
 /// tail (Closed / Open) so pass-through semantics propagate across
-/// Transform boundaries.
+/// Transform boundaries. A column a composition port carried in keeps its
+/// mark unless the Transform writes it, which makes it the body's own.
 fn propagate_row(upstream: &Row, typed: &TypedProgram) -> Row {
     let mut out = upstream.declared_map().clone();
+    let mut written: HashSet<QualifiedField> = HashSet::new();
     cxl::ast::for_each_field_emit(&typed.program.statements, &mut |name, expr| {
         let emit_type = typed
             .types
@@ -6326,8 +6808,11 @@ fn propagate_row(upstream: &Row, typed: &TypedProgram) -> Row {
             .and_then(|t| t.clone())
             .unwrap_or(Type::Any);
         out.insert(QualifiedField::bare(name), emit_type);
+        written.insert(QualifiedField::bare(name));
     });
-    Row::from_parts(out, upstream.declared_span, upstream.tail.clone())
+    let mut row = Row::from_parts(out, upstream.declared_span, upstream.tail.clone());
+    row.inherit_carried(upstream, |field| !written.contains(field));
+    row
 }
 
 /// Propagate the authored multi-value declaration through one Transform.
@@ -6554,7 +7039,16 @@ fn propagate_aggregate(
             Type::Any,
         );
     }
-    Row::from_parts(out, upstream.declared_span, upstream.tail.clone())
+    let mut written: HashSet<QualifiedField> = HashSet::new();
+    cxl::ast::for_each_field_emit(&typed.program.statements, &mut |name, _| {
+        written.insert(QualifiedField::bare(name));
+    });
+    let mut row = Row::from_parts(out, upstream.declared_span, upstream.tail.clone());
+    // A group key holds the caller's value; an emitted column is the body's.
+    row.inherit_carried(upstream, |field| {
+        group_by.iter().any(|gb| gb == field.name.as_ref()) && !written.contains(field)
+    });
+    row
 }
 
 // ─── Combine arm (Phase Combine C.1.1 + C.1.2 + C.1.3) ──────────────
@@ -6698,7 +7192,22 @@ fn bind_combine(
     artifacts.combine_strategy_hints.insert(id, config.strategy);
 
     let cxl_span = cxl::lexer::Span::new(span.start as usize, span.start as usize);
-    let merged_row = Row::closed(merged_declared, cxl_span);
+    let mut merged_row = Row::closed(merged_declared, cxl_span);
+    // Each input's carried columns stay carried under their qualifier, so
+    // `b.extra` is refused where `b`'s port does not declare `extra`.
+    for (qualifier, input) in artifacts
+        .combine_inputs
+        .get(&id)
+        .into_iter()
+        .flat_map(|inputs| inputs.iter())
+    {
+        for (field, column) in input.row.carried_columns() {
+            merged_row.carry(
+                QualifiedField::qualified(qualifier.as_str(), field.name.clone()),
+                column.clone(),
+            );
+        }
+    }
 
     // ── Where-clause typecheck ─────────────────────────────────────
     let typed_where = match typecheck_combine_where(
@@ -6720,7 +7229,8 @@ fn bind_combine(
         .insert(id, Arc::clone(&typed_where));
 
     // Post-walk for E304 (unknown / 3-part qualified refs in where).
-    let e304_before = diags.iter().filter(|d| d.code == "E304").count();
+    let refused_where = |d: &Diagnostic| d.code == "E304" || d.code == "E169";
+    let e304_before = diags.iter().filter(|d| refused_where(d)).count();
     if let Some(Statement::Filter { predicate, .. }) = typed_where.program.statements.first() {
         walk_for_unknown_refs(
             predicate,
@@ -6734,7 +7244,7 @@ fn bind_combine(
             diags,
         );
     }
-    let e304_fired = diags.iter().filter(|d| d.code == "E304").count() > e304_before;
+    let e304_fired = diags.iter().filter(|d| refused_where(d)).count() > e304_before;
 
     // Decompose predicate → DecomposedPredicate. The shared typed_where
     // Arc is threaded through so each EqualityConjunct captures the
@@ -6877,7 +7387,9 @@ fn bind_combine(
                 }
             }
         }
-        let output_row = Row::closed(output_decl, cxl_span);
+        let mut output_row = Row::closed(output_decl, cxl_span);
+        // The driver's columns pass through collect mode unchanged.
+        output_row.inherit_carried(&driver_input.row, |_| true);
         schema_by_name.insert(name.to_string(), output_row.clone());
         artifacts.typed_insert(id, Arc::new(synthetic_typed_program(output_row)));
         return;
@@ -6885,6 +7397,7 @@ fn bind_combine(
 
     // ── Body typecheck ─────────────────────────────────────────────
     let body_typed = match typecheck_cxl(
+        name,
         name,
         &config.cxl.source,
         &merged_row,
@@ -6894,7 +7407,7 @@ fn bind_combine(
     ) {
         Ok(t) => t,
         Err(d) => {
-            diags.push(d);
+            diags.extend(d);
             return;
         }
     };
@@ -7167,26 +7680,19 @@ fn typecheck_combine_where(
         )]);
     }
 
-    let field_refs: Vec<&str> = merged_row
-        .field_names()
-        .map(|qf| qf.name.as_ref())
-        .collect();
-    let resolved = match cxl::resolve::resolve_program_with_modules_and_vars(
+    let context = format!("combine {combine_name:?} where-clause name resolution");
+    let resolved = resolve_against_row(
+        ResolveSite {
+            node: combine_name,
+            context: &context,
+            span,
+        },
         parse_result.ast,
-        &field_refs,
         parse_result.node_count,
+        merged_row,
         &std::collections::HashMap::new(),
         scoped_vars,
-    ) {
-        Ok(r) => r,
-        Err(rd) => {
-            return Err(vec![resolve_failure_diagnostic(
-                &format!("combine {combine_name:?} where-clause name resolution"),
-                rd,
-                span,
-            )]);
-        }
-    };
+    )?;
 
     match cxl::typecheck::pass::type_check_with_mode_and_vars(
         resolved,
@@ -7282,6 +7788,29 @@ fn walk_for_unknown_refs(expr: &Expr, cx: CombineWalkContext<'_>, diags: &mut Ve
                          Transform before the combine",
                     ),
                 );
+            } else if parts.len() == 2
+                && let Some(carried) = cx
+                    .merged_row
+                    .undeclared_carried_qualified(&parts[0], &parts[1])
+            {
+                // The input's composition port carries the column undeclared.
+                let caller_type = cx.merged_row.declared_map().get(&QualifiedField::qualified(
+                    parts[0].as_ref(),
+                    parts[1].as_ref(),
+                ));
+                let diag = undeclared_column_diagnostic(
+                    cx.combine_name,
+                    &parts[1],
+                    carried,
+                    caller_type,
+                    cx.combine_span,
+                );
+                if !diags
+                    .iter()
+                    .any(|seen| seen.code == diag.code && seen.message == diag.message)
+                {
+                    diags.push(diag);
+                }
             } else if parts.len() == 2
                 && matches!(
                     cx.merged_row.lookup_qualified(&parts[0], &parts[1]),

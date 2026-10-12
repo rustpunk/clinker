@@ -10,7 +10,6 @@ pub mod execution;
 pub mod explain_provenance;
 pub mod extraction;
 pub mod index;
-pub(crate) mod port_vocabulary;
 pub mod predicate_support;
 pub mod properties;
 pub mod row_type;
