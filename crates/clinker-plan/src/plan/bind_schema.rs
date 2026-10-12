@@ -4793,10 +4793,13 @@ fn bind_composition(
             .insert(node_id, declared_multiple);
         let row = carry_into_caller_scope(
             row,
-            node_name,
-            call_inputs,
-            parent_schema_by_name,
-            span,
+            &CallerScope {
+                call: node_name,
+                in_body: bind_ctx.depth > 0,
+                call_inputs,
+                parent_schema_by_name,
+                span,
+            },
             diags,
         );
         parent_schema_by_name.insert(node_name.to_string(), row);
@@ -5270,20 +5273,18 @@ fn build_input_port_rows(
             // A node of this scope with no row failed to bind, and said why
             // where it failed; a second error here would only say that the
             // call cannot read it.
+            has_errors = true;
             let failed_upstream = scope_nodes.contains(upstream_name.as_str())
                 && diags.iter().any(|d| d.severity == Severity::Error);
-            has_errors = true;
-            if failed_upstream {
-                continue;
+            if !failed_upstream {
+                diags.push(unbound_port_upstream(
+                    call,
+                    port_name,
+                    upstream_name,
+                    parent_schemas,
+                    span,
+                ));
             }
-            diags.push(unbound_port_upstream(
-                call,
-                port_name,
-                upstream_name,
-                parent_schemas,
-                span,
-            ));
-            has_errors = true;
             continue;
         };
         let from_source = source_nodes.contains(upstream_name.as_str());
@@ -6190,6 +6191,23 @@ fn seed_port_row(
     seed
 }
 
+/// The scope a composition call returns its output row into, for
+/// [`carry_into_caller_scope`].
+struct CallerScope<'a> {
+    /// The composition node's name at the call site.
+    call: &'a str,
+    /// Whether the calling scope is itself a composition body. Decided by
+    /// the bind depth, not by the rows feeding the call's ports: a call
+    /// that binds no input port (a composition reading only its own
+    /// Sources) still returns into a body when it sits in one.
+    in_body: bool,
+    /// The call site's `inputs:` map: port name to upstream node.
+    call_inputs: &'a IndexMap<String, String>,
+    /// The calling scope's bound rows.
+    parent_schema_by_name: &'a HashMap<String, Row>,
+    span: Span,
+}
+
 /// A composition call's output row as the scope that called it sees it.
 ///
 /// Inside the body, a carried mark means the column is the caller's,
@@ -6205,26 +6223,22 @@ fn seed_port_row(
 /// does not mark it, or a column with no mark at all, is a state no bind
 /// produces; it is reported as an internal error (E000) naming the call, the
 /// port and the column, and the column is left unmarked, so not nameable.
-fn carry_into_caller_scope(
-    row: Row,
-    call: &str,
-    call_inputs: &IndexMap<String, String>,
-    parent_schema_by_name: &HashMap<String, Row>,
-    span: Span,
-    diags: &mut Vec<Diagnostic>,
-) -> Row {
+fn carry_into_caller_scope(row: Row, scope: &CallerScope<'_>, diags: &mut Vec<Diagnostic>) -> Row {
+    let &CallerScope {
+        call,
+        in_body,
+        call_inputs,
+        parent_schema_by_name,
+        span,
+    } = scope;
     let fed = |port: &str| {
         call_inputs
             .get(port)
             .and_then(|upstream| parent_schema_by_name.get(upstream))
     };
-    let caller_in_body = call_inputs
-        .keys()
-        .filter_map(|port| fed(port))
-        .any(Row::in_body_scope);
     let mut out = row.clone();
     out.leave_body_scope();
-    if !caller_in_body {
+    if !in_body {
         return out;
     }
     out.enter_body_scope();
@@ -9825,10 +9839,13 @@ nodes:
         let mut diags = Vec::new();
         let out = carry_into_caller_scope(
             returned,
-            "inner",
-            &inputs,
-            &parent,
-            Span::SYNTHETIC,
+            &CallerScope {
+                call: "inner",
+                in_body: true,
+                call_inputs: &inputs,
+                parent_schema_by_name: &parent,
+                span: Span::SYNTHETIC,
+            },
             &mut diags,
         );
         assert_eq!(diags.len(), 1, "{diags:#?}");
