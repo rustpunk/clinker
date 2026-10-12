@@ -117,7 +117,9 @@ composition it escaped every check and the call wrote no rows while the run
 exited 0. A composition node that reads itself or sits on a cycle now fails
 with `E107`, and one whose `input:` names nothing in the composition with
 `E004`, as the same mistakes do in a pipeline; before, each wrote no rows
-with exit 0.
+with exit 0. The `E107` help names the node to change and prints its
+`input:` line, choosing the node so that no node is left reading the
+composition's output node.
 
 **Breaking:** a composition node that reads an input port declared
 `required: false` now needs every call to bind that port. A call that leaves

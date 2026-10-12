@@ -3201,3 +3201,82 @@ fn a_combine_body_that_does_not_handle_an_empty_value_is_refused_at_every_call()
         );
     }
 }
+
+/// A three-node cycle `a` <- `c` <- `b` <- `a`, beside `last`.
+const THREE_CYCLE: &str = r#"  - type: transform
+    name: a
+    input: c
+    config:
+      cxl: |
+        emit p = 1
+  - type: transform
+    name: b
+    input: a
+    config:
+      cxl: |
+        emit q = 1
+  - type: transform
+    name: c
+    input: b
+    config:
+      cxl: |
+        emit s = 1
+  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit r = v
+"#;
+
+/// The help of the one E107 a body with `comp_yaml` raises.
+fn cycle_help(comp_yaml: &str) -> String {
+    let Err(diags) = compile(comp_yaml) else {
+        panic!("a body with a cycle must not compile");
+    };
+    assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
+    assert_eq!(diags[0].code, "E107", "{:#?}", describe(&diags));
+    diags[0].help.clone().expect("a fix")
+}
+
+#[test]
+fn the_e107_fix_for_a_cycle_never_leaves_a_node_reading_the_output_node() {
+    // Output `a`: changing `b`, the node that reads `a`, leaves
+    // `inp` -> `b` -> `c` -> `a`. Changing `a` or `c` would leave `b`
+    // reading the output node, which fails when the call runs.
+    let help = cycle_help(&comp_out("a", THREE_CYCLE));
+    assert_eq!(
+        help,
+        "set `input:` of node \"b\" to an input port of the composition: `input: inp`"
+    );
+    // Output `last`: no node on the cycle reads an output node, so
+    // changing the first one is enough.
+    let help = cycle_help(&comp(THREE_CYCLE));
+    assert_eq!(
+        help,
+        "set `input:` of node \"a\" to an input port of the composition: `input: inp`"
+    );
+}
+
+#[test]
+fn the_e107_fix_for_a_node_reading_itself_reads_a_port() {
+    let help = cycle_help(&comp(
+        r#"  - type: transform
+    name: a
+    input: a
+    config:
+      cxl: |
+        emit p = 1
+  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit r = v
+"#,
+    ));
+    assert_eq!(
+        help,
+        "set `input:` of node \"a\" to an input port of the composition: `input: inp`"
+    );
+}
