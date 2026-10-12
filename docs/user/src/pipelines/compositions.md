@@ -96,8 +96,20 @@ For the `risk_score` composition above, a call fed rows of `order_id`,
 `region`, `amount` gets back `order_id`, `region`, `amount`, `high_value`:
 `region` passes through even though the port does not declare it.
 
+The composition's nodes see each declared column with the type the port
+declares, at every call, so a composition that compiles against its ports
+compiles wherever it is called. A column declared `any` is seen with the type
+the call provides it with; a type error over one names the composition and the
+port, because it depends on the call. Columns the port does not declare keep
+the caller's types on the way through.
+
 Each call checks the caller's rows against the port: every declared column
-must be there with a compatible type, or the call fails with `E102`. A node
+must be there, with the declared type, with the non-empty form of a
+`{ nullable: <type> }` declaration, or with any type for `any`. Otherwise the
+call fails with `E102`. Nothing is converted at the port, so a caller's `int`
+column does not fit a `float` port column, and a caller column with no
+declared type fits only `any`; the help prints the `schema:` line or the
+`emit` that fixes the call. A node
 inside the composition that uses a column its port does not declare fails
 compilation with `E169`, at every call, and the help prints the line to add
 under `_compose.inputs.<port>.schema`. A column the composition creates itself,

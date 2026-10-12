@@ -238,7 +238,7 @@ diagnostic_registry! {
     "E011", Error, "Log directive sanity (`every` must be valid)";
     // ── Composition binding and the channel/group overlay ───────────────
     "E101", Error, "Composition signature parse error (malformed `.comp.yaml`)";
-    "E102", Error, "Composition body references undeclared port";
+    "E102", Error, "Composition input port does not accept the column the call gives it";
     "E103", Error, "Call site or channel binds undeclared input/config/resource";
     "E104", Error, "Call site or channel missing required input/config";
     "E106", Error, "Name collision after composition expansion";

@@ -2648,6 +2648,12 @@ fn bind_schema_inner(
     // Keep the shared shape in sync across both when either changes.
     let mut source_has_watermark: HashMap<String, bool> = HashMap::new();
     let mut upstream_sources: HashMap<String, HashSet<String>> = HashMap::new();
+    // This scope's Source nodes, which a composition call's E102 points at.
+    let source_nodes: HashSet<String> = nodes
+        .iter()
+        .filter(|spanned| matches!(spanned.value, PipelineNode::Source { .. }))
+        .map(|spanned| spanned.value.name().to_string())
+        .collect();
 
     for spanned in nodes {
         let node = &spanned.value;
@@ -3473,6 +3479,7 @@ fn bind_schema_inner(
                         call_inputs: inputs,
                         call_config: config,
                         call_resources: resources,
+                        source_nodes: &source_nodes,
                         span,
                     },
                     diags,
@@ -3505,6 +3512,9 @@ struct CompositionBindParams<'a> {
     call_inputs: &'a IndexMap<String, String>,
     call_config: &'a IndexMap<String, serde_json::Value>,
     call_resources: &'a IndexMap<String, ResourceBinding>,
+    /// The calling scope's Source nodes, so an E102 can point at the
+    /// `schema:` line that declares a column's type.
+    source_nodes: &'a HashSet<String>,
     span: Span,
 }
 
@@ -3528,6 +3538,7 @@ fn bind_composition(
         call_inputs,
         call_config,
         call_resources,
+        source_nodes,
         span,
     } = params;
     // 1. Resolve use_path to workspace-relative key and look up in symbol_table.
@@ -3620,12 +3631,16 @@ fn bind_composition(
     // 6. Check each bound port against its upstream (E102) and record the
     //    port's declared columns, the vocabulary the body may name.
     let input_port_rows = match build_input_port_rows(
-        call_inputs,
-        signature,
-        parent_schema_by_name,
+        &PortAdmission {
+            call: node_name,
+            call_inputs,
+            signature,
+            parent_schemas: parent_schema_by_name,
+            source_nodes,
+            body_file: &resolved_path,
+            span,
+        },
         &mut artifacts.next_tail_var,
-        node_name,
-        span,
         diags,
     ) {
         Some(rows) => rows,
@@ -5021,118 +5036,123 @@ fn populate_config_provenance(
 
 // ─── Input port row building ────────────────────────────────────────
 
+/// One call site's input ports, as [`build_input_port_rows`] checks them.
+struct PortAdmission<'a> {
+    /// The composition node's name at the call site.
+    call: &'a str,
+    /// The call site's `inputs:` map: port name to upstream node.
+    call_inputs: &'a IndexMap<String, String>,
+    signature: &'a CompositionSignature,
+    /// The calling scope's bound rows.
+    parent_schemas: &'a HashMap<String, Row>,
+    /// The calling scope's Source nodes, whose `schema:` declares a type.
+    source_nodes: &'a HashSet<String>,
+    /// The composition file, as the author refers to it.
+    body_file: &'a Path,
+    span: Span,
+}
+
 /// Check a call site's bound input ports and return each port's vocabulary.
 ///
-/// For each bound port, validates that the upstream row carries every
-/// declared column with a compatible type (E102), then records the port's
-/// declared columns as `Row::open(declared, fresh_tail)`: the columns the
-/// body may name, with every other column passing through. This row is the
-/// port's contract only. The body binds against the upstream row itself (see
-/// `bind_composition`), so nothing positional is compiled from it.
-/// Returns `None` if any E102 errors were emitted.
+/// For each bound port, every declared column must reach the call with a
+/// type the declaration admits (E102): the same type; `T` into
+/// `{ nullable: T }`; anything into `any`. Nothing is converted at the port,
+/// so there is no numeric widening, and a column the caller has no type for
+/// (`any`) is admitted only by an `any` declaration: the body is typed by
+/// the port, and a value the caller never typed is not known to be one.
+///
+/// Each port's declared columns are recorded as `Row::open(declared,
+/// fresh_tail)`, the port's vocabulary. Nothing positional is compiled from
+/// it: the body binds against the caller's row (see `seed_port_row`).
+/// Returns `None` if any port was refused.
 fn build_input_port_rows(
-    call_inputs: &IndexMap<String, String>,
-    signature: &CompositionSignature,
-    parent_schemas: &HashMap<String, Row>,
+    admission: &PortAdmission<'_>,
     next_tail_var: &mut u32,
-    node_name: &str,
-    span: Span,
     diags: &mut Vec<Diagnostic>,
 ) -> Option<IndexMap<String, Row>> {
+    let &PortAdmission {
+        call,
+        call_inputs,
+        signature,
+        parent_schemas,
+        source_nodes,
+        span,
+        ..
+    } = admission;
     let mut rows = IndexMap::new();
     let mut has_errors = false;
 
     for (port_name, port_decl) in &signature.inputs {
-        // Look up the upstream node binding for this port.
-        let upstream_name = match call_inputs.get(port_name) {
-            Some(name) => name,
-            None => {
-                if !port_decl.required {
-                    // Optional port not bound — skip.
-                    continue;
-                }
-                // Required port missing — already diagnosed by validate_inputs.
-                continue;
-            }
+        // An unbound port is optional or already diagnosed by validate_inputs.
+        let Some(upstream_name) = call_inputs.get(port_name) else {
+            continue;
         };
-
-        // Look up upstream row.
-        let upstream_row = match parent_schemas.get(upstream_name.as_str()) {
-            Some(row) => row,
-            None => {
-                diags.push(Diagnostic::error(
-                    "E102",
-                    format!(
-                        "composition node {node_name:?}: input port {port_name:?} \
-                         binds to {upstream_name:?} which has no bound schema"
-                    ),
-                    LabeledSpan::primary(span, String::new()),
-                ));
-                has_errors = true;
-                continue;
-            }
+        let Some(upstream_row) = parent_schemas.get(upstream_name.as_str()) else {
+            diags.push(Diagnostic::error(
+                "E102",
+                format!(
+                    "composition {call:?}: input port `{port_name}` reads {upstream_name:?}, \
+                     which produces no rows Clinker could bind the port to"
+                ),
+                LabeledSpan::primary(span, String::new()),
+            ));
+            has_errors = true;
+            continue;
         };
+        let from_source = source_nodes.contains(upstream_name.as_str());
 
-        // Validate declared minimum columns against upstream.
         let declared_columns = port_columns(port_decl);
         for (col_name, col_type) in &declared_columns {
             let col_str = col_name.name.as_ref();
             // A nested call inside a body names each column its port
             // declares: one the enclosing port carries undeclared is E169.
-            if let Some(refused) = refuse_undeclared(upstream_row, node_name, col_str, span) {
+            if let Some(refused) = refuse_undeclared(upstream_row, call, col_str, span) {
                 diags.push(refused);
                 has_errors = true;
                 continue;
             }
-            match upstream_row.lookup(col_str) {
-                cxl::typecheck::ColumnLookup::Unknown => {
-                    // Closed upstream, no match — required column missing.
-                    diags.push(Diagnostic::error(
+            let refusal = match upstream_row.lookup(col_str) {
+                ColumnLookup::Declared(provided) if admits(col_type, provided) => None,
+                ColumnLookup::Declared(provided) => Some(port_type_refusal(
+                    admission, port_name, col_str, col_type, provided,
+                )),
+                // Every bound row is closed: a column it does not declare is
+                // not there.
+                ColumnLookup::Unknown | ColumnLookup::PassThrough(_) => Some(
+                    Diagnostic::error(
                         "E102",
                         format!(
-                            "composition node {node_name:?}: input port {port_name:?} \
-                             requires column {col_str:?} but upstream {upstream_name:?} \
-                             does not provide it"
+                            "composition {call:?}: input port `{port_name}` needs column \
+                             `{col_str}`, which {upstream_name:?} does not provide"
                         ),
                         LabeledSpan::primary(span, String::new()),
-                    ));
-                    has_errors = true;
-                }
-                cxl::typecheck::ColumnLookup::PassThrough(_) => {
-                    // Open upstream: column may pass through — allow it.
-                }
-                cxl::typecheck::ColumnLookup::Declared(upstream_type) => {
-                    // Type compatibility check: Any matches anything.
-                    if *upstream_type != Type::Any
-                        && *col_type != Type::Any
-                        && upstream_type != col_type
-                    {
-                        diags.push(Diagnostic::error(
-                            "E102",
-                            format!(
-                                "composition node {node_name:?}: input port {port_name:?} \
-                                 declares column {col_str:?} as {col_type:?} but upstream \
-                                 {upstream_name:?} provides {upstream_type:?}"
-                            ),
-                            LabeledSpan::primary(span, String::new()),
-                        ));
-                        has_errors = true;
-                    }
-                }
-                cxl::typecheck::ColumnLookup::Ambiguous(_) => {
-                    // Composition ports don't traffic in qualified fields —
-                    // an ambiguous match can only arise from a misconstructed
-                    // upstream row. Report as E102.
-                    diags.push(Diagnostic::error(
-                        "E102",
+                    )
+                    .with_help(if from_source {
                         format!(
-                            "composition node {node_name:?}: input port {port_name:?} \
-                             column {col_str:?} is ambiguous in upstream {upstream_name:?}"
-                        ),
-                        LabeledSpan::primary(span, String::new()),
-                    ));
-                    has_errors = true;
-                }
+                            "add the column to the `schema:` of source {upstream_name:?}: \
+                             `- {{ name: {col_str}, type: {} }}`",
+                            port_column_type(col_type)
+                        )
+                    } else {
+                        format!(
+                            "emit `{col_str}` in {upstream_name:?} or a node before it, so the \
+                             call receives it"
+                        )
+                    }),
+                ),
+                ColumnLookup::Ambiguous(_) => Some(Diagnostic::error(
+                    "E102",
+                    format!(
+                        "composition {call:?}: input port `{port_name}` needs column \
+                         `{col_str}`, and {upstream_name:?} provides more than one column of \
+                         that name"
+                    ),
+                    LabeledSpan::primary(span, String::new()),
+                )),
+            };
+            if let Some(refusal) = refusal {
+                diags.push(refusal);
+                has_errors = true;
             }
         }
 
@@ -5146,6 +5166,100 @@ fn build_input_port_rows(
     }
 
     if has_errors { None } else { Some(rows) }
+}
+
+/// Whether a port column declared `declared` admits a caller column of type
+/// `provided`: the same type, `T` into `{ nullable: T }`, or anything into
+/// `any`. A caller column typed `any` is admitted only by `any`.
+fn admits(declared: &Type, provided: &Type) -> bool {
+    match declared {
+        Type::Any => true,
+        Type::Nullable(inner) => provided == declared || provided == inner.as_ref(),
+        _ => provided == declared,
+    }
+}
+
+/// E102 for a caller column whose type the port's declaration does not
+/// admit, with the one change that makes the call compile.
+fn port_type_refusal(
+    admission: &PortAdmission<'_>,
+    port: &str,
+    column: &str,
+    declared: &Type,
+    provided: &Type,
+) -> Diagnostic {
+    let &PortAdmission {
+        call,
+        call_inputs,
+        source_nodes,
+        body_file,
+        span,
+        ..
+    } = admission;
+    let upstream = call_inputs
+        .get(port)
+        .map(String::as_str)
+        .unwrap_or_default();
+    let from_source = source_nodes.contains(upstream);
+    let declared_spelling = port_column_type(declared);
+    let provided_spelling = port_column_type(provided);
+    let base = declared.unwrap_nullable();
+    let conversion =
+        conversion_method(base).map(|method| format!("`emit {column} = {column}.{method}()`"));
+    let message = if matches!(provided, Type::Any) {
+        format!(
+            "composition {call:?}: input port `{port}` declares `{column}` as \
+             `{declared_spelling}`, but {upstream:?} provides `{column}` with no declared type \
+             (`any`), so nothing guarantees its values are `{declared_spelling}`"
+        )
+    } else {
+        format!(
+            "composition {call:?}: input port `{port}` declares `{column}` as \
+             `{declared_spelling}`, but {upstream:?} provides `{column}` as \
+             `{provided_spelling}`"
+        )
+    };
+    let help = match (provided, &conversion) {
+        (Type::Any, _) if from_source => format!(
+            "declare the type where source {upstream:?} declares the column: \
+             `- {{ name: {column}, type: {} }}`",
+            port_column_type(base)
+        ),
+        (Type::Nullable(inner), _) if inner.as_ref() == declared => format!(
+            "{upstream:?} can provide an empty `{column}`; declare the port column as nullable \
+             in `{}`: `- {{ name: {column}, type: {{ nullable: {declared_spelling} }} }}`",
+            body_file.display()
+        ),
+        (_, Some(conversion)) => {
+            format!("convert the column in a transform before the call: {conversion}")
+        }
+        (_, None) => format!(
+            "give `{column}` the type `{declared_spelling}` before the call, or declare it as \
+             `{provided_spelling}` on input port `{port}` in `{}`",
+            body_file.display()
+        ),
+    };
+    Diagnostic::error("E102", message, LabeledSpan::primary(span, String::new())).with_help(
+        format!(
+            "{help}. A port admits the type it declares, that type's non-empty form into a \
+         `{{ nullable: ... }}` declaration, and anything into `any`; nothing is converted at \
+         the port"
+        ),
+    )
+}
+
+/// The CXL method that converts a value to `ty`, where one exists.
+fn conversion_method(ty: &Type) -> Option<&'static str> {
+    Some(match ty {
+        Type::Int => "to_int",
+        Type::Float => "to_float",
+        Type::Decimal => "to_decimal",
+        Type::String => "to_string",
+        Type::Bool => "to_bool",
+        Type::Date => "to_date",
+        Type::DateTime => "to_datetime",
+        _ => return None,
+    })
 }
 
 /// Extract declared columns from a `PortDecl` as bare
@@ -5591,20 +5705,25 @@ fn caller_typed_reads<'a>(
         .collect()
 }
 
-/// How a port schema spells `ty`. A type a port column cannot declare
-/// directly (an array, a map, or a type the caller's row leaves open) is
-/// written `any`, which accepts whatever the caller provides.
-fn port_column_type(ty: &Type) -> &'static str {
+/// How a port schema spells `ty`: the spelling a `- { name: ..., type: ... }`
+/// line takes, so a declaration built from it is admitted by E102 when the
+/// caller provides `ty`. A type a port column cannot declare directly (an
+/// array, a map, or a type the caller's row leaves open) is written `any`,
+/// which admits whatever the caller provides.
+fn port_column_type(ty: &Type) -> String {
     match ty {
-        Type::Nullable(inner) => port_column_type(inner),
-        Type::Bool => "bool",
-        Type::Int => "int",
-        Type::Float => "float",
-        Type::Decimal => "decimal",
-        Type::String => "string",
-        Type::Date => "date",
-        Type::DateTime => "date_time",
-        Type::Null | Type::Array | Type::Map | Type::Numeric | Type::Any => "any",
+        Type::Nullable(inner) => match inner.as_ref() {
+            Type::Null | Type::Array | Type::Map | Type::Numeric | Type::Any => "any".to_string(),
+            inner => format!("{{ nullable: {} }}", port_column_type(inner)),
+        },
+        Type::Bool => "bool".to_string(),
+        Type::Int => "int".to_string(),
+        Type::Float => "float".to_string(),
+        Type::Decimal => "decimal".to_string(),
+        Type::String => "string".to_string(),
+        Type::Date => "date".to_string(),
+        Type::DateTime => "date_time".to_string(),
+        Type::Null | Type::Array | Type::Map | Type::Numeric | Type::Any => "any".to_string(),
     }
 }
 

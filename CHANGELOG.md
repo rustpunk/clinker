@@ -34,7 +34,29 @@ did not say the port was the reason. `W101` now fires only where a
 composition writes a column with the name of a caller column its port does
 not declare, not for every column a composition adds.
 
-To migrate, add each column `E169` names to the port's `schema:`.
+**Breaking:** a composition's nodes now see each column its port declares
+with the port's type, at every call. A column the port declares `any` is seen
+with the type the call provides; columns the port does not declare keep the
+caller's types. Before, the nodes saw whatever type the caller's column had,
+so a composition could compile in one pipeline and fail in another although
+both met its ports. A type error on a column declared `any` now names the
+composition and the port.
+
+**Breaking:** `E102` now admits a caller's column only when the port's
+declared type admits it: the same type, a type into its `{ nullable: ... }`
+form, or anything into `any`. A caller column with no declared type (`any`)
+fed into a port column with a concrete type is now refused; before, it was
+accepted and arithmetic over its values could silently come out empty.
+`E102` now also accepts `int` into `{ nullable: int }`, which it refused
+before. Nothing is converted at the port, so `int` is still refused for
+`float`. The message names the call, the port, the column and both types in
+the pipeline's spelling, and the help gives the one change to make: the
+`schema:` line for a column read straight from a Source, or an
+`emit <column> = <column>.to_<type>()` before the call.
+
+To migrate, add each column `E169` names to the port's `schema:`. For an
+`E102` on an untyped column, declare its type where the Source declares it,
+or convert it before the call.
 
 Closes [#1221](https://github.com/rustpunk/clinker/issues/1221).
 
