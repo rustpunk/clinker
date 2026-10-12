@@ -797,18 +797,19 @@ fn assert_filter_body_refused(v_type: &str, input: &str) -> Diagnostic {
     );
     let help = refused.help.as_deref().unwrap_or_default();
     assert!(
-        help.contains("`filter (v ?? 0) > 6`") && help.contains("- { name: v, type: int }"),
-        "{help}"
+        help.contains("`filter (v ?? 0) > 6`") && !help.contains("name: v"),
+        "one fix: {help}"
     );
     refused.clone()
 }
 
-/// The help's paste-ready line: the text between the backticks that follow
-/// the body file's name.
+/// The help's paste-ready line: the text between the last pair of
+/// backticks before the type checker's detail.
 fn pasted_line(help: &str) -> &str {
-    help.split("`: `")
-        .nth(1)
-        .and_then(|rest| rest.split("`, so the composition").next())
+    help.split(". Technical detail: ")
+        .next()
+        .and_then(|fix| fix.rsplit_once(": `"))
+        .and_then(|(_, line)| line.strip_suffix('`'))
         .unwrap_or_else(|| panic!("the help prints a line to paste: {help}"))
 }
 
@@ -1208,11 +1209,7 @@ fn the_fix_for_a_type_error_on_an_any_column_is_one_line_that_runs_as_inline() {
     assert_eq!(diags.len(), 1, "{diags:#?}");
     assert_eq!(diags[0].code, "E200", "{diags:#?}");
     let help = diags[0].help.as_deref().unwrap_or_default();
-    let line = help
-        .rsplit(": `")
-        .next()
-        .and_then(|rest| rest.strip_suffix('`'))
-        .unwrap_or_else(|| panic!("the help ends with the line to paste: {help}"));
+    let line = pasted_line(help);
     assert_eq!(line, "emit u = v.to_string().upper()");
     assert_inline_equivalent(
         &Shape {

@@ -580,9 +580,12 @@ fn a_body_that_does_not_handle_an_empty_value_is_refused_at_every_call() {
         );
         let help = diag.help.as_deref().expect("a fix");
         assert!(
-            help.contains("`filter (v ?? 0) > 6`")
-                && help.contains("`- { name: v, type: int }`")
-                && help.contains("c.comp.yaml"),
+            help.contains("`filter (v ?? 0) > 6`") && help.contains("c.comp.yaml"),
+            "{help}"
+        );
+        // One fix: the declaration a second fix would change is not offered.
+        assert!(
+            !help.contains("name: v") && !help.contains(" or "),
             "{help}"
         );
     }
@@ -942,12 +945,25 @@ nodes:
             diag.message
         );
     }
-    let help = diag.help.as_deref().expect("a fix");
+    // The type checker's detail follows the fix, in the author's spelling.
     assert!(
-        help.contains("c.comp.yaml")
-            && help.ends_with(": `emit s = department.to_int() + 1`")
-            && help.contains("`int` it needs"),
+        !diag.message.contains("arithmetic") && !diag.message.contains("String"),
+        "{}",
+        diag.message
+    );
+    let help = diag.help.as_deref().expect("a fix");
+    let (fix, detail) = help
+        .split_once(". Technical detail: ")
+        .unwrap_or_else(|| panic!("the detail follows the fix: {help}"));
+    assert!(
+        fix.contains("c.comp.yaml")
+            && fix.ends_with(": `emit s = department.to_int() + 1`")
+            && fix.contains("`int` it needs"),
         "the help prints the node's line converting the column to the type it needs: {help}"
+    );
+    assert!(
+        detail.contains("string and int") && !detail.contains("String"),
+        "{detail}"
     );
 }
 
@@ -3120,9 +3136,10 @@ fn empty_value_refusal(body: &str) -> Diagnostic {
 /// The help's paste-ready line: the text between the backticks that follow
 /// the body file's name.
 fn pasted_line(help: &str) -> &str {
-    help.split("`: `")
-        .nth(1)
-        .and_then(|rest| rest.split("`, so the composition").next())
+    help.split(". Technical detail: ")
+        .next()
+        .and_then(|fix| fix.rsplit_once(": `"))
+        .and_then(|(_, line)| line.strip_suffix('`'))
         .unwrap_or_else(|| panic!("the help prints a line to paste: {help}"))
 }
 
@@ -3322,7 +3339,7 @@ fn a_combine_where_that_does_not_handle_an_empty_value_is_refused_at_every_call(
             "{caller}: {help}"
         );
         assert!(
-            help.contains("`- { name: v, type: int }`") && help.contains("c.comp.yaml"),
+            help.contains("c.comp.yaml") && !help.contains("name: v"),
             "{help}"
         );
     }
@@ -3689,4 +3706,115 @@ fn a_nested_call_reading_a_body_node_after_a_misspelt_input_is_not_told_it_reads
     };
     assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
     assert_eq!(diags[0].code, "E004", "{:#?}", describe(&diags));
+}
+
+#[test]
+fn a_combine_where_misusing_an_any_column_names_the_composition_and_its_pasted_entry_compiles() {
+    // `pa` declares `v` as `any`; this call provides an `int`, which has
+    // no `upper`. The `where:` gets the E200 every other body program gets
+    // for an `any` column, with the entry to paste.
+    let where_clause = "a.department == b.department and a.v.upper() == b.label";
+    let composition = combine_comp_with_v("any", where_clause, COMBINE_EMITS);
+    let Err(diags) = compile_in(
+        COMBINE_PIPELINE,
+        &[("compositions/c.comp.yaml", &composition)],
+    ) else {
+        panic!("`upper` over an int is a type error");
+    };
+    assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
+    let diag = &diags[0];
+    assert_eq!(diag.code, "E200", "{:#?}", describe(&diags));
+    for fragment in [
+        "composition \"call\"",
+        "node \"j\"",
+        "as `int`",
+        "input port `pa`",
+    ] {
+        assert!(
+            diag.message.contains(fragment),
+            "{fragment}: {}",
+            diag.message
+        );
+    }
+    let help = diag.help.as_deref().unwrap_or_default();
+    let entry = pasted_line(help);
+    assert_eq!(
+        entry, "where: 'a.department == b.department and a.v.to_string().upper() == b.label'",
+        "{help}"
+    );
+    let pasted = combine_comp_with_v(
+        "any",
+        "a.department == b.department and a.v.to_string().upper() == b.label",
+        COMBINE_EMITS,
+    );
+    compile_in(COMBINE_PIPELINE, &[("compositions/c.comp.yaml", &pasted)])
+        .unwrap_or_else(|d| panic!("the pasted entry compiles: {:#?}", describe(&d)));
+}
+
+#[test]
+fn a_conversion_the_provided_values_cannot_make_is_not_offered() {
+    // A date has no number to convert to, so `v.to_int() + 1` would send
+    // every row to the error rows; the help names the declaration to
+    // change instead, with no line.
+    let pipeline = PIPELINE.replace(
+        "        - { name: v, type: int }\n",
+        "        - { name: v, type: date }\n",
+    );
+    let composition = comp_declaring(
+        &["{ name: v, type: any }"],
+        r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit x = v + 1
+"#,
+    );
+    let Err(diags) = compile_in(&pipeline, &[("compositions/c.comp.yaml", &composition)]) else {
+        panic!("`v + 1` over a date is a type error");
+    };
+    assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
+    let help = diags[0].help.as_deref().unwrap_or_default();
+    let fix = help.split(". Technical detail: ").next().unwrap_or(help);
+    assert_eq!(
+        fix,
+        "declare on input port `inp` in `compositions/c.comp.yaml` the type node \"last\" \
+         needs for `v`, in place of `any`, so every call has to provide that type"
+    );
+}
+
+#[test]
+fn a_rewritten_line_that_does_not_compile_is_not_offered() {
+    // `v > wt` needs both columns never empty. Handling only `v` (or only
+    // `wt`) leaves the line failing, so neither error prints a line: each
+    // says which column needs a value, as one sentence.
+    let composition = comp_declaring(
+        &[
+            "{ name: v, type: { nullable: int } }",
+            "{ name: wt, type: { nullable: int } }",
+        ],
+        r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        filter v > wt
+"#,
+    );
+    let Err(diags) = compile_in(PIPELINE, &[("compositions/c.comp.yaml", &composition)]) else {
+        panic!("the filter does not handle an empty value");
+    };
+    assert_eq!(diags.len(), 2, "{:#?}", describe(&diags));
+    for (diag, column) in diags.iter().zip(["v", "wt"]) {
+        let help = diag.help.as_deref().unwrap_or_default();
+        let fix = help.split(". Technical detail: ").next().unwrap_or(help);
+        assert_eq!(
+            fix,
+            format!(
+                "give node \"last\" in `compositions/c.comp.yaml` a value to use when \
+                 `{column}` is empty"
+            ),
+            "{help}"
+        );
+    }
 }

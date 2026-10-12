@@ -2616,6 +2616,7 @@ fn bind_cull(
         span,
         scoped_vars,
         authored: Authored::Synthesized,
+        text: ProgramText::AsParsed,
     };
     match typecheck_parsed_program(
         &decision_ctx,
@@ -2642,6 +2643,7 @@ fn bind_cull(
                         text: &rule.drop_group_when.source,
                         at: CULL_RULE_PARSE_PREFIX.len(),
                     },
+                    text: ProgramText::CullRule,
                 };
                 if let Err(rule_diags) =
                     typecheck_cull_rule(&rule_ctx, &rule.drop_group_when.source)
@@ -7362,14 +7364,24 @@ struct FieldRead {
 }
 
 impl FieldRead {
-    /// Whether this read names `field`: the same column name, of the same
-    /// input when both the read and the column say which.
-    fn reads(&self, field: &QualifiedField) -> bool {
-        self.name.as_ref() == field.name.as_ref()
-            && match (&self.qualifier, &field.qualifier) {
-                (Some(read), Some(column)) => read.as_ref() == column.as_ref(),
-                _ => true,
+    /// Whether this read names `field` of `row`, the row the program was
+    /// checked against. A qualified read (`a.v`) names the column of that
+    /// input and no other. A bare read (`v`) names the one column of that
+    /// name the body may name, which is the column the type checker reads
+    /// it as; a bare name that matches several, or none, names no column.
+    fn reads(&self, field: &QualifiedField, row: &Row) -> bool {
+        if self.name.as_ref() != field.name.as_ref() {
+            return false;
+        }
+        match &self.qualifier {
+            Some(read) => field.qualifier.as_deref() == Some(read.as_ref()),
+            None => {
+                let mut nameable = row
+                    .field_names()
+                    .filter(|candidate| candidate.name == field.name && row.is_nameable(candidate));
+                nameable.next() == Some(field) && nameable.next().is_none()
             }
+        }
     }
 
     /// The reference as the author wrote it: `a.v` or `v`.
@@ -7509,6 +7521,7 @@ impl BodyReads {
     /// reads, or every one the program reads when no error span holds one.
     fn possibly_empty_in<'e>(
         &self,
+        row: &Row,
         empty_by_port: &'e [MayBeEmpty],
         within: &[cxl::lexer::Span],
     ) -> Vec<&'e MayBeEmpty> {
@@ -7518,7 +7531,7 @@ impl BodyReads {
                 .filter(|empty| {
                     self.fields
                         .iter()
-                        .any(|read| inside(read.at) && read.reads(&empty.field))
+                        .any(|read| inside(read.at) && read.reads(&empty.field, row))
                 })
                 .collect::<Vec<_>>()
         };
@@ -7537,37 +7550,36 @@ impl BodyReads {
     /// The author's line that reads `field` inside one of the failing
     /// expressions (`line.within`), or the first line reading it when none
     /// does, with every read of `field` on it written `(v ?? stand_in)`
-    /// (`(a.v ?? stand_in)` for a qualified read). For an expression the
-    /// author wrote under a YAML key, the rewritten entry
-    /// (`key: '<expression>'`). `None` when the program is the planner's
-    /// own, the expression spans several lines, or the reads' spans do not
-    /// address the text.
+    /// (`(a.v ?? stand_in)` for a qualified read). See
+    /// [`BodyReads::line_rewriting`].
     fn line_with_stand_in(
         &self,
         line: &AuthoredLine<'_>,
         field: &QualifiedField,
         stand_in: &str,
-    ) -> Option<String> {
+    ) -> Option<Rewrite> {
         self.line_rewriting(line, field, &|written| format!("({written} ?? {stand_in})"))
     }
 
     /// The author's line that reads `field` inside one of the failing
     /// expressions (`line.within`), or the first line reading it when none
     /// does, with every read of `field` on it, written `written`, replaced
-    /// by `rewrite(written)`. For an expression the author wrote under a
-    /// YAML key, the rewritten entry (`key: '<expression>'`). `None` when the
-    /// program is the planner's own, the expression spans several lines, or
-    /// the reads' spans do not address the text.
+    /// by `rewrite(written)`: the line to show (for an expression the author
+    /// wrote under a YAML key, the rewritten entry, `key: '<expression>'`),
+    /// and the program's text with the line rewritten, to check the line
+    /// compiles. `None` when the program is the planner's own, the
+    /// expression spans several lines, or the reads' spans do not address
+    /// the text.
     fn line_rewriting(
         &self,
         line: &AuthoredLine<'_>,
         field: &QualifiedField,
         rewrite: &dyn Fn(&str) -> String,
-    ) -> Option<String> {
+    ) -> Option<Rewrite> {
         let reads_of_name = || {
             self.fields
                 .iter()
-                .filter(|read| read.reads(field))
+                .filter(|read| read.reads(field, line.row))
                 .map(|read| (read.at.start as usize, read.at.end as usize, read.written()))
         };
         let anchor = reads_of_name()
@@ -7579,23 +7591,23 @@ impl BodyReads {
             .map(|(start, ..)| start)
             .min()
             .or_else(|| reads_of_name().map(|(start, ..)| start).min())?;
-        // The text to rewrite, the offset of its first byte in the program
-        // source, and the bounds of the line within the source.
-        let (text, base, start, end) = match line.authored {
+        // The bounds, within the program's text, of what to rewrite: the
+        // line holding the anchor, or the authored expression.
+        let source = line.source;
+        let (start, end) = match line.authored {
             Authored::Program => {
-                let source = line.source;
                 let start = source.get(..anchor)?.rfind('\n').map_or(0, |at| at + 1);
                 let end = source
                     .get(anchor..)?
                     .find('\n')
                     .map_or(source.len(), |at| anchor + at);
-                (source, 0, start, end)
+                (start, end)
             }
             Authored::Expression { text, at, .. } => {
-                if text.contains('\n') {
+                if text.contains('\n') || source.get(at..at + text.len())? != text {
                     return None;
                 }
-                (text, at, at, at + text.len())
+                (at, at + text.len())
             }
             Authored::Synthesized => return None,
         };
@@ -7607,19 +7619,21 @@ impl BodyReads {
         let mut rewritten = String::new();
         let mut from = start;
         for (read_start, read_end, written) in reads {
-            if text.get(read_start - base..read_end - base)? != written {
+            if source.get(read_start..read_end)? != written {
                 return None;
             }
-            rewritten.push_str(text.get(from - base..read_start - base)?);
+            rewritten.push_str(source.get(from..read_start)?);
             rewritten.push_str(&rewrite(&written));
             from = read_end;
         }
-        rewritten.push_str(text.get(from - base..end - base)?);
-        let rewritten = rewritten.trim().to_string();
-        match line.authored {
-            Authored::Expression { key, .. } => yaml_entry(key, &rewritten),
-            _ => Some(rewritten),
-        }
+        rewritten.push_str(source.get(from..end)?);
+        let program = format!("{}{rewritten}{}", source.get(..start)?, source.get(end..)?);
+        let rewritten = rewritten.trim();
+        let shown = match line.authored {
+            Authored::Expression { key, .. } => yaml_entry(key, rewritten)?,
+            _ => rewritten.to_string(),
+        };
+        Some(Rewrite { shown, program })
     }
 
     /// The `any`-declared column the field reference inside `within` reads,
@@ -7634,7 +7648,7 @@ impl BodyReads {
             .filter(|read| within.start <= read.at.start && read.at.end <= within.end)
             .find_map(|read| {
                 row.carried_columns().find(|(field, _, column)| {
-                    column.access == PortAccess::DeclaredAny && read.reads(field)
+                    column.access == PortAccess::DeclaredAny && read.reads(field, row)
                 })
             })
     }
@@ -7986,6 +8000,8 @@ struct CxlTypecheckCtx<'a> {
     /// How the author wrote the program, so a help that rewrites one of
     /// its lines prints the author's YAML.
     authored: Authored<'a>,
+    /// How the program is built from the text it was parsed from.
+    text: ProgramText,
 }
 
 /// A CXL program to typecheck: its text, and how the author wrote it.
@@ -8204,6 +8220,7 @@ fn typecheck_cxl(
         span,
         scoped_vars,
         authored,
+        text: ProgramText::AsParsed,
     };
     typecheck_parsed_program(
         &ctx,
@@ -8294,6 +8311,10 @@ fn resolve_failure_diagnostic(
 /// `program` (the resolver/typechecker size their per-node side-tables by
 /// it); a synthesizing caller is responsible for keeping ids dense and
 /// below it.
+///
+/// Inside a composition body, `source` is also the text the program was
+/// parsed from (see [`ProgramText`]): a help that rewrites one of its lines
+/// is checked by compiling the text with the line rewritten.
 fn typecheck_parsed_program(
     ctx: &CxlTypecheckCtx<'_>,
     program: cxl::ast::Program,
@@ -8308,6 +8329,7 @@ fn typecheck_parsed_program(
         span,
         scoped_vars,
         authored,
+        text,
     } = *ctx;
     // Field names for CXL resolve. In the non-combine case all fields are
     // bare; in the combine case qualified fields collapse to their `.name` —
@@ -8315,24 +8337,13 @@ fn typecheck_parsed_program(
     // and combine bodies address qualified fields via
     // `Expr::QualifiedFieldRef` (handled in typecheck/pass.rs, not resolve).
     let context = format!("CXL name resolution failed in {node_name:?}");
-    // A body whose port declares a column `{ nullable: T }` is checked as if
-    // the column could be empty. Kept to tell, if the check fails, whether
-    // the column's possible emptiness is what failed it.
-    // A body that reads a column its port declares `any` sees the type this
-    // call provides; kept too, to find the type a failing node needs.
-    let empty_by_port = may_be_empty_by_port(schema);
-    let reads_caller_typed = schema.in_body_scope()
-        && schema
-            .carried_columns()
-            .any(|(_, _, column)| column.access == PortAccess::DeclaredAny);
-    let recheck = (!empty_by_port.is_empty() || reads_caller_typed).then(|| program.clone());
-    let display_source = Arc::clone(&source);
+    let site = ResolveSite {
+        node,
+        context: &context,
+        span,
+    };
     let resolved = resolve_against_row(
-        ResolveSite {
-            node,
-            context: &context,
-            span,
-        },
+        site,
         program,
         node_count,
         schema,
@@ -8350,107 +8361,201 @@ fn typecheck_parsed_program(
     if !refused.is_empty() {
         return Err(refused);
     }
-    cxl::typecheck::pass::type_check_with_mode_and_vars(resolved, schema, mode.clone(), scoped_vars)
-        .map(|mut typed| {
+    let plain = |errors: &[&cxl::typecheck::TypeDiagnostic]| -> Vec<Diagnostic> {
+        let joined = errors
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        let helps: Vec<&str> = errors.iter().filter_map(|d| d.help.as_deref()).collect();
+        let diag = Diagnostic::error(
+            "E200",
+            format!("CXL type error in {node_name:?}: {joined}"),
+            LabeledSpan::primary(span, String::new()),
+        );
+        vec![if helps.is_empty() {
+            diag
+        } else {
+            diag.with_help(helps.join("; "))
+        }]
+    };
+    match cxl::typecheck::pass::type_check_returning_program(
+        resolved,
+        schema,
+        mode.clone(),
+        scoped_vars,
+    ) {
+        Ok(mut typed) => {
             fold_body_config(&mut typed, scoped_vars);
-            typed.with_source(source)
-        })
-        .map_err(|diags| {
-            let errors: Vec<&cxl::typecheck::TypeDiagnostic> =
-                diags.iter().filter(|d| !d.is_warning).collect();
-            let errors = if errors.is_empty() {
-                diags.iter().collect()
-            } else {
-                errors
-            };
-            // An error inside an expression that reads a column the port
-            // declares `any` is this call's: the node sees the type the call
-            // provides, so the author has to learn that first. Every other
-            // error is the node's own.
-            let mut out: Vec<Diagnostic> = Vec::new();
-            let mut by_column: Vec<CallerTypedErrors<'_>> = Vec::new();
-            let mut plain: Vec<&cxl::typecheck::TypeDiagnostic> = Vec::new();
-            for error in errors {
-                match reads.caller_typed_in(schema, error.span) {
-                    Some((field, provided, column)) => {
-                        match by_column.iter_mut().find(|seen| seen.field == field) {
-                            Some(seen) => {
-                                seen.details.push(&error.message);
-                                seen.within.push(error.span);
-                            }
-                            None => by_column.push(CallerTypedErrors {
-                                field,
-                                provided,
-                                column,
-                                details: vec![&error.message],
-                                within: vec![error.span],
-                            }),
-                        }
+            Ok(typed.with_source(source))
+        }
+        Err((diags, resolved)) => Err(body_type_errors(
+            &FailedProgram {
+                recheck: Recheck {
+                    site,
+                    program: &resolved.program,
+                    node_count,
+                    row: schema,
+                    mode,
+                    module_exports: &scoped_vars.module_exports,
+                    scoped_vars,
+                },
+                reads: &reads,
+                authored,
+                parsed: &source,
+                text,
+            },
+            &diags,
+            plain,
+        )),
+    }
+}
+
+/// How the program a [`CxlTypecheckCtx`] typechecks is built from the text
+/// it was parsed from, so a fix pasted into that text compiles as the
+/// program would.
+#[derive(Clone, Copy)]
+enum ProgramText {
+    /// The program is the text as parsed.
+    AsParsed,
+    /// The text is [`CULL_RULE_PARSE_PREFIX`] and one Cull rule; the
+    /// program reads the rule's predicate `or false` (see
+    /// [`typecheck_cull_rule`]).
+    CullRule,
+}
+
+/// A body program that failed to typecheck, with what its errors are
+/// worded and their fixes checked against.
+struct FailedProgram<'a> {
+    /// The program as it failed, to typecheck again with columns retyped.
+    recheck: Recheck<'a>,
+    reads: &'a BodyReads,
+    authored: Authored<'a>,
+    /// The text the program was parsed from; the reads' spans address it.
+    parsed: &'a str,
+    text: ProgramText,
+}
+
+impl FailedProgram<'_> {
+    /// Whether `parsed`, the program's text with a fix pasted in, compiles
+    /// against the row the program failed against, under the same name and
+    /// type rules.
+    fn compiles(&self, parsed: &str) -> bool {
+        let built;
+        let program_text = match self.text {
+            ProgramText::AsParsed => parsed,
+            ProgramText::CullRule => {
+                let Some(rule) = parsed.strip_prefix(CULL_RULE_PARSE_PREFIX) else {
+                    return false;
+                };
+                built = format!("{CULL_RULE_PARSE_PREFIX}({rule}) or false");
+                &built
+            }
+        };
+        let parsed = cxl::parser::Parser::parse(program_text);
+        if !parsed.errors.is_empty() {
+            return false;
+        }
+        let recheck = &self.recheck;
+        let Ok(resolved) = resolve_against_row(
+            recheck.site,
+            parsed.ast,
+            parsed.node_count,
+            recheck.row,
+            recheck.module_exports,
+            recheck.scoped_vars,
+        ) else {
+            return false;
+        };
+        if recheck.row.in_body_scope()
+            && !BodyReads::collect(&resolved)
+                .refused(recheck.row, recheck.site.node, recheck.site.span)
+                .is_empty()
+        {
+            return false;
+        }
+        cxl::typecheck::pass::type_check_with_mode_and_vars(
+            resolved,
+            recheck.row,
+            recheck.mode.clone(),
+            recheck.scoped_vars,
+        )
+        .is_ok()
+    }
+
+    /// Where a help finds the author's line to rewrite, for errors spanning
+    /// `within`.
+    fn line<'w>(&'w self, within: &'w [cxl::lexer::Span]) -> AuthoredLine<'w> {
+        AuthoredLine {
+            authored: self.authored,
+            source: self.parsed,
+            within,
+            row: self.recheck.row,
+        }
+    }
+}
+
+/// The diagnostics for the type errors `diags` of a program, `failed`.
+///
+/// Inside a composition body an error that reads a column its port
+/// declares `any` is the call's (see [`caller_typed_type_error`]), and one
+/// that only fails because a `{ nullable: T }` column may be empty is the
+/// composition's (see [`possibly_empty_errors`]); `plain` words every other
+/// error as the node's own. Every program a body typechecks reaches its
+/// errors through here, so no site can word them another way.
+fn body_type_errors(
+    failed: &FailedProgram<'_>,
+    diags: &[cxl::typecheck::TypeDiagnostic],
+    plain: impl FnOnce(&[&cxl::typecheck::TypeDiagnostic]) -> Vec<Diagnostic>,
+) -> Vec<Diagnostic> {
+    let errors: Vec<&cxl::typecheck::TypeDiagnostic> =
+        diags.iter().filter(|d| !d.is_warning).collect();
+    let errors = if errors.is_empty() {
+        diags.iter().collect()
+    } else {
+        errors
+    };
+    let schema = failed.recheck.row;
+    if !schema.in_body_scope() {
+        return plain(&errors);
+    }
+    // An error inside an expression that reads a column the port declares
+    // `any` is this call's: the node sees the type the call provides, so the
+    // author has to learn that first. Every other error is the node's own.
+    let mut out: Vec<Diagnostic> = Vec::new();
+    let mut by_column: Vec<CallerTypedErrors<'_>> = Vec::new();
+    let mut rest: Vec<&cxl::typecheck::TypeDiagnostic> = Vec::new();
+    for error in errors {
+        match failed.reads.caller_typed_in(schema, error.span) {
+            Some((field, provided, column)) => {
+                match by_column.iter_mut().find(|seen| seen.field == field) {
+                    Some(seen) => {
+                        seen.details.push(&error.message);
+                        seen.within.push(error.span);
                     }
-                    None => plain.push(error),
+                    None => by_column.push(CallerTypedErrors {
+                        field,
+                        provided,
+                        column,
+                        details: vec![&error.message],
+                        within: vec![error.span],
+                    }),
                 }
             }
-            let recheck = recheck.as_ref().map(|program| Recheck {
-                site: ResolveSite {
-                    node,
-                    context: &context,
-                    span,
-                },
-                program,
-                node_count,
-                row: schema,
-                mode,
-                module_exports: &scoped_vars.module_exports,
-                scoped_vars,
-            });
-            for errors in &by_column {
-                let fix = recheck.as_ref().and_then(|recheck| {
-                    converted_line(
-                        recheck,
-                        &reads,
-                        errors,
-                        &AuthoredLine {
-                            authored,
-                            source: &display_source,
-                            within: &errors.within,
-                        },
-                    )
-                });
-                out.push(caller_typed_type_error(node, errors, fix.as_ref(), span));
-            }
-            if let Some(recheck) = &recheck
-                && let Some(blamed) = possibly_empty_errors(
-                    recheck,
-                    &empty_by_port,
-                    &reads,
-                    &plain,
-                    authored,
-                    &display_source,
-                )
-            {
-                out.extend(blamed);
-                return out;
-            }
-            if !plain.is_empty() {
-                let joined = plain
-                    .iter()
-                    .map(|d| d.message.as_str())
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                let helps: Vec<&str> = plain.iter().filter_map(|d| d.help.as_deref()).collect();
-                let diag = Diagnostic::error(
-                    "E200",
-                    format!("CXL type error in {node_name:?}: {joined}"),
-                    LabeledSpan::primary(span, String::new()),
-                );
-                out.push(if helps.is_empty() {
-                    diag
-                } else {
-                    diag.with_help(helps.join("; "))
-                });
-            }
-            out
-        })
+            None => rest.push(error),
+        }
+    }
+    for errors in &by_column {
+        out.push(caller_typed_type_error(failed, errors));
+    }
+    if let Some(blamed) = possibly_empty_errors(failed, &rest) {
+        out.extend(blamed);
+        return out;
+    }
+    if !rest.is_empty() {
+        out.extend(plain(&rest));
+    }
+    out
 }
 
 /// A body row column whose input port declares it `{ nullable: T }` with a
@@ -8487,7 +8592,8 @@ fn may_be_empty_by_port(row: &Row) -> Vec<MayBeEmpty> {
 /// passes tells which column's type failed it.
 struct Recheck<'a> {
     site: ResolveSite<'a>,
-    /// The program as parsed, before name resolution.
+    /// The program's syntax tree, handed back by the type check that
+    /// failed: a program that compiles is never kept for a recheck.
     program: &'a cxl::ast::Program,
     node_count: u32,
     row: &'a Row,
@@ -8546,19 +8652,17 @@ impl Recheck<'_> {
 }
 
 /// The E200s for a body program whose type errors `plain` come from a
-/// column its input port declares `{ nullable: T }` (one of
-/// `empty_by_port`) that it does not handle being empty: one per column
-/// whose possible emptiness fails it. `None` when the errors are not about
-/// an empty value, or when no column the program reads can be blamed; the
-/// caller then reports the errors as they are.
+/// column its input port declares `{ nullable: T }` that it does not handle
+/// being empty: one per column whose possible emptiness fails it. `None`
+/// when the errors are not about an empty value, or when no column the
+/// program reads can be blamed; the caller then reports the errors as they
+/// are.
 fn possibly_empty_errors(
-    recheck: &Recheck<'_>,
-    empty_by_port: &[MayBeEmpty],
-    reads: &BodyReads,
+    failed: &FailedProgram<'_>,
     plain: &[&cxl::typecheck::TypeDiagnostic],
-    authored: Authored<'_>,
-    source: &str,
 ) -> Option<Vec<Diagnostic>> {
+    let recheck = &failed.recheck;
+    let empty_by_port = may_be_empty_by_port(recheck.row);
     if plain.is_empty()
         || empty_by_port.is_empty()
         || !recheck.passes_when_never_empty(&empty_by_port.iter().collect::<Vec<_>>())
@@ -8575,7 +8679,9 @@ fn possibly_empty_errors(
     // node: one that, never empty on its own, lets the node compile. When
     // no single column does, the columns the failing expressions read are
     // needed together.
-    let candidates = reads.possibly_empty_in(empty_by_port, &within);
+    let candidates = failed
+        .reads
+        .possibly_empty_in(recheck.row, &empty_by_port, &within);
     let on_their_own: Vec<&MayBeEmpty> = candidates
         .iter()
         .copied()
@@ -8602,12 +8708,8 @@ fn possibly_empty_errors(
                         declared: &empty.declared,
                         span,
                     },
-                    reads,
-                    &AuthoredLine {
-                        authored,
-                        source,
-                        within: &within,
-                    },
+                    failed,
+                    &within,
                     &detail,
                 )
             })
@@ -8616,11 +8718,20 @@ fn possibly_empty_errors(
 }
 
 /// Where a help finds the author's line to rewrite: how the program was
-/// written, its source, and the spans of the failing expressions.
+/// written, the text it was parsed from, the spans of the failing
+/// expressions, and the row it was checked against.
 struct AuthoredLine<'a> {
     authored: Authored<'a>,
     source: &'a str,
     within: &'a [cxl::lexer::Span],
+    row: &'a Row,
+}
+
+/// One of the author's lines rewritten by a fix: as the help shows it, and
+/// the program's text with it, to compile.
+struct Rewrite {
+    shown: String,
+    program: String,
 }
 
 /// `key: '<expr>'` as a YAML entry the author can paste: single-quoted
@@ -8705,11 +8816,12 @@ fn empty_stand_in(ty: &Type) -> Option<&'static str> {
 /// E200 for a body node that fails because a column its input port declares
 /// `{ nullable: T }` may be empty. Every call checks the body as if the
 /// column could be empty, so this fails at every call, whoever the caller
-/// is; the fix is in the composition.
+/// is; the fix is in the composition: the node's line with the empty case
+/// handled, shown only once the node compiles with it.
 fn possibly_empty_type_error(
     at: &PossiblyEmpty<'_>,
-    reads: &BodyReads,
-    line: &AuthoredLine<'_>,
+    failed: &FailedProgram<'_>,
+    within: &[cxl::lexer::Span],
     detail: &str,
 ) -> Diagnostic {
     let PossiblyEmpty {
@@ -8727,24 +8839,27 @@ fn possibly_empty_type_error(
     let name = field.name.as_ref();
     let declared = port_column_type(at.declared);
     let inner = at.declared.unwrap_nullable();
-    let never_empty = port_column_type(inner);
-    let declare = format!(
-        "declare `{name}` as never empty on input port `{port}` in `{body_file}`: \
-         `- {{ name: {name}, type: {never_empty} }}`"
+    let rewrite = empty_stand_in(inner).and_then(|stand_in| {
+        failed
+            .reads
+            .line_with_stand_in(&failed.line(within), field, stand_in)
+    });
+    let fix = crate::plan::fix_offer::offer_fix(
+        format!("give node {node:?} in `{body_file}` a value to use when `{name}` is empty"),
+        rewrite.map(|rewrite| {
+            (
+                crate::plan::fix_offer::PasteFix::new(
+                    format!(
+                        "handle an empty `{name}` in node {node:?} in `{body_file}`, so the \
+                         composition works for callers whose `{name}` can be empty"
+                    ),
+                    rewrite.shown,
+                ),
+                rewrite.program,
+            )
+        }),
+        |program| failed.compiles(program),
     );
-    let fix = match empty_stand_in(inner)
-        .and_then(|stand_in| reads.line_with_stand_in(line, field, stand_in))
-    {
-        Some(line) => format!(
-            "handle an empty `{name}` in node {node:?} in `{body_file}`: `{line}`, so the \
-             composition works for callers whose `{name}` can be empty. If it should not accept \
-             an empty `{name}`, {declare}"
-        ),
-        None => format!(
-            "give node {node:?} in `{body_file}` a value to use when `{name}` is empty \
-             (`{name} ?? <value>`), or {declare}"
-        ),
-    };
     Diagnostic::error(
         "E200",
         format!(
@@ -8784,70 +8899,95 @@ const CONVERTIBLE_TYPES: [Type; 7] = [
     Type::DateTime,
 ];
 
-/// The type a node needs a column its port declares `any` to have, and the
-/// node's failing line with every read of the column on it converted to
-/// that type (`v.to_string()`): the line compiles whatever type a call
-/// provides. `None` when no single conversion makes the node compile or no
-/// authored line can be rewritten.
-fn converted_line(
-    recheck: &Recheck<'_>,
-    reads: &BodyReads,
-    errors: &CallerTypedErrors<'_>,
-    line: &AuthoredLine<'_>,
-) -> Option<(Type, String)> {
-    let needed = CONVERTIBLE_TYPES
-        .iter()
-        .find(|ty| recheck.passes_with(&[(errors.field, (*ty).clone())]))?;
-    let method = conversion_method(needed)?;
-    let rewritten = reads.line_rewriting(line, errors.field, &|written| {
-        format!("{written}.{method}()")
-    })?;
-    Some((needed.clone(), rewritten))
+/// Whether a value of type `provided` can be converted to `needed` at all.
+/// A string may hold any value, so it may convert to every type, depending
+/// on its values; every value converts to a string; numbers convert to one
+/// another, and dates to date-times and back. A date never converts to a
+/// number or a yes/no, nor a number or a yes/no to a date, so a conversion
+/// between them fails on every row.
+fn may_convert(provided: &Type, needed: &Type) -> bool {
+    let numeric = |ty: &Type| matches!(ty, Type::Int | Type::Float | Type::Decimal);
+    let dated = |ty: &Type| matches!(ty, Type::Date | Type::DateTime);
+    match (provided.unwrap_nullable(), needed) {
+        (_, Type::String) | (Type::String | Type::Any | Type::Null, _) => true,
+        (from, to) if from == to => true,
+        (from, to) if numeric(from) && numeric(to) => true,
+        (from, to) if dated(from) && dated(to) => true,
+        _ => false,
+    }
 }
 
 /// E200 for a type error in a composition body node that reads a column
 /// its input port declares `any`. The body sees the type this call
 /// provides, so the composition and the port are what the author has to
-/// read first. With `fix`, the type the node needs and its line converting
-/// the column to it, the help is that line; the composition then works for
-/// every call whose values convert.
+/// read first. The fix is the node's failing line with the column converted
+/// to the type the node needs (`v.to_string()`), for the first type the
+/// provided values can convert to with which the node compiles; it is shown
+/// only once the node compiles with the line. The type checker's detail
+/// follows the fix.
 fn caller_typed_type_error(
-    node: &str,
+    failed: &FailedProgram<'_>,
     errors: &CallerTypedErrors<'_>,
-    fix: Option<&(Type, String)>,
-    span: Span,
 ) -> Diagnostic {
     let PortOrigin {
         call,
         port,
         body_file,
     } = errors.column.port.as_ref();
+    let node = failed.recheck.site.node;
+    let span = failed.recheck.site.span;
     let name = errors.field.name.as_ref();
     let detail = errors.details.join("; ");
-    let help = match fix {
-        Some((needed, line)) => format!(
-            "convert `{name}` where node {node:?} in `{body_file}` uses it, so the node gets the \
-             `{}` it needs whatever type a call provides, as long as its values convert: `{line}`",
-            port_column_type(needed)
-        ),
-        None => format!(
+    let line = failed.line(&errors.within);
+    let candidates = CONVERTIBLE_TYPES.iter().filter_map(|needed| {
+        if !may_convert(errors.provided, needed)
+            || !failed
+                .recheck
+                .passes_with(&[(errors.field, needed.clone())])
+        {
+            return None;
+        }
+        let method = conversion_method(needed)?;
+        let rewrite = failed
+            .reads
+            .line_rewriting(&line, errors.field, &|written| {
+                format!("{written}.{method}()")
+            })?;
+        Some((
+            crate::plan::fix_offer::PasteFix::new(
+                format!(
+                    "convert `{name}` where node {node:?} in `{body_file}` uses it, so the node \
+                     gets the `{}` it needs whatever type a call provides, as long as its \
+                     values convert",
+                    port_column_type(needed)
+                ),
+                rewrite.shown,
+            ),
+            rewrite.program,
+        ))
+    });
+    let fix = crate::plan::fix_offer::offer_fix(
+        format!(
             "declare on input port `{port}` in `{body_file}` the type node {node:?} needs for \
-             `{name}`, so every call has to provide that type — replace `type: any` in \
-             `- {{ name: {name}, type: any }}` — or convert `{name}` in this pipeline before the \
-             call"
+             `{name}`, in place of `any`, so every call has to provide that type"
         ),
-    };
+        candidates,
+        |program| failed.compiles(program),
+    );
     Diagnostic::error(
         "E200",
         format!(
             "composition {call:?} passes column `{name}` to node {node:?} as `{}`, the type \
-             this call provides, because its input port `{port}` declares `{name}` as `any`; \
-             node {node:?} cannot use it that way: {detail}",
+             this call provides, because its input port `{port}` declares `{name}` as `any`, \
+             and node {node:?} cannot use it that way",
             port_column_type(errors.provided)
         ),
         LabeledSpan::primary(span, String::new()),
     )
-    .with_help(help)
+    .with_help(format!(
+        "{fix}. Technical detail: {}",
+        author_spelling(&detail)
+    ))
 }
 
 /// Wrapper a single Cull rule predicate is parsed inside. The rule source is
@@ -8955,7 +9095,9 @@ fn typecheck_cull_rule(
         }],
         span: cxl::lexer::Span::default(),
     };
-    let display = format!("emit __cull_pred = ({source}) or false");
+    // The text the rule was parsed from, which the predicate's spans
+    // address; the program is built from it as `ProgramText::CullRule` says.
+    let display = format!("{CULL_RULE_PARSE_PREFIX}{source}");
     typecheck_parsed_program(
         ctx,
         program,
@@ -10274,11 +10416,6 @@ fn typecheck_combine_where(
         span,
     };
     let no_modules = std::collections::HashMap::new();
-    // Inside a composition body the predicate is checked as if each column
-    // a port declares `{ nullable: T }` could be empty, as every body
-    // program is; kept to tell whether that is what fails it.
-    let empty_by_port = may_be_empty_by_port(merged_row);
-    let recheck = (!empty_by_port.is_empty()).then(|| parse_result.ast.clone());
     let resolved = resolve_against_row(
         site,
         parse_result.ast,
@@ -10293,8 +10430,41 @@ fn typecheck_combine_where(
         BodyReads::default()
     };
     let mode = cxl::typecheck::pass::AggregateMode::Row;
+    // Typechecker's Filter-statement check emits a specific error message
+    // when the predicate's type is neither Bool nor Any — that is exactly
+    // E303 territory.
+    let plain = |errors: &[&cxl::typecheck::TypeDiagnostic]| -> Vec<Diagnostic> {
+        errors
+            .iter()
+            .map(|td| {
+                if td.message.starts_with("filter predicate must be type Bool") {
+                    Diagnostic::error(
+                        "E303",
+                        format!(
+                            "combine {combine_name:?} where-clause is not boolean: {}",
+                            td.message
+                        ),
+                        LabeledSpan::primary(span, String::new()),
+                    )
+                    .with_help(
+                        "the `where:` predicate must return Bool — use a comparison \
+                         (e.g. `a.id == b.id`)",
+                    )
+                } else {
+                    Diagnostic::error(
+                        "E200",
+                        format!(
+                            "combine {combine_name:?} where-clause type error: {}",
+                            td.message
+                        ),
+                        LabeledSpan::primary(span, String::new()),
+                    )
+                }
+            })
+            .collect()
+    };
 
-    match cxl::typecheck::pass::type_check_with_mode_and_vars(
+    match cxl::typecheck::pass::type_check_returning_program(
         resolved,
         merged_row,
         mode.clone(),
@@ -10304,65 +10474,32 @@ fn typecheck_combine_where(
             fold_body_config(&mut typed, scoped_vars);
             Ok(typed.with_source(std::sync::Arc::from(wrapped.as_str())))
         }
-        Err(type_diags) => {
-            let errors: Vec<&cxl::typecheck::TypeDiagnostic> =
-                type_diags.iter().filter(|d| !d.is_warning).collect();
-            if let Some(program) = &recheck
-                && let Some(blamed) = possibly_empty_errors(
-                    &Recheck {
+        Err((type_diags, resolved)) => {
+            let errors: Vec<cxl::typecheck::TypeDiagnostic> =
+                type_diags.into_iter().filter(|d| !d.is_warning).collect();
+            Err(body_type_errors(
+                &FailedProgram {
+                    recheck: Recheck {
                         site,
-                        program,
+                        program: &resolved.program,
                         node_count: parse_result.node_count,
                         row: merged_row,
                         mode: &mode,
                         module_exports: &no_modules,
                         scoped_vars,
                     },
-                    &empty_by_port,
-                    &reads,
-                    &errors,
-                    Authored::Expression {
+                    reads: &reads,
+                    authored: Authored::Expression {
                         key: "where",
                         text: where_src,
                         at: "filter ".len(),
                     },
-                    &wrapped,
-                )
-            {
-                return Err(blamed);
-            }
-            let mut out = Vec::new();
-            for td in type_diags.into_iter().filter(|d| !d.is_warning) {
-                // Typechecker's Filter-statement check emits a specific
-                // error message when the predicate's type is neither
-                // Bool nor Any — that is exactly E303 territory.
-                if td.message.starts_with("filter predicate must be type Bool") {
-                    out.push(
-                        Diagnostic::error(
-                            "E303",
-                            format!(
-                                "combine {combine_name:?} where-clause is not boolean: {}",
-                                td.message
-                            ),
-                            LabeledSpan::primary(span, String::new()),
-                        )
-                        .with_help(
-                            "the `where:` predicate must return Bool — use a comparison \
-                             (e.g. `a.id == b.id`)",
-                        ),
-                    );
-                } else {
-                    out.push(Diagnostic::error(
-                        "E200",
-                        format!(
-                            "combine {combine_name:?} where-clause type error: {}",
-                            td.message
-                        ),
-                        LabeledSpan::primary(span, String::new()),
-                    ));
-                }
-            }
-            Err(out)
+                    parsed: &wrapped,
+                    text: ProgramText::AsParsed,
+                },
+                &errors,
+                plain,
+            ))
         }
     }
 }
@@ -11243,6 +11380,55 @@ nodes:
         let mut diags_after_failure = vec![diags[0].clone()];
         assert!(admission(&failed, &mut diags_after_failure).is_none());
         assert_eq!(diags_after_failure.len(), 1, "{diags_after_failure:#?}");
+    }
+
+    #[test]
+    fn a_read_names_only_the_column_the_type_checker_reads_it_as() {
+        let origin = Arc::new(PortOrigin {
+            call: Arc::from("call"),
+            port: Arc::from("pa"),
+            body_file: Arc::from("c.comp.yaml"),
+        });
+        let carried = |access| {
+            ColumnMark::Carried(CarriedColumn {
+                port: Arc::clone(&origin),
+                access,
+            })
+        };
+        let read = |qualifier: Option<&str>, name: &str| FieldRead {
+            at: cxl::lexer::Span::new(0, 0),
+            qualifier: qualifier.map(Box::from),
+            name: Box::from(name),
+        };
+        let a_v = QualifiedField::qualified("a", "v");
+        let b_v = QualifiedField::qualified("b", "v");
+        let bare_v = QualifiedField::bare("v");
+        // `a.v` may be named; `b.v` came through a port that does not
+        // declare it, so a bare `v` can only be `a.v`.
+        let mut merged = Row::closed(
+            IndexMap::from([(a_v.clone(), Type::Int), (b_v.clone(), Type::Int)]),
+            cxl::lexer::Span::new(0, 0),
+        );
+        merged.enter_body_scope();
+        merged.mark(a_v.clone(), carried(PortAccess::Declared));
+        merged.mark(b_v.clone(), carried(PortAccess::Undeclared));
+        assert!(read(Some("a"), "v").reads(&a_v, &merged));
+        assert!(!read(Some("a"), "v").reads(&b_v, &merged));
+        assert!(read(None, "v").reads(&a_v, &merged));
+        assert!(!read(None, "v").reads(&b_v, &merged));
+        // A qualified read is not a read of a bare column of that name.
+        let mut plain = Row::closed(
+            IndexMap::from([(bare_v.clone(), Type::Int)]),
+            cxl::lexer::Span::new(0, 0),
+        );
+        plain.enter_body_scope();
+        plain.mark(bare_v.clone(), carried(PortAccess::Declared));
+        assert!(read(None, "v").reads(&bare_v, &plain));
+        assert!(!read(Some("a"), "v").reads(&bare_v, &plain));
+        // A bare name both inputs let the body name reads neither.
+        merged.mark(b_v.clone(), carried(PortAccess::Declared));
+        assert!(!read(None, "v").reads(&a_v, &merged));
+        assert!(!read(None, "v").reads(&b_v, &merged));
     }
 
     #[test]

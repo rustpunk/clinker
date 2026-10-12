@@ -224,6 +224,20 @@ pub fn type_check_with_mode_and_vars(
     aggregate_mode: AggregateMode,
     scoped_vars: &ScopedVarsRegistry,
 ) -> Result<TypedProgram, Vec<TypeDiagnostic>> {
+    type_check_returning_program(resolved, schema, aggregate_mode, scoped_vars)
+        .map_err(|(diagnostics, _)| diagnostics)
+}
+
+/// [`type_check_with_mode_and_vars`], handing the resolved program back
+/// with the diagnostics when the check fails, so a caller that needs to
+/// typecheck the program again (against a row with other column types, say)
+/// has it without keeping a copy on the path where the check passes.
+pub fn type_check_returning_program(
+    resolved: ResolvedProgram,
+    schema: &Row,
+    aggregate_mode: AggregateMode,
+    scoped_vars: &ScopedVarsRegistry,
+) -> Result<TypedProgram, (Vec<TypeDiagnostic>, ResolvedProgram)> {
     let registry = BuiltinRegistry::new();
     let node_count = resolved.node_count;
 
@@ -280,7 +294,15 @@ pub fn type_check_with_mode_and_vars(
 
     let has_errors = checker.diagnostics.iter().any(|d| !d.is_warning);
     if has_errors {
-        return Err(checker.diagnostics);
+        let diagnostics = checker.diagnostics;
+        return Err((
+            diagnostics,
+            ResolvedProgram {
+                program,
+                bindings,
+                node_count,
+            },
+        ));
     }
 
     // Extract from checker (partial moves release the borrow on `bindings`)

@@ -118,10 +118,13 @@ A column declared `any` (or `{ nullable: any }`) is checked with the type the
 call provides, so a node that uses it in a way only some types support
 compiles at some calls and not at others; the type error names the
 composition and the port, because it depends on the call. Its help prints the
-node's line with the column converted to the type the node needs, such as
-`emit u = v.to_string().upper()`, which compiles whatever type a call provides
-as long as the values convert. Columns the port
-does not declare keep the caller's types on the way through.
+node's line, or a Combine's `where:` entry, with the column converted to the
+type the node needs, such as `emit u = v.to_string().upper()`, which compiles
+whatever type a call provides as long as the values convert. The line is
+offered only for a type the provided values can convert to, and only once the
+node compiles with it; otherwise the help says to declare the type the node
+needs on the port. Columns the port does not declare keep the caller's types
+on the way through.
 
 A column declared `{ nullable: <type> }` says the composition copes with an
 empty value in that column. Its nodes are checked as if the value could be
