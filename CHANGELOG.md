@@ -22,12 +22,12 @@ a Source or another node fed it.
 
 The composition's nodes now compile against the rows the call actually feeds
 each port. A call writes what the same nodes written in the pipeline at the
-call site would write, with two exceptions that remain open: a Sink with
-`include_unmapped: false` reading a call writes every column the call passes
-on, where the same Sink after the inline nodes writes only the columns their
-last Transform emits; and an Aggregate inside a composition fed by a source
-that declares a `correlation_key` stops with `E314` where the inline Aggregate
-runs. Columns the port does not declare pass through the composition in the
+call site would write. A Sink with `include_unmapped: false` reading a call
+now writes only the columns the node behind the composition's first output
+port emits, as it does after the same nodes written inline; before, it wrote
+every column the call passed on. One exception remains open: an Aggregate
+inside a composition fed by a source that declares a `correlation_key` stops
+with `E314` where the inline Aggregate runs. Columns the port does not declare pass through the composition in the
 caller's position, so a call fed by a Transform that adds a column runs and
 writes that column.
 
@@ -74,6 +74,11 @@ pipeline: a `mapping:` entry reading a column no row carries is `E365`, and one
 whose output name collides with a caller column `include_unmapped: true`
 writes beside it is `E364`. Before, both checks stood down inside a
 composition.
+
+`E378`'s help for a composition Sink that writes only emitted columns now
+moves it with its configuration unchanged, with no `mapping:`, and moves
+such a Sink even when its `exclude:` removes every column it reads: the
+moved Sink writes the same columns at pipeline level.
 
 A composition node listed before the node it reads is now bound after it.
 Before, such a node was left unbound: it escaped every check, and the call

@@ -477,13 +477,14 @@ pub(crate) fn diagnose_untagged_composition_edges(
 /// new composition output port runs on the engine as it is, the help is
 /// that move as numbered fragments the author can paste, the pipeline Sink
 /// block carrying the body Sink's compiled configuration rendered back to
-/// YAML, with the columns of a Sink that writes only emitted columns written
-/// out as its `mapping:`. A call carries only the rows of its composition's
+/// YAML, unchanged: a call emits what the node behind its first output port
+/// emits, so a Sink reading the call writes what it wrote reading that node,
+/// `include_unmapped: false` included. A call carries only the rows of its composition's
 /// first declared output port, and only when nothing else in the body reads
 /// that port's node (#1315), so the move is offered only for a
 /// pipeline-level call, made once, whose body Sink reads the plain node
-/// behind that first port and shares it with no other body node, and whose
-/// columns a `mapping:` can state. Everywhere else the help is one next step,
+/// behind that first port and shares it with no other body node. Everywhere
+/// else the help is one next step,
 /// the explain page, with the reason.
 ///
 /// Every help is written as if every movable Sink moves, so applying them
@@ -681,15 +682,6 @@ pub(crate) fn diagnose_document_dlq_body_sinks(
                 quoted_reader = body.graph[reader].name().quoted_name(),
             ));
         }
-        if projected_columns(&body.graph, idx).is_some_and(|kept| kept.is_empty()) {
-            return Err(format!(
-                "Sink {quoted_sink} sets `include_unmapped: false` and its `exclude:` removes \
-                 every column {quoted_port_node} emits, so at pipeline level it would write \
-                 the columns composition {quoted_call} passes through instead",
-                quoted_sink = body.graph[idx].name().quoted_name(),
-                quoted_port_node = port_node_name.quoted_name(),
-            ));
-        }
         Ok(port_node_name)
     };
 
@@ -782,25 +774,13 @@ pub(crate) fn diagnose_document_dlq_body_sinks(
                         call = call.name,
                     ));
                 }
-                // The Sink's own configuration, under its pipeline name. A
-                // Sink that writes only emitted columns gets them written out
-                // as its `mapping:`: in the body its input is the port node,
-                // which emits only those columns, but at pipeline level its
-                // input is the call, whose emitted columns are its whole
-                // output, pass-through columns included. A mapping under
-                // `include_unmapped: false` writes exactly the listed columns
-                // in the listed order, which is what the body Sink wrote.
+                // The Sink's own configuration, under its pipeline name and
+                // otherwise unchanged. At pipeline level its input is the
+                // call, which emits what the port node emits, so a Sink that
+                // writes only emitted columns writes the same ones there.
                 let config = resolved.as_deref().map(|payload| {
                     let mut config = payload.sink.clone();
                     config.name.clone_from(&pipeline_name);
-                    if let Some(columns) = projected_columns(&body.graph, idx) {
-                        config.mapping = Some(crate::config::OutputMapping::new(
-                            columns
-                                .into_iter()
-                                .map(crate::config::MappingEntry::passthrough)
-                                .collect(),
-                        ));
-                    }
                     config
                 });
                 steps.push(format!(
@@ -854,46 +834,6 @@ fn composition_file_label(path: &std::path::Path) -> String {
         .map(|component| component.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/")
-}
-
-/// The columns a body Sink restricts its output to, where the moved Sink
-/// would not restrict itself to the same ones, in the order it writes them;
-/// `None` when the moved Sink, with the body Sink's configuration unchanged,
-/// writes what the body Sink wrote.
-///
-/// A Sink with `include_unmapped: false` and no `mapping:` writes only the
-/// columns its input emits ([`cxl_emit_walk`], the walk the runtime
-/// projection reads), less the names its `exclude:` lists, in the order the
-/// record carries them, which is the emit walk's schema order. Only a walk
-/// that ends at a Transform reports fewer columns than the row the
-/// composition call passes on: the call's own emit names are its whole
-/// output schema, so the moved Sink would also write the columns the
-/// Transform passes through. Every other end already reports the whole row
-/// the port carries, engine-stamped columns included, which the runtime
-/// projection never writes, so the unchanged configuration writes the same
-/// columns and no `mapping:` is needed (one would name those engine columns,
-/// written as empty cells). An input that emits no named column applies no
-/// restriction at runtime, so it is `None` here too. `Some` of an empty list
-/// is a Sink whose `exclude:` removes every column a Transform emits.
-fn projected_columns(graph: &DiGraph<PlanNode, PlanEdge>, idx: NodeIndex) -> Option<Vec<String>> {
-    let PlanNode::Sink { resolved, .. } = &graph[idx] else {
-        return None;
-    };
-    let sink = &resolved.as_deref()?.sink;
-    if sink.include_unmapped || sink.mapping.is_some() {
-        return None;
-    }
-    let (end, emitted) = cxl_emit_walk(graph, idx)?;
-    if !matches!(graph[end], PlanNode::Transform { .. }) || emitted.is_empty() {
-        return None;
-    }
-    let excluded = sink.exclude.as_deref().unwrap_or_default();
-    Some(
-        emitted
-            .into_iter()
-            .filter(|column| !excluded.contains(column))
-            .collect(),
-    )
 }
 
 /// The `config:` lines of a pipeline Sink block: the body Sink's compiled
@@ -1251,6 +1191,7 @@ mod port_tag_guard_tests {
             output_schema: SharedStorage::from_arc(Arc::new(clinker_record::Schema::new(
                 Vec::new(),
             ))),
+            emits: Default::default(),
         }
     }
 

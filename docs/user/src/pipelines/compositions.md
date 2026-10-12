@@ -96,12 +96,11 @@ For the `risk_score` composition above, a call fed rows of `order_id`,
 `region`, `amount` gets back `order_id`, `region`, `amount`, `high_value`:
 `region` passes through even though the port does not declare it.
 
-Two cases do not yet match the inline nodes. A Sink with
-`include_unmapped: false` reading the call writes every column the call passes
-on, where the same Sink after the inline nodes writes only the columns their
-last Transform emits. And an Aggregate inside a composition fed by a source
-that declares a `correlation_key` stops with `E314` where the inline Aggregate
-runs.
+A Sink with `include_unmapped: false` reading the call writes only the columns
+the node behind the composition's first output port emits, as it would after
+the same nodes written inline. One case does not yet match the inline nodes:
+an Aggregate inside a composition fed by a source that declares a
+`correlation_key` stops with `E314` where the inline Aggregate runs.
 
 The composition's nodes see each declared column with the type the port
 declares, at every call, so a composition that compiles against its ports

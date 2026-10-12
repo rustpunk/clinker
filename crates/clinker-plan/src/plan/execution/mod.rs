@@ -452,6 +452,12 @@ pub enum PlanNode {
         /// `bind_composition` from the body's terminal-node output row.
         #[serde(skip)]
         output_schema: SharedStorage<Schema>,
+        /// The columns the call emits, as the node behind its first output
+        /// port emits them: what a Sink with `include_unmapped: false`
+        /// reading the call writes, as it would after the same nodes
+        /// written inline.
+        #[serde(skip)]
+        emits: CallEmits,
     },
     /// Planner-synthesized terminal commit node for `correlation_key` pipelines.
     ///
@@ -1095,11 +1101,42 @@ pub(crate) fn cxl_emit_walk(
         match own_cxl_emit_names(&graph[idx]) {
             Some(names) => return Some((idx, names)),
             None => {
-                idx = graph
-                    .neighbors_directed(idx, petgraph::Direction::Incoming)
-                    .next()?;
+                // A call whose output passes a port through continues at
+                // the node feeding that port; every other pass-through
+                // variant has one upstream.
+                let port = match &graph[idx] {
+                    PlanNode::Composition {
+                        emits: CallEmits::Port(port),
+                        ..
+                    } => Some(port.as_str()),
+                    _ => None,
+                };
+                let mut incoming = graph.edges_directed(idx, petgraph::Direction::Incoming);
+                idx = match port {
+                    Some(port) => incoming
+                        .find(|edge| edge.weight().port.as_deref() == Some(port))
+                        .map(|edge| petgraph::visit::EdgeRef::source(&edge))?,
+                    None => petgraph::visit::EdgeRef::source(&incoming.next()?),
+                };
             }
         }
+    }
+}
+
+/// What composition body `graph` emits through output node `output`, for
+/// [`PlanNode::Composition`]'s `emits`. `port_sources` maps each input
+/// port name to its synthetic Source in `graph`.
+pub(crate) fn call_emits(
+    graph: &DiGraph<PlanNode, PlanEdge>,
+    output: NodeIndex,
+    port_sources: &std::collections::HashMap<String, NodeIndex>,
+) -> CallEmits {
+    match cxl_emit_walk(graph, output) {
+        Some((end, names)) => match port_sources.iter().find(|(_, idx)| **idx == end) {
+            Some((port, _)) => CallEmits::Port(port.clone()),
+            None => CallEmits::Columns(names),
+        },
+        None => CallEmits::WholeRow,
     }
 }
 
@@ -1126,6 +1163,14 @@ fn own_cxl_emit_names(node: &PlanNode) -> Option<Vec<String>> {
                 .map(|c| c.to_string())
                 .collect(),
         ),
+        PlanNode::Composition {
+            emits: CallEmits::Columns(names),
+            ..
+        } => Some(names.clone()),
+        PlanNode::Composition {
+            emits: CallEmits::Port(_),
+            ..
+        } => None,
         PlanNode::Aggregation { output_schema, .. }
         | PlanNode::Combine { output_schema, .. }
         | PlanNode::Composition { output_schema, .. }
@@ -1144,6 +1189,21 @@ fn own_cxl_emit_names(node: &PlanNode) -> Option<Vec<String>> {
         | PlanNode::Sink { .. }
         | PlanNode::CorrelationCommit { .. } => None,
     }
+}
+
+/// The columns a composition call emits, resolved from the node behind its
+/// first output port by the same walk [`cxl_emit_names_at`] runs.
+#[derive(Debug, Clone, Default)]
+pub enum CallEmits {
+    /// The call's whole output row: the body could not be read.
+    #[default]
+    WholeRow,
+    /// The columns the output node emits, in the order the row carries them.
+    Columns(Vec<String>),
+    /// The output node passes the rows of this input port through without
+    /// emitting a column of its own: the call emits what the node feeding
+    /// that port emits.
+    Port(String),
 }
 
 /// Edge dependency type.

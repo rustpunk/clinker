@@ -919,3 +919,53 @@ fn a_call_s_column_lineage_is_the_lineage_of_its_body_written_inline() {
         );
     }
 }
+
+/// `sink(input, sort)` writing only the columns its input emits.
+fn emitted_only_sink(input: &str, sort: &[&str]) -> String {
+    sink(input, sort).replace(
+        "      path: out.csv\n",
+        "      path: out.csv\n      include_unmapped: false\n",
+    )
+}
+
+#[test]
+fn a_sink_writing_only_emitted_columns_writes_what_it_writes_after_the_inline_nodes() {
+    // After the inline Transform the Sink writes only `v` and `r`, the
+    // columns the Transform emits. After the call it writes the same: the
+    // call emits what the node behind its output port emits.
+    let body = r#"  - type: transform
+    name: t1
+    input: inp
+    config:
+      cxl: |
+        emit v = v + 100
+        emit r = v * 2
+"#;
+    let composition = comp("c", &[("v", "int"), ("department", "string")], "t1", body);
+    let composed = pipeline(
+        "emitted",
+        &format!(
+            "{ORDERS_SOURCE}{}{}",
+            call("call", "c.comp.yaml", "src"),
+            emitted_only_sink("call", &["v"])
+        ),
+    );
+    let inline = pipeline(
+        "emitted_inline",
+        &format!(
+            "{ORDERS_SOURCE}{}{}",
+            body.replace("input: inp", "input: src"),
+            emitted_only_sink("t1", &["v"])
+        ),
+    );
+    assert_inline_equivalent(
+        &[
+            (PIPELINE, &composed),
+            ("compositions/c.comp.yaml", &composition),
+            ("pipelines/in.csv", ORDERS),
+        ],
+        &[(PIPELINE, &inline), ("pipelines/in.csv", ORDERS)],
+        0,
+        "v,r\n105,10\n106,12\n107,14\n",
+    );
+}
