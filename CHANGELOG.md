@@ -73,8 +73,10 @@ after the call could not name them. A node that does not handle
 an empty value in a column its port declares `{ nullable: ... }` now fails
 with `E200` at every call, naming the node, the composition, the port and the
 column, and the help prints the node's line with the empty case handled, such
-as `filter (v ?? 0) > 6`. The `E102` that followed it, saying the next call
-reads a node the pipeline does not bind, is no longer reported. A composition
+as `filter (v ?? 0) > 6`: the line whose expression fails, or, for a Route
+branch, a Reshape `when:` or a log `condition:`, that YAML entry rewritten.
+The `E102` that followed it, saying the next call reads a node the pipeline
+does not bind, is no longer reported. A composition
 that passes such a column unchanged to an inner composition whose port needs it
 never empty fails with `E102` at every call; the error names the outer port's
 `{ nullable: ... }` declaration as the cause and prints that port's line with
