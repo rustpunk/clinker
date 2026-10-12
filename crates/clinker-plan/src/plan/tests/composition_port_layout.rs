@@ -2765,3 +2765,98 @@ fn an_optional_port_no_node_reads_may_stay_unbound() {
     let unread = OPTIONAL_PORT_COMPOSITION.replace("    input: opt\n", "    input: inp\n");
     compile(&unread).unwrap_or_else(|d| panic!("compiles: {:#?}", describe(&d)));
 }
+
+/// A composition `enrich` with two output ports, `out` and `audit`.
+const TWO_OUTPUT_COMPOSITION: &str = r#"_compose:
+  name: enrich
+  inputs:
+    inp:
+      schema:
+        - { name: v, type: int }
+  outputs:
+    out: t
+    audit: a
+  config_schema: {}
+
+nodes:
+  - type: transform
+    name: t
+    input: inp
+    config:
+      cxl: |
+        emit a = v
+  - type: transform
+    name: a
+    input: inp
+    config:
+      cxl: |
+        emit extra = 1
+"#;
+
+/// The one E102 a call whose port reads `upstream` draws.
+fn port_upstream_refusal(upstream: &str, extra_nodes: &str) -> Diagnostic {
+    let pipeline = PIPELINE
+        .replace("      inp: src\n", &format!("      inp: {upstream}\n"))
+        .replace(
+            "  - type: composition\n    name: call\n    input: src\n",
+            &format!("{extra_nodes}  - type: composition\n    name: call\n    input: src\n"),
+        );
+    let Err(diags) = compile_in(
+        &pipeline,
+        &[
+            ("compositions/c.comp.yaml", &comp(IDENTITY_BODY)),
+            ("compositions/enrich.comp.yaml", TWO_OUTPUT_COMPOSITION),
+        ],
+    ) else {
+        panic!("a port reading {upstream} must not compile");
+    };
+    assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
+    assert_eq!(diags[0].code, "E102", "{:#?}", describe(&diags));
+    diags[0].clone()
+}
+
+#[test]
+fn a_port_reading_another_output_port_of_a_composition_is_told_what_a_call_carries() {
+    let refused = port_upstream_refusal(
+        "enrich.audit",
+        r#"  - type: composition
+    name: enrich
+    input: src
+    use: ../compositions/enrich.comp.yaml
+    inputs:
+      inp: src
+"#,
+    );
+    for fragment in [
+        "cannot read \"enrich.audit\"",
+        "output port `audit` of composition \"enrich\"",
+        "only the rows of its first output port",
+    ] {
+        assert!(
+            refused.message.contains(fragment),
+            "{fragment}: {}",
+            refused.message
+        );
+    }
+    assert!(
+        !refused.message.contains("Route or a Cull"),
+        "{}",
+        refused.message
+    );
+    let help = refused.help.as_deref().unwrap_or_default();
+    assert!(help.contains("`inp: enrich`"), "{help}");
+}
+
+#[test]
+fn a_port_reading_a_port_of_a_node_without_ports_is_told_so() {
+    let refused = port_upstream_refusal("src.rows", "");
+    assert!(
+        refused
+            .message
+            .contains("\"src\" is a source node, which has no output port `rows`"),
+        "{}",
+        refused.message
+    );
+    let help = refused.help.as_deref().unwrap_or_default();
+    assert!(help.contains("`inp: src`"), "{help}");
+}

@@ -2691,17 +2691,30 @@ fn bind_schema_inner(
         .filter(|spanned| matches!(spanned.value, PipelineNode::Source { .. }))
         .map(|spanned| spanned.value.name().to_string())
         .collect();
-    // Every node of this scope, so a call reading one that failed to bind
-    // is not reported a second time as reading a node that does not exist.
-    let scope_nodes: HashSet<String> = nodes
-        .iter()
-        .map(|spanned| spanned.value.name().to_string())
-        .collect();
-
     // Bind each node after the nodes of this scope it reads. An author may
     // list a node before its input; binding in list order left such a node
     // unbound, so it escaped every check and wrote no rows.
     let (order, unplaced) = bind_order(nodes);
+    // The nodes of this scope that failed to bind: those on a cycle, and
+    // each whose own bind raised an error. A call reading one of them is
+    // not told a second time that it reads a node with no row.
+    let mut failed_nodes: HashSet<String> = unplaced
+        .iter()
+        .map(|&i| nodes[i].value.name().to_string())
+        .collect();
+    // The node being bound and where its diagnostics start.
+    let mut binding: Option<(String, usize)> = None;
+    fn settle(
+        binding: &mut Option<(String, usize)>,
+        diags: &[Diagnostic],
+        failed_nodes: &mut HashSet<String>,
+    ) {
+        if let Some((name, from)) = binding.take()
+            && diags[from..].iter().any(|d| d.severity == Severity::Error)
+        {
+            failed_nodes.insert(name);
+        }
+    }
     if bind_ctx.depth > 0 {
         let ports: HashSet<&str> = schema_by_name.keys().map(String::as_str).collect();
         body_input_diagnostics(
@@ -2714,9 +2727,11 @@ fn bind_schema_inner(
     }
 
     for spanned in order.iter().map(|&i| &nodes[i]) {
+        settle(&mut binding, diags, &mut failed_nodes);
         let node = &spanned.value;
         let name = node.name().to_string();
         let span = span_for(spanned);
+        binding = Some((name.clone(), diags.len()));
         // The node's stable id for this scope. Pre-minted before the walk
         // (top-level vector zip, or body pre-mint), so every visited node
         // is present. A missing entry can only mean an internal pre-mint /
@@ -3547,7 +3562,8 @@ fn bind_schema_inner(
                         call_config: config,
                         call_resources: resources,
                         source_nodes: &source_nodes,
-                        scope_nodes: &scope_nodes,
+                        scope: nodes,
+                        failed_nodes: &failed_nodes,
                         span,
                     },
                     diags,
@@ -3559,6 +3575,7 @@ fn bind_schema_inner(
             }
         }
     }
+    settle(&mut binding, diags, &mut failed_nodes);
 
     // Inside a composition body every bound row must carry its marks: a
     // row built without them would let a node name every column. A node
@@ -3648,8 +3665,11 @@ struct CompositionBindParams<'a> {
     /// The calling scope's Source nodes, so an E102 can point at the
     /// `schema:` line that declares a column's type.
     source_nodes: &'a HashSet<String>,
-    /// Every node of the calling scope.
-    scope_nodes: &'a HashSet<String>,
+    /// Every node of the calling scope, so an E102 about a `node.port`
+    /// upstream can say what kind of node it names.
+    scope: &'a [Spanned<PipelineNode>],
+    /// The nodes of the calling scope whose bind failed with an error.
+    failed_nodes: &'a HashSet<String>,
     span: Span,
 }
 
@@ -3674,7 +3694,8 @@ fn bind_composition(
         call_config,
         call_resources,
         source_nodes,
-        scope_nodes,
+        scope,
+        failed_nodes,
         span,
     } = params;
     // 1. Resolve use_path to workspace-relative key and look up in symbol_table.
@@ -3773,7 +3794,8 @@ fn bind_composition(
             signature,
             parent_schemas: parent_schema_by_name,
             source_nodes,
-            scope_nodes,
+            scope,
+            failed_nodes,
             body_file: &resolved_path,
             span,
         },
@@ -5267,7 +5289,9 @@ struct PortAdmission<'a> {
     /// The calling scope's Source nodes, whose `schema:` declares a type.
     source_nodes: &'a HashSet<String>,
     /// Every node of the calling scope.
-    scope_nodes: &'a HashSet<String>,
+    scope: &'a [Spanned<PipelineNode>],
+    /// The nodes of the calling scope whose bind failed with an error.
+    failed_nodes: &'a HashSet<String>,
     /// The composition file, as the author refers to it.
     body_file: &'a Path,
     span: Span,
@@ -5297,7 +5321,8 @@ fn build_input_port_rows(
         signature,
         parent_schemas,
         source_nodes,
-        scope_nodes,
+        scope,
+        failed_nodes,
         span,
         ..
     } = admission;
@@ -5310,18 +5335,16 @@ fn build_input_port_rows(
             continue;
         };
         let Some(upstream_row) = parent_schemas.get(upstream_name.as_str()) else {
-            // A node of this scope with no row failed to bind, and said why
-            // where it failed; a second error here would only say that the
-            // call cannot read it.
+            // A node of this scope whose own bind failed said why where it
+            // failed; a second error here would only say that the call
+            // cannot read it.
             has_errors = true;
-            let failed_upstream = scope_nodes.contains(upstream_name.as_str())
-                && diags.iter().any(|d| d.severity == Severity::Error);
-            if !failed_upstream {
+            if !failed_nodes.contains(upstream_name.as_str()) {
                 diags.push(unbound_port_upstream(
                     call,
                     port_name,
                     upstream_name,
-                    parent_schemas,
+                    scope,
                     span,
                 ));
             }
@@ -5424,18 +5447,29 @@ fn unbound_port_read(
 }
 
 /// E102 for a port whose upstream has no bound row. A `node.port`
-/// reference to a node that exists is an output port of a Route or a Cull,
-/// which a composition input port cannot read yet (#888); the fix routes the
-/// rows through a Transform that passes them on.
+/// reference names an output port of a node of the scope: of a Route or a
+/// Cull, which a composition input port cannot read yet (#888), so the fix
+/// routes the rows through a Transform that passes them on; of a
+/// composition, whose call carries only the rows of its first output port
+/// (#1315); or of a node that has no output ports at all.
 fn unbound_port_upstream(
     call: &str,
     port: &str,
     upstream: &str,
-    parent_schemas: &HashMap<String, Row>,
+    scope: &[Spanned<PipelineNode>],
     span: Span,
 ) -> Diagnostic {
-    match upstream.split_once('.') {
-        Some((node, branch)) if parent_schemas.contains_key(node) => {
+    let kind_of = |name: &str| {
+        scope
+            .iter()
+            .find(|spanned| spanned.value.name() == name)
+            .map(|spanned| spanned.value.type_tag())
+    };
+    let named = upstream
+        .split_once('.')
+        .and_then(|(node, branch)| kind_of(node).map(|kind| (node, branch, kind)));
+    match named {
+        Some((node, branch, "route" | "cull")) => {
             let relay = format!("{node}_{branch}");
             Diagnostic::error(
                 "E102",
@@ -5454,6 +5488,31 @@ fn unbound_port_upstream(
                  branch directly)"
             ))
         }
+        Some((node, branch, "composition")) => Diagnostic::error(
+            "E102",
+            format!(
+                "composition {call:?}: input port `{port}` cannot read {upstream:?}, output port \
+                 `{branch}` of composition {node:?}; a call carries only the rows of its first \
+                 output port"
+            ),
+            LabeledSpan::primary(span, String::new()),
+        )
+        .with_help(format!(
+            "write `{port}: {node}` under `inputs:` to feed the port from the first output \
+             port of {node:?}; to read `{branch}`, move the nodes that read it into \
+             `{node}`'s composition (issue #1315 tracks reading another output port)"
+        )),
+        Some((node, branch, kind)) => Diagnostic::error(
+            "E102",
+            format!(
+                "composition {call:?}: input port `{port}` reads {upstream:?}, but {node:?} is a \
+                 {kind} node, which has no output port `{branch}`"
+            ),
+            LabeledSpan::primary(span, String::new()),
+        )
+        .with_help(format!(
+            "write `{port}: {node}` under `inputs:` to feed the port from {node:?}"
+        )),
         _ => Diagnostic::error(
             "E102",
             format!(
@@ -9970,5 +10029,66 @@ nodes:
         );
         assert!(out.is_nameable(&QualifiedField::bare("v")));
         assert!(!out.is_nameable(&QualifiedField::bare("w")));
+    }
+
+    /// A call reading a node with no row is told so unless that node's own
+    /// bind failed; an error elsewhere in the compile does not stand in
+    /// for the upstream's failure.
+    #[test]
+    fn a_port_reading_a_rowless_node_that_did_not_fail_is_still_refused() {
+        let config = crate::config::parse_config(
+            "pipeline:\n  name: p\nnodes:\n  - type: transform\n    name: up\n    input: src\n    \
+             config:\n      cxl: |\n        emit a = 1\n",
+        )
+        .expect("parse");
+        let body = CompositionFile::parse(
+            "_compose:\n  name: c\n  inputs:\n    inp:\n      schema:\n        - { name: a, type: \
+             int }\n  outputs:\n    out: last\n  config_schema: {}\nnodes:\n  - type: transform\n    \
+             name: last\n    input: inp\n    config:\n      cxl: |\n        emit b = a\n",
+            FileId::new(NonZeroU32::new(1).expect("non-zero")),
+            PathBuf::from("compositions/c.comp.yaml"),
+        )
+        .expect("parse body");
+        let call_inputs: IndexMap<String, String> = [("inp".to_string(), "up".to_string())]
+            .into_iter()
+            .collect();
+        let parent_schemas: HashMap<String, Row> = HashMap::new();
+        let source_nodes: HashSet<String> = HashSet::new();
+        let mut diags = vec![Diagnostic::error(
+            "E200",
+            "an unrelated node failed".to_string(),
+            LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+        )];
+        let mut next_tail_var = 0;
+        let mut admission = |failed_nodes: &HashSet<String>, diags: &mut Vec<Diagnostic>| {
+            build_input_port_rows(
+                &PortAdmission {
+                    call: "call",
+                    call_inputs: &call_inputs,
+                    signature: &body.signature,
+                    parent_schemas: &parent_schemas,
+                    source_nodes: &source_nodes,
+                    scope: &config.nodes,
+                    failed_nodes,
+                    body_file: Path::new("compositions/c.comp.yaml"),
+                    span: Span::SYNTHETIC,
+                },
+                &mut next_tail_var,
+                diags,
+            )
+        };
+        assert!(admission(&HashSet::new(), &mut diags).is_none());
+        assert_eq!(diags.len(), 2, "{diags:#?}");
+        assert_eq!(diags[1].code, "E102");
+        assert!(
+            diags[1].message.contains("reads \"up\""),
+            "{}",
+            diags[1].message
+        );
+
+        let failed: HashSet<String> = ["up".to_string()].into_iter().collect();
+        let mut diags_after_failure = vec![diags[0].clone()];
+        assert!(admission(&failed, &mut diags_after_failure).is_none());
+        assert_eq!(diags_after_failure.len(), 1, "{diags_after_failure:#?}");
     }
 }
