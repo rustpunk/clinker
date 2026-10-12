@@ -426,11 +426,13 @@ impl Row {
         }
     }
 
-    /// Every carried column, in field order.
-    pub fn carried_columns(&self) -> impl Iterator<Item = (&QualifiedField, &CarriedColumn)> {
+    /// Every carried column with its type, in field order.
+    pub fn carried_columns(
+        &self,
+    ) -> impl Iterator<Item = (&QualifiedField, &Type, &CarriedColumn)> {
         self.declared
-            .keys()
-            .filter_map(|field| self.carried(field).map(|column| (field, column)))
+            .iter()
+            .filter_map(|(field, ty)| self.carried(field).map(|column| (field, ty, column)))
     }
 
     /// Whether a program bound against this row may name `field`: always
@@ -450,19 +452,22 @@ impl Row {
     /// The carried mark of a column a bare `name` matches, when no column of
     /// that name may be named and one entered through a port that does not
     /// declare it: the case [`Row::lookup`] reports as `Unknown` although the
-    /// row carries the column.
-    pub fn undeclared_carried(&self, name: &str) -> Option<&CarriedColumn> {
-        let matches: Vec<&QualifiedField> = self
+    /// row carries the column. Returns the column's type in this row with
+    /// its mark, so a diagnostic about the column never has to look the
+    /// type up again.
+    pub fn undeclared_carried(&self, name: &str) -> Option<(&Type, &CarriedColumn)> {
+        let matches: Vec<(&QualifiedField, &Type)> = self
             .declared
-            .keys()
-            .filter(|qf| qf.name.as_ref() == name)
+            .iter()
+            .filter(|(qf, _)| qf.name.as_ref() == name)
             .collect();
-        if matches.iter().any(|qf| self.is_nameable(qf)) {
+        if matches.iter().any(|(qf, _)| self.is_nameable(qf)) {
             return None;
         }
-        matches.iter().find_map(|qf| {
+        matches.iter().find_map(|&(qf, ty)| {
             self.carried(qf)
                 .filter(|column| column.access == PortAccess::Undeclared)
+                .map(|column| (ty, column))
         })
     }
 
@@ -471,12 +476,13 @@ impl Row {
         &self,
         qualifier: &str,
         name: &str,
-    ) -> Option<&CarriedColumn> {
-        self.declared.keys().find_map(|qf| {
+    ) -> Option<(&Type, &CarriedColumn)> {
+        self.declared.iter().find_map(|(qf, ty)| {
             (qf.qualifier.as_deref() == Some(qualifier) && qf.name.as_ref() == name)
                 .then(|| self.carried(qf))
                 .flatten()
                 .filter(|column| column.access == PortAccess::Undeclared)
+                .map(|column| (ty, column))
         })
     }
 }

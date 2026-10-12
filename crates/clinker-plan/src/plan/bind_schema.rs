@@ -3309,8 +3309,8 @@ fn bind_schema_inner(
                         if let Some(other) = schema_by_name.get(input_target(&input.value)) {
                             let undeclared: Vec<(QualifiedField, CarriedColumn)> = other
                                 .carried_columns()
-                                .filter(|(_, column)| column.access == PortAccess::Undeclared)
-                                .map(|(field, column)| (field.clone(), column.clone()))
+                                .filter(|(_, _, column)| column.access == PortAccess::Undeclared)
+                                .map(|(field, _, column)| (field.clone(), column.clone()))
                                 .collect();
                             for (field, column) in undeclared {
                                 row.mark(field, ColumnMark::Carried(column));
@@ -4312,10 +4312,13 @@ fn bind_composition(
             if column.starts_with('$') || !matches!(row.mark_of(field), Some(ColumnMark::Own)) {
                 continue; // an engine column, or the caller's own value
             }
-            let Some((input, seed)) = port_seeds
-                .iter()
-                .find(|(_, seed)| seed.undeclared_carried(column).is_some())
-            else {
+            // The caller's type for the declaration in the fix: the type
+            // the port seed gives the column it carries undeclared, which is
+            // the type the caller passes.
+            let Some((input, caller_type)) = port_seeds.iter().find_map(|(input, seed)| {
+                seed.undeclared_carried(column)
+                    .map(|(ty, _)| (input, port_column_type(ty)))
+            }) else {
                 continue;
             };
             let writer = body_writer_of(
@@ -4325,11 +4328,6 @@ fn bind_composition(
                 output_node,
                 column,
             );
-            let caller_type = seed
-                .fields()
-                .find(|(seeded, _)| seeded.name.as_ref() == column)
-                .map(|(_, ty)| port_column_type(ty))
-                .unwrap_or_else(|| "any".to_string());
             let (writer_span, writer_label) = match writer {
                 Some(spanned) => (
                     span_for_node(spanned),
@@ -6054,11 +6052,7 @@ fn carry_into_caller_scope(
 /// a Sink `mapping:` source, ...) goes through this before its own presence
 /// check, so the author reads which port to edit rather than "not present".
 fn refuse_undeclared(row: &Row, node: &str, column: &str, span: Span) -> Option<Diagnostic> {
-    let carried = row.undeclared_carried(column)?;
-    let caller_type = row
-        .fields()
-        .find(|(field, _)| field.name.as_ref() == column)
-        .map(|(_, ty)| ty);
+    let (caller_type, carried) = row.undeclared_carried(column)?;
     Some(undeclared_column_diagnostic(
         node,
         column,
@@ -6099,7 +6093,7 @@ fn undeclared_column_diagnostic(
     node: &str,
     column: &str,
     carried: &CarriedColumn,
-    caller_type: Option<&Type>,
+    caller_type: &Type,
     span: Span,
 ) -> Diagnostic {
     let PortOrigin {
@@ -6122,7 +6116,7 @@ fn undeclared_column_diagnostic(
          composition has to provide it:\n\
          _compose:\n  inputs:\n    {port}:\n      schema:\n        \
          - {{ name: {column}, type: {} }}",
-        port_column_type(caller_type.unwrap_or(&Type::Any)),
+        port_column_type(caller_type),
     ))
 }
 
@@ -6328,10 +6322,7 @@ impl BodyReads {
             let refused = match qualified_input {
                 Some(qualifier) => {
                     row.undeclared_carried_qualified(qualifier, name)
-                        .map(|carried| {
-                            let ty = row
-                                .declared_map()
-                                .get(&QualifiedField::qualified(qualifier, name.as_ref()));
+                        .map(|(ty, carried)| {
                             undeclared_column_diagnostic(node, name, carried, ty, span)
                         })
                 }
@@ -6349,18 +6340,17 @@ impl BodyReads {
     /// reads, or every one the program reads when no error span holds one.
     fn possibly_empty_in<'e>(
         &self,
-        empty_by_port: &'e [(QualifiedField, CarriedColumn)],
+        empty_by_port: &'e [MayBeEmpty],
         within: &[cxl::lexer::Span],
-    ) -> Vec<(&'e QualifiedField, &'e CarriedColumn)> {
+    ) -> Vec<&'e MayBeEmpty> {
         let read = |inside: &dyn Fn(cxl::lexer::Span) -> bool| {
             empty_by_port
                 .iter()
-                .filter(|(field, _)| {
+                .filter(|empty| {
                     self.fields
                         .iter()
-                        .any(|(at, name)| inside(*at) && name.as_ref() == field.name.as_ref())
+                        .any(|(at, name)| inside(*at) && name.as_ref() == empty.field.name.as_ref())
                 })
-                .map(|(field, column)| (field, column))
                 .collect::<Vec<_>>()
         };
         let in_errors = read(&|at| {
@@ -6420,12 +6410,12 @@ impl BodyReads {
         &self,
         row: &'r Row,
         within: cxl::lexer::Span,
-    ) -> Option<(&'r QualifiedField, &'r CarriedColumn)> {
+    ) -> Option<(&'r QualifiedField, &'r Type, &'r CarriedColumn)> {
         self.fields
             .iter()
             .filter(|(at, _)| within.start <= at.start && at.end <= within.end)
             .find_map(|(_, name)| {
-                row.carried_columns().find(|(field, column)| {
+                row.carried_columns().find(|(field, _, column)| {
                     column.access == PortAccess::DeclaredAny && field.name.as_ref() == name.as_ref()
                 })
             })
@@ -7117,30 +7107,26 @@ fn typecheck_parsed_program(
             // provides, so the author has to learn that first. Every other
             // error is the node's own.
             let mut out: Vec<Diagnostic> = Vec::new();
-            let mut by_column: Vec<(&QualifiedField, &CarriedColumn, Vec<&str>)> = Vec::new();
+            let mut by_column: Vec<(&QualifiedField, &Type, &CarriedColumn, Vec<&str>)> =
+                Vec::new();
             let mut plain: Vec<&cxl::typecheck::TypeDiagnostic> = Vec::new();
             for error in errors {
                 match reads.caller_typed_in(schema, error.span) {
-                    Some((field, column)) => {
-                        match by_column.iter_mut().find(|(seen, _, _)| *seen == field) {
-                            Some((_, _, details)) => details.push(&error.message),
-                            None => by_column.push((field, column, vec![&error.message])),
+                    Some((field, ty, column)) => {
+                        match by_column.iter_mut().find(|(seen, ..)| *seen == field) {
+                            Some((.., details)) => details.push(&error.message),
+                            None => by_column.push((field, ty, column, vec![&error.message])),
                         }
                     }
                     None => plain.push(error),
                 }
             }
-            for (field, column, details) in by_column {
-                let ty = schema
-                    .declared_map()
-                    .get(field)
-                    .cloned()
-                    .unwrap_or(Type::Any);
+            for (field, ty, column, details) in by_column {
                 out.push(caller_typed_type_error(
                     node,
                     field,
                     column,
-                    &ty,
+                    ty,
                     &details.join("; "),
                     span,
                 ));
@@ -7167,17 +7153,13 @@ fn typecheck_parsed_program(
                     .collect::<Vec<_>>()
                     .join("; ");
                 let within: Vec<cxl::lexer::Span> = plain.iter().map(|d| d.span).collect();
-                for (field, column) in reads.possibly_empty_in(&empty_by_port, &within) {
+                for empty in reads.possibly_empty_in(&empty_by_port, &within) {
                     out.push(possibly_empty_type_error(
                         &PossiblyEmpty {
                             node,
-                            field,
-                            column,
-                            declared: schema
-                                .declared_map()
-                                .get(field)
-                                .cloned()
-                                .unwrap_or(Type::Any),
+                            field: &empty.field,
+                            column: &empty.column,
+                            declared: &empty.declared,
                             span,
                         },
                         &reads,
@@ -7209,21 +7191,32 @@ fn typecheck_parsed_program(
         })
 }
 
+/// A body row column whose input port declares it `{ nullable: T }` with a
+/// concrete `T`.
+struct MayBeEmpty {
+    field: QualifiedField,
+    /// The port's declaration, `{ nullable: T }`: the column's type in the
+    /// row the body is checked against.
+    declared: Type,
+    column: CarriedColumn,
+}
+
 /// The columns of a body row that a port declares `{ nullable: T }` with a
 /// concrete `T`: a body is checked as if each could be empty.
-fn may_be_empty_by_port(row: &Row) -> Vec<(QualifiedField, CarriedColumn)> {
+fn may_be_empty_by_port(row: &Row) -> Vec<MayBeEmpty> {
     if !row.in_body_scope() {
         return Vec::new();
     }
     row.carried_columns()
-        .filter(|(field, column)| {
+        .filter(|(_, ty, column)| {
             column.access == PortAccess::Declared
-                && matches!(
-                    row.declared_map().get(*field),
-                    Some(Type::Nullable(inner)) if !matches!(inner.as_ref(), Type::Any)
-                )
+                && matches!(ty, Type::Nullable(inner) if !matches!(inner.as_ref(), Type::Any))
         })
-        .map(|(field, column)| (field.clone(), column.clone()))
+        .map(|(field, ty, column)| MayBeEmpty {
+            field: field.clone(),
+            declared: ty.clone(),
+            column: column.clone(),
+        })
         .collect()
 }
 
@@ -7235,14 +7228,14 @@ fn passes_when_never_empty(
     program: cxl::ast::Program,
     node_count: u32,
     row: &Row,
-    empty_by_port: &[(QualifiedField, CarriedColumn)],
+    empty_by_port: &[MayBeEmpty],
     mode: &AggregateMode,
     scoped_vars: &cxl::resolve::ScopedVarsRegistry,
 ) -> bool {
     let columns: IndexMap<QualifiedField, Type> = row
         .fields()
         .map(|(field, ty)| {
-            let never_empty = empty_by_port.iter().any(|(empty, _)| empty == field);
+            let never_empty = empty_by_port.iter().any(|empty| &empty.field == field);
             let ty = if never_empty {
                 ty.unwrap_nullable().clone()
             } else {
@@ -7283,7 +7276,7 @@ struct PossiblyEmpty<'a> {
     field: &'a QualifiedField,
     column: &'a CarriedColumn,
     /// The port's declaration, `{ nullable: T }`.
-    declared: Type,
+    declared: &'a Type,
     span: Span,
 }
 
@@ -8898,15 +8891,11 @@ fn walk_for_unknown_refs(expr: &Expr, cx: CombineWalkContext<'_>, diags: &mut Ve
                     ),
                 );
             } else if parts.len() == 2
-                && let Some(carried) = cx
+                && let Some((caller_type, carried)) = cx
                     .merged_row
                     .undeclared_carried_qualified(&parts[0], &parts[1])
             {
                 // The input's composition port carries the column undeclared.
-                let caller_type = cx.merged_row.declared_map().get(&QualifiedField::qualified(
-                    parts[0].as_ref(),
-                    parts[1].as_ref(),
-                ));
                 let diag = undeclared_column_diagnostic(
                     cx.combine_name,
                     &parts[1],
