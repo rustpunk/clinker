@@ -1570,6 +1570,61 @@ fn a_column_a_nested_call_writes_is_the_outer_body_s_own() {
     .unwrap_or_else(|d| panic!("compiles: {:#?}", describe(&d)));
 }
 
+#[test]
+fn a_nested_call_with_no_input_ports_returns_the_outer_body_s_own_columns() {
+    // The inner composition reads its own Source and binds no input port.
+    // Called inside the outer body, its columns are the outer body's own,
+    // so the outer body may name them.
+    let outer = comp_out(
+        "after",
+        r#"  - type: composition
+    name: ic
+    input: inp
+    use: ./inner.comp.yaml
+    inputs: {}
+    resources: { own_data: shared }
+  - type: transform
+    name: after
+    input: ic
+    config:
+      cxl: |
+        emit z = k + 1
+"#,
+    );
+    let inner = r#"_compose:
+  name: inner
+  inputs: {}
+  outputs:
+    out: own
+  config_schema: {}
+  resources_schema:
+    own_data: { kind: file, required: true }
+
+nodes:
+  - type: source
+    name: own
+    config:
+      name: own
+      type: csv
+      resource: own_data
+      schema:
+        - { name: k, type: int }
+"#;
+    compile_in(
+        PIPELINE,
+        &[
+            ("compositions/c.comp.yaml", &outer),
+            ("compositions/inner.comp.yaml", inner),
+            ("data/k.csv", "k\n1\n"),
+            (
+                "clinker.toml",
+                "[catalog.resources.shared]\nkind = \"file\"\npath = \"data/k.csv\"\naccess = \"read\"\n",
+            ),
+        ],
+    )
+    .unwrap_or_else(|d| panic!("compiles: {:#?}", describe(&d)));
+}
+
 /// The W101 warnings a bind of `pipeline` with composition `comp_yaml` raises.
 fn w101(pipeline: &str, comp_yaml: &str) -> Vec<Diagnostic> {
     bind_in(pipeline, &[("compositions/c.comp.yaml", comp_yaml)])
