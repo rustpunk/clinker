@@ -58,7 +58,7 @@ nodes with the type the call provides. Before, it was untyped inside the
 composition, so a node that used it in a way that type does not support
 compiled and wrote empty values; now it fails with `E200` at that call, and
 the message names the composition and the port. A column the port declares
-with a concrete type is still seen with that type, and the columns the port
+with a concrete type is still checked with that type, and the columns the port
 does not declare reach the composition's output with the caller's types.
 
 A composition's port types are now what its nodes are checked against, and
