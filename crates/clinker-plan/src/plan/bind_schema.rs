@@ -7533,7 +7533,7 @@ fn possibly_empty_type_error(
         body_file,
     } = column.port.as_ref();
     let name = field.name.as_ref();
-    let declared = port_column_type(&at.declared);
+    let declared = port_column_type(at.declared);
     let inner = at.declared.unwrap_nullable();
     let never_empty = port_column_type(inner);
     let declare = format!(
