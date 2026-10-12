@@ -5416,6 +5416,10 @@ fn port_type_refusal(
         span,
         ..
     } = admission;
+    if let Some(refusal) = enclosing_port_may_be_empty(admission, port, column, declared, provided)
+    {
+        return refusal;
+    }
     let upstream = call_inputs
         .get(port)
         .map(String::as_str)
@@ -5465,6 +5469,71 @@ fn port_type_refusal(
          `{{ nullable: ... }}` declaration, and anything into `any`; nothing is converted at \
          the port"
         ),
+    )
+}
+
+/// E102 for a call inside a composition body whose port needs `column` never
+/// empty, when the column reaches it unchanged from the enclosing
+/// composition's own input port, which declares it `{ nullable: T }`.
+///
+/// The enclosing body is checked at every call as if the column could be
+/// empty, so the cause is that declaration, not the node feeding the call:
+/// the error names the enclosing port, and the fix to paste is that port's
+/// line with the never-empty type. `None` for every other refusal.
+fn enclosing_port_may_be_empty(
+    admission: &PortAdmission<'_>,
+    port: &str,
+    column: &str,
+    declared: &Type,
+    provided: &Type,
+) -> Option<Diagnostic> {
+    let &PortAdmission {
+        call,
+        call_inputs,
+        parent_schemas,
+        body_file,
+        span,
+        ..
+    } = admission;
+    let Type::Nullable(inner) = provided else {
+        return None;
+    };
+    if inner.as_ref() != declared {
+        return None;
+    }
+    let carried = parent_schemas
+        .get(call_inputs.get(port)?.as_str())?
+        .carried(&QualifiedField::bare(column))?;
+    if carried.access != PortAccess::Declared {
+        return None;
+    }
+    let PortOrigin {
+        call: outer,
+        port: outer_port,
+        body_file: outer_file,
+    } = carried.port.as_ref();
+    let needed = port_column_type(declared);
+    let possibly_empty = port_column_type(provided);
+    Some(
+        Diagnostic::error(
+            "E102",
+            format!(
+                "composition {outer:?} passes a `{column}` that may be empty to composition \
+                 {call:?}, whose input port `{port}` needs `{column}` never empty (`{needed}`): \
+                 input port `{outer_port}` of {outer:?} declares `{column}` as \
+                 `{possibly_empty}` in `{outer_file}`, so {outer:?} is checked at every call as \
+                 if `{column}` could be empty"
+            ),
+            LabeledSpan::primary(span, String::new()),
+        )
+        .with_help(format!(
+            "declare `{column}` as never empty on input port `{outer_port}` in `{outer_file}`: \
+             `- {{ name: {column}, type: {needed} }}`, so {outer:?} accepts only a `{column}` \
+             that is never empty, as {call:?} needs. If {outer:?} must accept an empty \
+             `{column}`, declare it nullable on input port `{port}` in `{}` instead: \
+             `- {{ name: {column}, type: {possibly_empty} }}`",
+            body_file.display()
+        )),
     )
 }
 
