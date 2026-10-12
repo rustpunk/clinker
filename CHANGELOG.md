@@ -58,8 +58,10 @@ nodes with the type the call provides. Before, it was untyped inside the
 composition, so a node that used it in a way that type does not support
 compiled and wrote empty values; now it fails with `E200` at that call, and
 the message names the composition and the port. The help prints the node's
-line with the column converted to the type the node needs, such as
-`emit u = v.to_string().upper()`. A column the port declares
+line, or a Combine's `where:` entry, with the column converted to the type the
+node needs, such as `emit u = v.to_string().upper()`, for a type the provided
+values can convert to; the type checker's detail follows the fix, in a port
+schema's spelling. A column the port declares
 with a concrete type is still checked with that type, and the columns the port
 does not declare reach the composition's output with the caller's types.
 
@@ -79,10 +81,8 @@ as `filter (v ?? 0) > 6`: the line whose expression fails, or, for a Route
 branch, a Reshape `when:`, a log `condition:` or a Combine `where:`, that YAML
 entry rewritten. A Combine `where:` that compares such a column without
 handling the empty case was refused with `E303`, which named neither the
-composition nor the port; it is now this `E200`. A Combine body that read
-such a column by its qualified name (`a.v`) without handling the empty case
-compiled, because the check did not see the qualified read; it now fails with
-this `E200` at every call too.
+composition nor the port; it is now this `E200`. The help prints one fix,
+and prints the rewritten line only when the node compiles with it.
 The `E102` that followed it, saying the next call reads a node the pipeline
 does not bind, is no longer reported. A composition
 that passes such a column unchanged to an inner composition whose port needs it
