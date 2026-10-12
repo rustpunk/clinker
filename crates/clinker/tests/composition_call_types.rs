@@ -212,6 +212,9 @@ fn describe(output: &Output) -> String {
     )
 }
 
+/// The `(code, message)` pairs of a compile that failed, sorted.
+type Failures = Vec<(String, String)>;
+
 /// What one pipeline did: its exit code, `out.csv`, and either the Sink's
 /// column types or the compile diagnostics.
 struct Outcome {
@@ -229,11 +232,11 @@ impl Outcome {
     /// message)` pairs with the node feeding `second` written `"<node>"`:
     /// the call `first` on one side, the body's output node `out` on the
     /// other, so the same failure compares equal on both.
-    fn typing(&self, out: &str) -> Result<&[(String, String)], Vec<(String, String)>> {
+    fn typing(&self, out: &str) -> Result<&[(String, String)], Failures> {
         match &self.compiled {
             Ok(types) => Ok(types),
             Err(diags) => {
-                let mut failures: Vec<(String, String)> = diags
+                let mut failures: Failures = diags
                     .iter()
                     .map(|d| {
                         (
