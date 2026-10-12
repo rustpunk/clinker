@@ -263,7 +263,7 @@ nodes:
 /// Gate 3: Given upstream row with extra columns beyond port schema,
 /// binding succeeds: the extra columns pass through the body.
 #[test]
-fn test_bind_composition_passthrough_column_available_in_body_cxl() {
+fn test_bind_composition_binds_with_upstream_columns_the_port_does_not_declare() {
     // customer_enrich has inputs.customers with schema {customer_id, name}.
     // The upstream provides {customer_id, name, region}; "region" passes
     // through the body in the caller's position. The body may not name it

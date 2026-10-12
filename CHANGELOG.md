@@ -61,8 +61,8 @@ the message names the composition and the port. A column the port declares
 with a concrete type is still checked with that type, and the columns the port
 does not declare reach the composition's output with the caller's types.
 
-A composition's port types are now what its nodes are checked against, and
-what a call outputs follows what the caller passed. A column a composition
+A composition's nodes are still checked against its port types; what a call
+outputs now follows what the caller passed. A column a composition
 does not write leaves the call with the type it arrived with, and a column it
 writes has the type its nodes give it from the caller's values, as the same
 nodes written in the pipeline would. Before, a column the port declared left
