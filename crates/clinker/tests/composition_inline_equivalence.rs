@@ -969,3 +969,76 @@ fn a_sink_writing_only_emitted_columns_writes_what_it_writes_after_the_inline_no
         "v,r\n105,10\n106,12\n107,14\n",
     );
 }
+
+#[test]
+fn a_body_cycle_stops_the_run_instead_of_writing_nothing() {
+    let body = r#"  - type: transform
+    name: a
+    input: b
+    config:
+      cxl: |
+        emit p = v
+  - type: transform
+    name: b
+    input: a
+    config:
+      cxl: |
+        emit q = 1
+"#;
+    let composition = comp("c", &[("v", "int"), ("department", "string")], "a", body);
+    let composed = pipeline(
+        "cycle",
+        &format!(
+            "{ORDERS_SOURCE}{}{}",
+            call("call", "c.comp.yaml", "src"),
+            sink("call", &["v"])
+        ),
+    );
+    let (run, _) = run_workspace(&[
+        (PIPELINE, &composed),
+        ("compositions/c.comp.yaml", &composition),
+        ("pipelines/in.csv", ORDERS),
+    ]);
+    assert_eq!(run.status.code(), Some(1), "{}", describe(&run));
+    assert!(
+        String::from_utf8_lossy(&run.stderr).contains("E107"),
+        "{}",
+        describe(&run)
+    );
+}
+
+#[test]
+fn a_pipeline_listing_a_node_before_its_input_writes_what_the_ordered_pipeline_writes() {
+    let transform = r#"  - type: transform
+    name: t
+    input: src
+    config:
+      cxl: |
+        emit r = v * 2
+"#;
+    let ordered = pipeline(
+        "ordered",
+        &format!("{ORDERS_SOURCE}{transform}{}", sink("t", &["v"])),
+    );
+    let reversed = pipeline(
+        "reversed",
+        &format!("{}{transform}{ORDERS_SOURCE}", sink("t", &["v"])),
+    );
+    let (ordered_run, ordered_out) =
+        run_workspace(&[(PIPELINE, &ordered), ("pipelines/in.csv", ORDERS)]);
+    assert_eq!(
+        ordered_run.status.code(),
+        Some(0),
+        "{}",
+        describe(&ordered_run)
+    );
+    let (reversed_run, reversed_out) =
+        run_workspace(&[(PIPELINE, &reversed), ("pipelines/in.csv", ORDERS)]);
+    assert_eq!(
+        reversed_run.status.code(),
+        Some(0),
+        "{}",
+        describe(&reversed_run)
+    );
+    assert_eq!(reversed_out, ordered_out);
+}

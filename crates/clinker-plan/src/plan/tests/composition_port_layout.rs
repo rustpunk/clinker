@@ -1335,7 +1335,7 @@ fn w101_warns_where_the_body_writes_a_column_the_port_passes_through() {
     );
     assert_eq!(warned.len(), 1, "{:#?}", describe(&warned));
     assert!(
-        warned[0].message.contains("\"wt\"") && warned[0].message.contains("\"inp\""),
+        warned[0].message.contains("`wt`") && warned[0].message.contains("\"inp\""),
         "{}",
         warned[0].message
     );
@@ -1561,4 +1561,492 @@ fn an_int_caller_column_is_refused_by_a_float_port() {
         &["input port `inp`", "`v`", "`float`", "`int`", "\"src\""],
         &["emit v = v.to_float()"],
     );
+}
+
+/// [`COMBINE_PIPELINE`] with `wt` on the second Source too, so both
+/// Combine inputs carry a `wt`.
+fn combine_pipeline_with_wt_on_both() -> String {
+    COMBINE_PIPELINE.replace(
+        "        - { name: extra, type: string }\n",
+        "        - { name: extra, type: string }\n        - { name: wt, type: int }\n",
+    )
+}
+
+#[test]
+fn a_combine_naming_a_column_both_inputs_carry_undeclared_is_refused() {
+    // Neither port declares `wt`, though both callers have it: the bare
+    // name is a column the body may not use, not a missing one.
+    let compiled = compile_in(
+        &combine_pipeline_with_wt_on_both(),
+        &[(
+            "compositions/c.comp.yaml",
+            &combine_comp("a.department == b.department", "emit z = wt"),
+        )],
+    );
+    let Err(diags) = compiled else {
+        panic!("`wt` is not declared on either port");
+    };
+    let refused: Vec<&Diagnostic> = diags.iter().filter(|d| d.code == "E169").collect();
+    assert_eq!(refused.len(), 1, "{:#?}", describe(&diags));
+    assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
+    assert!(
+        refused[0].message.contains("`wt`"),
+        "{}",
+        refused[0].message
+    );
+}
+
+#[test]
+fn an_ambiguous_name_offers_only_the_inputs_the_body_may_name() {
+    // `pb` declares `wt`, `pa` does not: the help names `b.wt` only.
+    let composition = combine_comp("a.department == b.department", "emit z = wt");
+    let composition = composition.replace(
+        "    pb:\n      schema:\n        - { name: department, type: string }\n        - { name: label, type: string }\n",
+        "    pb:\n      schema:\n        - { name: department, type: string }\n        - { name: label, type: string }\n        - { name: wt, type: int }\n",
+    );
+    let Err(diags) = compile_in(
+        &combine_pipeline_with_wt_on_both(),
+        &[("compositions/c.comp.yaml", &composition)],
+    ) else {
+        panic!("a bare `wt` over two inputs must be qualified");
+    };
+    assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
+    let text = format!(
+        "{}\n{}",
+        diags[0].message,
+        diags[0].help.as_deref().unwrap_or_default()
+    );
+    assert!(text.contains("b.wt"), "the help names `b.wt`: {text}");
+    assert!(
+        !text.contains("a.wt"),
+        "`a.wt` is not the body's to name: {text}"
+    );
+}
+
+#[test]
+fn a_qualified_reference_to_an_undeclared_column_is_refused() {
+    // Outside a Combine the qualifier names no input, and the value read is
+    // the caller's `wt`.
+    assert_undeclared_column_refused(
+        r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit z = anything.wt
+"#,
+        "wt",
+        "- { name: wt, type: int }",
+    );
+}
+
+#[test]
+fn a_type_error_unrelated_to_an_any_column_is_not_blamed_on_it() {
+    let composition = comp_declaring(
+        &["{ name: v, type: int }", "{ name: department, type: any }"],
+        r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit a = department
+        emit b = v.upper()
+"#,
+    );
+    let Err(diags) = compile_in(PIPELINE, &[("compositions/c.comp.yaml", &composition)]) else {
+        panic!("`v.upper()` on an int is a type error");
+    };
+    assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
+    assert_eq!(diags[0].code, "E200", "{:#?}", describe(&diags));
+    assert!(
+        !diags[0].message.contains("department")
+            && !diags[0]
+                .help
+                .as_deref()
+                .unwrap_or_default()
+                .contains("department"),
+        "the error is about `v`, not `department`: {:#?}",
+        describe(&diags)
+    );
+}
+
+/// The one diagnostic `body` draws, which must have code `code` and name
+/// node `node` in its message.
+fn assert_body_refused_with(body: &str, code: &str, node: &str) {
+    let Err(diags) = compile(&comp(body)) else {
+        panic!("the body must not compile");
+    };
+    let coded: Vec<&Diagnostic> = diags.iter().filter(|d| d.code == code).collect();
+    assert!(
+        !coded.is_empty(),
+        "{code} expected: {:#?}",
+        describe(&diags)
+    );
+    assert!(
+        coded
+            .iter()
+            .any(|d| d.message.contains(&format!("\"{node}\""))),
+        "{code} names node {node:?}: {:#?}",
+        describe(&diags)
+    );
+    assert!(
+        diags.iter().all(|d| d.code == code),
+        "only {code}: {:#?}",
+        describe(&diags)
+    );
+}
+
+#[test]
+fn a_body_cycle_is_refused() {
+    assert_body_refused_with(
+        r#"  - type: transform
+    name: a
+    input: b
+    config:
+      cxl: |
+        emit p = wt
+  - type: transform
+    name: b
+    input: a
+    config:
+      cxl: |
+        emit q = 1
+  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit r = v
+"#,
+        "E107",
+        "a",
+    );
+}
+
+#[test]
+fn a_body_node_reading_itself_is_refused() {
+    assert_body_refused_with(
+        r#"  - type: transform
+    name: a
+    input: a
+    config:
+      cxl: |
+        emit p = wt
+  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit r = v
+"#,
+        "E107",
+        "a",
+    );
+}
+
+#[test]
+fn a_body_node_reading_a_name_the_body_does_not_have_is_refused() {
+    assert_body_refused_with(
+        r#"  - type: transform
+    name: a
+    input: inpp
+    config:
+      cxl: |
+        emit p = wt
+  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit r = v
+"#,
+        "E004",
+        "a",
+    );
+}
+
+#[test]
+fn a_top_level_node_listed_before_its_input_is_bound() {
+    // The bind walk orders every scope by input, the pipeline's own nodes
+    // included.
+    let pipeline = r#"
+pipeline:
+  name: forward
+nodes:
+  - type: sink
+    name: out
+    input: t
+    config:
+      name: out
+      type: csv
+      path: out.csv
+  - type: transform
+    name: t
+    input: src
+    config:
+      cxl: |
+        emit r = v
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - { name: v, type: int }
+"#;
+    let plan =
+        compile_in(pipeline, &[]).unwrap_or_else(|d| panic!("compiles: {:#?}", describe(&d)));
+    let transforms = plan
+        .dag()
+        .graph
+        .node_weights()
+        .filter(|node| matches!(node, PlanNode::Transform { .. }))
+        .count();
+    assert_eq!(
+        transforms, 1,
+        "the Transform listed after its reader is lowered"
+    );
+}
+
+#[test]
+fn a_port_declared_nullable_any_admits_every_caller_type() {
+    let composition = comp_declaring(
+        &[
+            "{ name: v, type: { nullable: any } }",
+            "{ name: department, type: string }",
+        ],
+        IDENTITY_BODY,
+    );
+    compile_in(PIPELINE, &[("compositions/c.comp.yaml", &composition)])
+        .unwrap_or_else(|d| panic!("`{{ nullable: any }}` admits an int: {:#?}", describe(&d)));
+}
+
+#[test]
+fn e102_describes_an_always_empty_caller_column_in_plain_words() {
+    let pipeline = PIPELINE
+        .replace(
+            "  - type: composition\n    name: call\n    input: src\n",
+            "  - type: transform\n    name: pre\n    input: src\n    config:\n      cxl: |\n        emit w2 = null\n  - type: composition\n    name: call\n    input: pre\n",
+        )
+        .replace("      inp: src\n", "      inp: pre\n");
+    let composition = comp_declaring(
+        &[
+            "{ name: v, type: int }",
+            "{ name: department, type: string }",
+            "{ name: w2, type: { nullable: int } }",
+        ],
+        IDENTITY_BODY,
+    );
+    let Err(diags) = compile_in(&pipeline, &[("compositions/c.comp.yaml", &composition)]) else {
+        panic!("an always-empty column is not an int");
+    };
+    assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
+    assert_eq!(diags[0].code, "E102");
+    assert!(
+        !diags[0].message.contains("as `any`") && diags[0].message.contains("always empty"),
+        "{}",
+        diags[0].message
+    );
+}
+
+#[test]
+fn e102_for_a_port_fed_by_a_route_branch_says_why_and_how_to_fix_it() {
+    let pipeline = PIPELINE.replace(
+        "  - type: composition\n    name: call\n    input: src\n    use: ../compositions/c.comp.yaml\n    inputs:\n      inp: src\n",
+        "  - type: route\n    name: r\n    input: src\n    config:\n      conditions:\n        high: \"v > 5\"\n      default: low\n  - type: composition\n    name: call\n    input: r.high\n    use: ../compositions/c.comp.yaml\n    inputs:\n      inp: r.high\n",
+    );
+    let Err(diags) = compile_in(
+        &pipeline,
+        &[("compositions/c.comp.yaml", &comp(IDENTITY_BODY))],
+    ) else {
+        panic!("a Route branch cannot feed a port yet");
+    };
+    let e102: Vec<&Diagnostic> = diags.iter().filter(|d| d.code == "E102").collect();
+    assert_eq!(e102.len(), 1, "{:#?}", describe(&diags));
+    assert!(
+        e102[0].message.contains("\"r.high\"")
+            && e102[0].message.contains("cannot read")
+            && !e102[0].message.contains("produces no rows"),
+        "{}",
+        e102[0].message
+    );
+    let help = e102[0].help.as_deref().unwrap_or_default();
+    assert!(
+        help.contains("input: r.high") && help.contains("filter true") && help.contains("#888"),
+        "{help}"
+    );
+}
+
+#[test]
+fn w101_points_at_the_body_line_that_writes_the_column_and_gives_a_fix() {
+    let composition = comp(
+        r#"  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit wt = 2
+"#,
+    );
+    let warned = w101(PIPELINE, &composition);
+    assert_eq!(warned.len(), 1, "{:#?}", describe(&warned));
+    let line = composition
+        .lines()
+        .position(|l| l.contains("- type: transform"))
+        .expect("the node line") as u32
+        + 1;
+    assert_eq!(
+        warned[0].primary.span,
+        clinker_core_types::Span::line_only(line)
+    );
+    let help = warned[0].help.as_deref().expect("W101 carries a fix");
+    assert!(
+        help.contains("- { name: wt, type: int }") && help.contains("c.comp.yaml"),
+        "{help}"
+    );
+}
+
+#[test]
+fn a_column_a_merge_input_carries_undeclared_stays_unnamed() {
+    // `pa` declares `wt`, `pb` does not: after the Merge a row may come from
+    // `pb`, so `wt` is still the caller's.
+    let composition = r#"_compose:
+  name: c
+  inputs:
+    pa:
+      schema:
+        - { name: v, type: int }
+        - { name: wt, type: int }
+    pb:
+      schema:
+        - { name: v, type: int }
+  outputs:
+    out: last
+  config_schema: {}
+
+nodes:
+  - type: merge
+    name: m
+    inputs: [pa, pb]
+  - type: transform
+    name: last
+    input: m
+    config:
+      cxl: |
+        emit z = wt
+"#;
+    let pipeline = PIPELINE.replace("      inp: src\n", "      pa: src\n      pb: src\n");
+    assert_refused(
+        compile_in(&pipeline, &[("compositions/c.comp.yaml", composition)]),
+        "last",
+        "wt",
+        "pb",
+        "- { name: wt, type: int }",
+    );
+}
+
+#[test]
+fn a_column_carried_through_a_reshape_stays_unnamed() {
+    assert_refused(
+        compile(&comp(
+            r#"  - type: reshape
+    name: rsh
+    input: inp
+    config:
+      partition_by: [department]
+      rules:
+        - name: r1
+          when: "v > 5"
+          mutate:
+            set:
+              v: "v + 100"
+  - type: transform
+    name: last
+    input: rsh
+    config:
+      cxl: |
+        emit z = wt
+"#,
+        )),
+        "last",
+        "wt",
+        "inp",
+        "- { name: wt, type: int }",
+    );
+}
+
+#[test]
+fn a_driver_column_carried_through_a_collect_combine_stays_unnamed() {
+    // Collect mode passes the driver's columns through; `order_id` is the
+    // caller's and `pa` does not declare it.
+    let composition = r#"_compose:
+  name: c
+  inputs:
+    pa:
+      schema:
+        - { name: department, type: string }
+        - { name: v, type: int }
+    pb:
+      schema:
+        - { name: department, type: string }
+        - { name: label, type: string }
+  outputs:
+    out: last
+  config_schema: {}
+
+nodes:
+  - type: combine
+    name: j
+    input:
+      a: pa
+      b: pb
+    config:
+      where: "a.department == b.department"
+      match: collect
+      on_miss: null_fields
+      propagate_ck: driver
+      drive: a
+      cxl: ""
+  - type: transform
+    name: last
+    input: j
+    config:
+      cxl: |
+        emit z = order_id
+"#;
+    assert_refused(
+        compile_in(
+            COMBINE_PIPELINE,
+            &[("compositions/c.comp.yaml", composition)],
+        ),
+        "last",
+        "order_id",
+        "pa",
+        "- { name: order_id, type: string }",
+    );
+}
+
+#[test]
+fn an_aggregate_group_key_stays_nameable_after_the_aggregate() {
+    // The group key is the caller's declared column: later nodes may still
+    // name it, and an undeclared column is still refused after a nested
+    // call that aggregates.
+    compile(&comp(
+        r#"  - type: aggregate
+    name: g
+    input: inp
+    config:
+      group_by: [department]
+      cxl: |
+        emit s = sum(v)
+  - type: transform
+    name: last
+    input: g
+    config:
+      cxl: |
+        emit d = department
+"#,
+    ))
+    .unwrap_or_else(|d| panic!("compiles: {:#?}", describe(&d)));
 }
