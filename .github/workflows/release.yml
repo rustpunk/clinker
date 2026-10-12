@@ -122,25 +122,25 @@ jobs:
           persist-credentials: false
 
       - name: Download the Linux build input
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-input-x86_64-unknown-linux-gnu
           path: target/x86_64-unknown-linux-gnu/release
 
       - name: Download the Windows build input
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-input-x86_64-pc-windows-msvc
           path: target/x86_64-pc-windows-msvc/release
 
       - name: Download the Apple silicon build input
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-input-aarch64-apple-darwin
           path: target/aarch64-apple-darwin/release
 
       - name: Download the Intel macOS build input
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-input-x86_64-apple-darwin
           path: target/x86_64-apple-darwin/release
