@@ -759,3 +759,27 @@ fn a_window_lookup_in_a_body_is_refused() {
         describe(&diags)
     );
 }
+
+#[test]
+fn a_body_node_listed_before_its_input_is_still_checked() {
+    // `last` reads `a`, which is listed after it. The body binds in input
+    // order, so `last` binds against `a`'s row and its undeclared `wt` is
+    // refused like any other.
+    assert_undeclared_column_refused(
+        r#"  - type: transform
+    name: last
+    input: a
+    config:
+      cxl: |
+        emit z = wt
+  - type: transform
+    name: a
+    input: inp
+    config:
+      cxl: |
+        emit r = v
+"#,
+        "wt",
+        "- { name: wt, type: int }",
+    );
+}

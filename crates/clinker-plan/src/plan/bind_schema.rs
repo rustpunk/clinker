@@ -4119,6 +4119,12 @@ fn bind_composition(
         }
     }
 
+    // Bind the body's nodes after the nodes they read. The bind walk binds
+    // in list order and needs each node's input row bound first; an author
+    // may list a node before its input, which used to leave the node
+    // unbound: it escaped every check and its call wrote no rows.
+    order_body_nodes_by_input(&mut body_file.nodes);
+
     // Pre-mint a stable id per body node and per synthetic input-port
     // source BEFORE binding, so the bind walk can key this body's typed /
     // combine side-table entries by id — body node ids are not available
@@ -5366,6 +5372,54 @@ fn compute_output_rows(
 }
 
 // ─── Port vocabulary ────────────────────────────────────────────────
+
+/// Reorder a composition body's nodes so each comes after every body node it
+/// reads, keeping the authored order wherever it already satisfies that.
+///
+/// Inputs that are not body nodes (the body's input ports) impose no order.
+/// Nodes on a cycle keep their authored order after everything else; the
+/// body graph reports the cycle.
+fn order_body_nodes_by_input(nodes: &mut Vec<Spanned<PipelineNode>>) {
+    let names: HashSet<String> = nodes
+        .iter()
+        .map(|spanned| spanned.value.name().to_string())
+        .collect();
+    let inputs_of = |node: &PipelineNode| -> Vec<String> {
+        let mut inputs: Vec<String> = node
+            .direct_input_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        if let PipelineNode::Composition { inputs: ports, .. } = node {
+            inputs.extend(
+                ports
+                    .values()
+                    .map(|upstream| upstream.split('.').next().unwrap_or(upstream).to_string()),
+            );
+        }
+        inputs.retain(|input| names.contains(input) && input != node.name());
+        inputs
+    };
+    let mut pending: Vec<Spanned<PipelineNode>> = std::mem::take(nodes);
+    let mut placed: HashSet<String> = HashSet::new();
+    while !pending.is_empty() {
+        let ready = pending.iter().position(|spanned| {
+            inputs_of(&spanned.value)
+                .iter()
+                .all(|input| placed.contains(input))
+        });
+        match ready {
+            Some(index) => {
+                let node = pending.remove(index);
+                placed.insert(node.value.name().to_string());
+                nodes.push(node);
+            }
+            None => {
+                nodes.append(&mut pending);
+            }
+        }
+    }
+}
 
 /// The row a composition body binds input port `port` against: the row the
 /// call site feeds it, with the port's declaration applied.

@@ -54,6 +54,10 @@ the pipeline's spelling, and the help gives the one change to make: the
 `schema:` line for a column read straight from a Source, or an
 `emit <column> = <column>.to_<type>()` before the call.
 
+A composition node listed before the node it reads is now bound after it.
+Before, such a node was left unbound: it escaped every check, and the call
+wrote no rows while the run exited 0.
+
 To migrate, add each column `E169` names to the port's `schema:`. For an
 `E102` on an untyped column, declare its type where the Source declares it,
 or convert it before the call.

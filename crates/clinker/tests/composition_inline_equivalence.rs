@@ -524,3 +524,68 @@ fn a_nested_composition_reads_the_columns_its_own_port_declares() {
         "department,s\na,12\nb,6\n",
     );
 }
+
+#[test]
+fn a_body_node_listed_before_its_input_writes_what_the_inline_nodes_write() {
+    // The body lists `b` before `a`, the node it reads. The call binds the
+    // nodes in input order and writes every row, as the same nodes written
+    // inline in input order do.
+    let body = |first_input: &str| {
+        format!(
+            r#"  - type: transform
+    name: b
+    input: a
+    config:
+      cxl: |
+        emit z = v
+  - type: transform
+    name: a
+    input: {first_input}
+    config:
+      cxl: |
+        emit r = v
+"#
+        )
+    };
+    let composition = comp(
+        "c",
+        &[("v", "int"), ("department", "string")],
+        "b",
+        &body("inp"),
+    );
+    let composed = pipeline(
+        "forward",
+        &format!(
+            "{ORDERS_SOURCE}{}{}",
+            call("call", "c.comp.yaml", "src"),
+            sink("call", &["v"])
+        ),
+    );
+    let inline_nodes = r#"  - type: transform
+    name: a
+    input: src
+    config:
+      cxl: |
+        emit r = v
+  - type: transform
+    name: b
+    input: a
+    config:
+      cxl: |
+        emit z = v
+"#;
+    let inline = pipeline(
+        "forward_inline",
+        &format!("{ORDERS_SOURCE}{inline_nodes}{}", sink("b", &["v"])),
+    );
+    assert_inline_equivalent(
+        &[
+            (PIPELINE, &composed),
+            ("compositions/c.comp.yaml", &composition),
+            ("pipelines/in.csv", ORDERS),
+        ],
+        &[(PIPELINE, &inline), ("pipelines/in.csv", ORDERS)],
+        0,
+        "order_id,department,v,wt,r,z\nO1,a,5,0,5,5\nO1,b,6,1,6,6\nO2,a,7,1,7,7\n",
+    );
+}
