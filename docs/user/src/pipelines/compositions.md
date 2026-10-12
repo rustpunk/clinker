@@ -115,15 +115,6 @@ others; the type error names the composition and the port, because it depends
 on the call. Columns the port does not declare keep the
 caller's types on the way through.
 
-A port's type is how the composition's nodes see the column, not a change to
-it. A column the composition does not write leaves the call exactly as it came
-in, with the caller's type, even when the port declared it more loosely (for
-example `{ nullable: int }` over a caller's `int`). A column the composition
-writes, with an `emit`, a Reshape `set` or `overrides` entry, or as an
-aggregate result, is the composition's own and leaves with the type the
-composition gave it; write a column (`emit qty = qty`) when you want its type
-fixed for every caller.
-
 Each call checks the caller's rows against the port: every declared column
 must be there, with the declared type, with the non-empty form of a
 `{ nullable: <type> }` declaration, or with any type for `any`. Otherwise the
