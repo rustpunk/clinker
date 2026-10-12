@@ -75,12 +75,36 @@ nodes:
 | Field | Required | Description |
 |-------|----------|-------------|
 | `_compose.name` | Yes | Composition identifier |
-| `_compose.inputs` | Yes | Named input ports and their minimum required schemas |
+| `_compose.inputs` | Yes | Named input ports and the columns the body may use; see [Input ports](#input-ports) |
 | `_compose.outputs` | Yes | Output port aliases pointing to body nodes or route ports |
 | `_compose.config_schema` | No | Typed configuration parameters, defaults, and constraints |
 | `_compose.scoped_vars` | No | Explicit scoped-variable names the sealed body may read from its caller |
 | `_compose.resources_schema` | No | Typed resource slots; see [Resource bindings](#resource-bindings) |
 | `nodes` | Yes | Unified node list for the sealed composition body |
+
+### Input ports
+
+A call behaves as if the composition's nodes were written in the pipeline at
+the call site. Each input port receives the caller's rows as they are: every
+column the caller has, in the caller's order. The port's `schema:` lists the
+columns the composition needs, and those are the only columns of the caller's
+rows its nodes may use. Every other column passes through the composition
+untouched and comes out in the same place, the way a Transform passes through
+the columns it does not `emit`.
+
+For the `risk_score` composition above, a call fed rows of `order_id`,
+`region`, `amount` gets back `order_id`, `region`, `amount`, `high_value`:
+`region` passes through even though the port does not declare it.
+
+Each call checks the caller's rows against the port: every declared column
+must be there with a compatible type, or the call fails with `E102`. A node
+inside the composition that uses a column its port does not declare fails
+compilation with `E169`, at every call, and the help prints the line to add
+under `_compose.inputs.<port>.schema`. A column the composition creates itself,
+with an `emit` or as an aggregate result, is its own, and later nodes may use
+it. When the composition writes a column with the same name as a caller column
+its port does not declare, the composition's value replaces the caller's and
+the compiler warns with `W101`. Run `clinker explain --code E169` for details.
 
 ### Reading config parameters in the body
 
