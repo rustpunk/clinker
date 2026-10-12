@@ -61,6 +61,18 @@ the message names the composition and the port. A column the port declares
 with a concrete type is still seen with that type, and the columns the port
 does not declare reach the composition's output with the caller's types.
 
+A column a composition does not write now leaves the call with the type it
+arrived with: a port's type is how the composition's nodes see the column, not
+a change to it. Before, a column the port declared left the call with the
+port's declared type whether or not the composition wrote it (an `any` port
+over an `int` column left as `any`), and the columns the port did not declare
+did not reach the calling scope's schema at all, so a node after the call
+could not name them. A column the composition writes, including a Reshape
+`set` or `overrides` target, leaves with the type the composition gave it. So
+a call that reads a caller's `int` through a `{ nullable: int }` port and does
+not write it can feed a call whose port needs an `int`, as the same nodes
+written in the pipeline can.
+
 **Breaking:** `E102` now admits a caller's column only when the port's
 declared type admits it: the same type, a type into its `{ nullable: ... }`
 form, or anything into `any`. A caller column with no declared type (`any`)
