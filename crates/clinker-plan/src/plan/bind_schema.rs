@@ -6124,10 +6124,10 @@ struct BodyBind<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ContractCheck {
     body_file: PathBuf,
-    /// Each port's seed row, in port order: its columns in order, with
-    /// their types and what the body may do with each (see
-    /// [`SeedColumn`]).
-    seeds: Vec<(String, Vec<SeedColumn>)>,
+    /// Each port's seed row, in port order: its tail, and its columns in
+    /// order with their types and what the body may do with each (see
+    /// [`SeedRow`]).
+    seeds: Vec<(String, SeedRow)>,
     declared_multiple: HashMap<String, BTreeSet<String>>,
     scoped_vars: ScopedVarsSeen,
     use_path_stack: Vec<PathBuf>,
@@ -6137,11 +6137,30 @@ pub(crate) struct ContractCheck {
     outside_inputs: Vec<(String, bool)>,
 }
 
+/// What a body's check reads of a port's seed row: its tail, which decides
+/// what a name the row does not declare resolves to ([`Row::lookup`]: an
+/// unknown column on a closed row, a pass-through on an open one), and its
+/// columns in order ([`SeedColumn`]). The row's declaration span only words
+/// diagnostics, and so does the call's name in a mark, so neither is in the
+/// key.
+#[derive(Debug, Clone, PartialEq)]
+struct SeedRow {
+    tail: cxl::typecheck::RowTail,
+    columns: Vec<SeedColumn>,
+}
+
+impl SeedRow {
+    fn of_row(row: &Row) -> Self {
+        Self {
+            tail: row.tail.clone(),
+            columns: SeedColumn::of_row(row),
+        }
+    }
+}
+
 /// What a body's check reads of one column of a port's seed row: its
 /// position (the column's place in the row), its name, its type and what
-/// the port's declaration lets the body do with it. A row's declaration
-/// span and tail word diagnostics and never decide a check, and the call's
-/// name in a mark only words them too, so none of those is in the key.
+/// the port's declaration lets the body do with it.
 #[derive(Debug, Clone, PartialEq)]
 struct SeedColumn {
     field: QualifiedField,
@@ -6221,7 +6240,7 @@ impl ContractCheck {
             seeds: bind
                 .contract_seeds
                 .iter()
-                .map(|(port, row)| (port.clone(), SeedColumn::of_row(row)))
+                .map(|(port, row)| (port.clone(), SeedRow::of_row(row)))
                 .collect(),
             declared_multiple: body_declared_multiple_by_name.clone(),
             scoped_vars: ScopedVarsSeen {
@@ -10348,6 +10367,33 @@ nodes:
     /// A row a nested call returns into its enclosing body whose carried
     /// column names a port no row fed is an internal error, not a column
     /// silently left without its mark.
+    #[test]
+    fn a_contract_check_key_tells_an_open_seed_row_from_a_closed_one() {
+        // An open row resolves a name it does not declare to a pass-through
+        // column, a closed one to an unknown column: a check that passed
+        // against one does not stand for the other.
+        let columns: IndexMap<QualifiedField, Type> = [(QualifiedField::bare("v"), Type::Int)]
+            .into_iter()
+            .collect();
+        let span = cxl::lexer::Span::new(0, 0);
+        let closed = Row::from_parts(columns.clone(), span, cxl::typecheck::RowTail::Closed);
+        let open = Row::from_parts(
+            columns,
+            span,
+            cxl::typecheck::RowTail::Open(cxl::typecheck::row::TailVarId(0)),
+        );
+        assert!(matches!(
+            closed.lookup("w"),
+            cxl::typecheck::ColumnLookup::Unknown
+        ));
+        assert!(matches!(
+            open.lookup("w"),
+            cxl::typecheck::ColumnLookup::PassThrough(_)
+        ));
+        assert_ne!(SeedRow::of_row(&closed), SeedRow::of_row(&open));
+        assert_eq!(SeedRow::of_row(&closed), SeedRow::of_row(&closed.clone()));
+    }
+
     #[test]
     fn a_carried_column_whose_port_was_not_fed_is_an_internal_error() {
         let origin = Arc::new(PortOrigin {
