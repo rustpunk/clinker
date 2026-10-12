@@ -2685,3 +2685,83 @@ fn a_check_that_passed_for_one_call_stands_for_a_call_fed_the_same_columns_from_
         "a check and a produce for the first call, a produce for the second"
     );
 }
+
+/// A composition with a second input port `opt`, declared optional, that
+/// body node `u` reads; `last` reads `inp` as every case does.
+const OPTIONAL_PORT_COMPOSITION: &str = r#"_compose:
+  name: c
+  inputs:
+    inp:
+      schema:
+        - { name: v, type: int }
+    opt:
+      required: false
+      schema:
+        - { name: v, type: int }
+  outputs:
+    out: last
+  config_schema: {}
+
+nodes:
+  - type: transform
+    name: last
+    input: inp
+    config:
+      cxl: |
+        emit a = v
+  - type: transform
+    name: u
+    input: opt
+    config:
+      cxl: |
+        emit b = v
+"#;
+
+#[test]
+fn a_body_node_reading_an_input_port_the_call_does_not_bind_is_refused() {
+    // `opt` is optional, so the call may leave it unbound; but `u` reads
+    // it and would receive no row. The call is refused, naming the call,
+    // the node and the port, with the binding to add at the call site.
+    let Err(diags) = compile(OPTIONAL_PORT_COMPOSITION) else {
+        panic!("a body node reading an unbound port must not compile");
+    };
+    assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
+    let refused = &diags[0];
+    assert_eq!(refused.code, "E104", "{:#?}", describe(&diags));
+    for fragment in [
+        "composition \"call\"",
+        "node \"u\"",
+        "in `compositions/c.comp.yaml`",
+        "reads input port `opt`",
+        "this call does not bind",
+    ] {
+        assert!(
+            refused.message.contains(fragment),
+            "{fragment}: {}",
+            refused.message
+        );
+    }
+    let help = refused.help.as_deref().unwrap_or_default();
+    for fragment in [
+        "add `opt: <node>` under `inputs:` of composition \"call\"",
+        "remove node \"u\" from `compositions/c.comp.yaml`",
+    ] {
+        assert!(help.contains(fragment), "{fragment}: {help}");
+    }
+}
+
+#[test]
+fn binding_the_port_the_help_names_compiles_the_call() {
+    let bound = PIPELINE.replace("      inp: src\n", "      inp: src\n      opt: src\n");
+    compile_in(
+        &bound,
+        &[("compositions/c.comp.yaml", OPTIONAL_PORT_COMPOSITION)],
+    )
+    .unwrap_or_else(|d| panic!("compiles once `opt` is bound: {:#?}", describe(&d)));
+}
+
+#[test]
+fn an_optional_port_no_node_reads_may_stay_unbound() {
+    let unread = OPTIONAL_PORT_COMPOSITION.replace("    input: opt\n", "    input: inp\n");
+    compile(&unread).unwrap_or_else(|d| panic!("compiles: {:#?}", describe(&d)));
+}
