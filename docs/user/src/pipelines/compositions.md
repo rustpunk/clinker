@@ -122,9 +122,10 @@ does not declare keep the caller's types on the way through.
 
 A column declared `{ nullable: <type> }` says the composition copes with an
 empty value in that column. Its nodes are checked as if the value could be
-empty, so a node that cannot take an empty value, such as `filter qty > 6`,
-fails with `E200` at every call, and the fix is to handle the empty case in
-the composition: `filter (qty ?? 0) > 6`. A call whose column is never empty
+empty, so a node that cannot take an empty value, such as `filter qty > 6`
+or a Combine `where:` comparing `a.qty > 6`, fails with `E200` at every call,
+and the fix is to handle the empty case in the composition:
+`filter (qty ?? 0) > 6`, or `where: '(a.qty ?? 0) > 6'`. A call whose column is never empty
 keeps that guarantee through the call, so a later composition that needs a
 never-empty `qty` still accepts it. A call whose column can be empty gets
 results that can be empty, and a later composition that needs a never-empty

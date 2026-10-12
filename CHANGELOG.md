@@ -74,7 +74,13 @@ an empty value in a column its port declares `{ nullable: ... }` now fails
 with `E200` at every call, naming the node, the composition, the port and the
 column, and the help prints the node's line with the empty case handled, such
 as `filter (v ?? 0) > 6`: the line whose expression fails, or, for a Route
-branch, a Reshape `when:` or a log `condition:`, that YAML entry rewritten.
+branch, a Reshape `when:`, a log `condition:` or a Combine `where:`, that YAML
+entry rewritten. A Combine `where:` that compares such a column without
+handling the empty case was refused with `E303`, which named neither the
+composition nor the port; it is now this `E200`. A Combine body that read
+such a column by its qualified name (`a.v`) without handling the empty case
+compiled, because the check did not see the qualified read; it now fails with
+this `E200` at every call too.
 The `E102` that followed it, saying the next call reads a node the pipeline
 does not bind, is no longer reported. A composition
 that passes such a column unchanged to an inner composition whose port needs it

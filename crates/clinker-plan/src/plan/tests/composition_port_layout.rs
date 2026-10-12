@@ -1395,6 +1395,11 @@ nodes:
 /// A two-port composition: `pa` declares `department, v`, `pb` declares
 /// `department, label`; a Combine `j` with `where_clause` and `cxl`.
 fn combine_comp(where_clause: &str, cxl: &str) -> String {
+    combine_comp_with_v("int", where_clause, cxl)
+}
+
+/// [`combine_comp`] with `pa` declaring `v` as `v_type`.
+fn combine_comp_with_v(v_type: &str, where_clause: &str, cxl: &str) -> String {
     format!(
         r#"_compose:
   name: c
@@ -1402,7 +1407,7 @@ fn combine_comp(where_clause: &str, cxl: &str) -> String {
     pa:
       schema:
         - {{ name: department, type: string }}
-        - {{ name: v, type: int }}
+        - {{ name: v, type: {v_type} }}
     pb:
       schema:
         - {{ name: department, type: string }}
@@ -3124,4 +3129,75 @@ fn only_the_column_whose_emptiness_fails_the_node_is_blamed() {
     );
     let help = diags[0].help.as_deref().unwrap_or_default();
     assert_eq!(pasted_line(help), "let x = (v ?? 0)", "{help}");
+}
+
+/// The one E200 a Combine `j` over a `pa` declaring `v` as
+/// `{ nullable: int }` draws, with `where_clause` and `cxl`, called with a
+/// caller whose `v` is `caller_v`.
+fn combine_empty_value_refusal(caller_v: &str, where_clause: &str, cxl: &str) -> Diagnostic {
+    let pipeline = COMBINE_PIPELINE.replace(
+        "        - { name: v, type: int }",
+        &format!("        - {{ name: v, type: {caller_v} }}"),
+    );
+    let composition = combine_comp_with_v("{ nullable: int }", where_clause, cxl);
+    let Err(diags) = compile_in(&pipeline, &[("compositions/c.comp.yaml", &composition)]) else {
+        panic!("the Combine does not handle an empty `a.v`");
+    };
+    assert_eq!(diags.len(), 1, "{caller_v}: {:#?}", describe(&diags));
+    let diag = &diags[0];
+    assert_eq!(diag.code, "E200", "{:#?}", describe(&diags));
+    assert!(
+        diag.message.starts_with(
+            "node \"j\" in composition \"call\" cannot use `v` while it may be empty: \
+             input port `pa` declares `v` as `{ nullable: int }`"
+        ),
+        "{}",
+        diag.message
+    );
+    diag.clone()
+}
+
+const COMBINE_EMITS: &str =
+    "emit department = a.department\n        emit v = a.v\n        emit label = b.label";
+
+#[test]
+fn a_combine_where_that_does_not_handle_an_empty_value_is_refused_at_every_call() {
+    // `a.v > 5` is empty when `a.v` is: the predicate is not a yes or no.
+    // The help prints the `where:` entry with the empty case handled.
+    for caller in ["int", "{ nullable: int }"] {
+        let refused = combine_empty_value_refusal(
+            caller,
+            "a.department == b.department and a.v > 5",
+            COMBINE_EMITS,
+        );
+        let help = refused.help.as_deref().unwrap_or_default();
+        assert_eq!(
+            pasted_line(help),
+            "where: 'a.department == b.department and (a.v ?? 0) > 5'",
+            "{caller}: {help}"
+        );
+        assert!(
+            help.contains("`- { name: v, type: int }`") && help.contains("c.comp.yaml"),
+            "{help}"
+        );
+    }
+}
+
+#[test]
+fn a_combine_body_that_does_not_handle_an_empty_value_is_refused_at_every_call() {
+    // The body reads `a.v` by its qualified name; the check that the body
+    // handles an empty `a.v` reads it as it reads a bare `v`.
+    for caller in ["int", "{ nullable: int }"] {
+        let refused = combine_empty_value_refusal(
+            caller,
+            "a.department == b.department and (a.v ?? 0) > 5",
+            &format!("filter a.v > 5\n        {COMBINE_EMITS}"),
+        );
+        let help = refused.help.as_deref().unwrap_or_default();
+        assert_eq!(
+            pasted_line(help),
+            "filter (a.v ?? 0) > 5",
+            "{caller}: {help}"
+        );
+    }
 }
