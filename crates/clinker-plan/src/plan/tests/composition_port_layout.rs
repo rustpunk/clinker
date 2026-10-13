@@ -3978,3 +3978,77 @@ fn the_e169_declaration_is_not_offered_when_the_composition_would_then_fail() {
         )
     );
 }
+
+#[test]
+fn a_port_reading_a_name_the_pipeline_does_not_have_is_told_what_to_bind() {
+    for upstream in ["nosuch", "nosuch.x"] {
+        let pipeline = PIPELINE.replace("      inp: src\n", &format!("      inp: {upstream}\n"));
+        let Err(diags) = compile_in(
+            &pipeline,
+            &[("compositions/c.comp.yaml", &comp(IDENTITY_BODY))],
+        ) else {
+            panic!("{upstream:?} is not a node of the pipeline");
+        };
+        assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
+        assert_eq!(diags[0].code, "E102");
+        assert_eq!(
+            diags[0].message,
+            format!(
+                "composition \"call\": input port `inp` reads {upstream:?}, which is not a node \
+                 this pipeline binds"
+            )
+        );
+        assert_eq!(
+            diags[0].help.as_deref(),
+            Some(
+                format!(
+                    "under `inputs:`, bind input port `inp` to a node of this pipeline in place \
+                     of {upstream:?}"
+                )
+                .as_str()
+            )
+        );
+    }
+}
+
+#[test]
+fn a_nested_port_reading_a_node_outside_the_composition_is_told_what_to_bind() {
+    // `src` is a node of the pipeline, not of the composition the call `ic`
+    // sits in.
+    let outer = comp_out(
+        "ic",
+        r#"  - type: composition
+    name: ic
+    input: inp
+    use: ./inner.comp.yaml
+    inputs:
+      ip: src
+"#,
+    );
+    let Err(diags) = compile_in(
+        PIPELINE,
+        &[
+            ("compositions/c.comp.yaml", &outer),
+            (
+                "compositions/inner.comp.yaml",
+                &inner_comp("        - { name: v, type: int }\n"),
+            ),
+        ],
+    ) else {
+        panic!("a body cannot read a node of the pipeline");
+    };
+    assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
+    assert_eq!(diags[0].code, "E102");
+    assert_eq!(
+        diags[0].message,
+        "composition \"ic\": input port `ip` reads \"src\", which is not a node this \
+         composition binds"
+    );
+    assert_eq!(
+        diags[0].help.as_deref(),
+        Some(
+            "under `inputs:`, bind input port `ip` to a node or input port of this composition \
+             in place of \"src\""
+        )
+    );
+}
