@@ -143,13 +143,23 @@ compiled and wrote no rows, not even a header, with exit 0. To migrate, bind
 the port under the call's `inputs:`.
 
 A help that prints YAML or a line of CXL for the author to paste now prints
-it only after the compiler has tried it: the edit is compiled in scratch and
-must clear the error without raising a new one. Otherwise the help is one
-sentence saying what to change, with no code, and no help offers two fixes.
-The `E104` help prints the `inputs:` entry naming the first node of the
-calling pipeline whose rows the port accepts; before, it named the node
-feeding the call's first bound port even when the port refused that node's
-rows, and with no bound port it asked the author to fill a name in.
+it only once the compiler has tried it where it applies: a line of YAML by
+binding the call it is for with it (or, for an `input:` line inside a
+composition, the nodes it is for), and a rewritten CXL line by compiling that
+node with it. There it must clear the error without raising a new one.
+Otherwise the help is one sentence saying what to change, with no code, and
+no help offers two fixes. The check covers only that call or node, not the
+whole pipeline: another call of the same composition, or a node that reads a
+column or node the fix changes, can still fail once the fix is pasted, and
+the next compile reports it. Checking a pasted fix against the whole pipeline
+is left to later work. The `E104` help tries, in order, the nodes feeding the
+call's other input ports, the input ports of the composition the call is in
+(for a call inside a composition), then every other node of the calling
+pipeline or composition in the order they are declared, and prints the
+`inputs:` entry naming the first one with which the call compiles; before,
+it named the node feeding the call's first bound port even when the port
+refused that node's rows, and with no bound port it asked the author to fill
+a name in.
 
 `E102` for a port fed by a Route branch now says a composition input port
 cannot read a Route or Cull output port yet and prints the Transform that

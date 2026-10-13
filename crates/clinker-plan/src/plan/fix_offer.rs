@@ -3,12 +3,17 @@
 //!
 //! A diagnostic's help may print YAML or a CXL line written for the author
 //! to paste: the binding to add at a call, the `input:` line that breaks a
-//! cycle, a node's line rewritten. Such a fix is a claim that pasting it
-//! compiles, so it is shown only after the engine has tried it: the edit is
-//! bound or typechecked in scratch state under the same rules as a real
-//! compile, and it must clear the error it was written for without raising
-//! one the compile did not already raise. A fix that does not check out is
-//! replaced by one plain sentence that says what to change, with no code.
+//! cycle, a node's line rewritten. Such a fix is shown only after the engine
+//! has tried it where it applies: the edit is bound or typechecked in scratch
+//! state under the same rules as a real compile, and it must clear the error
+//! it was written for without raising one the compile did not already raise.
+//! A fix that does not check out is replaced by one plain sentence that says
+//! what to change, with no code.
+//!
+//! The trial covers the call or nodes the fix is for, not the whole
+//! pipeline: another call of the same composition, or a node that reads a
+//! column or node the fix changes, can still fail once the fix is pasted,
+//! and the next compile reports it.
 //!
 //! [`offer_fix`] is the one place a generated fix becomes help text. A
 //! [`PasteFix`] has no other way out, so a fix cannot reach a diagnostic

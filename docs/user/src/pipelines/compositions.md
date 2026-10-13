@@ -175,8 +175,11 @@ an output port that is such an input port, needs every call to bind that port:
 a call that leaves it unbound fails with `E104`, and the help prints the
 `inputs:` entry to add. Only a port nothing in the composition reads may be
 left unbound. A help that prints YAML or a line of CXL to paste prints it only
-after the compiler has tried it and the composition compiled with it; when no
-such fix works, the help says in one sentence what to change. Run `clinker explain --code E169` for details.
+once the call or node it changes compiles with it; when no such fix works,
+the help says in one sentence what to change. That check does not cover the
+rest of the pipeline: another call of the same composition, or a node that
+reads a column or node the fix changes, can still fail once the fix is
+pasted, and the next compile reports it. Run `clinker explain --code E169` for details.
 
 ### Reading config parameters in the body
 
