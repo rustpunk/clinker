@@ -2742,14 +2742,14 @@ fn bind_schema_inner(
     // list a node before its input; binding in list order left such a node
     // unbound, so it escaped every check and wrote no rows.
     let (order, unplaced) = bind_order(nodes);
-    // The nodes of this scope that failed to bind: those on a cycle, each
-    // whose own bind raised an error, and each left without a row because a
-    // node it reads failed. A call reading one of them is not told a second
-    // time that it reads a node with no row.
-    let mut failed_nodes: HashSet<String> = unplaced
-        .iter()
-        .map(|&i| nodes[i].value.name().to_string())
-        .collect();
+    // The nodes of this scope that failed to bind: each whose own bind
+    // raised an error, each left without a row because a node it reads
+    // failed, and in a body the nodes on a cycle (E107 and E004 report
+    // those below). A call reading one of them is not told a second time
+    // that it reads a node with no row. At pipeline level a node `bind_order`
+    // could not place is not one: E003 does not see a cycle through a
+    // call's `inputs:` ports, so the call's E102 is what refuses it.
+    let mut failed_nodes: HashSet<String> = HashSet::new();
     // The node being bound (its index) and where its diagnostics start.
     let mut binding: Option<(usize, usize)> = None;
     fn settle(
@@ -6451,6 +6451,20 @@ fn unbound_port_upstream(
                 None => (diag.with_help(plain), None),
             }
         }
+        // A node of this scope that has no row when the call binds: one
+        // downstream of the call, which E003 does not see through a call's
+        // `inputs:` ports.
+        None if node_of(upstream).is_some() => (
+            Diagnostic::error(
+                "E102",
+                format!(
+                    "composition node {call:?}: input port {port:?} binds to {upstream:?} which \
+                     has no bound schema"
+                ),
+                LabeledSpan::primary(span, String::new()),
+            ),
+            None,
+        ),
         _ => {
             let (scope_word, readable) = if in_body {
                 ("composition", "a node or input port")
@@ -12046,10 +12060,10 @@ nodes:
         assert!(admission(&HashSet::new(), &mut diags).is_none());
         assert_eq!(diags.len(), 2, "{diags:#?}");
         assert_eq!(diags[1].code, "E102");
-        assert!(
-            diags[1].message.contains("reads \"up\""),
-            "{}",
-            diags[1].message
+        assert_eq!(
+            diags[1].message,
+            "composition node \"call\": input port \"inp\" binds to \"up\" which has no bound \
+             schema"
         );
 
         let failed: HashSet<String> = ["up".to_string()].into_iter().collect();
