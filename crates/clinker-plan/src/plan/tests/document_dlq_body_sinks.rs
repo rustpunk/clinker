@@ -318,6 +318,27 @@ fn e378_states_the_port_count_after_every_body_sink_moves() {
 }
 
 #[test]
+fn e378_step_three_keeps_a_composition_call_s_port_binding_on_the_bare_name() {
+    // A composition call that binds `enrich` to one of its input ports reads
+    // the rows of `enrich`'s first output port by the call's name; written
+    // `enrich.out` there, it is refused. Step 3 says to leave it.
+    let comp = composition("audited", "    out: shape", &body_sink("audit"));
+    let diags = e378_for(&[("compositions/audited.comp.yaml", &comp)], ENRICH_CALL);
+    let help = help_for(&diags, "audit");
+    let step = help
+        .lines()
+        .find(|line| line.starts_with("3. "))
+        .unwrap_or_else(|| panic!("a step 3: {help}"));
+    assert!(
+        step.ends_with(
+            "without a port; a composition call that binds \"enrich\" to an input port \
+             keeps the bare name there"
+        ),
+        "{step}"
+    );
+}
+
+#[test]
 fn e378_proposes_a_port_no_output_already_uses() {
     // `out` and `out_2` are ports already; `out_3` is a body Sink whose own
     // name the first Sink's port takes, so it moves on to the next suffix.
