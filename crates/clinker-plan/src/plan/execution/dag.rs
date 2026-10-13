@@ -769,7 +769,9 @@ pub(crate) fn diagnose_document_dlq_body_sinks(
                 {
                     steps.push(format!(
                         "composition {quoted_call} then has {count} output ports, so read \
-                         `{call}.{only_port}` wherever the pipeline reads `{call}` without a port",
+                         `{call}.{only_port}` wherever the pipeline reads `{call}` without a \
+                         port; a composition call that binds {quoted_call} to an input port \
+                         keeps the bare name there",
                         count = port_taken.get(&body_id).map_or(0, HashSet::len),
                         call = call.name,
                     ));
