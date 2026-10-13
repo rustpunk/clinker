@@ -99,8 +99,9 @@ accepted and arithmetic over its values could silently come out empty.
 before. Nothing is converted at the port, so `int` is still refused for
 `float`. The message names the call, the port, the column and both types in
 the pipeline's spelling, and the help gives the one change to make: the
-`schema:` line for a column read straight from a Source, or a Transform to add
-before the call that converts the column (`emit <column> = <column>.to_<type>()`).
+`schema:` line for a column read straight from a Source, or the line that
+converts the column (`emit <column> = <column>.to_<type>()`) to write in a
+Transform before the call.
 
 A Sink inside a composition is now checked like the same Sink in the
 pipeline: a `mapping:` entry reading a column no row carries is `E365`, and one

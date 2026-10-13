@@ -38,27 +38,39 @@ impl PasteFix {
 /// The help for a diagnostic whose fix the engine can generate: the first
 /// of `candidates` whose edit `check` says compiles and clears the error,
 /// and otherwise (or when there is none) `plain`, one sentence naming what
-/// to change.
+/// to change. `after` follows the fix or the sentence: a sentence that
+/// opens with `. `, or nothing.
 ///
 /// Each candidate is a fix to print and the edit it stands for. `check`
 /// runs on the edits in order until one passes; it is where the edit is
 /// bound or typechecked in scratch state, and [`fix_resolves`] says what a
 /// tried edit has to show.
+///
+/// A one-line fix is quoted at the end of its lead, and `after` follows
+/// the closing quote. A fix of several lines is a block of its own below
+/// the lead, and `after` starts a new line below the block, so the block
+/// holds only what to paste and can be pasted as printed.
 pub(crate) fn offer_fix<E>(
     plain: impl Into<String>,
+    after: &str,
     candidates: impl IntoIterator<Item = (PasteFix, E)>,
     mut check: impl FnMut(&E) -> bool,
 ) -> String {
     for (fix, edit) in candidates {
         if check(&edit) {
-            return if fix.paste.contains('\n') {
-                format!("{}:\n{}", fix.lead, fix.paste)
-            } else {
-                format!("{}: `{}`", fix.lead, fix.paste)
-            };
+            if !fix.paste.contains('\n') {
+                return format!("{}: `{}`{after}", fix.lead, fix.paste);
+            }
+            let mut help = format!("{}:\n{}", fix.lead, fix.paste.trim_end_matches('\n'));
+            let sentence = after.trim_start_matches(['.', ' ']);
+            if !sentence.is_empty() {
+                help.push('\n');
+                help.push_str(sentence);
+            }
+            return help;
         }
     }
-    plain.into()
+    format!("{}{after}", plain.into())
 }
 
 /// Whether an edit, tried, resolves `target`: the tried compile no longer
@@ -101,16 +113,16 @@ mod tests {
                 )
             })
         };
-        let shown = offer_fix("bind the port", candidates(), |node| *node == "dep");
+        let shown = offer_fix("bind the port", "", candidates(), |node| *node == "dep");
         assert_eq!(shown, "add under `inputs:`: `opt: dep`");
         let mut tried = Vec::new();
-        let refused = offer_fix("bind the port", candidates(), |node| {
+        let refused = offer_fix("bind the port", "", candidates(), |node| {
             tried.push(*node);
             false
         });
         assert_eq!(refused, "bind the port");
         assert_eq!(tried, ["src", "dep"]);
-        let none = offer_fix("bind the port", Vec::<(PasteFix, ())>::new(), |_| {
+        let none = offer_fix("bind the port", "", Vec::<(PasteFix, ())>::new(), |_| {
             panic!("nothing to check")
         });
         assert_eq!(none, "bind the port");
@@ -120,10 +132,47 @@ mod tests {
     fn a_several_line_fix_is_printed_below_its_lead() {
         let shown = offer_fix(
             "plain",
+            "",
             [(PasteFix::new("add", "- type: transform\n  name: t"), ())],
             |_| true,
         );
         assert_eq!(shown, "add:\n- type: transform\n  name: t");
+    }
+
+    #[test]
+    fn what_follows_a_block_starts_a_new_line_and_follows_a_line_or_sentence() {
+        let after = ". A port admits the type it declares";
+        let block = offer_fix(
+            "plain",
+            after,
+            [(
+                PasteFix::new("add", "- type: transform\n  cxl: emit v = v.to_float()"),
+                (),
+            )],
+            |_| true,
+        );
+        assert_eq!(
+            block,
+            "add:\n- type: transform\n  cxl: emit v = v.to_float()\nA port admits the type it declares",
+            "the block's last line holds only what to paste"
+        );
+        let line = offer_fix(
+            "plain",
+            after,
+            [(PasteFix::new("write", "emit v = v.to_float()"), ())],
+            |_| true,
+        );
+        assert_eq!(
+            line,
+            "write: `emit v = v.to_float()`. A port admits the type it declares"
+        );
+        let sentence = offer_fix(
+            "convert `v`",
+            after,
+            [(PasteFix::new("write", "emit v = v.to_float()"), ())],
+            |_| false,
+        );
+        assert_eq!(sentence, "convert `v`. A port admits the type it declares");
     }
 
     #[test]

@@ -154,8 +154,8 @@ must be there, with the declared type, with the non-empty form of a
 `{ nullable: <type> }` declaration, or with any type for `any`. Otherwise the
 call fails with `E102`. Nothing is converted at the port, so a caller's `int`
 column does not fit a `float` port column, and a caller column with no declared
-type fits only `any`; the help prints the `schema:` line, or the Transform to
-add before the call, that fixes it.
+type fits only `any`; the help prints the `schema:` line, or the line to write
+in a Transform before the call that converts the column.
 
 A node inside the composition that uses a column its port does not declare
 fails compilation with `E169` at every call whose rows carry that column, and
