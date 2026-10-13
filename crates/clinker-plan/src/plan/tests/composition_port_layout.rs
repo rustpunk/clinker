@@ -4052,3 +4052,69 @@ fn a_nested_port_reading_a_node_outside_the_composition_is_told_what_to_bind() {
         )
     );
 }
+
+/// Compile `pipeline` against the identity composition and return its
+/// errors; a call whose input port reads a node downstream of itself is
+/// refused at compile time, not when it runs.
+fn refused_cycle(pipeline: &str) -> Vec<Diagnostic> {
+    let Err(diags) = compile_in(
+        pipeline,
+        &[("compositions/c.comp.yaml", &comp(IDENTITY_BODY))],
+    ) else {
+        panic!("a call whose input port reads its own downstream must not compile");
+    };
+    diags
+}
+
+#[test]
+fn a_port_reading_the_calls_own_sink_is_refused_at_compile_time() {
+    let pipeline = PIPELINE.replace("      inp: src\n", "      inp: out\n");
+    let diags = refused_cycle(&pipeline);
+    assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
+    assert_eq!(diags[0].code, "E102");
+    assert_eq!(
+        diags[0].message,
+        "composition node \"call\": input port \"inp\" binds to \"out\" which has no bound \
+         schema"
+    );
+}
+
+#[test]
+fn a_port_reading_a_transform_downstream_of_the_call_is_refused_at_compile_time() {
+    let pipeline = PIPELINE.replace("      inp: src\n", "      inp: down\n").replace(
+        "  - type: sink\n    name: out\n    input: call\n",
+        "  - type: transform\n    name: down\n    input: call\n    config:\n      cxl: |\n        \
+         emit x = 1\n  - type: sink\n    name: out\n    input: down\n",
+    );
+    let diags = refused_cycle(&pipeline);
+    assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
+    assert_eq!(diags[0].code, "E102");
+    assert_eq!(
+        diags[0].message,
+        "composition node \"call\": input port \"inp\" binds to \"down\" which has no bound \
+         schema"
+    );
+}
+
+#[test]
+fn two_calls_feeding_each_other_are_refused_at_compile_time() {
+    let pipeline = PIPELINE
+        .replace(
+            "    name: call\n    input: src\n    use: ../compositions/c.comp.yaml\n    inputs:\n      \
+             inp: src\n",
+            "    name: a\n    input: src\n    use: ../compositions/c.comp.yaml\n    inputs:\n      \
+             inp: b\n  - type: composition\n    name: b\n    input: src\n    use: \
+             ../compositions/c.comp.yaml\n    inputs:\n      inp: a\n",
+        )
+        .replace("    input: call\n", "    input: b\n");
+    let diags = refused_cycle(&pipeline);
+    assert!(
+        !diags.is_empty() && diags.iter().all(|d| d.code == "E102"),
+        "{:#?}",
+        describe(&diags)
+    );
+    assert_eq!(
+        diags[0].message,
+        "composition node \"a\": input port \"inp\" binds to \"b\" which has no bound schema"
+    );
+}
