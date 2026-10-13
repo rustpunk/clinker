@@ -624,7 +624,7 @@ pub(crate) fn diagnose_document_dlq_body_sinks(
             return Err(format!(
                 "`{file}` is used by {count} composition calls, so the moved Sink would be \
                  declared once per call, each writing the same output",
-                file = composition_file_label(&body.signature_path),
+                file = crate::plan::bind_schema::author_path(&body.signature_path),
             ));
         }
         let Some((port, &port_node)) = body.output_port_to_node_idx.first() else {
@@ -750,7 +750,7 @@ pub(crate) fn diagnose_document_dlq_body_sinks(
                 port_node,
                 pipeline_name,
             }) => {
-                let file = composition_file_label(&body.signature_path);
+                let file = crate::plan::bind_schema::author_path(&body.signature_path);
                 // The reference as authored; the port node is the same node.
                 let feeding = body
                     .node_input_refs
@@ -827,15 +827,6 @@ pub(crate) fn diagnose_document_dlq_body_sinks(
         );
     }
     out
-}
-
-/// A composition file as the help names it: its workspace-relative path with
-/// `/` between components, the form a `use:` line spells on every platform.
-fn composition_file_label(path: &std::path::Path) -> String {
-    path.components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 /// The `config:` lines of a pipeline Sink block: the body Sink's compiled
