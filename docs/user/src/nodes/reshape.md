@@ -146,7 +146,7 @@ synthesize:
 For each trigger row, `synthesize` emits one new row:
 
 - `copy_from: trigger` — the new row starts as a copy of the trigger row's values, then `overrides` are applied on top.
-- `copy_from: none` — the new row's columns start null; `overrides` must supply every column (enforced at compile time, so a synthesized row is never silently empty).
+- `copy_from: none` — the new row's columns start null; `overrides` must supply every column (enforced at compile time, so a synthesized row is never silently empty). Inside a composition, a column the caller's rows carry but the input port does not declare cannot be named, so it cannot be overridden: it stays empty on the synthesized row.
 
 Each `overrides:` entry is `field: <CXL expression>`, evaluated against the trigger row.
 

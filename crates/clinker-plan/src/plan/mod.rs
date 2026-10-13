@@ -9,6 +9,7 @@ pub mod envelope_synthesis;
 pub mod execution;
 pub mod explain_provenance;
 pub mod extraction;
+pub(crate) mod fix_offer;
 pub mod index;
 pub mod predicate_support;
 pub mod properties;

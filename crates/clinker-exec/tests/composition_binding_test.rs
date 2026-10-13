@@ -261,17 +261,15 @@ nodes:
 }
 
 /// Gate 3: Given upstream row with extra columns beyond port schema,
-/// a body Transform referencing those columns via CXL typechecks successfully.
+/// binding succeeds: the extra columns pass through the body.
 #[test]
-fn test_bind_composition_passthrough_column_available_in_body_cxl() {
+fn test_bind_composition_binds_with_upstream_columns_the_port_does_not_declare() {
     // customer_enrich has inputs.customers with schema {customer_id, name}.
-    // If upstream provides {customer_id, name, region}, then "region" is
-    // a pass-through via the Open tail. A body CXL expression referencing
-    // "region" should NOT produce an error (it's available via PassThrough).
-    //
-    // The customer_enrich body only uses `emit match_score = 0.95` and
-    // `emit enriched_flag = true`, which don't reference pass-through columns.
-    // But the key test is: binding succeeds with extra upstream columns.
+    // The upstream provides {customer_id, name, region}; "region" passes
+    // through the body in the caller's position. The body may not name it
+    // (that is E169); the customer_enrich body names no caller column
+    // (`emit match_score = 0.95`, `emit enriched_flag = true`), so binding
+    // succeeds with the extra upstream column.
     let yaml = r#"
 pipeline:
   name: passthrough_test

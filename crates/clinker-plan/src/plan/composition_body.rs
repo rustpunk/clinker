@@ -186,9 +186,11 @@ pub struct BoundBody {
     /// drives runtime record movement.
     pub output_port_to_node_idx: IndexMap<String, NodeIndex>,
 
-    /// Input row types at the body's declared input ports, with
-    /// `tail: Open(fresh_tail)` — the row variables bound here are
-    /// what carry pass-through columns through the body.
+    /// Each input port's vocabulary: the columns its `schema:` declares,
+    /// with their declared types, as `tail: Open(fresh_tail)`. Nothing binds
+    /// against these rows; the body binds against the row its call feeds
+    /// each port, where every other caller column passes through and cannot
+    /// be named (E169).
     pub input_port_rows: IndexMap<String, Row>,
 
     /// Nested composition bodies (composition-of-composition). Keyed

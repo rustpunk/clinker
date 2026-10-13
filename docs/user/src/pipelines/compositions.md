@@ -75,12 +75,111 @@ nodes:
 | Field | Required | Description |
 |-------|----------|-------------|
 | `_compose.name` | Yes | Composition identifier |
-| `_compose.inputs` | Yes | Named input ports and their minimum required schemas |
+| `_compose.inputs` | Yes | Named input ports and the columns the body may use; see [Input ports](#input-ports) |
 | `_compose.outputs` | Yes | Output port aliases pointing to body nodes or route ports |
 | `_compose.config_schema` | No | Typed configuration parameters, defaults, and constraints |
 | `_compose.scoped_vars` | No | Explicit scoped-variable names the sealed body may read from its caller |
 | `_compose.resources_schema` | No | Typed resource slots; see [Resource bindings](#resource-bindings) |
 | `nodes` | Yes | Unified node list for the sealed composition body |
+
+### Input ports
+
+A call behaves as if the composition's nodes were written in the pipeline at
+the call site. Each input port receives the caller's rows as they are: every
+column the caller has, in the caller's order. The port's `schema:` lists the
+columns the composition needs, and those are the only columns of the caller's
+rows its nodes may use. Every other column passes through the composition
+untouched and comes out in the same place, the way a Transform passes through
+the columns it does not `emit`.
+
+For the `risk_score` composition above, a call fed rows of `order_id`,
+`region`, `amount` gets back `order_id`, `region`, `amount`, `high_value`:
+`region` passes through even though the port does not declare it.
+
+A Sink with `include_unmapped: false` reading the call writes only the columns
+the node behind the composition's first output port emits, as it would after
+the same nodes written inline. Some shapes do not yet match the inline nodes:
+a call carries only the rows of its composition's first output port, so a
+composition whose output reads a Route, one with several output ports, and a
+Cull's `removed_to` rows do not reach the pipeline as they would inline
+([#1315](https://github.com/rustpunk/clinker/issues/1315)); and an Aggregate
+inside a composition fed by a source that declares a `correlation_key` stops
+with `E314` where the inline Aggregate runs.
+
+A port's types are what the composition's nodes are checked against; what a
+call outputs follows what the caller passed. Each node is checked with every
+column the port declares at its declared type, at every call, so a composition
+that passes the check compiles wherever its ports accept the caller's rows.
+The rows a call then carries out are the composition's nodes run on the
+caller's values: a column the composition does not write leaves the call with
+the type it arrived with, and a column it writes has the type its nodes give
+it from the caller's values, as the same nodes written in the pipeline would.
+A column declared `any` (or `{ nullable: any }`) is checked with the type the
+call provides, so a node that uses it in a way only some types support
+compiles at some calls and not at others; the type error names the
+composition and the port, because it depends on the call. Its help prints the
+node's line, or a Combine's `where:` entry, with the column converted to the
+type the node needs, such as `emit u = v.to_string().upper()`, which compiles
+whatever type a call provides as long as the values convert. The line is
+offered only for a type the provided values can convert to, and only once the
+node compiles with it; otherwise the help says to declare the type the node
+needs on the port. Columns the port does not declare keep the caller's types
+on the way through.
+
+A column declared `{ nullable: <type> }` says the composition copes with an
+empty value in that column. Its nodes are checked as if the value could be
+empty, so a node that cannot take an empty value, such as `filter qty > 6`
+or a Combine `where:` comparing `a.qty > 6`, fails with `E200` at every call,
+and the fix is to handle the empty case in the composition:
+`filter (qty ?? 0) > 6`, or `where: '(a.qty ?? 0) > 6'`. A call whose column is never empty
+keeps that guarantee through the call, so a later composition that needs a
+never-empty `qty` still accepts it. A call whose column can be empty gets
+results that can be empty, and a later composition that needs a never-empty
+value says so with `E102`.
+
+The same check applies to a composition called inside another composition.
+If the outer composition declares `qty` as `{ nullable: int }` and passes it
+unchanged to an inner composition whose port declares `qty` as `int`, the
+outer composition fails with `E102` at every call, even when every caller's
+`qty` is never empty: the outer composition is checked as if `qty` could be
+empty, and the inner one does not accept an empty `qty`. The error names the
+outer composition's port as the cause. Declare `qty` as never empty on that
+port, `- { name: qty, type: int }`, when the outer composition should only be
+called with a value; to keep accepting empty values, handle them before the
+inner call, or declare the inner port `{ nullable: int }` if the inner
+composition copes with an empty `qty`.
+
+Each call checks the caller's rows against the port: every declared column
+must be there, with the declared type, with the non-empty form of a
+`{ nullable: <type> }` declaration, or with any type for `any`. Otherwise the
+call fails with `E102`. Nothing is converted at the port, so a caller's `int`
+column does not fit a `float` port column, and a caller column with no declared
+type fits only `any`; the help prints the `schema:` line, or the line to write
+in a Transform before the call that converts the column.
+
+A node inside the composition that uses a column its port does not declare
+fails compilation with `E169` at every call whose rows carry that column, and
+the help prints the line to add under `_compose.inputs.<port>.schema` once the
+call compiles with it. A call
+whose rows do not carry the column fails with the ordinary unknown-name error,
+such as `E203`. A Reshape `set` or `overrides` entry counts as using the column
+it rewrites. A column the composition creates itself, with an `emit` or as an
+aggregate result, is its own, and later nodes may use it. When the composition
+writes a column with the same name as a caller column its port does not
+declare, the composition's value replaces the caller's and the compiler warns
+with `W101`. Nodes may be listed in any order; each is bound after the nodes it
+reads. A node that reads itself or sits on a cycle fails with `E107`, and one
+whose `input:` names neither a node nor an input port of the composition fails
+with `E004`. A node that reads an input port declared `required: false`, or
+an output port that is such an input port, needs every call to bind that port:
+a call that leaves it unbound fails with `E104`, and the help prints the
+`inputs:` entry to add. Only a port nothing in the composition reads may be
+left unbound. A help that prints YAML or a line of CXL to paste prints it only
+once the call or node it changes compiles with it; when no such fix works,
+the help says in one sentence what to change. That check does not cover the
+rest of the pipeline: another call of the same composition, or a node that
+reads a column or node the fix changes, can still fail once the fix is
+pasted, and the next compile reports it. Run `clinker explain --code E169` for details.
 
 ### Reading config parameters in the body
 
@@ -194,7 +293,9 @@ For compositions with multiple input ports, bind every declared port by name:
 
 The primary `input:` must be present for the current YAML node shape. The
 planner builds composition edges from the named `inputs:` map, so that map must
-contain every required port declared by `_compose.inputs`.
+contain every required port declared by `_compose.inputs`, and every port
+declared `required: false` that a node of the composition reads or an output
+port carries (`E104`).
 
 Downstream nodes consume a composition's declared output ports using the usual
 `node.port` syntax. If there is only one output port, the bare composition node
