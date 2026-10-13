@@ -2208,3 +2208,56 @@ fn a_conversion_to_paste_stands_alone_and_pasted_as_printed_runs_as_inline() {
         0,
     );
 }
+
+#[test]
+fn the_e169_line_pasted_under_the_port_s_schema_runs_as_inline() {
+    // `e169`: the body multiplies by `wt`, which `inp` does not declare. The
+    // help prints the one line to add and says where it goes; pasted under
+    // `inp`'s `schema:` as printed, the call runs as the inline nodes do.
+    let shape = Shape {
+        ports: &[("inp", &["{ name: v, type: int }"])],
+        bindings: FED_BY_SRC,
+        out: "t",
+        body: r#"  - type: transform
+    name: t
+    input: inp
+    config:
+      cxl: |
+        emit v = v * wt
+"#,
+        upstream: source("int"),
+        input: ORDERS,
+    };
+    let diags = refusals(&shape.call_files());
+    assert_eq!(diags.len(), 1, "{diags:#?}");
+    assert_eq!(diags[0].code, "E169", "{diags:#?}");
+    let help = diags[0].help.as_deref().unwrap_or_default();
+    assert_eq!(
+        help,
+        "declare `wt` under input port `inp`'s `schema:` in `compositions/c.comp.yaml`, so \
+         every call of the composition has to provide it: `- { name: wt, type: int }`"
+    );
+    let line = help
+        .rsplit_once(": `")
+        .and_then(|(_, line)| line.strip_suffix('`'))
+        .unwrap_or_else(|| panic!("the help quotes the line to paste last: {help}"));
+    let mut files = shape.call_files();
+    for (path, contents) in &mut files {
+        if path == "compositions/c.comp.yaml" {
+            *contents = contents.replacen(
+                "    inp:\n      schema:\n",
+                &format!("    inp:\n      schema:\n        {line}\n"),
+                1,
+            );
+        }
+    }
+    let pasted = outcome(&files);
+    let inline = outcome(&shape.inline_files());
+    assert_eq!(inline.exit(), Some(0), "{}", describe(&inline.run));
+    assert_eq!(pasted.exit(), Some(0), "{}", describe(&pasted.run));
+    assert_eq!(
+        pasted.out, inline.out,
+        "the pasted call writes what the inline nodes write"
+    );
+    assert_eq!(pasted.typing("t"), inline.typing("t"));
+}

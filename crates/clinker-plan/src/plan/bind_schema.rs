@@ -3876,14 +3876,10 @@ struct PortDeclaration {
 }
 
 impl PortDeclaration {
-    /// The `_compose:` block declaring the column, to paste into the
-    /// composition file.
-    fn block(port: &str, column: &str, ty: &Type) -> String {
-        format!(
-            "_compose:\n  inputs:\n    {port}:\n      schema:\n        - {{ name: {column}, \
-             type: {} }}",
-            port_column_type(ty)
-        )
+    /// The `schema:` line declaring the column, to paste under the input
+    /// port's `schema:` in the composition file.
+    fn line(column: &str, ty: &Type) -> String {
+        format!("- {{ name: {column}, type: {} }}", port_column_type(ty))
     }
 
     /// `signature` with the column declared.
@@ -3926,14 +3922,14 @@ fn port_declarations(
                 {
                     continue;
                 }
-                let block = PortDeclaration::block(port, column, ty);
+                let line = PortDeclaration::line(column, ty);
                 out.push(PortDeclaration {
                     code: "E169",
                     opening: e169_opening(call, column),
                     plain: e169_help(column, port, file),
                     after: String::new(),
-                    lead: e169_help(column, port, file),
-                    paste: block.clone(),
+                    lead: e169_lead(column, port, file),
+                    paste: line.clone(),
                     port: port.clone(),
                     column: column.to_string(),
                     ty: ty.clone(),
@@ -3943,8 +3939,8 @@ fn port_declarations(
                     opening: w101_opening(call, column),
                     plain: w101_help(column, port, file),
                     after: String::new(),
-                    lead: w101_help(column, port, file),
-                    paste: block,
+                    lead: w101_lead(column, port, file),
+                    paste: line,
                     port: port.clone(),
                     column: column.to_string(),
                     ty: ty.clone(),
@@ -7866,6 +7862,15 @@ fn e169_help(column: &str, port: &str, file: &str) -> String {
     )
 }
 
+/// What E169 says before the `schema:` line it prints for `column`, once
+/// the call compiles with it: where the line goes.
+fn e169_lead(column: &str, port: &str, file: &str) -> String {
+    format!(
+        "declare `{column}` under input port `{port}`'s `schema:` in `{file}`, so every call \
+         of the composition has to provide it"
+    )
+}
+
 /// The opening of an E169 for `column`, used by `call`.
 fn e169_opening(call: &str, column: &str) -> String {
     format!("composition {call:?} uses column `{column}` in node ")
@@ -7877,6 +7882,15 @@ fn w101_help(column: &str, port: &str, file: &str) -> String {
     format!(
         "declare `{column}` on input port `{port}` in `{file}` so replacing the caller's value \
          is part of the port's contract"
+    )
+}
+
+/// What W101 says before the `schema:` line it prints for `column`; see
+/// [`e169_lead`].
+fn w101_lead(column: &str, port: &str, file: &str) -> String {
+    format!(
+        "declare `{column}` under input port `{port}`'s `schema:` in `{file}` so replacing the \
+         caller's value is part of the port's contract"
     )
 }
 

@@ -311,20 +311,18 @@ fn assert_refused(
         );
     }
     let help = diag.help.as_deref().expect("E169 carries the fix");
-    let port_line = format!("{port}:");
-    for fragment in [
-        "c.comp.yaml",
-        "_compose:",
-        "inputs:",
-        port_line.as_str(),
-        "schema:",
-        declaration,
-    ] {
+    let under = format!("under input port `{port}`'s `schema:` in `compositions/c.comp.yaml`");
+    let pasted = format!(": `{declaration}`");
+    for fragment in [under.as_str(), pasted.as_str()] {
         assert!(
             help.contains(fragment),
             "the help carries {fragment:?}: {help}"
         );
     }
+    assert!(
+        help.ends_with(&pasted) && !help.contains('\n'),
+        "the help prints only the `schema:` line, last: {help}"
+    );
     assert!(
         !diag.message.contains('$') && !help.contains('$'),
         "no engine column in the diagnostic: {}\n{help}",
@@ -853,10 +851,9 @@ fn the_e169_fix_for_a_nullable_caller_column_compiles_when_pasted() {
     assert_eq!(diags.len(), 1, "{:#?}", describe(&diags));
     let help = diags[0].help.as_deref().expect("E169 carries the fix");
     let declaration = help
-        .lines()
-        .map(str::trim)
-        .find(|line| line.starts_with("- { name: w2"))
-        .unwrap_or_else(|| panic!("the fix declares `w2`: {help}"));
+        .rsplit_once(": `")
+        .and_then(|(_, line)| line.strip_suffix('`'))
+        .unwrap_or_else(|| panic!("the fix quotes the line declaring `w2` last: {help}"));
     assert_eq!(declaration, "- { name: w2, type: { nullable: int } }");
     let pasted = comp_declaring(
         &[
