@@ -4243,6 +4243,7 @@ fn bind_call(
             failed_nodes,
             body_file: &resolved_path,
             first_output_of: &first_output_of,
+            in_body: bind_ctx.depth > 0,
             span,
         },
         &mut artifacts.next_tail_var,
@@ -5797,6 +5798,9 @@ struct PortAdmission<'a> {
     body_file: &'a Path,
     /// The first output port of the composition a `use:` path names.
     first_output_of: &'a dyn Fn(&Path) -> Option<String>,
+    /// Whether the calling scope is a composition body rather than the
+    /// pipeline.
+    in_body: bool,
     span: Span,
 }
 
@@ -6063,15 +6067,21 @@ fn build_input_port_rows(
                     has_errors = true;
                 }
                 ColumnLookup::Ambiguous(_) => {
-                    diags.push(Diagnostic::error(
-                        "E102",
-                        format!(
-                            "composition {call:?}: input port `{port_name}` needs column \
-                             `{col_str}`, and {upstream_name:?} provides more than one column \
-                             of that name"
-                        ),
-                        LabeledSpan::primary(span, String::new()),
-                    ));
+                    diags.push(
+                        Diagnostic::error(
+                            "E102",
+                            format!(
+                                "composition {call:?}: input port `{port_name}` needs column \
+                                 `{col_str}`, and {upstream_name:?} provides more than one \
+                                 column of that name"
+                            ),
+                            LabeledSpan::primary(span, String::new()),
+                        )
+                        .with_help(format!(
+                            "make {upstream_name:?} provide only one column named `{col_str}`, \
+                             so input port `{port_name}` reads one value"
+                        )),
+                    );
                     has_errors = true;
                 }
             }
@@ -6318,7 +6328,11 @@ fn unbound_port_upstream(
     upstream: &str,
 ) -> (Diagnostic, Option<ScopeFix>) {
     let &PortAdmission {
-        call, scope, span, ..
+        call,
+        scope,
+        in_body,
+        span,
+        ..
     } = admission;
     let node_of = |name: &str| {
         scope
@@ -6437,17 +6451,28 @@ fn unbound_port_upstream(
                 None => (diag.with_help(plain), None),
             }
         }
-        _ => (
-            Diagnostic::error(
-                "E102",
-                format!(
-                    "composition {call:?}: input port `{port}` reads {upstream:?}, which is not a \
-                     node this pipeline binds"
-                ),
-                LabeledSpan::primary(span, String::new()),
-            ),
-            None,
-        ),
+        _ => {
+            let (scope_word, readable) = if in_body {
+                ("composition", "a node or input port")
+            } else {
+                ("pipeline", "a node")
+            };
+            (
+                Diagnostic::error(
+                    "E102",
+                    format!(
+                        "composition {call:?}: input port `{port}` reads {upstream:?}, which is \
+                         not a node this {scope_word} binds"
+                    ),
+                    LabeledSpan::primary(span, String::new()),
+                )
+                .with_help(format!(
+                    "under `inputs:`, bind input port `{port}` to {readable} of this \
+                     {scope_word} in place of {upstream:?}"
+                )),
+                None,
+            )
+        }
     }
 }
 
@@ -12008,6 +12033,7 @@ nodes:
                     failed_nodes,
                     body_file: Path::new("compositions/c.comp.yaml"),
                     first_output_of: &|_| None,
+                    in_body: false,
                     span: Span::SYNTHETIC,
                 },
                 &mut next_tail_var,
@@ -12028,6 +12054,65 @@ nodes:
         let mut diags_after_failure = vec![diags[0].clone()];
         assert!(admission(&failed, &mut diags_after_failure).is_none());
         assert_eq!(diags_after_failure.len(), 1, "{diags_after_failure:#?}");
+    }
+
+    /// A port column the upstream row holds more than once is refused with
+    /// one sentence saying what to change.
+    #[test]
+    fn a_port_column_the_upstream_holds_twice_is_told_what_to_change() {
+        let config = crate::config::parse_config(
+            "pipeline:\n  name: p\nnodes:\n  - type: transform\n    name: up\n    input: src\n    \
+             config:\n      cxl: |\n        emit a = 1\n",
+        )
+        .expect("parse");
+        let body = CompositionFile::parse(
+            "_compose:\n  name: c\n  inputs:\n    inp:\n      schema:\n        - { name: a, type: \
+             int }\n  outputs:\n    out: last\n  config_schema: {}\nnodes:\n  - type: transform\n    \
+             name: last\n    input: inp\n    config:\n      cxl: |\n        emit b = a\n",
+            FileId::new(NonZeroU32::new(1).expect("non-zero")),
+            PathBuf::from("compositions/c.comp.yaml"),
+        )
+        .expect("parse body");
+        let call_inputs: IndexMap<String, String> = [("inp".to_string(), "up".to_string())]
+            .into_iter()
+            .collect();
+        let twice = Row::closed(
+            IndexMap::from([
+                (QualifiedField::qualified("l", "a"), Type::Int),
+                (QualifiedField::qualified("r", "a"), Type::Int),
+            ]),
+            cxl::lexer::Span::new(0, 0),
+        );
+        let parent_schemas: HashMap<String, Row> =
+            [("up".to_string(), twice)].into_iter().collect();
+        let mut diags = Vec::new();
+        let admitted = build_input_port_rows(
+            &PortAdmission {
+                call: "call",
+                call_inputs: &call_inputs,
+                signature: &body.signature,
+                parent_schemas: &parent_schemas,
+                source_nodes: &HashSet::new(),
+                scope: &config.nodes,
+                failed_nodes: &HashSet::new(),
+                body_file: Path::new("compositions/c.comp.yaml"),
+                first_output_of: &|_| None,
+                in_body: false,
+                span: Span::SYNTHETIC,
+            },
+            &mut 0,
+            &mut diags,
+            &mut Vec::new(),
+        );
+        assert!(admitted.is_none());
+        assert_eq!(diags.len(), 1, "{diags:#?}");
+        assert_eq!(diags[0].code, "E102");
+        assert_eq!(
+            diags[0].help.as_deref(),
+            Some(
+                "make \"up\" provide only one column named `a`, so input port `inp` reads one value"
+            )
+        );
     }
 
     #[test]
