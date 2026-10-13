@@ -4025,7 +4025,7 @@ fn offer_port_declarations(
     else {
         return;
     };
-    let file = resolved_path.display().to_string();
+    let file = author_path(&resolved_path);
     for declaration in port_declarations(params, signature, &file, rows) {
         let raised = format!("{}{}", declaration.plain, declaration.after);
         let matching: Vec<usize> = (from..diags.len())
@@ -4146,7 +4146,7 @@ fn bind_call(
                 format!(
                     "composition node {node_name:?}: `use: {}` does not match any \
                      .comp.yaml in the workspace",
-                    use_path.display()
+                    author_path(use_path)
                 ),
                 LabeledSpan::primary(span, String::new()),
             ));
@@ -4159,8 +4159,8 @@ fn bind_call(
         let cycle: Vec<String> = bind_ctx
             .use_path_stack
             .iter()
-            .map(|p| p.display().to_string())
-            .chain(std::iter::once(resolved_path.display().to_string()))
+            .map(|p| author_path(p))
+            .chain(std::iter::once(author_path(&resolved_path)))
             .collect();
         diags.push(Diagnostic::error(
             "E107",
@@ -4324,7 +4324,7 @@ fn bind_call(
                         "[E230] composition node {node_name:?}: body file {}: channel source \
                          patch targets unknown source {inner_source:?}: no source node by that \
                          name in the composition body",
-                        resolved_path.display()
+                        author_path(&resolved_path)
                     ),
                     LabeledSpan::primary(span, String::new()),
                 ));
@@ -4342,7 +4342,7 @@ fn bind_call(
                     code,
                     format!(
                         "[{code}] composition node {node_name:?}: body file {}: {detail}",
-                        resolved_path.display()
+                        author_path(&resolved_path)
                     ),
                     LabeledSpan::primary(span, String::new()),
                 ));
@@ -4385,7 +4385,7 @@ fn bind_call(
                     "E115",
                     format!(
                         "composition node {node_name:?}: body file {}: {}",
-                        resolved_path.display(),
+                        author_path(&resolved_path),
                         violation.message
                     ),
                     LabeledSpan::primary(
@@ -4420,7 +4420,7 @@ fn bind_call(
                         "E115",
                         format!(
                             "composition node {node_name:?}: body file {}: {raw}",
-                            resolved_path.display()
+                            author_path(&resolved_path)
                         ),
                         LabeledSpan::primary(node_span, String::new()),
                     ));
@@ -4513,7 +4513,7 @@ fn bind_call(
                         format!(
                             "composition node {node_name:?}: body file {}: {node_label} declares \
                              an external schema file {rel:?} that failed to load: {e}",
-                            resolved_path.display()
+                            author_path(&resolved_path)
                         ),
                         LabeledSpan::primary(span_for_node(spanned), String::new()),
                     ));
@@ -4560,7 +4560,7 @@ fn bind_call(
                     fault.code,
                     format!(
                         "composition node {node_name:?}: body file {}: {}",
-                        resolved_path.display(),
+                        author_path(&resolved_path),
                         fault.message
                     ),
                     LabeledSpan::primary(
@@ -4579,7 +4579,7 @@ fn bind_call(
                     fault.code,
                     format!(
                         "composition node {node_name:?}: body file {}: {}",
-                        resolved_path.display(),
+                        author_path(&resolved_path),
                         fault.message
                     ),
                     LabeledSpan::primary(
@@ -4730,7 +4730,7 @@ fn bind_call(
     // checked against the declared ones (see `bind_body`).
     let mut body_schema_by_name: HashMap<String, Row> = HashMap::new();
     let mut body_declared_multiple_by_name: HashMap<String, BTreeSet<String>> = HashMap::new();
-    let body_file_label: Arc<str> = Arc::from(resolved_path.display().to_string().as_str());
+    let body_file_label: Arc<str> = Arc::from(author_path(&resolved_path).as_str());
     let mut port_seeds: IndexMap<String, Row> = IndexMap::new();
     let mut contract_seeds: IndexMap<String, Row> = IndexMap::new();
     for port_name in input_port_rows.keys() {
@@ -4788,7 +4788,7 @@ fn bind_call(
                     format!(
                         "composition node {node_name:?}: body file {} declares \
                          duplicate node name: {n_name:?}",
-                        resolved_path.display()
+                        author_path(&resolved_path)
                     ),
                     LabeledSpan::primary(span_for_node(spanned), String::new()),
                 ));
@@ -4934,11 +4934,7 @@ fn bind_call(
                     ),
                     LabeledSpan::primary(writer_span, writer_label),
                 )
-                .with_help(w101_help(
-                    column,
-                    input,
-                    &resolved_path.display().to_string(),
-                )),
+                .with_help(w101_help(column, input, &author_path(&resolved_path))),
             );
         }
     }
@@ -4967,7 +4963,7 @@ fn bind_call(
             "E111",
             format!(
                 "composition node {node_name:?}: body file {} has zero nodes",
-                resolved_path.display()
+                author_path(&resolved_path)
             ),
             LabeledSpan::primary(span, String::new()),
         ));
@@ -5396,7 +5392,7 @@ fn compile_body_source_requirements(
                     "E103",
                     format!(
                         "composition node {call_name:?}: body file {}: source {source_name:?} declares no resource slot; authored body Sources cannot use an inert direct file target",
-                        body_path.display()
+                        author_path(body_path)
                     ),
                     LabeledSpan::primary(node_span, "missing body Source resource slot"),
                 )
@@ -5429,7 +5425,7 @@ fn compile_body_source_requirements(
                     "E103",
                     format!(
                         "composition node {call_name:?}: body file {}: source {source_name:?} declares `resource: {slot}` together with direct matcher(s) {}; a resource-backed Source has exactly one external target",
-                        body_path.display(),
+                        author_path(body_path),
                         matchers.join(", ")
                     ),
                     LabeledSpan::primary(resource_span, "resource conflicts with direct matcher"),
@@ -5447,7 +5443,7 @@ fn compile_body_source_requirements(
                     "E103",
                     format!(
                         "composition node {call_name:?}: body file {}: source {source_name:?} binds file resource slot {slot:?} but declares `{}` transport",
-                        body_path.display(),
+                        author_path(body_path),
                         config.source.transport.transport_name()
                     ),
                     LabeledSpan::primary(resource_span, "file resource requires file transport"),
@@ -5463,7 +5459,7 @@ fn compile_body_source_requirements(
                     "E103",
                     format!(
                         "composition node {call_name:?}: body file {}: source {source_name:?} names resource slot {slot:?}, but `_compose.resources_schema` does not declare it",
-                        body_path.display()
+                        author_path(body_path)
                     ),
                     LabeledSpan::primary(resource_span, "undeclared body Source resource slot"),
                 )
@@ -6147,7 +6143,7 @@ fn unbound_port_read(at: &UnboundPortRead<'_>) -> Diagnostic {
         body_file,
         span,
     } = at;
-    let file = body_file.display();
+    let file = author_path(body_file);
     let message = match reader {
         UnboundPortReader::Node(node) => format!(
             "composition {call:?}: node {node:?} in `{file}` reads input port `{port}`, which \
@@ -6605,7 +6601,7 @@ fn port_type_refusal(
                 upstream,
                 column,
                 port,
-                &body_file.display().to_string(),
+                &author_path(body_file),
             )),
             None,
         ),
@@ -6763,7 +6759,7 @@ fn read_and_parse_body(
                 "E103",
                 format!(
                     "composition node {node_name:?}: failed to read body from {}: {e}",
-                    source_path.display()
+                    author_path(source_path)
                 ),
                 LabeledSpan::primary(span, String::new()),
             ));
@@ -6777,7 +6773,7 @@ fn read_and_parse_body(
             "E103",
             format!(
                 "composition node {node_name:?}: body {} changed after module-closure discovery; retry compilation against a stable workspace snapshot",
-                source_path.display()
+                author_path(source_path)
             ),
             LabeledSpan::primary(span, String::new()),
         ));
@@ -6790,7 +6786,7 @@ fn read_and_parse_body(
                 "E101",
                 format!(
                     "composition node {node_name:?}: body parse failed for {}: body is not UTF-8: {e}",
-                    source_path.display()
+                    author_path(source_path)
                 ),
                 LabeledSpan::primary(span, String::new()),
             ));
@@ -6805,7 +6801,7 @@ fn read_and_parse_body(
                 "E101",
                 format!(
                     "composition node {node_name:?}: body parse failed for {}: {e}",
-                    source_path.display()
+                    author_path(source_path)
                 ),
                 LabeledSpan::primary(span, String::new()),
             ));
@@ -8361,6 +8357,30 @@ fn port_column_type(ty: &Type) -> String {
 }
 
 // ─── Use-path resolution ────────────────────────────────────────────
+
+/// Spell a composition file path the way pipeline YAML spells `use:`,
+/// for a diagnostic message or help text: components joined by `/` on
+/// every operating system, so a fix printed on Windows reads the same
+/// as on Linux and can be pasted back into YAML as written. A `\` inside
+/// a component is read as a separator too: a path built from a Windows
+/// spelling prints the same on every OS.
+pub(crate) fn author_path(path: &Path) -> String {
+    use std::path::Component;
+    let mut out = String::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => out.push_str(&prefix.as_os_str().to_string_lossy()),
+            Component::RootDir => out.push('/'),
+            other => {
+                if !out.is_empty() && !out.ends_with('/') {
+                    out.push('/');
+                }
+                out.push_str(&other.as_os_str().to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    out
+}
 
 /// Resolve a `use:` path to a symbol table key.
 ///
@@ -11643,6 +11663,25 @@ fn combine_e309(combine_name: &str, span: Span) -> Diagnostic {
 mod tests {
     use super::*;
     use clinker_record::FieldMetadata;
+
+    /// A composition file path joined with the Windows separator is printed
+    /// with `/`, the way the pipeline YAML spells `use:`, so a fix printed on
+    /// Windows names the file as the author wrote it.
+    #[test]
+    fn a_composition_path_is_printed_with_forward_slashes_on_every_os() {
+        let windows = PathBuf::from(format!("compositions{}c.comp.yaml", '\\'));
+        assert_eq!(author_path(&windows), "compositions/c.comp.yaml");
+        let native = Path::new("compositions").join("c.comp.yaml");
+        assert_eq!(author_path(&native), "compositions/c.comp.yaml");
+        assert_eq!(
+            author_path(Path::new("./inner.comp.yaml")),
+            "./inner.comp.yaml"
+        );
+        assert_eq!(
+            author_path(Path::new("../compositions/c.comp.yaml")),
+            "../compositions/c.comp.yaml"
+        );
+    }
 
     /// Only the engine's own prelude is discounted from a gate's statement
     /// count.
