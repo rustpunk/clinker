@@ -2113,11 +2113,41 @@ fn a_call_reading_a_node_whose_upstream_failed_reports_what_the_inline_nodes_rep
     assert_eq!(called.codes(), ["E200"]);
 }
 
+/// The CXL line an E102 for a column of another type says to write in a
+/// Transform before the call. The help is one line: the line to paste is
+/// quoted at the end of the lead and stands alone, with the admission rule
+/// after the closing quote.
+fn conversion_line(diags: &[Diagnostic]) -> &str {
+    assert_eq!(diags.len(), 1, "{diags:#?}");
+    assert_eq!(diags[0].code, "E102", "{diags:#?}");
+    let help = diags[0].help.as_deref().unwrap_or_default();
+    assert!(!help.contains('\n'), "the help is one line: {help}");
+    let (fix, _) = help
+        .split_once(". A port admits")
+        .unwrap_or_else(|| panic!("the admission rule follows the fix: {help}"));
+    let (lead, line) = fix
+        .rsplit_once(": `")
+        .and_then(|(lead, rest)| Some((lead, rest.strip_suffix('`')?)))
+        .unwrap_or_else(|| panic!("the help quotes the line to paste last: {help}"));
+    assert_eq!(
+        lead, "convert the column in a Transform before the call",
+        "{help}"
+    );
+    line
+}
+
+/// A Transform `name` reading `input` and running the one CXL line `line`.
+fn transform_node(name: &str, input: &str, line: &str) -> String {
+    format!(
+        "  - type: transform\n    name: {name}\n    input: {input}\n    config:\n      cxl: |\n        {line}\n"
+    )
+}
+
 #[test]
-fn a_column_of_another_type_gets_a_converting_transform_that_runs_as_inline() {
-    // `src` reads `v` as text; the port needs an `int`. The help prints a
-    // Transform converting it, to feed the port from.
-    let pre = "  - type: transform\n    name: pre\n    input: src\n    config:\n      cxl: |\n        emit v = v\n";
+fn a_column_of_another_type_gets_a_conversion_line_that_runs_as_inline() {
+    // `src` reads `v` as text; the port needs an `int`. The help prints the
+    // line converting it, for a Transform before the call.
+    let pre = transform_node("pre", "src", "emit v = v");
     let shape = Shape {
         ports: &[("inp", &["{ name: v, type: int }"])],
         bindings: &[("inp", "pre")],
@@ -2133,19 +2163,46 @@ fn a_column_of_another_type_gets_a_converting_transform_that_runs_as_inline() {
         input: ORDERS,
     };
     let diags = refusals(&shape.call_files());
-    assert_eq!(diags.len(), 1, "{diags:#?}");
-    assert_eq!(diags[0].code, "E102", "{diags:#?}");
-    let help = diags[0].help.as_deref().unwrap_or_default();
-    let yaml = help
-        .split_once(":\n")
-        .and_then(|(_, rest)| rest.split(". A port admits").next())
-        .unwrap_or_else(|| panic!("the help prints a Transform: {help}"));
-    assert!(yaml.contains("emit v = v.to_int()"), "{help}");
-    let indented: String = yaml.lines().map(|line| format!("  {line}\n")).collect();
+    let line = conversion_line(&diags);
+    assert_eq!(line, "emit v = v.to_int()");
+    let converter = transform_node("conv", "pre", line);
     assert_inline_equivalent(
         &Shape {
-            bindings: &[("inp", "pre_v")],
-            upstream: format!("{}{pre}{indented}", source("string")),
+            bindings: &[("inp", "conv")],
+            upstream: format!("{}{pre}{converter}", source("string")),
+            ..shape
+        },
+        0,
+    );
+}
+
+#[test]
+fn a_conversion_to_paste_stands_alone_and_pasted_as_printed_runs_as_inline() {
+    // `v` is an `int` at the Source and a `float` at the port. The line to
+    // paste is the CXL line and nothing else: the admission rule that
+    // follows it is not part of it, so pasted as printed it parses.
+    let shape = Shape {
+        ports: &[("inp", &["{ name: v, type: float }"])],
+        bindings: &[("inp", "src")],
+        out: "t",
+        body: r#"  - type: transform
+    name: t
+    input: inp
+    config:
+      cxl: |
+        emit v = (v * 2.0).to_int()
+"#,
+        upstream: source("int"),
+        input: ORDERS,
+    };
+    let diags = refusals(&shape.call_files());
+    let line = conversion_line(&diags);
+    assert_eq!(line, "emit v = v.to_float()");
+    let converter = transform_node("conv", "src", line);
+    assert_inline_equivalent(
+        &Shape {
+            bindings: &[("inp", "conv")],
+            upstream: format!("{}{converter}", source("int")),
             ..shape
         },
         0,

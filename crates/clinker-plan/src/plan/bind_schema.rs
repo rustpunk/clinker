@@ -4052,6 +4052,7 @@ fn offer_port_declarations(
         } = &declaration;
         let help = crate::plan::fix_offer::offer_fix(
             plain.clone(),
+            after,
             [(
                 crate::plan::fix_offer::PasteFix::new(lead.clone(), paste.clone()),
                 &declaration,
@@ -4074,7 +4075,7 @@ fn offer_port_declarations(
             },
         );
         for i in matching {
-            diags[i].help = Some(format!("{help}{after}"));
+            diags[i].help = Some(help.clone());
         }
     }
 }
@@ -5913,6 +5914,7 @@ fn check_scope_fix(
     } = fix;
     let help = crate::plan::fix_offer::offer_fix(
         plain,
+        &after,
         [(crate::plan::fix_offer::PasteFix::new(lead, paste), edits)],
         |edits| {
             let tried = trial_scope(
@@ -5929,7 +5931,7 @@ fn check_scope_fix(
             crate::plan::fix_offer::fix_resolves(&diags[diag], diags, &tried)
         },
     );
-    diags[diag].help = Some(format!("{help}{after}"));
+    diags[diag].help = Some(help);
 }
 
 /// Push `diag` with the plain help of `fix`, and keep `fix` to check.
@@ -6253,12 +6255,12 @@ fn offer_port_bindings(
             continue;
         };
         let help = match chosen.get(port.as_str()) {
-            Some(decided) => crate::plan::fix_offer::offer_fix(plain, offered, |upstream| {
+            Some(decided) => crate::plan::fix_offer::offer_fix(plain, "", offered, |upstream| {
                 decided.as_ref() == Some(upstream)
             }),
             None => {
                 let mut passed = None;
-                let help = crate::plan::fix_offer::offer_fix(plain, offered, |upstream| {
+                let help = crate::plan::fix_offer::offer_fix(plain, "", offered, |upstream| {
                     let Some(edited) = feeders.binding(port, upstream) else {
                         return false;
                     };
@@ -6577,24 +6579,19 @@ fn port_type_refusal(
                 "convert `{column}` to `{declared_spelling}` in a node before the call, and feed \
                  input port `{port}` from it"
             );
+            // The help prints the one CXL line; the trial adds it as a
+            // Transform between the upstream and the call.
+            let conversion = format!("emit {column} = {column}.{method}()");
             let converter = format!("{upstream}_{column}");
-            let (yaml, parsed) = relay_transform(
-                &converter,
-                upstream,
-                &format!("emit {column} = {column}.{method}()"),
-            );
+            let (_, parsed) = relay_transform(&converter, upstream, &conversion);
             let fix = parsed.and_then(|converter_node| {
                 let call_node = admission.call_rebound(&[(port, &converter)], Some(upstream))?;
                 Some(ScopeFix {
                     diag: 0,
                     plain: plain.clone(),
                     after: after.clone(),
-                    lead: format!(
-                        "convert the column in a Transform before the call: write `{converter}` \
-                         for `{upstream}` in the call's `input:` and as `{port}: {converter}` \
-                         under `inputs:`, and add the Transform"
-                    ),
-                    paste: yaml,
+                    lead: "convert the column in a Transform before the call".to_string(),
+                    paste: conversion,
                     edits: vec![converter_node, call_node],
                 })
             });
@@ -7224,7 +7221,7 @@ fn check_body_input_fix(
                 edited,
             ))
         });
-    let help = crate::plan::fix_offer::offer_fix(plain, offered, |edited| {
+    let help = crate::plan::fix_offer::offer_fix(plain, "", offered, |edited| {
         let tried = trial_scope(
             &ScopeTrial {
                 scope: nodes,
@@ -9480,6 +9477,7 @@ fn possibly_empty_type_error(
     });
     let fix = crate::plan::fix_offer::offer_fix(
         format!("give node {node:?} in `{body_file}` a value to use when `{name}` is empty"),
+        "",
         rewrite.map(|rewrite| {
             (
                 crate::plan::fix_offer::PasteFix::new(
@@ -9605,6 +9603,7 @@ fn caller_typed_type_error(
             "declare on input port `{port}` in `{body_file}` the type node {node:?} needs for \
              `{name}`, in place of `any`, so every call has to provide that type"
         ),
+        "",
         candidates,
         |program| failed.compiles(program),
     );
