@@ -11896,9 +11896,8 @@ nodes:
         );
     }
 
-    /// A row a nested call returns into its enclosing body whose carried
-    /// column names a port no row fed is an internal error, not a column
-    /// silently left without its mark.
+    /// The key a passed contract check is recorded under tells an open seed
+    /// row from a closed one with the same columns.
     #[test]
     fn a_contract_check_key_tells_an_open_seed_row_from_a_closed_one() {
         // An open row resolves a name it does not declare to a pass-through
@@ -11926,6 +11925,9 @@ nodes:
         assert_eq!(SeedRow::of_row(&closed), SeedRow::of_row(&closed.clone()));
     }
 
+    /// A row a nested call returns into its enclosing body whose carried
+    /// column names a port no row fed is an internal error, not a column
+    /// silently left without its mark.
     #[test]
     fn a_carried_column_whose_port_was_not_fed_is_an_internal_error() {
         let origin = Arc::new(PortOrigin {

@@ -803,9 +803,6 @@ impl PlanNode {
         }
     }
 
-    /// The stored `SharedStorage<Schema>` for this node. For variants whose output
-    /// row shape matches the upstream (Route/Output/Sort), callers must
-    /// resolve via the graph (see [`PlanNode::output_schema_in`]).
     /// Names of CXL-emitted columns this node produces, for downstream
     /// `include_unmapped: false` projection at the Output boundary.
     ///
@@ -814,9 +811,13 @@ impl PlanNode {
     /// - Transform: `write_set` — just the `emit` LHS names, excluding
     ///   upstream passthroughs that the planner widened into the output
     ///   schema.
-    /// - Aggregation / Combine / Composition / Merge: `output_schema`
-    ///   columns — these variants don't widen; their schema IS the set
-    ///   of explicitly produced columns.
+    /// - Aggregation / Combine / Merge: `output_schema` columns — these
+    ///   variants don't widen; their schema IS the set of explicitly
+    ///   produced columns.
+    /// - Composition: what the body node behind the call's first output
+    ///   port emits ([`CallEmits`]); when that node passes an input port
+    ///   through, what the node feeding that port emits; its whole
+    ///   `output_schema` when the body could not be read.
     /// - Route / Sort / Output: walk to the immediate upstream and
     ///   inherit its emit names (these variants don't add their own).
     ///
@@ -829,6 +830,9 @@ impl PlanNode {
         }
     }
 
+    /// The stored `SharedStorage<Schema>` for this node. For variants whose output
+    /// row shape matches the upstream (Route/Output/Sort), callers must
+    /// resolve via the graph (see [`PlanNode::output_schema_in`]).
     pub fn stored_output_schema(&self) -> Option<&SharedStorage<Schema>> {
         match self {
             PlanNode::Source { output_schema, .. }
