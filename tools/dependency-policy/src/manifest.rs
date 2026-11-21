@@ -112,9 +112,9 @@ const LINEAGE_METADATA_DEPENDENCIES: [ExpectedMetadataDependency; 7] = [
 /// approved, never to make a red gate green. The values are whatever
 /// [`check_lock_membership`] computes for the approved `Cargo.lock`, which is
 /// what its own failure reports as `found`.
-const LOCK_PACKAGE_COUNT: usize = 317;
+const LOCK_PACKAGE_COUNT: usize = 318;
 pub const LOCK_PACKAGE_DIGEST: &str =
-    "1e3a583bb0986619ec38d92190a758d646017829382fcefc4e47ce1a98760f72";
+    "5e1d03c444012e1d53688f0ebdcd9004f779a0912db04ce4a10b192eaeb1c1c1";
 
 #[derive(Clone, Copy)]
 struct ExpectedMetadataDependency {

@@ -46,7 +46,15 @@ toml = "0.8"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["arbitrary_precision", "preserve_order"] }
 serde-saphyr = { version = "=0.0.23", features = ["miette"] }
-chrono = { version = "0.4", features = ["serde"] }
+# Maintained date/time implementation replacing the unmaintained chrono package
+# (RUSTSEC-2026-0543), approved on 2026-11-20. The Cargo import name stays
+# `chrono`; every workspace edge resolves to sad-chrono, with no old package or
+# in-repo shim. It preserves the full -262143..=262142 calendar range, strftime
+# syntax, clock behavior and serde/spill representation.
+# This fork was created on 2026-11-18, so pin the reviewed release exactly and
+# review future updates explicitly. MSRV 1.85 fits our 1.91 toolchain; the crate
+# has no build script. Preserve the existing clock/wasm defaults and serde.
+chrono = { package = "sad-chrono", version = "=0.5.1", features = ["serde"] }
 miette = { version = "7", features = ["fancy"] }
 clap = { version = "4", features = ["derive"] }
 regex = "1"

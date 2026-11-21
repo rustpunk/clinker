@@ -6,7 +6,9 @@ license = "MIT"
 publish = false
 
 [dependencies]
-chrono = { version = "=0.4.44", default-features = false, features = ["std"] }
+# Same reviewed replacement as the workspace, retaining this independent
+# tool's std-only feature set and lockfile. `chrono` is the Cargo import name.
+chrono = { package = "sad-chrono", version = "=0.5.1", default-features = false, features = ["std"] }
 clap = { version = "=4.6.0", features = ["derive"] }
 nix = { version = "=0.31.2", features = ["fs", "process", "resource", "signal"] }
 regex = "=1.12.3"
