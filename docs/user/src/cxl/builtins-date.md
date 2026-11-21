@@ -194,7 +194,7 @@ Returns the difference in years between two dates.
 
 ### format_date(format: String) -> String
 
-Formats the date/datetime using a `chrono` format string. See [chrono format syntax](https://docs.rs/chrono/latest/chrono/format/strftime/index.html).
+Formats the date/datetime using a strftime format string. See the [supported format syntax](https://docs.rs/sad-chrono/0.5.1/sad_chrono/format/strftime/index.html). Existing format strings are unchanged.
 
 Common format specifiers:
 

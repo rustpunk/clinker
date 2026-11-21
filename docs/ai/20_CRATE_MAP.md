@@ -6,6 +6,13 @@ Purpose: Give future AI agents a factual map of the current Cargo workspace, wit
 
 ## Workspace Overview
 
+The `chrono` dependency/import name in this map and the crate manifests resolves
+to the exact `sad-chrono` pin in the root manifest. The original unmaintained
+`chrono` package is absent from the resolved graph. The detached release-policy
+tool uses the same replacement with its own lockfile and std-only features.
+Date ranges, strftime syntax, clock behavior, and spill encodings are retained;
+`crates/clinker-record/tests/datetime_contract.rs` pins the pre-migration wire bytes.
+
 The root workspace has 15 members: `clinker-record`, `cxl`, `cxl-cli`, `clinker-format`, `clinker-core-types`, `clinker-plan`, `clinker-exec`, `clinker-net`, `clinker-channel`, `clinker`, `clinker-schema`, `clinker-lineage`, `clinker-bench-support`, `clinker-benchmarks`, and `clinker-scenarios` (`Cargo.toml`). A separate non-member Cargo package named `clinker` (a crates.io name-reservation placeholder, directory `reserve/`) is maintained outside the tracked tree — it is untracked, absent from fresh clones, and nothing in the workspace depends on it.
 
 No Cargo `examples` targets were found. The repository does contain YAML pipeline examples and fixtures under `examples/pipelines/`, the executed scenario corpus under `examples/scenarios/`, plus benchmark pipeline configs under `benches/pipelines/`.

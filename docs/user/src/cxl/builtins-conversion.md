@@ -138,7 +138,7 @@ $ cxl eval -e 'emit result = 0.to_bool()'
 
 ### to_date([format: String]) -> Date
 
-Parses a string to a Date. Without a format argument, expects ISO 8601 (`YYYY-MM-DD`). With a format, uses chrono strftime syntax.
+Parses a string to a Date. Without a format argument, expects ISO 8601 (`YYYY-MM-DD`). With a format, uses [strftime syntax](https://docs.rs/sad-chrono/0.5.1/sad_chrono/format/strftime/index.html).
 
 ```bash
 $ cxl eval -e 'emit result = "2024-03-15".to_date()'
@@ -162,7 +162,7 @@ $ cxl eval -e 'emit result = "15/03/2024".to_date("%d/%m/%Y")'
 
 ### to_datetime([format: String]) -> DateTime
 
-Parses a string to a DateTime. Without a format argument, expects ISO 8601 (`YYYY-MM-DDTHH:MM:SS`). With a format, uses chrono strftime syntax.
+Parses a string to a DateTime. Without a format argument, expects ISO 8601 (`YYYY-MM-DDTHH:MM:SS`). With a format, uses [strftime syntax](https://docs.rs/sad-chrono/0.5.1/sad_chrono/format/strftime/index.html).
 
 ```bash
 $ cxl eval -e 'emit result = "2024-03-15T14:30:00".to_datetime()'
