@@ -238,9 +238,9 @@ diagnostic_registry! {
     "E011", Error, "Log directive sanity (`every` must be valid)";
     // ── Composition binding and the channel/group overlay ───────────────
     "E101", Error, "Composition signature parse error (malformed `.comp.yaml`)";
-    "E102", Error, "Composition body references undeclared port";
+    "E102", Error, "Composition input port does not accept the column the call gives it";
     "E103", Error, "Call site or channel binds undeclared input/config/resource";
-    "E104", Error, "Call site or channel missing required input/config";
+    "E104", Error, "Call site or channel leaves unbound an input or config the composition needs";
     "E106", Error, "Name collision after composition expansion";
     "E107", Error, "Cycle detected in flat post-expansion graph";
     "E108", Error, "Composition body references enclosing scope (IsolatedFromAbove)";
@@ -293,6 +293,7 @@ diagnostic_registry! {
     "E166", Error, "Composition-body window is rooted at a Merge node";
     "E167", Error, "Composition-body window resolves through an undeclared input port";
     "E168", Error, "Composition-body window root schema is missing or incompatible";
+    "E169", Error, "Composition body uses a column its input port does not declare";
     "E171", Error, "Scoped-var reader is not a DAG descendant of the Transform that writes it";
     "E172", Error, "`$source` scoped var read downstream of a Merge/Combine node (the per-source value is ambiguous there)";
     "E173", Error, "Composition body reads a parent-scope `$pipeline` / `$source` var its `_compose.scoped_vars` schema does not opt into";

@@ -4,6 +4,180 @@ All notable changes to Clinker are tracked here.
 
 ## Unreleased
 
+### Fixed — a composition call writes what its nodes written in the pipeline would write
+
+**Breaking:** a composition node that uses a column its input port does not
+declare now fails compilation with the new code `E169`.
+
+A composition's input port receives the caller's rows as they are, but the
+compiler used to describe them with only the port's declared columns, in the
+port's order. An Aggregate, Cull or Combine inside the composition then read
+its columns by the wrong position whenever the port declared fewer columns
+than the caller had, or the same columns in another order. A sum came out
+empty or summed the wrong column, and a Combine wrote the wrong input's
+values, with no error. A Transform-only composition read the right values,
+but any call whose port declared fewer columns than the caller had, or the
+same columns in another order, stopped with `E314` at the next Sink, whether
+a Source or another node fed it.
+
+The composition's nodes now compile against the rows the call actually feeds
+each port. A call writes what the same nodes written in the pipeline at the
+call site would write. A Sink with `include_unmapped: false` reading a call
+now writes only the columns the node behind the composition's first output
+port emits, as it does after the same nodes written inline; before, it wrote
+every column the call passed on. Some shapes are still not equivalent: a call
+carries only the rows of its composition's first output port, so a composition
+whose output reads a Route, one with several output ports, and a Cull's
+`removed_to` rows differ from the same nodes inline
+([#1315](https://github.com/rustpunk/clinker/issues/1315)); and an Aggregate
+inside a composition fed by a source that declares a `correlation_key` stops
+with `E314` where the inline Aggregate runs. Columns the port does not declare pass through the composition in the
+caller's position, so a call fed by a Transform that adds a column runs and
+writes that column.
+
+The emitted OpenLineage column lineage changes with it: a composition's
+column now names the input column it really reads (an Aggregate's `sum(v)`
+named `order_id` before), and the columns a composition passes through now
+appear with identity lineage, as they do when the same nodes are written in
+the pipeline.
+
+The port's `schema:` is now the list of columns the composition may use. A
+node that uses any other column of the caller's rows fails with `E169` at
+every call whose rows carry that column, naming the call, the node, the port
+and the column, and the help prints the line to add under
+`_compose.inputs.<port>.schema`. A Reshape `set` or `overrides` entry on such a
+column counts as using it. Before, such a node failed with an error that did
+not say the port was the reason: `E203` for an expression, `E200` for a
+`group_by`, `partition_by` or Reshape target, `E308` for a Combine, or, for log
+`fields`, `E314` only once the run started. `W101` now fires only where a
+composition writes a column with the name of a caller column its port does
+not declare, not for every column a composition adds.
+
+**Breaking:** a column a port declares `any` is now seen by the composition's
+nodes with the type the call provides. Before, it was untyped inside the
+composition, so a node that used it in a way that type does not support
+compiled and wrote empty values; now it fails with `E200` at that call, and
+the message names the composition and the port. The help prints the node's
+line, or a Combine's `where:` entry, with the column converted to the type the
+node needs, such as `emit u = v.to_string().upper()`, for a type the provided
+values can convert to; the type checker's detail follows the fix, in a port
+schema's spelling. A column the port declares
+with a concrete type is still checked with that type, and the columns the port
+does not declare reach the composition's output with the caller's types.
+
+A composition's nodes are still checked against its port types; what a call
+outputs now follows what the caller passed. A column a composition
+does not write leaves the call with the type it arrived with, and a column it
+writes has the type its nodes give it from the caller's values, as the same
+nodes written in the pipeline would. Before, a column the port declared left
+the call with the port's declared type whatever the caller passed: an `int`
+column read through an `any` port came out untyped (`any`), and the columns
+the port did not declare did not reach the calling scope's schema, so a node
+after the call could not name them. A node that does not handle
+an empty value in a column its port declares `{ nullable: ... }` now fails
+with `E200` at every call, naming the node, the composition, the port and the
+column, and the help prints the node's line with the empty case handled, such
+as `filter (v ?? 0) > 6`: the line whose expression fails, or, for a Route
+branch, a Reshape `when:`, a log `condition:` or a Combine `where:`, that YAML
+entry rewritten. A Combine `where:` that compares such a column without
+handling the empty case was refused with `E303`, which named neither the
+composition nor the port; it is now this `E200`. The help prints one fix,
+and prints the rewritten line only when the node compiles with it.
+The `E102` that followed it, saying the next call reads a node the pipeline
+does not bind, is no longer reported. A composition
+that passes such a column unchanged to an inner composition whose port needs it
+never empty fails with `E102` at every call; the error names the outer port's
+`{ nullable: ... }` declaration as the cause and prints that port's line with
+the never-empty type.
+
+**Breaking:** `E102` now admits a caller's column only when the port's
+declared type admits it: the same type, a type into its `{ nullable: ... }`
+form, or anything into `any`. A caller column with no declared type (`any`)
+fed into a port column with a concrete type is now refused; before, it was
+accepted and arithmetic over its values could silently come out empty.
+`E102` now also accepts `int` into `{ nullable: int }`, which it refused
+before. Nothing is converted at the port, so `int` is still refused for
+`float`. The message names the call, the port, the column and both types in
+the pipeline's spelling, and the help gives the one change to make: the
+`schema:` line for a column read straight from a Source, or the line that
+converts the column (`emit <column> = <column>.to_<type>()`) to write in a
+Transform before the call.
+
+A Sink inside a composition is now checked like the same Sink in the
+pipeline: a `mapping:` entry reading a column no row carries is `E365`, and one
+whose output name collides with a caller column `include_unmapped: true`
+writes beside it is `E364`. Before, both checks stood down inside a
+composition.
+
+`E378`'s help for a composition Sink that writes only emitted columns now
+moves it with its configuration unchanged, with no `mapping:`, and moves
+such a Sink even when its `exclude:` removes every column it reads: the
+moved Sink writes the same columns at pipeline level.
+
+A node listed before the node it reads is now bound after it, in a pipeline
+and in a composition alike. Before, such a node was left unbound: in a
+composition it escaped every check and the call wrote no rows while the run
+exited 0. A composition node that reads itself or sits on a cycle now fails
+with `E107`, and one whose `input:` names nothing in the composition with
+`E004`, as the same mistakes do in a pipeline; before, each wrote no rows
+with exit 0. A cycle is reported once; the nodes on it are not bound, so no
+second `E107` or follower error such as `E304` is reported. The `E107` help
+names the node to change, choosing it so that no node is left reading the
+composition's output node, and prints its `input:` line naming the first
+input port with which every node on the cycle compiles. A cycle through a
+Merge, a Combine or a composition call, or one no port can end, gets a
+sentence naming the node to change instead.
+
+**Breaking:** a composition node that reads an input port declared
+`required: false` now needs every call to bind that port. A call that leaves
+it unbound fails with `E104`, naming the call, the node and the port. The
+`E104` title no longer says the input is required, since the port is declared
+optional. Before, the node was left unbound: it escaped every check and the
+call ran with the node writing nothing. A port nothing in the composition
+reads may still be left unbound.
+
+**Breaking:** a composition whose output port is an input port declared
+`required: false` (`outputs: { out: opt }`) now needs every call to bind that
+port, and a call that leaves it unbound fails with `E104`. Before, such a call
+compiled and wrote no rows, not even a header, with exit 0. To migrate, bind
+the port under the call's `inputs:`.
+
+A help that prints YAML or a line of CXL for the author to paste now prints
+it only once the compiler has tried it where it applies: a line of YAML by
+binding the call it is for with it (or, for an `input:` line inside a
+composition, the nodes it is for), and a rewritten CXL line by compiling that
+node with it. There it must clear the error without raising a new one.
+Otherwise the help is one sentence saying what to change, with no code, and
+no help offers two fixes. The check covers only that call or node, not the
+whole pipeline: another call of the same composition, or a node that reads a
+column or node the fix changes, can still fail once the fix is pasted, and
+the next compile reports it. Checking a pasted fix against the whole pipeline
+is left to later work. The `E104` help tries, in order, the nodes feeding the
+call's other input ports, the input ports of the composition the call is in
+(for a call inside a composition), then every other node of the calling
+pipeline or composition in the order they are declared, and prints the
+`inputs:` entry naming the first one with which the call compiles; before,
+it named the node feeding the call's first bound port even when the port
+refused that node's rows, and with no bound port it asked the author to fill
+a name in.
+
+`E102` for a port fed by a Route branch now says a composition input port
+cannot read a Route or Cull output port yet and prints the Transform that
+passes the rows on (#888). A port that names a composition's first output
+port (`call.out`) is told that a call's rows are read by the call's name and
+gets the `inputs:` entry naming the call; another output port gets no line
+to paste (#1315). An `E102` is no longer reported for a port reading a node
+whose own upstream failed, or a composition that failed: the earlier error
+says why. A port declared `{ nullable: any }` accepts every
+caller type, as `any` does, and an always-empty caller column is described as
+such rather than as `any`.
+
+To migrate, add each column `E169` names to the port's `schema:`. For an
+`E102` on an untyped column, declare its type where the Source declares it,
+or convert it before the call.
+
+Closes [#1221](https://github.com/rustpunk/clinker/issues/1221).
+
 ### Changed — sorts compare faster, and a hash Aggregate stops recomputing its groups' hashes as it grows
 
 Output is unchanged; only speed and an Aggregate's memory estimate change.

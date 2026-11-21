@@ -41,9 +41,13 @@
 //!
 //! ## Pass-through columns
 //!
-//! Upstream rows may carry additional columns beyond the declared
-//! port schema. These extras pass through the composition on the same row. On
-//! name collision between a pass-through column and a body-created column, the
+//! A call behaves as its body written inline at the call site. Upstream rows
+//! may carry additional columns beyond the declared port schema; the body
+//! binds against the upstream row itself, so those extras reach every body
+//! node in the upstream's position and pass through on the same row. The
+//! port schema is the body's vocabulary: a body node that names an upstream
+//! column the port does not declare is refused at bind time (E169). On name
+//! collision between a pass-through column and a body-created column, the
 //! body wins (warning W101). If the composition should narrow its output, add
 //! an explicit projection node inside the body.
 //!
@@ -180,7 +184,9 @@ pub struct ScopedVarsSchema {
 ///
 /// `schema` is the **minimum-required** column set: rows flowing through
 /// the port must carry at least these columns, but may carry extras
-/// (pass-through). `None` means accept-any — the port has no declared shape.
+/// (pass-through). It is also the body's vocabulary: the only upstream
+/// columns a body node may name (E169). `None` means accept-any — the port
+/// has no declared shape and the body names no upstream column.
 ///
 /// The schema carries typed column declarations as a [`Column`] list — the
 /// same `[{name, type}]` shape a single-record `SourceBody` schema uses. Types
